@@ -718,6 +718,23 @@ refuses the launch with [`E-RUN-019`](diagnostics.md#e-run-019). Every other cap
 connection at all and needs no daemon running. See
 [the mur-roost HTTP API](roost-api.md#post-register).
 
+### `SIGTERM` { #mur-run-sigterm }
+
+An agent capsule that receives `SIGTERM` — from [`mur stop`](#mur-stop), `kill`, or a service
+manager — ends its session the way a clean exit does:
+
+1. Every live task is cancelled, as [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) cancels them, and no new task is started.
+2. Each cancelled task's `task_end` is written, after its `on-task-end` hooks.
+3. The session teardown runs: `on-session-end`, the async hook drain, `shell_abandoned` records for detached commands, `session_end`, and removal of the [running-capsule record](#running-capsule-records).
+
+| Bound | Effect |
+|---|---|
+| A second `SIGTERM` | The process exits at once, with status 143 |
+| 20 seconds after the first `SIGTERM` | The process exits with status 143, wherever the teardown is |
+
+A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule
+has no `SIGTERM` handling and ends at once.
+
 **Artifact pre-check:** Before staging, `mur run` verifies that all artifacts declared in the manifest are installed locally. If any are missing it exits immediately with `error[E-RUN-008]` and a `mur install` hint. Run `mur install` first to fetch missing artifacts.
 
 Current runtime constraints:
@@ -805,9 +822,12 @@ Three steps, in this order:
 
 | Step | What it does |
 |---|---|
-| 1. [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) through the A2A door | Cancels every task the session still holds and reads what it leaves running |
-| 2. `SIGTERM` to the recorded process | Ends the capsule |
+| 1. [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) through the A2A door | Cancels every task the session still holds and reads what it leaves running, then waits up to 5 seconds for the trace to record how each cancelled task ended |
+| 2. `SIGTERM` to the recorded process | Ends the capsule. An agent capsule records its remaining endings and runs its teardown first — see [`SIGTERM`](#mur-run-sigterm) |
 | 3. `SIGKILL` after `--timeout` seconds | Only if the process is still there |
+
+A cancelled task's ending is its `task_end` record, or, for a task cancelled before it started,
+its `task_canceled` record with `phase: "queued"`.
 
 The door step is the only moment anything can ask the capsule what it leaves running. A detached
 shell command keeps its own lifecycle and a delegated sub-capsule is still going, and the record of
@@ -836,6 +856,16 @@ them was stopped.
 A capsule that answered with nothing and a capsule that could not be asked are different facts
 about the machine, so they are different lines. Both exit 0: the session was ended either way, and
 only the accounting is incomplete.
+
+One more line appears only when an ending could not be recorded — the capsule was still busy when
+the wait and `--timeout` ran out, and `SIGKILL` ended it. It prints after the `canceled:` lines,
+one per task:
+
+| Line | Means |
+|---|---|
+| `unended: <task_id>  the trace does not record how this task ended` | The task was cancelled, but `trace.jsonl` has no ending for it |
+
+A stop whose capsule recorded every ending prints no `unended:` line.
 
 ### There is no `--url` { #mur-stop-no-url }
 

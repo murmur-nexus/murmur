@@ -154,6 +154,17 @@ fn start_agent_with(
     name: &str,
     extra: &str,
 ) -> Capsule {
+    start_agent_with_env(home, server, name, extra, &[])
+}
+
+/// [`start_agent_with`], with `env` added to the capsule process's environment.
+fn start_agent_with_env(
+    home: &Arc<TempDir>,
+    server: &common::ScriptedServer,
+    name: &str,
+    extra: &str,
+    env: &[(&str, &str)],
+) -> Capsule {
     let project = agent_project(&server.endpoint, name, extra);
     let manifest = project.path().join("murmur.yaml");
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
@@ -163,6 +174,7 @@ fn start_agent_with(
         .current_dir(project.path())
         .env("HOME", home.path())
         .env_remove("NEXUS_API_KEY")
+        .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -662,6 +674,359 @@ fn stop_cancels_through_the_door_before_it_signals() {
         "the stop must unlink the record; nothing else will"
     );
     assert_eq!(ps_stdout(home.path()), "no running capsules\n");
+}
+
+/// The index of the first event matching `predicate`, for ordering assertions.
+fn position_of(events: &[Value], predicate: impl Fn(&Value) -> bool) -> Option<usize> {
+    events.iter().position(predicate)
+}
+
+/// Polls the capsule's own child handle until it has exited or `timeout` passes.
+fn exited_within(capsule: &mut Capsule, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if capsule
+            .child
+            .try_wait()
+            .expect("the child is waitable")
+            .is_some()
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// With work between the two records, a stop that waited only for `task_canceled` signals inside
+/// that work and the ending is never written. The trace is read once, with no wait: `mur stop`
+/// returning is the promise that it is already there.
+///
+/// `--timeout 0` takes the capsule's own `SIGTERM` teardown out of the picture: with a grace
+/// period it would write the ending itself, and this case would pass whatever `mur stop` waited
+/// for.
+#[test]
+fn stop_waits_for_the_ending_not_just_the_cancel() {
+    if !cfg!(debug_assertions) {
+        eprintln!(
+            "[SKIP] stop_waits_for_the_ending_not_just_the_cancel: the task-end delay seam exists only in debug builds"
+        );
+        return;
+    }
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            tool_call_response("msg_1", "toolu_1", "no-such-tool", json!({})),
+            end_turn_response("msg_2", "a turn that must never be asked for"),
+        ],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let capsule = start_agent_with_env(
+        &home,
+        &server,
+        "stop-waits-ending",
+        "",
+        &[("MURMUR_DEBUG_TASK_END_DELAY_MS", "250")],
+    );
+    let trace_path = capsule.trace_path();
+
+    let task_id = submit(&capsule.url(), "msg-1", "start something slow");
+    wait_for_requests(&server, 1, Duration::from_secs(60));
+
+    let output = mur(home.path())
+        .args(["stop", "@1", "--timeout", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let events = read_trace(&trace_path);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "task_canceled"
+                && event["task_id"] == task_id.as_str()),
+        "no task_canceled for {task_id} when the stop returned: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event["event_type"] == "task_end"
+            && event["task_id"] == task_id.as_str()
+            && event["exit_status"] == "canceled"),
+        "no canceled task_end for {task_id} when the stop returned: {events:?}"
+    );
+    assert!(stdout.contains(&format!("canceled: {task_id}")), "{stdout}");
+    assert!(!stdout.contains("unended:"), "{stdout}");
+
+    thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the loop asked the provider again after the stop"
+    );
+}
+
+/// A `SIGTERM` from anyone — not only `mur stop` — cancels the task, lets the ending be written and
+/// runs the session's teardown.
+#[test]
+fn a_plain_sigterm_records_the_ending() {
+    if !cfg!(debug_assertions) {
+        eprintln!(
+            "[SKIP] a_plain_sigterm_records_the_ending: the task-end delay seam exists only in debug builds"
+        );
+        return;
+    }
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            tool_call_response("msg_1", "toolu_1", "no-such-tool", json!({})),
+            end_turn_response("msg_2", "a turn that must never be asked for"),
+        ],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let mut capsule = start_agent_with_env(
+        &home,
+        &server,
+        "plain-sigterm",
+        "",
+        &[("MURMUR_DEBUG_TASK_END_DELAY_MS", "2000")],
+    );
+    let trace_path = capsule.trace_path();
+    let session_id = capsule.session_id();
+
+    let task_id = submit(&capsule.url(), "msg-1", "start something slow");
+    wait_for_requests(&server, 1, Duration::from_secs(60));
+
+    kill(capsule.pid(), 15);
+    assert!(
+        exited_within(&mut capsule, Duration::from_secs(10)),
+        "the capsule was still running 10 seconds after SIGTERM"
+    );
+
+    let events = read_trace(&trace_path);
+    let canceled = position_of(&events, |event| {
+        event["event_type"] == "task_canceled" && event["task_id"] == task_id.as_str()
+    })
+    .unwrap_or_else(|| panic!("no task_canceled for {task_id}: {events:?}"));
+    let ended = position_of(&events, |event| {
+        event["event_type"] == "task_end"
+            && event["task_id"] == task_id.as_str()
+            && event["exit_status"] == "canceled"
+    })
+    .unwrap_or_else(|| panic!("no canceled task_end for {task_id}: {events:?}"));
+    let session_end = position_of(&events, |event| event["event_type"] == "session_end")
+        .unwrap_or_else(|| panic!("no session_end: {events:?}"));
+    assert!(
+        canceled < ended && ended < session_end,
+        "records out of order: {events:?}"
+    );
+    assert!(
+        !record_for(home.path(), &session_id).exists(),
+        "the teardown must remove the running record"
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the loop asked the provider again after SIGTERM"
+    );
+}
+
+/// With nothing running, `SIGTERM` is a clean end of session.
+#[test]
+fn an_idle_capsule_ends_cleanly_on_sigterm() {
+    let server = common::ScriptedServer::start_with_delay(
+        vec![end_turn_response("msg_1", "never asked for")],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let mut capsule = start_agent(&home, &server, "idle-sigterm");
+    let trace_path = capsule.trace_path();
+    let session_id = capsule.session_id();
+
+    kill(capsule.pid(), 15);
+    assert!(
+        exited_within(&mut capsule, Duration::from_secs(5)),
+        "the idle capsule was still running 5 seconds after SIGTERM"
+    );
+
+    let events = read_trace(&trace_path);
+    assert_eq!(
+        events.last().map(|event| event["event_type"].clone()),
+        Some(json!("session_end")),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(
+            |event| event["event_type"] == "task_end" || event["event_type"] == "task_canceled"
+        ),
+        "{events:?}"
+    );
+    assert!(!record_for(home.path(), &session_id).exists());
+    assert_eq!(ps_stdout(home.path()), "no running capsules\n");
+}
+
+/// A capsule too slow to record its ending inside the wait, killed with no grace, is reported as
+/// having lost it.
+#[test]
+fn a_stop_that_outruns_the_ending_says_so() {
+    if !cfg!(debug_assertions) {
+        eprintln!(
+            "[SKIP] a_stop_that_outruns_the_ending_says_so: the task-end delay seam exists only in debug builds"
+        );
+        return;
+    }
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            tool_call_response("msg_1", "toolu_1", "no-such-tool", json!({})),
+            end_turn_response("msg_2", "a turn that must never be asked for"),
+        ],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let capsule = start_agent_with_env(
+        &home,
+        &server,
+        "stop-outruns",
+        "",
+        &[("MURMUR_DEBUG_TASK_END_DELAY_MS", "8000")],
+    );
+    let trace_path = capsule.trace_path();
+
+    let task_id = submit(&capsule.url(), "msg-1", "start something slow");
+    wait_for_requests(&server, 1, Duration::from_secs(60));
+
+    let output = mur(home.path())
+        .args(["stop", "@1", "--timeout", "0"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(stdout.contains(&format!("canceled: {task_id}")), "{stdout}");
+    assert!(stdout.contains("signal:  SIGKILL"), "{stdout}");
+    let unended = format!("unended: {task_id}  the trace does not record how this task ended");
+    assert_eq!(
+        stdout.lines().filter(|line| *line == unended).count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("unended:"))
+            .count(),
+        1,
+        "{stdout}"
+    );
+
+    let events = read_trace(&trace_path);
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "task_canceled"
+                && event["task_id"] == task_id.as_str()),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event_type"] == "task_end" && event["task_id"] == task_id.as_str()),
+        "{events:?}"
+    );
+}
+
+/// The teardown is bounded by the operator too: a second `SIGTERM` does not wait for it.
+#[test]
+fn a_second_sigterm_ends_the_process_at_once() {
+    if !cfg!(debug_assertions) {
+        eprintln!(
+            "[SKIP] a_second_sigterm_ends_the_process_at_once: the task-end delay seam exists only in debug builds"
+        );
+        return;
+    }
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            tool_call_response("msg_1", "toolu_1", "no-such-tool", json!({})),
+            end_turn_response("msg_2", "a turn that must never be asked for"),
+        ],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let mut capsule = start_agent_with_env(
+        &home,
+        &server,
+        "second-sigterm",
+        "",
+        &[("MURMUR_DEBUG_TASK_END_DELAY_MS", "30000")],
+    );
+
+    submit(&capsule.url(), "msg-1", "start something slow");
+    wait_for_requests(&server, 1, Duration::from_secs(60));
+
+    kill(capsule.pid(), 15);
+    thread::sleep(Duration::from_millis(500));
+    kill(capsule.pid(), 15);
+    assert!(
+        exited_within(&mut capsule, Duration::from_secs(2)),
+        "the capsule was still running 2 seconds after the second SIGTERM"
+    );
+}
+
+/// A task cancelled before it started writes no `task_end`, so its queued `task_canceled` is what
+/// the stop waits for — not the whole deadline.
+#[test]
+fn a_queued_cancel_does_not_wait_out_the_deadline() {
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            tool_call_response("msg_1", "toolu_1", "no-such-tool", json!({})),
+            end_turn_response("msg_2", "a turn that must never be asked for"),
+        ],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let capsule = start_agent(&home, &server, "queued-cancel");
+    let trace_path = capsule.trace_path();
+
+    let first = submit(&capsule.url(), "msg-1", "start something slow");
+    let second = submit(&capsule.url(), "msg-2", "wait behind it");
+    wait_for_requests(&server, 1, Duration::from_secs(60));
+
+    let started = Instant::now();
+    let output = mur(home.path())
+        .args(["stop", "@1"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(stdout.contains(&format!("canceled: {first}")), "{stdout}");
+    assert!(stdout.contains(&format!("canceled: {second}")), "{stdout}");
+    assert!(!stdout.contains("unended:"), "{stdout}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the stop waited out the deadline for a task that never started ({elapsed:?})"
+    );
+
+    let events = read_trace(&trace_path);
+    assert!(
+        events.iter().any(|event| event["event_type"] == "task_end"
+            && event["task_id"] == first.as_str()
+            && event["exit_status"] == "canceled"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "task_canceled"
+                && event["task_id"] == second.as_str()
+                && event["phase"] == "queued"),
+        "{events:?}"
+    );
 }
 
 // ── 6. What the capsule left running ──────────────────────────────────────────

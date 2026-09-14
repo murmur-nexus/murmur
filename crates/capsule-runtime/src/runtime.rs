@@ -112,6 +112,14 @@ const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.1.0";
 const WIT_TEXT_CHUNKS_IFACE: &str = "murmur:text/chunks@0.1.0";
 const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 
+/// How long an agent session's teardown may run after the first `SIGTERM` before the process
+/// exits with status 143 regardless.
+///
+/// Longer than the async-hook drain budget (`ASYNC_HOOK_DRAIN_TIMEOUT` in `hooks.rs`, 15 s), so a
+/// drain that stays inside its own bound is never cut short by this one. A second `SIGTERM`
+/// exits at once without waiting for either.
+const TERMINATE_TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Resolve a guest interface instance export by its versioned name. Returns
 /// `None` when the versioned name is absent, so a component that exports only
 /// the legacy unversioned name (or no recognizable name) surfaces as the
@@ -225,6 +233,18 @@ async fn run_task_with_reopens(
             cancel.clone(),
         )
         .await;
+
+        // Stands in for work between `task_canceled` and `task_end` — a slow `on-task-end` hook —
+        // so the `ps_stop` tests can hold a capsule in that window. Absent from release builds.
+        #[cfg(debug_assertions)]
+        {
+            if let Some(ms) = std::env::var("MURMUR_DEBUG_TASK_END_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
 
         // The attempt's own terminal outcome, not a coarse ok/failed: an agent loop that
         // burned its turn budget reports `max_turns_reached`, and this is the only record
@@ -1252,6 +1272,25 @@ pub fn launch_session(
         // Only the agent path reaches here. A script capsule binds nothing and is never
         // addressable, so it records nothing.
         let _running_record = open_running_record(&staged, &session_id, &capsule_url, &workdir);
+
+        // Taken over from the default disposition before the door is announced, so a `SIGTERM`
+        // sent by anyone who has seen the URL is held for the task loop's handler rather than
+        // ending the process with no teardown. A signal that arrives before the handler is
+        // spawned is delivered to it then.
+        #[cfg(unix)]
+        let sigterm = {
+            let _runtime = rt.enter();
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(sigterm) => Some(sigterm),
+                Err(e) => {
+                    eprintln!(
+                        "[capsule-runtime] could not install a SIGTERM handler; SIGTERM will end this session without its teardown: {e}"
+                    );
+                    None
+                }
+            }
+        };
+
         on_url(&capsule_url);
 
         let capsule_identity = CapsuleIdentity {
@@ -1812,10 +1851,52 @@ pub fn launch_session(
                         }
                     }
 
+                    // Raised once, by the first `SIGTERM`. Every wait below that is not already a
+                    // task's own cancel races it, and the loop takes no new work once it is up, so
+                    // the session falls through to the same teardown a clean exit runs.
+                    let terminating = crate::cancel::CancelSignal::new();
+                    #[cfg(unix)]
+                    if let Some(mut sigterm) = sigterm {
+                        let task_registry = Arc::clone(&task_registry);
+                        let terminating = terminating.clone();
+                        tokio::spawn(async move {
+                            if sigterm.recv().await.is_none() {
+                                return;
+                            }
+                            // Cancelled before the signal is raised, so an agent loop that wakes
+                            // on either finds its task already `Canceled`.
+                            let _ = task_registry.lock().unwrap().cancel_every_live();
+                            terminating.cancel();
+                            eprintln!(
+                                "[capsule-runtime] SIGTERM received — cancelling live tasks and ending the session"
+                            );
+                            std::thread::spawn(|| {
+                                std::thread::sleep(TERMINATE_TEARDOWN_DEADLINE);
+                                std::process::exit(143);
+                            });
+                            if sigterm.recv().await.is_some() {
+                                std::process::exit(143);
+                            }
+                        });
+                    }
+
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
                     // Each iteration processes one task. Single/none modes break after
                     // the first iteration; queue+sleep iterates until channel closes.
                     'task_loop: loop {
+                        if terminating.is_canceled() {
+                            close_lanes_on_termination(
+                                &mut lanes,
+                                &task_registry,
+                                &mut trace,
+                                &detached,
+                                &live_delegations,
+                                &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
+                                &mut queued_cancel_event_id,
+                            )
+                            .await;
+                            break 'task_loop;
+                        }
                         // ── WAIT FOR NEXT TASK ──
                         let (incoming_lane, incoming) = if closing_out {
                             let active = task_registry.lock().unwrap().active_lane();
@@ -1892,8 +1973,8 @@ pub fn launch_session(
                                             &task_id,
                                             seed,
                                             // No A2A task, so nothing a person can address a
-                                            // `tasks/cancel` to.
-                                            None,
+                                            // `tasks/cancel` to; only `SIGTERM` cancels it.
+                                            Some(terminating.clone()),
                                         )
                                         .await;
                                         let failed = result.is_err();
@@ -1971,7 +2052,7 @@ pub fn launch_session(
                                             Some(context_id.clone()),
                                             &task_id,
                                             seed,
-                                            None,
+                                            Some(terminating.clone()),
                                         )
                                         .await;
                                         let _ = trace.flush().await;
@@ -2021,6 +2102,19 @@ pub fn launch_session(
                                         while let Ok(task) = task_rx.try_recv() {
                                             lanes.push(task);
                                         }
+                                        if terminating.is_canceled() {
+                                            close_lanes_on_termination(
+                                                &mut lanes,
+                                                &task_registry,
+                                                &mut trace,
+                                                &detached,
+                                                &live_delegations,
+                                                &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
+                                                &mut queued_cancel_event_id,
+                                            )
+                                            .await;
+                                            break 'task_loop;
+                                        }
                                         let active = task_registry.lock().unwrap().active_lane();
                                         if let Some(selected) = lanes.next(active) {
                                             break selected;
@@ -2033,6 +2127,7 @@ pub fn launch_session(
                                             // so only `task_rx` can close, and it still ends the
                                             // loop when it does.
                                             tokio::select! {
+                                                () = terminating.canceled() => break 'task_loop,
                                                 arrived = task_rx.recv() => match arrived {
                                                     Some(task) => task,
                                                     None => {
@@ -2065,6 +2160,7 @@ pub fn launch_session(
                                                 std::time::Duration::from_secs(idle_timeout_secs),
                                                 async {
                                                     tokio::select! {
+                                                        () = terminating.canceled() => Woke::Terminating,
                                                         arrived = task_rx.recv() => Woke::Task(arrived),
                                                         Some(report) = completion_rx.recv() => {
                                                             Woke::Report(report)
@@ -2086,6 +2182,7 @@ pub fn launch_session(
                                                     .await;
                                                     continue;
                                                 }
+                                                Ok(Woke::Terminating) => break 'task_loop,
                                                 Ok(Woke::Task(Some(task))) => task,
                                                 Ok(Woke::Task(None)) => {
                                                     final_loop_result = Ok(AgentLoopExit::Ok);
@@ -2115,8 +2212,9 @@ pub fn launch_session(
                                                         // path, so `on-task-start` never fired and
                                                         // there is no seed to apply.
                                                         None,
-                                                        // Nor is there a task to cancel.
-                                                        None,
+                                                        // Nor is there a task to cancel; only
+                                                        // `SIGTERM` ends this attempt early.
+                                                        Some(terminating.clone()),
                                                     )
                                                     .await;
                                                     break 'task_loop;
@@ -2150,36 +2248,13 @@ pub fn launch_session(
                             }
                         };
                         let Some(cancel_signal) = cancel_signal else {
-                            let residue = crate::cancel::Residue::snapshot(
-                                Some(&detached),
+                            record_canceled_before_start(
+                                &incoming,
+                                &mut trace,
+                                &detached,
                                 &live_delegations,
-                            );
-                            let _ = trace
-                                .write_task_canceled(
-                                    &incoming.task_id,
-                                    None,
-                                    crate::cancel::PHASE_QUEUED,
-                                    residue.detached_work_ids(),
-                                    residue.delegation_ids(),
-                                )
-                                .await;
-                            let _ = trace.flush().await;
-                            // The only thing that closes a `message/stream` connection on this
-                            // task: it never reaches an agent loop, so nothing else would.
-                            emit_sse(
                                 &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
                                 &mut queued_cancel_event_id,
-                                "status",
-                                &crate::streaming::TaskStatusUpdateEvent {
-                                    id: incoming.task_id.clone(),
-                                    context_id: Some(incoming.context_id.clone()),
-                                    status: crate::streaming::StreamStatus {
-                                        state: "canceled".into(),
-                                        message: "task canceled before it started".into(),
-                                        response: None,
-                                    },
-                                    r#final: true,
-                                },
                             )
                             .await;
                             continue 'task_loop;
@@ -2285,6 +2360,23 @@ pub fn launch_session(
                             // Immediately after the terminal state, so a resource-plane read that
                             // lands next reports the turn these bytes belong to.
                             reg.advance_resource_generation();
+                        }
+
+                        // A terminating session starts nothing after the task it was running:
+                        // what is still in a lane gets its cancel recorded, and the loop ends.
+                        if terminating.is_canceled() {
+                            final_loop_result = loop_result;
+                            close_lanes_on_termination(
+                                &mut lanes,
+                                &task_registry,
+                                &mut trace,
+                                &detached,
+                                &live_delegations,
+                                &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
+                                &mut queued_cancel_event_id,
+                            )
+                            .await;
+                            break 'task_loop;
                         }
 
                         // ── DECIDE WHETHER TO CONTINUE ──
@@ -7383,6 +7475,74 @@ where
 enum Woke {
     Task(Option<IncomingTask>),
     Report(DetachedReport),
+    /// The session received `SIGTERM`.
+    Terminating,
+}
+
+/// Say that a task was cancelled while it was still `submitted`, which is all such a task gets: no
+/// `task_start`, no `on-task-start`, no request to the provider, and no `task_end`, because it
+/// never ran. The `PHASE_QUEUED` record is its ending.
+///
+/// The final status event is the only thing that closes a `message/stream` connection on this
+/// task: it never reaches an agent loop, so nothing else would.
+async fn record_canceled_before_start(
+    task: &IncomingTask,
+    trace: &mut TraceWriter,
+    detached: &Arc<DetachedRegistry>,
+    live_delegations: &crate::cancel::LiveDelegations,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    event_id: &mut u64,
+) {
+    let residue = crate::cancel::Residue::snapshot(Some(detached), live_delegations);
+    let _ = trace
+        .write_task_canceled(
+            &task.task_id,
+            None,
+            crate::cancel::PHASE_QUEUED,
+            residue.detached_work_ids(),
+            residue.delegation_ids(),
+        )
+        .await;
+    let _ = trace.flush().await;
+    emit_sse(
+        sse,
+        event_id,
+        "status",
+        &crate::streaming::TaskStatusUpdateEvent {
+            id: task.task_id.clone(),
+            context_id: Some(task.context_id.clone()),
+            status: crate::streaming::StreamStatus {
+                state: "canceled".into(),
+                message: "task canceled before it started".into(),
+                response: None,
+            },
+            r#final: true,
+        },
+    )
+    .await;
+}
+
+/// Empty every lane on the way out of a terminating session, starting nothing.
+///
+/// A task the `SIGTERM` handler cancelled is recorded as cancelled before it started, exactly as
+/// the activation step records one. A task the door accepted after the handler ran is not
+/// `Canceled` and is dropped without a record.
+async fn close_lanes_on_termination(
+    lanes: &mut LaneQueue,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    trace: &mut TraceWriter,
+    detached: &Arc<DetachedRegistry>,
+    live_delegations: &crate::cancel::LiveDelegations,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    event_id: &mut u64,
+) {
+    // `None` for the active lane is safe only because nothing taken here is started.
+    while let Some((_, task)) = lanes.next(None) {
+        if task_registry.lock().unwrap().is_canceled(&task.task_id) {
+            record_canceled_before_start(&task, trace, detached, live_delegations, sse, event_id)
+                .await;
+        }
+    }
 }
 
 /// Turn a report about work this runtime started into a queued `completion`-origin task, and
