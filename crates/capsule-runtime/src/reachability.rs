@@ -500,7 +500,7 @@ enum HelperProbe {
 /// (`ETXTBSY`) or out of resources at staging time is reported rather than retried.
 ///
 /// A driver that exited on its own has answered, and the answer has three shapes, all handled here
-/// because this host's own `gcc` produces two of them:
+/// because GCC itself produces two of them:
 ///
 ///   * an **absolute path** — `cc -print-prog-name=cc1` →
 ///     `/usr/libexec/gcc/x86_64-linux-gnu/13/cc1`. The driver found it in its private libexec

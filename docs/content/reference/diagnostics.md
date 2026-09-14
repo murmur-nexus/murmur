@@ -2061,9 +2061,8 @@ before the driver answers. It fires once per `shell.allow` entry, on stderr, at 
 The bracketed list names the helpers that were not checked. Helpers checked before the failure
 are reported with `W-SEC-012` as usual.
 
-**Why it matters:** without this warning, a driver that could not be run printed nothing, which
-reads the same as a `W-SEC-012` check that passed. The capsule may still have a toolchain it cannot
-run under `sealed`.
+**Why it matters:** the helpers in the bracketed list were not checked, so the capsule may have a
+toolchain it cannot run under `sealed` even though no `W-SEC-012` names it.
 
 **What the runtime does about it:** nothing is refused, and the driver is not run again.
 
