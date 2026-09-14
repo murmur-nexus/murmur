@@ -41,7 +41,11 @@
 //!     [`warn_on_unreachable_toolchain_helpers`] warns with `W-SEC-012` and lets the launch
 //!     proceed. A warning rather than a refusal because the probe behind it
 //!     (`<driver> -print-prog-name=<helper>`) is a heuristic about one driver family, and a hard
-//!     refusal built on a heuristic would block capsules that would in fact have worked.
+//!     refusal built on a heuristic would block capsules that would in fact have worked. A driver
+//!     that answers with nothing usable is an unknown family and stays silent; a driver that
+//!     could not be asked at all — the spawn failed with an OS error, or a signal killed it before
+//!     it answered — warns with `W-SEC-029` instead, because silence there would read as a
+//!     `W-SEC-012` check that passed.
 //!
 //! ## Why both are gated on the *declared* floor
 //!
@@ -61,11 +65,11 @@
 //!
 //! Nothing here widens anything. No path becomes reachable inside a composed root, no Landlock
 //! rule is added or relaxed, and no manifest key is introduced. The entire contribution is
-//! turning two silent under-deliveries into a named refusal and a named warning at launch.
+//! turning two silent under-deliveries into a named refusal and named warnings at launch.
 
 use std::path::{Path, PathBuf};
 
-use murmur_artifact::{security_warning_link, ContainmentClass, W_SEC_012};
+use murmur_artifact::{security_warning_link, ContainmentClass, W_SEC_012, W_SEC_029};
 
 use crate::errors::{RuntimeError, UnreachableEntrypoint};
 use crate::types::CapabilityPolicy;
@@ -96,9 +100,10 @@ const SHEBANG_PROBE_BYTES: u64 = 512;
 /// answers `-print-prog-name=<helper>` on stdout with either an absolute path or the helper name
 /// unchanged — `clang`/`clang++` do (they accept the flag for GCC compatibility), so adding them
 /// is a one-line change plus a helper list (`clang -cc1` is in-process, so the useful names there
-/// are the assembler and linker: `as`, `ld`, `lld`). A driver that does not answer that flag
-/// contributes nothing and warns about nothing, because [`probe_helper_path`] treats an
-/// unrecognised flag as "not found" (see its own doc comment).
+/// are the assembler and linker: `as`, `ld`, `lld`). A driver that runs but does not answer that
+/// flag contributes nothing and warns about nothing, because [`probe_helper_path`] treats an
+/// unrecognised flag as [`HelperProbe::NothingUsable`]. A driver that cannot be run at all is
+/// reported once, as an [`UnprobedToolchainDriver`], whatever its row lists.
 const KNOWN_TOOLCHAIN_DRIVERS: &[(&str, &[&str])] = &[
     ("cc", &["cc1", "cc1plus", "as", "ld", "collect2"]),
     ("gcc", &["cc1", "cc1plus", "as", "ld", "collect2"]),
@@ -119,6 +124,35 @@ pub struct ToolchainHelperWarning {
     pub helper: String,
     /// Where the driver said that helper lives on this host.
     pub resolved_path: PathBuf,
+}
+
+/// One compiler driver whose `-print-prog-name=` probe could not be run, so `W-SEC-012` was not
+/// evaluated for the helpers named in `unchecked_helpers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnprobedToolchainDriver {
+    /// The `capabilities.shell.allow` entry that named the driver, verbatim.
+    pub driver: String,
+    /// The absolute path that entry resolved to, which is what the probe tried to exec.
+    pub driver_path: PathBuf,
+    /// The helper whose probe failed, followed by every later helper in the driver's
+    /// [`KNOWN_TOOLCHAIN_DRIVERS`] row, in table order. Helpers before it were probed normally.
+    pub unchecked_helpers: Vec<String>,
+    /// `Some` when the spawn itself failed (`PermissionDenied`, `ExecutableFileBusy`, …); `None`
+    /// when the driver started and a signal terminated it before it answered.
+    pub error_kind: Option<std::io::ErrorKind>,
+    /// The spawn error's `Display`, or `terminated by signal N`.
+    pub reason: String,
+}
+
+/// Everything [`warn_on_unreachable_toolchain_helpers`] decided. Both lists empty means every
+/// known driver was either probed with every helper covered, or answered nothing usable; a
+/// driver that could not be asked always lands in `unprobed`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolchainHelperReport {
+    /// One `W-SEC-012` each.
+    pub uncovered: Vec<ToolchainHelperWarning>,
+    /// One `W-SEC-029` each.
+    pub unprobed: Vec<UnprobedToolchainDriver>,
 }
 
 /// Reads the leading bytes of `path` and, if it is a script, returns the bare name of the
@@ -304,15 +338,22 @@ fn check_interpreted_entrypoints_reachable_in(
 /// root, readable, and un-exec'able. Treating "it's under `/usr`" as coverage here would suppress
 /// exactly the warning this function exists to emit.
 ///
-/// Never returns an error and never fails a launch. Each step is shrink-not-fail: a driver that
-/// does not resolve, a probe that fails to spawn, a helper the driver does not know about, all
-/// contribute nothing.
+/// Never returns an error and never fails a launch. Under a declared `sealed` floor, each known
+/// driver entry that resolves to an absolute path ends in exactly one of three states:
+///
+/// | Probe outcome | Reported as |
+/// |---|---|
+/// | The driver answered, for each helper | zero or more `uncovered` entries, one `W-SEC-012` each |
+/// | The driver ran and named nothing usable — non-zero exit, empty or unrecognised output, a path that does not exist | nothing: an unknown driver family shrinks the check rather than failing it |
+/// | The driver could not be asked — the spawn failed with an OS error, or a signal killed it | one `unprobed` entry and one `W-SEC-029`, after which that entry's remaining helpers are not probed |
+///
+/// A driver entry that does not resolve contributes nothing to either list.
 pub fn warn_on_unreachable_toolchain_helpers(
     policy: &CapabilityPolicy,
     declared_floor: ContainmentClass,
-) -> Vec<ToolchainHelperWarning> {
-    let warnings = unreachable_toolchain_helpers_in(policy, declared_floor, &host_path_dirs());
-    for warning in &warnings {
+) -> ToolchainHelperReport {
+    let report = unreachable_toolchain_helpers_in(policy, declared_floor, &host_path_dirs());
+    for warning in &report.uncovered {
         let link = security_warning_link(W_SEC_012);
         eprintln!(
             "[capsule-runtime] warning[{W_SEC_012}]: capabilities.shell.allow grants the compiler \
@@ -334,7 +375,22 @@ pub fn warn_on_unreachable_toolchain_helpers(
                 .display(),
         );
     }
-    warnings
+    for unprobed in &report.unprobed {
+        let link = security_warning_link(W_SEC_029);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_029}]: capabilities.shell.allow grants the compiler \
+             driver '{}', but running {} -print-prog-name=<helper> failed ({}), so W-SEC-012 was \
+             not evaluated for its helpers [{}] and they may have no Execute grant under the \
+             'sealed' composed root; check that {} can be executed by this user and re-run \
+             `mur doctor` ({link})",
+            unprobed.driver,
+            unprobed.driver_path.display(),
+            unprobed.reason,
+            unprobed.unchecked_helpers.join(", "),
+            unprobed.driver_path.display(),
+        );
+    }
+    report
 }
 
 /// Testable core of [`warn_on_unreachable_toolchain_helpers`]: decides, prints nothing, and takes
@@ -343,9 +399,10 @@ fn unreachable_toolchain_helpers_in(
     policy: &CapabilityPolicy,
     declared_floor: ContainmentClass,
     path_dirs: &[PathBuf],
-) -> Vec<ToolchainHelperWarning> {
+) -> ToolchainHelperReport {
+    let mut report = ToolchainHelperReport::default();
     if declared_floor != ContainmentClass::Sealed {
-        return Vec::new();
+        return report;
     }
 
     let declared_dirs = declared_grant_dirs(policy);
@@ -362,8 +419,6 @@ fn unreachable_toolchain_helpers_in(
         })
         .collect();
 
-    let mut warnings: Vec<ToolchainHelperWarning> = Vec::new();
-
     for entry in &policy.shell_allow {
         let Some((_, helpers)) = KNOWN_TOOLCHAIN_DRIVERS
             .iter()
@@ -378,9 +433,28 @@ fn unreachable_toolchain_helpers_in(
             continue;
         }
 
-        for helper in *helpers {
-            let Some(resolved_path) = probe_helper_path(&driver_path, helper, path_dirs) else {
-                continue;
+        for (index, helper) in helpers.iter().enumerate() {
+            let resolved_path = match probe_helper_path(&driver_path, helper, path_dirs) {
+                HelperProbe::Located(path) => path,
+                HelperProbe::NothingUsable => continue,
+                HelperProbe::NotAsked { error_kind, reason } => {
+                    // A driver that cannot be exec'd for one helper cannot be exec'd for the
+                    // next either, so one report covers the rest of the row.
+                    let unprobed = UnprobedToolchainDriver {
+                        driver: entry.clone(),
+                        driver_path: driver_path.clone(),
+                        unchecked_helpers: helpers[index..]
+                            .iter()
+                            .map(|name| (*name).to_string())
+                            .collect(),
+                        error_kind,
+                        reason,
+                    };
+                    if !report.unprobed.contains(&unprobed) {
+                        report.unprobed.push(unprobed);
+                    }
+                    break;
+                }
             };
             if under_any(&resolved_path, &declared_dirs)
                 || policy.shell_allow.iter().any(|allowed| allowed == helper)
@@ -395,20 +469,38 @@ fn unreachable_toolchain_helpers_in(
             };
             // `cc` and `gcc` are usually the same binary reached under two names, so a capsule
             // allowlisting both would otherwise report each helper twice.
-            if !warnings.contains(&warning) {
-                warnings.push(warning);
+            if !report.uncovered.contains(&warning) {
+                report.uncovered.push(warning);
             }
         }
     }
 
-    warnings
+    report
 }
 
-/// Asks `driver` where it would find `helper`, via the GCC driver's own `-print-prog-name=` query,
-/// and returns the canonical path when that answer names a real file.
+/// What one `-print-prog-name=` probe established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelperProbe {
+    /// The driver answered with a helper path that exists; canonical.
+    Located(PathBuf),
+    /// The driver ran and exited, but named nothing usable.
+    NothingUsable,
+    /// The driver was never asked: the spawn failed (`error_kind` is `Some`), or a signal
+    /// terminated it before it exited (`error_kind` is `None`).
+    NotAsked {
+        error_kind: Option<std::io::ErrorKind>,
+        reason: String,
+    },
+}
+
+/// Asks `driver` where it would find `helper`, via the GCC driver's own `-print-prog-name=` query.
 ///
-/// The flag's output contract has three shapes, and all three are handled here because this host's
-/// own `gcc` produces two of them:
+/// A spawn error, or an exit by signal, is [`HelperProbe::NotAsked`]: the driver gave no answer,
+/// so nothing is known about `helper`. The spawn happens exactly once; a driver that is busy
+/// (`ETXTBSY`) or out of resources at staging time is reported rather than retried.
+///
+/// A driver that exited on its own has answered, and the answer has three shapes, all handled here
+/// because this host's own `gcc` produces two of them:
 ///
 ///   * an **absolute path** — `cc -print-prog-name=cc1` →
 ///     `/usr/libexec/gcc/x86_64-linux-gnu/13/cc1`. The driver found it in its private libexec
@@ -422,23 +514,37 @@ fn unreachable_toolchain_helpers_in(
 ///     two of the four helpers that matter most.
 ///   * **anything else** — a driver that does not understand the flag (it typically echoes the
 ///     flag back, or writes usage text to stderr and exits non-zero), an empty stdout, a path that
-///     no longer exists. All treated as "not found, skip": shrink-not-fail, so an unknown driver
+///     does not exist. All [`HelperProbe::NothingUsable`]: shrink-not-fail, so an unknown driver
 ///     family contributes no warnings rather than bogus ones.
 ///
 /// This is the one part of the module that spawns a process. It is a single short-lived exec of a
 /// binary the manifest itself allowlisted, running in the parent at staging time — never in a
 /// forked child's `pre_exec` window, and never after the sandbox is installed.
-fn probe_helper_path(driver: &Path, helper: &str, path_dirs: &[PathBuf]) -> Option<PathBuf> {
-    let output = std::process::Command::new(driver)
+fn probe_helper_path(driver: &Path, helper: &str, path_dirs: &[PathBuf]) -> HelperProbe {
+    let output = match std::process::Command::new(driver)
         .arg(format!("-print-prog-name={helper}"))
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return HelperProbe::NotAsked {
+                error_kind: Some(error.kind()),
+                reason: error.to_string(),
+            }
+        }
+    };
+    if let Some(reason) = terminating_signal(&output.status) {
+        return HelperProbe::NotAsked {
+            error_kind: None,
+            reason,
+        };
+    }
     if !output.status.success() {
-        return None;
+        return HelperProbe::NothingUsable;
     }
     let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if printed.is_empty() {
-        return None;
+        return HelperProbe::NothingUsable;
     }
 
     let candidate = if printed == helper {
@@ -450,9 +556,27 @@ fn probe_helper_path(driver: &Path, helper: &str, path_dirs: &[PathBuf]) -> Opti
         PathBuf::from(&printed)
     };
     if !candidate.is_absolute() {
-        return None;
+        return HelperProbe::NothingUsable;
     }
-    std::fs::canonicalize(candidate).ok()
+    match std::fs::canonicalize(candidate) {
+        Ok(path) => HelperProbe::Located(path),
+        Err(_) => HelperProbe::NothingUsable,
+    }
+}
+
+/// `terminated by signal N` when `status` records a signal rather than an exit code. Only Unix
+/// distinguishes the two.
+#[cfg(unix)]
+fn terminating_signal(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .signal()
+        .map(|signal| format!("terminated by signal {signal}"))
+}
+
+#[cfg(not(unix))]
+fn terminating_signal(_status: &std::process::ExitStatus) -> Option<String> {
+    None
 }
 
 /// The host `PATH`, split the same way `execvp` splits it — the single place this module reads
@@ -829,12 +953,16 @@ mod tests {
 
         for class in ALL_CLASSES {
             let refusal = check_interpreted_entrypoints_reachable_in(&policy, *class, &dirs);
-            let warnings = unreachable_toolchain_helpers_in(&policy, *class, &dirs);
+            let report = unreachable_toolchain_helpers_in(&policy, *class, &dirs);
             if *class == ContainmentClass::Sealed {
                 assert!(refusal.is_err(), "sealed must still be checked");
             } else {
                 assert!(refusal.is_ok(), "{class} must not be refused");
-                assert!(warnings.is_empty(), "{class} must not warn");
+                assert!(report.uncovered.is_empty(), "{class} must not warn");
+                assert!(
+                    report.unprobed.is_empty(),
+                    "{class} must not probe anything: {report:?}"
+                );
             }
         }
     }
@@ -845,6 +973,8 @@ mod tests {
     /// letting Scenarios 6 and 7 run on any host with a shell — including one with no real GCC.
     /// Absolute answers for the front ends, `PATH`-deferred answers for the assembler/linker,
     /// matching GCC's own behaviour.
+    ///
+    /// Settled before returning, so a probe of the result cannot fail with `ETXTBSY`.
     #[cfg(unix)]
     fn fake_driver(dir: &Path, name: &str, libexec: &Path) -> PathBuf {
         let script = format!(
@@ -859,7 +989,43 @@ mod tests {
              esac\n",
             libexec = libexec.display()
         );
-        write_binary(dir, name, script.as_bytes())
+        let path = write_binary(dir, name, script.as_bytes());
+        settle_exec_fixture(&path);
+        path
+    }
+
+    /// Upper bound on [`settle_exec_fixture`]'s attempts; with [`SETTLE_EXEC_INTERVAL`] the
+    /// helper gives up after about two seconds of `ETXTBSY`.
+    #[cfg(unix)]
+    const SETTLE_EXEC_ATTEMPTS: u32 = 200;
+
+    #[cfg(unix)]
+    const SETTLE_EXEC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// Execs `path` until an attempt fails with something other than `ExecutableFileBusy`,
+    /// panicking if it is still busy after [`SETTLE_EXEC_ATTEMPTS`].
+    ///
+    /// `std::fs::write` closes its descriptor before returning, but a child another test thread
+    /// forked while that descriptor was open holds an inherited copy until its own `execve`
+    /// closes it (`O_CLOEXEC`). An exec of the fixture inside that window fails with `ETXTBSY`.
+    /// Once one exec of the file has got past the busy check, no process holds a write
+    /// descriptor for it, and none can acquire one by inheritance because nobody holds one to
+    /// inherit — so the race cannot recur for that file, and a later exec by the code under test
+    /// sees the file as a normal executable.
+    #[cfg(unix)]
+    fn settle_exec_fixture(path: &Path) {
+        for _ in 0..SETTLE_EXEC_ATTEMPTS {
+            match std::process::Command::new(path).output() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(SETTLE_EXEC_INTERVAL);
+                }
+                _ => return,
+            }
+        }
+        panic!(
+            "{} was still text file busy after {SETTLE_EXEC_ATTEMPTS} exec attempts",
+            path.display()
+        );
     }
 
     /// Scenario 6: an allowlisted driver whose helpers have no `Execute`-carrying grant warns,
@@ -876,16 +1042,21 @@ mod tests {
         fake_driver(dir.path(), "cc", &libexec);
         let dirs = vec![dir.path().to_path_buf()];
 
-        let warnings = unreachable_toolchain_helpers_in(
+        let report = unreachable_toolchain_helpers_in(
             &policy_allowing(&["cc"]),
             ContainmentClass::Sealed,
             &dirs,
         );
 
-        let cc1 = warnings
+        assert!(
+            report.unprobed.is_empty(),
+            "the driver must be probed: {report:?}"
+        );
+        let cc1 = report
+            .uncovered
             .iter()
             .find(|warning| warning.helper == "cc1")
-            .expect("cc1 must be reported as uncovered");
+            .unwrap_or_else(|| panic!("cc1 must be reported as uncovered: {report:?}"));
         assert_eq!(cc1.driver, "cc");
         assert_eq!(
             cc1.resolved_path,
@@ -914,11 +1085,18 @@ mod tests {
             )],
             ..policy_allowing(&["cc"])
         };
-        let warnings = unreachable_toolchain_helpers_in(&policy, ContainmentClass::Sealed, &dirs);
+        let report = unreachable_toolchain_helpers_in(&policy, ContainmentClass::Sealed, &dirs);
 
         assert!(
-            !warnings.iter().any(|warning| warning.helper == "cc1"),
-            "a declared grant directory must cover its helpers: {warnings:?}"
+            report.unprobed.is_empty(),
+            "the driver must be probed: {report:?}"
+        );
+        assert!(
+            !report
+                .uncovered
+                .iter()
+                .any(|warning| warning.helper == "cc1"),
+            "a declared grant directory must cover its helpers: {report:?}"
         );
     }
 
@@ -937,16 +1115,21 @@ mod tests {
         fake_driver(dir.path(), "cc", &libexec);
         let dirs = vec![dir.path().to_path_buf()];
 
-        let warnings = unreachable_toolchain_helpers_in(
+        let report = unreachable_toolchain_helpers_in(
             &policy_allowing(&["cc"]),
             ContainmentClass::Sealed,
             &dirs,
         );
 
-        let assembler = warnings
+        assert!(
+            report.unprobed.is_empty(),
+            "the driver must be probed: {report:?}"
+        );
+        let assembler = report
+            .uncovered
             .iter()
             .find(|warning| warning.helper == "as")
-            .expect("a PATH-deferred helper must still be checked");
+            .unwrap_or_else(|| panic!("a PATH-deferred helper must still be checked: {report:?}"));
         assert_eq!(
             assembler.resolved_path,
             std::fs::canonicalize(dir.path().join("as")).expect("canonical as")
@@ -983,14 +1166,21 @@ mod tests {
         fake_driver(dir.path(), "cc", &libexec);
         let dirs = vec![dir.path().to_path_buf()];
 
-        let warnings = unreachable_toolchain_helpers_in(
+        let report = unreachable_toolchain_helpers_in(
             &policy_allowing(&["cc", "cc1"]),
             ContainmentClass::Sealed,
             &dirs,
         );
         assert!(
-            !warnings.iter().any(|warning| warning.helper == "cc1"),
-            "an allowlisted helper carries its own Execute grant: {warnings:?}"
+            report.unprobed.is_empty(),
+            "the driver must be probed: {report:?}"
+        );
+        assert!(
+            !report
+                .uncovered
+                .iter()
+                .any(|warning| warning.helper == "cc1"),
+            "an allowlisted helper carries its own Execute grant: {report:?}"
         );
     }
 
@@ -1004,12 +1194,169 @@ mod tests {
         fake_driver(dir.path(), "not-a-compiler", &dir.path().join("libexec"));
         let dirs = vec![dir.path().to_path_buf()];
 
-        assert!(unreachable_toolchain_helpers_in(
-            &policy_allowing(&["not-a-compiler"]),
+        assert_eq!(
+            unreachable_toolchain_helpers_in(
+                &policy_allowing(&["not-a-compiler"]),
+                ContainmentClass::Sealed,
+                &dirs
+            ),
+            ToolchainHelperReport::default()
+        );
+    }
+
+    /// Every helper in the `cc` row, as the owned strings `unchecked_helpers` holds.
+    fn cc_row() -> Vec<String> {
+        ["cc1", "cc1plus", "as", "ld", "collect2"]
+            .iter()
+            .map(|helper| (*helper).to_string())
+            .collect()
+    }
+
+    /// A driver the launching user cannot exec (`EACCES`) was never asked anything, so it is
+    /// reported with every helper unchecked rather than read as a driver with nothing to say.
+    #[cfg(unix)]
+    #[test]
+    fn a_driver_that_cannot_be_executed_is_reported_as_unprobed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = write_binary(dir.path(), "cc", b"#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        let entry = driver.to_str().expect("utf-8 temp path");
+
+        let report = unreachable_toolchain_helpers_in(
+            &policy_allowing(&[entry]),
             ContainmentClass::Sealed,
-            &dirs
-        )
-        .is_empty());
+            &[],
+        );
+
+        assert!(report.uncovered.is_empty(), "{report:?}");
+        assert_eq!(report.unprobed.len(), 1, "{report:?}");
+        let unprobed = &report.unprobed[0];
+        assert_eq!(unprobed.driver, entry);
+        assert_eq!(
+            unprobed.driver_path,
+            std::fs::canonicalize(&driver).expect("canonical driver")
+        );
+        assert_eq!(
+            unprobed.error_kind,
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{report:?}"
+        );
+        assert_eq!(unprobed.unchecked_helpers, cc_row());
+    }
+
+    /// A process holding a write descriptor on the driver makes its exec fail with `ETXTBSY`.
+    /// That is reported as unprobed, not as a driver that answered nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_driver_busy_being_written_is_reported_as_unprobed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let libexec = dir.path().join("libexec");
+        std::fs::create_dir_all(&libexec).expect("libexec");
+        for helper in ["cc1", "cc1plus", "collect2"] {
+            write_binary(&libexec, helper, b"#!/bin/sh\nexit 0\n");
+        }
+        // `fake_driver`'s script, written without settling: the handle below keeps it busy.
+        let driver = write_binary(
+            dir.path(),
+            "cc",
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 -print-prog-name=cc1) echo {libexec}/cc1 ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n",
+                libexec = libexec.display()
+            )
+            .as_bytes(),
+        );
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&driver)
+            .expect("open driver for append");
+        let report = unreachable_toolchain_helpers_in(
+            &policy_allowing(&["cc"]),
+            ContainmentClass::Sealed,
+            &dirs,
+        );
+        drop(writer);
+
+        assert!(report.uncovered.is_empty(), "{report:?}");
+        assert_eq!(report.unprobed.len(), 1, "{report:?}");
+        assert_eq!(
+            report.unprobed[0].error_kind,
+            Some(std::io::ErrorKind::ExecutableFileBusy),
+            "{report:?}"
+        );
+        assert_eq!(report.unprobed[0].unchecked_helpers, cc_row());
+    }
+
+    /// A driver a signal terminates before it exits gave no answer, so it is unprobed with no
+    /// `error_kind`.
+    #[cfg(unix)]
+    #[test]
+    fn a_driver_killed_before_answering_is_reported_as_unprobed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = write_binary(dir.path(), "cc", b"#!/bin/sh\nkill -9 $$\n");
+        settle_exec_fixture(&driver);
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let report = unreachable_toolchain_helpers_in(
+            &policy_allowing(&["cc"]),
+            ContainmentClass::Sealed,
+            &dirs,
+        );
+
+        assert!(report.uncovered.is_empty(), "{report:?}");
+        assert_eq!(report.unprobed.len(), 1, "{report:?}");
+        assert_eq!(report.unprobed[0].error_kind, None, "{report:?}");
+        assert!(report.unprobed[0].reason.contains("signal 9"), "{report:?}");
+        assert_eq!(report.unprobed[0].unchecked_helpers, cc_row());
+    }
+
+    /// A driver that runs and exits non-zero for every helper is an unknown family: silent in
+    /// both lists.
+    #[cfg(unix)]
+    #[test]
+    fn a_driver_that_does_not_understand_the_flag_contributes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = write_binary(dir.path(), "cc", b"#!/bin/sh\nexit 1\n");
+        settle_exec_fixture(&driver);
+        let dirs = vec![dir.path().to_path_buf()];
+
+        let report = unreachable_toolchain_helpers_in(
+            &policy_allowing(&["cc"]),
+            ContainmentClass::Sealed,
+            &dirs,
+        );
+
+        assert_eq!(report, ToolchainHelperReport::default());
+    }
+
+    /// The settle helper gives up while a write descriptor keeps the file busy, and returns once
+    /// that descriptor is gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_exec_settle_retries_only_while_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_binary(dir.path(), "busy", b"#!/bin/sh\nexit 0\n");
+
+        let writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open fixture for append");
+        let while_busy = std::panic::catch_unwind(|| settle_exec_fixture(&path));
+        assert!(
+            while_busy.is_err(),
+            "a held write handle must exhaust the bound"
+        );
+
+        drop(writer);
+        settle_exec_fixture(&path);
     }
 
     /// The registry is the *whole* contract of which drivers get probed, so its contents are

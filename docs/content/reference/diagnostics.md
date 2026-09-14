@@ -116,6 +116,7 @@ section that explains it.
 | `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
 | `W-SEC-027` | The inference key is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
 | `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file an inference key was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
+| `W-SEC-029` | A compiler driver could not be run to ask where its helper binaries live, so `W-SEC-012` was not evaluated for it | [W-SEC-029](#w-sec-029) |
 
 ---
 
@@ -1098,7 +1099,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1462,6 +1463,9 @@ cc -print-prog-name=as         # `as` — deferred to PATH, i.e. /usr/bin/as
 ```
 
 The warning itself names the helper's containing directory, so the common case is a copy-paste.
+
+A driver that cannot be run to answer those questions gets [`W-SEC-029`](#w-sec-029) instead,
+and no `W-SEC-012` for the helpers it was not asked about.
 
 #### Why this warns where `E-CAP-006` refuses { #w-sec-012-vs-e-cap-006 }
 
@@ -2036,3 +2040,33 @@ another tool.
 
 **What to do:** run the `chmod` the warning names. Running `mur config set -g` again also rewrites
 `config.yaml` at `0600`.
+
+### W-SEC-029 — a compiler driver could not be asked where its toolchain lives { #w-sec-029 }
+
+**Fires when:** the capsule's declared containment floor is
+[`sealed`](containment.md#field-containment), `capabilities.shell.allow` names a compiler driver
+that [`W-SEC-012`](#w-sec-012) checks, and running that driver to ask where a helper lives fails
+before the driver answers. It fires once per `shell.allow` entry, on stderr, at staging and from
+`mur doctor`.
+
+| Failure | Reported as |
+|---|---|
+| The driver could not be started — for example `Permission denied`, `Text file busy`, or a resource error | The operating system's error message |
+| The driver was killed by a signal before it answered | `terminated by signal N` |
+
+```text
+[capsule-runtime] warning[W-SEC-029]: capabilities.shell.allow grants the compiler driver 'cc', but running /home/alice/bin/cc -print-prog-name=<helper> failed (Permission denied (os error 13)), so W-SEC-012 was not evaluated for its helpers [cc1, cc1plus, as, ld, collect2] and they may have no Execute grant under the 'sealed' composed root; check that /home/alice/bin/cc can be executed by this user and re-run `mur doctor` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-029)
+```
+
+The bracketed list names the helpers that were not checked. Helpers checked before the failure
+are reported with `W-SEC-012` as usual.
+
+**Why it matters:** without this warning, a driver that could not be run printed nothing, which
+reads the same as a `W-SEC-012` check that passed. The capsule may still have a toolchain it cannot
+run under `sealed`.
+
+**What the runtime does about it:** nothing is refused, and the driver is not run again.
+
+**What to do:** make the driver named in the warning runnable by the user launching the capsule,
+then run `mur doctor`. A `Text file busy` or resource error that clears on its own is gone on
+the next `mur doctor`.
