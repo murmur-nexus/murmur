@@ -409,6 +409,28 @@ impl TaskRegistry {
         CancelOutcome::Accepted
     }
 
+    /// Cancel every task that is not yet terminal, and return the ids that were cancelled, sorted.
+    ///
+    /// Each goes through [`Self::request_cancel`], so a running task's signal is raised and a
+    /// `submitted` task's queue slot is given back. A second call returns nothing: every task the
+    /// first one touched is `Canceled`, which is terminal.
+    pub(crate) fn cancel_every_live(&mut self) -> Vec<String> {
+        let live: Vec<String> = self
+            .history
+            .iter()
+            .filter(|(_, (state, _))| !state.is_terminal())
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        let mut canceled: Vec<String> = live
+            .into_iter()
+            .filter(|task_id| matches!(self.request_cancel(task_id), CancelOutcome::Accepted))
+            .collect();
+        // `history` is a `HashMap`, so without this the same two tasks come back in a different
+        // order on every call and nothing can diff two stops.
+        canceled.sort();
+        canceled
+    }
+
     /// Return the prompt stored for an input-required task.
     #[allow(dead_code)] // used in unit tests
     pub(crate) fn get_input_prompt(&self, task_id: &str) -> Option<&str> {
@@ -594,6 +616,27 @@ mod tests {
         let mut r = running_registry("tsk_002");
         assert_eq!(r.request_cancel("tsk_002"), CancelOutcome::Accepted);
         assert_eq!(r.request_cancel("tsk_002"), CancelOutcome::AlreadyTerminal);
+    }
+
+    #[test]
+    fn cancel_every_live_cancels_live_tasks_in_order_and_leaves_terminal_ones() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_c", "ctx_001");
+        r.enqueue("tsk_a", "ctx_001");
+        r.enqueue("tsk_done", "ctx_001");
+        r.start_task("tsk_done".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        r.finish_task(TaskState::Completed);
+        r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        let running = r.cancel_watch("tsk_a");
+
+        assert_eq!(r.cancel_every_live(), vec!["tsk_a", "tsk_c"]);
+        assert!(running.is_canceled());
+        assert!(r.is_canceled("tsk_c"));
+        assert_eq!(
+            r.get_task("tsk_done").unwrap().status.state,
+            TaskState::Completed
+        );
+        assert!(r.cancel_every_live().is_empty());
     }
 
     #[test]

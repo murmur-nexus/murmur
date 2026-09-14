@@ -7,8 +7,8 @@ use std::{
 
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
-    launch_session, preopen_reports, probe_io_max, requires_process_bounding, stage_session,
-    state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LifecycleOverride,
+    launch_session_handling_sigterm, preopen_reports, probe_io_max, requires_process_bounding,
+    stage_session, state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LifecycleOverride,
     LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest, TaskAcceptance,
 };
 use murmur_artifact::warn_on_unknown_manifest_keys;
@@ -771,7 +771,7 @@ pub(crate) fn run_run(
             Some(wd) => absolutise(wd),
             None => staged.workdir.clone(),
         };
-        launch_session(staged, move |url| {
+        launch_session_handling_sigterm(staged, move |url| {
             println!(
                 "{}",
                 serde_json::json!({
@@ -811,7 +811,7 @@ pub(crate) fn run_run(
             }
         });
 
-        match launch_session(staged, move |url| {
+        match launch_session_handling_sigterm(staged, move |url| {
             if !url.is_empty() {
                 println!("murmur: url {url}");
             }

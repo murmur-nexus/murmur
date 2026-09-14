@@ -29,7 +29,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
 tiktoken-rs = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "macros", "time", "fs", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "macros", "time", "fs", "process", "signal"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "v7"] }
 wasmtime = { version = "46", default-features = false, features = [

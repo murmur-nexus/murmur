@@ -846,23 +846,7 @@ fn handle_session_stop(
     live_delegations: &LiveDelegations,
     session_id: &str,
 ) -> String {
-    let canceled = {
-        let mut registry = task_registry.lock().unwrap();
-        let live: Vec<String> = registry
-            .history
-            .iter()
-            .filter(|(_, (state, _))| !state.is_terminal())
-            .map(|(task_id, _)| task_id.clone())
-            .collect();
-        let mut canceled: Vec<String> = live
-            .into_iter()
-            .filter(|task_id| matches!(registry.request_cancel(task_id), CancelOutcome::Accepted))
-            .collect();
-        // `history` is a `HashMap`, so without this the same two tasks come back in a different
-        // order on every call and nothing can diff two stops.
-        canceled.sort();
-        canceled
-    };
+    let canceled = task_registry.lock().unwrap().cancel_every_live();
 
     // Read after every cancellation is recorded, so nothing this snapshot names can have been
     // started by a task afterwards.
