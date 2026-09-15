@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "capsule-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "mur-roost"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "capsule-runtime",
  "murmur-artifact",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "murmur-artifact"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "http",
@@ -1938,7 +1938,7 @@ dependencies = [
 
 [[package]]
 name = "murmur-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "bytes",
