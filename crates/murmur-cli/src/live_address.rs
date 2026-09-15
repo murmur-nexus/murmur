@@ -10,11 +10,12 @@
 //! The candidate set is the machine-wide running record under `~/.murmur/running/`, so whoever
 //! types `mur watch @1` does not have to know which directory the capsule was launched from.
 //! Reading it prunes every record whose process is gone, and a record pruned by this read is still
-//! what explains the address that named it.
+//! what explains the address that named it. A directory that cannot be read is `E-RUN-028`, never
+//! an empty candidate set.
 
 use capsule_runtime::{running, Liveness, ProcessState, RunningRecord};
 
-use crate::error::{CliError, E_RUN_022, E_RUN_023};
+use crate::error::{CliError, E_RUN_022, E_RUN_023, E_RUN_028};
 
 /// The address an omitted argument means: the most recent running session.
 const LATEST: &str = "@1";
@@ -117,25 +118,42 @@ struct Candidates {
     gone: Vec<(RunningRecord, String)>,
 }
 
-/// Reads the record directory and unlinks what fails layer 1 or 2.
+/// Reads the record directory and unlinks what layers 1 and 2 find gone.
 ///
 /// The only reaper there is, and it is enough because a record is a hint: whatever it missed is
-/// removed by the next read. Layer 3 is a network round trip and is not applied here — it is
-/// applied once, to the record an address resolved to, which is also what keeps "the door is
-/// quiet" reportable as its own thing rather than collapsing into "the process is gone".
-fn read_and_prune() -> Candidates {
+/// removed by the next read. A record whose pid is held and whose start time could not be read is
+/// a candidate like a confirmed one — [`running::verify`] reports it unreachable and
+/// [`running::signal_term`] refuses it, so nothing downstream treats it as confirmed. Layer 3 is a
+/// network round trip and is not applied here — it is applied once, to the record an address
+/// resolved to, which is also what keeps "the door is quiet" reportable as its own thing rather
+/// than collapsing into "the process is gone".
+///
+/// Fails with `E-RUN-028` when the directory cannot be read, so an unreadable directory is never
+/// reported as a machine running nothing.
+fn read_and_prune() -> Result<Candidates, CliError> {
     let mut alive = Vec::new();
     let mut gone = Vec::new();
-    for record in running::list() {
+    for record in running::list().map_err(|reason| records_unreadable(&reason))? {
         match running::process_state(&record) {
-            ProcessState::Alive => alive.push(record),
+            ProcessState::Alive | ProcessState::Unverified(_) => alive.push(record),
             ProcessState::Gone(reason) => {
                 running::prune(&record);
                 gone.push((record, reason));
             }
         }
     }
-    Candidates { alive, gone }
+    Ok(Candidates { alive, gone })
+}
+
+/// `~/.murmur/running` could not be read, so which capsules are running is unknown. `reason` is
+/// the [`running::list`] error, which names the path.
+pub(crate) fn records_unreadable(reason: &str) -> CliError {
+    CliError::with_hint(
+        E_RUN_028,
+        format!("the running-capsule records could not be read: {reason}"),
+        "nothing was listed and nothing was removed; check that ~/.murmur/running is a directory \
+         this user owns",
+    )
 }
 
 /// The record an address names, before the door has been asked anything.
@@ -150,7 +168,7 @@ fn candidate(address: &str) -> Result<RunningRecord, CliError> {
         ));
     }
 
-    let Candidates { alive, gone } = read_and_prune();
+    let Candidates { alive, gone } = read_and_prune()?;
 
     if let Some(ordinal) = address.strip_prefix('@') {
         let n: usize = ordinal.parse().map_err(|_| {

@@ -4,6 +4,7 @@ use capsule_runtime::{running, Liveness, RunningRecord};
 use chrono::{DateTime, Utc};
 
 use crate::error::CliError;
+use crate::live_address::records_unreadable;
 
 /// Full session id: `ses_` and 32 hex characters, never abbreviated — the column exists so the
 /// id can be copied into the next command.
@@ -26,17 +27,24 @@ const STATUS_UNREACHABLE: &str = "unreachable";
 /// Host-scoped, exactly like `docker ps`. A capsule deployed onto another machine writes its
 /// record on *that* machine, so it is that machine's `mur ps` that lists it.
 ///
-/// The listing is also the reaper: a record whose process is gone is unlinked on the way past.
-/// A record whose process is alive and whose door is quiet is kept and reported as `unreachable`
-/// — a slow door is not evidence of a dead capsule, and unlinking it would throw away the only
-/// handle to something still running.
+/// The listing is also the reaper: a record whose process is gone is unlinked on the way past, and
+/// each unlink is named on stderr as `pruned: <session_id> — <reason>`. A record whose process is
+/// alive and whose door is quiet, or whose start time could not be read, is kept and reported as
+/// `unreachable` — neither is evidence of a dead capsule, and unlinking it would throw away the
+/// only handle to something still running.
+///
+/// A record directory that cannot be read fails with `E-RUN-028` and prints nothing on stdout.
 pub(crate) fn run_ps() -> Result<(), CliError> {
+    let records = running::list().map_err(|reason| records_unreadable(&reason))?;
     let mut rows = Vec::new();
-    for record in running::list() {
+    for record in records {
         match running::verify(&record) {
             Liveness::Live => rows.push((record, STATUS_RUNNING)),
             Liveness::Unreachable(_) => rows.push((record, STATUS_UNREACHABLE)),
-            Liveness::Gone(_) => running::prune(&record),
+            Liveness::Gone(reason) => {
+                running::prune(&record);
+                eprintln!("pruned: {} — {reason}", record.session_id);
+            }
         }
     }
 

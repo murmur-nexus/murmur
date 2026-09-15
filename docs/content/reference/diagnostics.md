@@ -77,6 +77,7 @@ section that explains it.
 | `E-RUN-025` | The `transport: http` inference driver declares no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
+| `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -360,7 +361,6 @@ The reason names which of the two local checks the record failed.
 |---|---|
 | `no process holds pid N` | Nothing is running under that process id |
 | `pid N is held by a process that started at another time` | The process id was handed out again to something unrelated |
-| `pid N's start time could not be read` | The host would not say when the process started, so the record cannot be verified |
 
 The same code covers an address that is not a session address at all — a path, a `host:port`, or
 fewer than four characters:
@@ -381,10 +381,16 @@ error[E-RUN-023]: ses_019f01a940ce7761854e768ecbe3d399 is running but its capsul
   hint: the process holding the door is alive — it may be mid-turn; its record is kept
 ```
 
-`E-RUN-022` removes the record; this one keeps it. The process is genuinely running, so the record
-still names something real, and a capsule that was slow to answer must not lose the only handle
-anyone has on it. Try again, or read what the session is doing with
+`E-RUN-022` removes the record; this one keeps it. The process is running, so the record still
+names something real, and a capsule that was slow to answer must not lose the only handle anyone
+has on it. Try again, or read what the session is doing with
 [`mur trace show`](cli.md#mur-trace-show) in its workdir.
+
+| Reason | Means |
+|---|---|
+| `failed to connect to …`, or a read timeout | The door did not answer in time — the capsule may be mid-turn |
+| `the capsule at … answers for session …` | Another session holds that address |
+| `pid N's start time could not be read` | A process holds the process id and the host would not say when it started, so whether it is the capsule is unknown |
 
 ### E-RUN-024 — the session could not be ended { #e-run-024 }
 
@@ -392,16 +398,17 @@ anyone has on it. Try again, or read what the session is doing with
 record](cli.md#running-capsule-records) names, and the process is still there afterwards.
 
 ```text
-error[E-RUN-024]: ses_019f01a940ce7761854e768ecbe3d399 could not be ended: the kernel refused SIGTERM to pid 48213: Operation not permitted (os error 1)
+error[E-RUN-024]: ses_019f01a940ce7761854e768ecbe3d399 could not be ended: SIGTERM to pid 48213 was refused: Operation not permitted (os error 1)
   hint: the capsule is still running and its record is kept; the process may belong to another user
 ```
 
-The message names which signal was refused and what the kernel said about it.
+The message names which signal was refused and why.
 
 | Reason | Means |
 |---|---|
-| `the kernel refused SIGTERM to pid N: …` | The process is there and this user may not signal it — usually another user's capsule |
-| `the kernel refused SIGKILL to pid N: …` | The same, at the escalation step |
+| `SIGTERM to pid N was refused: pid N's start time could not be read` | A process holds the process id and the host would not say when it started, so it could not be confirmed as the capsule and was not signalled |
+| `SIGTERM to pid N was refused: …` with an OS error | The process is there and this user may not signal it — usually another user's capsule |
+| `SIGKILL to pid N was refused: …` | The same two, at the escalation step |
 | `pid N was still running 5 seconds after SIGKILL` | The kernel accepted the signal and the process has not gone, which an uninterruptible wait can cause |
 
 The record is **not** removed. Unlike [`E-RUN-022`](#e-run-022), the capsule it names is still
@@ -474,6 +481,26 @@ new value was rejected too. The session trace records the rejection as an
 [`inference_credential`](observability-schemas.md#inference-credential) event with
 `change: "rejected"`. Any status other than `401`, including `403`, reaches the driver unchanged
 and is reported as the driver reports it.
+
+### E-RUN-028 — the running-capsule records could not be read { #e-run-028 }
+
+[`mur ps`](cli.md#mur-ps), [`mur watch`](cli.md#mur-watch), [`mur cancel`](cli.md#mur-cancel) and
+[`mur stop`](cli.md#mur-stop) read the [running-capsule records](cli.md#running-capsule-records)
+under `~/.murmur/running/`, and that directory could not be created, held at `0700`, or listed.
+Which capsules are running is unknown, so nothing is listed, nothing is removed and nothing is
+signalled.
+
+```text
+error[E-RUN-028]: the running-capsule records could not be read: /home/me/.murmur/running: failed to create the directory: File exists (os error 17)
+  hint: nothing was listed and nothing was removed; check that ~/.murmur/running is a directory this user owns
+```
+
+The message ends with the path and the operating system's error.
+
+| Error | Means |
+|---|---|
+| `File exists` | A file is where the directory belongs |
+| `Permission denied` | The directory exists and this user may not list it |
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

@@ -233,14 +233,16 @@ fn endings_noted(trace_path: &Path) -> HashSet<String> {
 ///
 /// Every `kill(2)` re-runs layers 1 and 2 inside [`running::signal_term`] and
 /// [`running::signal_kill`], so a pid that has been inherited by an unrelated process since this
-/// command started is not signalled.
+/// command started is not signalled. A pid whose start time cannot be read is refused rather than
+/// signalled, and that refusal is `E-RUN-024` with the record kept; its reason is the one
+/// [`capsule_runtime::ProcessState::Unverified`] carries, and the errno description otherwise.
 fn end_the_process(record: &RunningRecord, grace: Duration) -> Result<&'static str, CliError> {
     match running::signal_term(record) {
         SignalOutcome::AlreadyGone => return Ok("none — the process had already exited"),
         SignalOutcome::Refused(reason) => {
             return Err(unendable(
                 record,
-                &format!("the kernel refused SIGTERM to pid {}: {reason}", record.pid),
+                &format!("SIGTERM to pid {} was refused: {reason}", record.pid),
             ))
         }
         SignalOutcome::Sent => {}
@@ -255,7 +257,7 @@ fn end_the_process(record: &RunningRecord, grace: Duration) -> Result<&'static s
         SignalOutcome::Refused(reason) => {
             return Err(unendable(
                 record,
-                &format!("the kernel refused SIGKILL to pid {}: {reason}", record.pid),
+                &format!("SIGKILL to pid {} was refused: {reason}", record.pid),
             ))
         }
         SignalOutcome::Sent => {}
