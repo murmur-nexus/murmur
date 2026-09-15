@@ -417,25 +417,31 @@ mod platform {
 
     /// `proc_bsdinfo.pbi_start_tvsec` and `pbi_start_tvusec`, rendered as `seconds.microseconds`.
     pub(super) fn process_start_token(pid: u32) -> Option<String> {
-        let info = bsd_info(pid)?;
+        let info = bsd_info(pid).ok()?;
         Some(format!(
             "{}.{:06}",
             info.pbi_start_tvsec, info.pbi_start_tvusec
         ))
     }
 
-    /// `proc_bsdinfo.pbi_status` is `SZOMB` for a process that has exited and not yet been waited
-    /// on — XNU still answers `PROC_PIDTBSDINFO` for one. A pid the kernel will not describe is not
-    /// reported as a zombie, on the same terms as the Linux reading.
+    /// A process that has exited and not yet been waited on. `kill(pid, 0)` still reports its pid
+    /// held, but `PROC_PIDTBSDINFO` refuses to describe it with `ESRCH`; one described mid-exit
+    /// carries `pbi_status` `SZOMB`. `ESRCH` read straight after layer 1 found the pid held means
+    /// either that or a process that exited in between, and both are gone.
+    ///
+    /// Any other failed reading, `EPERM` or a short write, is not reported as a zombie, on the
+    /// same terms as the Linux reading: layer 2 reads the pid as `Unverified`.
     pub(super) fn is_zombie(pid: u32) -> bool {
-        bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB)
+        match bsd_info(pid) {
+            Ok(info) => info.pbi_status == libc::SZOMB,
+            Err(err) => err.raw_os_error() == Some(libc::ESRCH),
+        }
     }
 
-    /// The kernel's `PROC_PIDTBSDINFO` description of `pid`, or `None` when it wrote anything
-    /// other than exactly one `proc_bsdinfo`: an unknown pid, a pid this user may not inspect, or
-    /// a short write are all a failed reading rather than a struct to read fields from.
+    /// The kernel's `PROC_PIDTBSDINFO` description of `pid`. `Err` carries the `errno` when the
+    /// call failed, and no OS error when it wrote anything other than exactly one `proc_bsdinfo`.
     #[allow(unsafe_code)]
-    fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    fn bsd_info(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
         // SAFETY: `proc_bsdinfo` is a plain C struct of integers and fixed-size integer arrays,
         // with no pointer, niche or validity invariant, so an all-zero value is a valid one.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -453,7 +459,15 @@ mod platform {
                 size as libc::c_int,
             )
         };
-        (usize::try_from(written).ok() == Some(size)).then_some(info)
+        if written <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if usize::try_from(written).ok() != Some(size) {
+            return Err(std::io::Error::other(format!(
+                "proc_pidinfo wrote {written} bytes, not one proc_bsdinfo of {size}"
+            )));
+        }
+        Ok(info)
     }
 }
 
