@@ -343,12 +343,15 @@ fn read_record(path: &Path) -> Option<RunningRecord> {
 /// otherwise answer for processes the record never named.
 #[allow(unsafe_code)]
 fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 || libc::pid_t::try_from(pid).is_err() {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if target == 0 {
         return false;
     }
     // SAFETY: `kill` with signal 0 runs the existence and permission checks without delivering
     // anything, and dereferences no pointer.
-    let held = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+    let held = unsafe { libc::kill(target, 0) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     held && !platform::is_zombie(pid)
 }
@@ -385,10 +388,14 @@ mod platform {
     /// Field 22 of one `/proc/<pid>/stat` line, or `None` when the line has no `)` or ends before
     /// field 22.
     pub(super) fn start_token_from_stat(stat: &str) -> Option<String> {
-        let tail = &stat[stat.rfind(')')? + 1..];
-        tail.split_whitespace()
+        fields_after_comm(stat)?
             .nth(STARTTIME_OFFSET_AFTER_COMM)
             .map(str::to_string)
+    }
+
+    /// The fields of a `/proc/<pid>/stat` line from field 3 on, or `None` when it has no `)`.
+    fn fields_after_comm(stat: &str) -> Option<std::str::SplitWhitespace<'_>> {
+        Some(stat[stat.rfind(')')? + 1..].split_whitespace())
     }
 
     /// Field 3 of `/proc/<pid>/stat` — the first after the executable name — is the state
@@ -400,10 +407,7 @@ mod platform {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
         };
-        let Some(close) = stat.rfind(')') else {
-            return false;
-        };
-        stat[close + 1..].split_whitespace().next() == Some("Z")
+        fields_after_comm(&stat).and_then(|mut fields| fields.next()) == Some("Z")
     }
 }
 

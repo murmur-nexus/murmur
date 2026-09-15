@@ -130,9 +130,7 @@ sweep there is, and it is enough because a record is never treated as truth.
 | Layer 3: the agent card did not answer for the session | Kept, reported as unreachable | Yes |
 
 A kept record names a process that is alive, possibly mid-turn, and the command reports
-[`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away. A record whose
-start time could not be read is never signalled: `mur stop` refuses it with
-[`E-RUN-024`](diagnostics.md#e-run-024).
+[`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
 
 When `~/.murmur/running/` itself cannot be read, every command that reads the records fails with
 [`E-RUN-028`](diagnostics.md#e-run-028) and removes nothing.
@@ -802,7 +800,8 @@ same way. A `~/.murmur/running/` that cannot be read — a file where the direct
 directory this user may not list — is neither: `mur ps` prints nothing on stdout and fails with
 [`E-RUN-028`](diagnostics.md#e-run-028).
 
-Every record `mur ps` removes is named on stderr, one line each:
+Every record `mur ps` removes because its process is gone is named on stderr, one line each. A
+file in the directory that is not a readable record is removed without a line.
 
 ```text
 pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce2 — no process holds pid 48213
@@ -831,6 +830,7 @@ Neither a quiet door nor a start time that could not be read is evidence that th
 An `unreachable` capsule may be mid-turn, including busy with synchronous work inside a turn that
 keeps its door from answering until that work returns, and unlinking its record would throw away
 the only handle anyone has on something still running.
+
 Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
 so the first row is what `@1` names.
 

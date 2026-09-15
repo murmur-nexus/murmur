@@ -394,8 +394,9 @@ has on it. Try again, or read what the session is doing with
 
 ### E-RUN-024 — the session could not be ended { #e-run-024 }
 
-[`mur stop`](cli.md#mur-stop) signalled the process a [running-capsule
-record](cli.md#running-capsule-records) names, and the process is still there afterwards.
+[`mur stop`](cli.md#mur-stop) could not end the process a [running-capsule
+record](cli.md#running-capsule-records) names: a signal was refused, or the process is still there
+afterwards.
 
 ```text
 error[E-RUN-024]: ses_019f01a940ce7761854e768ecbe3d399 could not be ended: SIGTERM to pid 48213 was refused: Operation not permitted (os error 1)
