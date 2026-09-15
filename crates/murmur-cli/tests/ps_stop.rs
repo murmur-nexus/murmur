@@ -199,9 +199,16 @@ fn start_agent_with_env(
         }
     });
 
-    let startup = startup_rx
-        .recv_timeout(Duration::from_secs(120))
-        .expect("timed out waiting for the capsule to print where its door is");
+    // No `Capsule` exists yet, so its drop cannot end the child: a bare `Child` is not killed on
+    // drop, and an unkilled `mur run` outlives the test and its scratch home.
+    let startup = match startup_rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(startup) => startup,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for the capsule to print where its door is");
+        }
+    };
 
     Capsule {
         child,
