@@ -96,7 +96,7 @@ removes it when the session ends.
 | Location | `~/.murmur/running/<session_id>.json` |
 | Directory mode | `0700` |
 | File mode | `0600` |
-| Written by | The runtime, at the moment it binds the port |
+| Written by | The runtime, once the capsule is serving its door and just before `mur run` prints its URL |
 | Removed by | The runtime, when the session ends |
 
 Each record carries the session id, the capsule address, the process id and its start time, the

@@ -351,10 +351,6 @@ fn set_hard_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
 pub(crate) fn uid_task_count() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt;
-
-        // A `/proc/<pid>` directory is owned by the uid the process runs as, so a `stat` per
-        // entry finds this uid's processes without opening or parsing a single `status` file.
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         let uid = {
             #[allow(unsafe_code)]
@@ -362,25 +358,7 @@ pub(crate) fn uid_task_count() -> Option<u64> {
                 libc::geteuid()
             }
         };
-        let entries = std::fs::read_dir("/proc").ok()?;
-        let count: u64 = entries
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
-                    && entry.metadata().is_ok_and(|metadata| metadata.uid() == uid)
-            })
-            .map(|entry| {
-                // One `task/` entry per thread of that process, the group leader included. A
-                // process that exits mid-walk contributes 0 rather than aborting the count.
-                std::fs::read_dir(entry.path().join("task"))
-                    .map(|threads| threads.flatten().count() as u64)
-                    .unwrap_or(0)
-            })
-            .sum();
-        return Some(count);
+        return uid_task_count_in(Path::new("/proc"), uid);
     }
 
     #[cfg(target_os = "macos")]
@@ -415,6 +393,37 @@ pub(crate) fn uid_task_count() -> Option<u64> {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     None
+}
+
+/// The Linux walk behind [`uid_task_count`], over a `/proc`-shaped tree at `proc_root`: the
+/// `task/` entries of every all-digit directory owned by `uid`, summed.
+///
+/// `None` only when `proc_root` itself cannot be read. A process directory whose `task/` cannot be
+/// read — one that exited mid-walk — contributes 0.
+#[cfg(target_os = "linux")]
+pub(crate) fn uid_task_count_in(proc_root: &Path, uid: u32) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    // A `/proc/<pid>` directory is owned by the uid the process runs as, so a `stat` per entry
+    // finds this uid's processes without opening or parsing a single `status` file.
+    let entries = std::fs::read_dir(proc_root).ok()?;
+    let count = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
+                && entry.metadata().is_ok_and(|metadata| metadata.uid() == uid)
+        })
+        .map(|entry| {
+            // One `task/` entry per thread of that process, the group leader included.
+            std::fs::read_dir(entry.path().join("task"))
+                .map(|threads| threads.flatten().count() as u64)
+                .unwrap_or(0)
+        })
+        .sum();
+    Some(count)
 }
 
 /// A workdir-size ceiling that was crossed: what was allowed, and what was actually observed.
@@ -660,53 +669,36 @@ mod tests {
         );
     }
 
-    /// The regression guard for the unit itself: on Linux `RLIMIT_NPROC` is enforced against
-    /// *threads*, so threads spawned inside this very process must move the baseline. A
-    /// `/proc/<pid>`-directory count — one entry per process — would not move at all here, which
-    /// is exactly the bug this replaces.
+    /// On Linux `RLIMIT_NPROC` is enforced against threads, so the baseline sums `task/` entries:
+    /// the three owned processes below hold 7 threads between them, where a count of processes
+    /// would come out as 3. Directories that are not pids (`self`), a process with no readable
+    /// `task/` (`400`), and processes owned by another uid add nothing.
     ///
-    /// Asserted as strictly-greater rather than against an expected number: the host's other
-    /// threads come and go while the test runs, so any absolute expectation would be flaky on a
-    /// busy machine, while "spawning live threads cannot leave the count unchanged" holds
-    /// regardless of what else the uid is doing.
+    /// Run against a synthetic tree because the live count covers the whole uid and moves with
+    /// every other thread on the machine, so no assertion that it rises can be deterministic.
     #[cfg(target_os = "linux")]
     #[test]
-    fn uid_task_count_rises_when_this_process_gains_threads() {
-        use std::sync::Barrier;
-
-        const EXTRA_THREADS: usize = 8;
-
-        let before = uid_task_count().expect("linux can be asked for its task count");
-
-        // Two rendezvous points: the first proves every spawned thread is alive *before* the
-        // second measurement, the second holds them alive *across* it.
-        let started = Arc::new(Barrier::new(EXTRA_THREADS + 1));
-        let release = Arc::new(Barrier::new(EXTRA_THREADS + 1));
-        let handles: Vec<_> = (0..EXTRA_THREADS)
-            .map(|_| {
-                let started = Arc::clone(&started);
-                let release = Arc::clone(&release);
-                thread::spawn(move || {
-                    started.wait();
-                    release.wait();
-                })
-            })
-            .collect();
-        started.wait();
-
-        let during = uid_task_count().expect("linux can be asked for its task count");
-
-        release.wait();
-        for handle in handles {
-            handle.join().expect("spawned thread must not panic");
+    fn uid_task_count_sums_threads_not_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for (pid, threads) in [("100", 1), ("200", 4), ("300", 2), ("self", 5)] {
+            let task = root.join(pid).join("task");
+            std::fs::create_dir_all(&task).unwrap();
+            for thread in 0..threads {
+                std::fs::write(task.join(thread.to_string()), b"").unwrap();
+            }
         }
+        std::fs::create_dir(root.join("400")).unwrap();
 
-        assert!(
-            during > before,
-            "{EXTRA_THREADS} live extra threads must raise the uid's task count \
-             (before: {before}, during: {during}) — an unchanged count means the baseline is \
-             counting processes, not the threads the kernel enforces `RLIMIT_NPROC` against"
-        );
+        // The owner the walk reads off each pid directory, taken from one of them.
+        let own_uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(root.join("100")).unwrap().uid()
+        };
+
+        assert_eq!(uid_task_count_in(root, own_uid), Some(7));
+        assert_eq!(uid_task_count_in(root, own_uid.wrapping_add(1)), Some(0));
+        assert_eq!(uid_task_count_in(&root.join("missing"), own_uid), None);
     }
 
     /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap

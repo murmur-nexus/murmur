@@ -1288,17 +1288,9 @@ fn launch(
         let capsule_url = format!("localhost:{external_port}");
         staged.capsule_url = capsule_url.clone();
 
-        // The one place in the runtime that knows where this session's door is, so the one place
-        // the record can be written. A guard rather than a line at each return: `loop_result?`
-        // and both success returns below end the session, and a record that outlived its session
-        // would resolve an address onto a port nothing holds.
-        //
-        // Written before `on_url` announces the door: a caller that sees the URL and runs
-        // `mur ps` or addresses the session must find the record already there.
-        //
-        // Only the agent path reaches here. A script capsule binds nothing and is never
-        // addressable, so it records nothing.
-        let _running_record = open_running_record(&staged, &session_id, &capsule_url, &workdir);
+        // Built while `staged` is still whole. It is written, and the URL announced, inside the
+        // task `LocalSet` below, once the door is being served.
+        let running_record = running_record_for(&staged, &session_id, &capsule_url);
 
         // Taken over from the default disposition, when the caller owns the process, before the
         // door is announced, so a `SIGTERM` sent by anyone who has seen the URL is held for the
@@ -1321,8 +1313,6 @@ fn launch(
                 }
             }
         };
-
-        on_url(&capsule_url);
 
         let capsule_identity = CapsuleIdentity {
             capsule_name: staged.capsule_name.clone(),
@@ -1825,6 +1815,27 @@ fn launch(
                     // regardless of task_acceptance. For queue capsules this is the single
                     // session boundary that the per-task on-task-start events nest inside.
                     hooks.emit(&workdir, HookEvent::SessionStart).await;
+
+                    // The session is addressable from here, and this is where it says so. A
+                    // caller that sees the URL reads the record and then probes the door, so the
+                    // two halves of the order are both load-bearing:
+                    //
+                    //   - the record exists before `on_url` announces the URL, or `mur ps` run
+                    //     on the announcement finds nothing to list;
+                    //   - the URL is announced only once `serve_http` is spawned on this
+                    //     `LocalSet` and `session_start` is in the trace. The listener's backlog
+                    //     accepts a connection from the moment it is bound, and until
+                    //     `serve_http` is polled nothing reads it, so a probe sent into that
+                    //     window waits out its read deadline and reports a live session as
+                    //     unreachable. `serve_http` is first polled at the next `.await`, the
+                    //     task loop's wait for work at the latest.
+                    //
+                    // A guard rather than a line at each return, bound in this future so it lives
+                    // until the task loop has ended: a record that outlived its session would
+                    // resolve an address onto a port nothing holds. Only the agent path reaches
+                    // here; a script capsule binds nothing and is never addressable.
+                    let _running_record = write_running_record(&running_record, &workdir);
+                    on_url(&capsule_url);
 
                     // Seeded rather than assigned on every exit path: an iteration that only
                     // closes out work already in a lane can end without a result of its own, and
@@ -2782,23 +2793,18 @@ fn launch(
     })
 }
 
-/// Writes this session's entry in `~/.murmur/running/` and returns the guard that removes it.
-///
-/// `None` when the record could not be written, which warns `W-SEC-023` and changes nothing else:
-/// the session runs and serves exactly as it would have, reachable by the URL `mur run` printed
-/// rather than by session address.
+/// This session's entry for `~/.murmur/running/`, not yet written — see [`write_running_record`].
 ///
 /// `outlives_launcher` is derived from whether the launching process has a controlling terminal.
 /// A capsule started in a terminal dies with that window; one started without a terminal —
 /// `nohup … </dev/null &`, a `setsid`, a service manager — survives whoever started it.
-fn open_running_record(
+fn running_record_for(
     staged: &StagedSession,
     session_id: &str,
     capsule_url: &str,
-    workdir: &Path,
-) -> Option<running::RunningGuard> {
+) -> running::RunningRecord {
     let pid = std::process::id();
-    let record = running::RunningRecord {
+    running::RunningRecord {
         session_id: session_id.to_string(),
         url: capsule_url.to_string(),
         pid,
@@ -2810,16 +2816,26 @@ fn open_running_record(
         workdir: staged.workdir.clone(),
         outlives_launcher: !running::has_controlling_terminal(),
         started_at: chrono::Utc::now().to_rfc3339(),
-    };
+    }
+}
 
-    match running::RunningGuard::write(&record) {
+/// Writes `record` into `~/.murmur/running/` and returns the guard that removes it.
+///
+/// `None` when the record could not be written, which warns `W-SEC-023` and changes nothing else:
+/// the session runs and serves exactly as it would have, reachable by the URL `mur run` prints
+/// rather than by session address.
+fn write_running_record(
+    record: &running::RunningRecord,
+    workdir: &Path,
+) -> Option<running::RunningGuard> {
+    match running::RunningGuard::write(record) {
         Ok(guard) => Some(guard),
         Err(reason) => {
             let link = security_warning_link(W_SEC_023);
             let message = format!(
                 "this session's record under ~/.murmur/running/ could not be written, so \
                  `mur watch` and `mur cancel` cannot reach it by session address — only by the \
-                 URL printed above: {reason}"
+                 URL it announces: {reason}"
             );
             eprintln!("[capsule-runtime] warning[{W_SEC_023}]: {message} ({link})");
             agent::append_bootstrap_log(

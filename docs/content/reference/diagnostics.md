@@ -1885,7 +1885,7 @@ declaring `capabilities.shell.allow` on a capsule that runs no commands.
 stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL printed above: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-023)
+[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL it announces: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-023)
 ```
 
 **Why it matters:** the record is what lets [`mur watch`](cli.md#mur-watch) and
