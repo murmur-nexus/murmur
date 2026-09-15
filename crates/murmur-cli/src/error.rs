@@ -42,6 +42,7 @@ pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolv
 pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
 pub const E_RUN_025: &str = "E-RUN-025"; // the inference driver declares no usable inference_auth: block
 pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
+pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed

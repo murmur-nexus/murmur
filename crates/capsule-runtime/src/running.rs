@@ -12,10 +12,13 @@
 //!    the capsule nor that it can still respond, so the agent card is fetched and its `session_id`
 //!    compared.
 //!
-//! Reading prunes what fails layer 1 or 2, and that is the only reaper there is — which is enough
-//! precisely because the record is a hint. A record that passes 1 and 2 and fails 3 is kept: it
-//! names a process that is genuinely alive, possibly mid-turn, and unlinking it would throw away
-//! the only handle to a running capsule because it was slow to answer.
+//! Reading prunes a record only on evidence: layer 1 finding no process, or layer 2 reading a start
+//! time that differs from the recorded one, which means the pid was reused. That is the only reaper
+//! there is, and it is enough because the record is a hint. A reading that could not be taken is
+//! not evidence. A live pid whose start time cannot be read is [`ProcessState::Unverified`]: kept,
+//! reported as unreachable, and never signalled. A record that passes 1 and 2 and fails 3 is kept
+//! too: it names a process that is alive, possibly mid-turn, and unlinking it would throw away the
+//! only handle to a running capsule because it was slow to answer.
 //!
 //! The record names the process and stores nothing from the environment. The directory is `0700`
 //! and each record `0600`, because the set of records is a map of reachable capsules to anything
@@ -47,9 +50,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field is required. There is no version field: a record that does not deserialize is
-/// unverifiable, and an unverifiable record is pruned, which is what "the record is a hint"
-/// already means.
+/// Every field is required. There is no version field: a record that does not deserialize names
+/// no process that could be checked, and is pruned, which is what "the record is a hint" already
+/// means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
@@ -75,9 +78,12 @@ pub struct RunningRecord {
 ///
 /// The directory is global rather than per-workdir because the question a live address answers is
 /// "what is running on this machine", which no single project directory can answer.
+///
+/// The `Err` names the path that failed and why.
 pub fn running_dir() -> Result<PathBuf, String> {
     let dir = crate::murmur_home::ensure_murmur_home()?.join(RUNNING_DIR);
-    crate::state_store::ensure_private_dir(&dir, RUNNING_DIR_MODE)?;
+    crate::state_store::ensure_private_dir(&dir, RUNNING_DIR_MODE)
+        .map_err(|reason| format!("{}: {reason}", dir.display()))?;
     Ok(dir)
 }
 
@@ -86,13 +92,13 @@ pub fn running_dir() -> Result<PathBuf, String> {
 /// Session ids are time-ordered, so a lexical sort descending is chronological. A file that does
 /// not parse is unlinked on the way past: nothing can verify it, and leaving it would mean
 /// carrying a permanent unreadable entry in a directory whose whole purpose is to be read.
-pub fn list() -> Vec<RunningRecord> {
-    let Ok(dir) = running_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
+///
+/// The `Err` is the directory being unusable — `~/.murmur/running` cannot be created, held at
+/// `0700`, or listed — and names the path and the OS error. An empty machine is `Ok` with no
+/// records, so a caller can tell the two apart.
+pub fn list() -> Result<Vec<RunningRecord>, String> {
+    let dir = running_dir()?;
+    let entries = std::fs::read_dir(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
 
     let mut records = Vec::new();
     for entry in entries.flatten() {
@@ -108,33 +114,54 @@ pub fn list() -> Vec<RunningRecord> {
         }
     }
     records.sort_by(|left, right| right.session_id.cmp(&left.session_id));
-    records
+    Ok(records)
 }
 
 /// What layers 1 and 2 say about the process a record names.
+///
+/// Only `Gone` licenses unlinking the record. `Unverified` is a reading that failed, which says
+/// nothing about the process either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessState {
     /// The pid is held by the process that wrote the record.
     Alive,
-    /// The process is gone; the string says how that was decided.
+    /// The pid is held and its start time could not be read, so whether the holder wrote the record
+    /// is unknown. The record is kept and the pid is never signalled; the string is the reason.
+    Unverified(String),
+    /// The process is gone — nothing holds the pid, or the process holding it started at another
+    /// time than the recorded one. The string says which.
     Gone(String),
 }
 
 /// Layers 1 and 2: the pid is alive, and the process holding it is the one that wrote the record.
 ///
 /// Local and cheap, which is what makes this the candidacy test — a reader can apply it to every
-/// record without a single network round trip.
+/// record without a single network round trip. The start time is read only for a live pid; see
+/// [`classify`] for how the two readings combine.
 pub fn process_state(record: &RunningRecord) -> ProcessState {
-    if !pid_is_alive(record.pid) {
+    let alive = pid_is_alive(record.pid);
+    let token = alive.then(|| process_start_token(record.pid)).flatten();
+    classify(record, alive, token.as_deref())
+}
+
+/// Layers 1 and 2 over readings already taken: whether `record.pid` is held, and its start token
+/// read afterwards, `None` when it could not be read.
+///
+/// A recorded `process_start` of `""` is what a writer that could not read its own start time
+/// stores, and it differs from every token the host reports, so that record reads as `Gone`.
+fn classify(record: &RunningRecord, pid_alive: bool, fresh_token: Option<&str>) -> ProcessState {
+    if !pid_alive {
         return ProcessState::Gone(format!("no process holds pid {}", record.pid));
     }
-    match process_start_token(record.pid) {
+    match fresh_token {
         Some(token) if token == record.process_start => ProcessState::Alive,
         Some(_) => ProcessState::Gone(format!(
             "pid {} is held by a process that started at another time",
             record.pid
         )),
-        None => ProcessState::Gone(format!("pid {}'s start time could not be read", record.pid)),
+        None => {
+            ProcessState::Unverified(format!("pid {}'s start time could not be read", record.pid))
+        }
     }
 }
 
@@ -143,7 +170,8 @@ pub fn process_state(record: &RunningRecord) -> ProcessState {
 pub enum Liveness {
     /// The process is the one that wrote the record and its door answers for that session.
     Live,
-    /// The process is alive and the door did not answer for it. The record is kept.
+    /// The process is alive and either the door did not answer for it or its identity could not be
+    /// read. The record is kept.
     Unreachable(String),
     /// The process that wrote the record is gone. The record is stale and can be pruned.
     Gone(String),
@@ -152,18 +180,29 @@ pub enum Liveness {
 /// All three layers, door probe included.
 ///
 /// The probe is one blocking `GET /.well-known/agent-card.json`, so this is callable from outside
-/// any async runtime.
+/// any async runtime. A record whose process is not [`ProcessState::Alive`] is answered without a
+/// probe.
 pub fn verify(record: &RunningRecord) -> Liveness {
-    match process_state(record) {
-        ProcessState::Gone(reason) => Liveness::Gone(reason),
-        ProcessState::Alive => match probe_session_id(&record.url) {
-            Ok(session_id) if session_id == record.session_id => Liveness::Live,
-            Ok(other) => Liveness::Unreachable(format!(
-                "the capsule at {} answers for session {other}",
-                record.url
-            )),
-            Err(reason) => Liveness::Unreachable(reason),
-        },
+    if let Some(liveness) = liveness_without_probe(process_state(record)) {
+        return liveness;
+    }
+    match probe_session_id(&record.url) {
+        Ok(session_id) if session_id == record.session_id => Liveness::Live,
+        Ok(other) => Liveness::Unreachable(format!(
+            "the capsule at {} answers for session {other}",
+            record.url
+        )),
+        Err(reason) => Liveness::Unreachable(reason),
+    }
+}
+
+/// The [`Liveness`] layers 1 and 2 decide on their own, or `None` for [`ProcessState::Alive`],
+/// which only the door probe can settle.
+fn liveness_without_probe(state: ProcessState) -> Option<Liveness> {
+    match state {
+        ProcessState::Alive => None,
+        ProcessState::Unverified(reason) => Some(Liveness::Unreachable(reason)),
+        ProcessState::Gone(reason) => Some(Liveness::Gone(reason)),
     }
 }
 
@@ -174,8 +213,9 @@ pub enum SignalOutcome {
     Sent,
     /// Nothing was signalled: the process that wrote the record is no longer there.
     AlreadyGone,
-    /// The process is there and the kernel refused the signal; the string is the errno
-    /// description, `EPERM` included.
+    /// Something holds the pid and no signal reached it: the kernel refused `kill(2)`, and the
+    /// string is the errno description, `EPERM` included; or the pid is
+    /// [`ProcessState::Unverified`], `kill(2)` was never called, and the string is that reason.
     Refused(String),
 }
 
@@ -193,13 +233,13 @@ pub fn signal_kill(record: &RunningRecord) -> SignalOutcome {
 ///
 /// A record is a hint, and a pid whose recorded start time no longer matches names a process that
 /// inherited the number. Signalling it would end something the operator never launched, so the
-/// check is not a caller's to have made earlier: it is re-run here, immediately before the
+/// check is not a caller's to have made earlier: it is run here, immediately before the
 /// `kill(2)`, so the window between the two is two adjacent syscalls. No userspace program can
 /// close that window; narrowing it to this is the whole of what can be done about it.
 #[allow(unsafe_code)]
 fn signal(record: &RunningRecord, signal: libc::c_int) -> SignalOutcome {
-    if matches!(process_state(record), ProcessState::Gone(_)) {
-        return SignalOutcome::AlreadyGone;
+    if let Some(outcome) = refusal_before_signal(&process_state(record)) {
+        return outcome;
     }
     // SAFETY: `kill` takes a pid and a signal number by value and dereferences no pointer. The
     // pid is the one the check above just confirmed is held by the process that wrote the record.
@@ -213,6 +253,19 @@ fn signal(record: &RunningRecord, signal: libc::c_int) -> SignalOutcome {
         return SignalOutcome::AlreadyGone;
     }
     SignalOutcome::Refused(err.to_string())
+}
+
+/// What a signal to a process in `state` comes to without `kill(2)` being called, or `None` when
+/// the process is confirmed as the one that wrote the record and may be signalled.
+///
+/// A pid whose identity could not be read is refused rather than reported as gone: something holds
+/// it, and it may be the capsule.
+fn refusal_before_signal(state: &ProcessState) -> Option<SignalOutcome> {
+    match state {
+        ProcessState::Alive => None,
+        ProcessState::Unverified(reason) => Some(SignalOutcome::Refused(reason.clone())),
+        ProcessState::Gone(_) => Some(SignalOutcome::AlreadyGone),
+    }
 }
 
 /// Unlink one record. For a [`Liveness::Gone`] reading only.
@@ -284,11 +337,21 @@ fn read_record(path: &Path) -> Option<RunningRecord> {
 /// started it waits on it. Counting one as alive would mean `mur ps` listing an exited capsule as
 /// `unreachable` for as long as its launcher neglected to reap it, and `mur stop` never able to
 /// confirm that the process it just signalled had gone.
+///
+/// A pid outside `1..=pid_t::MAX` is held by no process. `kill(2)` reads `0` as the caller's own
+/// process group and a negative `pid_t` as a process group or every process, so either would
+/// otherwise answer for processes the record never named.
 #[allow(unsafe_code)]
 fn pid_is_alive(pid: u32) -> bool {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if target == 0 {
+        return false;
+    }
     // SAFETY: `kill` with signal 0 runs the existence and permission checks without delivering
     // anything, and dereferences no pointer.
-    let held = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+    let held = unsafe { libc::kill(target, 0) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     held && !platform::is_zombie(pid)
 }
@@ -319,10 +382,20 @@ mod platform {
 
     pub(super) fn process_start_token(pid: u32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let tail = &stat[stat.rfind(')')? + 1..];
-        tail.split_whitespace()
+        start_token_from_stat(&stat)
+    }
+
+    /// Field 22 of one `/proc/<pid>/stat` line, or `None` when the line has no `)` or ends before
+    /// field 22.
+    pub(super) fn start_token_from_stat(stat: &str) -> Option<String> {
+        fields_after_comm(stat)?
             .nth(STARTTIME_OFFSET_AFTER_COMM)
             .map(str::to_string)
+    }
+
+    /// The fields of a `/proc/<pid>/stat` line from field 3 on, or `None` when it has no `)`.
+    fn fields_after_comm(stat: &str) -> Option<std::str::SplitWhitespace<'_>> {
+        Some(stat[stat.rfind(')')? + 1..].split_whitespace())
     }
 
     /// Field 3 of `/proc/<pid>/stat` — the first after the executable name — is the state
@@ -334,10 +407,7 @@ mod platform {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
         };
-        let Some(close) = stat.rfind(')') else {
-            return false;
-        };
-        stat[close + 1..].split_whitespace().next() == Some("Z")
+        fields_after_comm(&stat).and_then(|mut fields| fields.next()) == Some("Z")
     }
 }
 
@@ -347,25 +417,31 @@ mod platform {
 
     /// `proc_bsdinfo.pbi_start_tvsec` and `pbi_start_tvusec`, rendered as `seconds.microseconds`.
     pub(super) fn process_start_token(pid: u32) -> Option<String> {
-        let info = bsd_info(pid)?;
+        let info = bsd_info(pid).ok()?;
         Some(format!(
             "{}.{:06}",
             info.pbi_start_tvsec, info.pbi_start_tvusec
         ))
     }
 
-    /// `proc_bsdinfo.pbi_status` is `SZOMB` for a process that has exited and not yet been waited
-    /// on — XNU still answers `PROC_PIDTBSDINFO` for one. A pid the kernel will not describe is not
-    /// reported as a zombie, on the same terms as the Linux reading.
+    /// A process that has exited and not yet been waited on. `kill(pid, 0)` still reports its pid
+    /// held, but `PROC_PIDTBSDINFO` refuses to describe it with `ESRCH`; one described mid-exit
+    /// carries `pbi_status` `SZOMB`. `ESRCH` read straight after layer 1 found the pid held means
+    /// either that or a process that exited in between, and both are gone.
+    ///
+    /// Any other failed reading, `EPERM` or a short write, is not reported as a zombie, on the
+    /// same terms as the Linux reading: layer 2 reads the pid as `Unverified`.
     pub(super) fn is_zombie(pid: u32) -> bool {
-        bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB)
+        match bsd_info(pid) {
+            Ok(info) => info.pbi_status == libc::SZOMB,
+            Err(err) => err.raw_os_error() == Some(libc::ESRCH),
+        }
     }
 
-    /// The kernel's `PROC_PIDTBSDINFO` description of `pid`, or `None` when it wrote anything
-    /// other than exactly one `proc_bsdinfo`: an unknown pid, a pid this user may not inspect, or
-    /// a short write are all a failed reading rather than a struct to read fields from.
+    /// The kernel's `PROC_PIDTBSDINFO` description of `pid`. `Err` carries the `errno` when the
+    /// call failed, and no OS error when it wrote anything other than exactly one `proc_bsdinfo`.
     #[allow(unsafe_code)]
-    fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    fn bsd_info(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
         // SAFETY: `proc_bsdinfo` is a plain C struct of integers and fixed-size integer arrays,
         // with no pointer, niche or validity invariant, so an all-zero value is a valid one.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -383,7 +459,15 @@ mod platform {
                 size as libc::c_int,
             )
         };
-        (usize::try_from(written).ok() == Some(size)).then_some(info)
+        if written <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if usize::try_from(written).ok() != Some(size) {
+            return Err(std::io::Error::other(format!(
+                "proc_pidinfo wrote {written} bytes, not one proc_bsdinfo of {size}"
+            )));
+        }
+        Ok(info)
     }
 }
 
@@ -479,7 +563,7 @@ mod tests {
                 reason.contains("another time"),
                 "the reason must say the pid belongs to another process now: {reason}"
             ),
-            ProcessState::Alive => panic!("a mismatched start time must not read as alive"),
+            other => panic!("a mismatched start time must read as gone, not {other:?}"),
         }
     }
 
@@ -556,6 +640,129 @@ mod tests {
         };
         record.url = format!("127.0.0.1:{port}");
         assert!(matches!(verify(&record), Liveness::Unreachable(_)));
+    }
+
+    const PID: u32 = 4242;
+
+    #[test]
+    fn classify_a_dead_pid_is_gone_whatever_the_token() {
+        for token in [None, Some("123"), Some("")] {
+            assert_eq!(
+                classify(&record(PID, "123"), false, token),
+                ProcessState::Gone("no process holds pid 4242".to_string()),
+                "token {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_a_live_pid_with_the_recorded_token_is_alive() {
+        assert_eq!(
+            classify(&record(PID, "123"), true, Some("123")),
+            ProcessState::Alive
+        );
+    }
+
+    #[test]
+    fn classify_a_live_pid_with_another_token_is_gone() {
+        assert_eq!(
+            classify(&record(PID, "123"), true, Some("456")),
+            ProcessState::Gone("pid 4242 is held by a process that started at another time".into())
+        );
+    }
+
+    /// The writer stores `""` when it could not read its own start time, and that must never match.
+    #[test]
+    fn classify_a_recorded_empty_token_against_a_fresh_one_is_gone() {
+        assert!(matches!(
+            classify(&record(PID, ""), true, Some("123")),
+            ProcessState::Gone(reason) if reason.contains("another time")
+        ));
+    }
+
+    #[test]
+    fn classify_a_live_pid_whose_token_cannot_be_read_is_unverified() {
+        assert_eq!(
+            classify(&record(PID, "123"), true, None),
+            ProcessState::Unverified("pid 4242's start time could not be read".into())
+        );
+    }
+
+    #[test]
+    fn nothing_is_refused_before_signalling_a_confirmed_process() {
+        assert_eq!(refusal_before_signal(&ProcessState::Alive), None);
+    }
+
+    #[test]
+    fn a_gone_process_is_already_gone_before_any_signal() {
+        assert_eq!(
+            refusal_before_signal(&ProcessState::Gone("no process holds pid 1".into())),
+            Some(SignalOutcome::AlreadyGone)
+        );
+    }
+
+    #[test]
+    fn an_unverified_process_is_refused_before_any_signal() {
+        let reason = "pid 1's start time could not be read".to_string();
+        assert_eq!(
+            refusal_before_signal(&ProcessState::Unverified(reason.clone())),
+            Some(SignalOutcome::Refused(reason))
+        );
+    }
+
+    /// `liveness_without_probe` has no URL to probe, so an answer for `Unverified` is one reached
+    /// without the network.
+    #[test]
+    fn an_unverified_process_is_unreachable_without_a_probe() {
+        let reason = "pid 1's start time could not be read".to_string();
+        assert_eq!(
+            liveness_without_probe(ProcessState::Unverified(reason.clone())),
+            Some(Liveness::Unreachable(reason))
+        );
+        assert_eq!(
+            liveness_without_probe(ProcessState::Gone("gone".into())),
+            Some(Liveness::Gone("gone".into()))
+        );
+        assert_eq!(liveness_without_probe(ProcessState::Alive), None);
+    }
+
+    /// A stat line with field 22 set to `987654`: pid, comm, then fields 3 through 22.
+    #[cfg(target_os = "linux")]
+    fn stat_line(comm: &str) -> String {
+        let fields: Vec<String> = (3..=21).map(|field| field.to_string()).collect();
+        format!("1234 ({comm}) {} 987654 23 24\n", fields.join(" "))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_start_token_is_field_22_of_a_plain_stat_line() {
+        assert_eq!(
+            platform::start_token_from_stat(&stat_line("sleep")),
+            Some("987654".to_string())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_start_token_is_counted_from_the_last_close_paren() {
+        assert_eq!(
+            platform::start_token_from_stat(&stat_line("a) (b c")),
+            Some("987654".to_string())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stat_line_with_no_close_paren_has_no_start_token() {
+        assert_eq!(platform::start_token_from_stat("1234 sleep S 1 2 3"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stat_line_truncated_before_field_22_has_no_start_token() {
+        let line = stat_line("sleep");
+        let truncated = &line[..line.find(" 987654").unwrap()];
+        assert_eq!(platform::start_token_from_stat(truncated), None);
     }
 }
 

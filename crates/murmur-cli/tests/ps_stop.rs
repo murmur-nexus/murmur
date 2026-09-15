@@ -137,7 +137,8 @@ impl Drop for Capsule {
     fn drop(&mut self) {
         // A case that ended the capsule on purpose has nothing here to kill; one that failed
         // halfway leaves a process holding a port and a scratch home about to be removed.
-        kill(self.pid(), 9);
+        // Through the child handle only: once the child has been reaped its pid number may belong
+        // to another case's process, and `Child::kill` on a reaped child signals nothing.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -198,9 +199,16 @@ fn start_agent_with_env(
         }
     });
 
-    let startup = startup_rx
-        .recv_timeout(Duration::from_secs(120))
-        .expect("timed out waiting for the capsule to print where its door is");
+    // No `Capsule` exists yet, so its drop cannot end the child: a bare `Child` is not killed on
+    // drop, and an unkilled `mur run` outlives the test and its scratch home.
+    let startup = match startup_rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(startup) => startup,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timed out waiting for the capsule to print where its door is");
+        }
+    };
 
     Capsule {
         child,
@@ -301,7 +309,8 @@ impl Stray {
 
 impl Drop for Stray {
     fn drop(&mut self) {
-        kill(self.pid(), 9);
+        // Through the child handle, for the same reason as `Capsule`'s drop.
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -399,8 +408,24 @@ fn mur(home: &Path) -> Command {
 }
 
 fn ps_stdout(home: &Path) -> String {
+    ps_output(home).0
+}
+
+/// A successful `mur ps`'s stdout and stderr. Stderr carries one `pruned:` line per record unlinked.
+fn ps_output(home: &Path) -> (String, String) {
     let output = mur(home).arg("ps").assert().success().get_output().clone();
-    String::from_utf8_lossy(&output.stdout).to_string()
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// How many `pruned:` lines a `mur ps` stderr carries.
+fn pruned_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("pruned:"))
+        .collect()
 }
 
 /// Every line of a `mur ps` listing below the header.
@@ -453,20 +478,55 @@ fn wait_for_trace(
 
 /// One running capsule, every column of its row, and the record left exactly as it was: listing
 /// a live capsule reads the record and disturbs nothing.
+///
+/// A listing with no row has three explanations, and the failure message tells them apart: the
+/// capsule process had exited before `mur ps` ran, its record was already gone, or `mur ps` pruned
+/// it and said why on stderr.
 #[test]
 fn ps_lists_a_running_capsule_in_full() {
     let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "hello")]);
     let home = driver_home();
-    let capsule = start_agent(&home, &server, "ps-happy");
+    let mut capsule = start_agent(&home, &server, "ps-happy");
 
-    let stdout = ps_stdout(home.path());
-    let header = stdout.lines().next().expect("a header line");
+    let process_before = match capsule.child.try_wait().expect("the child is waitable") {
+        None => "still running".to_string(),
+        Some(status) => format!("exited: {status}"),
+    };
+    let record_before = if record_for(home.path(), &capsule.session_id()).exists() {
+        "present"
+    } else {
+        "absent"
+    };
+    let (stdout, stderr) = ps_output(home.path());
+    // A process that has been sent SIGKILL can still read as running an instant later, before the
+    // kernel has finished its exit; the second reading, after `mur ps`, is taken once it has.
+    let process_after = match capsule.child.try_wait().expect("the child is waitable") {
+        None => "still running".to_string(),
+        Some(status) => format!("exited: {status}"),
+    };
+    let diagnostic = format!(
+        "capsule process before ps: {process_before}\nrecord before ps: {record_before}\n\
+         ps stdout: {stdout:?}\nps stderr: {stderr:?}\ncapsule process after ps: {process_after}"
+    );
+
+    let header = stdout.lines().next().unwrap_or("");
     for column in ["SESSION", "CAPSULE", "STATUS", "DETACHED", "UPTIME", "URL"] {
-        assert!(header.contains(column), "header lacks {column}: {header:?}");
+        assert!(
+            header.contains(column),
+            "header lacks {column}: {header:?}\n{diagnostic}"
+        );
     }
+    assert!(
+        !stderr.contains("pruned:"),
+        "listing a live capsule pruned a record\n{diagnostic}"
+    );
 
     let rows = ps_rows(&stdout);
-    assert_eq!(rows.len(), 1, "expected exactly one row in:\n{stdout}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one row in:\n{stdout}\n{diagnostic}"
+    );
     let row = rows[0];
     let session_id = capsule.session_id();
     assert_eq!(session_id.len(), 36, "a session id is 36 characters");
@@ -529,11 +589,20 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
         &stray.token(),
     );
 
-    let stdout = ps_stdout(home.path());
+    let (stdout, stderr) = ps_output(home.path());
     let rows = ps_rows(&stdout);
     assert_eq!(rows.len(), 1, "expected one row in:\n{stdout}");
     assert!(rows[0].contains(&quiet), "{stdout}");
     assert!(rows[0].contains("unreachable"), "{stdout}");
+
+    let pruned = pruned_lines(&stderr);
+    assert_eq!(pruned.len(), 1, "one unlink, one line: {stderr}");
+    assert!(pruned[0].contains(&dead), "{stderr}");
+    assert!(pruned[0].contains("no process holds pid"), "{stderr}");
+    assert!(
+        !stderr.contains(&quiet),
+        "a kept record is not named as pruned: {stderr}"
+    );
 
     assert!(!record_for(home.path(), &dead).exists(), "the dead record");
     assert!(
@@ -542,10 +611,88 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     );
 
     // A second read is the same read: nothing about the first changed the answer.
-    let again = ps_stdout(home.path());
+    let (again, again_stderr) = ps_output(home.path());
     assert_eq!(ps_rows(&again).len(), 1, "{again}");
     assert!(again.contains(&quiet), "{again}");
+    assert!(
+        pruned_lines(&again_stderr).is_empty(),
+        "nothing was left to prune: {again_stderr}"
+    );
     assert!(stray.is_alive(), "`mur ps` must signal nothing");
+}
+
+/// A live pid whose start time differs from the recorded one belongs to another process now. The
+/// record is unlinked and named on stderr, and the process holding the pid is left alone.
+#[test]
+fn ps_prunes_a_reused_pid_and_signals_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let mut stray = Stray::sleeping();
+    let session_id = fabricated_id("f00d");
+    write_record(
+        home.path(),
+        &session_id,
+        "127.0.0.1:1",
+        stray.pid(),
+        "deliberately-not-this-process",
+    );
+
+    let (stdout, stderr) = ps_output(home.path());
+    assert_eq!(stdout, "no running capsules\n");
+    assert!(
+        stderr.contains(&format!("pruned: {session_id}")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("started at another time"), "{stderr}");
+    assert!(!record_for(home.path(), &session_id).exists());
+
+    thread::sleep(Duration::from_millis(300));
+    assert!(stray.is_alive(), "`mur ps` must signal nothing");
+}
+
+/// A record directory that cannot be read is not a machine running nothing. `mur ps` and a command
+/// resolving a session address both fail with `E-RUN-028`, and the path is left as it was.
+///
+/// A regular file where the directory belongs fails for root too, which a `0000` directory would
+/// not.
+#[test]
+fn ps_reports_records_it_cannot_read_instead_of_an_empty_machine() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let murmur = home.path().join(".murmur");
+    fs::create_dir(&murmur).unwrap();
+    fs::set_permissions(&murmur, fs::Permissions::from_mode(0o700)).unwrap();
+    let running = running_dir(home.path());
+    let bytes = b"not a directory\n";
+    fs::write(&running, bytes).unwrap();
+
+    let output = mur(home.path())
+        .arg("ps")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-RUN-028"), "{stderr}");
+    assert!(!stdout.contains("no running capsules"), "{stdout}");
+    assert!(stdout.is_empty(), "nothing is listed: {stdout}");
+
+    let output = mur(home.path())
+        .args(["watch", "@1"])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-RUN-028"), "{stderr}");
+    assert!(
+        !stderr.contains("no capsule is running on this machine"),
+        "{stderr}"
+    );
+
+    assert_eq!(fs::read(&running).unwrap(), bytes);
 }
 
 // ── 4. Ordinal order ──────────────────────────────────────────────────────────

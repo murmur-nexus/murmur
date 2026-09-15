@@ -119,10 +119,21 @@ read verifies it in three layers, and a session is reported as running only when
 | 2 | Did that process start when the record says it did? | That the process id was not reused by something unrelated |
 | 3 | Does the capsule's agent card answer, naming that session? | That the capsule is the one being addressed and can still respond |
 
-Reading the records removes every one that fails layer 1 or 2 — that is the only sweep there is,
-and it is enough because a record is never treated as truth. A record that passes layers 1 and 2
-and fails layer 3 is kept: it names a process that is genuinely alive, possibly mid-turn, and the
-command reports [`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
+Reading the records removes a record only on evidence that its process is gone — that is the only
+sweep there is, and it is enough because a record is never treated as truth.
+
+| Reading | The record | Signalled by `mur stop` |
+|---|---|---|
+| Layer 1: no process holds the process id | Removed | No |
+| Layer 2: the process started at another time | Removed — the process id was reused | No |
+| Layer 2: the process's start time could not be read | Kept, reported as unreachable | No |
+| Layer 3: the agent card did not answer for the session | Kept, reported as unreachable | Yes |
+
+A kept record names a process that is alive, possibly mid-turn, and the command reports
+[`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
+
+When `~/.murmur/running/` itself cannot be read, every command that reads the records fails with
+[`E-RUN-028`](diagnostics.md#e-run-028) and removes nothing.
 
 Ordinals count over records that pass layers 1 and 2, so a capsule that has stopped never shifts
 the numbering of the ones still running.
@@ -785,7 +796,21 @@ no running capsules
 ```
 
 An absent `~/.murmur/running/` and an empty one are the same fact about the machine, and read the
-same way.
+same way. A `~/.murmur/running/` that cannot be read — a file where the directory belongs, or a
+directory this user may not list — is neither: `mur ps` prints nothing on stdout and fails with
+[`E-RUN-028`](diagnostics.md#e-run-028).
+
+Every record `mur ps` removes because its process is gone is named on stderr, one line each. A
+file in the directory that is not a readable record is removed without a line.
+
+```text
+pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce2 — no process holds pid 48213
+```
+
+Exit codes:
+
+- `0` — the records were read, whether or not any row was printed
+- `1` — `~/.murmur/running/` could not be read ([`E-RUN-028`](diagnostics.md#e-run-028))
 
 ### What each row was verified against { #mur-ps-verification }
 
@@ -793,14 +818,19 @@ Every record is put through all three layers described under
 [A record is a hint](#running-record-is-a-hint) before its row is printed, and what the layers say
 decides both the `STATUS` column and whether the record survives the read.
 
-| Layers | `STATUS` | The record |
-|---|---|---|
-| All three pass | `running` | Kept |
-| The process is the one that wrote the record; the door did not answer | `unreachable` | Kept |
-| The process that wrote the record is gone | No row | Unlinked |
+| Layers | `STATUS` | The record | Reason on the `pruned:` line |
+|---|---|---|---|
+| All three pass | `running` | Kept | — |
+| The process is the one that wrote the record; the door did not answer | `unreachable` | Kept | — |
+| A process holds the process id and its start time could not be read | `unreachable` | Kept | — |
+| No process holds the process id | No row | Unlinked | `no process holds pid N` |
+| The process holding the process id started at another time | No row | Unlinked | `pid N is held by a process that started at another time` |
 
-A quiet door is not evidence that the process is gone. An `unreachable` capsule may be mid-turn,
-and unlinking its record would throw away the only handle anyone has on something still running.
+Neither a quiet door nor a start time that could not be read is evidence that the process is gone.
+An `unreachable` capsule may be mid-turn, including busy with synchronous work inside a turn that
+keeps its door from answering until that work returns, and unlinking its record would throw away
+the only handle anyone has on something still running.
+
 Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
 so the first row is what `@1` names.
 
@@ -878,12 +908,16 @@ third of the job. A capsule on another machine records on *that* machine, so it 
 Exit codes:
 
 - `0` — the session was ended, whether or not its door answered
-- `1` — the address named no running session ([`E-RUN-022`](diagnostics.md#e-run-022)), or the
-  session could not be ended and is still running ([`E-RUN-024`](diagnostics.md#e-run-024))
+- `1` — the address named no running session ([`E-RUN-022`](diagnostics.md#e-run-022)), the
+  session could not be ended and is still running ([`E-RUN-024`](diagnostics.md#e-run-024)), or
+  the running-capsule records could not be read ([`E-RUN-028`](diagnostics.md#e-run-028))
 
-`mur stop` refuses to signal a process id it cannot confirm. A record whose recorded start time no
-longer matches the host's names a process that inherited the number, and the refusal is
-`E-RUN-022`: the record is unlinked and no signal of any kind is sent.
+`mur stop` refuses to signal a process id it cannot confirm, and no signal of any kind is sent.
+
+| The recorded process | Refusal | The record |
+|---|---|---|
+| Started at another time than the host reports — the number was inherited | `E-RUN-022` | Unlinked |
+| Start time could not be read | `E-RUN-024` | Kept |
 
 ---
 
