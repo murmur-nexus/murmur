@@ -1198,3 +1198,36 @@ fn the_trace_distinguishes_cancelled_from_failed() {
     );
     assert!(capsule.session_dir.exists());
 }
+
+// ── The announcement follows the session frame ────────────────────────────────
+
+/// By the time a launch hands its address to `on_url`, `session_start` is already in the trace.
+///
+/// The trace is read inside the callback, so the check sees exactly what the announcement
+/// guarantees, with nothing scheduled between the two. Read from a separate process the order is
+/// a race, and the trace can catch up before anyone looks.
+#[test]
+fn the_session_frame_is_in_the_trace_when_the_address_is_announced() {
+    let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "hello")]);
+    let (home, manifest_path) =
+        setup_project(&server.endpoint, "announce-agent", &network(&server));
+    let staged = stage_agent(&home, &manifest_path, queue_lifecycle());
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<(String, Vec<Value>)>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = seen_tx.send((url.to_string(), read_trace(&trace_path)));
+        });
+    });
+    let (url, events) = seen_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("timed out waiting for the capsule URL");
+
+    assert!(!url.is_empty(), "an agent capsule announces an address");
+    assert_eq!(
+        events_named(&events, "session_start").len(),
+        1,
+        "the address was announced before `session_start` was in the trace: {events:?}"
+    );
+}

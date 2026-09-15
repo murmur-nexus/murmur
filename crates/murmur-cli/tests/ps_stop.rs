@@ -1634,3 +1634,95 @@ fn a_sigterm_ends_mur_eval_at_once() {
         "no case after the first may reach the provider"
     );
 }
+
+// ── 17. The announcement follows the door ─────────────────────────────────────
+
+/// What `mur run` printing a URL guarantees, read the instant it is printed: the session frame is
+/// in the trace and the door answers for the session. A probe that reaches a bound listener
+/// nothing is serving yet waits in the backlog, and `mur ps` reports that live capsule as
+/// `unreachable`.
+#[test]
+fn the_door_answers_by_the_time_its_address_is_announced() {
+    let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "hello")]);
+    let home = driver_home();
+    let capsule = start_agent(&home, &server, "announced");
+
+    let events = read_trace(&capsule.trace_path());
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "session_start"),
+        "the URL was announced before `session_start` was in the trace: {events:?}"
+    );
+
+    let url = capsule.url();
+    let port = url.rsplit(':').next().unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
+        .expect("the announced door accepts a connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: {url}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut response)
+        .expect("the announced door answers the agent-card request");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_else(|| panic!("no HTTP body in: {response:?}"));
+    let card: Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|err| panic!("the agent card is not JSON ({err}): {body:?}"));
+    assert_eq!(card["session_id"], capsule.session_id(), "{card}");
+}
+
+// ── 18. A door that accepts and never answers ─────────────────────────────────
+
+/// A connection the backlog accepts and nothing reads is a slow door, not a dead process. The
+/// probe times out, the row says `unreachable`, and neither `mur ps` nor `mur watch` unlinks the
+/// record: only layers 1 and 2 prune.
+#[test]
+fn a_door_that_accepts_and_never_answers_is_unreachable_and_kept() {
+    let home = tempfile::tempdir().unwrap();
+    // Held for the whole case and never accepted from.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener_addr = listener.local_addr().unwrap().to_string();
+    let mut stray = Stray::sleeping();
+    let session_id = fabricated_id("5104");
+    write_record(
+        home.path(),
+        &session_id,
+        &listener_addr,
+        stray.pid(),
+        &stray.token(),
+    );
+
+    let stdout = ps_stdout(home.path());
+    let rows = ps_rows(&stdout);
+    assert_eq!(rows.len(), 1, "expected one row in:\n{stdout}");
+    assert!(rows[0].contains(&session_id), "{stdout}");
+    assert!(rows[0].contains("unreachable"), "{stdout}");
+    assert!(
+        record_for(home.path(), &session_id).exists(),
+        "a door that timed out must not unlink its record"
+    );
+    assert!(stray.is_alive(), "`mur ps` must signal nothing");
+
+    let output = mur(home.path())
+        .args(["watch", &session_id])
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-RUN-023"), "{stderr}");
+    assert!(
+        record_for(home.path(), &session_id).exists(),
+        "a door that timed out must not unlink its record"
+    );
+    drop(listener);
+}
