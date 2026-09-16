@@ -72,6 +72,13 @@ capsule writes reaches every open connection on either endpoint, so a `message/s
 carries the frames of other tasks running or queued on the same capsule, and closes on the first
 `final` status of any of them. Read the `id` key in each frame's `data` to tell tasks apart.
 
+A client that sends a message and waits for its own reply cannot match on that task id: the id is
+minted when the task is accepted and appears only in the frames, so it is not known when the request
+is made. Send a `contextId` of your own in the message instead — the capsule uses it verbatim and
+mints one only when it is absent — then match each frame on `context_id` in its `data` and ignore
+the rest. Without this, two senders that overlap both return on whichever task finishes first, and
+one of them reads a reply to a message it never sent.
+
 ### What `message/stream` writes, in order
 
 1. The response headers.
