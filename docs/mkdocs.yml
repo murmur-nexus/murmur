@@ -177,6 +177,7 @@ nav:
       - Resource Plane: reference/resource-plane.md
       - Agent Card: reference/agent-card.md
       - Observability Schemas: reference/observability-schemas.md
+      - Streaming Protocol: reference/streaming-protocol.md
       - Untrusted Fence: reference/untrusted-fence.md
       - Default Artifacts: reference/default-artifacts.md
       - Installing Artifacts: reference/installing-artifacts.md

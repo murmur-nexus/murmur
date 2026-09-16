@@ -963,7 +963,7 @@ Output format:
 ```
 
 The bracket after a tool name is the call's outcome, read from the
-[`artifact` frame](observability-schemas.md#task-stream-artifact-frame):
+[`artifact` frame](streaming-protocol.md#event-artifact):
 
 | Segment | Shown when |
 |---|---|
@@ -976,32 +976,28 @@ A capsule whose runtime reports no outcome prints no bracket.
 
 ### Heartbeat
 
-While no events are flowing, a capsule writes a heartbeat to every open `stream/watch`
-connection, so an idle capsule can be told apart from a closed one by reading bytes.
-`message/stream` writes the same heartbeat on the same cadence.
+`mur watch` reads the capsule's [heartbeat](streaming-protocol.md#heartbeat) and discards it; no
+heartbeat appears in its output. A pause in the output longer than 15 seconds means the capsule is
+busy, not gone.
 
-| Property | Value |
-|---|---|
-| Wire form | The comment line `:heartbeat`, followed by a blank line |
-| Interval | 15 seconds |
-| Event id | None — the line carries no `id:` field |
-| Replay buffer | Never entered, so a reconnect with `Last-Event-ID` never replays one |
+`mur watch` does not reconnect. When the connection ends without a
+[`capsule-closed`](streaming-protocol.md#event-capsule-closed) frame, it names the last
+[event id](streaming-protocol.md#event-ids) it received and exits. A capsule that exits, including
+one ended with [`mur stop`](#mur-stop), closes the connection without that frame:
 
-Skip lines beginning with `:` rather than reading them as events. A heartbeat leaves the
-`Last-Event-ID` sequence exactly where it was, so a client that counts events must not count it.
-`mur watch` discards these lines, and no heartbeat appears in its output.
+```text
+error[E-IO-003]: connection to ses_019ed2af53da75c2aefee84ee10c34af lost after event id 4 — the capsule may still be running; run mur watch again to reattach
+```
 
-**A pause longer than 15 seconds means the capsule is busy, not gone.** The connection is served
-on the same thread that runs the capsule's turn, so work the capsule does without pausing — an
-inference call, a tool call, a shell command it is waiting on — holds the heartbeat with it. A
-heartbeat that came due meanwhile goes out the moment the thread is free again, which makes the
-pause as long as the work was. A closed socket is what says the capsule is gone.
+What else it implements of the protocol is listed in
+[Streaming Protocol](streaming-protocol.md#mur-watch).
 
 Exit codes:
 
-- `0` — terminal state event received (`completed` or `failed`)
+- `0` — the capsule closed the stream with a `capsule-closed` frame
 - `1` — the session address named nothing running (`E-RUN-022`), the capsule did not answer
-  (`E-RUN-023`), or the connection failed
+  (`E-RUN-023`), the connection failed, or the connection was lost before the capsule closed the
+  stream (`E-IO-003`)
 
 ---
 

@@ -11,7 +11,8 @@ use crate::live_address::Target;
 ///
 /// Unlike `message/stream`, this does not submit a task. It passively observes the capsule's
 /// SSE stream, including any events buffered since the capsule started. The process stays
-/// connected across task turns and exits only when the capsule closes or Ctrl+C is pressed.
+/// connected across task turns. It returns `Ok` only on `capsule-closed`; a stream that ends any
+/// other way is `E_IO_003`, because the capsule behind it may still be running.
 ///
 /// The capsule is already resolved: a session address was verified against the running record
 /// before this ran, so an unreachable capsule is reported as such rather than as a refused
@@ -82,30 +83,77 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
         target.label()
     );
 
-    // SSE stream state
+    match read_stream(reader, &mut std::io::stdout().lock()) {
+        Ok(StreamEnd::CapsuleClosed) => {
+            eprintln!("[murmur] capsule closed");
+            Ok(())
+        }
+        Ok(StreamEnd::ConnectionLost { last_event_id }) => {
+            let position = match last_event_id {
+                Some(id) => format!("after event id {id}"),
+                None => "before any event".to_string(),
+            };
+            Err(CliError::new(
+                E_IO_003,
+                format!(
+                    "connection to {} lost {position} — the capsule may still be running; run \
+                     mur watch again to reattach",
+                    target.label()
+                ),
+            ))
+        }
+        Err(e) => Err(CliError::new(
+            E_IO_003,
+            format!("failed to write to stdout: {e}"),
+        )),
+    }
+}
+
+/// How a `stream/watch` connection ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StreamEnd {
+    /// The capsule wrote `capsule-closed`.
+    CapsuleClosed,
+    /// The stream reached EOF or a read error with no `capsule-closed`. `last_event_id` is the
+    /// `id:` of the last complete frame that carried one, or `None` when no such frame arrived.
+    /// Ids are not unique within a session, so it names a position for a person to read, not an
+    /// anchor to resume from.
+    ConnectionLost { last_event_id: Option<u64> },
+}
+
+/// Read a `stream/watch` SSE body to its end, rendering `status`, `artifact` and `text` frames to
+/// `out` and warnings to stderr.
+///
+/// `reader` is positioned after the HTTP response headers. Errors only when writing to `out`
+/// fails; a failed read ends the stream as [`StreamEnd::ConnectionLost`].
+pub(crate) fn read_stream(
+    mut reader: impl BufRead,
+    out: &mut impl Write,
+) -> std::io::Result<StreamEnd> {
     let mut conversation_mode = String::from("stateless");
     let mut task_context_map: HashMap<String, String> = HashMap::new();
     let mut context_turns: HashMap<String, u32> = HashMap::new();
 
-    // Parse SSE event stream
     let mut current_event_type = String::new();
     let mut current_data = String::new();
+    // An `id:` belongs to the frame it appears in, so it is recorded only once that frame's
+    // terminating blank line arrives.
+    let mut current_id: Option<u64> = None;
+    let mut last_event_id: Option<u64> = None;
 
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Err(_) => break,
+            Ok(0) | Err(_) => return Ok(StreamEnd::ConnectionLost { last_event_id }),
             Ok(_) => {}
         }
 
-        let line = line
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string();
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
 
         if line.is_empty() {
-            // Dispatch the accumulated event
+            if current_id.is_some() {
+                last_event_id = current_id;
+            }
             if !current_event_type.is_empty() && !current_data.is_empty() {
                 match current_event_type.as_str() {
                     "connection-ack" => {
@@ -124,47 +172,50 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
                             .unwrap_or(0);
                         eprintln!("[murmur] warning: buffer overflow — some earlier events were lost (first available id: {first_id})");
                     }
-                    "capsule-closed" => {
-                        eprintln!("[murmur] capsule closed");
-                        return Ok(());
-                    }
-                    _ => {
+                    "capsule-closed" => return Ok(StreamEnd::CapsuleClosed),
+                    "status" | "artifact" | "text" => {
+                        // A `final` status ends one task, not the capsule, so the watch goes on.
                         dispatch_sse_event(
+                            out,
                             &current_event_type,
                             &current_data,
                             &conversation_mode,
                             &mut task_context_map,
                             &mut context_turns,
-                        );
-                        // Do NOT exit on final — stream/watch persists across task turns.
+                        )?;
                     }
+                    // Reasoning chunks are not shown.
+                    "thinking" => {}
+                    // Forward compatibility: an event type this client does not know is skipped,
+                    // so the capsule can add one without breaking the watch.
+                    _ => {}
                 }
             }
             current_event_type.clear();
             current_data.clear();
+            current_id = None;
+        } else if line.starts_with(':') {
+            // A comment line — the heartbeat — is not part of any frame.
         } else if let Some(rest) = line.strip_prefix("event: ") {
             current_event_type = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("data: ") {
             current_data = rest.to_string();
-        } else if line.starts_with(':') {
-            // SSE comment (heartbeat) — ignore
         } else if let Some(rest) = line.strip_prefix("id: ") {
-            // Event ID — tracked by client for reconnection; not used in watch
-            let _ = rest;
+            current_id = rest.trim().parse().ok().or(current_id);
         }
     }
-
-    Ok(())
 }
 
-/// Print the event and return true if it was a final event.
+/// Render one `status`, `artifact` or `text` frame to `out`. Keys a frame carries beyond the ones
+/// read here are ignored.
 fn dispatch_sse_event(
+    out: &mut impl Write,
     event_type: &str,
     data: &str,
     conversation_mode: &str,
     task_context_map: &mut HashMap<String, String>,
     context_turns: &mut HashMap<String, u32>,
-) -> bool {
+) -> std::io::Result<()> {
     let is_final = data.contains("\"final\":true");
     let is_threaded = conversation_mode == "threaded";
 
@@ -212,34 +263,34 @@ fn dispatch_sse_event(
                     let prefix = format!("[{} / turn {turn} / {state}]", truncate_context_id(&cid));
 
                     if is_final {
-                        println!("{prefix}");
+                        writeln!(out, "{prefix}")?;
                         if state == "completed" {
                             if let Some(ref resp) = response {
                                 let col_width = terminal_width().saturating_sub(2);
                                 for line in wrap_text(resp, col_width) {
-                                    println!("  {line}");
+                                    writeln!(out, "  {line}")?;
                                 }
-                                println!();
+                                writeln!(out)?;
                             }
                         }
                         *context_turns.entry(cid).or_insert(1) += 1;
                     } else {
-                        println!("{prefix}  {message}");
+                        writeln!(out, "{prefix}  {message}")?;
                     }
                 } else {
                     if is_final {
-                        println!("[{state}]");
+                        writeln!(out, "[{state}]")?;
                         if state == "completed" {
                             if let Some(ref resp) = response {
                                 let col_width = terminal_width().saturating_sub(2);
                                 for line in wrap_text(resp, col_width) {
-                                    println!("  {line}");
+                                    writeln!(out, "  {line}")?;
                                 }
-                                println!();
+                                writeln!(out)?;
                             }
                         }
                     } else {
-                        println!("[{state}]  {message}");
+                        writeln!(out, "[{state}]  {message}")?;
                     }
                 }
             }
@@ -254,12 +305,12 @@ fn dispatch_sse_event(
                     .unwrap_or("");
                 let mut content_lines = content.lines();
                 if let Some(first) = content_lines.next() {
-                    println!("{header} | {first}");
+                    writeln!(out, "{header} | {first}")?;
                     for rest in content_lines {
-                        println!("  {rest}");
+                        writeln!(out, "  {rest}")?;
                     }
                 } else {
-                    println!("{header}");
+                    writeln!(out, "{header}")?;
                 }
             }
         }
@@ -267,8 +318,8 @@ fn dispatch_sse_event(
             if let Ok(event) = serde_json::from_str::<Value>(data) {
                 if let Some(text) = event.get("text").and_then(Value::as_str) {
                     if !text.is_empty() {
-                        print!("{text}");
-                        let _ = std::io::stdout().flush();
+                        write!(out, "{text}")?;
+                        out.flush()?;
                     }
                 }
             }
@@ -276,7 +327,7 @@ fn dispatch_sse_event(
         _ => {}
     }
 
-    is_final
+    Ok(())
 }
 
 /// Truncate a context ID for display: "ctx_XXXXXXXX..." (first 8 hex chars after the prefix).
@@ -353,7 +404,113 @@ fn artifact_header(artifact: &Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::artifact_header;
+    use super::{artifact_header, read_stream, StreamEnd};
+
+    /// Read `body` as a `stream/watch` SSE body, returning how it ended and what was rendered.
+    fn read(body: &str) -> (StreamEnd, String) {
+        let mut out = Vec::new();
+        let end = read_stream(body.as_bytes(), &mut out).unwrap();
+        (end, String::from_utf8(out).unwrap())
+    }
+
+    const ACK: &str =
+        "event: connection-ack\ndata: {\"role\":\"observer\",\"conversation_mode\":\"stateless\"}\n\n";
+
+    #[test]
+    fn capsule_closed_ends_the_stream_as_closed() {
+        let body = format!("{ACK}event: capsule-closed\ndata: {{}}\n\n");
+        assert_eq!(read(&body).0, StreamEnd::CapsuleClosed);
+    }
+
+    #[test]
+    fn eof_after_frames_with_ids_reports_the_last_id() {
+        let body = format!(
+            "{ACK}id: 0\nevent: status\ndata: {{\"id\":\"tsk_1\",\"status\":{{\"state\":\"working\",\"message\":\"inference turn 1\"}},\"final\":false}}\n\n\
+             id: 7\nevent: text\ndata: {{\"id\":\"tsk_1\",\"text\":\"hi\",\"final\":false}}\n\n"
+        );
+        assert_eq!(
+            read(&body).0,
+            StreamEnd::ConnectionLost {
+                last_event_id: Some(7)
+            }
+        );
+    }
+
+    #[test]
+    fn eof_after_only_the_ack_reports_no_id() {
+        assert_eq!(
+            read(ACK).0,
+            StreamEnd::ConnectionLost {
+                last_event_id: None
+            }
+        );
+    }
+
+    #[test]
+    fn frames_without_an_id_keep_the_last_recorded_id() {
+        let body = format!(
+            "id: 4\nevent: text\ndata: {{\"id\":\"tsk_1\",\"text\":\"\",\"final\":true}}\n\n\
+             event: gap\ndata: {{\"first_available_id\":2}}\n\n{ACK}"
+        );
+        assert_eq!(
+            read(&body).0,
+            StreamEnd::ConnectionLost {
+                last_event_id: Some(4)
+            }
+        );
+    }
+
+    #[test]
+    fn an_id_is_recorded_only_once_its_frame_is_complete() {
+        let body = "id: 4\nevent: text\ndata: {\"id\":\"tsk_1\",\"text\":\"\",\"final\":true}\n\n\
+                    id: 5\nevent: text\n";
+        assert_eq!(
+            read(body).0,
+            StreamEnd::ConnectionLost {
+                last_event_id: Some(4)
+            }
+        );
+    }
+
+    #[test]
+    fn heartbeat_changes_nothing() {
+        let frame = "id: 3\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"working\",\"message\":\"inference turn 1\"},\"final\":false}\n\n";
+        let with = format!("{ACK}:heartbeat\n\n{frame}:heartbeat\n\n");
+        let without = format!("{ACK}{frame}");
+        assert_eq!(read(&with), read(&without));
+        assert_eq!(
+            read(&with).0,
+            StreamEnd::ConnectionLost {
+                last_event_id: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn thinking_and_unknown_event_types_are_consumed_without_ending_the_stream() {
+        let body = format!(
+            "{ACK}id: 1\nevent: thinking\ndata: {{\"id\":\"tsk_1\",\"text\":\"hmm\",\"final\":false}}\n\n\
+             id: 2\nevent: some-future-type\ndata: {{\"anything\":true}}\n\n\
+             event: capsule-closed\ndata: {{}}\n\n"
+        );
+        let (end, rendered) = read(&body);
+        assert_eq!(end, StreamEnd::CapsuleClosed);
+        assert_eq!(rendered, "");
+    }
+
+    #[test]
+    fn unknown_keys_render_as_if_absent() {
+        let plain = "event: status\ndata: {\"id\":\"tsk_1\",\"context_id\":\"ctx_1\",\"status\":{\"state\":\"completed\",\"message\":\"session ended\",\"response\":\"done\"},\"final\":true}\n\n\
+                     event: artifact\ndata: {\"id\":\"tsk_1\",\"artifact\":{\"tool_name\":\"bash\",\"content\":\"a\\nb\",\"fence_source\":null,\"tool_call_id\":\"c1\",\"is_error\":false,\"duration_ms\":4,\"exit_code\":0,\"truncated\":false}}\n\n";
+        let extended = "event: status\ndata: {\"id\":\"tsk_1\",\"context_id\":\"ctx_1\",\"extra\":1,\"status\":{\"state\":\"completed\",\"message\":\"session ended\",\"response\":\"done\",\"new_key\":[1]},\"final\":true}\n\n\
+                        event: artifact\ndata: {\"id\":\"tsk_1\",\"later\":{},\"artifact\":{\"tool_name\":\"bash\",\"content\":\"a\\nb\",\"fence_source\":null,\"tool_call_id\":\"c1\",\"is_error\":false,\"duration_ms\":4,\"exit_code\":0,\"truncated\":false,\"summary\":\"x\"}}\n\n";
+        let (_, plain_out) = read(plain);
+        assert_eq!(
+            plain_out,
+            "[completed]\n  done\n\n[artifact] tool: bash [ok, exit 0, 4ms] | a\n  b\n"
+        );
+        assert_eq!(read(extended).1, plain_out);
+    }
 
     #[test]
     fn successful_shell_call_reports_ok_exit_and_duration() {
