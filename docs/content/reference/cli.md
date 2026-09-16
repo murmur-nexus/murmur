@@ -826,10 +826,14 @@ decides both the `STATUS` column and whether the record survives the read.
 | No process holds the process id | No row | Unlinked | `no process holds pid N` |
 | The process holding the process id started at another time | No row | Unlinked | `pid N is held by a process that started at another time` |
 
-Neither a quiet door nor a start time that could not be read is evidence that the process is gone.
-An `unreachable` capsule may be mid-turn, including busy with synchronous work inside a turn that
-keeps its door from answering until that work returns, and unlinking its record would throw away
-the only handle anyone has on something still running.
+Neither a quiet door nor a start time that could not be read is evidence that the process is gone,
+and unlinking the record would throw away the only handle anyone has on something still running. A
+capsule's door is served apart from its turns, so a capsule busy with a turn still reads `running`.
+A capsule whose process is alive reads `unreachable` when:
+
+- the process is suspended, for example by `SIGSTOP` or a debugger
+- the host is too loaded to schedule the capsule within the probe's deadline
+- the capsule's runtime has every thread it serves requests on occupied
 
 Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
 so the first row is what `@1` names.
@@ -991,11 +995,10 @@ Skip lines beginning with `:` rather than reading them as events. A heartbeat le
 `Last-Event-ID` sequence exactly where it was, so a client that counts events must not count it.
 `mur watch` discards these lines, and no heartbeat appears in its output.
 
-**A pause longer than 15 seconds means the capsule is busy, not gone.** The connection is served
-on the same thread that runs the capsule's turn, so work the capsule does without pausing — an
-inference call, a tool call, a shell command it is waiting on — holds the heartbeat with it. A
-heartbeat that came due meanwhile goes out the moment the thread is free again, which makes the
-pause as long as the work was. A closed socket is what says the capsule is gone.
+The heartbeat is written apart from the capsule's turns, so it keeps its cadence while a turn is
+running — through an inference call, a tool call, or a shell command the capsule is waiting on.
+A pause longer than 15 seconds means the process is suspended or the host is too loaded to run it.
+A closed socket is what says the capsule is gone.
 
 Exit codes:
 

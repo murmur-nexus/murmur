@@ -875,8 +875,8 @@ impl HookRuntime {
     /// `instantiate_async` is required because the engine has `async_support(true)`.
     ///
     /// Must be called from inside a `tokio::task::LocalSet` whenever any staged hook is
-    /// async: the workers are `spawn_local` tasks, because a `Store<HookStoreState>` is not
-    /// `Send`. The session's `LocalSet` in `runtime.rs` is that context.
+    /// async: the workers are `spawn_local` tasks, tied to the thread running the agent loop.
+    /// The session's `LocalSet` in `runtime.rs` is that context.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         engine: &wasmtime::Engine,
