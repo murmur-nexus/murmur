@@ -128,7 +128,9 @@ fn install_refuses_a_release_that_publishes_no_asset_for_this_platform() {
         .stderr(predicate::str::contains("E-REG-001"))
         .stderr(predicate::str::contains(current_platform()))
         .stderr(predicate::str::contains("mur build"))
-        .stderr(predicate::str::contains("ask the publisher"));
+        .stderr(predicate::str::contains("ask the publisher"))
+        .stderr(predicate::str::contains("mur doctor").not())
+        .stderr(predicate::str::contains("E-REG-006").not());
     for platform in &platforms {
         assertion = assertion.stderr(predicate::str::contains(*platform));
     }

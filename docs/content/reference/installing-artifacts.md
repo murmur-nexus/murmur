@@ -50,6 +50,8 @@ The `token` field accepts three forms:
 | `MY_TOKEN` | Value of the `MY_TOKEN` env var, or the literal string if the var is unset |
 | `ghp_abc123` | Used as-is |
 
+Lookups sent without a token share GitHub's limit of 60 API requests an hour per IP address, and one artifact lookup can spend up to four of them. A token raises the limit. A lookup refused by the limit fails with [`E-REG-006`](diagnostics.md#e-reg-006), not `E-REG-001`.
+
 ## Multiple sources and fallthrough
 
 For lookups by name, configured sources are tried in the order they appear in the effective

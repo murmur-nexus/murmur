@@ -186,14 +186,19 @@ pub(crate) fn ensure_artifact_for_deploy(
                 sha256,
             })
         }
-        Err(chain_err) => Err(crate::error::CliError::new(
-            E_REG_001,
-            format!(
-                "artifact {name}@{version} not found locally or in any source\n  \
-                 source chain: {chain_err}\n  \
-                 hint: check your source config or run `mur doctor`"
-            ),
-        )),
+        Err(chain_err) => {
+            let diagnosis = chain_err.diagnosis();
+            let headline = if diagnosis.code == E_REG_001 {
+                format!("artifact {name}@{version} not found locally or in any source")
+            } else {
+                format!("artifact {name}@{version} is not in the local store")
+            };
+            Err(crate::error::CliError {
+                code: diagnosis.code,
+                message: format!("{headline}\n  source chain: {}", diagnosis.message),
+                hint: diagnosis.hint,
+            })
+        }
     }
 }
 

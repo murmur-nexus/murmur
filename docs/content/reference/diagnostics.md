@@ -45,11 +45,12 @@ section that explains it.
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), or an `inference.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
-| `E-REG-001` | Artifact not found in registry, or found in a release that publishes no asset for the host platform | [`mur install`](cli.md#mur-install) |
+| `E-REG-001` | Artifact not found in registry, or every configured source answered that it has no such artifact or no asset for the host platform | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`) | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-005` | A registry-resolved artifact's version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused, unreachable, or misconfigured — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
 | `E-RUN-003` | Unsupported `lock_version`, missing lock entry, or a lock entry with no hash for this host's platform | [Lockfile](workdir.md#lockfile-murmurlock) |
@@ -1008,6 +1009,34 @@ A wasm or native artifact declares an obvious build input in `requires_files:` �
 payload, not the sources it was built from, so this is almost always a stray declaration.
 
 Static artifacts (`runtime: skill`) are exempt: their files *are* their content.
+
+---
+
+## Registry errors
+
+### E-REG-006 — a source did not answer the lookup { #e-reg-006 }
+
+`mur install`, `mur install --all-platforms` and `mur deploy run` look an artifact up in each
+source of the [source chain](installing-artifacts.md#multiple-sources-and-fallthrough). When no
+source produces it and at least one source failed to answer, the install fails with `E-REG-006`
+rather than [`E-REG-001`](cli.md#mur-install): one source may publish the artifact. Each source
+gets one line with what it returned:
+
+```text
+error[E-REG-006]: could not look up 'murmur-driver-anthropic': a source did not answer, so whether it publishes the artifact is not known
+  github:murmur-nexus/default-artifacts — rate limited by GitHub (HTTP 403): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
+  hint: GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; authenticate with `export GITHUB_TOKEN=$(gh auth token)` (or any GitHub token), or set `token: ${GITHUB_TOKEN}` on the source in config.yaml to keep it
+```
+
+An explicit `mur install github:<owner>/<repo>@<tag>` reports a rate limit the same way.
+
+| Source line | Meaning | Fix |
+|---|---|---|
+| `rate limited by GitHub (HTTP 403)` or `(HTTP 429)`, requests sent without a token | The anonymous limit for this IP address is spent | Export `GITHUB_TOKEN`, or set `token:` on the source — see [Authentication](installing-artifacts.md#authentication) |
+| `rate limited by GitHub`, requests sent with a token | The token's own limit is spent | Retry after the reset the line shows |
+| `HTTP 401` or `HTTP 403` without `rate limited` | GitHub refused the token — for example, an organization's SAML enforcement, or a revoked token | Authorize or replace the token |
+| `HTTP 5xx`, `request failed: …` | GitHub or the network did not answer | Retry |
+| `invalid github repo …`, ``missing `repo` …`` | The source entry is misconfigured | Fix the entry in the [`registry:` section](config.md#registry-section) |
 
 ---
 
