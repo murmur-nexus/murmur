@@ -183,9 +183,15 @@ A 200 response confirms the capsule is running:
     "shell": true,
     "network": false,
     "streaming": true
+  },
+  "serves": {
+    "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+    "planes": []
   }
 }
 ```
+
+See [Agent Card](../reference/agent-card.md) for what each key means.
 
 ---
 
