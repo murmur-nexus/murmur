@@ -9,6 +9,20 @@ use tokio::sync::broadcast;
 
 pub(crate) type SseBroadcast = broadcast::Sender<Arc<String>>;
 
+/// Cadence at which an idle SSE connection writes [`SSE_HEARTBEAT_COMMENT`].
+///
+/// Shared by `message/stream` and `stream/watch` so the two endpoints present one
+/// liveness contract. Not configurable.
+pub(crate) const SSE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The liveness signal written to an idle SSE connection.
+///
+/// An SSE comment, not a frame: it carries no `id:` line, is written straight to the
+/// socket rather than through [`emit_sse`] or [`SseEventBuffer::push`], and so consumes
+/// no event id and never enters the replay buffer. A client that counts events sees
+/// none of these.
+pub(crate) const SSE_HEARTBEAT_COMMENT: &[u8] = b":heartbeat\n\n";
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TaskStatusUpdateEvent {
     pub id: String,

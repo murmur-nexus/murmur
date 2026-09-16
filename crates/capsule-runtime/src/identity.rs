@@ -20,7 +20,8 @@ use crate::resource_plane::{
 };
 use crate::streaming::{
     format_gap_event, format_sse_event, is_final_sse_event, ReplayResult, SseBroadcast,
-    SseEventBuffer, StreamStatus, TaskStatusUpdateEvent,
+    SseEventBuffer, StreamStatus, TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT,
+    SSE_HEARTBEAT_INTERVAL,
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
 
@@ -505,14 +506,14 @@ async fn handle_message_stream(
     }
 
     // Forward broadcast events to the SSE stream
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // consume the immediate first tick
 
     loop {
         tokio::select! {
             biased;
             _ = heartbeat.tick() => {
-                if writer.write_all(b":heartbeat\n\n").await.is_err() {
+                if writer.write_all(SSE_HEARTBEAT_COMMENT).await.is_err() {
                     return;
                 }
             }
@@ -544,6 +545,11 @@ async fn handle_message_stream(
 /// replays buffered events, then forwards live events until the capsule shuts down or
 /// the client disconnects. A `final: true` status event ends one task turn but does NOT
 /// close this connection — the observer stays alive across turns.
+///
+/// While no events flow, writes [`SSE_HEARTBEAT_COMMENT`] every [`SSE_HEARTBEAT_INTERVAL`] so
+/// an observer can tell an idle capsule from a dead socket. The handler runs on the session's
+/// `LocalSet`, so the heartbeat only fires when that thread reaches an await point: synchronous
+/// work inside a turn stalls it until the thread is released.
 async fn handle_stream_watch(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     last_event_id: Option<u64>,
@@ -590,23 +596,37 @@ async fn handle_stream_watch(
         }
     }
 
+    let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
+    heartbeat.tick().await; // consume the immediate first tick
+
     loop {
-        match rx.recv().await {
-            Ok(event_arc) => {
-                if writer.write_all(event_arc.as_bytes()).await.is_err() {
+        tokio::select! {
+            biased;
+            _ = heartbeat.tick() => {
+                // A failed write means the observer is gone; there is nothing left to serve.
+                if writer.write_all(SSE_HEARTBEAT_COMMENT).await.is_err() {
                     return;
                 }
-                // Do NOT exit on is_final_sse_event — final ends one task turn, not the capsule.
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                let _ = writer
-                    .write_all(b"event: capsule-closed\ndata: {}\n\n")
-                    .await;
-                return;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                eprintln!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
-                continue;
+            result = rx.recv() => {
+                match result {
+                    Ok(event_arc) => {
+                        if writer.write_all(event_arc.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        // Do NOT exit on is_final_sse_event — final ends one task turn, not the capsule.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = writer
+                            .write_all(b"event: capsule-closed\ndata: {}\n\n")
+                            .await;
+                        return;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -901,6 +921,125 @@ mod tests {
         assert!(
             matches!(err, RuntimeError::PortInUse { port: p } if p == port),
             "expected PortInUse {{ port: {port} }}, got {err}"
+        );
+    }
+
+    /// The heartbeat shares the session's `LocalSet` with the agent loop, so it can only fire
+    /// when that thread reaches an await point. This reproduces that shape — a `spawn_local`ed
+    /// `handle_stream_watch` alongside a `spawn_local`ed task that holds the thread with
+    /// `std::thread::sleep` across a due tick — and asserts what a client actually reads:
+    /// nothing while the thread is held, and a heartbeat once it is released.
+    ///
+    /// Moving the door off the session thread is a separate concern; this test records the
+    /// current behaviour rather than a desired one.
+    #[tokio::test]
+    async fn stream_watch_heartbeat_stalls_while_session_thread_is_blocked() {
+        use std::io::{BufRead, BufReader};
+        use std::time::{Duration, Instant};
+
+        // Longer than one heartbeat interval, so a tick falls due inside the blocked stretch.
+        const BLOCK: Duration = Duration::from_secs(20);
+        // How long to keep reading after the thread is released, to see whether ticks resume.
+        const OBSERVE_AFTER_RELEASE: Duration = Duration::from_secs(8);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Read the client side on its own OS thread: the runtime thread is about to be
+        // unavailable, which is the whole point.
+        let (line_tx, line_rx) = std::sync::mpsc::channel::<(Instant, String)>();
+        let client = std::thread::spawn(move || {
+            let sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(
+                BLOCK + OBSERVE_AFTER_RELEASE + Duration::from_secs(10),
+            ))
+            .unwrap();
+            let mut reader = BufReader::new(sock);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if line_tx.send((Instant::now(), line)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+
+        let local = tokio::task::LocalSet::new();
+        let (connected_at, blocked_at) = local
+            .run_until(async {
+                let (sock, _peer) = listener.accept().await.unwrap();
+                let connected_at = Instant::now();
+                // Hold the read half so the socket stays open for the whole measurement.
+                let (_read_half, write_half) = sock.into_split();
+                tokio::task::spawn_local(handle_stream_watch(
+                    write_half,
+                    Some(0),
+                    sse_tx.clone(),
+                    Arc::clone(&sse_buffer),
+                    "stateless".to_string(),
+                ));
+
+                // Let the handler write its preamble and settle into the receive loop before
+                // the thread is taken away from it.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                let blocked_at = Instant::now();
+                tokio::task::spawn_local(async { std::thread::sleep(BLOCK) })
+                    .await
+                    .unwrap();
+
+                tokio::time::sleep(OBSERVE_AFTER_RELEASE).await;
+                (connected_at, blocked_at)
+            })
+            .await;
+
+        // Dropping the LocalSet drops the handler, closing the socket and ending the reader.
+        drop(local);
+        drop(sse_tx);
+        client.join().unwrap();
+
+        let released_at = blocked_at + BLOCK;
+        let heartbeats: Vec<Instant> = line_rx
+            .try_iter()
+            .filter(|(_, line)| line.trim_end() == ":heartbeat")
+            .map(|(at, _)| at)
+            .collect();
+
+        let arrivals: Vec<Duration> = heartbeats
+            .iter()
+            .map(|at| at.duration_since(connected_at))
+            .collect();
+        // Reported so the measurement can be re-read rather than re-derived.
+        eprintln!(
+            "[heartbeat] thread held from {:?} to {:?} after connect; heartbeats arrived at {arrivals:?}",
+            blocked_at.duration_since(connected_at),
+            released_at.duration_since(connected_at)
+        );
+        assert!(
+            !heartbeats.is_empty(),
+            "heartbeat never resumed after the session thread was released; arrivals: {arrivals:?}"
+        );
+
+        let first = heartbeats[0];
+        assert!(
+            first + Duration::from_millis(100) >= released_at,
+            "a heartbeat arrived while the session thread was blocked: first at {:?} after \
+             connect, thread released at {:?} after connect",
+            first.duration_since(connected_at),
+            released_at.duration_since(connected_at)
+        );
+        assert!(
+            first.duration_since(connected_at) > SSE_HEARTBEAT_INTERVAL,
+            "the tick due at {SSE_HEARTBEAT_INTERVAL:?} was expected to be stalled past its \
+             deadline, but the first heartbeat arrived at {:?}",
+            first.duration_since(connected_at)
         );
     }
 }

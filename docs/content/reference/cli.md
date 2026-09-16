@@ -959,6 +959,29 @@ Output format:
 [completed]
 ```
 
+### Heartbeat
+
+While no events are flowing, a capsule writes a heartbeat to every open `stream/watch`
+connection, so an idle capsule can be told apart from a closed one by reading bytes.
+`message/stream` writes the same heartbeat on the same cadence.
+
+| Property | Value |
+|---|---|
+| Wire form | The comment line `:heartbeat`, followed by a blank line |
+| Interval | 15 seconds |
+| Event id | None — the line carries no `id:` field |
+| Replay buffer | Never entered, so a reconnect with `Last-Event-ID` never replays one |
+
+Skip lines beginning with `:` rather than reading them as events. A heartbeat leaves the
+`Last-Event-ID` sequence exactly where it was, so a client that counts events must not count it.
+`mur watch` discards these lines, and no heartbeat appears in its output.
+
+**A pause longer than 15 seconds means the capsule is busy, not gone.** The connection is served
+on the same thread that runs the capsule's turn, so work the capsule does without pausing — an
+inference call, a tool call, a shell command it is waiting on — holds the heartbeat with it. A
+heartbeat that came due meanwhile goes out the moment the thread is free again, which makes the
+pause as long as the work was. A closed socket is what says the capsule is gone.
+
 Exit codes:
 
 - `0` — terminal state event received (`completed` or `failed`)
