@@ -101,22 +101,7 @@ fn end_turn(text: &str) -> String {
 
 /// One Anthropic response that asks for a tool, so the loop takes the `tool_call` arm.
 fn tool_call() -> String {
-    json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{
-            "type": "tool_use",
-            "id": "toolu_1",
-            "name": "bash",
-            "input": {"command": "echo hello"}
-        }],
-        "stop_reason": "tool_use",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 10, "output_tokens": 5}
-    })
-    .to_string()
+    tool_call_named("toolu_1", "bash")
 }
 
 /// A capsule manifest declaring the driver, `blocks` of extra top-level YAML, and the hooks.
@@ -523,5 +508,135 @@ fn a_record_store_that_is_not_one_segment_refuses_the_launch() {
         .stderr(predicate::str::contains("single path segment"));
 
     assert!(!f.home.path().join(".murmur/conversations").exists());
+    drop(f.project);
+}
+
+// ── fence labels ─────────────────────────────────────────────────────────────
+
+/// One Anthropic response asking for `name`, so a turn can exercise any dispatch shape. Scripts
+/// the same `echo hello` input whatever the tool, which a skill and an undeclared tool both ignore.
+fn tool_call_named(call_id: &str, name: &str) -> String {
+    json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{
+            "type": "tool_use",
+            "id": call_id,
+            "name": name,
+            "input": {"command": "echo hello"}
+        }],
+        "stop_reason": "tool_use",
+        "stop_sequence": Value::Null,
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    })
+    .to_string()
+}
+
+/// The `fence` key on a record line, or `None` when the line carries none.
+fn fence_of(message: &Value) -> Option<&str> {
+    message.get("fence").map(|value| {
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("the fence key is a string: {message}"))
+    })
+}
+
+/// The record labels exactly the lines whose content is fenced.
+///
+/// One run, four turns: a declared shell tool (fenced), a declared skill (never fenced), an
+/// undeclared tool whose dispatch fails before any tool ran (never fenced), and a plain reply.
+/// A consumer reading `conversation.jsonl` keys off `fence` rather than matching a marker
+/// against the content — and the content still carries the markers either way, because the
+/// record is what the next run replays into the model's context.
+#[test]
+fn the_record_labels_a_fenced_tool_message() {
+    // The shell grant below makes this capsule need host support the rest of this file does not.
+    if common::skip_without_host_support("the_record_labels_a_fenced_tool_message") {
+        return;
+    }
+    const SKILL_NAME: &str = "house-style";
+    const SKILL_TEXT: &str = "# House style\n\nPrefer short sentences.";
+
+    let f = fixture(
+        vec![
+            tool_call(),
+            tool_call_named("toolu_skill", SKILL_NAME),
+            tool_call_named("toolu_missing", "no-such-tool"),
+            end_turn("done"),
+        ],
+        "",
+        &[],
+    );
+
+    let skill = common::create_skill_artifact(f._artifacts.path(), SKILL_NAME, "0.1.0", SKILL_TEXT);
+    common::publish_local(&f.home, &skill).success();
+
+    // `create_manifest` writes neither a shell grant nor a skill entry, and both are needed for
+    // this run's first two turns to dispatch rather than fail.
+    let manifest = fs::read_to_string(&f.manifest)
+        .unwrap()
+        .replace(
+            "capabilities:\n  network:\n",
+            "capabilities:\n  shell:\n    allow:\n      - bash\n  network:\n",
+        )
+        .replace(
+            "    runtime: driver\n",
+            &format!("    runtime: driver\n  - name: {SKILL_NAME}\n    version: 0.1.0\n    runtime: skill\n"),
+        );
+    fs::write(&f.manifest, manifest).unwrap();
+
+    run(&f.home, &f.manifest, &["--context", CONTEXT_ID]);
+
+    let messages = record_messages(&f.home, CAPSULE_NAME, CONTEXT_ID);
+    let labelled: Vec<(&str, Option<&str>)> = messages
+        .iter()
+        .map(|message| (message["role"].as_str().unwrap(), fence_of(message)))
+        .collect();
+    assert_eq!(
+        labelled,
+        vec![
+            // The task, launched locally, so `user` origin and trusted.
+            ("user", None),
+            ("assistant", None),
+            ("tool", Some("tool:bash")),
+            ("assistant", None),
+            ("tool", None),
+            ("assistant", None),
+            ("tool", None),
+            ("assistant", None),
+        ],
+        "{messages:#?}"
+    );
+
+    let fenced_text = messages[2]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        fenced_text.starts_with("<untrusted-content source=tool:bash>")
+            && fenced_text.ends_with("</untrusted-content>"),
+        "a labelled line still carries the markers verbatim: {fenced_text}"
+    );
+
+    let skill_text = messages[4]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        skill_text, SKILL_TEXT,
+        "a skill result is unlabelled and unfenced"
+    );
+
+    let failure_text = messages[6]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !failure_text.contains("untrusted-content"),
+        "a dispatch failure is unlabelled and unfenced: {failure_text}"
+    );
+
+    // What the record labels is never what the driver receives.
+    for request in f.server.requests() {
+        for message in request_messages(&request) {
+            assert!(
+                message.get("fence").is_none(),
+                "the fence key must not reach the driver: {message}"
+            );
+        }
+    }
     drop(f.project);
 }

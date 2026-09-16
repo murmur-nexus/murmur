@@ -27,6 +27,9 @@ use zip::{
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
+const SKILL_NAME: &str = "house-style";
+const SKILL_VERSION: &str = "0.1.0";
+
 const STREAMING_DRIVER_NAME: &str = "streaming-driver";
 const STREAMING_DRIVER_VERSION: &str = "0.1.0";
 
@@ -84,6 +87,17 @@ fn tool_then_end_turn_server(
 }
 
 fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
+    setup_agent_project_with_skill(endpoint, None)
+}
+
+/// `setup_agent_project`, optionally declaring a skill artifact carrying `skill_content`.
+///
+/// A skill is the one dispatch branch that reaches the model unfenced, so it is the shape an
+/// artifact frame's `fence_source: null` has to be checked against.
+fn setup_agent_project_with_skill(
+    endpoint: &str,
+    skill_content: Option<&str>,
+) -> (TempDir, PathBuf) {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -96,10 +110,20 @@ fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
     );
     common::publish_local(&home, &driver_artifact).success();
 
+    let skill_entry = match skill_content {
+        Some(content) => {
+            let skill =
+                common::create_skill_artifact(artifacts.path(), SKILL_NAME, SKILL_VERSION, content);
+            common::publish_local(&home, &skill).success();
+            format!("  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n")
+        }
+        None => String::new(),
+    };
+
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: streaming-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+            "name: streaming-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n{skill_entry}capabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -784,5 +808,150 @@ fn streaming_non_streaming_driver_fallback() {
     assert!(
         completed.is_some(),
         "should have received status:completed event; got events: {events:?}"
+    );
+}
+
+// ── artifact-frame fence labels ────────────────────────────────────────────────
+
+/// Run one streamed task and hand back the parsed `artifact` frames in arrival order.
+fn artifact_frames(
+    server_endpoint_setup: (TempDir, PathBuf),
+) -> (Vec<Value>, capsule_runtime::LaunchResult) {
+    let (home, manifest_path) = server_endpoint_setup;
+    let staged = stage_agent(&home, &manifest_path);
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+        .expect("launch should succeed")
+    });
+
+    let capsule_url = url_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("timed out waiting for capsule_url");
+    let events = collect_sse_events(&capsule_url, None, Duration::from_secs(30));
+    let launched = handle.join().expect("launch thread should not panic");
+
+    let frames: Vec<Value> = events
+        .iter()
+        .filter(|e| e.event_type == "artifact")
+        .map(|e| serde_json::from_str(&e.data).expect("artifact frame data is JSON"))
+        .collect();
+    assert!(
+        !frames.is_empty(),
+        "expected at least one artifact frame; got events: {events:?}"
+    );
+    (frames, launched)
+}
+
+/// An ordinary tool result's frame names the source its content is fenced under, and carries
+/// the fenced bytes the model read — not a rewritten or stripped copy of them.
+#[test]
+fn artifact_frame_names_the_fence_source_of_a_tool_result() {
+    if common::skip_without_host_support("artifact_frame_names_the_fence_source_of_a_tool_result") {
+        return;
+    }
+    let server = tool_then_end_turn_server("bash", "echo hello_from_tool", "tool done");
+    let (frames, _launched) = artifact_frames(setup_agent_project(&server.endpoint));
+
+    let artifact = &frames[0]["artifact"];
+    assert_eq!(artifact["tool_name"], "bash");
+    assert_eq!(
+        artifact["fence_source"], "tool:bash",
+        "the frame must name the fence source; got: {artifact}"
+    );
+
+    let content = artifact["content"].as_str().expect("content is a string");
+    assert!(
+        content.starts_with("<untrusted-content source=tool:bash>"),
+        "content must be the fenced bytes the model received: {content}"
+    );
+    assert!(
+        content.ends_with("</untrusted-content>"),
+        "content must still close its fence: {content}"
+    );
+    assert!(
+        content.contains("hello_from_tool"),
+        "the tool's own output must be inside the fence: {content}"
+    );
+}
+
+/// A dispatch that never reached a tool produces the runtime's own text, so the frame says so
+/// with `fence_source: null` rather than by leaving the key off.
+#[test]
+fn artifact_frame_of_a_dispatch_failure_carries_no_fence() {
+    if common::skip_without_host_support("artifact_frame_of_a_dispatch_failure_carries_no_fence") {
+        return;
+    }
+    // A tool the capsule never declared: `dispatch_agent_tool_async` returns `Err` and the turn
+    // loop emits the error-arm frame.
+    let server = tool_then_end_turn_server("no-such-tool", "irrelevant", "recovered");
+    let (frames, _launched) = artifact_frames(setup_agent_project(&server.endpoint));
+
+    let artifact = &frames[0]["artifact"];
+    assert!(
+        artifact.get("fence_source").is_some(),
+        "the key is present on every frame: {artifact}"
+    );
+    assert!(
+        artifact["fence_source"].is_null(),
+        "a dispatch failure carries no fence: {artifact}"
+    );
+
+    let content = artifact["content"].as_str().expect("content is a string");
+    assert!(
+        !content.contains("<untrusted-content") && !content.contains("</untrusted-content>"),
+        "the runtime's own failure text must carry no marker: {content}"
+    );
+}
+
+/// A skill result is the capsule author's own guidance and reaches the model unfenced, so its
+/// frame says `null` while still naming the skill in `tool_name`.
+#[test]
+fn artifact_frame_of_a_skill_result_carries_no_fence() {
+    if common::skip_without_host_support("artifact_frame_of_a_skill_result_carries_no_fence") {
+        return;
+    }
+    let guidance = "# House style\n\nPrefer short sentences.";
+    let server = tool_then_end_turn_server(SKILL_NAME, "unused", "read it");
+    let (frames, launched) = artifact_frames(setup_agent_project_with_skill(
+        &server.endpoint,
+        Some(guidance),
+    ));
+
+    let artifact = &frames[0]["artifact"];
+    assert_eq!(artifact["tool_name"], SKILL_NAME);
+    assert!(
+        artifact.get("fence_source").is_some(),
+        "the key is present on every frame: {artifact}"
+    );
+    assert!(
+        artifact["fence_source"].is_null(),
+        "a skill result carries no fence: {artifact}"
+    );
+    assert_eq!(
+        artifact["content"].as_str(),
+        Some(guidance),
+        "the skill.md text must reach the frame verbatim: {artifact}"
+    );
+
+    let events: Vec<Value> = fs::read_to_string(launched.workdir.join("trace.jsonl"))
+        .expect("trace.jsonl should exist")
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "skill_call"),
+        "the skill dispatch must still trace as skill_call; got: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["event_type"] == "tool_call"),
+        "a skill dispatch writes no tool_call event; got: {events:#?}"
     );
 }

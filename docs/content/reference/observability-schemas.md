@@ -173,7 +173,7 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `tool_call_id` | string \| null | The provider's own id for this call, recorded verbatim and never parsed. It is what pairs this line with the tool-result message the runtime sent back. `null` when the provider named none |
 | `input` | object | The tool input, as the model supplied it |
 | `input_bytes` | u64 | Byte length of the serialized tool input |
-| `output` | string | The tool output text, with peer handle tokens redacted. Carries the [untrusted fence](../concepts/access-control.md#threat-model) the model received it inside. Written only under [`trace.capture: content`](manifest.md#field-trace) |
+| `output` | string | The tool output text, with peer handle tokens redacted. Carries the [untrusted fence](untrusted-fence.md) the model received it inside. Written only under [`trace.capture: content`](manifest.md#field-trace) |
 | `output_bytes` | u64 | Byte length of the tool output text, fence markers included |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
@@ -187,7 +187,7 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `turn` | u32 | |
 | `task_id` | string \| null | The task this call belongs to. `null` when no task is in scope |
 | `skill_name` | string | |
-| `output_bytes` | u64 | Byte length of the returned `skill.md` text. A skill result carries no fence |
+| `output_bytes` | u64 | Byte length of the returned `skill.md` text. A skill result carries no [fence](untrusted-fence.md) |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
 
