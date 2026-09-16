@@ -412,7 +412,7 @@ fn the_page_covers_every_frame_a_task_writes() {
 }
 
 #[test]
-fn the_page_names_every_state_mode_and_limit() {
+fn the_page_names_every_state_and_mode() {
     let page = page();
     for state in [
         "working",
@@ -430,11 +430,6 @@ fn the_page_names_every_state_mode_and_limit() {
     for mode in ["`stateless`", "`threaded`"] {
         assert!(page.contains(mode), "conversation mode {mode} is not named");
     }
-    assert!(page.contains("512"), "the replay capacity is not stated");
-    assert!(
-        page.contains("15 seconds"),
-        "the heartbeat interval is not stated"
-    );
 }
 
 /// A capsule that dies under an attached `mur watch` is reported as a lost connection, not as a

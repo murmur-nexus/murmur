@@ -334,11 +334,12 @@ from a closed connection by reading bytes.
 | Event id | None |
 | Replay buffer | Never entered, so no replay contains one |
 
-**A pause longer than 15 seconds means the capsule is busy, not gone.** The connection is served
-on the same thread that runs the capsule's task, so work the capsule does without pausing — an
-inference call, a tool call, a shell command it is waiting on — holds the heartbeat with it. A
-heartbeat that came due meanwhile is written the moment the thread is free again, which makes the
-pause as long as the work was. A closed connection is what says the capsule is gone.
+The heartbeat is written apart from the capsule's turns, so it
+keeps its cadence while a turn is running — through an inference call, a tool call, or a shell
+command the capsule is waiting on. Frames are different: a turn waiting on one call writes no
+frame until the call returns, so heartbeats may be the only bytes on the connection for a while.
+A pause longer than 15 seconds means the process is suspended or the host is too loaded to run
+it. A closed connection is what says the capsule is gone.
 
 ---
 

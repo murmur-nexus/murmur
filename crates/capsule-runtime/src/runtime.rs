@@ -339,7 +339,7 @@ const SSE_BROADCAST_CAPACITY: usize = 128;
 /// Replay buffer: covers observers joining mid-task. Sized to handle the longest
 /// expected task turn without eviction. Can be tuned independently of broadcast capacity.
 /// Candidate for `LifecycleConfig` if operator tuning is needed in a future slice.
-const SSE_REPLAY_CAPACITY: usize = 512;
+pub(crate) const SSE_REPLAY_CAPACITY: usize = 512;
 
 /// Whether any staged hook can receive the `on-compaction` lifecycle event. Mirrors the
 /// binding match the runtime uses when it actually dispatches compaction, so MURMUR.md's

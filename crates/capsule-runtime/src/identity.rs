@@ -1153,6 +1153,9 @@ mod tests {
     /// every connection, beside a `LocalSet` task that holds the calling thread with
     /// `std::thread::sleep` across a due tick — and asserts what a client actually reads: a
     /// heartbeat while the thread is still held.
+    ///
+    /// `protocol_page_says_the_heartbeat_keeps_its_cadence_during_a_turn` holds the protocol page to
+    /// this behaviour and must change with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stream_watch_heartbeat_continues_while_session_thread_is_blocked() {
         use std::io::{BufRead, BufReader};
@@ -1255,5 +1258,106 @@ mod tests {
              {:?} after connect",
             first.duration_since(connected_at)
         );
+    }
+
+    const PROTOCOL_PAGE_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/content/reference/streaming-protocol.md"
+    );
+
+    fn protocol_page() -> String {
+        std::fs::read_to_string(PROTOCOL_PAGE_PATH)
+            .unwrap_or_else(|e| panic!("cannot read {PROTOCOL_PAGE_PATH}: {e}"))
+    }
+
+    /// The section of the protocol page whose heading carries `anchor`, from the start of that
+    /// heading line up to the next line consisting only of `---`.
+    fn protocol_page_section<'a>(page: &'a str, anchor: &str) -> &'a str {
+        let marker = format!("{{ #{anchor} }}");
+        let at = page
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{PROTOCOL_PAGE_PATH} has no heading with anchor {marker}"));
+        let start = page[..at].rfind('\n').map_or(0, |i| i + 1);
+        let len = page[start..].find("\n---\n").unwrap_or_else(|| {
+            panic!("the {marker} section of {PROTOCOL_PAGE_PATH} has no closing `---` line")
+        });
+        &page[start..start + len]
+    }
+
+    /// Every number written immediately before the word `seconds`, in order.
+    fn numbers_before_seconds(text: &str) -> Vec<u64> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        words
+            .windows(2)
+            .filter(|pair| {
+                pair[1]
+                    .trim_end_matches(|c: char| !c.is_alphanumeric())
+                    .eq("seconds")
+            })
+            .filter_map(|pair| {
+                pair[0]
+                    .trim_start_matches(|c: char| !c.is_ascii_digit())
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// The Heartbeat section states `SSE_HEARTBEAT_INTERVAL` in its Interval row, and every
+    /// duration in seconds anywhere in the section is that interval.
+    #[test]
+    fn protocol_page_heartbeat_interval_is_the_runtime_interval() {
+        let page = protocol_page();
+        let section = protocol_page_section(&page, "heartbeat");
+        let interval = SSE_HEARTBEAT_INTERVAL.as_secs();
+        let row = format!("| Interval | {interval} seconds");
+        assert!(
+            section.contains(&row),
+            "the Heartbeat section ({{ #heartbeat }}) of {PROTOCOL_PAGE_PATH} has no `{row}` row; \
+             SSE_HEARTBEAT_INTERVAL is {interval} seconds"
+        );
+        let stated = numbers_before_seconds(section);
+        let wrong: Vec<u64> = stated.iter().copied().filter(|&n| n != interval).collect();
+        assert!(
+            wrong.is_empty(),
+            "the Heartbeat section ({{ #heartbeat }}) of {PROTOCOL_PAGE_PATH} states {wrong:?} \
+             seconds; SSE_HEARTBEAT_INTERVAL is {interval} seconds"
+        );
+    }
+
+    /// The Replay section states `SSE_REPLAY_CAPACITY` as the number of frames a session keeps.
+    #[test]
+    fn protocol_page_replay_capacity_is_the_runtime_capacity() {
+        let page = protocol_page();
+        let section = protocol_page_section(&page, "replay");
+        let capacity = crate::runtime::SSE_REPLAY_CAPACITY;
+        let phrase = format!("most recent {capacity} frames");
+        assert!(
+            section.contains(&phrase),
+            "the Replay section ({{ #replay }}) of {PROTOCOL_PAGE_PATH} does not say `{phrase}`; \
+             SSE_REPLAY_CAPACITY is {capacity}"
+        );
+    }
+
+    /// The Heartbeat section's liveness claim is held against
+    /// `stream_watch_heartbeat_continues_while_session_thread_is_blocked`: the heartbeat keeps its
+    /// cadence while the thread running the agent loop is held.
+    #[test]
+    fn protocol_page_says_the_heartbeat_keeps_its_cadence_during_a_turn() {
+        let page = protocol_page();
+        let section = protocol_page_section(&page, "heartbeat");
+        let required = "keeps its cadence while a turn is running";
+        assert!(
+            section.contains(required),
+            "the Heartbeat section ({{ #heartbeat }}) of {PROTOCOL_PAGE_PATH} does not say \
+             `{required}`"
+        );
+        for forbidden in ["same thread", "holds the heartbeat"] {
+            assert!(
+                !section.contains(forbidden),
+                "the Heartbeat section ({{ #heartbeat }}) of {PROTOCOL_PAGE_PATH} says \
+                 `{forbidden}`, but the heartbeat is served off the agent loop's thread"
+            );
+        }
     }
 }
