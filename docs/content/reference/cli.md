@@ -129,7 +129,7 @@ sweep there is, and it is enough because a record is never treated as truth.
 | Layer 2: the process's start time could not be read | Kept, reported as unreachable | No |
 | Layer 3: the agent card did not answer for the session | Kept, reported as unreachable | Yes |
 
-A kept record names a process that is alive, possibly mid-turn, and the command reports
+A kept record names a process that is alive, and the command reports
 [`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
 
 When `~/.murmur/running/` itself cannot be read, every command that reads the records fails with
@@ -826,10 +826,14 @@ decides both the `STATUS` column and whether the record survives the read.
 | No process holds the process id | No row | Unlinked | `no process holds pid N` |
 | The process holding the process id started at another time | No row | Unlinked | `pid N is held by a process that started at another time` |
 
-Neither a quiet door nor a start time that could not be read is evidence that the process is gone.
-An `unreachable` capsule may be mid-turn, including busy with synchronous work inside a turn that
-keeps its door from answering until that work returns, and unlinking its record would throw away
-the only handle anyone has on something still running.
+Neither a quiet door nor a start time that could not be read is evidence that the process is gone,
+and unlinking the record would throw away the only handle anyone has on something still running. A
+capsule's door is served apart from its turns, so a capsule busy with a turn still reads `running`.
+A capsule whose process is alive reads `unreachable` when:
+
+- the process is suspended, for example by `SIGSTOP` or a debugger
+- the host is too loaded to schedule the capsule within the probe's deadline
+- the capsule's runtime has every thread it serves requests on occupied
 
 Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
 so the first row is what `@1` names.
@@ -989,8 +993,10 @@ one ended with [`mur stop`](#mur-stop), closes the connection without that frame
 error[E-IO-003]: connection to ses_019ed2af53da75c2aefee84ee10c34af lost after event id 4 — the capsule may still be running; run mur watch again to reattach
 ```
 
-What else it implements of the protocol is listed in
-[Streaming Protocol](streaming-protocol.md#mur-watch).
+The heartbeat is written apart from the capsule's turns, so it keeps its cadence while a turn is
+running — through an inference call, a tool call, or a shell command the capsule is waiting on.
+A pause longer than 15 seconds means the process is suspended or the host is too loaded to run it.
+A closed socket is what says the capsule is gone.
 
 Exit codes:
 
