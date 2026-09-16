@@ -378,7 +378,7 @@ The address named a capsule whose process is alive, and the capsule's agent card
 
 ```text
 error[E-RUN-023]: ses_019f01a940ce7761854e768ecbe3d399 is running but its capsule did not answer at localhost:41235: failed to connect to localhost:41235: Connection refused (os error 111)
-  hint: the process holding the door is alive — it may be mid-turn; its record is kept
+  hint: the process holding the door is alive — it may be suspended or the host overloaded; its record is kept
 ```
 
 `E-RUN-022` removes the record; this one keeps it. The process is running, so the record still
@@ -388,7 +388,7 @@ has on it. Try again, or read what the session is doing with
 
 | Reason | Means |
 |---|---|
-| `failed to connect to …`, or a read timeout | The door did not answer in time — the capsule may be mid-turn |
+| `failed to connect to …`, or a read timeout | The door did not answer in time — the process may be suspended, or the host too loaded to run it |
 | `the capsule at … answers for session …` | Another session holds that address |
 | `pid N's start time could not be read` | A process holds the process id and the host would not say when it started, so whether it is the capsule is unknown |
 

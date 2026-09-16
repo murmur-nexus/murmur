@@ -190,8 +190,13 @@ pub(crate) fn build_agent_card(
 
 /// Serve the agent-card endpoint and A2A JSON-RPC endpoints until shutdown.
 ///
-/// Runs as a tokio task. Each accepted connection is handled in its own spawned task.
-/// Shuts down cleanly when shutdown_rx fires or when accept returns an error.
+/// Spawned onto the session runtime's worker pool, and each accepted connection is handled in
+/// its own task on that pool, so the door answers while the thread running the agent loop is
+/// held by synchronous work inside a turn. No handler waits on the agent loop.
+///
+/// Returns once `shutdown_rx` fires or its sender is dropped, having closed the listener and
+/// ended every connection still open, so the door closes with the session rather than with the
+/// runtime. An accept error closes the listener but leaves open connections served until then.
 // Everything after the listener and the shutdown channel is A2A server state that is cloned
 // once per accepted connection and handed to `handle_connection` unchanged. A wrapper struct
 // would name the argument count rather than a concept.
@@ -221,9 +226,12 @@ pub(crate) async fn serve_http(
         ConversationMode::Stateless => "stateless",
         ConversationMode::Threaded => "threaded",
     };
-    loop {
+    let mut connections = tokio::task::JoinSet::new();
+    let accept_failed = loop {
         tokio::select! {
-            _ = &mut shutdown_rx => break,
+            _ = &mut shutdown_rx => break false,
+            // Reaps finished connections, which a `JoinSet` otherwise keeps until joined.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
@@ -239,18 +247,25 @@ pub(crate) async fn serve_http(
                         let session = session_id.clone();
                         let detached_for_conn = detached.clone();
                         let live = Arc::clone(&live_delegations);
-                        tokio::task::spawn_local(async move {
+                        connections.spawn(async move {
                             handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live).await;
                         });
                     }
                     Err(e) => {
                         eprintln!("[capsule-runtime] HTTP accept error: {e}");
-                        break;
+                        break true;
                     }
                 }
             }
         }
+    };
+    drop(listener);
+    if accept_failed {
+        let _ = shutdown_rx.await;
     }
+    // A `stream/watch` or `message/stream` connection otherwise outlives the session: its
+    // handler holds a broadcast sender, so it never sees the channel close.
+    connections.shutdown().await;
 }
 
 // Receives `serve_http`'s state verbatim and splits it across the three request handlers; see
@@ -642,9 +657,9 @@ async fn handle_message_stream(
 /// close this connection — the observer stays alive across turns.
 ///
 /// While no events flow, writes [`SSE_HEARTBEAT_COMMENT`] every [`SSE_HEARTBEAT_INTERVAL`] so
-/// an observer can tell an idle capsule from a dead socket. The handler runs on the session's
-/// `LocalSet`, so the heartbeat only fires when that thread reaches an await point: synchronous
-/// work inside a turn stalls it until the thread is released.
+/// an observer can tell an idle capsule from a dead socket. The handler runs on the runtime's
+/// worker pool, off the thread running the agent loop, so synchronous work inside a turn does
+/// not delay it.
 async fn handle_stream_watch(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     last_event_id: Option<u64>,
@@ -1133,36 +1148,29 @@ mod tests {
         );
     }
 
-    /// The heartbeat shares the session's `LocalSet` with the agent loop, so it can only fire
-    /// when that thread reaches an await point. This reproduces that shape — a `spawn_local`ed
-    /// `handle_stream_watch` alongside a `spawn_local`ed task that holds the thread with
-    /// `std::thread::sleep` across a due tick — and asserts what a client actually reads:
-    /// nothing while the thread is held, and a heartbeat once it is released.
-    ///
-    /// Moving the door off the session thread is a separate concern; this test records the
-    /// current behaviour rather than a desired one.
-    #[tokio::test]
-    async fn stream_watch_heartbeat_stalls_while_session_thread_is_blocked() {
+    /// The door runs on the runtime's worker pool while the agent loop holds its own thread. This
+    /// reproduces that shape — `handle_stream_watch` spawned onto the pool, as `serve_http` spawns
+    /// every connection, beside a `LocalSet` task that holds the calling thread with
+    /// `std::thread::sleep` across a due tick — and asserts what a client actually reads: a
+    /// heartbeat while the thread is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_watch_heartbeat_continues_while_session_thread_is_blocked() {
         use std::io::{BufRead, BufReader};
         use std::time::{Duration, Instant};
 
         // Longer than one heartbeat interval, so a tick falls due inside the blocked stretch.
         const BLOCK: Duration = Duration::from_secs(20);
-        // How long to keep reading after the thread is released, to see whether ticks resume.
-        const OBSERVE_AFTER_RELEASE: Duration = Duration::from_secs(8);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Read the client side on its own OS thread: the runtime thread is about to be
-        // unavailable, which is the whole point.
+        // Read the client side on its own OS thread, so what it records does not depend on the
+        // thread about to be held.
         let (line_tx, line_rx) = std::sync::mpsc::channel::<(Instant, String)>();
         let client = std::thread::spawn(move || {
             let sock = std::net::TcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(
-                BLOCK + OBSERVE_AFTER_RELEASE + Duration::from_secs(10),
-            ))
-            .unwrap();
+            sock.set_read_timeout(Some(BLOCK + Duration::from_secs(10)))
+                .unwrap();
             let mut reader = BufReader::new(sock);
             loop {
                 let mut line = String::new();
@@ -1181,35 +1189,35 @@ mod tests {
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
 
         let local = tokio::task::LocalSet::new();
-        let (connected_at, blocked_at) = local
+        let (connected_at, blocked_at, watcher) = local
             .run_until(async {
                 let (sock, _peer) = listener.accept().await.unwrap();
                 let connected_at = Instant::now();
                 // Hold the read half so the socket stays open for the whole measurement.
-                let (_read_half, write_half) = sock.into_split();
-                tokio::task::spawn_local(handle_stream_watch(
-                    write_half,
-                    Some(0),
-                    sse_tx.clone(),
-                    Arc::clone(&sse_buffer),
-                    "stateless".to_string(),
-                ));
+                let (read_half, write_half) = sock.into_split();
+                let sse = sse_tx.clone();
+                let buffer = Arc::clone(&sse_buffer);
+                let watcher = tokio::spawn(async move {
+                    let _read_half = read_half;
+                    handle_stream_watch(write_half, Some(0), sse, buffer, "stateless".to_string())
+                        .await;
+                });
 
                 // Let the handler write its preamble and settle into the receive loop before
-                // the thread is taken away from it.
+                // the thread is held.
                 tokio::time::sleep(Duration::from_millis(250)).await;
 
                 let blocked_at = Instant::now();
                 tokio::task::spawn_local(async { std::thread::sleep(BLOCK) })
                     .await
                     .unwrap();
-
-                tokio::time::sleep(OBSERVE_AFTER_RELEASE).await;
-                (connected_at, blocked_at)
+                (connected_at, blocked_at, watcher)
             })
             .await;
 
-        // Dropping the LocalSet drops the handler, closing the socket and ending the reader.
+        // Ending the handler closes the socket, which ends the reader.
+        watcher.abort();
+        let _ = watcher.await;
         drop(local);
         drop(sse_tx);
         client.join().unwrap();
@@ -1231,23 +1239,20 @@ mod tests {
             blocked_at.duration_since(connected_at),
             released_at.duration_since(connected_at)
         );
+        let Some(&first) = heartbeats.first() else {
+            panic!("no heartbeat arrived while the session thread was blocked");
+        };
         assert!(
-            !heartbeats.is_empty(),
-            "heartbeat never resumed after the session thread was released; arrivals: {arrivals:?}"
-        );
-
-        let first = heartbeats[0];
-        assert!(
-            first + Duration::from_millis(100) >= released_at,
-            "a heartbeat arrived while the session thread was blocked: first at {:?} after \
-             connect, thread released at {:?} after connect",
+            first < released_at,
+            "the first heartbeat waited for the session thread: it arrived at {:?} after \
+             connect, and the thread was released at {:?} after connect",
             first.duration_since(connected_at),
             released_at.duration_since(connected_at)
         );
         assert!(
-            first.duration_since(connected_at) > SSE_HEARTBEAT_INTERVAL,
-            "the tick due at {SSE_HEARTBEAT_INTERVAL:?} was expected to be stalled past its \
-             deadline, but the first heartbeat arrived at {:?}",
+            first.duration_since(connected_at) < SSE_HEARTBEAT_INTERVAL + Duration::from_secs(2),
+            "the tick due at {SSE_HEARTBEAT_INTERVAL:?} was late: the first heartbeat arrived at \
+             {:?} after connect",
             first.duration_since(connected_at)
         );
     }

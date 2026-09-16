@@ -17,7 +17,7 @@
 //! there is, and it is enough because the record is a hint. A reading that could not be taken is
 //! not evidence. A live pid whose start time cannot be read is [`ProcessState::Unverified`]: kept,
 //! reported as unreachable, and never signalled. A record that passes 1 and 2 and fails 3 is kept
-//! too: it names a process that is alive, possibly mid-turn, and unlinking it would throw away the
+//! too: it names a process that is alive, perhaps suspended, and unlinking it would throw away the
 //! only handle to a running capsule because it was slow to answer.
 //!
 //! The record names the process and stores nothing from the environment. The directory is `0700`

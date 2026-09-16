@@ -1289,7 +1289,7 @@ fn launch(
         staged.capsule_url = capsule_url.clone();
 
         // Built while `staged` is still whole. It is written, and the URL announced, inside the
-        // task `LocalSet` below, once the door is being served.
+        // task `LocalSet` below, once the door has been spawned.
         let running_record = running_record_for(&staged, &session_id, &capsule_url);
 
         // Taken over from the default disposition, when the caller owns the process, before the
@@ -1536,7 +1536,11 @@ fn launch(
         let session_id_ret = session_id.clone();
         let workdir_ret = workdir.clone();
 
-        // --- Agent loop inside a LocalSet (handles !Send WasiCtx) ---
+        // --- Agent loop inside a LocalSet ---
+        // The session future is `!Send`: it captures `on_url`, which has no `Send` bound, and
+        // `CapsuleStoreState::close_started_delegation` holds `&CapsuleStoreState` across an
+        // `.await` while the store state is `!Sync` (its `WasiCtx` is). The loop and the async
+        // hook workers therefore run on this thread; the A2A door does not.
         let loop_result: Result<(), RuntimeError> = rt.block_on(async move {
             let mut trace = TraceWriter::open(
                 &workdir,
@@ -1661,9 +1665,11 @@ fn launch(
             let local = tokio::task::LocalSet::new();
             local
                 .run_until(async move {
-                    // Spawn HTTP server as a local task (uses spawn_local for !Send compat)
+                    // The door runs on the runtime's worker pool, not on this `LocalSet`: the
+                    // agent loop holds this thread for as long as a guest computes or a tool
+                    // dispatch blocks in place, and the door must answer through that.
                     let server_handle =
-                        tokio::task::spawn_local(identity::serve_http(
+                        tokio::spawn(identity::serve_http(
                             tcp_listener,
                             shutdown_rx,
                             agent_card_json,
@@ -1827,13 +1833,12 @@ fn launch(
                     //
                     //   - the record exists before `on_url` announces the URL, or `mur ps` run
                     //     on the announcement finds nothing to list;
-                    //   - the URL is announced only once `serve_http` is spawned on this
-                    //     `LocalSet` and `session_start` is in the trace. The listener's backlog
-                    //     accepts a connection from the moment it is bound, and until
-                    //     `serve_http` is polled nothing reads it, so a probe sent into that
-                    //     window waits out its read deadline and reports a live session as
-                    //     unreachable. `serve_http` is first polled at the next `.await`, the
-                    //     task loop's wait for work at the latest.
+                    //   - the URL is announced only once `serve_http` is spawned and
+                    //     `session_start` is in the trace. The listener's backlog accepts a
+                    //     connection from the moment it is bound, and until `serve_http` runs
+                    //     nothing reads it, so a probe sent before the spawn waits out its read
+                    //     deadline and reports a live session as unreachable. Once spawned, a
+                    //     worker picks it up whatever this thread is doing.
                     //
                     // A guard rather than a line at each return, bound in this future so it lives
                     // until the task loop has ended: a record that outlived its session would
@@ -2567,7 +2572,9 @@ fn launch(
                         RuntimeError::AgentLoopFailed(format!("failed to flush trace: {e}"))
                     })?;
 
-                    // Signal HTTP server to shut down, then wait for it
+                    // The door's connections live on the worker pool, where the end of
+                    // `run_until` does not reach them; `serve_http` ends them itself on this
+                    // signal, so the door is closed before the session returns.
                     let _ = shutdown_tx.send(());
                     let _ = server_handle.await;
 
@@ -5296,8 +5303,8 @@ impl CapsuleStoreState {
             .map(DispatchOutcome::tool);
         }
 
-        // Shell tool — run on a blocking thread so the LocalSet stays free to handle
-        // incoming HTTP requests (e.g. curl POSTing back to the same capsule's server).
+        // Shell tool — run on the blocking pool, since waiting on the child process is a
+        // blocking wait.
         if self
             .capability_policy
             .shell_allow
@@ -5743,7 +5750,7 @@ impl CapsuleStoreState {
     /// The scheduler is blocking and thread-scoped, so it runs on `spawn_blocking` while this
     /// side services its tool calls over a channel — the shape [`Self::dispatch_delegate_task`]
     /// uses for its launch notices, for the same reason: the blocking side has no runtime handle
-    /// and the `!Send` WASI state it needs lives on this `LocalSet`.
+    /// and the WASI state it needs is borrowed from this store state, which is not `Sync`.
     async fn dispatch_submit_plan(
         &self,
         input: murmur::tool::run::ToolInput,
