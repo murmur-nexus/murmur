@@ -158,12 +158,13 @@ keep writing frames for the same task id afterwards:
 
 | After | What follows |
 |---|---|
-| `completed`, when an `on-task-end` hook reopens the task ([`lifecycle.max_task_reopens`](manifest.md#field-lifecycle)) | A new attempt: `working` from `inference turn 1`, with ids starting again at `0` |
+| `completed` or `failed`, when an `on-task-end` hook reopens the task ([`lifecycle.max_task_reopens`](manifest.md#field-lifecycle)) | A new attempt: `working` from `inference turn 1`, with ids starting again at `0` |
 | `failed` with message `input-timeout` | The tool that asked for input fails, the model receives that failure as an `artifact`, and the task goes on to its own final status |
 
 A task that ends in an error the agent loop does not report — a driver response that is not JSON,
-a trace write failure, a workdir size breach — writes no final status, and a `message/stream`
-connection on it stays open until another task's final status or the capsule's exit.
+a trace write failure, a workdir size breach — writes no final status for that attempt. Unless an
+`on-task-end` hook reopens the task, a `message/stream` connection on it stays open until another
+task's final status or the capsule's exit.
 
 ```json
 {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"completed","message":"session ended","response":"README.md describes the build."},"final":true}
@@ -334,11 +335,20 @@ from a closed connection by reading bytes.
 | Event id | None |
 | Replay buffer | Never entered, so no replay contains one |
 
-**A pause longer than 15 seconds means the capsule is busy, not gone.** The connection is served
-on the same thread that runs the capsule's task, so work the capsule does without pausing — an
-inference call, a tool call, a shell command it is waiting on — holds the heartbeat with it. A
-heartbeat that came due meanwhile is written the moment the thread is free again, which makes the
-pause as long as the work was. A closed connection is what says the capsule is gone.
+The heartbeat is written apart from the capsule's turns, so it
+keeps its cadence while a turn is running — through an inference call, a tool call, or a shell
+command the capsule is waiting on. Frames wait on the call: a turn waiting on one call writes no
+frame until the call returns, so heartbeats may be the only bytes on the connection for a while.
+
+A pause in the heartbeat longer than 15 seconds means the capsule's process is alive but not
+being given time to write it:
+
+- the process is suspended, for example by `SIGSTOP` or a debugger
+- the host is too loaded to schedule the process
+- every thread the capsule serves connections on is occupied
+
+A pause does not mean the capsule is gone. The connection closing is what ends the stream; what
+that tells a client is under [`capsule-closed`](#event-capsule-closed).
 
 ---
 
