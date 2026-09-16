@@ -552,6 +552,10 @@ fn fence_of(message: &Value) -> Option<&str> {
 /// record is what the next run replays into the model's context.
 #[test]
 fn the_record_labels_a_fenced_tool_message() {
+    // The shell grant below makes this capsule need host support the rest of this file does not.
+    if common::skip_without_host_support("the_record_labels_a_fenced_tool_message") {
+        return;
+    }
     const SKILL_NAME: &str = "house-style";
     const SKILL_TEXT: &str = "# House style\n\nPrefer short sentences.";
 
