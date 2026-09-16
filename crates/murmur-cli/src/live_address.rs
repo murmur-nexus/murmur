@@ -86,7 +86,7 @@ pub(crate) fn resolve_live(address: &str) -> Result<RunningRecord, CliError> {
                 "{} is running but its capsule did not answer at {}: {reason}",
                 record.session_id, record.url
             ),
-            "the process holding the door is alive — it may be mid-turn; its record is kept",
+            "the process holding the door is alive — it may be suspended or the host overloaded; its record is kept",
         )),
         // Between the candidacy read and here, which is a race rather than a state.
         Liveness::Gone(reason) => {

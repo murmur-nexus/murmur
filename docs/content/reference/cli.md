@@ -129,7 +129,7 @@ sweep there is, and it is enough because a record is never treated as truth.
 | Layer 2: the process's start time could not be read | Kept, reported as unreachable | No |
 | Layer 3: the agent card did not answer for the session | Kept, reported as unreachable | Yes |
 
-A kept record names a process that is alive, possibly mid-turn, and the command reports
+A kept record names a process that is alive, and the command reports
 [`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
 
 When `~/.murmur/running/` itself cannot be read, every command that reads the records fails with
