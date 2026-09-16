@@ -1047,6 +1047,7 @@ pub(crate) async fn run_agent_loop(
                             // before the result's owned fields are consumed below.
                             let state_effect = extract_state_effect(&outcome.result.metadata);
                             let resource_id = extract_resource_id(&outcome.result.metadata);
+                            let truncated = outcome.result.truncated;
                             let text = outcome
                                 .result
                                 .data
@@ -1116,6 +1117,8 @@ pub(crate) async fn run_agent_loop(
                                 &status,
                             )
                             .await;
+                            // Read before the observation is moved into the hook and trace below.
+                            let exit_code = outcome.shell.as_ref().map(|shell| shell.exit_code);
                             if let Some(shell) = outcome.shell {
                                 hooks
                                     .emit(
@@ -1171,11 +1174,16 @@ pub(crate) async fn run_agent_loop(
                                     "artifact",
                                     &TaskArtifactUpdateEvent {
                                         id: task_id_str.clone(),
-                                        artifact: StreamArtifact {
-                                            tool_name: tool_name.clone(),
-                                            content: text.clone(),
-                                            fence_source: fence_source.clone(),
-                                        },
+                                        artifact: StreamArtifact::tool_call(
+                                            tool_name.clone(),
+                                            text.clone(),
+                                            fence_source.clone(),
+                                            &tool_call_id,
+                                            is_error,
+                                            duration_ms,
+                                            exit_code,
+                                            truncated,
+                                        ),
                                     },
                                 )
                                 .await;
@@ -1250,13 +1258,19 @@ pub(crate) async fn run_agent_loop(
                                     "artifact",
                                     &TaskArtifactUpdateEvent {
                                         id: task_id_str.clone(),
-                                        artifact: StreamArtifact {
-                                            tool_name: tool_name.clone(),
-                                            content: error.clone(),
-                                            // The runtime's own text about a call that never
-                                            // reached a tool, so there is no source to name.
-                                            fence_source: None,
-                                        },
+                                        // The runtime's own text about a call that never
+                                        // reached a tool: no source to name, no subprocess and
+                                        // no tool declaration of truncation.
+                                        artifact: StreamArtifact::tool_call(
+                                            tool_name.clone(),
+                                            error.clone(),
+                                            None,
+                                            &tool_call_id,
+                                            true,
+                                            duration_ms,
+                                            None,
+                                            false,
+                                        ),
                                     },
                                 )
                                 .await;
@@ -1682,13 +1696,9 @@ async fn finish_completed_turn(
                 "artifact",
                 &TaskArtifactUpdateEvent {
                     id: task_id_str.to_string(),
-                    artifact: StreamArtifact {
-                        tool_name: ha.hook_name.clone(),
-                        content: ha.payload.clone(),
-                        // A hook artifact is the capsule operator's own declared hook speaking,
-                        // not content a tool fetched, and reaches the model unfenced.
-                        fence_source: None,
-                    },
+                    // A hook artifact is the capsule operator's own declared hook speaking, not
+                    // content a tool fetched, and reaches the model unfenced.
+                    artifact: StreamArtifact::hook(ha.hook_name.clone(), ha.payload.clone()),
                 },
             )
             .await;

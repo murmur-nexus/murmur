@@ -64,6 +64,69 @@ pub(crate) struct StreamArtifact {
     /// Naming a fence never justifies rewriting one: `content` is the bytes the model received,
     /// markers and all.
     pub fence_source: Option<String>,
+    /// The provider's id for the call this frame reports, or `None` for a frame no call is
+    /// behind (a hook artifact) and for a call the provider issued no id for. An empty provider
+    /// id is `None` too, by the rule `TraceWriter::write_tool_call` applies to the same id.
+    pub tool_call_id: Option<String>,
+    /// Whether the call failed: the tool returned a status other than `passed`, or the dispatch
+    /// never reached a tool. The call's `tool_call` or `skill_call` trace record spells the same
+    /// fact as `"status":"error"`.
+    pub is_error: bool,
+    /// Wall-clock time of the dispatch, the same measurement the call's `tool_call` or
+    /// `skill_call` trace record carries. `None` for a hook artifact.
+    pub duration_ms: Option<u64>,
+    /// The exit status of the subprocess this dispatch ran to completion, or `None` when it ran
+    /// none — a WASM tool, a skill, a command demoted to the background, a failed dispatch, a
+    /// hook artifact.
+    pub exit_code: Option<i32>,
+    /// The tool's own `truncated` declaration, passed through as the guest set it.
+    pub truncated: bool,
+}
+
+// Every field above is serialized on every frame, `null` included, for the reason
+// `fence_source` documents: an absent key tells a consumer the runtime does not report the fact,
+// which is not the same as the fact not applying to this frame.
+impl StreamArtifact {
+    /// The frame for one dispatched tool call, whether it reached a tool or failed before one.
+    // One parameter per wire field, so a call site names every value the frame carries.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tool_call(
+        tool_name: String,
+        content: String,
+        fence_source: Option<String>,
+        tool_call_id: &str,
+        is_error: bool,
+        duration_ms: u64,
+        exit_code: Option<i32>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            tool_name,
+            content,
+            fence_source,
+            tool_call_id: (!tool_call_id.is_empty()).then(|| tool_call_id.to_string()),
+            is_error,
+            duration_ms: Some(duration_ms),
+            exit_code,
+            truncated,
+        }
+    }
+
+    /// The frame forwarding one hook artifact. No tool call is behind it, so it has no id, no
+    /// duration, no exit code and nothing that could have been truncated, and it never reports
+    /// an error. A hook artifact reaches the model unfenced.
+    pub(crate) fn hook(hook_name: String, payload: String) -> Self {
+        Self {
+            tool_name: hook_name,
+            content: payload,
+            fence_source: None,
+            tool_call_id: None,
+            is_error: false,
+            duration_ms: None,
+            exit_code: None,
+            truncated: false,
+        }
+    }
 }
 
 /// Format a single SSE event frame:
@@ -239,6 +302,114 @@ fn format_text_sse_data(task_id: &str, text: &str, is_final: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame_json(artifact: StreamArtifact) -> String {
+        serde_json::to_string(&TaskArtifactUpdateEvent {
+            id: "task_1".into(),
+            artifact,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn tool_call_frame_serializes_every_key_in_declaration_order() {
+        let json = frame_json(StreamArtifact::tool_call(
+            "bash".into(),
+            "hello".into(),
+            Some("tool:bash".into()),
+            "call_1",
+            false,
+            12,
+            Some(0),
+            false,
+        ));
+        assert_eq!(
+            json,
+            r#"{"id":"task_1","artifact":{"tool_name":"bash","content":"hello","fence_source":"tool:bash","tool_call_id":"call_1","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}}"#
+        );
+    }
+
+    #[test]
+    fn tool_call_frame_passes_truncated_through() {
+        let json = frame_json(StreamArtifact::tool_call(
+            "read".into(),
+            "partial".into(),
+            None,
+            "call_1",
+            false,
+            3,
+            None,
+            true,
+        ));
+        assert!(json.contains(r#""truncated":true"#), "{json}");
+    }
+
+    #[test]
+    fn tool_call_frame_keeps_the_exit_code_key_with_or_without_a_subprocess() {
+        let ran = frame_json(StreamArtifact::tool_call(
+            "bash".into(),
+            String::new(),
+            None,
+            "call_1",
+            true,
+            1204,
+            Some(2),
+            false,
+        ));
+        assert!(ran.contains(r#""exit_code":2"#), "{ran}");
+        assert!(ran.contains(r#""is_error":true"#), "{ran}");
+
+        let none = frame_json(StreamArtifact::tool_call(
+            "write-file".into(),
+            String::new(),
+            None,
+            "call_1",
+            true,
+            3,
+            None,
+            false,
+        ));
+        assert!(none.contains(r#""exit_code":null"#), "{none}");
+    }
+
+    #[test]
+    fn tool_call_frame_records_an_empty_provider_id_as_null() {
+        let empty = frame_json(StreamArtifact::tool_call(
+            "bash".into(),
+            String::new(),
+            None,
+            "",
+            false,
+            1,
+            None,
+            false,
+        ));
+        assert!(empty.contains(r#""tool_call_id":null"#), "{empty}");
+
+        let issued = frame_json(StreamArtifact::tool_call(
+            "bash".into(),
+            String::new(),
+            None,
+            "toolu_01",
+            false,
+            1,
+            None,
+            false,
+        ));
+        assert!(issued.contains(r#""tool_call_id":"toolu_01""#), "{issued}");
+    }
+
+    #[test]
+    fn hook_frame_reports_no_call_behind_it() {
+        let json = frame_json(StreamArtifact::hook(
+            "my-hook".into(),
+            r#"{"reviewed":true}"#.into(),
+        ));
+        assert_eq!(
+            json,
+            r#"{"id":"task_1","artifact":{"tool_name":"my-hook","content":"{\"reviewed\":true}","fence_source":null,"tool_call_id":null,"is_error":false,"duration_ms":null,"exit_code":null,"truncated":false}}"#
+        );
+    }
 
     #[test]
     fn format_sse_event_produces_correct_frame() {

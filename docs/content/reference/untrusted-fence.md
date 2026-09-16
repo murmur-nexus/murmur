@@ -88,6 +88,7 @@ keys in the file, which are all absent when unset.
 | `fence_source` | string \| null | The source `content` is fenced under, or `null` when `content` carries no fence |
 
 A frame with no `fence_source` key came from a runtime that predates the field. Read the markers.
+The frame's full field list is in [Observability Schemas](observability-schemas.md#task-stream-artifact-frame).
 
 ### The record line
 

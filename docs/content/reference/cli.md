@@ -949,7 +949,7 @@ Output format:
 
 ```text
 [working]  inference turn 1
-[artifact] tool: bash | $ echo hello
+[artifact] tool: bash [ok, exit 0, 12ms] | $ echo hello
   Exit code: 0
   Stdout:
   hello
@@ -958,6 +958,18 @@ Output format:
 [working]  inference turn 2
 [completed]
 ```
+
+The bracket after a tool name is the call's outcome, read from the
+[`artifact` frame](observability-schemas.md#task-stream-artifact-frame):
+
+| Segment | Shown when |
+|---|---|
+| `ok` or `error` | Always — `error` when `is_error` is true |
+| `exit <n>` | The call ran a subprocess to completion |
+| `<n>ms` | The frame reports a duration |
+| `truncated` | The tool marked its result truncated |
+
+A capsule whose runtime reports no outcome prints no bracket.
 
 ### Heartbeat
 
