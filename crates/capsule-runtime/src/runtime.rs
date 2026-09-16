@@ -334,11 +334,10 @@ fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String
 
 /// Live-delivery buffer: only needs to cover the lag between fastest and slowest
 /// currently-connected reader.
-const SSE_BROADCAST_CAPACITY: usize = 128;
+pub(crate) const SSE_BROADCAST_CAPACITY: usize = 128;
 
 /// Replay buffer: covers observers joining mid-task. Sized to handle the longest
 /// expected task turn without eviction. Can be tuned independently of broadcast capacity.
-/// Candidate for `LifecycleConfig` if operator tuning is needed in a future slice.
 pub(crate) const SSE_REPLAY_CAPACITY: usize = 512;
 
 /// Whether any staged hook can receive the `on-compaction` lifecycle event. Mirrors the

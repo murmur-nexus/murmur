@@ -656,10 +656,10 @@ async fn handle_message_stream(
 /// the client disconnects. A `final: true` status event ends one task turn but does NOT
 /// close this connection — the observer stays alive across turns.
 ///
-/// While no events flow, writes [`SSE_HEARTBEAT_COMMENT`] every [`SSE_HEARTBEAT_INTERVAL`] so
-/// an observer can tell an idle capsule from a dead socket. The handler runs on the runtime's
-/// worker pool, off the thread running the agent loop, so synchronous work inside a turn does
-/// not delay it.
+/// Writes [`SSE_HEARTBEAT_COMMENT`] every [`SSE_HEARTBEAT_INTERVAL`], whether or not events
+/// flowed in between, so an observer can tell an idle capsule from a dead socket. The handler
+/// runs on the runtime's worker pool, off the thread running the agent loop, so synchronous work
+/// inside a turn does not delay it.
 async fn handle_stream_watch(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     last_event_id: Option<u64>,
@@ -1323,6 +1323,25 @@ mod tests {
             "the Heartbeat section ({{ #heartbeat }}) of {PROTOCOL_PAGE_PATH} states {wrong:?} \
              seconds; SSE_HEARTBEAT_INTERVAL is {interval} seconds"
         );
+    }
+
+    /// The Frames-a-connection-misses section states `SSE_BROADCAST_CAPACITY` as the size of each
+    /// connection's live queue.
+    #[test]
+    fn protocol_page_broadcast_queue_is_the_runtime_capacity() {
+        let page = protocol_page();
+        let section = protocol_page_section(&page, "lagged");
+        let capacity = crate::runtime::SSE_BROADCAST_CAPACITY;
+        for phrase in [
+            format!("queue of {capacity}"),
+            format!("more than {capacity}"),
+        ] {
+            assert!(
+                section.contains(&phrase),
+                "the Frames a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} \
+                 does not say `{phrase}`; SSE_BROADCAST_CAPACITY is {capacity}"
+            );
+        }
     }
 
     /// The Replay section states `SSE_REPLAY_CAPACITY` as the number of frames a session keeps.

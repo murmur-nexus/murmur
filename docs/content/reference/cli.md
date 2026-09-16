@@ -981,8 +981,11 @@ A capsule whose runtime reports no outcome prints no bracket.
 ### Heartbeat
 
 `mur watch` reads the capsule's [heartbeat](streaming-protocol.md#heartbeat) and discards it; no
-heartbeat appears in its output. A pause in the output longer than 15 seconds means the capsule is
-busy, not gone.
+heartbeat appears in its output, and `mur watch` keeps waiting on a quiet connection for as long as
+it stays open. A pause in the output means the capsule wrote no frame: a turn waiting on an
+inference call, a tool call or a shell command writes none until the call returns. What a pause in
+the heartbeat itself means is under [Heartbeat](streaming-protocol.md#heartbeat) on the protocol
+page.
 
 `mur watch` does not reconnect. When the connection ends without a
 [`capsule-closed`](streaming-protocol.md#event-capsule-closed) frame, it names the last
@@ -992,11 +995,6 @@ one ended with [`mur stop`](#mur-stop), closes the connection without that frame
 ```text
 error[E-IO-003]: connection to ses_019ed2af53da75c2aefee84ee10c34af lost after event id 4 — the capsule may still be running; run mur watch again to reattach
 ```
-
-The heartbeat is written apart from the capsule's turns, so it keeps its cadence while a turn is
-running — through an inference call, a tool call, or a shell command the capsule is waiting on.
-A pause longer than 15 seconds means the process is suspended or the host is too loaded to run it.
-A closed socket is what says the capsule is gone.
 
 Exit codes:
 
