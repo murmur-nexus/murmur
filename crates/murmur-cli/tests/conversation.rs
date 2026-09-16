@@ -101,22 +101,7 @@ fn end_turn(text: &str) -> String {
 
 /// One Anthropic response that asks for a tool, so the loop takes the `tool_call` arm.
 fn tool_call() -> String {
-    json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{
-            "type": "tool_use",
-            "id": "toolu_1",
-            "name": "bash",
-            "input": {"command": "echo hello"}
-        }],
-        "stop_reason": "tool_use",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 10, "output_tokens": 5}
-    })
-    .to_string()
+    tool_call_named("toolu_1", "bash")
 }
 
 /// A capsule manifest declaring the driver, `blocks` of extra top-level YAML, and the hooks.
@@ -528,8 +513,8 @@ fn a_record_store_that_is_not_one_segment_refuses_the_launch() {
 
 // ── fence labels ─────────────────────────────────────────────────────────────
 
-/// One Anthropic response asking for `name`, so a turn can exercise a dispatch shape other than
-/// the `bash` call [`tool_call`] scripts.
+/// One Anthropic response asking for `name`, so a turn can exercise any dispatch shape. Scripts
+/// the same `echo hello` input whatever the tool, which a skill and an undeclared tool both ignore.
 fn tool_call_named(call_id: &str, name: &str) -> String {
     json!({
         "id": "msg_1",

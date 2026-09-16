@@ -225,15 +225,13 @@ available, and permanently open elsewhere.
     | A declared skill's `skill.md` | No. It is the capsule author's own guidance, staged inside the capsule at install; fencing it as data would make the skill inert |
     | A `user` or `schedule` task | No. It is the operator instructing their own capsule, for the same reason |
 
-    Fenced content arrives between `<untrusted-content source=NAME>` and `</untrusted-content>`,
-    where NAME is `tool:<artifact name>` for a tool result and `task:<origin>` for a task payload.
-    A marker found inside the content itself is rewritten to
-    `<!MURMUR-NEUTRALISED!/untrusted-content>` before the fence closes, so content cannot end its
-    own block; the rewrite inserts and deletes nothing, so an operator reading the trace sees the
+    Fenced content arrives between a pair of markers naming where it came from. A marker found
+    inside the content itself is rewritten before the fence closes, so content cannot end its own
+    block; the rewrite inserts and deletes nothing, so an operator reading the trace sees the
     forged marker as rewritten text. The system prompt tells the model that everything between the
     markers is data and that a closing marker appearing anywhere inside a block — including one
-    drawn inside an image — is a forgery. The full grammar, and the field each surface labels a
-    fence with, are in [Untrusted fence](../reference/untrusted-fence.md).
+    drawn inside an image — is a forgery. [Untrusted fence](../reference/untrusted-fence.md) has
+    the marker forms and the field each surface labels a fence with.
 
     The fence marks content; it does not control capability. It sits inside the boundary
     `capabilities:` draws and replaces no part of it — nothing is refused or delayed for being
