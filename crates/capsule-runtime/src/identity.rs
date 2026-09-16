@@ -62,21 +62,112 @@ pub(crate) async fn bind_local_port(
     }
 }
 
+/// A JSON-RPC method the door at `POST /` answers.
+///
+/// This is the door's whole method table: dispatch resolves a request's `method` through
+/// [`DoorMethod::resolve`], and the agent card's `serves.methods` is [`served_methods`], which
+/// asks the same resolver. Adding a method means adding a variant, its wire name and its `ALL`
+/// entry; the handler arm is then demanded by the exhaustive matches in the dispatcher, and the
+/// card lists it without further change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoorMethod {
+    MessageSend,
+    MessageStream,
+    StreamWatch,
+    TasksGet,
+    TasksCancel,
+    SessionStop,
+}
+
+impl DoorMethod {
+    /// Every method, in the order the card lists them.
+    pub(crate) const ALL: [DoorMethod; 6] = [
+        DoorMethod::MessageSend,
+        DoorMethod::MessageStream,
+        DoorMethod::StreamWatch,
+        DoorMethod::TasksGet,
+        DoorMethod::TasksCancel,
+        DoorMethod::SessionStop,
+    ];
+
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            DoorMethod::MessageSend => "message/send",
+            DoorMethod::MessageStream => "message/stream",
+            DoorMethod::StreamWatch => "stream/watch",
+            DoorMethod::TasksGet => "tasks/get",
+            DoorMethod::TasksCancel => "tasks/cancel",
+            DoorMethod::SessionStop => "session/stop",
+        }
+    }
+
+    /// The method this door answers for a request's `method` string, or `None` when it answers
+    /// `-32601`.
+    ///
+    /// The only place a request's method is interpreted and the only place
+    /// `lifecycle.task_acceptance` gates one: under `TaskAcceptance::None` neither task-starting
+    /// method is served. The match is exact — no case folding, no trimming — so a name the card
+    /// lists is the name to send.
+    pub(crate) fn resolve(method: &str, acceptance: &TaskAcceptance) -> Option<DoorMethod> {
+        let resolved = Self::ALL.into_iter().find(|m| m.wire_name() == method)?;
+        match (resolved, acceptance) {
+            (DoorMethod::MessageSend | DoorMethod::MessageStream, TaskAcceptance::None) => None,
+            _ => Some(resolved),
+        }
+    }
+}
+
+/// The wire names of every method [`DoorMethod::resolve`] serves under `acceptance`, in `ALL`
+/// order.
+pub(crate) fn served_methods(acceptance: &TaskAcceptance) -> Vec<&'static str> {
+    DoorMethod::ALL
+        .into_iter()
+        .filter(|m| DoorMethod::resolve(m.wire_name(), acceptance).is_some())
+        .map(DoorMethod::wire_name)
+        .collect()
+}
+
+/// Which HTTP planes the manifest declares. An undeclared plane is still routed, but answers only
+/// refusals, so the card lists a plane only when it is declared here.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DeclaredPlanes {
+    /// `exports.files` is declared: the operator plane under `/resources/files` serves content.
+    pub files: bool,
+    /// `exports.peer_files` is declared: the peer plane under `/resources/peer/{handle}` serves
+    /// content.
+    pub peer_files: bool,
+}
+
 /// Build the Agent Card JSON derived from capsule identity and capability policy.
 ///
 /// `session_id` is served alongside the rest because the card is how a caller confirms that the
 /// capsule answering an address is the session it went looking for. A session id is already
 /// non-secret here — the door names the addressed session when it refuses a completion meant for
 /// another one.
+///
+/// `capabilities` is what this capsule may do; `serves` is what this door answers. `serves.methods`
+/// is [`served_methods`] for the acceptance the door is given, so it cannot list a method the
+/// dispatcher refuses or omit one it serves, and `capabilities.streaming` is `true` exactly when
+/// it contains `message/stream`. `serves.planes` lists `files` then `peer_files`, each only when
+/// declared.
 pub(crate) fn build_agent_card(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
     capability_policy: &CapabilityPolicy,
+    task_acceptance: &TaskAcceptance,
+    planes: DeclaredPlanes,
 ) -> serde_json::Value {
     let tools: Vec<&str> = installed_artifacts
         .iter()
         .filter(|a| a.runtime.is_llm_visible())
         .map(|a| a.name.as_str())
+        .collect();
+
+    let methods = served_methods(task_acceptance);
+    let streaming = methods.contains(&DoorMethod::MessageStream.wire_name());
+    let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
+        .into_iter()
+        .filter_map(|(declared, name)| declared.then_some(name))
         .collect();
 
     serde_json::json!({
@@ -88,7 +179,11 @@ pub(crate) fn build_agent_card(
             "tools": tools,
             "shell": !capability_policy.shell_allow.is_empty(),
             "network": !capability_policy.network_allow.is_empty(),
-            "streaming": true,
+            "streaming": streaming,
+        },
+        "serves": {
+            "methods": methods,
+            "planes": declared_planes,
         }
     })
 }
@@ -308,15 +403,24 @@ async fn handle_connection(
             return;
         }
 
-        // Peek at method to route SSE endpoints before full dispatch
-        if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&body_str) {
-            if req.method == "message/stream" {
+        let req = match serde_json::from_str::<JsonRpcRequest>(&body_str) {
+            Ok(req) => req,
+            Err(_) => {
+                let response =
+                    JsonRpcResponse::err(Value::Null, -32700, "Parse error").into_http_response();
+                let _ = writer_half.write_all(response.as_bytes()).await;
+                return;
+            }
+        };
+
+        // The streaming methods own the connection; every other method answers one JSON body.
+        let response = match DoorMethod::resolve(&req.method, &task_acceptance) {
+            Some(DoorMethod::MessageStream) => {
                 handle_message_stream(
                     writer_half,
                     req,
                     &task_registry,
                     &task_tx,
-                    &task_acceptance,
                     traceparent,
                     provenance,
                     delegation_id,
@@ -327,7 +431,7 @@ async fn handle_connection(
                 .await;
                 return;
             }
-            if req.method == "stream/watch" {
+            Some(DoorMethod::StreamWatch) => {
                 handle_stream_watch(
                     writer_half,
                     last_event_id,
@@ -338,20 +442,20 @@ async fn handle_connection(
                 .await;
                 return;
             }
-        }
-
-        let response = handle_jsonrpc(
-            &body_str,
-            &task_registry,
-            &task_tx,
-            &task_acceptance,
-            traceparent,
-            provenance,
-            delegation_id,
-            detached.as_ref(),
-            &live_delegations,
-            &session_id,
-        );
+            Some(door_method) => handle_jsonrpc(
+                door_method,
+                req,
+                &task_registry,
+                &task_tx,
+                traceparent,
+                provenance,
+                delegation_id,
+                detached.as_ref(),
+                &live_delegations,
+                &session_id,
+            ),
+            None => JsonRpcResponse::err(req.id, -32601, "Method not found").into_http_response(),
+        };
         let _ = writer_half.write_all(response.as_bytes()).await;
         return;
     }
@@ -385,7 +489,6 @@ async fn handle_message_stream(
     req: JsonRpcRequest,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
-    task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
@@ -394,14 +497,6 @@ async fn handle_message_stream(
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
 ) {
     use tokio::io::AsyncWriteExt;
-
-    // task_acceptance: none — method is not available
-    if matches!(task_acceptance, TaskAcceptance::None) {
-        let error_body =
-            JsonRpcResponse::err(req.id, -32601, "Method not found").into_http_response();
-        let _ = writer.write_all(error_body.as_bytes()).await;
-        return;
-    }
 
     // Subscribe to broadcast BEFORE writing headers so we don't miss events
     // emitted between enqueue and the start of our receive loop.
@@ -632,12 +727,13 @@ async fn handle_stream_watch(
     }
 }
 
+/// Answers a resolved method that replies with one JSON-RPC body.
 #[allow(clippy::too_many_arguments)]
 fn handle_jsonrpc(
-    body: &str,
+    method: DoorMethod,
+    req: JsonRpcRequest,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
-    task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
@@ -645,33 +741,27 @@ fn handle_jsonrpc(
     live_delegations: &LiveDelegations,
     session_id: &str,
 ) -> String {
-    let req: JsonRpcRequest = match serde_json::from_str(body) {
-        Ok(r) => r,
-        Err(_) => {
-            return JsonRpcResponse::err(Value::Null, -32700, "Parse error").into_http_response();
-        }
-    };
-
-    let id = req.id.clone();
-    match req.method.as_str() {
-        "message/send" => handle_message_send(
+    let id = req.id;
+    match method {
+        DoorMethod::MessageSend => handle_message_send(
             id,
             &req.params,
             task_registry,
             task_tx,
-            task_acceptance,
             traceparent,
             provenance,
             delegation_id,
         ),
-        "tasks/get" => handle_tasks_get(id, &req.params, task_registry),
-        "tasks/cancel" => {
+        DoorMethod::TasksGet => handle_tasks_get(id, &req.params, task_registry),
+        DoorMethod::TasksCancel => {
             handle_tasks_cancel(id, &req.params, task_registry, detached, live_delegations)
         }
-        "session/stop" => {
+        DoorMethod::SessionStop => {
             handle_session_stop(id, task_registry, detached, live_delegations, session_id)
         }
-        _ => JsonRpcResponse::err(id, -32601, "Method not found").into_http_response(),
+        DoorMethod::MessageStream | DoorMethod::StreamWatch => {
+            unreachable!("handle_connection answers the streaming methods before this point")
+        }
     }
 }
 
@@ -681,16 +771,10 @@ fn handle_message_send(
     params: &Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
-    task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
 ) -> String {
-    // task_acceptance: none — method is not available
-    if matches!(task_acceptance, TaskAcceptance::None) {
-        return JsonRpcResponse::err(id, -32601, "Method not found").into_http_response();
-    }
-
     let msg_value = params.get("message").unwrap_or(params);
     let message: A2aMessage = match serde_json::from_value(msg_value.clone()) {
         Ok(m) => m,
@@ -887,6 +971,125 @@ fn handle_session_stop(
 mod tests {
     use super::*;
     use crate::errors::RuntimeError;
+
+    const ACCEPTANCES: [TaskAcceptance; 3] = [
+        TaskAcceptance::None,
+        TaskAcceptance::Single,
+        TaskAcceptance::Queue,
+    ];
+
+    fn card_for(acceptance: &TaskAcceptance, planes: DeclaredPlanes) -> Value {
+        let identity = CapsuleIdentity {
+            capsule_name: "probe".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            session_id: "ses_probe".to_string(),
+            capsule_url: "http://127.0.0.1:1".to_string(),
+        };
+        build_agent_card(
+            &identity,
+            &[],
+            &CapabilityPolicy::default(),
+            acceptance,
+            planes,
+        )
+    }
+
+    #[test]
+    fn door_method_served_methods_are_exactly_what_resolve_serves() {
+        for acceptance in &ACCEPTANCES {
+            let resolved: Vec<&str> = DoorMethod::ALL
+                .into_iter()
+                .filter(|m| DoorMethod::resolve(m.wire_name(), acceptance).is_some())
+                .map(DoorMethod::wire_name)
+                .collect();
+            assert_eq!(served_methods(acceptance), resolved, "{acceptance:?}");
+
+            for method in DoorMethod::ALL {
+                if let Some(resolved) = DoorMethod::resolve(method.wire_name(), acceptance) {
+                    assert_eq!(resolved, method, "{acceptance:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn door_method_acceptance_none_serves_no_task_starting_method() {
+        assert_eq!(
+            served_methods(&TaskAcceptance::None),
+            ["stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+        );
+        for acceptance in [TaskAcceptance::Single, TaskAcceptance::Queue] {
+            assert_eq!(
+                served_methods(&acceptance),
+                [
+                    "message/send",
+                    "message/stream",
+                    "stream/watch",
+                    "tasks/get",
+                    "tasks/cancel",
+                    "session/stop"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn door_method_resolve_matches_names_exactly() {
+        for acceptance in &ACCEPTANCES {
+            for name in [
+                "tasks/list",
+                "",
+                "Tasks/Get",
+                "TASKS/GET",
+                " tasks/get",
+                "tasks/get ",
+                "tasks/get\n",
+                "session/stop/",
+            ] {
+                assert_eq!(
+                    DoorMethod::resolve(name, acceptance),
+                    None,
+                    "{name:?} under {acceptance:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn door_method_card_advertises_what_the_resolver_serves() {
+        for acceptance in &ACCEPTANCES {
+            let card = card_for(acceptance, DeclaredPlanes::default());
+            let methods: Vec<&str> = card["serves"]["methods"]
+                .as_array()
+                .expect("serves.methods is an array")
+                .iter()
+                .map(|m| m.as_str().expect("each method is a string"))
+                .collect();
+            assert_eq!(methods, served_methods(acceptance), "{acceptance:?}");
+            assert_eq!(
+                card["capabilities"]["streaming"],
+                methods.contains(&"message/stream"),
+                "{acceptance:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn door_method_card_lists_declared_planes_in_order() {
+        let cases = [
+            (false, false, serde_json::json!([])),
+            (true, false, serde_json::json!(["files"])),
+            (false, true, serde_json::json!(["peer_files"])),
+            (true, true, serde_json::json!(["files", "peer_files"])),
+        ];
+        for (files, peer_files, expected) in cases {
+            let card = card_for(
+                &TaskAcceptance::Single,
+                DeclaredPlanes { files, peer_files },
+            );
+            assert_eq!(card["serves"]["planes"], expected);
+        }
+    }
 
     #[tokio::test]
     async fn bind_local_port_os_assigned_when_none() {

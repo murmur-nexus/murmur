@@ -1368,6 +1368,11 @@ fn launch(
             &capsule_identity,
             &staged.installed_artifacts,
             &staged.capability_policy,
+            &staged.lifecycle.task_acceptance,
+            identity::DeclaredPlanes {
+                files: staged.exports_files.is_some(),
+                peer_files: staged.exports_peer_files.is_some(),
+            },
         );
         let agent_card_json = agent_card.to_string();
 
