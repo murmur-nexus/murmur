@@ -191,6 +191,8 @@ A 200 response confirms the capsule is running:
 }
 ```
 
+See [Agent Card](../reference/agent-card.md) for what each key means.
+
 ---
 
 ## Step 5 — send a task

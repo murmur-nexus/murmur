@@ -175,7 +175,7 @@ A capsule that runs `task.md` and exits needs nothing further. To keep it up and
 PORT=$(mur run --json --task task.md | head -n 1 | sed 's/.*localhost:\([0-9]*\).*/\1/')
 ```
 
-The capsule describes itself at `/.well-known/agent-card.json`:
+The capsule describes itself at `/.well-known/agent-card.json`, including the JSON-RPC methods it answers (see [Agent Card](../reference/agent-card.md)):
 
 ```bash
 curl -s http://localhost:$PORT/.well-known/agent-card.json

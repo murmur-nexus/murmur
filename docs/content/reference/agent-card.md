@@ -2,7 +2,7 @@
 
 Every capsule serves an agent card at `GET /.well-known/agent-card.json` on its HTTP listener. The
 card names the session answering the address, states what the capsule may do, and lists what its
-door answers.
+listener answers.
 
 ```json
 {
@@ -28,13 +28,13 @@ The card answers two separate questions:
 | Block | Answers | Derived from |
 |---|---|---|
 | [`capabilities`](#capabilities) | What may this capsule do? | The capsule's permissions: installed artifacts and `capabilities.*` in the manifest |
-| [`serves`](#serves) | What does this door answer? | The door's own method resolver and the declared `exports` |
+| [`serves`](#serves) | What does this listener answer? | The methods `POST /` dispatches and the declared `exports` |
 
 ---
 
 ## Keys { #keys }
 
-Every key is present on every card.
+Every key below is present on every card this runtime serves.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -58,7 +58,7 @@ This capsule's permissions.
 
 ## `serves` { #serves }
 
-What this door answers. Both keys are always present; either may be an empty array.
+What this listener answers. Both keys are always present; `serves.planes` may be empty.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -69,7 +69,7 @@ The card endpoint itself is not listed.
 
 ### `serves.methods` { #serves-methods }
 
-A method is listed exactly when the door answers it with something other than `-32601 Method not
+A method is listed exactly when `POST /` answers it with something other than `-32601 Method not
 found`. Method names match exactly: case and surrounding whitespace are significant. Methods appear
 in this order:
 
@@ -82,7 +82,7 @@ in this order:
 | `tasks/cancel` | Cancels the task named by `params.id` | Always |
 | `session/stop` | Cancels every live task and reports what the session leaves running | Always |
 
-See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, the door
+See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
 answers `message/send` and `message/stream` with `-32601`, so neither is listed and
 `capabilities.streaming` is `false`.
 

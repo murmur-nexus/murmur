@@ -765,7 +765,6 @@ fn handle_jsonrpc(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_message_send(
     id: Value,
     params: &Value,
@@ -997,18 +996,25 @@ mod tests {
     #[test]
     fn door_method_served_methods_are_exactly_what_resolve_serves() {
         for acceptance in &ACCEPTANCES {
-            let resolved: Vec<&str> = DoorMethod::ALL
-                .into_iter()
-                .filter(|m| DoorMethod::resolve(m.wire_name(), acceptance).is_some())
-                .map(DoorMethod::wire_name)
-                .collect();
-            assert_eq!(served_methods(acceptance), resolved, "{acceptance:?}");
-
+            let served = served_methods(acceptance);
             for method in DoorMethod::ALL {
-                if let Some(resolved) = DoorMethod::resolve(method.wire_name(), acceptance) {
+                let resolved = DoorMethod::resolve(method.wire_name(), acceptance);
+                assert_eq!(
+                    served.contains(&method.wire_name()),
+                    resolved.is_some(),
+                    "{} under {acceptance:?}",
+                    method.wire_name()
+                );
+                if let Some(resolved) = resolved {
                     assert_eq!(resolved, method, "{acceptance:?}");
                 }
             }
+            let listed_in_all_order: Vec<&str> = DoorMethod::ALL
+                .into_iter()
+                .map(DoorMethod::wire_name)
+                .filter(|name| served.contains(name))
+                .collect();
+            assert_eq!(served, listed_in_all_order, "{acceptance:?}");
         }
     }
 
