@@ -361,17 +361,17 @@ pause as long as the work was. A closed connection is what says the capsule is g
 | Counter | Starts at | Advances |
 |---|---|---|
 | The task's counter | `0`, again for every task and for every reopened attempt of a task | By one per frame |
-| The chunk counter | `4611686018427387903` (`u64::MAX / 4`) at launch | By one per chunk. Set to the task's counter before each inference call, and the task's counter is set to it after the call returns, so a task's chunks and its `status` and `artifact` frames share one run of numbers |
-| The input-wait counter | `9223372036854775807` (`u64::MAX / 2`), again for every `request-input` call | By one per frame |
-| The queued-cancel counter | `2305843009213693951` (`u64::MAX / 8`) at launch, once per session | By one per frame |
+| The chunk counter | `4611686018427387903` at launch | By one per chunk. Set to the task's counter before each inference call, and the task's counter is set to it after the call returns, so a task's chunks and its `status` and `artifact` frames share one run of numbers |
+| The input-wait counter | `9223372036854775807`, again for every `request-input` call | By one per frame |
+| The queued-cancel counter | `2305843009213693951` at launch, once per session | By one per frame |
 
 !!! warning "Ids are labels, not a sequence"
     Ids are not consecutive across frame kinds and not unique within a session. Two tasks on one
     capsule write ids `0, 1, 2, …` each, so a session's frames read `0, 1, 2, 0, 1, 2`. Two
-    `request-input` waits both start at `u64::MAX / 2`. Chunks a tool emits while it runs are
-    numbered from the same value as the `artifact` frames that follow them, and the whole-reply
-    `text` frame is numbered from the same value as the hook artifacts written before it. Never subtract two ids, never read a jump
-    as lost frames, and never read a repeat as a duplicate.
+    `request-input` waits both start at `9223372036854775807`. Chunks a tool emits while it runs
+    are numbered from the same value as the `artifact` frames that follow them, and the whole-reply
+    `text` frame is numbered from the same value as the hook artifacts written before it. Never
+    subtract two ids, never read a jump as lost frames, and never read a repeat as a duplicate.
 
 ---
 
