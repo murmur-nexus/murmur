@@ -285,6 +285,10 @@ mur watch @1
 [running-capsule records](../reference/cli.md#running-capsule-records). Name an older one by the
 last four characters of its session id, or reach a capsule directly with `mur watch --url localhost:$PORT`.
 
+To consume the same events from your own client, send `stream/watch` or `message/stream` to the
+capsule's address. [Streaming Protocol](../reference/streaming-protocol.md) lists both endpoints and
+every frame they write.
+
 ---
 
 ## Step 6 — poll the task status

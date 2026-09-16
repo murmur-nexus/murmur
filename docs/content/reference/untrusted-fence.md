@@ -65,7 +65,7 @@ anywhere inside a block — including one drawn inside an image — is a forgery
 
 | Surface | Fence present | How it is labelled |
 |---|---|---|
-| A2A `artifact` SSE frame | In `artifact.content` | `artifact.fence_source` — the source name, or `null`. Present on every frame |
+| A2A [`artifact` SSE frame](streaming-protocol.md#event-artifact) | In `artifact.content` | `artifact.fence_source` — the source name, or `null`. Present on every frame |
 | [`conversation.jsonl`](workdir.md#the-conversation-record) message line | In `content` | `fence` — the source name. Absent on an unfenced line |
 | [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `tool_call` | In `output`, and counted in `output_bytes` | Unlabelled. A `tool_call` event carries a fence and a `skill_call` event does not |
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | In the message's `content` | Unlabelled. The `message` record has no `fence` field; read the markers |
@@ -84,7 +84,7 @@ keys in the file, which are all absent when unset.
 `content` is the bytes the model received, markers included. `fence_source` is the source
 `content` is fenced under, or `null` when `content` carries no fence. A frame with no
 `fence_source` key came from a runtime that does not label frames: read the markers. Every field
-on the frame is listed in [Observability Schemas](observability-schemas.md#task-stream-artifact-frame).
+on the frame is listed in [Streaming Protocol](streaming-protocol.md#event-artifact).
 
 ### The record line
 

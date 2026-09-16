@@ -830,69 +830,8 @@ stopped early.
 
 ## Task stream `artifact` frame { #task-stream-artifact-frame }
 
-A client that sends `message/stream` or `stream/watch` to a capsule receives server-sent events.
-Each event has an `event:` type and a one-line JSON `data:` payload:
-
-| Event type | Carries |
-|---|---|
-| `connection-ack` | Sent once when a `stream/watch` connection opens: the capsule's conversation mode |
-| `status` | The task's state; `"final":true` on the last event of the task |
-| `text` | A chunk of the model's reply |
-| `thinking` | A chunk of the model's reasoning |
-| `artifact` | One tool call's result, or one hook artifact |
-| `gap` | The first event id still available on a reconnect that asked for older events |
-
-This section covers `artifact`. The runtime emits one frame for each tool call it dispatches, in
-dispatch order, and one for each hook artifact before the task's final `status` event. A call a
-policy hook refuses emits no frame.
-
-**Format:** `{"id":"<task id>","artifact":{…}}`. Every key below is present on every frame, in this
-order; a key that does not apply to the frame is `null`, never absent.
-
-| Field | Type | Notes |
-|---|---|---|
-| `tool_name` | string | The tool, skill or hook the frame reports |
-| `content` | string | The full result the model received, byte for byte. A tool result carries its [fence markers](untrusted-fence.md#which-surfaces-carry-a-fence) |
-| `fence_source` | string \| null | The source `content` is fenced under, or `null` when `content` carries no fence |
-| `tool_call_id` | string \| null | The provider's id for the call. `null` on a hook artifact, and on a call the provider gave no id or an empty one |
-| `is_error` | bool | `true` when the tool returned a status other than `passed`, or the call never reached a tool. Matches `"status":"error"` on the call's `tool_call` or `skill_call` event |
-| `duration_ms` | u64 \| null | Time the dispatch took. Equal to the `duration_ms` on the call's `tool_call` or `skill_call` event. `null` on a hook artifact |
-| `exit_code` | i32 \| null | The exit status of the subprocess the call ran to completion. Equal to the `exit_code` on the call's `shell` event. `null` when no subprocess ran to completion: a WASM tool, a skill, a command moved to the background, a call that never reached a tool, and a hook artifact |
-| `truncated` | bool | The tool result's own `truncated` flag, unchanged. `false` on a call that never reached a tool and on a hook artifact |
-
-The frame has no `summary` field. `content` is never truncated, at 200 characters or at any other
-length.
-
-`is_error` and `exit_code` are separate facts. A shell command that runs to completion is a
-successful call whatever its exit status, so `bash` reports `"is_error":false` beside
-`"exit_code":3`. Branch on `exit_code` to act on the command's own outcome.
-
-A frame with no `is_error` key came from a runtime that reports none of the fields from
-`tool_call_id` on.
-
-**A successful tool call**
-
-```json
-{"id":"tsk_01a0…","artifact":{"tool_name":"bash","content":"<untrusted-content source=tool:bash>\n$ echo hello\nExit code: 0\nStdout:\nhello\n\nStderr:\n\n</untrusted-content>","fence_source":"tool:bash","tool_call_id":"toolu_01","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}}
-```
-
-**A failed tool call**
-
-```json
-{"id":"tsk_01a0…","artifact":{"tool_name":"jsonl-line-count","content":"<untrusted-content source=tool:jsonl-line-count>\nfailed to read '{\"data\":\"missing.jsonl\"}': No such file or directory (os error 44)\n</untrusted-content>","fence_source":"tool:jsonl-line-count","tool_call_id":"toolu_02","is_error":true,"duration_ms":5,"exit_code":null,"truncated":false}}
-```
-
-**A call that never reached a tool**
-
-```json
-{"id":"tsk_01a0…","artifact":{"tool_name":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fence_source":null,"tool_call_id":"toolu_03","is_error":true,"duration_ms":0,"exit_code":null,"truncated":false}}
-```
-
-**A hook artifact**
-
-```json
-{"id":"tsk_01a0…","artifact":{"tool_name":"my-hook","content":"{\"reviewed\":true}","fence_source":null,"tool_call_id":null,"is_error":false,"duration_ms":null,"exit_code":null,"truncated":false}}
-```
+The `artifact` frame on a capsule's event stream, and every other frame, is listed in
+[Streaming Protocol](streaming-protocol.md#event-artifact).
 
 ---
 
