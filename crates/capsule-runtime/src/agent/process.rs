@@ -320,7 +320,10 @@ pub(crate) async fn run_process_inference_loop(
     // (where the agent's own tools are preopened), not the internal session workdir.
     // Fenced on the same condition as the http path, from the same function, so the transport
     // a capsule runs on does not decide whether an untrusted payload is marked.
-    let task = super::fence_task_payload(
+    // The fence source is discarded: this transport keeps no conversation record and emits no
+    // A2A artifact frame, so it has no surface to carry a label on. The CLI assembles its own
+    // payload from the fenced text, which still names its source in the markers.
+    let (task, _fence_source) = super::fence_task_payload(
         store_state.current_task_provenance,
         read_task_from_workdir(accessible_workdir),
     );

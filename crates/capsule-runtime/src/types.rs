@@ -29,6 +29,15 @@ pub(crate) struct DispatchOutcome {
     /// a binary or WASM component. Used by the agent loop to write a `skill_call` trace
     /// event instead of a `tool_call` event.
     pub is_skill: bool,
+    /// The fence source `result.data` was wrapped under, or `None` when the result carries no
+    /// fence. Set by [`crate::runtime::CapsuleStoreState::dispatch_agent_tool_async`] on the
+    /// same branch that applies the fence, so the label and the wrapping cannot drift: a caller
+    /// reading this never re-derives a source name by parsing the content back.
+    ///
+    /// `None` on every outcome that leaves the private unfenced dispatch — the skill branch,
+    /// and [`crate::runtime::CapsuleStoreState::dispatch_submit_plan`]'s route, whose step
+    /// output is fenced later as one field of a report.
+    pub fence_source: Option<String>,
     /// Set when this dispatch failed in a way that ends the *session* rather than just this
     /// tool call — today only a `sealed` composed-root construction failure
     /// ([`crate::shell::ShellExecError::session_fatal`]). `result` still describes the failed
@@ -49,6 +58,7 @@ impl DispatchOutcome {
             shell: None,
             detached: None,
             is_skill: false,
+            fence_source: None,
             fatal: None,
         }
     }
@@ -59,6 +69,7 @@ impl DispatchOutcome {
             shell: None,
             detached: None,
             is_skill: true,
+            fence_source: None,
             fatal: None,
         }
     }
