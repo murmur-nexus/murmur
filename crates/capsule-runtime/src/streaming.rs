@@ -50,6 +50,20 @@ pub(crate) struct TaskArtifactUpdateEvent {
 pub(crate) struct StreamArtifact {
     pub tool_name: String,
     pub content: String,
+    /// The fence source naming what produced `content` — `tool:<name>` — or `None` when
+    /// `content` carries no fence. It tells apart the frame shapes that are otherwise
+    /// identical on the wire: an ordinary tool result, a skill result, a dispatch failure and
+    /// a hook artifact all arrive as a `tool_name` and a `content`.
+    ///
+    /// Serialized on every frame, `null` included, without `skip_serializing_if`: a consumer
+    /// that sees the key knows it is talking to a runtime that labels its frames, and one that
+    /// sees no key knows it is not — which is a different thing from "this frame is unfenced".
+    /// The conversation record's `fence` key is absent-when-unset instead, because a record
+    /// line is read alongside four other envelope keys that all work that way.
+    ///
+    /// Naming a fence never justifies rewriting one: `content` is the bytes the model received,
+    /// markers and all.
+    pub fence_source: Option<String>,
 }
 
 /// Format a single SSE event frame:

@@ -199,9 +199,18 @@ One line is one message, as the runtime holds it:
 
 `role`, `content` and `id` are always present. `id` is `msg_` plus a uuid-v7, minted once where the
 message was created and preserved everywhere after — including across a reload and across a hook
-that hands the message back. A `tool` message also carries `tool_call_id` and `is_error`; a message
-a hook produced carries `source_id` when that hook supplied one. Neither `id` nor `source_id` ever
-reaches a driver.
+that hands the message back. It is the runtime's own and is stripped before the messages go to a
+driver. A `tool` message also carries `tool_call_id` and `is_error`.
+
+Four more keys are the runtime's own envelope, each written when it applies and each stripped
+before the messages go to a driver:
+
+| Key | Written on |
+|---|---|
+| `source_id` | A message a hook produced, when that hook supplied one |
+| `canceled` | The assistant message left behind by a turn a person stopped |
+| `truncated` | An assistant message the provider cut off at [`inference.max_tokens`](manifest.md#inference-max-tokens) |
+| `fence` | A message whose `content` is wrapped in the [untrusted fence](untrusted-fence.md) — the source name, `tool:<artifact name>` or `task:<origin>` |
 
 The record holds every message that enters the context, in the order it enters: the task's user
 message, each committed `seed-context` message, each assistant message, each tool result, and each
