@@ -78,17 +78,13 @@ keys in the file, which are all absent when unset.
 ### The `artifact` frame
 
 ```json
-{"id":"task_01a0…","artifact":{"tool_name":"web-fetch","content":"<untrusted-content source=tool:web-fetch>\n{\"status\":200}\n</untrusted-content>","fence_source":"tool:web-fetch"}}
+{"id":"tsk_01a0…","artifact":{"tool_name":"web-fetch","content":"<untrusted-content source=tool:web-fetch>\n{\"status\":200}\n</untrusted-content>","fence_source":"tool:web-fetch"}}
 ```
 
-| Field | Type | Value |
-|---|---|---|
-| `tool_name` | string | The tool, skill or hook the content came from |
-| `content` | string | The bytes the model received, markers included |
-| `fence_source` | string \| null | The source `content` is fenced under, or `null` when `content` carries no fence |
-
-A frame with no `fence_source` key came from a runtime that predates the field. Read the markers.
-The frame's full field list is in [Observability Schemas](observability-schemas.md#task-stream-artifact-frame).
+`content` is the bytes the model received, markers included. `fence_source` is the source
+`content` is fenced under, or `null` when `content` carries no fence. A frame with no
+`fence_source` key came from a runtime that does not label frames: read the markers. Every field
+on the frame is listed in [Observability Schemas](observability-schemas.md#task-stream-artifact-frame).
 
 ### The record line
 

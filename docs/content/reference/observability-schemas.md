@@ -835,6 +835,7 @@ Each event has an `event:` type and a one-line JSON `data:` payload:
 
 | Event type | Carries |
 |---|---|
+| `connection-ack` | Sent once when a `stream/watch` connection opens: the capsule's conversation mode |
 | `status` | The task's state; `"final":true` on the last event of the task |
 | `text` | A chunk of the model's reply |
 | `thinking` | A chunk of the model's reasoning |
@@ -872,25 +873,25 @@ A frame with no `is_error` key came from a runtime that reports none of the fiel
 **A successful tool call**
 
 ```json
-{"id":"task_01a0…","artifact":{"tool_name":"bash","content":"<untrusted-content source=tool:bash>\n$ echo hello\nExit code: 0\nStdout:\nhello\n\nStderr:\n\n</untrusted-content>","fence_source":"tool:bash","tool_call_id":"toolu_01","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}}
+{"id":"tsk_01a0…","artifact":{"tool_name":"bash","content":"<untrusted-content source=tool:bash>\n$ echo hello\nExit code: 0\nStdout:\nhello\n\nStderr:\n\n</untrusted-content>","fence_source":"tool:bash","tool_call_id":"toolu_01","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}}
 ```
 
 **A failed tool call**
 
 ```json
-{"id":"task_01a0…","artifact":{"tool_name":"jsonl-line-count","content":"<untrusted-content source=tool:jsonl-line-count>\nfailed to read '{\"data\":\"missing.jsonl\"}': No such file or directory (os error 44)\n</untrusted-content>","fence_source":"tool:jsonl-line-count","tool_call_id":"toolu_02","is_error":true,"duration_ms":5,"exit_code":null,"truncated":false}}
+{"id":"tsk_01a0…","artifact":{"tool_name":"jsonl-line-count","content":"<untrusted-content source=tool:jsonl-line-count>\nfailed to read '{\"data\":\"missing.jsonl\"}': No such file or directory (os error 44)\n</untrusted-content>","fence_source":"tool:jsonl-line-count","tool_call_id":"toolu_02","is_error":true,"duration_ms":5,"exit_code":null,"truncated":false}}
 ```
 
 **A call that never reached a tool**
 
 ```json
-{"id":"task_01a0…","artifact":{"tool_name":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fence_source":null,"tool_call_id":"toolu_03","is_error":true,"duration_ms":0,"exit_code":null,"truncated":false}}
+{"id":"tsk_01a0…","artifact":{"tool_name":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fence_source":null,"tool_call_id":"toolu_03","is_error":true,"duration_ms":0,"exit_code":null,"truncated":false}}
 ```
 
 **A hook artifact**
 
 ```json
-{"id":"task_01a0…","artifact":{"tool_name":"my-hook","content":"{\"reviewed\":true}","fence_source":null,"tool_call_id":null,"is_error":false,"duration_ms":null,"exit_code":null,"truncated":false}}
+{"id":"tsk_01a0…","artifact":{"tool_name":"my-hook","content":"{\"reviewed\":true}","fence_source":null,"tool_call_id":null,"is_error":false,"duration_ms":null,"exit_code":null,"truncated":false}}
 ```
 
 ---

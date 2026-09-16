@@ -948,11 +948,7 @@ fn artifact_frame_of_a_skill_result_carries_no_fence() {
         "the skill.md text must reach the frame verbatim: {artifact}"
     );
 
-    let events: Vec<Value> = fs::read_to_string(launched.workdir.join("trace.jsonl"))
-        .expect("trace.jsonl should exist")
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    let events = trace_events(&launched);
     assert!(
         events
             .iter()

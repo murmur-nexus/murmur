@@ -79,7 +79,8 @@ pub(crate) struct StreamArtifact {
     /// none — a WASM tool, a skill, a command demoted to the background, a failed dispatch, a
     /// hook artifact.
     pub exit_code: Option<i32>,
-    /// The tool's own `truncated` declaration, passed through as the guest set it.
+    /// The tool result's `truncated` flag, passed through unchanged: a tool's declaration that its
+    /// output was cut short. The shell tool sets it when output exceeds its capture limit.
     pub truncated: bool,
 }
 
