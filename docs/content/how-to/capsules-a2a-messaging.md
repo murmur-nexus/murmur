@@ -275,7 +275,7 @@ When the orchestrator capsule is itself a WASM capsule component, it sends messa
 
 ## Alternative: stream events instead of polling
 
-Use `mur watch` from a second terminal to observe live progress — inference heartbeats, tool results, and completion state — as the agent loop runs. It takes a [session address](../reference/cli.md#session-addresses), so the second terminal needs nothing the first one printed:
+Use `mur watch` from a second terminal to observe live progress — inference turns, tool results, and completion state — as the agent loop runs. It takes a [session address](../reference/cli.md#session-addresses), so the second terminal needs nothing the first one printed:
 
 ```bash
 mur watch @1
