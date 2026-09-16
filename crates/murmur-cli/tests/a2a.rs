@@ -581,3 +581,143 @@ fn a2a_tasks_get_unknown_method_returns_error() {
 
     handle.join().expect("launch thread should not panic");
 }
+
+// ── task-line fence labels ───────────────────────────────────────────────────
+
+/// A project whose records land under a caller-chosen `context.record_store` segment, so one
+/// test's record is findable among the many `a2a-agent` leaves the rest of this file writes.
+fn setup_agent_project_with_record(endpoint: &str, record_store: &str) -> (TempDir, PathBuf) {
+    let (home, manifest_path) = setup_agent_project(endpoint);
+    let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+        "capabilities:\n",
+        &format!("context:\n  record_store: {record_store}\ncapabilities:\n"),
+    );
+    fs::write(&manifest_path, manifest).unwrap();
+    (home, manifest_path)
+}
+
+/// A record-store segment no other run shares.
+fn unique_record_store(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Every message line of the one context written under `record_store`, and then the store is
+/// removed: the records resolve against the real `$HOME`, which the capsule runtime reads at
+/// dispatch time rather than from the staging request.
+fn recorded_messages_and_cleanup(record_store: &str) -> Vec<Value> {
+    let root = PathBuf::from(std::env::var("HOME").expect("HOME is set"))
+        .join(".murmur/conversations")
+        .join(record_store);
+    let context_dir = fs::read_dir(&root)
+        .unwrap_or_else(|err| panic!("reading {}: {err}", root.display()))
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| panic!("no context directory under {}", root.display()));
+
+    let text = fs::read_to_string(context_dir.join("conversation.jsonl"))
+        .unwrap_or_else(|err| panic!("reading the record under {}: {err}", root.display()));
+    let _ = fs::remove_dir_all(&root);
+
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("a record line is JSON"))
+        .filter(|line: &Value| line.get("role").is_some())
+        .collect()
+}
+
+/// A message with no origin claim is an `event`, which is untrusted — so its task payload is
+/// fenced, and the record line says which source it was fenced under.
+#[test]
+fn an_event_origin_task_line_is_labelled_fenced() {
+    if common::skip_without_host_support("an_event_origin_task_line_is_labelled_fenced") {
+        return;
+    }
+    let record_store = unique_record_store("fence-event");
+    let server = end_turn_server("event task done");
+    let (home, manifest_path) = setup_agent_project_with_record(&server.endpoint, &record_store);
+    let staged = stage_agent(&home, &manifest_path);
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+        .expect("launch should succeed")
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("timed out waiting for capsule_url");
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": "fence-event-msg",
+                "role": "user",
+                "parts": [{"text": "classify me"}]
+            }
+        }
+    })
+    .to_string();
+    let response = http_post_json(&capsule_url, "/", &body);
+    assert_eq!(response["result"]["status"]["state"], "submitted");
+
+    let launched = handle.join().expect("launch thread should not panic");
+    let task_start = task_start_line(&launched.workdir);
+    assert_eq!(task_start["origin"], "event", "got: {task_start}");
+    assert_eq!(task_start["trust"], "untrusted", "got: {task_start}");
+
+    let messages = recorded_messages_and_cleanup(&record_store);
+    let task_line = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap_or_else(|| panic!("no user line in the record: {messages:#?}"));
+
+    assert_eq!(
+        task_line["fence"], "task:event",
+        "an untrusted task line names its source: {task_line}"
+    );
+    let text = task_line["content"][0]["text"].as_str().expect("task text");
+    assert!(
+        text.starts_with("<untrusted-content source=task:event>")
+            && text.ends_with("</untrusted-content>"),
+        "the recorded task keeps the fence the model read: {text}"
+    );
+    assert!(text.contains("classify me"), "got: {text}");
+}
+
+/// A local launch with a `task.md` is `user` origin and trusted, so nothing is fenced and there
+/// is no key to carry.
+#[test]
+fn a_user_origin_task_line_carries_no_fence_key() {
+    if common::skip_without_host_support("a_user_origin_task_line_carries_no_fence_key") {
+        return;
+    }
+    let record_store = unique_record_store("fence-user");
+    let server = end_turn_server("task.md done");
+    let (home, manifest_path) = setup_agent_project_with_record(&server.endpoint, &record_store);
+    let staged = stage_agent(&home, &manifest_path);
+    fs::write(staged.workdir.join("task.md"), "Run the fallback task").unwrap();
+
+    let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
+    let task_start = task_start_line(&launched.workdir);
+    assert_eq!(task_start["origin"], "user", "got: {task_start}");
+    assert_eq!(task_start["trust"], "trusted", "got: {task_start}");
+
+    let messages = recorded_messages_and_cleanup(&record_store);
+    let task_line = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap_or_else(|| panic!("no user line in the record: {messages:#?}"));
+
+    assert!(
+        task_line.get("fence").is_none(),
+        "a trusted task line carries no fence key: {task_line}"
+    );
+    assert_eq!(
+        task_line["content"][0]["text"], "Run the fallback task",
+        "the recorded task is verbatim: {task_line}"
+    );
+}

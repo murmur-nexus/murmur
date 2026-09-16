@@ -232,7 +232,8 @@ available, and permanently open elsewhere.
     own block; the rewrite inserts and deletes nothing, so an operator reading the trace sees the
     forged marker as rewritten text. The system prompt tells the model that everything between the
     markers is data and that a closing marker appearing anywhere inside a block — including one
-    drawn inside an image — is a forgery.
+    drawn inside an image — is a forgery. The full grammar, and the field each surface labels a
+    fence with, are in [Untrusted fence](../reference/untrusted-fence.md).
 
     The fence marks content; it does not control capability. It sits inside the boundary
     `capabilities:` draws and replaces no part of it — nothing is refused or delayed for being

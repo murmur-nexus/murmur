@@ -149,6 +149,33 @@ const CANCELED_TURN_TEXT: &str = "[the person cancelled this task before the mod
 /// something the model said about itself.
 const MESSAGE_TRUNCATED_KEY: &str = "truncated";
 
+/// Message field naming the fence source this message's `content` is wrapped under —
+/// `tool:<name>` for a fenced tool result, `task:<origin>` for an untrusted task payload.
+/// Written to the conversation record and never sent to a driver, which already reads the
+/// markers inside the content.
+///
+/// Absent, rather than `null`, on a message whose content carries no fence: it joins the four
+/// envelope keys above, which are all absent-when-unset, and a reader of `conversation.jsonl`
+/// keys off the four the same way. The A2A `artifact` frame's `fence_source` is present on
+/// every frame instead — that consumer may be talking to any runtime version and needs to tell
+/// "unfenced" from "unlabelled".
+///
+/// A label, never a licence to rewrite: the content stays the bytes the model received, and a
+/// record line is not filtered, refused or truncated for carrying this key.
+const MESSAGE_FENCE_KEY: &str = "fence";
+
+/// `message` labelled with the fence source its content was wrapped under, or returned untouched
+/// when `source` is `None`.
+///
+/// The source is carried in from whoever applied the fence rather than recovered from the
+/// content, so the key and the markers state one decision instead of two.
+fn with_fence_source(mut message: Value, source: Option<String>) -> Value {
+    if let (Some(source), Some(fields)) = (source, message.as_object_mut()) {
+        fields.insert(MESSAGE_FENCE_KEY.to_string(), json!(source));
+    }
+    message
+}
+
 /// How one agent-loop attempt ended, for a caller that needs the outcome rather than just
 /// "did it error". The strings are the `exit_status` vocabulary `session_end` and `task_end`
 /// share, so the same value reads the same wherever it lands in a trace.
@@ -277,7 +304,7 @@ pub(crate) async fn run_agent_loop(
     // task.md lives in accessible_workdir (where the agent's own tools are preopened),
     // not workdir (the internal `.murmur/<session_id>` bookkeeping dir) — reading from
     // workdir here silently yields an empty task, producing an empty user message.
-    let task = fence_task_payload(
+    let (task, task_fence_source) = fence_task_payload(
         store_state.current_task_provenance,
         read_task(accessible_workdir),
     );
@@ -386,10 +413,13 @@ pub(crate) async fn run_agent_loop(
         }
     }
 
-    let task_message = with_new_id(json!({
-        "role": "user",
-        "content": [{"type": "text", "text": task}],
-    }));
+    let task_message = with_fence_source(
+        with_new_id(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": task}],
+        })),
+        task_fence_source,
+    );
     append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
     messages.push(task_message);
 
@@ -989,7 +1019,11 @@ pub(crate) async fn run_agent_loop(
                         }
                     }
 
-                    let (is_error, text) = match store_state
+                    // The fence source travels out of the match arms alongside the text rather
+                    // than being derived at the push below: one push serves both arms, and only
+                    // the arm knows whether what it produced is a fenced tool result, a skill
+                    // result read off disk, or the runtime's own dispatch-failure message.
+                    let (is_error, text, fence_source) = match store_state
                         .dispatch_agent_tool_async(
                             &tool_name,
                             ToolInput {
@@ -1005,6 +1039,9 @@ pub(crate) async fn run_agent_loop(
                             // this arm so the failed call is traced and hooked like any other
                             // before the session ends on it.
                             let fatal = outcome.fatal.take();
+                            // Set by the dispatch on exactly the branch that fenced the result,
+                            // so it is `Some` for an ordinary tool result and `None` for a skill.
+                            let fence_source = outcome.fence_source.take();
                             let is_error = !matches!(outcome.result.status, Status::Passed);
                             // Read the tool's self-declared state effect and resource identity
                             // before the result's owned fields are consumed below.
@@ -1137,6 +1174,7 @@ pub(crate) async fn run_agent_loop(
                                         artifact: StreamArtifact {
                                             tool_name: tool_name.clone(),
                                             content: text.clone(),
+                                            fence_source: fence_source.clone(),
                                         },
                                     },
                                 )
@@ -1153,7 +1191,7 @@ pub(crate) async fn run_agent_loop(
                             if let Some(fatal) = fatal {
                                 return Err(fatal);
                             }
-                            (is_error, text)
+                            (is_error, text, fence_source)
                         }
                         Err(error) => {
                             let duration_ms =
@@ -1215,21 +1253,27 @@ pub(crate) async fn run_agent_loop(
                                         artifact: StreamArtifact {
                                             tool_name: tool_name.clone(),
                                             content: error.clone(),
+                                            // The runtime's own text about a call that never
+                                            // reached a tool, so there is no source to name.
+                                            fence_source: None,
                                         },
                                     },
                                 )
                                 .await;
                             }
-                            (true, error)
+                            (true, error, None)
                         }
                     };
 
-                    tool_messages.push(with_new_id(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "is_error": is_error,
-                        "content": [{"type": "text", "text": text}],
-                    })));
+                    tool_messages.push(with_fence_source(
+                        with_new_id(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "is_error": is_error,
+                            "content": [{"type": "text", "text": text}],
+                        })),
+                        fence_source,
+                    ));
                 }
 
                 let turn_start = messages.len();
@@ -1641,6 +1685,9 @@ async fn finish_completed_turn(
                     artifact: StreamArtifact {
                         tool_name: ha.hook_name.clone(),
                         content: ha.payload.clone(),
+                        // A hook artifact is the capsule operator's own declared hook speaking,
+                        // not content a tool fetched, and reaches the model unfenced.
+                        fence_source: None,
                     },
                 },
             )
@@ -3016,14 +3063,18 @@ fn wire_messages<'a>(messages: &'a [Value], continuation: Option<(&str, usize)>)
 }
 
 /// The `messages` array as it goes on the wire: every message minus the runtime's own envelope
-/// keys — [`MESSAGE_ID_KEY`], [`MESSAGE_SOURCE_ID_KEY`], [`MESSAGE_CANCELED_KEY`] and
-/// [`MESSAGE_TRUNCATED_KEY`].
+/// keys — [`MESSAGE_ID_KEY`], [`MESSAGE_SOURCE_ID_KEY`], [`MESSAGE_CANCELED_KEY`],
+/// [`MESSAGE_TRUNCATED_KEY`] and [`MESSAGE_FENCE_KEY`].
 ///
-/// All four are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
+/// All five are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
 /// one is minted, so a seed message carrying its id at the head of the prompt is volatile
 /// content in the exact position a provider matches its cached prefix from — it would turn
 /// every request into a cache miss. A message carrying none of them is cloned through
 /// untouched, so a list that never met a hook serializes unchanged.
+///
+/// The membership test and the removal list name the same keys deliberately: a message carrying
+/// only one of them still has to enter the rewriting arm, or it is cloned through with that key
+/// still attached.
 fn strip_message_identity(messages: &[Value]) -> Value {
     Value::Array(
         messages
@@ -3033,13 +3084,15 @@ fn strip_message_identity(messages: &[Value]) -> Value {
                     if fields.contains_key(MESSAGE_ID_KEY)
                         || fields.contains_key(MESSAGE_SOURCE_ID_KEY)
                         || fields.contains_key(MESSAGE_CANCELED_KEY)
-                        || fields.contains_key(MESSAGE_TRUNCATED_KEY) =>
+                        || fields.contains_key(MESSAGE_TRUNCATED_KEY)
+                        || fields.contains_key(MESSAGE_FENCE_KEY) =>
                 {
                     let mut stripped = fields.clone();
                     stripped.remove(MESSAGE_ID_KEY);
                     stripped.remove(MESSAGE_SOURCE_ID_KEY);
                     stripped.remove(MESSAGE_CANCELED_KEY);
                     stripped.remove(MESSAGE_TRUNCATED_KEY);
+                    stripped.remove(MESSAGE_FENCE_KEY);
                     Value::Object(stripped)
                 }
                 _ => message.clone(),
@@ -3247,12 +3300,21 @@ pub(crate) fn count_tokens(text: &str) -> u32 {
 /// `None` means no task activation was in scope when the loop started, which leaves the payload
 /// unfenced. Every agent-path activation sets `current_task_provenance` immediately before
 /// running the task, so the unfenced answer is never a guess about an actual task.
-pub(crate) fn fence_task_payload(provenance: Option<TaskProvenance>, task: String) -> String {
+///
+/// Returns the payload and the source it was fenced under, `None` on the verbatim arms. The
+/// caller labels the task message from the second element rather than deciding a second time
+/// what this function already decided, so the label and the wrapping cannot disagree.
+pub(crate) fn fence_task_payload(
+    provenance: Option<TaskProvenance>,
+    task: String,
+) -> (String, Option<String>) {
     match provenance {
         Some(provenance) if provenance.trust() == TrustClass::Untrusted => {
-            crate::fence::wrap_untrusted(&crate::fence::task_source(provenance.origin()), &task)
+            let source = crate::fence::task_source(provenance.origin());
+            let fenced = crate::fence::wrap_untrusted(&source, &task);
+            (fenced, Some(source))
         }
-        _ => task,
+        _ => (task, None),
     }
 }
 
@@ -3518,11 +3580,13 @@ forgery: {prompt}"
     #[test]
     fn fence_task_payload_wraps_an_untrusted_task() {
         let provenance = TaskProvenance::derive(crate::origin::TaskOrigin::Event, None);
-        let fenced = fence_task_payload(Some(provenance), "summarise this PR comment".to_string());
+        let (fenced, source) =
+            fence_task_payload(Some(provenance), "summarise this PR comment".to_string());
         assert_eq!(
             fenced,
             "<untrusted-content source=task:event>\nsummarise this PR comment\n</untrusted-content>"
         );
+        assert_eq!(source.as_deref(), Some("task:event"));
     }
 
     /// A `user` or `schedule` task is the operator instructing their own capsule; fencing it as
@@ -3534,7 +3598,7 @@ forgery: {prompt}"
             let provenance = TaskProvenance::derive(origin, None);
             assert_eq!(
                 fence_task_payload(Some(provenance), "ship the release".to_string()),
-                "ship the release",
+                ("ship the release".to_string(), None),
                 "{origin:?} derives trusted and must not be fenced"
             );
         }
@@ -3544,7 +3608,43 @@ forgery: {prompt}"
     /// activation sets the provenance before the loop starts.
     #[test]
     fn fence_task_payload_without_provenance_leaves_the_task_alone() {
-        assert_eq!(fence_task_payload(None, "do it".to_string()), "do it");
+        assert_eq!(
+            fence_task_payload(None, "do it".to_string()),
+            ("do it".to_string(), None)
+        );
+    }
+
+    /// The task label never disagrees with the task payload: a source comes back on exactly the
+    /// provenances whose payload came back wrapped, so the record line's `fence` key and the
+    /// markers in its content are two readings of one decision.
+    #[test]
+    fn fence_task_payload_labels_exactly_what_it_wrapped() {
+        use crate::origin::TaskOrigin;
+        let provenances = [
+            None,
+            Some(TaskProvenance::derive(TaskOrigin::Event, None)),
+            Some(TaskProvenance::derive(TaskOrigin::User, None)),
+            Some(TaskProvenance::derive(TaskOrigin::Schedule, None)),
+            Some(TaskProvenance::derive(TaskOrigin::System, None)),
+        ];
+        for provenance in provenances {
+            let (payload, source) = fence_task_payload(provenance, "do the thing".to_string());
+            let wrapped = payload.starts_with("<untrusted-content source=task:")
+                && payload.ends_with(crate::fence::FENCE_CLOSE);
+            assert_eq!(
+                source.is_some(),
+                wrapped,
+                "{provenance:?}: source={source:?} payload={payload}"
+            );
+            if let Some(source) = source {
+                assert!(
+                    payload.starts_with(&crate::fence::open_marker(&source)),
+                    "the label must name the source the payload was wrapped under: {payload}"
+                );
+            } else {
+                assert_eq!(payload, "do the thing");
+            }
+        }
     }
 
     // ── prompt_cache_key ────────────────────────────────────────────────────────
@@ -4433,6 +4533,45 @@ forgery: {prompt}"
             payload["messages"][0],
             json!({"role": "user", "content": [{"type": "text", "text": "hello"}]})
         );
+    }
+
+    /// The fence label is the record's, not the provider's: the driver already reads the markers
+    /// inside the content, and a key it does not know is a key it may reject.
+    ///
+    /// The message carrying `fence` *alone* is the case that matters. The membership test and
+    /// the removal list in [`strip_message_identity`] are two separate lists, so a key added to
+    /// only the second one would let a fenced message with no id through untouched.
+    #[test]
+    fn the_fence_key_is_stripped_from_the_driver_payload() {
+        let with_id = json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [{"type": "text", "text": "<untrusted-content source=tool:probe>\nhi\n</untrusted-content>"}],
+            MESSAGE_ID_KEY: new_message_id(),
+            MESSAGE_FENCE_KEY: "tool:probe",
+        });
+        let fence_only = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "<untrusted-content source=task:event>\nhi\n</untrusted-content>"}],
+            MESSAGE_FENCE_KEY: "task:event",
+        });
+
+        let stripped = strip_message_identity(&[with_id, fence_only]);
+        for message in stripped.as_array().expect("an array of messages") {
+            assert!(
+                message.get(MESSAGE_FENCE_KEY).is_none(),
+                "the fence key must not reach the driver: {message}"
+            );
+            assert!(message.get(MESSAGE_ID_KEY).is_none());
+            // The label goes; the fenced bytes the model reads stay exactly as they were.
+            assert!(message["content"][0]["text"]
+                .as_str()
+                .expect("text content")
+                .contains("<untrusted-content source="));
+        }
+        assert!(!serde_json::to_string(&stripped)
+            .unwrap()
+            .contains("\"fence\""));
     }
 
     /// The id the runtime mints is an identity, never a content hash: two byte-identical
