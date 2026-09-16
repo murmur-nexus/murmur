@@ -30,6 +30,11 @@ const DRIVER_VERSION: &str = "0.1.4";
 const SKILL_NAME: &str = "house-style";
 const SKILL_VERSION: &str = "0.1.0";
 
+const SKILL_GUIDANCE: &str = "# House style\n\nPrefer short sentences.";
+
+const TOOL_NAME: &str = "jsonl-line-count";
+const TOOL_VERSION: &str = "0.1.0";
+
 const STREAMING_DRIVER_NAME: &str = "streaming-driver";
 const STREAMING_DRIVER_VERSION: &str = "0.1.0";
 
@@ -818,8 +823,14 @@ fn artifact_frames(
     server_endpoint_setup: (TempDir, PathBuf),
 ) -> (Vec<Value>, capsule_runtime::LaunchResult) {
     let (home, manifest_path) = server_endpoint_setup;
-    let staged = stage_agent(&home, &manifest_path);
+    streamed_artifact_frames(stage_agent(&home, &manifest_path))
+}
 
+/// Launch `staged`, run one streamed task against it and hand back the parsed `artifact` frames
+/// in arrival order.
+fn streamed_artifact_frames(
+    staged: capsule_runtime::StagedSession,
+) -> (Vec<Value>, capsule_runtime::LaunchResult) {
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
         launch_session(staged, move |url| {
@@ -937,11 +948,7 @@ fn artifact_frame_of_a_skill_result_carries_no_fence() {
         "the skill.md text must reach the frame verbatim: {artifact}"
     );
 
-    let events: Vec<Value> = fs::read_to_string(launched.workdir.join("trace.jsonl"))
-        .expect("trace.jsonl should exist")
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    let events = trace_events(&launched);
     assert!(
         events
             .iter()
@@ -954,4 +961,360 @@ fn artifact_frame_of_a_skill_result_carries_no_fence() {
             .any(|event| event["event_type"] == "tool_call"),
         "a skill dispatch writes no tool_call event; got: {events:#?}"
     );
+}
+
+// ── artifact-frame outcome fields ──────────────────────────────────────────────
+
+/// A scripted provider whose first reply asks for every `(id, tool name, input)` call in one
+/// assistant message, and whose second ends the turn.
+fn tool_calls_then_end_turn_server(
+    calls: &[(&str, &str, Value)],
+    final_text: &str,
+) -> common::ScriptedServer {
+    let tool_uses: Vec<Value> = calls
+        .iter()
+        .map(|(id, name, input)| {
+            serde_json::json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+        })
+        .collect();
+    common::ScriptedServer::start(vec![
+        serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": tool_uses,
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+        serde_json::json!({
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": final_text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+    ])
+}
+
+fn create_wasm_tool_artifact(dir: &Path) -> PathBuf {
+    let artifact_path = dir.join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
+    let file = fs::File::create(&artifact_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    let opts: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("murmur.yaml", opts).unwrap();
+    writeln!(zip, "name: {TOOL_NAME}").unwrap();
+    writeln!(zip, "version: {TOOL_VERSION}").unwrap();
+    writeln!(zip, "runtime: wasm").unwrap();
+    writeln!(zip, "description: counts JSONL lines").unwrap();
+    writeln!(zip, "input_schema:").unwrap();
+    writeln!(zip, "  type: object").unwrap();
+    writeln!(zip, "  properties:").unwrap();
+    writeln!(zip, "    data:").unwrap();
+    writeln!(zip, "      type: string").unwrap();
+
+    zip.start_file("tool.wasm", opts).unwrap();
+    zip.write_all(&fs::read(fixture_path("graduation/tool/jsonl-line-count.wasm")).unwrap())
+        .unwrap();
+
+    zip.finish().unwrap();
+    artifact_path
+}
+
+/// A capsule with the anthropic driver, a skill and the `jsonl-line-count` WASM tool.
+///
+/// The skill is the call that succeeds: a skill dispatch always passes. The tool is the call that
+/// fails: it treats the text it is handed — the call's input JSON — as a path, and returns
+/// `error` when no file has that name.
+///
+/// It grants no shell and declares no native tool, so it launches on a host that cannot delegate
+/// a cgroup scope or build an egress namespace — both launch gates apply only to a capsule that
+/// can spawn a subprocess.
+fn stage_skill_and_tool_agent(endpoint: &str) -> capsule_runtime::StagedSession {
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = common::create_driver_artifact(
+        artifacts.path(),
+        DRIVER_NAME,
+        DRIVER_VERSION,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+    common::publish_local(&home, &create_wasm_tool_artifact(artifacts.path())).success();
+    let skill =
+        common::create_skill_artifact(artifacts.path(), SKILL_NAME, SKILL_VERSION, SKILL_GUIDANCE);
+    common::publish_local(&home, &skill).success();
+
+    fs::write(
+        project.path().join("murmur.yaml"),
+        format!(
+            "name: streaming-tool-agent\nversion: 0.1.0\nartifacts:\n  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+        ),
+    )
+    .unwrap();
+
+    stage_agent(&home, &project.keep().join("murmur.yaml"))
+}
+
+fn trace_events(launched: &capsule_runtime::LaunchResult) -> Vec<Value> {
+    fs::read_to_string(launched.workdir.join("trace.jsonl"))
+        .expect("trace.jsonl should exist")
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The only `skill_call` trace record. It carries no `tool_call_id`, so a test that reads one
+/// dispatches exactly one skill.
+fn skill_call_record(events: &[Value]) -> &Value {
+    let mut records = events
+        .iter()
+        .filter(|event| event["event_type"] == "skill_call");
+    let record = records
+        .next()
+        .unwrap_or_else(|| panic!("no skill_call record; got: {events:#?}"));
+    assert!(records.next().is_none(), "expected one skill_call record");
+    record
+}
+
+/// The `tool_call` trace record for `tool_call_id`.
+fn tool_call_record<'a>(events: &'a [Value], tool_call_id: &str) -> &'a Value {
+    events
+        .iter()
+        .find(|event| event["event_type"] == "tool_call" && event["tool_call_id"] == tool_call_id)
+        .unwrap_or_else(|| panic!("no tool_call record for {tool_call_id}; got: {events:#?}"))
+}
+
+/// Every outcome key is on the frame, `null` or not, so a client can tell "does not apply" from
+/// "this runtime does not report it".
+fn assert_outcome_keys_present(artifact: &Value) {
+    for key in [
+        "tool_call_id",
+        "is_error",
+        "duration_ms",
+        "exit_code",
+        "truncated",
+    ] {
+        assert!(
+            artifact.get(key).is_some(),
+            "`{key}` must be present on every frame: {artifact}"
+        );
+    }
+}
+
+#[test]
+fn streaming_artifact_reports_a_successful_call() {
+    let server = tool_calls_then_end_turn_server(
+        &[("toolu_ok", SKILL_NAME, serde_json::json!({}))],
+        "read it",
+    );
+    let (frames, launched) = streamed_artifact_frames(stage_skill_and_tool_agent(&server.endpoint));
+
+    assert_eq!(frames.len(), 1, "one call, one frame: {frames:?}");
+    let artifact = &frames[0]["artifact"];
+    assert_outcome_keys_present(artifact);
+    assert_eq!(artifact["tool_name"], SKILL_NAME);
+    assert_eq!(artifact["content"], SKILL_GUIDANCE, "{artifact}");
+    assert_eq!(artifact["is_error"], false, "{artifact}");
+    assert_eq!(artifact["tool_call_id"], "toolu_ok", "{artifact}");
+    assert!(artifact["duration_ms"].is_u64(), "{artifact}");
+    assert!(
+        artifact["exit_code"].is_null(),
+        "a skill runs no subprocess: {artifact}"
+    );
+    assert_eq!(artifact["truncated"], false, "{artifact}");
+
+    let events = trace_events(&launched);
+    let record = skill_call_record(&events);
+    assert_eq!(record["status"], "ok", "{record}");
+    assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+}
+
+#[test]
+fn streaming_artifact_reports_a_failed_call() {
+    let server = tool_calls_then_end_turn_server(
+        &[(
+            "toolu_missing",
+            TOOL_NAME,
+            serde_json::json!({ "data": "does-not-exist.jsonl" }),
+        )],
+        "could not count",
+    );
+    let (frames, launched) = streamed_artifact_frames(stage_skill_and_tool_agent(&server.endpoint));
+
+    assert_eq!(frames.len(), 1, "one call, one frame: {frames:?}");
+    let artifact = &frames[0]["artifact"];
+    assert_outcome_keys_present(artifact);
+    assert_eq!(artifact["is_error"], true, "{artifact}");
+    assert_eq!(artifact["tool_call_id"], "toolu_missing", "{artifact}");
+    assert!(artifact["duration_ms"].is_u64(), "{artifact}");
+    assert!(artifact["exit_code"].is_null(), "{artifact}");
+    assert_eq!(artifact["truncated"], false, "{artifact}");
+
+    let events = trace_events(&launched);
+    let record = tool_call_record(&events, "toolu_missing");
+    assert_eq!(record["status"], "error", "{record}");
+    assert_eq!(
+        record["duration_ms"], artifact["duration_ms"],
+        "the frame and the trace carry one measurement"
+    );
+}
+
+#[test]
+fn streaming_artifact_reports_a_failed_dispatch() {
+    let server = tool_calls_then_end_turn_server(
+        &[("toolu_undeclared", "no-such-tool", serde_json::json!({}))],
+        "recovered",
+    );
+    let (frames, launched) = streamed_artifact_frames(stage_skill_and_tool_agent(&server.endpoint));
+
+    assert_eq!(frames.len(), 1, "one call, one frame: {frames:?}");
+    let artifact = &frames[0]["artifact"];
+    assert_outcome_keys_present(artifact);
+    assert_eq!(artifact["tool_name"], "no-such-tool");
+    assert_eq!(artifact["is_error"], true, "{artifact}");
+    assert_eq!(
+        artifact["tool_call_id"], "toolu_undeclared",
+        "the call was made even though no tool ran: {artifact}"
+    );
+    assert!(artifact["exit_code"].is_null(), "nothing ran: {artifact}");
+    assert_eq!(artifact["truncated"], false, "{artifact}");
+    assert!(artifact["duration_ms"].is_u64(), "{artifact}");
+
+    let events = trace_events(&launched);
+    let record = tool_call_record(&events, "toolu_undeclared");
+    assert_eq!(record["status"], "error", "{record}");
+    assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+}
+
+#[test]
+fn streaming_artifact_frames_carry_their_own_call_id() {
+    let server = tool_calls_then_end_turn_server(
+        &[
+            ("toolu_a", SKILL_NAME, serde_json::json!({})),
+            (
+                "toolu_b",
+                TOOL_NAME,
+                serde_json::json!({ "data": "does-not-exist.jsonl" }),
+            ),
+        ],
+        "done",
+    );
+    let (frames, launched) = streamed_artifact_frames(stage_skill_and_tool_agent(&server.endpoint));
+
+    assert_eq!(frames.len(), 2, "two calls, two frames: {frames:?}");
+    let ids: Vec<&str> = frames
+        .iter()
+        .map(|frame| {
+            frame["artifact"]["tool_call_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every call frame carries an id: {frame}"))
+        })
+        .collect();
+    assert_eq!(
+        ids.iter().copied().collect::<HashSet<_>>(),
+        HashSet::from(["toolu_a", "toolu_b"]),
+        "one frame per issued id, no duplicates: {ids:?}"
+    );
+
+    let events = trace_events(&launched);
+    for frame in &frames {
+        let artifact = &frame["artifact"];
+        let id = artifact["tool_call_id"].as_str().unwrap();
+        assert_eq!(
+            artifact["is_error"],
+            id == "toolu_b",
+            "only the failing call's frame reports an error: {artifact}"
+        );
+        // The skill writes a `skill_call` record, which carries no id to look it up by.
+        let record = if id == "toolu_a" {
+            skill_call_record(&events)
+        } else {
+            tool_call_record(&events, id)
+        };
+        assert_eq!(
+            record["status"] == "error",
+            artifact["is_error"] == true,
+            "one fact, two spellings: {record} vs {artifact}"
+        );
+        assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+    }
+}
+
+#[test]
+fn streaming_artifact_carries_the_subprocess_exit_code() {
+    if common::skip_without_host_support("streaming_artifact_carries_the_subprocess_exit_code") {
+        return;
+    }
+    let server = tool_calls_then_end_turn_server(
+        &[
+            (
+                "toolu_zero",
+                "bash",
+                serde_json::json!({ "command": "echo fine" }),
+            ),
+            (
+                "toolu_three",
+                "bash",
+                serde_json::json!({ "command": "echo broken; exit 3" }),
+            ),
+        ],
+        "ran both",
+    );
+    let (frames, launched) = artifact_frames(setup_agent_project(&server.endpoint));
+
+    assert_eq!(frames.len(), 2, "two calls, two frames: {frames:?}");
+    let events = trace_events(&launched);
+    let shell_records: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event_type"] == "shell")
+        .collect();
+    assert_eq!(
+        shell_records.len(),
+        2,
+        "one shell record per foreground command: {events:#?}"
+    );
+
+    let exit_codes: Vec<i64> = frames
+        .iter()
+        .map(|frame| {
+            let artifact = &frame["artifact"];
+            assert_outcome_keys_present(artifact);
+            artifact["exit_code"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("a completed subprocess reports its exit: {artifact}"))
+        })
+        .collect();
+    assert_eq!(exit_codes, vec![0, 3], "frames arrive in call order");
+
+    // Calls dispatch one after another, so the n-th shell record belongs to the n-th frame.
+    for (frame, shell) in frames.iter().zip(&shell_records) {
+        assert_eq!(
+            frame["artifact"]["exit_code"], shell["exit_code"],
+            "the frame and the shell record carry one exit code: {frame} vs {shell}"
+        );
+    }
+    assert_eq!(frames[0]["artifact"]["tool_call_id"], "toolu_zero");
+    assert_eq!(frames[1]["artifact"]["tool_call_id"], "toolu_three");
+
+    // A command that ran to completion is a successful call whatever its exit status, so
+    // `is_error` and `exit_code` are separate facts; `is_error` still agrees with the trace.
+    for frame in &frames {
+        let artifact = &frame["artifact"];
+        let record = tool_call_record(&events, artifact["tool_call_id"].as_str().unwrap());
+        assert_eq!(
+            record["status"] == "error",
+            artifact["is_error"] == true,
+            "one fact, two spellings: {record} vs {artifact}"
+        );
+        assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+    }
 }

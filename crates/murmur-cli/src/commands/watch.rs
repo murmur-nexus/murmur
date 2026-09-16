@@ -246,24 +246,20 @@ fn dispatch_sse_event(
         }
         "artifact" => {
             if let Ok(event) = serde_json::from_str::<Value>(data) {
-                let tool_name = event
-                    .get("artifact")
-                    .and_then(|a| a.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let content = event
-                    .get("artifact")
-                    .and_then(|a| a.get("content"))
+                let artifact = event.get("artifact").unwrap_or(&Value::Null);
+                let header = artifact_header(artifact);
+                let content = artifact
+                    .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let mut content_lines = content.lines();
                 if let Some(first) = content_lines.next() {
-                    println!("[artifact] tool: {tool_name} | {first}");
+                    println!("{header} | {first}");
                     for rest in content_lines {
                         println!("  {rest}");
                     }
                 } else {
-                    println!("[artifact] tool: {tool_name}");
+                    println!("{header}");
                 }
             }
         }
@@ -324,4 +320,106 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+/// The `[artifact]` line's header for one frame's `artifact` object, without the content that
+/// follows it: `[artifact] tool: bash [error, exit 2, 1204ms]`.
+///
+/// The bracketed outcome lists `ok` or `error`, then `exit <n>`, `<n>ms` and `truncated` for
+/// whichever of those the frame reports. A frame with no `is_error` key comes from a runtime that
+/// reports no outcome, and gets no brackets rather than an `ok` it never claimed.
+fn artifact_header(artifact: &Value) -> String {
+    let tool_name = artifact
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let Some(is_error) = artifact.get("is_error").and_then(Value::as_bool) else {
+        return format!("[artifact] tool: {tool_name}");
+    };
+    let mut outcome = vec![if is_error { "error" } else { "ok" }.to_string()];
+    if let Some(exit_code) = artifact.get("exit_code").and_then(Value::as_i64) {
+        outcome.push(format!("exit {exit_code}"));
+    }
+    if let Some(duration_ms) = artifact.get("duration_ms").and_then(Value::as_u64) {
+        outcome.push(format!("{duration_ms}ms"));
+    }
+    if artifact.get("truncated").and_then(Value::as_bool) == Some(true) {
+        outcome.push("truncated".to_string());
+    }
+    format!("[artifact] tool: {tool_name} [{}]", outcome.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::artifact_header;
+
+    #[test]
+    fn successful_shell_call_reports_ok_exit_and_duration() {
+        let artifact = json!({
+            "tool_name": "bash", "content": "$ echo hello", "fence_source": "tool:bash",
+            "tool_call_id": "call_1", "is_error": false, "duration_ms": 12, "exit_code": 0,
+            "truncated": false,
+        });
+        assert_eq!(
+            artifact_header(&artifact),
+            "[artifact] tool: bash [ok, exit 0, 12ms]"
+        );
+    }
+
+    #[test]
+    fn failed_shell_call_reports_error_and_its_exit_code() {
+        let artifact = json!({
+            "tool_name": "bash", "content": "", "fence_source": "tool:bash",
+            "tool_call_id": "call_1", "is_error": true, "duration_ms": 1204, "exit_code": 2,
+            "truncated": false,
+        });
+        assert_eq!(
+            artifact_header(&artifact),
+            "[artifact] tool: bash [error, exit 2, 1204ms]"
+        );
+    }
+
+    #[test]
+    fn failed_call_without_a_subprocess_has_no_exit_segment() {
+        let artifact = json!({
+            "tool_name": "write-file", "content": "permission denied", "fence_source": null,
+            "tool_call_id": "call_1", "is_error": true, "duration_ms": 3, "exit_code": null,
+            "truncated": false,
+        });
+        assert_eq!(
+            artifact_header(&artifact),
+            "[artifact] tool: write-file [error, 3ms]"
+        );
+    }
+
+    #[test]
+    fn truncated_call_ends_with_truncated() {
+        let artifact = json!({
+            "tool_name": "read-file", "content": "partial", "fence_source": "tool:read-file",
+            "tool_call_id": "call_1", "is_error": false, "duration_ms": 5, "exit_code": null,
+            "truncated": true,
+        });
+        assert_eq!(
+            artifact_header(&artifact),
+            "[artifact] tool: read-file [ok, 5ms, truncated]"
+        );
+    }
+
+    #[test]
+    fn hook_artifact_reports_only_ok() {
+        let artifact = json!({
+            "tool_name": "my-hook", "content": "{\"reviewed\":true}", "fence_source": null,
+            "tool_call_id": null, "is_error": false, "duration_ms": null, "exit_code": null,
+            "truncated": false,
+        });
+        assert_eq!(artifact_header(&artifact), "[artifact] tool: my-hook [ok]");
+    }
+
+    #[test]
+    fn frame_from_a_runtime_without_outcome_fields_renders_without_brackets() {
+        let artifact = json!({ "tool_name": "bash", "content": "hello" });
+        assert_eq!(artifact_header(&artifact), "[artifact] tool: bash");
+    }
 }
