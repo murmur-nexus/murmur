@@ -185,17 +185,14 @@ pub(crate) fn install_resolved(
     Ok(())
 }
 
-pub(crate) fn source_chain_error_to_cli(target: &str, error: SourceChainError) -> CliError {
-    match error {
-        SourceChainError::NotFound { attempts, .. } => {
-            let mut message = format!("could not resolve '{target}'");
-            for attempt in attempts {
-                message.push_str(&format!("\n  {} — {}", attempt.source, attempt.reason));
-            }
-            message.push_str("\n  hint: run `mur doctor` to check your source configuration");
-            CliError::new(E_REG_001, message)
-        }
-        SourceChainError::SourceFailure(message) => CliError::new(E_IO_003, message),
+/// The `CliError` for a failed source-chain lookup; code, message and hint all come from
+/// [`SourceChainError::diagnosis`].
+pub(crate) fn source_chain_error_to_cli(error: SourceChainError) -> CliError {
+    let diagnosis = error.diagnosis();
+    CliError {
+        code: diagnosis.code,
+        message: diagnosis.message,
+        hint: diagnosis.hint,
     }
 }
 
@@ -333,10 +330,10 @@ fn install_single(
         let resolved_list = match &parsed {
             ArtifactRef::BareName(name) => vec![chain
                 .resolve_bare(name, None)
-                .map_err(|e| source_chain_error_to_cli(artifact_ref, e))?],
+                .map_err(source_chain_error_to_cli)?],
             ArtifactRef::GitHub { owner, repo, tag } => chain
                 .resolve_github_all(owner, repo, tag)
-                .map_err(|e| source_chain_error_to_cli(artifact_ref, e))?,
+                .map_err(source_chain_error_to_cli)?,
         };
         let lock_path = project_root.map(|r| r.join("murmur.lock"));
         for resolved in resolved_list {
@@ -384,7 +381,7 @@ fn install_single(
                 Some(chain) => {
                     let resolved = chain
                         .resolve_bare(name, Some(version))
-                        .map_err(|e| source_chain_error_to_cli(name, e))?;
+                        .map_err(source_chain_error_to_cli)?;
                     let lock_path = project_root.map(|r| r.join("murmur.lock"));
                     install_resolved(store, resolved, lock_path.as_deref())?;
                     return Ok(());
@@ -723,7 +720,7 @@ fn fetch_and_store(
             Some(chain) => {
                 let resolved = chain
                     .resolve_bare(name, Some(version))
-                    .map_err(|e| source_chain_error_to_cli(name, e))?;
+                    .map_err(source_chain_error_to_cli)?;
                 let sha256 = sha256_hex(&resolved.bytes);
                 let len = resolved.bytes.len() as u64;
                 let inner = load_manifest_from_artifact_bytes(&resolved.bytes).map_err(|e| {
@@ -925,16 +922,7 @@ fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError>
 }
 
 fn source_chain_err_display(e: &SourceChainError) -> String {
-    match e {
-        SourceChainError::NotFound { target, attempts } => {
-            let mut msg = format!("could not resolve '{target}'");
-            for a in attempts {
-                msg.push_str(&format!("\n  {} — {}", a.source, a.reason));
-            }
-            msg
-        }
-        SourceChainError::SourceFailure(m) => m.clone(),
-    }
+    e.to_string()
 }
 
 fn is_local_path(s: &str) -> bool {

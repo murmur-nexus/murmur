@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::env;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use indicatif::ProgressBar;
@@ -9,7 +10,7 @@ use ureq::Agent;
 
 use crate::registry_client::blocking_agent;
 
-use super::{ArtifactSource, SourceError, SourceResolution};
+use super::{ArtifactSource, RateLimitSignal, SourceError, SourceResolution};
 
 // ── Per-thread download progress ─────────────────────────────────────────────
 //
@@ -280,14 +281,7 @@ impl GitHubSource {
         }
 
         if !status.is_success() {
-            let message = response
-                .body_mut()
-                .read_to_string()
-                .unwrap_or_else(|_| "request failed".to_string());
-            return Err(SourceError::Http {
-                status: status.as_u16(),
-                message,
-            });
+            return Err(self.http_failure(&mut response, "request failed"));
         }
 
         response
@@ -323,14 +317,7 @@ impl GitHubSource {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .body_mut()
-                .read_to_string()
-                .unwrap_or_else(|_| "asset download failed".to_string());
-            return Err(SourceError::Http {
-                status: status.as_u16(),
-                message,
-            });
+            return Err(self.http_failure(&mut response, "asset download failed"));
         }
 
         // If a progress bar is registered for this thread, stream the response body through
@@ -359,6 +346,45 @@ impl GitHubSource {
                 .map(Bytes::from)
                 .map_err(|error| SourceError::Other(format!("failed to read asset bytes: {error}")))
         }
+    }
+
+    /// The error for a non-success response other than a release lookup's 404. `unreadable` is
+    /// the message used when the body cannot be read.
+    fn http_failure(
+        &self,
+        response: &mut ureq::http::Response<ureq::Body>,
+        unreadable: &str,
+    ) -> SourceError {
+        let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let remaining = header("x-ratelimit-remaining");
+        let reset = header("x-ratelimit-reset");
+        let retry_after = header("retry-after");
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|_| unreadable.to_string());
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        classify_http_failure(
+            status,
+            RateLimitHeaders {
+                remaining: remaining.as_deref(),
+                reset: reset.as_deref(),
+                retry_after: retry_after.as_deref(),
+            },
+            body,
+            self.effective_token().is_some(),
+            now_unix,
+        )
     }
 
     fn effective_token(&self) -> Option<String> {
@@ -568,7 +594,7 @@ fn select_versioned_asset(
 /// which platforms the release does publish for this artifact, and the two things an operator can
 /// do about it.
 ///
-/// Single-line by contract: `source_chain_error_to_cli` renders each source's reason on one
+/// Single-line by contract: `SourceChainError::diagnosis` renders each source's reason on one
 /// indented line of the `E-REG-001` message.
 fn no_asset_message(
     artifact_name: &str,
@@ -612,6 +638,75 @@ fn no_asset_message(
     )
 }
 
+/// The raw rate-limit header values of a GitHub response, `None` for a header that is absent.
+#[derive(Debug, Clone, Copy, Default)]
+struct RateLimitHeaders<'a> {
+    /// `x-ratelimit-remaining`: requests left in the current window.
+    remaining: Option<&'a str>,
+    /// `x-ratelimit-reset`: unix seconds at which the window resets.
+    reset: Option<&'a str>,
+    /// `retry-after`: seconds to wait, sent with GitHub's secondary rate limits.
+    retry_after: Option<&'a str>,
+}
+
+/// Classifies a non-success GitHub response as [`SourceError::RateLimited`] or
+/// [`SourceError::Http`].
+///
+/// A 429 is always a rate limit. A 403 is one when `x-ratelimit-remaining` is `0`, `retry-after`
+/// is present, or — checked last, because it is prose GitHub may reword — the body mentions a rate
+/// limit. GitHub also answers 403 for SAML enforcement and blocked tokens, which stay `Http` and
+/// must never get rate-limit advice. The message is the body's JSON `message` when it has
+/// one, else the trimmed body, flattened to one line.
+fn classify_http_failure(
+    status: u16,
+    headers: RateLimitHeaders<'_>,
+    body: String,
+    authenticated: bool,
+    now_unix: u64,
+) -> SourceError {
+    let message = one_line_message(&body);
+
+    let signal = if status == 429 {
+        RateLimitSignal::Status
+    } else if status != 403 {
+        return SourceError::Http { status, message };
+    } else if headers.remaining.map(str::trim) == Some("0") {
+        RateLimitSignal::RemainingHeader
+    } else if headers.retry_after.is_some() {
+        RateLimitSignal::RetryAfterHeader
+    } else if body.to_ascii_lowercase().contains("rate limit") {
+        RateLimitSignal::Body
+    } else {
+        return SourceError::Http { status, message };
+    };
+
+    let resets_in_secs = headers
+        .retry_after
+        .and_then(|retry_after| retry_after.trim().parse::<u64>().ok())
+        .or_else(|| {
+            headers
+                .reset
+                .and_then(|reset| reset.trim().parse::<u64>().ok())
+                .map(|reset| reset.saturating_sub(now_unix))
+        });
+
+    SourceError::RateLimited {
+        status,
+        message,
+        signal,
+        resets_in_secs,
+        authenticated,
+    }
+}
+
+fn one_line_message(body: &str) -> String {
+    let extracted = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("message")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| body.trim().to_string());
+    extracted.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn github_api_base() -> String {
     env::var("MUR_GITHUB_API_BASE")
         .ok()
@@ -623,6 +718,209 @@ fn github_api_base() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: u64 = 1_700_000_000;
+
+    const RATE_LIMIT_BODY: &str = "{\"message\":\"API rate limit exceeded for 127.0.0.1.\",\"documentation_url\":\"https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting\"}";
+
+    fn classify(status: u16, headers: RateLimitHeaders<'_>, body: &str) -> SourceError {
+        classify_http_failure(status, headers, body.to_string(), false, NOW)
+    }
+
+    #[test]
+    fn a_403_with_no_requests_remaining_is_a_rate_limit_reset_from_the_header() {
+        let reset = (NOW + 600).to_string();
+        let error = classify(
+            403,
+            RateLimitHeaders {
+                remaining: Some("0"),
+                reset: Some(&reset),
+                retry_after: None,
+            },
+            RATE_LIMIT_BODY,
+        );
+        match error {
+            SourceError::RateLimited {
+                status,
+                message,
+                signal,
+                resets_in_secs,
+                authenticated,
+            } => {
+                assert_eq!(status, 403);
+                assert_eq!(signal, RateLimitSignal::RemainingHeader);
+                assert_eq!(message, "API rate limit exceeded for 127.0.0.1.");
+                assert_eq!(resets_in_secs, Some(600));
+                assert!(!authenticated);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_403_whose_body_names_a_rate_limit_is_one_without_headers() {
+        let error = classify(
+            403,
+            RateLimitHeaders::default(),
+            "{\"message\":\"You have exceeded a secondary Rate Limit.\"}",
+        );
+        assert!(
+            matches!(
+                error,
+                SourceError::RateLimited {
+                    signal: RateLimitSignal::Body,
+                    resets_in_secs: None,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .reason()
+                .starts_with("rate limited by GitHub (HTTP 403, response body says rate limit): "),
+            "{}",
+            error.reason()
+        );
+    }
+
+    #[test]
+    fn retry_after_gives_the_reset() {
+        let error = classify(
+            403,
+            RateLimitHeaders {
+                retry_after: Some("30"),
+                ..RateLimitHeaders::default()
+            },
+            "{\"message\":\"slow down\"}",
+        );
+        assert!(
+            matches!(
+                error,
+                SourceError::RateLimited {
+                    signal: RateLimitSignal::RetryAfterHeader,
+                    resets_in_secs: Some(30),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error.reason().ends_with("resets in about 1 minute"),
+            "{}",
+            error.reason()
+        );
+    }
+
+    #[test]
+    fn a_429_is_always_a_rate_limit() {
+        let error = classify_http_failure(
+            429,
+            RateLimitHeaders::default(),
+            "too many".to_string(),
+            true,
+            NOW,
+        );
+        assert!(
+            matches!(
+                error,
+                SourceError::RateLimited {
+                    status: 429,
+                    signal: RateLimitSignal::Status,
+                    authenticated: true,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_saml_403_with_requests_remaining_is_not_a_rate_limit() {
+        let error = classify(
+            403,
+            RateLimitHeaders {
+                remaining: Some("4999"),
+                ..RateLimitHeaders::default()
+            },
+            "{\"message\":\"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization.\"}",
+        );
+        match error {
+            SourceError::Http { status, message } => {
+                assert_eq!(status, 403);
+                assert!(message.starts_with("Resource protected by organization SAML"));
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_500_is_an_http_failure() {
+        let error = classify(500, RateLimitHeaders::default(), "{\"message\":\"boom\"}");
+        assert!(
+            matches!(&error, SourceError::Http { status: 500, message } if message == "boom"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_used_trimmed() {
+        let error = classify(502, RateLimitHeaders::default(), "  Bad Gateway \n");
+        assert!(
+            matches!(&error, SourceError::Http { message, .. } if message == "Bad Gateway"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_body_becomes_one_line() {
+        let error = classify(
+            403,
+            RateLimitHeaders {
+                remaining: Some("0"),
+                ..RateLimitHeaders::default()
+            },
+            "<html>\n<body>\r\nrate limit\n</body>\n</html>",
+        );
+        let reason = error.reason();
+        assert!(
+            !reason.contains('\n') && !reason.contains('\r'),
+            "{reason:?}"
+        );
+        assert!(
+            reason.contains("<html> <body> rate limit </body> </html>"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_reset_in_the_past_is_zero_seconds_away() {
+        let reset = (NOW - 5).to_string();
+        let error = classify(
+            403,
+            RateLimitHeaders {
+                remaining: Some("0"),
+                reset: Some(&reset),
+                retry_after: None,
+            },
+            RATE_LIMIT_BODY,
+        );
+        assert!(
+            matches!(
+                error,
+                SourceError::RateLimited {
+                    resets_in_secs: Some(0),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error.reason().ends_with("resets in about 1 minute"),
+            "{}",
+            error.reason()
+        );
+    }
 
     fn assets(names: &[&str]) -> Vec<GitHubReleaseAsset> {
         names

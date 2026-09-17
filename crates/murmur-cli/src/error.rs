@@ -14,6 +14,7 @@ pub const E_REG_002: &str = "E-REG-002"; // artifact integrity check failed
 pub const E_REG_003: &str = "E-REG-003"; // artifact already exists (conflict)
 pub const E_REG_004: &str = "E-REG-004"; // reserved version string
 pub const E_REG_005: &str = "E-REG-005"; // registry-resolved artifact conflicts with murmur.lock
+pub const E_REG_006: &str = "E-REG-006"; // a source did not answer an artifact lookup (rate limited, refused, unreachable, or misconfigured)
 
 // Capsule execution
 pub const E_RUN_001: &str = "E-RUN-001"; // capsule trap
