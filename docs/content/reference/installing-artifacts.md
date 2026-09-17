@@ -50,7 +50,30 @@ The `token` field accepts three forms:
 | `MY_TOKEN` | Value of the `MY_TOKEN` env var, or the literal string if the var is unset |
 | `ghp_abc123` | Used as-is |
 
-Lookups sent without a token share GitHub's limit of 60 API requests an hour per IP address, and one artifact lookup can spend up to four of them. A token raises the limit. A lookup refused by the limit fails with [`E-REG-006`](diagnostics.md#e-reg-006), not `E-REG-001`.
+### Rate limits
+
+Lookups sent without a token share GitHub's limit of 60 API requests an hour per IP address, and one artifact lookup can spend up to four of them, so a project with a handful of artifacts can use up the limit in a single `mur install`. A lookup refused by the limit fails with [`E-REG-006`](diagnostics.md#e-reg-006).
+
+A token raises the limit. Export one before installing:
+
+```bash
+export GITHUB_TOKEN=$(gh auth token)
+```
+
+Any GitHub token works; `gh auth token` is one way to get one. To send a token held in a different variable, name that variable on the source:
+
+```yaml
+registry:
+  sources:
+    - name: official
+      type: github
+      repo: murmur-nexus/default-artifacts
+      token: ${GH_TOKEN}
+```
+
+`GH_TOKEN` is not read unless a source names it this way.
+
+Prefer a `${NAME}` reference to a literal token in `config.yaml`. The token `gh auth token` prints is rotated by the GitHub CLI, so a copy written to disk stops working without warning and later lookups fail with `HTTP 401`.
 
 ## Multiple sources and fallthrough
 

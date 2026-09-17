@@ -10,7 +10,7 @@ use ureq::Agent;
 
 use crate::registry_client::blocking_agent;
 
-use super::{ArtifactSource, SourceError, SourceResolution};
+use super::{ArtifactSource, RateLimitSignal, SourceError, SourceResolution};
 
 // ── Per-thread download progress ─────────────────────────────────────────────
 //
@@ -653,8 +653,9 @@ struct RateLimitHeaders<'a> {
 /// [`SourceError::Http`].
 ///
 /// A 429 is always a rate limit. A 403 is one when `x-ratelimit-remaining` is `0`, `retry-after`
-/// is present, or the body mentions a rate limit; GitHub also answers 403 for SAML enforcement
-/// and blocked tokens, which stay `Http`. The message is the body's JSON `message` when it has
+/// is present, or — checked last, because it is prose GitHub may reword — the body mentions a rate
+/// limit. GitHub also answers 403 for SAML enforcement and blocked tokens, which stay `Http` and
+/// must never get rate-limit advice. The message is the body's JSON `message` when it has
 /// one, else the trimmed body, flattened to one line.
 fn classify_http_failure(
     status: u16,
@@ -665,15 +666,19 @@ fn classify_http_failure(
 ) -> SourceError {
     let message = one_line_message(&body);
 
-    let rate_limited = status == 429
-        || (status == 403
-            && (headers.remaining.map(str::trim) == Some("0")
-                || headers.retry_after.is_some()
-                || body.to_ascii_lowercase().contains("rate limit")));
-
-    if !rate_limited {
+    let signal = if status == 429 {
+        RateLimitSignal::Status
+    } else if status != 403 {
         return SourceError::Http { status, message };
-    }
+    } else if headers.remaining.map(str::trim) == Some("0") {
+        RateLimitSignal::RemainingHeader
+    } else if headers.retry_after.is_some() {
+        RateLimitSignal::RetryAfterHeader
+    } else if body.to_ascii_lowercase().contains("rate limit") {
+        RateLimitSignal::Body
+    } else {
+        return SourceError::Http { status, message };
+    };
 
     let resets_in_secs = headers
         .retry_after
@@ -688,6 +693,7 @@ fn classify_http_failure(
     SourceError::RateLimited {
         status,
         message,
+        signal,
         resets_in_secs,
         authenticated,
     }
@@ -737,10 +743,12 @@ mod tests {
             SourceError::RateLimited {
                 status,
                 message,
+                signal,
                 resets_in_secs,
                 authenticated,
             } => {
                 assert_eq!(status, 403);
+                assert_eq!(signal, RateLimitSignal::RemainingHeader);
                 assert_eq!(message, "API rate limit exceeded for 127.0.0.1.");
                 assert_eq!(resets_in_secs, Some(600));
                 assert!(!authenticated);
@@ -760,11 +768,19 @@ mod tests {
             matches!(
                 error,
                 SourceError::RateLimited {
+                    signal: RateLimitSignal::Body,
                     resets_in_secs: None,
                     ..
                 }
             ),
             "{error:?}"
+        );
+        assert!(
+            error
+                .reason()
+                .starts_with("rate limited by GitHub (HTTP 403, response body says rate limit): "),
+            "{}",
+            error.reason()
         );
     }
 
@@ -782,6 +798,7 @@ mod tests {
             matches!(
                 error,
                 SourceError::RateLimited {
+                    signal: RateLimitSignal::RetryAfterHeader,
                     resets_in_secs: Some(30),
                     ..
                 }
@@ -809,6 +826,7 @@ mod tests {
                 error,
                 SourceError::RateLimited {
                     status: 429,
+                    signal: RateLimitSignal::Status,
                     authenticated: true,
                     ..
                 }

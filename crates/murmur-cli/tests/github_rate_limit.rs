@@ -207,8 +207,8 @@ fn an_unauthenticated_rate_limit_is_unanswered_and_names_the_token_fix() {
     for needle in [
         "E-REG-006",
         "github:acme/artifacts",
-        "rate limited",
-        "HTTP 403",
+        "GitHub rate-limited the lookup",
+        "rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0)",
         "API rate limit exceeded",
         "minute",
         "GITHUB_TOKEN",
@@ -217,7 +217,13 @@ fn an_unauthenticated_rate_limit_is_unanswered_and_names_the_token_fix() {
     ] {
         assert!(stderr.contains(needle), "{needle} missing from:\n{stderr}");
     }
-    for absent in ["E-REG-001", "mur doctor", "documentation_url"] {
+    for absent in [
+        "E-REG-001",
+        "could not resolve",
+        "mur doctor",
+        "mur config set",
+        "documentation_url",
+    ] {
         assert!(!stderr.contains(absent), "{absent} present in:\n{stderr}");
     }
     assert_nothing_installed(home.path());
@@ -275,7 +281,13 @@ fn a_saml_refusal_is_unanswered_without_rate_limit_advice() {
     for needle in ["E-REG-006", "HTTP 403", "SAML"] {
         assert!(stderr.contains(needle), "{needle} missing from:\n{stderr}");
     }
-    for absent in ["E-REG-001", "rate limited", "gh auth token", "mur doctor"] {
+    for absent in [
+        "E-REG-001",
+        "rate limited",
+        "rate-limited",
+        "gh auth token",
+        "mur doctor",
+    ] {
         assert!(!stderr.contains(absent), "{absent} present in:\n{stderr}");
     }
 }

@@ -45,7 +45,7 @@ section that explains it.
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), or an `inference.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
-| `E-REG-001` | Artifact not found in registry, or every configured source answered that it has no such artifact or no asset for the host platform | [`mur install`](cli.md#mur-install) |
+| `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`) | [`mur publish`](cli.md#mur-publish) |
@@ -1023,16 +1023,25 @@ rather than [`E-REG-001`](cli.md#mur-install): one source may publish the artifa
 gets one line with what it returned:
 
 ```text
-error[E-REG-006]: could not look up 'murmur-driver-anthropic': a source did not answer, so whether it publishes the artifact is not known
-  github:murmur-nexus/default-artifacts — rate limited by GitHub (HTTP 403): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
-  hint: GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; authenticate with `export GITHUB_TOKEN=$(gh auth token)` (or any GitHub token), or set `token: ${GITHUB_TOKEN}` on the source in config.yaml to keep it
+error[E-REG-006]: could not look up 'murmur-driver-anthropic': GitHub rate-limited the lookup, so whether a source publishes the artifact is not known
+  github:murmur-nexus/default-artifacts — rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
+  hint: set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; see docs/content/reference/installing-artifacts.md
 ```
+
+The parenthesis on a `rate limited` line names what identified the rate limit:
+
+| Shown | Identified by |
+|---|---|
+| `(HTTP 429)` | The status alone |
+| `(HTTP 403, x-ratelimit-remaining: 0)` | GitHub's rate-limit header |
+| `(HTTP 403, retry-after header)` | A `retry-after` header, sent with GitHub's secondary rate limits |
+| `(HTTP 403, response body says rate limit)` | Only the response text; no rate-limit header was present |
 
 An explicit `mur install github:<owner>/<repo>@<tag>` reports a rate limit the same way.
 
 | Source line | Meaning | Fix |
 |---|---|---|
-| `rate limited by GitHub (HTTP 403)` or `(HTTP 429)`, requests sent without a token | The anonymous limit for this IP address is spent | Export `GITHUB_TOKEN`, or set `token:` on the source — see [Authentication](installing-artifacts.md#authentication) |
+| `rate limited by GitHub`, requests sent without a token | The anonymous limit for this IP address is spent | Export `GITHUB_TOKEN`, or set `token:` on the source — see [Rate limits](installing-artifacts.md#rate-limits) |
 | `rate limited by GitHub`, requests sent with a token | The token's own limit is spent | Retry after the reset the line shows |
 | `HTTP 401` or `HTTP 403` without `rate limited` | GitHub refused the token — for example, an organization's SAML enforcement, or a revoked token | Authorize or replace the token |
 | `HTTP 5xx`, `request failed: …` | GitHub or the network did not answer | Retry |

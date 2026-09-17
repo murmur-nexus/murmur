@@ -105,10 +105,11 @@ const NOT_FOUND_HINT: &str = "check the name and version; the sources searched a
      registry.sources entries of the effective config, or name one directly with \
      mur install github:<owner>/<repo>@<tag>";
 
-const ANONYMOUS_RATE_LIMIT_HINT: &str = "GitHub allows 60 unauthenticated API requests an hour \
-     and each artifact lookup can spend four; authenticate with \
-     `export GITHUB_TOKEN=$(gh auth token)` (or any GitHub token), or set \
-     `token: ${GITHUB_TOKEN}` on the source in config.yaml to keep it";
+const ANONYMOUS_RATE_LIMIT_HINT: &str = "set GITHUB_TOKEN to any GitHub token, for example \
+     `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a \
+     variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated \
+     API requests an hour and each artifact lookup can spend four; see \
+     docs/content/reference/installing-artifacts.md";
 
 const TOKEN_RATE_LIMIT_HINT: &str = "the token sent with these requests has exhausted its own \
      GitHub rate limit; retry after the reset shown above";
@@ -128,8 +129,19 @@ impl SourceChainError {
                 let answered = attempts
                     .iter()
                     .all(|attempt| matches!(attempt.error, SourceError::NotFound(_)));
+                let only_rate_limited = attempts.iter().all(|attempt| {
+                    matches!(
+                        attempt.error,
+                        SourceError::NotFound(_) | SourceError::RateLimited { .. }
+                    )
+                });
                 let mut message = if answered {
                     format!("could not resolve '{target}'")
+                } else if only_rate_limited {
+                    format!(
+                        "could not look up '{target}': GitHub rate-limited the lookup, so whether \
+                         a source publishes the artifact is not known"
+                    )
                 } else {
                     format!(
                         "could not look up '{target}': a source did not answer, so whether it \
@@ -215,6 +227,8 @@ pub enum SourceError {
     RateLimited {
         status: u16,
         message: String,
+        /// The part of the response that identified the rate limit; printed in the reason.
+        signal: RateLimitSignal,
         /// Seconds until the limit resets, or `None` when the response did not say.
         resets_in_secs: Option<u64>,
         /// Whether the refused request carried a token.
@@ -222,6 +236,31 @@ pub enum SourceError {
     },
     Config(String),
     Other(String),
+}
+
+/// What identified a response as a rate limit, strongest signal first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitSignal {
+    /// Status 429.
+    Status,
+    /// `x-ratelimit-remaining: 0`.
+    RemainingHeader,
+    /// A `retry-after` header.
+    RetryAfterHeader,
+    /// Only the body said so. GitHub's wording is prose it may change, so this is the fallback.
+    Body,
+}
+
+impl RateLimitSignal {
+    /// The evidence printed after the status, or `None` when the status alone is the signal.
+    fn evidence(self) -> Option<&'static str> {
+        match self {
+            RateLimitSignal::Status => None,
+            RateLimitSignal::RemainingHeader => Some("x-ratelimit-remaining: 0"),
+            RateLimitSignal::RetryAfterHeader => Some("retry-after header"),
+            RateLimitSignal::Body => Some("response body says rate limit"),
+        }
+    }
 }
 
 impl SourceError {
@@ -235,10 +274,16 @@ impl SourceError {
             SourceError::RateLimited {
                 status,
                 message,
+                signal,
                 resets_in_secs,
                 ..
             } => {
-                let mut reason = format!("rate limited by GitHub (HTTP {status}): {message}");
+                let mut reason = match signal.evidence() {
+                    Some(evidence) => {
+                        format!("rate limited by GitHub (HTTP {status}, {evidence}): {message}")
+                    }
+                    None => format!("rate limited by GitHub (HTTP {status}): {message}"),
+                };
                 if let Some(secs) = resets_in_secs {
                     let minutes = secs.div_ceil(60).max(1);
                     let unit = if minutes == 1 { "minute" } else { "minutes" };
@@ -490,6 +535,7 @@ mod tests {
         SourceError::RateLimited {
             status: 403,
             message: "API rate limit exceeded for 127.0.0.1.".to_string(),
+            signal: RateLimitSignal::RemainingHeader,
             resets_in_secs: Some(2460),
             authenticated,
         }
@@ -567,18 +613,23 @@ mod tests {
             failing("second", rate_limited(false)),
         ]);
         assert_eq!(diagnosis.code, E_REG_006);
+        assert!(diagnosis.message.starts_with(
+            "could not look up 'murmur-driver-anthropic': GitHub rate-limited the lookup"
+        ));
         assert!(diagnosis.message.contains(
-            "\n  second — rate limited by GitHub (HTTP 403): API rate limit exceeded for 127.0.0.1. — resets in about 41 minutes"
+            "\n  second — rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0): API rate limit exceeded for 127.0.0.1. — resets in about 41 minutes"
         ));
         let hint = hint(&diagnosis);
         for needle in [
             "GITHUB_TOKEN",
             "gh auth token",
-            "token: ${GITHUB_TOKEN}",
+            "token: ${GH_TOKEN}",
             "60",
+            "installing-artifacts.md",
         ] {
             assert!(hint.contains(needle), "{needle} missing from {hint}");
         }
+        assert!(!hint.contains("mur config set"), "{hint}");
     }
 
     #[test]
