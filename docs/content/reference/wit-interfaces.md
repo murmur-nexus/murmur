@@ -641,11 +641,10 @@ already forces that rebuild for another reason, in which case the new interface 
 package instead: `murmur:runtime/tokens` sits in `murmur:runtime` because the same bump that
 introduced it took `murmur:hook` to `0.6.0` and rebuilt every hook regardless.
 
-A package that only `use`s a type from another package moves when that type changes shape, for
-the same reason. `murmur:conversation` went to `0.2.0` and `murmur:runtime` to `0.4.0` alongside
-`murmur:hook@0.9.0`, whose `message` record gained `inserted-by`: `read-messages` returns that
-record and `inference-request` carries it, and every hook was being rebuilt for the `murmur:hook`
-bump already.
+A package that only `use`s a type from another package moves when that type changes shape.
+`murmur:conversation` and `murmur:runtime` both carry `murmur:hook`'s `message` record —
+`read-messages` returns it and `inference-request` holds it — so a change to `message` bumps all
+three packages together, and a hook importing either one is rebuilt with the `murmur:hook` bump.
 
 **One accepted version per interface.** The runtime resolves each interface by its versioned name
 and nothing else — there is no compatibility fallback for an earlier version or for an

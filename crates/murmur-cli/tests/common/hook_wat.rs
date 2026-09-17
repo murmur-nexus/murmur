@@ -221,6 +221,244 @@ pub fn compaction_hook_wasm_as(role: &str, summary: &str, inserted_by: Option<u8
     )
 }
 
+/// Separator between the entries of a mark report: ASCII unit separator. The content a report
+/// quotes is the JSON the runtime lowered, where that byte is always escaped, so it never appears
+/// inside an entry.
+pub const MARK_REPORT_SEP: char = '\u{1f}';
+
+/// Where a reporting hook assembles its report. The host's lowered strings go through the bump
+/// allocator at [`REPORTER_HEAP`], above it.
+const REPORT_BUFFER: u32 = 8192;
+/// Where a reporting hook's `realloc` starts handing out memory.
+const REPORTER_HEAP: u32 = 262_144;
+
+/// Core-module functions a reporting hook renders a `list<message>` with.
+///
+/// `$emit_messages` appends one entry per message to the report at `$cur`: `<role>=<mark>=<content>`,
+/// entries joined by [`MARK_REPORT_SEP`]. `<mark>` is `inserted-by` as the guest received it —
+/// `r` for `replace-context`, `s` for `seed-context`, `-` for `none` — read from the one-byte
+/// discriminant at 40 and case at 41 of each 44-byte record [`message_list`] describes.
+const MARK_REPORT_FUNCS: &str = r#"
+    (global $cur (mut i32) (i32.const 0))
+    (func $put (param $b i32)
+      (i32.store8 (global.get $cur) (local.get $b))
+      (global.set $cur (i32.add (global.get $cur) (i32.const 1))))
+    (func $append (param $src i32) (param $n i32)
+      (memory.copy (global.get $cur) (local.get $src) (local.get $n))
+      (global.set $cur (i32.add (global.get $cur) (local.get $n))))
+    (func $emit_messages (param $ptr i32) (param $n i32) (local $i i32) (local $rec i32)
+      (block $done
+        (loop $next
+          (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+          (local.set $rec (i32.add (local.get $ptr) (i32.mul (local.get $i) (i32.const 44))))
+          (if (local.get $i) (then (call $put (i32.const 31))))
+          (call $append (i32.load (local.get $rec)) (i32.load (i32.add (local.get $rec) (i32.const 4))))
+          (call $put (i32.const 61))
+          (if (i32.load8_u (i32.add (local.get $rec) (i32.const 40)))
+            (then (if (i32.load8_u (i32.add (local.get $rec) (i32.const 41)))
+                    (then (call $put (i32.const 115)))
+                    (else (call $put (i32.const 114)))))
+            (else (call $put (i32.const 45))))
+          (call $put (i32.const 61))
+          (call $append (i32.load (i32.add (local.get $rec) (i32.const 8)))
+                        (i32.load (i32.add (local.get $rec) (i32.const 12))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $next))))
+"#;
+
+/// The lifted half of a single-function hook component: the lifecycle types, `fn_name` lifted
+/// from core export `handler` of `$i`, every other export a stub, and the exported instance.
+/// Expects `$i`, `$mem` and `$realloc` in scope.
+fn lifecycle_exports(fn_name: &str, event_type: &str, event_type_name: &str) -> String {
+    let stubs = HOOK_FNS
+        .iter()
+        .filter(|n| **n != fn_name)
+        .map(|n| format!("    (export \"{n}\" (func $noop))"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"  (type $context-insertion (enum "replace-context" "seed-context"))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+{HOOK_OUTPUT}
+{event_type}
+  (type $ft (func (param "event" $event) (result (result $hook-output (error string)))))
+
+  (func $impl (type $ft)
+    (canon lift (core func $i "handler") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "context-insertion" (type $context-insertion))
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "{event_type_name}" (type $event))
+    (export "{fn_name}" (func $impl))
+{stubs}
+  )
+  (export "{LIFECYCLE_IFACE}" (instance $lc))"#
+    )
+}
+
+/// An `on-compaction` hook that reports the context it was handed: it returns
+/// `replace-context([summary])`, a `user` message whose content is the mark report of the event's
+/// `messages` (see [`MARK_REPORT_FUNCS`]). The report is what the hook itself read, so a test
+/// asserts the marks a compaction hook sees rather than the marks the record holds.
+pub fn mark_reporting_compaction_hook_wasm() -> Vec<u8> {
+    let compaction_event = r#"  (type $event (record
+    (field "messages" (list $message))
+    (field "session-tokens" u64)
+    (field "threshold" f64)
+    (field "model" (option string))
+    (field "system-prompt" (option string))))"#;
+    let wat = format!(
+        r#"(component
+  (core module $m
+    (memory (export "memory") 8)
+    (global $bump (mut i32) (i32.const {REPORTER_HEAP}))
+    (data (i32.const {STRING_POOL}) "user")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (local.get 3)))
+      (local.get $p))
+{MARK_REPORT_FUNCS}
+    (func (export "handler") (param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32) (result i32)
+      (global.set $cur (i32.const {REPORT_BUFFER}))
+      (call $emit_messages (local.get 0) (local.get 1))
+      ;; ok(replace-context([ {{role: "user", content: <report>}} ])); the record's option
+      ;; fields at 16..44 are never written, so they stay `none`.
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+      (i32.store (i32.const {arm}) (i32.const 1))
+      (i32.store (i32.const {list_ptr}) (i32.const {MESSAGE_RECORDS}))
+      (i32.store (i32.const {list_len}) (i32.const 1))
+      (i32.store (i32.const {MESSAGE_RECORDS}) (i32.const {STRING_POOL}))
+      (i32.store (i32.const {role_len}) (i32.const 4))
+      (i32.store (i32.const {content_ptr}) (i32.const {REPORT_BUFFER}))
+      (i32.store (i32.const {content_len}) (i32.sub (global.get $cur) (i32.const {REPORT_BUFFER})))
+      (i32.const {RETURN_AREA}))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+{exports}
+)"#,
+        arm = RETURN_AREA + 4,
+        list_ptr = RETURN_AREA + 8,
+        list_len = RETURN_AREA + 12,
+        role_len = MESSAGE_RECORDS + 4,
+        content_ptr = MESSAGE_RECORDS + 8,
+        content_len = MESSAGE_RECORDS + 12,
+        exports = lifecycle_exports("on-compaction", compaction_event, "compaction-event"),
+    );
+    wat::parse_str(&wat).expect("mark-reporting compaction hook WAT parses")
+}
+
+/// Interface a hook imports `read-messages` from.
+const CONVERSATION_IFACE: &str = "murmur:conversation/read@0.2.0";
+
+/// An `on-task-end` hook that reads the conversation through `murmur:conversation/read` and
+/// returns what it read as `reopen-task(<report>)`, once: every later `on-task-end` returns
+/// `none`, so the task reopens a single time and then ends. Bind it with `commit_policy:
+/// reopen-task` and grant it `capabilities.conversation.read`; the report lands in the
+/// session's `task_reopened` trace line.
+///
+/// The report is one `read-messages(none, 100)` page, newest first, in the encoding
+/// [`MARK_REPORT_FUNCS`] describes; an `err` renders as `!<error>`. The call's
+/// `result<message-page, string>` is written to 512: discriminant at 0, then either the page's
+/// `messages` ptr/len or the error string's ptr/len at 4/8.
+pub fn conversation_reading_task_end_hook_wasm() -> Vec<u8> {
+    let task_end_event = r#"  (type $event (record
+    (field "task-id" string)
+    (field "exit-status" string)))"#;
+    let wat = format!(
+        r#"(component
+  (import "{CONVERSATION_IFACE}" (instance $conv
+    (type (option string))
+    (type (enum "replace-context" "seed-context"))
+    (export "context-insertion" (type (eq 1)))
+    (type (option 2))
+    (type (record
+      (field "role" string)
+      (field "content" string)
+      (field "id" 0)
+      (field "source-id" 0)
+      (field "inserted-by" 3)))
+    (export "message" (type (eq 4)))
+    (type (list 5))
+    (type (record
+      (field "messages" 6)
+      (field "next-cursor" 0)
+      (field "total" u32)))
+    (export "message-page" (type (eq 7)))
+    (type (result 8 (error string)))
+    (export "read-messages" (func (param "cursor" 0) (param "limit" u32) (result 9)))
+  ))
+  (alias export $conv "read-messages" (func $readm))
+
+  ;; Memory and `realloc` in their own module, so the lowered import can name them without a
+  ;; cyclic instantiation.
+  (core module $libc
+    (memory (export "memory") 8)
+    (global $bump (mut i32) (i32.const {REPORTER_HEAP}))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (local.get 3)))
+      (local.get $p))
+  )
+  (core instance $li (instantiate $libc))
+  (alias core export $li "memory" (core memory $mem))
+  (alias core export $li "realloc" (core func $realloc))
+  (core func $read_lowered
+    (canon lower (func $readm) (memory $mem) (realloc $realloc) string-encoding=utf8))
+
+  (core module $m
+    (import "libc" "memory" (memory 8))
+    (import "conv" "read" (func $read (param i32 i32 i32 i32 i32)))
+{MARK_REPORT_FUNCS}
+    (global $reported (mut i32) (i32.const 0))
+    (func (export "handler") (param i32 i32 i32 i32) (result i32)
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+      (if (global.get $reported)
+        (then (i32.store (i32.const {arm}) (i32.const 0)))
+        (else
+          (global.set $reported (i32.const 1))
+          (global.set $cur (i32.const {REPORT_BUFFER}))
+          (call $read (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 100) (i32.const 512))
+          (if (i32.eqz (i32.load8_u (i32.const 512)))
+            (then (call $emit_messages (i32.load (i32.const 516)) (i32.load (i32.const 520))))
+            (else
+              (call $put (i32.const 33))
+              (call $append (i32.load (i32.const 516)) (i32.load (i32.const 520)))))
+          (i32.store (i32.const {arm}) (i32.const 4))
+          (i32.store (i32.const {str_ptr}) (i32.const {REPORT_BUFFER}))
+          (i32.store (i32.const {str_len}) (i32.sub (global.get $cur) (i32.const {REPORT_BUFFER})))))
+      (i32.const {RETURN_AREA}))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m
+    (with "libc" (instance $li))
+    (with "conv" (instance (export "read" (func $read_lowered))))))
+
+{exports}
+)"#,
+        arm = RETURN_AREA + 4,
+        str_ptr = RETURN_AREA + 8,
+        str_len = RETURN_AREA + 12,
+        exports = lifecycle_exports("on-task-end", task_end_event, "task-end-event"),
+    );
+    wat::parse_str(&wat).expect("conversation-reading task-end hook WAT parses")
+}
+
 /// Interface a hook imports `run-inference` from.
 const INFERENCE_IFACE: &str = "murmur:runtime/inference@0.4.0";
 

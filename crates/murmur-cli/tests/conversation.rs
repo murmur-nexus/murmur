@@ -21,7 +21,8 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use common::hook_wat::{
-    compaction_hook_wasm, compaction_hook_wasm_as, create_hook_zip, SEED_CONTEXT,
+    compaction_hook_wasm, compaction_hook_wasm_as, conversation_reading_task_end_hook_wasm,
+    create_hook_zip, mark_reporting_compaction_hook_wasm, MARK_REPORT_SEP, SEED_CONTEXT,
 };
 
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
@@ -113,6 +114,18 @@ fn create_manifest(
     blocks: &str,
     hook_names: &[&str],
 ) -> PathBuf {
+    create_manifest_named(project_dir, "murmur.yaml", endpoint, blocks, hook_names)
+}
+
+/// [`create_manifest`] under `file_name`, so one project directory — and so one session root —
+/// can hold several capsules that share a name and a record.
+fn create_manifest_named(
+    project_dir: &Path,
+    file_name: &str,
+    endpoint: &str,
+    blocks: &str,
+    hook_names: &[&str],
+) -> PathBuf {
     let hooks: String = hook_names
         .iter()
         .map(|name| format!("  - name: {name}\n    version: 0.1.0\n    runtime: hook\n"))
@@ -123,8 +136,21 @@ fn create_manifest(
          allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  \
          model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n",
     );
-    fs::write(project_dir.join("murmur.yaml"), manifest).unwrap();
-    project_dir.join("murmur.yaml")
+    let path = project_dir.join(file_name);
+    fs::write(&path, manifest).unwrap();
+    path
+}
+
+/// Grant the hook entry `hook_name` in `manifest` `capabilities.conversation.read`.
+fn grant_conversation_read(manifest: &Path, hook_name: &str) {
+    let entry = format!("  - name: {hook_name}\n    version: 0.1.0\n    runtime: hook\n");
+    let text = fs::read_to_string(manifest).unwrap();
+    assert!(text.contains(&entry), "{hook_name} is declared: {text}");
+    let granted = text.replace(
+        &entry,
+        &format!("{entry}    capabilities:\n      conversation:\n        read: true\n"),
+    );
+    fs::write(manifest, granted).unwrap();
 }
 
 /// Publish the driver, and each hook, into `home`'s artifact store.
@@ -535,6 +561,238 @@ fn an_assistant_role_summary_is_still_marked() {
             "{summary}"
         );
     }
+}
+
+/// One entry of a hook's mark report: the role, the `inserted-by` it read (`r`, `s` or `-`), and
+/// the text of the message's first content block, or `None` for a message with no text block.
+#[derive(Debug)]
+struct Seen {
+    role: String,
+    mark: char,
+    text: Option<String>,
+}
+
+/// Parse a report a `common::hook_wat` reporting hook produced.
+fn mark_report(report: &str) -> Vec<Seen> {
+    assert!(!report.starts_with('!'), "the hook's read failed: {report}");
+    report
+        .split(MARK_REPORT_SEP)
+        .map(|entry| {
+            let mut fields = entry.splitn(3, '=');
+            let (Some(role), Some(mark), Some(content)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                panic!("malformed report entry {entry:?} in {report:?}");
+            };
+            let content: Value =
+                serde_json::from_str(content).unwrap_or_else(|_| Value::from(content));
+            Seen {
+                role: role.to_string(),
+                mark: mark.chars().next().expect("every entry carries a mark"),
+                text: content[0]["text"].as_str().map(str::to_string),
+            }
+        })
+        .collect()
+}
+
+/// Every entry of `seen` whose text is exactly `text`, asserting there is at least one.
+fn seen_with_text<'a>(seen: &'a [Seen], text: &str) -> Vec<&'a Seen> {
+    let matching: Vec<&Seen> = seen
+        .iter()
+        .filter(|entry| entry.text.as_deref() == Some(text))
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "the hook saw a message reading {text:?}: {seen:#?}"
+    );
+    matching
+}
+
+/// Every event of `event_type` in a session's trace.
+fn trace_events(workdir: &Path, event_type: &str) -> Vec<Value> {
+    fs::read_to_string(workdir.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event_type"] == event_type)
+        .collect()
+}
+
+/// What the reading hook saw through `murmur:conversation/read`, taken off the `task_reopened`
+/// line its report became.
+fn read_through_conversation(workdir: &Path) -> Vec<Seen> {
+    let reopened = trace_events(workdir, "task_reopened");
+    assert_eq!(reopened.len(), 1, "the reader reopens once: {reopened:?}");
+    mark_report(reopened[0]["reason"].as_str().unwrap())
+}
+
+/// A hook reading the conversation through `murmur:conversation/read` after a real compaction
+/// tells the summary from the person's turn by `inserted-by` alone. The summary role is the
+/// hook's choice, so both are driven: under `user` the two messages share a role and differ only
+/// by the mark.
+#[test]
+fn a_reader_tells_a_real_compaction_summary_from_a_persons_turn() {
+    const SUMMARY: &str = "the conversation so far, summarised";
+    for role in ["user", "assistant"] {
+        let f = fixture(
+            vec![tool_call(), end_turn("done"), end_turn("reopened")],
+            "context:\n  max_tokens: 100\n",
+            &[
+                (
+                    "compactor",
+                    "on-compaction",
+                    "replace-context",
+                    compaction_hook_wasm_as(role, SUMMARY, None),
+                ),
+                (
+                    "reader",
+                    "on-task-end",
+                    "reopen-task",
+                    conversation_reading_task_end_hook_wasm(),
+                ),
+            ],
+        );
+        grant_conversation_read(&f.manifest, "reader");
+
+        let workdir = workdir_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success());
+        let seen = read_through_conversation(&workdir);
+
+        for person in seen_with_text(&seen, TASK_TEXT) {
+            assert_eq!(
+                (person.role.as_str(), person.mark),
+                ("user", '-'),
+                "{seen:#?}"
+            );
+        }
+        for summary in seen_with_text(&seen, SUMMARY) {
+            assert_eq!(
+                (summary.role.as_str(), summary.mark),
+                (role, 'r'),
+                "{seen:#?}"
+            );
+        }
+        for other in seen
+            .iter()
+            .filter(|entry| entry.text.as_deref() != Some(SUMMARY))
+        {
+            assert_eq!(other.mark, '-', "only the summary is marked: {seen:#?}");
+        }
+        drop(f.project);
+    }
+}
+
+/// The mark a run commits is still there when a later run loads the record, whether
+/// `lifecycle.conversation: threaded` reloads it or `--resume` does: the compaction hook of the
+/// later run is handed the earlier summary marked and the earlier task unmarked, a reader sees the
+/// same through `murmur:conversation/read`, and the earlier run's lines are never rewritten.
+#[test]
+fn the_mark_survives_a_threaded_reload_and_a_resume() {
+    const SUMMARY: &str = "the first run, summarised";
+    let f = fixture(
+        vec![
+            tool_call(),
+            end_turn("done"),
+            end_turn("reloaded"),
+            end_turn("resumed"),
+            end_turn("resumed and reopened"),
+        ],
+        "context:\n  max_tokens: 100\n",
+        &[(
+            "compactor",
+            "on-compaction",
+            "replace-context",
+            compaction_hook_wasm(SUMMARY),
+        )],
+    );
+    for (name, binding, commit_policy, wasm) in [
+        (
+            "reporter",
+            "on-compaction",
+            "replace-context",
+            mark_reporting_compaction_hook_wasm(),
+        ),
+        (
+            "reader",
+            "on-task-end",
+            "reopen-task",
+            conversation_reading_task_end_hook_wasm(),
+        ),
+    ] {
+        let artifact = create_hook_zip(f._artifacts.path(), name, binding, commit_policy, &wasm);
+        common::publish_local(&f.home, &artifact).success();
+    }
+    let threaded = create_manifest_named(
+        f.project.path(),
+        "threaded.yaml",
+        &f.server.endpoint,
+        "context:\n  max_tokens: 100\nlifecycle:\n  conversation: threaded\n",
+        &["reporter"],
+    );
+    let resumed = create_manifest_named(
+        f.project.path(),
+        "resumed.yaml",
+        &f.server.endpoint,
+        "context:\n  max_tokens: 100\n",
+        &["reporter", "reader"],
+    );
+    grant_conversation_read(&resumed, "reader");
+
+    run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success();
+    let first = record_lines(&f.home, CAPSULE_NAME, CONTEXT_ID);
+
+    // What the later run's compaction hook was handed, off the summary it wrote in reply.
+    let handed_in_run = |from_line: usize| -> Vec<Seen> {
+        let messages = record_messages(&f.home, CAPSULE_NAME, CONTEXT_ID);
+        let report = messages[from_line..]
+            .iter()
+            .find(|message| inserted_by_of(message) == Some("replace-context"))
+            .unwrap_or_else(|| panic!("the reporter's summary is a line: {messages:#?}"));
+        mark_report(report["content"][0]["text"].as_str().unwrap())
+    };
+    let assert_first_run_marks = |seen: &[Seen], view: &str| {
+        for summary in seen_with_text(seen, SUMMARY) {
+            assert_eq!(summary.mark, 'r', "{view}: {seen:#?}");
+        }
+        for person in seen_with_text(seen, TASK_TEXT) {
+            assert_eq!(person.mark, '-', "{view}: {seen:#?}");
+        }
+    };
+
+    // The three manifests share one project directory, and so one `murmur.lock`; each launch
+    // resolves its own artifacts afresh when none is there.
+    let unlock = || fs::remove_file(f.project.path().join("murmur.lock")).unwrap();
+
+    unlock();
+    run(&f.home, &threaded, &["--context", CONTEXT_ID]).success();
+    let reloaded = record_lines(&f.home, CAPSULE_NAME, CONTEXT_ID);
+    assert_eq!(&reloaded[..first.len()], &first[..], "no line is rewritten");
+    assert_first_run_marks(
+        &handed_in_run(first.len()),
+        "threaded reload, compaction event",
+    );
+
+    // `@1` is the threaded run, the latest session under this project's session root.
+    unlock();
+    let workdir = workdir_of(run(&f.home, &resumed, &["--resume", "@1"]).success());
+    let after = record_lines(&f.home, CAPSULE_NAME, CONTEXT_ID);
+    assert_eq!(
+        &after[..reloaded.len()],
+        &reloaded[..],
+        "no line is rewritten"
+    );
+    assert_first_run_marks(&handed_in_run(reloaded.len()), "resume, compaction event");
+    assert_first_run_marks(
+        &read_through_conversation(&workdir),
+        "resume, conversation/read",
+    );
+
+    for request in f.server.requests() {
+        let body = request.to_string();
+        assert!(!body.contains("inserted_by"), "{body}");
+        assert!(!body.contains("inserted-by"), "{body}");
+    }
+    drop(f.project);
 }
 
 /// Each agent-loop `inference` line names the messages its request embedded, in order.

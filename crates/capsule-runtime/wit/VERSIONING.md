@@ -151,6 +151,19 @@ from a person's turn: the shipped compaction hook returns its summary as
 field is appended last, after `source-id`. Adding a field to an existing record
 is always a breaking change under the rule below.
 
+The field is an enum rather than a boolean, and the boolean is declined. The
+runtime commits two hook outputs that put messages into a conversation, and a
+seeded message is no more a person's turn than a summary is. A single
+`is-summary` flag would either leave seeds unmarked, so a seed still reads as a
+person's turn, or mark them too, so a hook cannot tell a memory seed from a
+summary. The enum carries both facts at the same cost. It names hook outputs,
+not producers: a vocabulary of producers, such as the corpus records and
+reloaded history that `source-id`'s doc groups with compaction summaries, is
+declined as well. Reloaded history is not an insertion, since a reloaded line
+keeps the mark it was written with. A corpus record reaches the conversation
+only through a hook's `seed-context`, which is all the runtime can vouch for.
+The two cases are closed: a third case is a breaking bump, like a new field.
+
 That field and its enum are the whole of this bump. `canceled`, `truncated` and
 `fence` stay marks on the conversation record's lines and are not on the WIT
 record. `murmur:conversation` went to `0.2.0` and `murmur:runtime` went to
