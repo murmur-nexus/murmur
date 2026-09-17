@@ -1,4 +1,4 @@
-//! Host implementation of `murmur:runtime/inference@0.3.0#run-inference`.
+//! Host implementation of `murmur:runtime/inference@0.4.0#run-inference`.
 //!
 //! A hook component that imports this interface can run exactly one LLM
 //! completion through the capsule's already-configured inference driver. The
@@ -33,7 +33,7 @@ use crate::{
 
 /// The versioned instance name the host provides `run-inference` under. Hook
 /// components that do not import it simply ignore the registration.
-pub(crate) const INFERENCE_IFACE_VERSIONED: &str = "murmur:runtime/inference@0.3.0";
+pub(crate) const INFERENCE_IFACE_VERSIONED: &str = "murmur:runtime/inference@0.4.0";
 
 /// One completed `run-inference` call, buffered for the agent loop to write
 /// through the session's `TraceWriter`/`OtelEmitter`.
@@ -336,7 +336,7 @@ fn response_text(response: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Register `murmur:runtime/inference@0.3.0#run-inference` on a hook linker.
+/// Register `murmur:runtime/inference@0.4.0#run-inference` on a hook linker.
 ///
 /// `origin` is the `hook:<name>` tag attached to every trace record this hook's
 /// calls produce. `ctx` is `None` when the capsule has no usable inference
@@ -457,7 +457,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{test_support::driver_double, *};
-    use crate::bindings::hook::murmur::hook::lifecycle::Message;
+    use crate::bindings::hook::murmur::hook::lifecycle::{ContextInsertion, Message};
     use tempfile::TempDir;
 
     const CANNED: &str =
@@ -505,6 +505,7 @@ mod tests {
                 content: "summarize this".to_string(),
                 id: None,
                 source_id: None,
+                inserted_by: None,
             }],
             system_prompt: None,
             model: model.map(str::to_string),
@@ -632,12 +633,14 @@ mod tests {
                     content: "hello".to_string(),
                     id: None,
                     source_id: None,
+                    inserted_by: None,
                 },
                 Message {
                     role: "assistant".to_string(),
                     content: "hi there".to_string(),
                     id: None,
                     source_id: None,
+                    inserted_by: None,
                 },
             ],
             system_prompt: None,
@@ -660,7 +663,8 @@ mod tests {
         }
     }
 
-    /// Invariant: `message.id` and `message.source-id` never reach the provider.
+    /// Invariant: `message.id`, `message.source-id` and `message.inserted-by` never reach the
+    /// provider.
     ///
     /// `wire_messages` names the two fields it forwards rather than serializing the
     /// record, so a field added to the WIT `message` is inert on the wire until someone
@@ -674,6 +678,7 @@ mod tests {
                 content: "hello".to_string(),
                 id: Some("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d".to_string()),
                 source_id: Some("corpus:abc".to_string()),
+                inserted_by: Some(ContextInsertion::ReplaceContext),
             }],
             system_prompt: None,
             model: None,
@@ -694,6 +699,9 @@ mod tests {
         assert!(!serialized.contains("corpus:abc"));
         assert!(!serialized.contains("source_id"));
         assert!(!serialized.contains("source-id"));
+        assert!(!serialized.contains("inserted_by"));
+        assert!(!serialized.contains("inserted-by"));
+        assert!(!serialized.contains("replace-context"));
     }
 
     /// A spend ceiling refuses a hook's completion before dispatch — both a ceiling too small for

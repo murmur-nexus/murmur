@@ -4,6 +4,7 @@ mod process;
 
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::{
+    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -164,6 +165,85 @@ const MESSAGE_TRUNCATED_KEY: &str = "truncated";
 /// record line is not filtered, refused or truncated for carrying this key.
 const MESSAGE_FENCE_KEY: &str = "fence";
 
+/// Message field naming the hook output that put this message into the conversation: a
+/// compaction hook's `replace-context` or an `on-task-start` hook's `seed-context`. Written to the
+/// conversation record, served to hooks as `message.inserted-by`, and never sent to a driver.
+///
+/// Set only by the runtime, at the moment it commits that output, because only the runtime knows
+/// which output a message came in through. It is independent of `role`: a summary a hook returns
+/// as `"user"` or `"assistant"` is marked all the same. Absent on every message no hook output
+/// inserted — the task message, model turns, tool results and runtime markers — like the other
+/// envelope keys above. The values are [`ContextInsertion::as_str`]'s.
+const MESSAGE_INSERTED_BY_KEY: &str = "inserted_by";
+
+/// The hook output a message entered the conversation through, as recorded under
+/// [`MESSAGE_INSERTED_BY_KEY`].
+///
+/// The one mapping between the on-disk strings and the WIT `context-insertion` enum: the record
+/// is written through [`Self::as_str`] and read back through [`Self::of`], and bindgen's two
+/// views of the enum are produced by [`Self::to_wit`] and [`Self::to_imported_wit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextInsertion {
+    /// A compaction hook's `replace-context`, including the summary of a seed's overflowing
+    /// front.
+    ReplaceContext,
+    /// An `on-task-start` hook's `seed-context`.
+    SeedContext,
+}
+
+impl ContextInsertion {
+    /// The value written under [`MESSAGE_INSERTED_BY_KEY`].
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplaceContext => "replace-context",
+            Self::SeedContext => "seed-context",
+        }
+    }
+
+    /// The mark `message` carries. A missing key, an unrecognised string and a non-string value
+    /// all read as `None`: a record line is served whatever this key holds.
+    pub(crate) fn of(message: &Value) -> Option<Self> {
+        match message.get(MESSAGE_INSERTED_BY_KEY)?.as_str()? {
+            "replace-context" => Some(Self::ReplaceContext),
+            "seed-context" => Some(Self::SeedContext),
+            _ => None,
+        }
+    }
+
+    fn to_wit(self) -> crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion {
+        use crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion as Wit;
+        match self {
+            Self::ReplaceContext => Wit::ReplaceContext,
+            Self::SeedContext => Wit::SeedContext,
+        }
+    }
+
+    /// The mark [`to_wit_messages`] lowered, for a caller re-serving that lowering under another
+    /// bindgen view. Never applied to a message a hook returned: the runtime does not read a
+    /// hook's `inserted-by`.
+    pub(crate) fn from_lowered(
+        wit: crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion,
+    ) -> Self {
+        use crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion as Wit;
+        match wit {
+            Wit::ReplaceContext => Self::ReplaceContext,
+            Wit::SeedContext => Self::SeedContext,
+        }
+    }
+
+    /// The same mark as `murmur:conversation/read` serves it. Bindgen generates the imported view
+    /// of `murmur:hook/lifecycle` as a separate Rust type from the exported one.
+    pub(crate) fn to_imported_wit(
+        self,
+    ) -> crate::bindings::hook::murmur::hook::lifecycle::ContextInsertion {
+        use crate::bindings::hook::murmur::hook::lifecycle::ContextInsertion as Wit;
+        match self {
+            Self::ReplaceContext => Wit::ReplaceContext,
+            Self::SeedContext => Wit::SeedContext,
+        }
+    }
+}
+
 /// `message` labelled with the fence source its content was wrapped under, or returned untouched
 /// when `source` is `None`.
 ///
@@ -238,10 +318,11 @@ pub(crate) async fn run_agent_loop(
         // there is nowhere to put a seed. Recorded rather than dropped: a silently discarded
         // seed is indistinguishable from a capsule with no memory hook.
         if let Some(seed) = seed {
-            let proposed_tokens = reconstruct_hook_messages(seed.messages)
-                .iter()
-                .map(message_tokens)
-                .fold(0, u64::saturating_add);
+            let proposed_tokens =
+                reconstruct_hook_messages(seed.messages, ContextInsertion::SeedContext, &[])
+                    .iter()
+                    .map(message_tokens)
+                    .fold(0, u64::saturating_add);
             record_seed_rejection(
                 hooks,
                 trace,
@@ -2011,60 +2092,95 @@ const TOOL_MARKER: &str = "__murmur_tool_msg__";
 /// without one is new, and gets a freshly minted [`new_message_id`]. `source-id` is copied
 /// verbatim when the hook supplied one, absent when it did not, and never parsed. Both are
 /// stripped before the wire payload ([`strip_message_identity`]).
+///
+/// `insertion` is the output being reconstructed, and `handed` is the context the hook was
+/// dispatched with — empty for a seed, whose hook is handed none. Every message is marked
+/// `insertion` under [`MESSAGE_INSERTED_BY_KEY`] unless it is *carried*: its `id` names a
+/// message in `handed` and it reconstructs to exactly that message's `role`, `content` and,
+/// for a "tool" message, `tool_call_id` and `is_error`. A carried message keeps the mark the
+/// held message had, including none, so handing back a person's turn does not relabel it and a
+/// held id on rewritten content cannot pass a summary off as that turn. The hook's own
+/// `inserted-by` is never read.
 fn reconstruct_hook_messages(
     wit_messages: Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message>,
+    insertion: ContextInsertion,
+    handed: &[Value],
 ) -> Vec<Value> {
+    // Each held message as a hook handing it back verbatim would reconstruct it, so a carried
+    // message is recognized by value rather than by the bytes of its JSON encoding.
+    let held: HashMap<String, (Value, Option<ContextInsertion>)> = handed
+        .iter()
+        .filter_map(|message| {
+            let id = message_id(message)?.to_string();
+            let lowered = to_wit_messages(std::slice::from_ref(message)).pop()?;
+            Some((
+                id,
+                (hook_message_body(&lowered)?, ContextInsertion::of(message)),
+            ))
+        })
+        .collect();
+
     wit_messages
         .into_iter()
         .filter_map(|m| {
-            let source_id = m.source_id.clone();
-            let id = m.id.clone();
-            let stamp = |mut message: Value| {
-                if let Some(fields) = message.as_object_mut() {
-                    fields.insert(
-                        MESSAGE_ID_KEY.to_string(),
-                        json!(id.unwrap_or_else(new_message_id)),
-                    );
-                    if let Some(source_id) = source_id {
-                        fields.insert(MESSAGE_SOURCE_ID_KEY.to_string(), json!(source_id));
-                    }
-                }
-                message
+            let mut message = hook_message_body(&m)?;
+            let mark = match m.id.as_ref().and_then(|id| held.get(id)) {
+                Some((body, held_mark)) if *body == message => *held_mark,
+                _ => Some(insertion),
             };
-            if m.role == "tool" {
-                // Only keep a "tool" message if our marker round-tripped intact (i.e. the
-                // hook left this message's content untouched) — otherwise we have no way
-                // to recover a valid tool_call_id, and a "tool" message without one is
-                // guaranteed to break the next request. Drop it rather than risk that.
-                let parsed: Value = serde_json::from_str(&m.content).ok()?;
-                if parsed.get(TOOL_MARKER).and_then(Value::as_bool) != Some(true) {
-                    return None;
+            if let Some(fields) = message.as_object_mut() {
+                fields.insert(
+                    MESSAGE_ID_KEY.to_string(),
+                    json!(m.id.unwrap_or_else(new_message_id)),
+                );
+                if let Some(source_id) = m.source_id {
+                    fields.insert(MESSAGE_SOURCE_ID_KEY.to_string(), json!(source_id));
                 }
-                let tool_call_id = parsed.get("tool_call_id")?.as_str()?.to_string();
-                if tool_call_id.is_empty() {
-                    return None;
+                if let Some(mark) = mark {
+                    fields.insert(MESSAGE_INSERTED_BY_KEY.to_string(), json!(mark.as_str()));
                 }
-                Some(stamp(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "is_error": parsed.get("is_error").cloned().unwrap_or(Value::Null),
-                    "content": parsed.get("body").cloned().unwrap_or(Value::Null),
-                })))
-            } else {
-                // Content from hooks is a JSON string: a verbatim round-trip parses back to
-                // the original block array, a summary parses back to a bare JSON string, and
-                // anything unparseable is raw text. All three have to end up as blocks.
-                let parsed: Value =
-                    serde_json::from_str(&m.content).unwrap_or_else(|_| json!(m.content));
-                let content = match parsed {
-                    Value::Array(_) => parsed,
-                    Value::String(s) => json!([{"type": "text", "text": s}]),
-                    other => json!([{"type": "text", "text": other.to_string()}]),
-                };
-                Some(stamp(json!({"role": m.role, "content": content})))
             }
+            Some(message)
         })
         .collect()
+}
+
+/// The agent-loop message one hook-returned WIT message stands for, before any envelope key is
+/// attached, or `None` for a "tool" message that cannot be rebuilt.
+fn hook_message_body(
+    m: &crate::bindings::hook::exports::murmur::hook::lifecycle::Message,
+) -> Option<Value> {
+    if m.role == "tool" {
+        // Only keep a "tool" message if our marker round-tripped intact (i.e. the
+        // hook left this message's content untouched) — otherwise we have no way
+        // to recover a valid tool_call_id, and a "tool" message without one is
+        // guaranteed to break the next request. Drop it rather than risk that.
+        let parsed: Value = serde_json::from_str(&m.content).ok()?;
+        if parsed.get(TOOL_MARKER).and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let tool_call_id = parsed.get("tool_call_id")?.as_str()?.to_string();
+        if tool_call_id.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "is_error": parsed.get("is_error").cloned().unwrap_or(Value::Null),
+            "content": parsed.get("body").cloned().unwrap_or(Value::Null),
+        }))
+    } else {
+        // Content from hooks is a JSON string: a verbatim round-trip parses back to
+        // the original block array, a summary parses back to a bare JSON string, and
+        // anything unparseable is raw text. All three have to end up as blocks.
+        let parsed: Value = serde_json::from_str(&m.content).unwrap_or_else(|_| json!(m.content));
+        let content = match parsed {
+            Value::Array(_) => parsed,
+            Value::String(s) => json!([{"type": "text", "text": s}]),
+            other => json!([{"type": "text", "text": other.to_string()}]),
+        };
+        Some(json!({"role": m.role, "content": content}))
+    }
 }
 
 /// Lower agent-loop messages to the WIT `message` shape a hook receives.
@@ -2078,7 +2194,9 @@ fn reconstruct_hook_messages(
 /// summary. A message with no `role` is dropped: there is no default that is not a guess.
 ///
 /// `id` and `source-id` are handed over as the runtime holds them, so a hook that keeps a
-/// message verbatim can report which record it came from.
+/// message verbatim can report which record it came from. `inserted-by` is read from
+/// [`MESSAGE_INSERTED_BY_KEY`] through [`ContextInsertion::of`], so a missing or malformed mark
+/// lowers to `None` and the message is still handed over.
 pub(crate) fn to_wit_messages(
     messages: &[Value],
 ) -> Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message> {
@@ -2109,6 +2227,7 @@ pub(crate) fn to_wit_messages(
                     .get(MESSAGE_SOURCE_ID_KEY)
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                inserted_by: ContextInsertion::of(m).map(ContextInsertion::to_wit),
             })
         })
         .collect()
@@ -2288,7 +2407,8 @@ async fn try_compact_via_hooks(
         return Ok(());
     };
 
-    let candidate_messages: Vec<Value> = reconstruct_hook_messages(new_wit_messages);
+    let candidate_messages: Vec<Value> =
+        reconstruct_hook_messages(new_wit_messages, ContextInsertion::ReplaceContext, messages);
 
     if has_unresolved_tool_call(&candidate_messages) {
         append_bootstrap_log(
@@ -2674,7 +2794,7 @@ pub(crate) async fn apply_seed_context(
     } = seed;
     let budget = seed_budget_tokens(run_config.context_window, run_config.seed_budget);
 
-    let proposed = reconstruct_hook_messages(wit_messages);
+    let proposed = reconstruct_hook_messages(wit_messages, ContextInsertion::SeedContext, &[]);
     let per_message_tokens: Vec<u64> = proposed.iter().map(message_tokens).collect();
 
     // `seed_budget` is a fraction of `context.max_tokens`; a capsule declaring none has no
@@ -2859,7 +2979,8 @@ async fn summarize_seed_overflow(
 
     match dispatched {
         Ok(Some(wit_messages)) => {
-            let summary = reconstruct_hook_messages(wit_messages);
+            let summary =
+                reconstruct_hook_messages(wit_messages, ContextInsertion::ReplaceContext, front);
             if summary.is_empty() {
                 append_bootstrap_log(
                     workdir,
@@ -3074,9 +3195,9 @@ fn wire_messages<'a>(messages: &'a [Value], continuation: Option<(&str, usize)>)
 
 /// The `messages` array as it goes on the wire: every message minus the runtime's own envelope
 /// keys — [`MESSAGE_ID_KEY`], [`MESSAGE_SOURCE_ID_KEY`], [`MESSAGE_CANCELED_KEY`],
-/// [`MESSAGE_TRUNCATED_KEY`] and [`MESSAGE_FENCE_KEY`].
+/// [`MESSAGE_TRUNCATED_KEY`], [`MESSAGE_FENCE_KEY`] and [`MESSAGE_INSERTED_BY_KEY`].
 ///
-/// All five are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
+/// All six are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
 /// one is minted, so a seed message carrying its id at the head of the prompt is volatile
 /// content in the exact position a provider matches its cached prefix from — it would turn
 /// every request into a cache miss. A message carrying none of them is cloned through
@@ -3095,7 +3216,8 @@ fn strip_message_identity(messages: &[Value]) -> Value {
                         || fields.contains_key(MESSAGE_SOURCE_ID_KEY)
                         || fields.contains_key(MESSAGE_CANCELED_KEY)
                         || fields.contains_key(MESSAGE_TRUNCATED_KEY)
-                        || fields.contains_key(MESSAGE_FENCE_KEY) =>
+                        || fields.contains_key(MESSAGE_FENCE_KEY)
+                        || fields.contains_key(MESSAGE_INSERTED_BY_KEY) =>
                 {
                     let mut stripped = fields.clone();
                     stripped.remove(MESSAGE_ID_KEY);
@@ -3103,6 +3225,7 @@ fn strip_message_identity(messages: &[Value]) -> Value {
                     stripped.remove(MESSAGE_CANCELED_KEY);
                     stripped.remove(MESSAGE_TRUNCATED_KEY);
                     stripped.remove(MESSAGE_FENCE_KEY);
+                    stripped.remove(MESSAGE_INSERTED_BY_KEY);
                     Value::Object(stripped)
                 }
                 _ => message.clone(),
@@ -4317,12 +4440,19 @@ forgery: {prompt}"
 
     use crate::bindings::hook::exports::murmur::hook::lifecycle::Message as WitMessage;
 
+    /// A compaction hook's `replace-context` reconstructed with no handed context, for the
+    /// tests about content shape and identity rather than the insertion mark.
+    fn reconstruct_compaction(wit_messages: Vec<WitMessage>) -> Vec<Value> {
+        reconstruct_hook_messages(wit_messages, ContextInsertion::ReplaceContext, &[])
+    }
+
     fn wit(role: &str, content: &str) -> WitMessage {
         WitMessage {
             role: role.to_string(),
             content: content.to_string(),
             id: None,
             source_id: None,
+            inserted_by: None,
         }
     }
 
@@ -4341,7 +4471,7 @@ forgery: {prompt}"
             "\"Earlier turns: the agent read two files and ran the tests.\""
         );
 
-        let msgs = reconstruct_hook_messages(vec![wit("user", &encoded)]);
+        let msgs = reconstruct_compaction(vec![wit("user", &encoded)]);
 
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
@@ -4514,11 +4644,12 @@ forgery: {prompt}"
     /// serialized form — including the id the hook proposed.
     #[test]
     fn message_id_and_source_id_are_stripped_from_the_driver_payload() {
-        let msgs = reconstruct_hook_messages(vec![WitMessage {
+        let msgs = reconstruct_compaction(vec![WitMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
             id: Some("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d".to_string()),
             source_id: Some("corpus:abc".to_string()),
+            inserted_by: None,
         }]);
 
         assert_eq!(msgs.len(), 1);
@@ -4529,7 +4660,10 @@ forgery: {prompt}"
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["content", "id", "role", "source_id"]);
+        assert_eq!(
+            keys,
+            vec!["content", "id", "inserted_by", "role", "source_id"]
+        );
         assert_eq!(msgs[0]["source_id"], "corpus:abc");
 
         let payload = build_driver_payload("m", 8192, &msgs, &[], "sys", None, None);
@@ -4539,6 +4673,8 @@ forgery: {prompt}"
         assert!(!serialized.contains("\"id\""));
         assert!(!serialized.contains("source_id"));
         assert!(!serialized.contains("source-id"));
+        assert!(!serialized.contains("inserted_by"));
+        assert!(!serialized.contains("replace-context"));
         assert_eq!(
             payload["messages"][0],
             json!({"role": "user", "content": [{"type": "text", "text": "hello"}]})
@@ -4584,12 +4720,218 @@ forgery: {prompt}"
             .contains("\"fence\""));
     }
 
+    /// The insertion mark is the record's, not the provider's. A message carrying `inserted_by`
+    /// alone still enters the rewriting arm of [`strip_message_identity`], so the key cannot ride
+    /// through on a message with nothing else to strip.
+    #[test]
+    fn the_inserted_by_key_is_stripped_from_the_driver_payload() {
+        let mark_only = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "a summary"}],
+            MESSAGE_INSERTED_BY_KEY: "replace-context",
+        });
+
+        let stripped = strip_message_identity(&[mark_only]);
+
+        assert_eq!(
+            stripped,
+            json!([{"role": "user", "content": [{"type": "text", "text": "a summary"}]}])
+        );
+    }
+
+    /// A lifecycle `message` carrying a mark, the way a hook can return one.
+    fn wit_marked(
+        role: &str,
+        content: &str,
+        id: Option<&str>,
+        inserted_by: Option<
+            crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion,
+        >,
+    ) -> WitMessage {
+        WitMessage {
+            id: id.map(str::to_string),
+            inserted_by,
+            ..wit(role, content)
+        }
+    }
+
+    fn mark_of(message: &Value) -> Option<&str> {
+        message.get(MESSAGE_INSERTED_BY_KEY).and_then(Value::as_str)
+    }
+
+    /// The runtime alone decides the mark: whatever a hook put in `inserted-by` on a message it
+    /// returns, the message is marked with the output it actually came in through.
+    #[test]
+    fn a_hook_supplied_inserted_by_is_ignored() {
+        use crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion as Wit;
+
+        let replaced = reconstruct_hook_messages(
+            vec![
+                wit_marked("user", "\"unmarked summary\"", None, None),
+                wit_marked("assistant", "\"forged seed\"", None, Some(Wit::SeedContext)),
+            ],
+            ContextInsertion::ReplaceContext,
+            &[],
+        );
+        assert_eq!(mark_of(&replaced[0]), Some("replace-context"));
+        assert_eq!(mark_of(&replaced[1]), Some("replace-context"));
+
+        let seeded = reconstruct_hook_messages(
+            vec![wit_marked(
+                "user",
+                "\"forged summary\"",
+                None,
+                Some(Wit::ReplaceContext),
+            )],
+            ContextInsertion::SeedContext,
+            &[],
+        );
+        assert_eq!(mark_of(&seeded[0]), Some("seed-context"));
+    }
+
+    /// A message the hook hands back unchanged keeps the mark it was held under, and only then:
+    /// a held id on different content, or an id the hook was never handed, is the hook's own
+    /// message and is marked as one.
+    #[test]
+    fn carried_messages_keep_their_mark() {
+        use crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion as Wit;
+
+        let person = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "a person's turn"}],
+            MESSAGE_ID_KEY: "msg_person",
+        });
+        let summary = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "an earlier summary"}],
+            MESSAGE_ID_KEY: "msg_summary",
+            MESSAGE_INSERTED_BY_KEY: "replace-context",
+        });
+        let handed = vec![person.clone(), summary.clone()];
+        let lowered = to_wit_messages(&handed);
+
+        // (a) A person's turn handed back verbatim stays unmarked and keeps its id, even when the
+        // hook claims a mark for it.
+        let carried_person = WitMessage {
+            inserted_by: Some(Wit::ReplaceContext),
+            ..lowered[0].clone()
+        };
+        let msgs = reconstruct_hook_messages(
+            vec![carried_person],
+            ContextInsertion::ReplaceContext,
+            &handed,
+        );
+        assert_eq!(msgs, vec![person.clone()]);
+
+        // (b) An earlier summary handed back verbatim by a second compaction stays marked, even
+        // when the hook claims none.
+        let carried_summary = WitMessage {
+            inserted_by: None,
+            ..lowered[1].clone()
+        };
+        let msgs = reconstruct_hook_messages(
+            vec![carried_summary],
+            ContextInsertion::ReplaceContext,
+            &handed,
+        );
+        assert_eq!(msgs, vec![summary]);
+
+        // (c) A held id on different content is the hook's own message.
+        let rewritten = wit_marked(
+            "user",
+            "\"not what the person said\"",
+            Some("msg_person"),
+            None,
+        );
+        let msgs =
+            reconstruct_hook_messages(vec![rewritten], ContextInsertion::ReplaceContext, &handed);
+        assert_eq!(mark_of(&msgs[0]), Some("replace-context"));
+
+        // A held id on the same content under a different role is the hook's own message too.
+        let relabelled = WitMessage {
+            role: "assistant".to_string(),
+            ..lowered[0].clone()
+        };
+        let msgs =
+            reconstruct_hook_messages(vec![relabelled], ContextInsertion::ReplaceContext, &handed);
+        assert_eq!(mark_of(&msgs[0]), Some("replace-context"));
+
+        // (d) An id the hook was never handed is the hook's own message.
+        let stranger = WitMessage {
+            id: Some("msg_unknown".to_string()),
+            ..lowered[0].clone()
+        };
+        let msgs =
+            reconstruct_hook_messages(vec![stranger], ContextInsertion::ReplaceContext, &handed);
+        assert_eq!(mark_of(&msgs[0]), Some("replace-context"));
+        assert_eq!(msgs[0][MESSAGE_ID_KEY], "msg_unknown");
+    }
+
+    /// A tool result is carried only with the call it answers: the same body under another
+    /// `tool_call_id` is not the held message.
+    #[test]
+    fn a_carried_tool_message_must_keep_its_tool_call_id() {
+        let held = json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "is_error": false,
+            "content": [{"type": "text", "text": "ok"}],
+            MESSAGE_ID_KEY: "msg_tool",
+        });
+        let handed = vec![held.clone()];
+        let verbatim = to_wit_messages(&handed).pop().unwrap();
+        let rebound = WitMessage {
+            content: json!({
+                TOOL_MARKER: true,
+                "tool_call_id": "call_2",
+                "is_error": false,
+                "body": [{"type": "text", "text": "ok"}],
+            })
+            .to_string(),
+            ..verbatim.clone()
+        };
+
+        let msgs = reconstruct_hook_messages(
+            vec![verbatim, rebound],
+            ContextInsertion::ReplaceContext,
+            &handed,
+        );
+
+        assert_eq!(msgs[0], held);
+        assert_eq!(mark_of(&msgs[1]), Some("replace-context"));
+    }
+
+    /// Lowering reads the mark the runtime wrote and nothing else: an odd value is `none`, and the
+    /// message is still handed over.
+    #[test]
+    fn lowering_reads_only_a_recognised_mark() {
+        use crate::bindings::hook::exports::murmur::hook::lifecycle::ContextInsertion as Wit;
+
+        let lowered = to_wit_messages(&[
+            json!({"role": "user", "content": "a", MESSAGE_INSERTED_BY_KEY: "replace-context"}),
+            json!({"role": "user", "content": "b", MESSAGE_INSERTED_BY_KEY: "seed-context"}),
+            json!({"role": "user", "content": "c"}),
+            json!({"role": "user", "content": "d", MESSAGE_INSERTED_BY_KEY: "bogus"}),
+            json!({"role": "user", "content": "e", MESSAGE_INSERTED_BY_KEY: 42}),
+        ]);
+
+        assert_eq!(
+            lowered.iter().map(|m| m.inserted_by).collect::<Vec<_>>(),
+            vec![
+                Some(Wit::ReplaceContext),
+                Some(Wit::SeedContext),
+                None,
+                None,
+                None
+            ],
+        );
+    }
+
     /// The id the runtime mints is an identity, never a content hash: two byte-identical
     /// messages must not share one, or anything keyed on it would silently conflate them.
     #[test]
     fn message_ids_are_minted_fresh_for_byte_identical_messages() {
-        let msgs =
-            reconstruct_hook_messages(vec![wit("user", "\"same\""), wit("user", "\"same\"")]);
+        let msgs = reconstruct_compaction(vec![wit("user", "\"same\""), wit("user", "\"same\"")]);
         let first = msgs[0][MESSAGE_ID_KEY].as_str().unwrap();
         let second = msgs[1][MESSAGE_ID_KEY].as_str().unwrap();
         assert_ne!(first, second);
@@ -4607,7 +4949,7 @@ forgery: {prompt}"
     /// runtime records what it was given and invents nothing.
     #[test]
     fn message_source_id_is_absent_when_the_hook_supplied_none() {
-        let msgs = reconstruct_hook_messages(vec![wit("user", "\"hi\"")]);
+        let msgs = reconstruct_compaction(vec![wit("user", "\"hi\"")]);
         assert!(msgs[0].get(MESSAGE_SOURCE_ID_KEY).is_none());
         assert!(msgs[0].get(MESSAGE_ID_KEY).is_some());
     }
@@ -4624,10 +4966,10 @@ forgery: {prompt}"
             MESSAGE_ID_KEY: kept,
         })];
 
-        let round_tripped = reconstruct_hook_messages(to_wit_messages(&held));
+        let round_tripped = reconstruct_compaction(to_wit_messages(&held));
         assert_eq!(round_tripped[0][MESSAGE_ID_KEY], json!(kept));
 
-        let fresh = reconstruct_hook_messages(vec![wit("user", "\"a summary\"")]);
+        let fresh = reconstruct_compaction(vec![wit("user", "\"a summary\"")]);
         let minted = fresh[0][MESSAGE_ID_KEY].as_str().unwrap();
         assert_ne!(minted, kept);
         assert!(minted.starts_with("msg_"), "{minted}");
@@ -4646,7 +4988,7 @@ forgery: {prompt}"
             MESSAGE_ID_KEY: kept,
         })];
 
-        let round_tripped = reconstruct_hook_messages(to_wit_messages(&held));
+        let round_tripped = reconstruct_compaction(to_wit_messages(&held));
         assert_eq!(round_tripped[0][MESSAGE_ID_KEY], json!(kept));
         assert_eq!(round_tripped[0]["tool_call_id"], json!("t1"));
     }
@@ -4862,7 +5204,7 @@ forgery: {prompt}"
     #[test]
     fn reconstructed_non_tool_content_is_always_a_block_array() {
         let verbatim = json!([{"type": "text", "text": "kept as-is"}]);
-        let msgs = reconstruct_hook_messages(vec![
+        let msgs = reconstruct_compaction(vec![
             wit("assistant", &verbatim.to_string()),
             wit("user", "not json at all"),
             wit("user", "42"),
@@ -4894,7 +5236,7 @@ forgery: {prompt}"
             "is_error": false,
             "body": [{"type": "text", "text": "ok"}],
         });
-        let msgs = reconstruct_hook_messages(vec![
+        let msgs = reconstruct_compaction(vec![
             wit("tool", &wrapped.to_string()),
             wit("tool", "\"the hook summarized this away\""),
         ]);
@@ -5026,7 +5368,7 @@ forgery: {prompt}"
     fn extracted_summary_is_the_hook_string_verbatim() {
         let summary = "1. THE BUG: a \"quoted\" path\n\tC:\\tmp — and a trailing space ";
         let msgs =
-            reconstruct_hook_messages(vec![wit("user", &serde_json::to_string(summary).unwrap())]);
+            reconstruct_compaction(vec![wit("user", &serde_json::to_string(summary).unwrap())]);
 
         assert_eq!(extract_compaction_summary_text(&msgs), summary);
         // Same string that landed in the post-compaction context.
@@ -5043,7 +5385,7 @@ forgery: {prompt}"
             "is_error": false,
             "body": [{"type": "text", "text": "tool output must not appear"}],
         });
-        let msgs = reconstruct_hook_messages(vec![
+        let msgs = reconstruct_compaction(vec![
             wit("user", &serde_json::to_string("first part").unwrap()),
             wit("tool", &wrapped.to_string()),
             wit("assistant", &serde_json::to_string("second part").unwrap()),
@@ -5058,7 +5400,7 @@ forgery: {prompt}"
     /// Reconstructed post-commit messages, as `try_compact_via_hooks` would hand them to the
     /// dumper — a hook returning one JSON-encoded summary string.
     fn compacted_with_summary(summary: &str) -> Vec<Value> {
-        reconstruct_hook_messages(vec![wit("user", &serde_json::to_string(summary).unwrap())])
+        reconstruct_compaction(vec![wit("user", &serde_json::to_string(summary).unwrap())])
     }
 
     fn dump_lines(dir: &Path) -> Vec<Value> {

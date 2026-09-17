@@ -224,7 +224,7 @@ pub(crate) mod test_support {
     use super::TASK_IO_IFACE_VERSIONED;
     use wasmtime::component::Component;
 
-    /// One row per `murmur:hook/lifecycle@0.8.0` function: the WIT name, the WIT type of its
+    /// One row per `murmur:hook/lifecycle@0.9.0` function: the WIT name, the WIT type of its
     /// event parameter, and the core-function signature the canonical ABI flattens that type
     /// to. `on-inference`'s record flattens to 17 values and `on-shell`'s to 22, both past
     /// the 16-parameter limit, so each is passed indirectly as a single pointer.
@@ -351,11 +351,13 @@ pub(crate) mod test_support {
 
     /// Every WIT type a lifecycle export in these doubles names.
     const LIFECYCLE_TYPES: &str = r#"
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -434,7 +436,7 @@ pub(crate) mod test_support {
 "#;
 
     /// The types every lifecycle instance re-exports alongside its functions.
-    const TYPE_EXPORTS: &str = "    (export \"message\" (type $message))\n    \
+    const TYPE_EXPORTS: &str = "    (export \"context-insertion\" (type $context-insertion))\n    (export \"message\" (type $message))\n    \
                                 (export \"tool-manifest\" (type $tool-manifest))\n    \
                                 (export \"hook-output\" (type $hook-output))\n    \
                                 (export \"tool-outcome\" (type $tool-outcome))\n    \
@@ -450,7 +452,7 @@ pub(crate) mod test_support {
              (export \"rin\" (func $rin_l))\n      (export \"olen\" (func $olen_l))\n      \
              (export \"rout\" (func $rout_l))))))\n{LIFECYCLE_TYPES}\n{lifts}\n  \
              (instance $lc\n{TYPE_EXPORTS}{exports}  )\n  \
-             (export \"murmur:hook/lifecycle@0.8.0\" (instance $lc))\n)",
+             (export \"murmur:hook/lifecycle@0.9.0\" (instance $lc))\n)",
             preamble = preamble(),
         );
         let bytes = wat::parse_str(&wat).expect("task-io double WAT parses");

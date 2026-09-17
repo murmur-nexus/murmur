@@ -546,6 +546,9 @@ pub(crate) fn page(
                 content: message.content,
                 id: message.id,
                 source_id: message.source_id,
+                inserted_by: message.inserted_by.map(|mark| {
+                    crate::agent::ContextInsertion::from_lowered(mark).to_imported_wit()
+                }),
             })
             .collect(),
         next_cursor: (start > 0).then(|| encode_cursor(start)),

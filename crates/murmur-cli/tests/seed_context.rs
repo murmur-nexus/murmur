@@ -126,6 +126,28 @@ impl Session {
             .collect()
     }
 
+    /// Every line of the conversation record the session wrote, parsed.
+    ///
+    /// Staging in-process points `$HOME` at the test process's scratch home, which every session
+    /// in this binary shares, so the record is found by the context id the trace names.
+    fn record(&self) -> Vec<Value> {
+        let context_id = self
+            .trace
+            .iter()
+            .find_map(|event| event["context_id"].as_str())
+            .unwrap_or_else(|| panic!("the trace names a context id:\n{}", self.trace_raw));
+        let path = PathBuf::from(std::env::var_os("HOME").expect("staging set $HOME"))
+            .join(".murmur/conversations/seed-capsule")
+            .join(context_id)
+            .join("conversation.jsonl");
+        fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()))
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("every record line must be valid JSON"))
+            .collect()
+    }
+
     /// The one `context_seed` line, with the whole trace in the failure message — a seed
     /// decision that did not get recorded is the defect these tests exist to catch.
     fn context_seed(&self) -> &Value {
@@ -419,6 +441,115 @@ fn overflow_over_margin_is_compacted() {
         "the seed path compacts nothing about the session's context: {}",
         session.trace_raw
     );
+}
+
+/// A seed is recorded as one: every line an `on-task-start` hook's `seed-context` committed
+/// carries `"inserted_by": "seed-context"`, and the person's task line carries no mark.
+#[test]
+fn seeded_messages_are_marked_in_the_record() {
+    if common::skip_without_host_support("seeded_messages_are_marked_in_the_record") {
+        return;
+    }
+    let session = run_session(
+        "0.5",
+        &[(
+            "seed-hook",
+            "on-task-start",
+            "seed-context",
+            seed_hook_wasm(&[
+                ("user", "SEED-ONE an earlier note."),
+                ("assistant", "SEED-TWO an earlier reply."),
+            ]),
+        )],
+    );
+    assert_eq!(session.context_seed()["outcome"], "seeded");
+
+    let record = session.record();
+    let marks: Vec<(String, Option<&str>)> = record
+        .iter()
+        .map(|line| {
+            (
+                text_of(line),
+                line.get("inserted_by").and_then(Value::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            // The task message is recorded when it is built, ahead of the seed placed before it.
+            (TASK_TEXT.to_string(), None),
+            (
+                "SEED-ONE an earlier note.".to_string(),
+                Some("seed-context")
+            ),
+            (
+                "SEED-TWO an earlier reply.".to_string(),
+                Some("seed-context")
+            ),
+            ("Done.".to_string(), None),
+        ],
+        "{record:#?}"
+    );
+}
+
+/// A seed whose overflowing front was summarized records the summary as the `replace-context`
+/// the compaction hook returned it through, and the seed message it kept as `seed-context`.
+#[test]
+fn a_seed_overflow_summary_is_marked_replace_context_in_the_record() {
+    if common::skip_without_host_support(
+        "a_seed_overflow_summary_is_marked_replace_context_in_the_record",
+    ) {
+        return;
+    }
+    let summary = "SUMMARY-OF-THE-FRONT: two earlier notes.";
+    let oldest = seed_text("SEED-OLDEST", 100);
+    let middle = seed_text("SEED-MIDDLE", 100);
+    let newest = seed_text("SEED-NEWEST", 100);
+    let session = run_session(
+        "0.0008",
+        &[
+            (
+                "seed-hook",
+                "on-task-start",
+                "seed-context",
+                seed_hook_wasm(&[
+                    ("user", oldest.as_str()),
+                    ("user", middle.as_str()),
+                    ("user", newest.as_str()),
+                ]),
+            ),
+            (
+                "compact-hook",
+                "on-compaction",
+                "replace-context",
+                compaction_hook_wasm(summary),
+            ),
+        ],
+    );
+    assert_eq!(session.context_seed()["outcome"], "compacted");
+
+    let record = session.record();
+    let marks: Vec<(String, Option<&str>)> = record
+        .iter()
+        .map(|line| {
+            (
+                text_of(line),
+                line.get("inserted_by").and_then(Value::as_str),
+            )
+        })
+        .collect();
+    assert_eq!(marks.len(), 4, "{marks:?}");
+    // The task message is recorded when it is built, ahead of the seed placed before it.
+    assert_eq!(marks[0], (TASK_TEXT.to_string(), None), "{marks:?}");
+    assert_eq!(
+        marks[1],
+        (summary.to_string(), Some("replace-context")),
+        "{marks:?}"
+    );
+    assert!(marks[2].0.starts_with("SEED-NEWEST"), "{marks:?}");
+    assert_eq!(marks[2].1, Some("seed-context"), "{marks:?}");
+    assert_eq!(marks[3], ("Done.".to_string(), None), "{marks:?}");
 }
 
 /// With no compaction hook bound there is nothing to summarize the front, so it is trimmed —

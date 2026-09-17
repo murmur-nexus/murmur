@@ -214,14 +214,14 @@ mod tests {
             (component
               (import "murmur:tool-registry/invoke@0.1.0" (instance))
               (import "wasi:cli/environment@0.2.0" (instance))
-              (import "murmur:runtime/inference@0.3.0" (instance))
+              (import "murmur:runtime/inference@0.4.0" (instance))
             )
         "#;
         let contracts = extract_wit_contracts(&component(wat)).unwrap().unwrap();
         assert_eq!(
             contracts.imports,
             vec![
-                "murmur:runtime/inference@0.3.0",
+                "murmur:runtime/inference@0.4.0",
                 "murmur:tool-registry/invoke@0.1.0",
                 "wasi:cli/environment@0.2.0",
             ]

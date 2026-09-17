@@ -42,7 +42,7 @@ use crate::{
 /// `murmur:hook` version declared in `wit/`. The host keeps no compatibility
 /// fallback: a hook compiled against any other version does not resolve, so a
 /// WIT bump requires every hook artifact to be rebuilt (see `wit/VERSIONING.md`).
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.8.0";
+const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.9.0";
 
 /// Resolve the lifecycle instance export. `None` means the component does not
 /// export [`LIFECYCLE_IFACE`], which surfaces as a missing-export error at the
@@ -2129,7 +2129,7 @@ mod tests {
     /// A retired lifecycle instance name. The host accepts [`LIFECYCLE_IFACE`] and
     /// nothing else, so a double exporting this must fail to resolve — that is what
     /// the no-fallback tests below assert.
-    const RETIRED_IFACE: &str = "murmur:hook/lifecycle@0.5.0";
+    const RETIRED_IFACE: &str = "murmur:hook/lifecycle@0.8.0";
 
     /// Engine configured like the production one (component model + async + epoch
     /// interruption) so a hand-authored WAT component double can be compiled and
@@ -2156,7 +2156,7 @@ mod tests {
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
     /// instance name, so tests can build a component that exports the versioned
-    /// (`murmur:hook/lifecycle@0.8.0`), the legacy unversioned, or a
+    /// (`murmur:hook/lifecycle@0.9.0`), the legacy unversioned, or a
     /// deliberately-unmatched name to exercise `resolve_lifecycle_iface` and its
     /// hard-error path.
     fn hook_double_iface(engine: &wasmtime::Engine, iface: &str, fn_names: &[&str]) -> Component {
@@ -2540,7 +2540,7 @@ mod tests {
     }
 
     /// A hook component built against the *current* versioned
-    /// `murmur:hook/lifecycle@0.8.0` interface (the name a freshly-compiled hook
+    /// `murmur:hook/lifecycle@0.9.0` interface (the name a freshly-compiled hook
     /// carries) instantiates and registers every required and optional function.
     /// The current versioned name is the one `resolve_lifecycle_iface` probes first.
     #[test]
@@ -2689,11 +2689,13 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -2716,6 +2718,7 @@ mod tests {
       (memory $mem) (realloc $realloc) string-encoding=utf8))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -2758,11 +2761,13 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -2785,6 +2790,7 @@ mod tests {
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -2929,6 +2935,7 @@ mod tests {
                     content: "hello".to_string(),
                     id: None,
                     source_id: None,
+                    inserted_by: None,
                 }],
                 1234,
                 0.98,
@@ -3115,6 +3122,7 @@ mod tests {
                     content: "hello".to_string(),
                     id: None,
                     source_id: None,
+                    inserted_by: None,
                 }],
                 1234,
                 0.98,
@@ -3257,11 +3265,13 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -3293,6 +3303,7 @@ mod tests {
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -3405,7 +3416,7 @@ mod tests {
     }
 
     /// End-to-end through the real host import: a hook component that imports
-    /// `murmur:runtime/inference@0.3.0` and calls `run-inference` gets back the
+    /// `murmur:runtime/inference@0.4.0` and calls `run-inference` gets back the
     /// driver double's completion text, which it returns as an `on-inference`
     /// artifact so the test can read it.
     #[test]
@@ -3522,7 +3533,7 @@ mod tests {
         }
     }
 
-    /// A current-version lifecycle double that *imports* `murmur:runtime/inference@0.3.0`
+    /// A current-version lifecycle double that *imports* `murmur:runtime/inference@0.4.0`
     /// and, on `on-inference`, calls `run-inference` with an empty message list
     /// and `model: none`, then returns whichever string the call produced —
     /// the completion text on success, the error message on failure — as
@@ -3545,26 +3556,30 @@ mod tests {
             r#"(component
   (import "{INFERENCE_IFACE_VERSIONED}" (instance $inf
     (type (option string))
+    (type (enum "replace-context" "seed-context"))
+    (export "context-insertion" (type (eq 1)))
+    (type (option 2))
     (type (record
       (field "role" string)
       (field "content" string)
       (field "id" 0)
-      (field "source-id" 0)))
-    (export "message" (type (eq 1)))
-    (type (list 2))
+      (field "source-id" 0)
+      (field "inserted-by" 3)))
+    (export "message" (type (eq 4)))
+    (type (list 5))
     (type (record
-      (field "messages" 3)
+      (field "messages" 6)
       (field "system-prompt" 0)
       (field "model" 0)))
-    (export "inference-request" (type (eq 4)))
+    (export "inference-request" (type (eq 7)))
     (type (record
       (field "text" string)
       (field "model-used" string)
       (field "input-tokens" u64)
       (field "output-tokens" u64)))
-    (export "inference-response" (type (eq 6)))
-    (type (result 7 (error string)))
-    (export "run-inference" (func (param "request" 5) (result 8)))
+    (export "inference-response" (type (eq 9)))
+    (type (result 10 (error string)))
+    (export "run-inference" (func (param "request" 8) (result 11)))
   ))
   (alias export $inf "run-inference" (func $runi))
 
@@ -3603,11 +3618,13 @@ mod tests {
     (with "libc" (instance $li))
     (with "inf" (instance (export "run" (func $run_lowered))))))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -3633,6 +3650,7 @@ mod tests {
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -3719,7 +3737,7 @@ mod tests {
     const TOKEN_PROBE: &str =
         "the quick brown fox jumps over the lazy dog, and then counts its own tokens";
 
-    /// A lifecycle double that *imports* `murmur:runtime/tokens@0.3.0` and, on
+    /// A lifecycle double that *imports* `murmur:runtime/tokens@0.4.0` and, on
     /// `on-session-start`, calls `count` on [`TOKEN_PROBE`] and returns the result rendered
     /// as decimal digits in `err(...)`. A returned `err` is appended verbatim to
     /// `logs/hook-<name>.log`, so the number the host computed is readable from the log.
@@ -3786,11 +3804,13 @@ mod tests {
     (with "libc" (instance $li))
     (with "tok" (instance (export "count" (func $count_lowered))))))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -3813,6 +3833,7 @@ mod tests {
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -3827,7 +3848,7 @@ mod tests {
         Component::new(engine, &bytes).expect("token-counter component double compiles")
     }
 
-    /// Invariant: `murmur:runtime/tokens@0.3.0#count` is registered on the main hook
+    /// Invariant: `murmur:runtime/tokens@0.4.0#count` is registered on the main hook
     /// linker with no capability grant, and it answers with the host's own count.
     ///
     /// The double is staged default-deny — no network rules, no filesystem scope, no
@@ -4210,7 +4231,7 @@ mod tests {
         assert_eq!(
             pages[0],
             format!(
-                "T=5{sep}{id5}=user{sep}{id4}=user{sep}N=mc_3",
+                "T=5{sep}{id5}=user=-{sep}{id4}=user=-{sep}N=mc_3",
                 sep = CONVERSATION_SEP,
                 id5 = recorded_id(5),
                 id4 = recorded_id(4),
@@ -4220,7 +4241,7 @@ mod tests {
         assert_eq!(
             pages[1],
             format!(
-                "T=5{sep}{id3}=user{sep}{id2}=user{sep}N=mc_1",
+                "T=5{sep}{id3}=user=-{sep}{id2}=user=-{sep}N=mc_1",
                 sep = CONVERSATION_SEP,
                 id3 = recorded_id(3),
                 id2 = recorded_id(2),
@@ -4846,11 +4867,13 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -4877,6 +4900,7 @@ artifacts:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -4892,7 +4916,7 @@ artifacts:
         Component::new(engine, &bytes).expect("tool-call component double compiles")
     }
 
-    /// A *current-version* (`@0.8.0`, 7-case `hook-output`) `on-task-end` double that
+    /// A *current-version* (`@0.9.0`, 7-case `hook-output`) `on-task-end` double that
     /// returns `ok(<arm>)`. `arm_disc` selects the variant: `0` = `none`, `4` =
     /// `reopen-task(reason)`. The `reopen-task` payload is a static string at guest
     /// offset 300 so the host lifts the real bytes the guest declared, exercising the
@@ -4931,11 +4955,13 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -4955,6 +4981,7 @@ artifacts:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -5130,11 +5157,13 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -5159,6 +5188,7 @@ artifacts:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -5386,11 +5416,13 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -5408,6 +5440,7 @@ artifacts:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -5598,6 +5631,7 @@ artifacts:
                         content: "hello".to_string(),
                         id: None,
                         source_id: None,
+                        inserted_by: None,
                     }],
                     1234,
                     0.98,
@@ -6053,11 +6087,13 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -6104,6 +6140,7 @@ artifacts:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -6276,11 +6313,13 @@ artifacts:
   )
   (core instance $i (instantiate $m (with "host" (instance $imports))))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -6303,6 +6342,7 @@ artifacts:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -6704,6 +6744,7 @@ artifacts:
                         content: "hello".to_string(),
                         id: None,
                         source_id: None,
+                        inserted_by: None,
                     }],
                     1234,
                     0.98,
