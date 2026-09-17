@@ -1068,6 +1068,10 @@ fn the_record_shows_the_cancelled_turn() {
     let last = messages.last().unwrap();
     assert_eq!(last["role"], "assistant", "{last}");
     assert_eq!(last["canceled"], json!(true), "{last}");
+    assert!(
+        last.get("inserted_by").is_none(),
+        "no hook output inserted the cancelled turn: {last}"
+    );
     let canceled_text = last["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("the cancelled turn carries text: {last}"))

@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.8.0`  |
+| `murmur:hook`            | `0.9.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -19,10 +19,10 @@ Current versions:
 | `murmur:message`         | `0.1.0`  |
 | `murmur:task`            | `0.1.0`  |
 | `murmur:task-io`         | `0.1.0`  |
-| `murmur:conversation`    | `0.1.0`  |
+| `murmur:conversation`    | `0.2.0`  |
 | `murmur:text`            | `0.1.0`  |
 | `murmur:host`            | `0.1.0`  |
-| `murmur:runtime`         | `0.3.0`  |
+| `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
 
 `murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
@@ -140,6 +140,28 @@ and `murmur:conversation` did not move. Both merely `use` `murmur:hook`'s
 retargeted at `@0.8.0` and the packages themselves stayed where they were —
 the same precedent the `murmur:conversation` entry above records.
 
+`murmur:hook` then went to `0.9.0` when `message` gained
+`inserted-by: option<context-insertion>`, with the new
+`enum context-insertion { replace-context, seed-context }`. It names the hook
+output a message entered the conversation through, which only the runtime knows
+for certain, at the moment it commits a `replace-context` or a `seed-context`.
+Without it a hook reading the conversation could not tell a compaction summary
+from a person's turn: the shipped compaction hook returns its summary as
+`role: "user"`, and `source-id` is hook-supplied and carries no provenance. The
+field is appended last, after `source-id`. Adding a field to an existing record
+is always a breaking change under the rule below.
+
+That field and its enum are the whole of this bump. `canceled`, `truncated` and
+`fence` stay marks on the conversation record's lines and are not on the WIT
+record. `murmur:conversation` went to `0.2.0` and `murmur:runtime` went to
+`0.4.0` in the same step, because the `message` record both `use` changed shape:
+`read-messages` returns it and `inference-request` carries it. The `0.8.0` entry
+above kept both packages still because `message` did not change there. Here it
+does, and every hook rebuild is already forced by `murmur:hook@0.9.0`, so moving
+the two siblings costs nothing extra: the same reasoning as the
+`murmur:runtime@0.3.0` exception. Hooks built against `@0.8.0` or earlier stopped
+resolving at this bump and had to be rebuilt.
+
 The `deny` arm is the one `hook-output` case whose contract is *subtractive*: it can only
 stop a call the manifest already permitted, and there is deliberately no arm that permits
 one. Widening the variant with a permitting case would be a different kind of change from
@@ -244,8 +266,8 @@ only:
 
 The host-provided *import* interfaces (`murmur:tool-registry/invoke@0.1.0`,
 `murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`,
-`murmur:runtime/inference@0.3.0`, `murmur:runtime/tokens@0.3.0`,
-`murmur:task-io/read@0.1.0`, `murmur:conversation/read@0.1.0`) are likewise
+`murmur:runtime/inference@0.4.0`, `murmur:runtime/tokens@0.4.0`,
+`murmur:task-io/read@0.1.0`, `murmur:conversation/read@0.2.0`) are likewise
 registered under the versioned name only.
 
 An artifact that still exports (or imports) only the unversioned name now

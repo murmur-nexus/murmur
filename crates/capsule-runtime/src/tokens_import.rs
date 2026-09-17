@@ -1,4 +1,4 @@
-//! Host implementation of `murmur:runtime/tokens@0.3.0#count`.
+//! Host implementation of `murmur:runtime/tokens@0.4.0#count`.
 //!
 //! A hook that imports this interface measures text with the host's own
 //! `cl100k_base` tokenizer — [`crate::agent::count_tokens`], the counter behind
@@ -15,9 +15,9 @@ use wasmtime::component::Linker;
 
 /// The versioned instance name the host provides `count` under. Hook components
 /// that do not import it simply ignore the registration.
-pub(crate) const TOKENS_IFACE_VERSIONED: &str = "murmur:runtime/tokens@0.3.0";
+pub(crate) const TOKENS_IFACE_VERSIONED: &str = "murmur:runtime/tokens@0.4.0";
 
-/// Register `murmur:runtime/tokens@0.3.0#count` on a hook linker.
+/// Register `murmur:runtime/tokens@0.4.0#count` on a hook linker.
 ///
 /// Must be called on **every** linker a hook component instantiates against.
 /// The `hook` world declares this import, so a linker missing it turns any hook

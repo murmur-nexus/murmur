@@ -1,4 +1,4 @@
-package murmur:conversation@0.1.0;
+package murmur:conversation@0.2.0;
 
 /// Host-provided capability available to any hook component.
 ///
@@ -40,14 +40,14 @@ package murmur:conversation@0.1.0;
 /// receives on `murmur:hook/lifecycle`'s `message` — one encoding, in both
 /// places.
 interface read {
-    use murmur:hook/lifecycle@0.8.0.{message};
+    use murmur:hook/lifecycle@0.9.0.{message};
 
     /// One page of the record, newest first.
     record message-page {
         /// The page's messages, `messages[0]` being the most recently appended
-        /// one. Every message carries the `id` its record line holds, and a
-        /// message whose `role` is `"tool"` carries the envelope this
-        /// interface's doc describes.
+        /// one. Every message carries the `id` and `inserted-by` its record line
+        /// holds, and a message whose `role` is `"tool"` carries the envelope
+        /// this interface's doc describes.
         messages: list<message>,
         /// Cursor for the next (older) page, or `none` when this page reached
         /// the oldest message in the record.

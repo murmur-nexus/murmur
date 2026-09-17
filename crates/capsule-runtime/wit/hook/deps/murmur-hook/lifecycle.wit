@@ -1,4 +1,4 @@
-package murmur:hook@0.8.0;
+package murmur:hook@0.9.0;
 
 interface lifecycle {
     record message {
@@ -32,6 +32,34 @@ interface lifecycle {
         /// request. A `source-id` a hook supplies is carried verbatim; the key is
         /// absent when the hook supplied none.
         source-id: option<string>,
+        /// Which hook output put this message into the conversation. Set only by
+        /// the runtime, at the moment it commits that output, and read from the
+        /// conversation record wherever the message is served back.
+        ///
+        /// `none` means no hook output inserted the message: it is a person's or
+        /// a delegating caller's task message, a model turn, a tool result, or a
+        /// runtime marker, and `role` tells those apart. The mark is independent
+        /// of `role`, so a summary returned as `"assistant"` or `"user"` carries
+        /// it all the same.
+        ///
+        /// A message a hook hands back unchanged keeps the mark it already had:
+        /// its `id` names a message in the context the hook was handed, and its
+        /// `role` and `content` equal that message's. Any other message a hook
+        /// returns is marked with the output it came in through. A value a hook
+        /// sets on a message it returns is ignored.
+        ///
+        /// Stripped before the driver wire payload is built, like `id` and
+        /// `source-id`.
+        inserted-by: option<context-insertion>,
+    }
+
+    /// The hook output a message entered the conversation through.
+    enum context-insertion {
+        /// A compaction hook's `replace-context`, including the summary the
+        /// runtime asks for when a seed overflows its budget.
+        replace-context,
+        /// An `on-task-start` hook's `seed-context`.
+        seed-context,
     }
 
     record tool-manifest {

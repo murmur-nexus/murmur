@@ -1,4 +1,4 @@
-package murmur:runtime@0.3.0;
+package murmur:runtime@0.4.0;
 
 /// Host-provided token counter available to any hook component.
 ///

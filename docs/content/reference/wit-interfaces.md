@@ -362,10 +362,24 @@ fail-closed rule that governs a policy hook's failures.
   messages still carry different ids. `source-id` is opaque: whatever produced the content sets
   it, and the runtime records it verbatim without parsing it. Both are **stripped before the
   driver payload is built**, so neither reaches the provider — a uuid at the head of a cached
-  prefix would break prompt-prefix caching on every request. The runtime mints an `id` for every
-  message it builds out of a hook-returned message list, so an `id` a hook sets on a message it
-  returns is replaced rather than kept; a `source-id` a hook sets is carried verbatim, and the
-  field is absent when the hook set none.
+  prefix would break prompt-prefix caching on every request. An `id` a hook returns is kept, and
+  the runtime mints one for a message returned without one; a `source-id` a hook sets is carried
+  verbatim, and the field is absent when the hook set none.
+- `message.inserted-by` names the hook output that put a message into the conversation. Only the
+  runtime sets it, when it commits that output, and it is stripped before the driver payload like
+  `id` and `source-id`. A value a hook sets on a message it returns is ignored.
+
+  | Value | Meaning |
+  |---|---|
+  | `replace-context` | Committed from a compaction hook's `replace-context`, including the summary of a seed's overflowing front |
+  | `seed-context` | Committed from an `on-task-start` hook's `seed-context` |
+  | `none` | No hook output inserted it: a task message, a model turn, a tool result or a runtime marker. `role` tells those apart |
+
+  The mark is independent of `role`: a summary returned as `assistant` or `user` is marked the
+  same. A message a hook returns counts as carried, and keeps the mark it already had, when its
+  `id` names a message in the context the hook was handed and its `role` and `content` are
+  unchanged. Any other returned message is marked with the output it came in through, so reusing
+  a held `id` on new content cannot pass a summary off as a person's turn.
 - `task-start-event.context-window` is the capsule's
   [`context.max_tokens`](manifest.md#field-context), or `0` when the manifest declares no `context:`
   block. It is precomputed so a hook sizing its work against the window never has to know which
@@ -534,8 +548,9 @@ capsule manifest. A hook without the key still links and still runs — `read-me
 |---|---|
 | `read-messages(cursor, limit)` | One `message-page`: `messages`, `next-cursor`, `total` |
 
-`messages[0]` is the most recently appended message, and each carries the `id` its record line
-holds.
+`messages[0]` is the most recently appended message, and each carries the `id` and the
+[`inserted-by`](#event-field-notes) its record line holds. A line with no `inserted_by` key, or
+one this runtime does not recognise, is served with `inserted-by: none`.
 
 | Field | Meaning |
 |---|---|
@@ -598,10 +613,10 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:message` | `0.1.0` |
 | `murmur:task` | `0.1.0` |
 | `murmur:task-io` | `0.1.0` |
-| `murmur:conversation` | `0.1.0` |
+| `murmur:conversation` | `0.2.0` |
 | `murmur:text` | `0.1.0` |
-| `murmur:hook` | `0.8.0` |
-| `murmur:runtime` | `0.3.0` |
+| `murmur:hook` | `0.9.0` |
+| `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
 
@@ -625,6 +640,12 @@ artifact importing one of them stops loading until rebuilt. The exception is a c
 already forces that rebuild for another reason, in which case the new interface joins the existing
 package instead: `murmur:runtime/tokens` sits in `murmur:runtime` because the same bump that
 introduced it took `murmur:hook` to `0.6.0` and rebuilt every hook regardless.
+
+A package that only `use`s a type from another package moves when that type changes shape, for
+the same reason. `murmur:conversation` went to `0.2.0` and `murmur:runtime` to `0.4.0` alongside
+`murmur:hook@0.9.0`, whose `message` record gained `inserted-by`: `read-messages` returns that
+record and `inference-request` carries it, and every hook was being rebuilt for the `murmur:hook`
+bump already.
 
 **One accepted version per interface.** The runtime resolves each interface by its versioned name
 and nothing else — there is no compatibility fallback for an earlier version or for an

@@ -20,7 +20,9 @@ use predicates::prelude::*;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use common::hook_wat::{compaction_hook_wasm, create_hook_zip};
+use common::hook_wat::{
+    compaction_hook_wasm, compaction_hook_wasm_as, create_hook_zip, SEED_CONTEXT,
+};
 
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
@@ -443,6 +445,98 @@ fn every_recorded_message_carries_a_unique_well_formed_id() {
     drop(f.project);
 }
 
+/// The mark a record line carries, or `None` for a line no hook output inserted.
+fn inserted_by_of(message: &Value) -> Option<&str> {
+    message.get("inserted_by").map(|mark| {
+        mark.as_str()
+            .unwrap_or_else(|| panic!("inserted_by is a string when present: {message}"))
+    })
+}
+
+/// Run a capsule whose compaction hook fires on the first turn and returns `hook`'s summary, and
+/// return the record it left alongside every request body the provider received.
+fn compacted_run(summary: &str, hook: Vec<u8>) -> (Vec<Value>, Vec<Value>) {
+    let f = fixture(
+        vec![tool_call(), end_turn("done")],
+        // Small enough that the first turn's occupancy is over the threshold, so compaction
+        // fires on turn 1 and the summary joins the record.
+        "context:\n  max_tokens: 100\n",
+        &[("compactor", "on-compaction", "replace-context", hook)],
+    );
+
+    run(&f.home, &f.manifest, &["--context", CONTEXT_ID]);
+
+    let messages = record_messages(&f.home, CAPSULE_NAME, CONTEXT_ID);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["content"].to_string().contains(summary)),
+        "the compaction hook fired and its summary is a line: {messages:#?}"
+    );
+    (messages, f.server.requests())
+}
+
+/// A person opening the record can tell the compaction summary from their own turn: the runtime
+/// marks the line it committed from `replace-context`, and nothing else. The mark stays in the
+/// record and never reaches the provider.
+#[test]
+fn a_compaction_summary_is_marked_in_the_record() {
+    const SUMMARY: &str = "everything so far, in one line";
+    let (messages, requests) = compacted_run(SUMMARY, compaction_hook_wasm(SUMMARY));
+
+    for message in &messages {
+        let is_summary = message["content"].to_string().contains(SUMMARY);
+        let expected = is_summary.then_some("replace-context");
+        assert_eq!(inserted_by_of(message), expected, "{messages:#?}");
+    }
+    for role in ["user", "assistant", "tool"] {
+        assert!(
+            messages.iter().any(|message| message["role"] == role
+                && !message["content"].to_string().contains(SUMMARY)),
+            "the record holds an unmarked {role} line to check: {messages:#?}"
+        );
+    }
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["content"].to_string().contains(TASK_TEXT)
+                && inserted_by_of(message).is_none()),
+        "the person's task line is unmarked: {messages:#?}"
+    );
+
+    for request in &requests {
+        let body = request.to_string();
+        assert!(!body.contains("inserted_by"), "{body}");
+        assert!(!body.contains("inserted-by"), "{body}");
+    }
+}
+
+/// The mark follows the output a message came in through, not its role, and not what the hook
+/// claims: a summary returned as `assistant` with a forged `seed-context` mark is recorded as
+/// the `replace-context` it is.
+#[test]
+fn an_assistant_role_summary_is_still_marked() {
+    const SUMMARY: &str = "the assistant's own recap";
+    let (messages, _) = compacted_run(
+        SUMMARY,
+        compaction_hook_wasm_as("assistant", SUMMARY, Some(SEED_CONTEXT)),
+    );
+
+    let summaries: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["content"].to_string().contains(SUMMARY))
+        .collect();
+    assert!(!summaries.is_empty());
+    for summary in summaries {
+        assert_eq!(summary["role"], "assistant", "{summary}");
+        assert_eq!(
+            inserted_by_of(summary),
+            Some("replace-context"),
+            "{summary}"
+        );
+    }
+}
+
 /// Each agent-loop `inference` line names the messages its request embedded, in order.
 #[test]
 fn the_inference_trace_event_names_the_messages_it_sent() {
@@ -627,6 +721,13 @@ fn the_record_labels_a_fenced_tool_message() {
     assert!(
         !failure_text.contains("untrusted-content"),
         "a dispatch failure is unlabelled and unfenced: {failure_text}"
+    );
+
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.get("inserted_by").is_none()),
+        "no hook output inserted any of these lines: {messages:#?}"
     );
 
     // What the record labels is never what the driver receives.

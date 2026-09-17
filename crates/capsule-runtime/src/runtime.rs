@@ -11334,7 +11334,7 @@ inference:
         script
     }
 
-    /// A current-version (`@0.8.0`, 7-case `hook-output`) `on-task-end` hook double that
+    /// A current-version (`@0.9.0`, 7-case `hook-output`) `on-task-end` hook double that
     /// returns `reopen-task(reason)` on its first `reopen_limit` invocations (tracked by a
     /// mutable core global that persists across a blocking hook's reused store) and `none`
     /// thereafter. `reopen_limit` large ⇒ "always reopen".
@@ -11381,11 +11381,13 @@ inference:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -11405,6 +11407,7 @@ inference:
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -11412,7 +11415,7 @@ inference:
     (export "on-task-end" (func $te))
 {stubs}
   )
-  (export "murmur:hook/lifecycle@0.8.0" (instance $lc))
+  (export "murmur:hook/lifecycle@0.9.0" (instance $lc))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("on-task-end reopen double WAT parses");

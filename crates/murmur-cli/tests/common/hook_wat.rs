@@ -9,7 +9,7 @@ use std::{
 };
 
 /// Interface the host links hooks against.
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.8.0";
+const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.9.0";
 
 /// Every lifecycle export a hook component must carry to instantiate.
 const HOOK_FNS: [&str; 8] = [
@@ -25,10 +25,15 @@ const HOOK_FNS: [&str; 8] = [
 
 /// Where the lifted `result<hook-output, string>` return area sits in guest memory.
 const RETURN_AREA: u32 = 128;
-/// Where the `list<message>` records sit. One record is 40 bytes.
+/// Where the `list<message>` records sit. One record is 44 bytes.
 const MESSAGE_RECORDS: u32 = 256;
 /// Where the string bytes the records point at sit.
 const STRING_POOL: u32 = 1024;
+
+/// `context-insertion`'s `replace-context` case, as its canonical-ABI discriminant.
+pub const REPLACE_CONTEXT: u8 = 0;
+/// `context-insertion`'s `seed-context` case, as its canonical-ABI discriminant.
+pub const SEED_CONTEXT: u8 = 1;
 
 /// Encode `bytes` as a WAT data-segment string literal.
 pub fn wat_data(bytes: &[u8]) -> String {
@@ -41,10 +46,15 @@ pub fn le(value: u32, out: &mut Vec<u8>) {
 
 /// Lay out `messages` as a canonical-ABI `list<message>` plus its string pool.
 ///
-/// A `message` is 40 bytes: `role` ptr/len, `content` ptr/len, then the two
-/// `option<string>` fields as discriminant + ptr + len each. Both options are `none`, so the
-/// runtime is the only thing that ever puts an `id` on these.
-pub fn message_list(messages: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>) {
+/// A `message` is 44 bytes: `role` ptr/len at 0/4, `content` ptr/len at 8/12, the two
+/// `option<string>` fields `id` and `source-id` as discriminant + ptr + len at 16/20/24 and
+/// 28/32/36, then `inserted-by` as a one-byte option discriminant at 40 and a one-byte
+/// `context-insertion` case at 41, padded to the record's 4-byte alignment. `id` and `source-id`
+/// are `none`, so the runtime is the only thing that ever puts an `id` on these.
+///
+/// `inserted_by` is the mark every record claims — [`REPLACE_CONTEXT`], [`SEED_CONTEXT`], or
+/// `None` — so a test can hand the runtime a mark it must ignore.
+pub fn message_list(messages: &[(&str, &str)], inserted_by: Option<u8>) -> (Vec<u8>, Vec<u8>) {
     let mut records = Vec::new();
     let mut pool = Vec::new();
     for (role, content) in messages {
@@ -60,6 +70,12 @@ pub fn message_list(messages: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>) {
         for _ in 0..6 {
             le(0, &mut records);
         }
+        records.extend_from_slice(&[
+            u8::from(inserted_by.is_some()),
+            inserted_by.unwrap_or(0),
+            0,
+            0,
+        ]);
     }
     (records, pool)
 }
@@ -67,9 +83,10 @@ pub fn message_list(messages: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>) {
 /// A hook component that implements exactly one lifecycle function and stubs the rest.
 ///
 /// `arm_disc` selects the returned `hook-output` case — `0` = `none`, `1` = `replace-context`,
-/// `5` = `seed-context` — and `messages` is the list that case carries. `core_params` is the
-/// canonical flat lowering of the implemented function's event record; the body ignores it and
-/// returns the statically laid out result area.
+/// `5` = `seed-context` — and `messages` is the list that case carries, each claiming the
+/// `inserted_by` mark [`message_list`] describes. `core_params` is the canonical flat lowering of
+/// the implemented function's event record; the body ignores it and returns the statically laid
+/// out result area.
 pub fn hook_component(
     fn_name: &str,
     core_params: &str,
@@ -77,8 +94,9 @@ pub fn hook_component(
     event_type_name: &str,
     arm_disc: u32,
     messages: &[(&str, &str)],
+    inserted_by: Option<u8>,
 ) -> Vec<u8> {
-    let (records, pool) = message_list(messages);
+    let (records, pool) = message_list(messages, inserted_by);
     let mut ret = Vec::new();
     le(0, &mut ret); // result: ok
     le(arm_disc, &mut ret);
@@ -115,11 +133,13 @@ pub fn hook_component(
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -137,6 +157,7 @@ pub fn hook_component(
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -171,11 +192,18 @@ pub fn seed_hook_wasm(messages: &[(&str, &str)]) -> Vec<u8> {
         "task-start-event",
         if messages.is_empty() { 0 } else { 5 },
         messages,
+        None,
     )
 }
 
-/// An `on-compaction` hook returning `replace-context([summary])`.
+/// An `on-compaction` hook returning `replace-context([summary])`, the summary a `user` message.
 pub fn compaction_hook_wasm(summary: &str) -> Vec<u8> {
+    compaction_hook_wasm_as("user", summary, None)
+}
+
+/// An `on-compaction` hook returning `replace-context([summary])` with the summary under `role`,
+/// claiming the `inserted_by` mark [`message_list`] describes.
+pub fn compaction_hook_wasm_as(role: &str, summary: &str, inserted_by: Option<u8>) -> Vec<u8> {
     let compaction_event = r#"  (type $event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
@@ -188,12 +216,13 @@ pub fn compaction_hook_wasm(summary: &str) -> Vec<u8> {
         compaction_event,
         "compaction-event",
         1,
-        &[("user", summary)],
+        &[(role, summary)],
+        inserted_by,
     )
 }
 
 /// Interface a hook imports `run-inference` from.
-const INFERENCE_IFACE: &str = "murmur:runtime/inference@0.3.0";
+const INFERENCE_IFACE: &str = "murmur:runtime/inference@0.4.0";
 
 /// An `on-compaction` hook that calls `run-inference` once — no messages, no system prompt,
 /// `model: none` — and returns `err(<text>)`, where `text` is whichever string the call produced:
@@ -214,26 +243,30 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
         r#"(component
   (import "{INFERENCE_IFACE}" (instance $inf
     (type (option string))
+    (type (enum "replace-context" "seed-context"))
+    (export "context-insertion" (type (eq 1)))
+    (type (option 2))
     (type (record
       (field "role" string)
       (field "content" string)
       (field "id" 0)
-      (field "source-id" 0)))
-    (export "message" (type (eq 1)))
-    (type (list 2))
+      (field "source-id" 0)
+      (field "inserted-by" 3)))
+    (export "message" (type (eq 4)))
+    (type (list 5))
     (type (record
-      (field "messages" 3)
+      (field "messages" 6)
       (field "system-prompt" 0)
       (field "model" 0)))
-    (export "inference-request" (type (eq 4)))
+    (export "inference-request" (type (eq 7)))
     (type (record
       (field "text" string)
       (field "model-used" string)
       (field "input-tokens" u64)
       (field "output-tokens" u64)))
-    (export "inference-response" (type (eq 6)))
-    (type (result 7 (error string)))
-    (export "run-inference" (func (param "request" 5) (result 8)))
+    (export "inference-response" (type (eq 9)))
+    (type (result 10 (error string)))
+    (export "run-inference" (func (param "request" 8) (result 11)))
   ))
   (alias export $inf "run-inference" (func $runi))
 
@@ -273,11 +306,13 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
     (with "libc" (instance $li))
     (with "inf" (instance (export "run" (func $run_lowered))))))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
 {HOOK_OUTPUT}
   (type $event (record
@@ -293,6 +328,7 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
@@ -346,7 +382,7 @@ const REASON_POOL: u32 = 512;
 /// Where a policy hook assembles a reason out of the event it was handed.
 const SCRATCH: u32 = 4096;
 
-/// The seven-case `hook-output` of `murmur:hook/lifecycle@0.8.0`. `deny` is discriminant 6.
+/// The seven-case `hook-output` of `murmur:hook/lifecycle@0.9.0`. `deny` is discriminant 6.
 const HOOK_OUTPUT: &str = r#"  (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
@@ -480,11 +516,13 @@ fn policy_component(fn_name: &str, hook_output: &str, reason: &str, body: &str) 
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
 {hook_output}
 {decls}
@@ -495,6 +533,7 @@ fn policy_component(fn_name: &str, hook_output: &str, reason: &str, body: &str) 
   (func $noop (canon lift (core func $i "noop")))
 
   (instance $lc
+    (export "context-insertion" (type $context-insertion))
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))

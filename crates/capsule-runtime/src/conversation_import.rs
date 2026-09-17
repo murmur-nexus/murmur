@@ -1,4 +1,4 @@
-//! Host implementation of `murmur:conversation/read@0.1.0`.
+//! Host implementation of `murmur:conversation/read@0.2.0`.
 //!
 //! A hook component that imports this interface reads the capsule's durable conversation record —
 //! every message the runtime put in front of the model, newest first, paged — holding no
@@ -17,7 +17,7 @@ use crate::bindings::hook::murmur::conversation::read::MessagePage;
 
 /// The versioned instance name the host provides `read-messages` under. Hook components that do
 /// not import it ignore the registration.
-pub(crate) const CONVERSATION_IFACE_VERSIONED: &str = "murmur:conversation/read@0.1.0";
+pub(crate) const CONVERSATION_IFACE_VERSIONED: &str = "murmur:conversation/read@0.2.0";
 
 /// The runtime's view of which record is in scope.
 ///
@@ -107,7 +107,7 @@ impl ConversationState {
     }
 }
 
-/// Register `murmur:conversation/read@0.1.0` on a hook linker.
+/// Register `murmur:conversation/read@0.2.0` on a hook linker.
 ///
 /// `state` is `None` for a hook whose manifest entry does not declare
 /// `capabilities.conversation.read: true`: the function is still *defined* (so an importing hook
@@ -145,7 +145,7 @@ pub(crate) mod test_support {
     use super::CONVERSATION_IFACE_VERSIONED;
     use wasmtime::component::Component;
 
-    /// The import declaration for `murmur:conversation/read@0.1.0`, plus the memory and `realloc`
+    /// The import declaration for `murmur:conversation/read@0.2.0`, plus the memory and `realloc`
     /// the lowered import needs.
     ///
     /// Two things about the shape, both of which a `wit-bindgen` guest produces as well:
@@ -155,30 +155,42 @@ pub(crate) mod test_support {
     ///   does not have to: a types-only import carries no runtime value to link against.
     /// * An import instance must *export* every named type it uses, and everything referencing
     ///   one has to name the exported alias rather than the definition behind it — hence the
-    ///   numeric type indices below, which are the exports at 2 (`message`) and 5
-    ///   (`message-page`).
+    ///   numeric type indices below, which are the exports at 2 (`context-insertion`), 5
+    ///   (`message`) and 8 (`message-page`).
     fn preamble() -> String {
         format!(
-            r#"  (import "murmur:hook/lifecycle@0.8.0" (instance $lct
+            r#"  (import "murmur:hook/lifecycle@0.9.0" (instance $lct
     (type $o (option string))
-    (type $m (record (field "role" string) (field "content" string) (field "id" $o) (field "source-id" $o)))
+    (type $ci (enum "replace-context" "seed-context"))
+    (export "context-insertion" (type (eq $ci)))
+    (type $oci (option 2))
+    (type $m (record
+      (field "role" string)
+      (field "content" string)
+      (field "id" $o)
+      (field "source-id" $o)
+      (field "inserted-by" $oci)))
     (export "message" (type (eq $m)))
   ))
   (import "{CONVERSATION_IFACE_VERSIONED}" (instance $conv
     (type $optstr (option string))
+    (type $ci (enum "replace-context" "seed-context"))
+    (export "context-insertion" (type (eq $ci)))
+    (type $optci (option 2))
     (type $message (record
       (field "role" string)
       (field "content" string)
       (field "id" $optstr)
-      (field "source-id" $optstr)))
+      (field "source-id" $optstr)
+      (field "inserted-by" $optci)))
     (export "message" (type (eq $message)))
-    (type $msglist (list 2))
+    (type $msglist (list 5))
     (type $page (record
       (field "messages" $msglist)
       (field "next-cursor" $optstr)
       (field "total" u32)))
     (export "message-page" (type (eq $page)))
-    (type $ret (result 5 (error string)))
+    (type $ret (result 8 (error string)))
     (export "read-messages"
       (func (param "cursor" $optstr) (param "limit" u32) (result $ret)))
   ))
@@ -208,13 +220,18 @@ pub(crate) mod test_support {
     /// Core-module boilerplate: the lowered import, a bump cursor over the report buffer, and the
     /// decoder that renders one `result<message-page, string>`.
     ///
-    /// The report is `T=<total>` then, per message, `<id>=<role>` and the first bytes of its
-    /// content, joined by [`REPORT_SEP`], and ends with `N=<next-cursor>` (`N=-` for `none`). An
-    /// `err` renders as `!<error string>`, so a test asserts which error the host chose.
+    /// The report is `T=<total>` then, per message, `<id>=<role>=<mark>`, joined by
+    /// [`REPORT_SEP`], and ends with `N=<next-cursor>` (`N=-` for `none`). `<mark>` is the
+    /// message's `inserted-by`: `r` for `replace-context`, `s` for `seed-context`, `-` for
+    /// `none`. An `err` renders as `!<error string>`, so a test asserts which error the host
+    /// chose.
     ///
     /// `result<message-page, string>` has align 4: the discriminant is at byte 0, the page's
     /// three fields at 4/8 (messages ptr/len), 12/16/20 (`next-cursor` option), and 24 (`total`);
-    /// an `err`'s string sits at 4/8. One `message` record is 40 bytes.
+    /// an `err`'s string sits at 4/8. One `message` record is 44 bytes: `role` and `content`
+    /// ptr/len at 0/4 and 8/12, `id` and `source-id` discriminant/ptr/len at 16/20/24 and
+    /// 28/32/36, and `inserted-by` as a one-byte discriminant at 40 and a one-byte enum case at
+    /// 41, padded to the record's 4-byte alignment.
     const CORE_HELPERS: &str = r#"
     (import "libc" "memory" (memory 4))
     (import "conv" "read" (func $read (param i32 i32 i32 i32 i32)))
@@ -240,7 +257,7 @@ pub(crate) mod test_support {
             (loop $next
               (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
               (local.set $rec (i32.add (i32.load (i32.add (local.get $rp) (i32.const 4)))
-                                       (i32.mul (local.get $i) (i32.const 40))))
+                                       (i32.mul (local.get $i) (i32.const 44))))
               (call $put (i32.const 31))
               ;; id, when the option carries one
               (if (i32.load8_u (i32.add (local.get $rec) (i32.const 16)))
@@ -248,6 +265,13 @@ pub(crate) mod test_support {
                                     (i32.load (i32.add (local.get $rec) (i32.const 24))))))
               (call $put (i32.const 61))
               (call $append (i32.load (local.get $rec)) (i32.load (i32.add (local.get $rec) (i32.const 4))))
+              (call $put (i32.const 61))
+              ;; inserted-by: `r` for replace-context, `s` for seed-context, `-` for none
+              (if (i32.load8_u (i32.add (local.get $rec) (i32.const 40)))
+                (then (if (i32.load8_u (i32.add (local.get $rec) (i32.const 41)))
+                        (then (call $put (i32.const 115)))
+                        (else (call $put (i32.const 114)))))
+                (else (call $put (i32.const 45))))
               (local.set $i (i32.add (local.get $i) (i32.const 1)))
               (br $next)))
           (call $put (i32.const 31))
@@ -264,11 +288,13 @@ pub(crate) mod test_support {
 
     /// Every WIT type the lifecycle exports in this double name.
     const LIFECYCLE_TYPES: &str = r#"
+  (type $context-insertion (enum "replace-context" "seed-context"))
   (type $message (record
     (field "role" string)
     (field "content" string)
     (field "id" (option string))
-    (field "source-id" (option string))))
+    (field "source-id" (option string))
+    (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
@@ -324,12 +350,12 @@ pub(crate) mod test_support {
              (func $ontaskend (type $ontaskend-ft)\n    (canon lift (core func $i \"ontaskend\") \
              (memory $mem) (realloc $realloc) string-encoding=utf8))\n  \
              (func $noop (canon lift (core func $i \"noop\")))\n  \
-             (instance $lc\n    (export \"message\" (type $message))\n    \
+             (instance $lc\n    (export \"context-insertion\" (type $context-insertion))\n    (export \"message\" (type $message))\n    \
              (export \"tool-manifest\" (type $tool-manifest))\n    \
              (export \"hook-output\" (type $hook-output))\n    \
              (export \"task-end-event\" (type $task-end-event))\n    \
              (export \"on-task-end\" (func $ontaskend))\n{stubs}  )\n  \
-             (export \"murmur:hook/lifecycle@0.8.0\" (instance $lc))\n)",
+             (export \"murmur:hook/lifecycle@0.9.0\" (instance $lc))\n)",
             preamble = preamble(),
             stubs = [
                 "on-session-start",
@@ -460,5 +486,139 @@ mod tests {
         state.set_context(Some("../../escape".to_string()));
 
         assert_eq!(state.read_messages(None, 10).unwrap().total, 0);
+    }
+
+    /// Write `lines` as a record under `<root>/<context_id>/conversation.jsonl`.
+    fn write_record_lines(root: &Path, context_id: &str, lines: &[serde_json::Value]) {
+        let dir = root.join(context_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(dir.join("conversation.jsonl"), raw).unwrap();
+    }
+
+    /// A hook reading the record through the real import sees which message a hook output put
+    /// there: the guest decodes `inserted-by` out of the lowered `message` itself, so the mark is
+    /// checked at the byte offsets a compiled hook reads it from.
+    #[test]
+    fn a_reader_sees_which_messages_a_hook_inserted() {
+        use serde_json::json;
+        use wasmtime::component::Val;
+
+        let workdir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+        write_record_lines(
+            &root,
+            "ctx_marks",
+            &[
+                json!({"role": "user", "content": "a person's turn", "id": "msg_person"}),
+                json!({
+                    "role": "user",
+                    "content": "a summary",
+                    "id": "msg_summary",
+                    "inserted_by": "replace-context",
+                }),
+                json!({
+                    "role": "user",
+                    "content": "a seed",
+                    "id": "msg_seed",
+                    "inserted_by": "seed-context",
+                }),
+            ],
+        );
+        let state = Arc::new(ConversationState::new(Some(root), workdir.path()));
+        state.set_context(Some("ctx_marks".to_string()));
+
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        let engine = wasmtime::Engine::new(&config).expect("engine builds");
+        let component = test_support::reader_double(&engine, 3);
+        let mut linker: Linker<()> = Linker::new(&engine);
+        add_conversation_to_linker(&mut linker, Some(state)).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component).unwrap();
+        let lifecycle = instance
+            .get_export_index(&mut store, None, "murmur:hook/lifecycle@0.9.0")
+            .expect("the double exports the lifecycle");
+        let on_task_end = instance
+            .get_export_index(&mut store, Some(&lifecycle), "on-task-end")
+            .and_then(|index| instance.get_func(&mut store, index))
+            .expect("the double exports on-task-end");
+
+        let mut results = [Val::Bool(false)];
+        on_task_end
+            .call(
+                &mut store,
+                &[Val::Record(vec![
+                    ("task-id".to_string(), Val::String("tsk_1".to_string())),
+                    ("exit-status".to_string(), Val::String("ok".to_string())),
+                ])],
+                &mut results,
+            )
+            .expect("the read succeeds");
+        let Val::Result(Ok(Some(output))) = &results[0] else {
+            panic!("the double returns ok(hook-output): {:?}", results[0]);
+        };
+        let Val::Variant(case, Some(reason)) = output.as_ref() else {
+            panic!("the double returns reopen-task: {output:?}");
+        };
+        assert_eq!(case, "reopen-task");
+        let Val::String(report) = reason.as_ref() else {
+            panic!("reopen-task carries a string: {reason:?}");
+        };
+        let first_page = report.split('|').next().unwrap();
+
+        assert_eq!(
+            first_page,
+            [
+                "T=3",
+                "msg_seed=user=s",
+                "msg_summary=user=r",
+                "msg_person=user=-",
+                "N=-",
+            ]
+            .join(&test_support::REPORT_SEP.to_string()),
+        );
+    }
+
+    /// A mark this runtime did not write reads as no mark. The line is still a message: it is
+    /// served, counted in `total`, and reported nowhere.
+    #[test]
+    fn an_unrecognised_inserted_by_reads_as_none() {
+        use serde_json::json;
+
+        let workdir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+        write_record_lines(
+            &root,
+            "ctx_odd",
+            &[
+                json!({"role": "user", "content": "m", "id": "msg_absent"}),
+                json!({"role": "user", "content": "m", "id": "msg_bogus", "inserted_by": "bogus"}),
+                json!({"role": "user", "content": "m", "id": "msg_number", "inserted_by": 42}),
+            ],
+        );
+        let state = ConversationState::new(Some(root), workdir.path());
+        state.set_context(Some("ctx_odd".to_string()));
+
+        let page = state.read_messages(None, 10).expect("the read succeeds");
+
+        assert_eq!(page.total, 3);
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|m| (m.id.clone().unwrap(), m.inserted_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("msg_number".to_string(), None),
+                ("msg_bogus".to_string(), None),
+                ("msg_absent".to_string(), None),
+            ],
+        );
+        assert!(
+            !workdir.path().join("logs/bootstrap.log").exists(),
+            "an odd mark is not a defect worth reporting"
+        );
     }
 }
