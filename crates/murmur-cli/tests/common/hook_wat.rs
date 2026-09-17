@@ -103,13 +103,6 @@ pub fn hook_component(
     le(MESSAGE_RECORDS, &mut ret);
     le(messages.len() as u32, &mut ret);
 
-    let stubs = HOOK_FNS
-        .iter()
-        .filter(|n| **n != fn_name)
-        .map(|n| format!("    (export \"{n}\" (func $noop))"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let wat = format!(
         r#"(component
   (core module $m
@@ -133,43 +126,12 @@ pub fn hook_component(
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $context-insertion (enum "replace-context" "seed-context"))
-  (type $message (record
-    (field "role" string)
-    (field "content" string)
-    (field "id" (option string))
-    (field "source-id" (option string))
-    (field "inserted-by" (option $context-insertion))))
-  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
-  (type $hook-output (variant
-    (case "none")
-    (case "replace-context" (list $message))
-    (case "write-manifests" (list $tool-manifest))
-    (case "artifact" string)
-    (case "reopen-task" string)
-    (case "seed-context" (list $message))
-    (case "deny" string)))
-{event_type}
-  (type $ft (func (param "event" $event) (result (result $hook-output (error string)))))
-
-  (func $impl (type $ft)
-    (canon lift (core func $i "handler") (memory $mem) (realloc $realloc) string-encoding=utf8))
-  (func $noop (canon lift (core func $i "noop")))
-
-  (instance $lc
-    (export "context-insertion" (type $context-insertion))
-    (export "message" (type $message))
-    (export "tool-manifest" (type $tool-manifest))
-    (export "hook-output" (type $hook-output))
-    (export "{event_type_name}" (type $event))
-    (export "{fn_name}" (func $impl))
-{stubs}
-  )
-  (export "{LIFECYCLE_IFACE}" (instance $lc))
+{exports}
 )"#,
         ret = wat_data(&ret),
         records = wat_data(&records),
         pool = wat_data(&pool),
+        exports = lifecycle_exports(fn_name, event_type, event_type_name),
     );
     wat::parse_str(&wat).expect("hook component WAT parses")
 }
@@ -266,10 +228,35 @@ const MARK_REPORT_FUNCS: &str = r#"
           (br $next))))
 "#;
 
+/// `compaction-event`'s type declaration, for [`lifecycle_exports`].
+const COMPACTION_EVENT: &str = r#"  (type $event (record
+    (field "messages" (list $message))
+    (field "session-tokens" u64)
+    (field "threshold" f64)
+    (field "model" (option string))
+    (field "system-prompt" (option string))))"#;
+
 /// The lifted half of a single-function hook component: the lifecycle types, `fn_name` lifted
 /// from core export `handler` of `$i`, every other export a stub, and the exported instance.
-/// Expects `$i`, `$mem` and `$realloc` in scope.
+/// `event_type` declares `$event`, exported as `event_type_name`. Expects `$i`, `$mem` and
+/// `$realloc` in scope.
 fn lifecycle_exports(fn_name: &str, event_type: &str, event_type_name: &str) -> String {
+    lifecycle_exports_with(
+        fn_name,
+        HOOK_OUTPUT,
+        event_type,
+        &format!("    (export \"{event_type_name}\" (type $event))"),
+    )
+}
+
+/// [`lifecycle_exports`] with the `hook-output` declaration, and the instance's event type
+/// exports, given verbatim.
+fn lifecycle_exports_with(
+    fn_name: &str,
+    hook_output: &str,
+    event_decls: &str,
+    event_type_exports: &str,
+) -> String {
     let stubs = HOOK_FNS
         .iter()
         .filter(|n| **n != fn_name)
@@ -285,8 +272,8 @@ fn lifecycle_exports(fn_name: &str, event_type: &str, event_type_name: &str) -> 
     (field "source-id" (option string))
     (field "inserted-by" (option $context-insertion))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
-{HOOK_OUTPUT}
-{event_type}
+{hook_output}
+{event_decls}
   (type $ft (func (param "event" $event) (result (result $hook-output (error string)))))
 
   (func $impl (type $ft)
@@ -298,7 +285,7 @@ fn lifecycle_exports(fn_name: &str, event_type: &str, event_type_name: &str) -> 
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
-    (export "{event_type_name}" (type $event))
+{event_type_exports}
     (export "{fn_name}" (func $impl))
 {stubs}
   )
@@ -311,12 +298,6 @@ fn lifecycle_exports(fn_name: &str, event_type: &str, event_type_name: &str) -> 
 /// `messages` (see [`MARK_REPORT_FUNCS`]). The report is what the hook itself read, so a test
 /// asserts the marks a compaction hook sees rather than the marks the record holds.
 pub fn mark_reporting_compaction_hook_wasm() -> Vec<u8> {
-    let compaction_event = r#"  (type $event (record
-    (field "messages" (list $message))
-    (field "session-tokens" u64)
-    (field "threshold" f64)
-    (field "model" (option string))
-    (field "system-prompt" (option string))))"#;
     let wat = format!(
         r#"(component
   (core module $m
@@ -357,7 +338,7 @@ pub fn mark_reporting_compaction_hook_wasm() -> Vec<u8> {
         role_len = MESSAGE_RECORDS + 4,
         content_ptr = MESSAGE_RECORDS + 8,
         content_len = MESSAGE_RECORDS + 12,
-        exports = lifecycle_exports("on-compaction", compaction_event, "compaction-event"),
+        exports = lifecycle_exports("on-compaction", COMPACTION_EVENT, "compaction-event"),
     );
     wat::parse_str(&wat).expect("mark-reporting compaction hook WAT parses")
 }
@@ -471,12 +452,6 @@ const INFERENCE_IFACE: &str = "murmur:runtime/inference@0.4.0";
 /// The lifted `result<hook-output, string>` is at [`RETURN_AREA`]: discriminant `1` at 0, the error
 /// string's ptr/len at 4/8.
 pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
-    let stubs = HOOK_FNS
-        .iter()
-        .filter(|n| **n != "on-compaction")
-        .map(|n| format!("    (export \"{n}\" (func $noop))"))
-        .collect::<Vec<_>>()
-        .join("\n");
     let wat = format!(
         r#"(component
   (import "{INFERENCE_IFACE}" (instance $inf
@@ -544,40 +519,11 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
     (with "libc" (instance $li))
     (with "inf" (instance (export "run" (func $run_lowered))))))
 
-  (type $context-insertion (enum "replace-context" "seed-context"))
-  (type $message (record
-    (field "role" string)
-    (field "content" string)
-    (field "id" (option string))
-    (field "source-id" (option string))
-    (field "inserted-by" (option $context-insertion))))
-  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
-{HOOK_OUTPUT}
-  (type $event (record
-    (field "messages" (list $message))
-    (field "session-tokens" u64)
-    (field "threshold" f64)
-    (field "model" (option string))
-    (field "system-prompt" (option string))))
-  (type $ft (func (param "event" $event) (result (result $hook-output (error string)))))
-
-  (func $impl (type $ft)
-    (canon lift (core func $i "handler") (memory $mem) (realloc $realloc) string-encoding=utf8))
-  (func $noop (canon lift (core func $i "noop")))
-
-  (instance $lc
-    (export "context-insertion" (type $context-insertion))
-    (export "message" (type $message))
-    (export "tool-manifest" (type $tool-manifest))
-    (export "hook-output" (type $hook-output))
-    (export "compaction-event" (type $event))
-    (export "on-compaction" (func $impl))
-{stubs}
-  )
-  (export "{LIFECYCLE_IFACE}" (instance $lc))
+{exports}
 )"#,
         ptr = RETURN_AREA + 4,
         len = RETURN_AREA + 8,
+        exports = lifecycle_exports("on-compaction", COMPACTION_EVENT, "compaction-event"),
     );
     wat::parse_str(&wat).expect("run-inference compaction hook WAT parses")
 }
@@ -717,12 +663,6 @@ fn event_shape(fn_name: &str) -> EventShape {
 /// fixed reason; pass `""` for a body that does not.
 fn policy_component(fn_name: &str, hook_output: &str, reason: &str, body: &str) -> Vec<u8> {
     let shape = event_shape(fn_name);
-    let stubs = HOOK_FNS
-        .iter()
-        .filter(|n| **n != fn_name)
-        .map(|n| format!("    (export \"{n}\" (func $noop))"))
-        .collect::<Vec<_>>()
-        .join("\n");
 
     let wat = format!(
         r#"(component
@@ -754,37 +694,11 @@ fn policy_component(fn_name: &str, hook_output: &str, reason: &str, body: &str) 
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $context-insertion (enum "replace-context" "seed-context"))
-  (type $message (record
-    (field "role" string)
-    (field "content" string)
-    (field "id" (option string))
-    (field "source-id" (option string))
-    (field "inserted-by" (option $context-insertion))))
-  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
-{hook_output}
-{decls}
-  (type $ft (func (param "event" $event) (result (result $hook-output (error string)))))
-
-  (func $impl (type $ft)
-    (canon lift (core func $i "handler") (memory $mem) (realloc $realloc) string-encoding=utf8))
-  (func $noop (canon lift (core func $i "noop")))
-
-  (instance $lc
-    (export "context-insertion" (type $context-insertion))
-    (export "message" (type $message))
-    (export "tool-manifest" (type $tool-manifest))
-    (export "hook-output" (type $hook-output))
-{type_exports}
-    (export "{fn_name}" (func $impl))
-{stubs}
-  )
-  (export "{LIFECYCLE_IFACE}" (instance $lc))
+{exports}
 )"#,
         reason = wat_data(reason.as_bytes()),
         params = shape.params,
-        decls = shape.decls,
-        type_exports = shape.type_exports,
+        exports = lifecycle_exports_with(fn_name, hook_output, shape.decls, shape.type_exports),
     );
     wat::parse_str(&wat).expect("policy hook component WAT parses")
 }
