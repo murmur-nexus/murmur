@@ -103,14 +103,17 @@ UUIDv7 for the task, and the message's `contextId` or `ctx_` and a UUIDv7 for th
 2. A [`connection-ack`](#event-connection-ack) frame.
 3. The [replay](#replay), from `Last-Event-ID`, or from `0` when the header is absent: a `gap`
    frame if one applies, then the buffered frames.
-4. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the capsule's stream ends. A capsule process that exits
-   closes the connection without a [`capsule-closed`](#event-capsule-closed) frame.
+4. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the capsule's stream ends.
+   A capsule process that exits closes the connection without a
+   [`capsule-closed`](#event-capsule-closed) frame.
 
 ### Frames a connection misses { #lagged }
 
 Each connection reads live frames from a queue of 128. A connection that falls more than 128
 frames behind loses the oldest of them, and a [`lagged`](#event-lagged) frame naming how many is
-written before the next frame the connection receives. The connection stays open.
+written before the next frame the connection receives. The connection stays open. The capsule also
+writes the count to its own stderr, as `SSE broadcast lagged by <n> events`; nothing about a lag is
+written to `trace.jsonl`.
 
 On `message/stream`, a lost frame may be the `final` status the client is waiting for. The
 connection then stays open until the next `final` status it is delivered, from any task.
@@ -285,9 +288,9 @@ oldest frame in the replay buffer. The replay that follows is the whole buffer.
 
 ## `lagged` { #event-lagged }
 
-Written when a connection fell more than the [queue](#lagged) behind and lost live frames, before
-the next frame it receives. It is written only to the connection that lost them, once per loss.
-The count is not cumulative: a client that wants a total adds them up.
+Written to a connection that fell more than 128 frames behind and [lost live frames](#lagged),
+before the next frame it receives. Only that connection receives it, once per loss. The count is
+not cumulative: a client that wants a total adds them up.
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|

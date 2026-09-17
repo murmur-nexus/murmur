@@ -1172,7 +1172,6 @@ mod tests {
     /// this behaviour and must change with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stream_watch_heartbeat_continues_while_session_thread_is_blocked() {
-        use std::io::{BufRead, BufReader};
         use std::time::{Duration, Instant};
 
         // Longer than one heartbeat interval, so a tick falls due inside the blocked stretch.
@@ -1181,26 +1180,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Read the client side on its own OS thread, so what it records does not depend on the
-        // thread about to be held.
-        let (line_tx, line_rx) = std::sync::mpsc::channel::<(Instant, String)>();
-        let client = std::thread::spawn(move || {
-            let sock = std::net::TcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(BLOCK + Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = BufReader::new(sock);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if line_tx.send((Instant::now(), line)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        // Read on its own OS thread, so what the client records does not depend on the thread
+        // about to be held.
+        let (client, line_rx) = spawn_sse_line_reader(addr, BLOCK + Duration::from_secs(10));
 
         let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
@@ -1274,28 +1256,28 @@ mod tests {
         );
     }
 
-    /// Reads an SSE connection on its own OS thread, forwarding each line as it arrives. The
-    /// sender drops when the server closes the socket.
+    /// Reads an SSE connection on its own OS thread, forwarding each line with the moment it
+    /// arrived. The sender drops when the server closes the socket or a read times out.
     fn spawn_sse_line_reader(
         addr: std::net::SocketAddr,
+        read_timeout: std::time::Duration,
     ) -> (
         std::thread::JoinHandle<()>,
-        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Receiver<(std::time::Instant, String)>,
     ) {
         use std::io::{BufRead, BufReader};
 
-        let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn(move || {
             let sock = std::net::TcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                .unwrap();
+            sock.set_read_timeout(Some(read_timeout)).unwrap();
             let mut reader = BufReader::new(sock);
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if line_tx.send(line).is_err() {
+                        if line_tx.send((std::time::Instant::now(), line)).is_err() {
                             break;
                         }
                     }
@@ -1308,7 +1290,7 @@ mod tests {
     /// Appends received lines to `received` until it contains `needle`, or, with `None`, until the
     /// server closes the connection. Sleeps between polls so the handler under test can run.
     async fn collect_sse_lines(
-        lines: &std::sync::mpsc::Receiver<String>,
+        lines: &std::sync::mpsc::Receiver<(std::time::Instant, String)>,
         received: &mut String,
         needle: Option<&str>,
     ) {
@@ -1316,7 +1298,7 @@ mod tests {
         loop {
             loop {
                 match lines.try_recv() {
-                    Ok(line) => received.push_str(&line),
+                    Ok((_, line)) => received.push_str(&line),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         assert!(
@@ -1408,7 +1390,10 @@ mod tests {
     #[tokio::test]
     async fn stream_watch_writes_lagged_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (client, lines) = spawn_sse_line_reader(listener.local_addr().unwrap());
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
 
         let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(LAG_QUEUE);
         drop(sse_rx);
@@ -1459,7 +1444,10 @@ mod tests {
     #[tokio::test]
     async fn message_stream_writes_lagged_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (client, lines) = spawn_sse_line_reader(listener.local_addr().unwrap());
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
 
         let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(LAG_QUEUE);
         drop(sse_rx);
