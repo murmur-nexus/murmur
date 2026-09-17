@@ -19,8 +19,8 @@ use crate::resource_plane::{
     handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
 };
 use crate::streaming::{
-    format_gap_event, format_sse_event, is_final_sse_event, ReplayResult, SseBroadcast,
-    SseEventBuffer, StreamStatus, TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT,
+    format_gap_event, format_lagged_event, format_sse_event, is_final_sse_event, ReplayResult,
+    SseBroadcast, SseEventBuffer, StreamStatus, TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT,
     SSE_HEARTBEAT_INTERVAL,
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
@@ -641,6 +641,13 @@ async fn handle_message_stream(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[capsule-runtime] SSE broadcast lagged by {n} events");
+                        if writer
+                            .write_all(format_lagged_event(n).as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         continue;
                     }
                 }
@@ -734,6 +741,13 @@ async fn handle_stream_watch(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
+                        if writer
+                            .write_all(format_lagged_event(n).as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         continue;
                     }
                 }
@@ -1158,7 +1172,6 @@ mod tests {
     /// this behaviour and must change with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stream_watch_heartbeat_continues_while_session_thread_is_blocked() {
-        use std::io::{BufRead, BufReader};
         use std::time::{Duration, Instant};
 
         // Longer than one heartbeat interval, so a tick falls due inside the blocked stretch.
@@ -1167,26 +1180,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Read the client side on its own OS thread, so what it records does not depend on the
-        // thread about to be held.
-        let (line_tx, line_rx) = std::sync::mpsc::channel::<(Instant, String)>();
-        let client = std::thread::spawn(move || {
-            let sock = std::net::TcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(BLOCK + Duration::from_secs(10)))
-                .unwrap();
-            let mut reader = BufReader::new(sock);
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if line_tx.send((Instant::now(), line)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        // Read on its own OS thread, so what the client records does not depend on the thread
+        // about to be held.
+        let (client, line_rx) = spawn_sse_line_reader(addr, BLOCK + Duration::from_secs(10));
 
         let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
@@ -1258,6 +1254,266 @@ mod tests {
              {:?} after connect",
             first.duration_since(connected_at)
         );
+    }
+
+    /// Reads an SSE connection on its own OS thread, forwarding each line with the moment it
+    /// arrived. The sender drops when the server closes the socket or a read times out.
+    fn spawn_sse_line_reader(
+        addr: std::net::SocketAddr,
+        read_timeout: std::time::Duration,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(std::time::Instant, String)>,
+    ) {
+        use std::io::{BufRead, BufReader};
+
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(read_timeout)).unwrap();
+            let mut reader = BufReader::new(sock);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if line_tx.send((std::time::Instant::now(), line)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (client, line_rx)
+    }
+
+    /// Appends received lines to `received` until it contains `needle`, or, with `None`, until the
+    /// server closes the connection. Sleeps between polls so the handler under test can run.
+    async fn collect_sse_lines(
+        lines: &std::sync::mpsc::Receiver<(std::time::Instant, String)>,
+        received: &mut String,
+        needle: Option<&str>,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            loop {
+                match lines.try_recv() {
+                    Ok((_, line)) => received.push_str(&line),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        assert!(
+                            needle.is_none_or(|n| received.contains(n)),
+                            "the connection closed before {needle:?} arrived; received:\n{received}"
+                        );
+                        return;
+                    }
+                }
+            }
+            if needle.is_some_and(|n| received.contains(n)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?}; received:\n{received}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Waits until the handler under test has subscribed, so it is the channel's only receiver.
+    async fn wait_for_subscriber(sse_tx: &SseBroadcast) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sse_tx.receiver_count() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handler never subscribed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The body of an HTTP response: everything after the header block.
+    fn sse_body(received: &str) -> &str {
+        let at = received
+            .find("\r\n\r\n")
+            .unwrap_or_else(|| panic!("no header terminator in:\n{received}"));
+        &received[at + 4..]
+    }
+
+    /// Capacity of the broadcast channel in the lag tests; each handler's queue holds this many.
+    const LAG_QUEUE: usize = 4;
+    /// Frames beyond [`LAG_QUEUE`] in the burst, and so the count the `lagged` frame must carry.
+    const LAG_MISSED: usize = 3;
+
+    /// The burst sent to a lagging connection: `LAG_QUEUE + LAG_MISSED` non-final frames with ids
+    /// from 1.
+    fn lag_burst() -> Vec<String> {
+        (1..=(LAG_QUEUE + LAG_MISSED) as u64)
+            .map(|id| format_sse_event(id, "text", &format!("{{\"n\":{id},\"final\":false}}")))
+            .collect()
+    }
+
+    fn assert_single_lagged_frame(body: &str) {
+        let expected = format!("event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n");
+        assert_eq!(
+            body.matches("event: lagged").count(),
+            1,
+            "expected exactly one lagged frame in:\n{body}"
+        );
+        assert!(
+            body.contains(&expected),
+            "the lagged frame is not byte-exact `{expected:?}` in:\n{body}"
+        );
+        let before = &body[..body.find(&expected).unwrap()];
+        assert!(
+            before.is_empty() || before.ends_with("\n\n"),
+            "the lagged frame does not start its own block, so it carries an id line:\n{body}"
+        );
+    }
+
+    fn assert_buffer_has_no_lagged_frame(sse_buffer: &Arc<Mutex<SseEventBuffer>>) {
+        let events = match sse_buffer.lock().unwrap().replay_from(0) {
+            ReplayResult::Complete(events) => events,
+            ReplayResult::WithGap { events, .. } => events,
+        };
+        assert!(
+            events.iter().all(|e| !e.contains("event: lagged")),
+            "a lagged frame entered the replay buffer"
+        );
+    }
+
+    /// A `stream/watch` connection that falls behind is told how many live frames it lost, in one
+    /// id-less `lagged` frame written before the oldest retained frame, and stays open.
+    ///
+    /// Current-thread flavour: the burst is sent with no await between sends, so the handler cannot
+    /// drain its queue part-way through and the lost count is exact.
+    #[tokio::test]
+    async fn stream_watch_writes_lagged_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
+
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(LAG_QUEUE);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let buffer = Arc::clone(&sse_buffer);
+        let watcher = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_stream_watch(write_half, Some(0), sse, buffer, "stateless".to_string()).await;
+        });
+        wait_for_subscriber(&sse_tx).await;
+
+        let burst = lag_burst();
+        for frame in &burst {
+            sse_tx.send(Arc::new(frame.clone())).unwrap();
+        }
+        let retained = &burst[LAG_MISSED..];
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, Some(retained.last().unwrap())).await;
+
+        let last = format_sse_event(100, "text", "{\"n\":\"last\",\"final\":false}");
+        sse_tx.send(Arc::new(last.clone())).unwrap();
+        collect_sse_lines(&lines, &mut received, Some(&last)).await;
+
+        watcher.abort();
+        let _ = watcher.await;
+        drop(sse_tx);
+        client.join().unwrap();
+
+        let body = sse_body(&received);
+        assert_single_lagged_frame(body);
+        let expected = format!(
+            "event: connection-ack\ndata: {{\"role\":\"observer\",\"conversation_mode\":\"stateless\"}}\n\n\
+             event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n{}{last}",
+            retained.concat()
+        );
+        assert_eq!(body, expected);
+        assert_buffer_has_no_lagged_frame(&sse_buffer);
+    }
+
+    /// A `message/stream` connection that falls behind is told how many live frames it lost, keeps
+    /// receiving, and still closes on the first live `final` status it is delivered.
+    ///
+    /// Current-thread flavour for the same reason as `stream_watch_writes_lagged_frame`.
+    #[tokio::test]
+    async fn message_stream_writes_lagged_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
+
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(LAG_QUEUE);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "message/stream".to_string(),
+            params: serde_json::json!({
+                "message": {
+                    "messageId": "msg_lagged",
+                    "role": "user",
+                    "parts": [{"text": "hello"}]
+                }
+            }),
+        };
+
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let buffer = Arc::clone(&sse_buffer);
+        let handler = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_message_stream(
+                write_half,
+                req,
+                &task_registry,
+                &task_tx,
+                None,
+                TaskProvenance::derive(TaskOrigin::User, None),
+                None,
+                None,
+                sse,
+                buffer,
+            )
+            .await;
+        });
+        wait_for_subscriber(&sse_tx).await;
+
+        let burst = lag_burst();
+        for frame in &burst {
+            sse_tx.send(Arc::new(frame.clone())).unwrap();
+        }
+        let retained = &burst[LAG_MISSED..];
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, Some(retained.last().unwrap())).await;
+
+        let final_status =
+            format_sse_event(100, "status", "{\"id\":\"tsk_lagged\",\"final\":true}");
+        sse_tx.send(Arc::new(final_status.clone())).unwrap();
+        collect_sse_lines(&lines, &mut received, None).await;
+
+        handler.await.unwrap();
+        client.join().unwrap();
+        assert!(task_rx.try_recv().is_ok(), "the task was not submitted");
+
+        let body = sse_body(&received);
+        assert_single_lagged_frame(body);
+        let expected = format!(
+            "event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n{}{final_status}",
+            retained.concat()
+        );
+        assert_eq!(body, expected);
+        assert_buffer_has_no_lagged_frame(&sse_buffer);
     }
 
     const PROTOCOL_PAGE_PATH: &str = concat!(
@@ -1342,6 +1598,40 @@ mod tests {
                  does not say `{phrase}`; SSE_BROADCAST_CAPACITY is {capacity}"
             );
         }
+    }
+
+    /// The page documents the frame `stream_watch_writes_lagged_frame` and
+    /// `message_stream_writes_lagged_frame` hold the handlers to: its key, its place in the
+    /// endpoint and event-id tables, and its absence from replay.
+    #[test]
+    fn protocol_page_documents_the_lagged_frame() {
+        let page = protocol_page();
+        let section = protocol_page_section(&page, "event-lagged");
+        for required in ["`missed`", "{\"missed\":"] {
+            assert!(
+                section.contains(required),
+                "the `lagged` section ({{ #event-lagged }}) of {PROTOCOL_PAGE_PATH} does not \
+                 contain `{required}`"
+            );
+        }
+        for row in [
+            "| [`lagged`](#event-lagged) | yes | yes |",
+            "| `lagged` | no | — |",
+        ] {
+            assert!(
+                page.contains(row),
+                "{PROTOCOL_PAGE_PATH} has no `{row}` row"
+            );
+        }
+        assert!(
+            protocol_page_section(&page, "replay").contains("`lagged`"),
+            "the Replay section ({{ #replay }}) of {PROTOCOL_PAGE_PATH} does not list `lagged`"
+        );
+        assert!(
+            !protocol_page_section(&page, "lagged").contains("Nothing is written in their place"),
+            "the Frames a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} says \
+             nothing is written for lost frames"
+        );
     }
 
     /// The Replay section states `SSE_REPLAY_CAPACITY` as the number of frames a session keeps.

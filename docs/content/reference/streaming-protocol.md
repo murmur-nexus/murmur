@@ -62,6 +62,7 @@ Which frames each endpoint can deliver:
 | [`text`](#event-text) | yes | yes |
 | [`thinking`](#event-thinking) | yes | yes |
 | [`gap`](#event-gap) | yes, only when the request sent `Last-Event-ID` | yes |
+| [`lagged`](#event-lagged) | yes | yes |
 | [`connection-ack`](#event-connection-ack) | no | yes, first frame |
 | [`capsule-closed`](#event-capsule-closed) | no | yes, as the last frame when it is written |
 | [`error`](#event-error) | yes | no |
@@ -90,7 +91,8 @@ one of them reads a reply to a message it never sent.
    connection closes.
 5. When the task cannot be handed to the capsule's queue, an [`error`](#event-error) frame, and
    the connection closes.
-6. Live frames and heartbeats, until the first `status` frame with `"final":true`.
+6. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the first delivered
+   `status` frame with `"final":true`.
 
 The task id and context id minted for the task appear only in the frames' `data`: `tsk_` and a
 UUIDv7 for the task, and the message's `contextId` or `ctx_` and a UUIDv7 for the context.
@@ -101,15 +103,23 @@ UUIDv7 for the task, and the message's `contextId` or `ctx_` and a UUIDv7 for th
 2. A [`connection-ack`](#event-connection-ack) frame.
 3. The [replay](#replay), from `Last-Event-ID`, or from `0` when the header is absent: a `gap`
    frame if one applies, then the buffered frames.
-4. Live frames and heartbeats, until the capsule's stream ends. A capsule process that exits
-   closes the connection without a [`capsule-closed`](#event-capsule-closed) frame.
+4. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the capsule's stream ends.
+   A capsule process that exits closes the connection without a
+   [`capsule-closed`](#event-capsule-closed) frame.
 
 ### Frames a connection misses { #lagged }
 
 Each connection reads live frames from a queue of 128. A connection that falls more than 128
-frames behind loses the oldest of them. Nothing is written in their place: no `gap` frame, no
-comment. A client that needs every frame reconnects and [replays](#replay) instead of trusting a
-long-lived connection to be complete.
+frames behind loses the oldest of them, and a [`lagged`](#event-lagged) frame naming how many is
+written before the next frame the connection receives. The connection stays open. The capsule also
+writes the count to its own stderr, as `SSE broadcast lagged by <n> events`; nothing about a lag is
+written to `trace.jsonl`.
+
+On `message/stream`, a lost frame may be the `final` status the client is waiting for. The
+connection then stays open until the next `final` status it is delivered, from any task.
+
+A client that needs every frame reconnects and [replays](#replay) instead of trusting a long-lived
+connection to be complete.
 
 ---
 
@@ -276,6 +286,22 @@ oldest frame in the replay buffer. The replay that follows is the whole buffer.
 
 ---
 
+## `lagged` { #event-lagged }
+
+Written to a connection that fell more than 128 frames behind and [lost live frames](#lagged),
+before the next frame it receives. Only that connection receives it, once per loss. The count is
+not cumulative: a client that wants a total adds them up.
+
+| Key | Type | Absent when | Notes |
+|---|---|---|---|
+| `missed` | u64 | Never | The frames this connection lost since the last frame it received. At least `1` |
+
+```json
+{"missed":40}
+```
+
+---
+
 ## `connection-ack` { #event-connection-ack }
 
 The first frame on every `stream/watch` connection.
@@ -370,6 +396,7 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 | `status` `canceled` with message `task canceled before it started` | yes | The queued-cancel counter |
 | `status` `rejected` | yes | Always `0` |
 | `gap` | no | — |
+| `lagged` | no | — |
 | `connection-ack` | no | — |
 | `capsule-closed` | no | — |
 | `error` | no | — |
@@ -388,7 +415,8 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
     `request-input` waits both start at `9223372036854775807`. Chunks a tool emits while it runs
     are numbered from the same value as the `artifact` frames that follow them, and the whole-reply
     `text` frame is numbered from the same value as the hook artifacts written before it. Never
-    subtract two ids, never read a jump as lost frames, and never read a repeat as a duplicate.
+    subtract two ids, never read a jump as lost frames, and never read a repeat as a duplicate. A
+    [`lagged`](#event-lagged) frame is what reports live frames a connection lost.
 
 ---
 
@@ -396,8 +424,8 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 
 Each session keeps its most recent 512 frames with ids in one replay buffer shared by both
 endpoints, in the order they were written. When the buffer is full, a new frame evicts the oldest.
-The heartbeat, `connection-ack`, `gap`, `capsule-closed`, `error` and the `rejected` status never
-enter it.
+The heartbeat, `connection-ack`, `gap`, `lagged`, `capsule-closed`, `error` and the `rejected`
+status never enter it.
 
 | Endpoint | `Last-Event-ID` sent | `Last-Event-ID` absent | `Last-Event-ID` not a number |
 |---|---|---|---|
@@ -461,6 +489,7 @@ client that follows them.
 | Heartbeat | Read and discarded |
 | `error`, `rejected` status | Never delivered to this endpoint |
 | `gap` | A warning on stderr naming `first_available_id` |
+| `lagged` | A warning on stderr naming `missed` |
 | Unknown event types and keys | Ignored |
 | `capsule-closed` | Prints `[murmur] capsule closed` to stderr and exits `0` |
 | Connection lost | Exits `1` with `E-IO-003`: `connection to <session id or address> lost after event id <n>`, or `lost before any event`, followed by `the capsule may still be running; run mur watch again to reattach` |
