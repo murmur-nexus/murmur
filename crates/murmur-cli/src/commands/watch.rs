@@ -121,6 +121,11 @@ pub(crate) enum StreamEnd {
     ConnectionLost { last_event_id: Option<u64> },
 }
 
+/// The stderr warning for a `lagged` frame, naming how many live frames this connection lost.
+fn lagged_warning(missed: u64) -> String {
+    format!("[murmur] warning: this connection missed {missed} events")
+}
+
 /// Read a `stream/watch` SSE body to its end, rendering `status`, `artifact` and `text` frames to
 /// `out` and warnings to stderr.
 ///
@@ -171,6 +176,13 @@ pub(crate) fn read_stream(
                             .and_then(|v| v.get("first_available_id").and_then(Value::as_u64))
                             .unwrap_or(0);
                         eprintln!("[murmur] warning: buffer overflow — some earlier events were lost (first available id: {first_id})");
+                    }
+                    "lagged" => {
+                        let missed = serde_json::from_str::<Value>(&current_data)
+                            .ok()
+                            .and_then(|v| v.get("missed").and_then(Value::as_u64))
+                            .unwrap_or(0);
+                        eprintln!("{}", lagged_warning(missed));
                     }
                     "capsule-closed" => return Ok(StreamEnd::CapsuleClosed),
                     "status" | "artifact" | "text" => {
@@ -404,7 +416,7 @@ fn artifact_header(artifact: &Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{artifact_header, read_stream, StreamEnd};
+    use super::{artifact_header, lagged_warning, read_stream, StreamEnd};
 
     /// Read `body` as a `stream/watch` SSE body, returning how it ended and what was rendered.
     fn read(body: &str) -> (StreamEnd, String) {
@@ -483,6 +495,41 @@ mod tests {
             StreamEnd::ConnectionLost {
                 last_event_id: Some(3)
             }
+        );
+    }
+
+    const LAGGED: &str = "event: lagged\ndata: {\"missed\":3}\n\n";
+
+    #[test]
+    fn a_lagged_frame_renders_nothing_and_the_stream_continues() {
+        let first = "id: 1\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"working\",\"message\":\"inference turn 1\"},\"final\":false}\n\n";
+        let second = "id: 5\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"completed\",\"message\":\"session ended\",\"response\":\"done\"},\"final\":true}\n\n";
+        let closed = "event: capsule-closed\ndata: {}\n\n";
+        let (end, rendered) = read(&format!("{ACK}{first}{LAGGED}{second}{closed}"));
+        assert_eq!(end, StreamEnd::CapsuleClosed);
+        let (_, without_lag) = read(&format!("{ACK}{first}{second}{closed}"));
+        assert!(rendered.contains("[completed]"), "rendered: {rendered}");
+        assert_eq!(rendered, without_lag);
+    }
+
+    #[test]
+    fn eof_after_a_lagged_frame_reports_the_preceding_id() {
+        let body = format!(
+            "{ACK}id: 9\nevent: text\ndata: {{\"id\":\"tsk_1\",\"text\":\"hi\",\"final\":false}}\n\n{LAGGED}"
+        );
+        assert_eq!(
+            read(&body).0,
+            StreamEnd::ConnectionLost {
+                last_event_id: Some(9)
+            }
+        );
+    }
+
+    #[test]
+    fn lagged_frame_warning_names_the_count() {
+        assert_eq!(
+            lagged_warning(3),
+            "[murmur] warning: this connection missed 3 events"
         );
     }
 

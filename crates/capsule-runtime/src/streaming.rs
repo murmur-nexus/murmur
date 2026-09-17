@@ -154,6 +154,17 @@ pub(crate) fn format_gap_event(first_available_id: u64) -> String {
     format!("event: gap\ndata: {{\"first_available_id\":{first_available_id}}}\n\n")
 }
 
+/// Format the frame telling one SSE connection it lost `missed` live frames.
+///
+/// Written straight to that connection's socket, immediately before the next live frame
+/// it receives: it carries no `id:` line, never passes through [`emit_sse`] or
+/// [`SseEventBuffer::push`], and so consumes no event id, never appears in a replay and
+/// never reaches any other connection. `missed` is the count carried by the broadcast
+/// receiver's `RecvError::Lagged`, always at least 1.
+pub(crate) fn format_lagged_event(missed: u64) -> String {
+    format!("event: lagged\ndata: {{\"missed\":{missed}}}\n\n")
+}
+
 /// Bounded ring-buffer of pre-formatted SSE event strings for reconnect replay.
 pub(crate) struct SseEventBuffer {
     events: VecDeque<(u64, Arc<String>)>,
@@ -476,6 +487,18 @@ mod tests {
         assert!(s.contains("event: gap\n"), "missing event field");
         assert!(s.contains("\"first_available_id\":42"), "missing id field");
         assert!(s.ends_with("\n\n"), "missing double newline terminator");
+    }
+
+    #[test]
+    fn format_lagged_event_has_exact_wire_form() {
+        let s = format_lagged_event(7);
+        assert_eq!(s, "event: lagged\ndata: {\"missed\":7}\n\n");
+        let data = s
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data line");
+        let parsed: serde_json::Value = serde_json::from_str(data).expect("data is JSON");
+        assert_eq!(parsed, serde_json::json!({"missed": 7}));
     }
 
     #[test]

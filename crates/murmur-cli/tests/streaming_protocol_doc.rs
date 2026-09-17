@@ -387,7 +387,7 @@ fn the_page_covers_every_frame_a_task_writes() {
         );
     }
 
-    let allowed: HashSet<&str> = ["connection-ack", "gap"].into_iter().collect();
+    let allowed: HashSet<&str> = ["connection-ack", "gap", "lagged"].into_iter().collect();
     assert!(
         id_less.contains("connection-ack")
             && id_less.iter().all(|event| allowed.contains(event.as_str())),
