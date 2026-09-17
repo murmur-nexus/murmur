@@ -1752,7 +1752,6 @@ fn launch(
                         a2a_sse: Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
                         a2a_task_id: None,
                         input_timeout_secs: effective_lifecycle.input_timeout_secs,
-                        a2a_chunk_event_id: Arc::new(AtomicU64::new(u64::MAX / 4)),
                         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
                         registry: registry_for_pull,
                         lock_path: lock_path_for_pull,
@@ -1866,11 +1865,6 @@ fn launch(
                     // that one finishes.
                     let mut lanes = LaneQueue::new();
 
-                    // Event ids for the final status a task cancelled before it started emits.
-                    // High, like `request-input`'s, so they never collide with the agent loop's
-                    // own per-attempt counter, which restarts at 0 for every task.
-                    let mut queued_cancel_event_id: u64 = u64::MAX / 8;
-
                     // Demoted commands the resumed-from session never accounted for. Only a
                     // resume does this, and it costs one read of a file `--resume` has already
                     // read; a launch that resumes nothing does no work here at all.
@@ -1943,7 +1937,6 @@ fn launch(
                                 &detached,
                                 &live_delegations,
                                 &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
-                                &mut queued_cancel_event_id,
                             )
                             .await;
                             break 'task_loop;
@@ -2161,7 +2154,6 @@ fn launch(
                                                 &detached,
                                                 &live_delegations,
                                                 &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
-                                                &mut queued_cancel_event_id,
                                             )
                                             .await;
                                             break 'task_loop;
@@ -2305,7 +2297,6 @@ fn launch(
                                 &detached,
                                 &live_delegations,
                                 &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
-                                &mut queued_cancel_event_id,
                             )
                             .await;
                             continue 'task_loop;
@@ -2424,7 +2415,6 @@ fn launch(
                                 &detached,
                                 &live_delegations,
                                 &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
-                                &mut queued_cancel_event_id,
                             )
                             .await;
                             break 'task_loop;
@@ -2698,7 +2688,6 @@ fn launch(
         a2a_sse: None,
         a2a_task_id: None,
         input_timeout_secs: None,
-        a2a_chunk_event_id: Arc::new(AtomicU64::new(u64::MAX / 4)),
         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
         registry: Arc::clone(&staged.registry),
         lock_path: staged.manifest_dir.join("murmur.lock"),
@@ -4040,11 +4029,8 @@ pub(crate) async fn request_input_impl(
         reg.cancel_watch(&task_id)
     };
 
-    // Use high IDs to avoid overlapping with agent-loop SSE event IDs (which start at 0).
-    let mut sse_event_id: u64 = u64::MAX / 2;
     emit_sse(
         &sse,
-        &mut sse_event_id,
         "status",
         &TaskStatusUpdateEvent {
             id: task_id.clone(),
@@ -4084,7 +4070,6 @@ pub(crate) async fn request_input_impl(
         Ok(text) => {
             emit_sse(
                 &sse,
-                &mut sse_event_id,
                 "status",
                 &TaskStatusUpdateEvent {
                     id: task_id.clone(),
@@ -4112,7 +4097,6 @@ pub(crate) async fn request_input_impl(
             }
             emit_sse(
                 &sse,
-                &mut sse_event_id,
                 "status",
                 &TaskStatusUpdateEvent {
                     id: task_id.clone(),
@@ -4307,9 +4291,6 @@ pub(crate) struct CapsuleStoreState {
     /// Optional input timeout from lifecycle config.
     pub(crate) input_timeout_secs: Option<u64>,
     // ── A2A streaming text chunk support ─────────────────────────────────────────
-    /// Monotonically increasing event ID counter for text chunk SSE events.
-    /// Starts at u64::MAX/4 to avoid overlap with agent-loop status/artifact IDs (from 0).
-    pub(crate) a2a_chunk_event_id: Arc<AtomicU64>,
     /// Set to true when any emit-chunk call is made during the current driver dispatch.
     /// Reset to false before each driver dispatch in run_agent_loop.
     pub(crate) a2a_chunks_emitted: Arc<AtomicBool>,
@@ -4814,7 +4795,6 @@ pub(crate) struct ToolInvokeEnv<'a> {
 pub(crate) struct ToolA2aWiring {
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     task_id: Option<String>,
-    chunk_event_id: Arc<AtomicU64>,
     chunks_emitted: Arc<AtomicBool>,
     task_registry: Option<Arc<Mutex<TaskRegistry>>>,
     input_timeout_secs: Option<u64>,
@@ -4825,7 +4805,6 @@ impl ToolA2aWiring {
         Self {
             sse: None,
             task_id: None,
-            chunk_event_id: Arc::new(AtomicU64::new(0)),
             chunks_emitted: Arc::new(AtomicBool::new(false)),
             task_registry: None,
             input_timeout_secs: None,
@@ -4860,7 +4839,6 @@ pub(crate) async fn invoke_tool_component(
     let ToolA2aWiring {
         sse: a2a_sse,
         task_id: a2a_task_id,
-        chunk_event_id: a2a_chunk_event_id,
         chunks_emitted: a2a_chunks_emitted,
         task_registry: a2a_task_registry,
         input_timeout_secs,
@@ -4881,11 +4859,9 @@ pub(crate) async fn invoke_tool_component(
         let chunks_iface = WIT_TEXT_CHUNKS_IFACE;
         let sse_for_chunk = a2a_sse.clone();
         let task_id_for_chunk = a2a_task_id.clone();
-        let chunk_event_id = Arc::clone(&a2a_chunk_event_id);
         let chunks_emitted_flag = Arc::clone(&a2a_chunks_emitted);
         let sse_for_thinking = a2a_sse.clone();
         let task_id_for_thinking = a2a_task_id.clone();
-        let thinking_event_id = Arc::clone(&a2a_chunk_event_id);
 
         let mut inst = linker.instance(chunks_iface).map_err(|err| {
             format!("failed to define {chunks_iface} instance for '{name}': {err}")
@@ -4898,7 +4874,7 @@ pub(crate) async fn invoke_tool_component(
                 if let (Some((ref tx, ref buf)), Some(ref tid)) =
                     (&sse_for_chunk, &task_id_for_chunk)
                 {
-                    emit_chunk_sse(tx, buf, &chunk_event_id, tid, &chunk);
+                    emit_chunk_sse(tx, buf, tid, &chunk);
                 }
                 Ok(())
             },
@@ -4911,7 +4887,7 @@ pub(crate) async fn invoke_tool_component(
                 if let (Some((ref tx, ref buf)), Some(ref tid)) =
                     (&sse_for_thinking, &task_id_for_thinking)
                 {
-                    emit_thinking_chunk_sse(tx, buf, &thinking_event_id, tid, &chunk);
+                    emit_thinking_chunk_sse(tx, buf, tid, &chunk);
                 }
                 Ok(())
             },
@@ -5131,7 +5107,6 @@ impl CapsuleStoreState {
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
                 task_id: self.a2a_task_id.clone(),
-                chunk_event_id: Arc::clone(&self.a2a_chunk_event_id),
                 chunks_emitted: Arc::clone(&self.a2a_chunks_emitted),
                 task_registry: self.a2a_task_registry.clone(),
                 input_timeout_secs: self.input_timeout_secs,
@@ -7563,7 +7538,6 @@ async fn record_canceled_before_start(
     detached: &Arc<DetachedRegistry>,
     live_delegations: &crate::cancel::LiveDelegations,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    event_id: &mut u64,
 ) {
     let residue = crate::cancel::Residue::snapshot(Some(detached), live_delegations);
     let _ = trace
@@ -7578,7 +7552,6 @@ async fn record_canceled_before_start(
     let _ = trace.flush().await;
     emit_sse(
         sse,
-        event_id,
         "status",
         &crate::streaming::TaskStatusUpdateEvent {
             id: task.task_id.clone(),
@@ -7606,13 +7579,11 @@ async fn close_lanes_on_termination(
     detached: &Arc<DetachedRegistry>,
     live_delegations: &crate::cancel::LiveDelegations,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    event_id: &mut u64,
 ) {
     // `None` for the active lane is safe only because nothing taken here is started.
     while let Some((_, task)) = lanes.next(None) {
         if task_registry.lock().unwrap().is_canceled(&task.task_id) {
-            record_canceled_before_start(&task, trace, detached, live_delegations, sse, event_id)
-                .await;
+            record_canceled_before_start(&task, trace, detached, live_delegations, sse).await;
         }
     }
 }
@@ -9459,7 +9430,6 @@ inference:
             a2a_sse: None,
             a2a_task_id: None,
             input_timeout_secs: None,
-            a2a_chunk_event_id: Arc::new(AtomicU64::new(0)),
             a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
             registry,
             lock_path,

@@ -442,7 +442,6 @@ pub(crate) async fn run_agent_loop(
     // full-context input count before anything reads it. The initial value is what a seed
     // commit recounts into, and is read by nothing else.
     let mut session_tokens: u32 = 0;
-    let mut sse_event_id: u64 = 0;
 
     // `--resume-mode compact`: the same hook, the same commit site and the same record rules the
     // per-turn threshold trigger uses, reached from a second place — as the seed-overflow path
@@ -481,7 +480,6 @@ pub(crate) async fn run_agent_loop(
                     otel,
                     workdir,
                     &sse,
-                    &mut sse_event_id,
                     task_id.as_deref(),
                     task_id.as_deref().unwrap_or_default(),
                     context_id.clone(),
@@ -544,7 +542,6 @@ pub(crate) async fn run_agent_loop(
                 hooks,
                 record.as_mut(),
                 &sse,
-                &mut sse_event_id,
                 task_id.as_deref(),
                 &task_id_str,
                 context_id.clone(),
@@ -604,7 +601,6 @@ pub(crate) async fn run_agent_loop(
         if task_id.is_some() {
             emit_sse(
                 &sse,
-                &mut sse_event_id,
                 "status",
                 &TaskStatusUpdateEvent {
                     id: task_id_str.clone(),
@@ -624,10 +620,6 @@ pub(crate) async fn run_agent_loop(
         store_state
             .a2a_chunks_emitted
             .store(false, Ordering::Relaxed);
-        // Sync chunk ID counter with current sse_event_id so all events share one monotonic sequence.
-        store_state
-            .a2a_chunk_event_id
-            .store(sse_event_id, Ordering::Relaxed);
 
         // Admitted after the call is measured and before anything is sent. The guard is settled
         // once the response's output is counted; every other way out of this turn drops it, which
@@ -644,7 +636,6 @@ pub(crate) async fn run_agent_loop(
                     otel,
                     workdir,
                     &sse,
-                    &mut sse_event_id,
                     task_id.as_deref(),
                     &task_id_str,
                     context_id.clone(),
@@ -699,7 +690,6 @@ pub(crate) async fn run_agent_loop(
                 hooks,
                 record.as_mut(),
                 &sse,
-                &mut sse_event_id,
                 task_id.as_deref(),
                 &task_id_str,
                 context_id.clone(),
@@ -718,7 +708,6 @@ pub(crate) async fn run_agent_loop(
                 if task_id.is_some() {
                     emit_sse(
                         &sse,
-                        &mut sse_event_id,
                         "status",
                         &TaskStatusUpdateEvent {
                             id: task_id_str.clone(),
@@ -747,11 +736,9 @@ pub(crate) async fn run_agent_loop(
         // Non-streaming fallback text event is emitted per stop_reason branch below.
         if let (Some(ref tid), Some((ref tx, ref buf))) = (&task_id, &sse) {
             if store_state.a2a_chunks_emitted.load(Ordering::Relaxed) {
-                emit_chunk_sse_final(tx, buf, &store_state.a2a_chunk_event_id, tid, "");
+                emit_chunk_sse_final(tx, buf, tid, "");
             }
         }
-        // Sync sse_event_id back from the chunk counter (may have advanced during dispatch or cursor-removal).
-        sse_event_id = store_state.a2a_chunk_event_id.load(Ordering::Relaxed);
 
         if !matches!(driver_result.status, Status::Passed) {
             let error_text = match credential_failure(store_state) {
@@ -768,7 +755,6 @@ pub(crate) async fn run_agent_loop(
             if task_id.is_some() {
                 emit_sse(
                     &sse,
-                    &mut sse_event_id,
                     "status",
                     &TaskStatusUpdateEvent {
                         id: task_id_str.clone(),
@@ -910,7 +896,6 @@ pub(crate) async fn run_agent_loop(
             if task_id.is_some() {
                 emit_sse(
                     &sse,
-                    &mut sse_event_id,
                     "status",
                     &TaskStatusUpdateEvent {
                         id: task_id_str.clone(),
@@ -971,7 +956,6 @@ pub(crate) async fn run_agent_loop(
                         otel,
                         workdir,
                         &sse,
-                        &mut sse_event_id,
                         task_id.as_deref(),
                         &task_id_str,
                         context_id.clone(),
@@ -990,7 +974,6 @@ pub(crate) async fn run_agent_loop(
                     if task_id.is_some() {
                         emit_sse(
                             &sse,
-                            &mut sse_event_id,
                             "status",
                             &TaskStatusUpdateEvent {
                                 id: task_id_str.clone(),
@@ -1035,7 +1018,6 @@ pub(crate) async fn run_agent_loop(
                     if task_id.is_some() {
                         emit_sse(
                             &sse,
-                            &mut sse_event_id,
                             "status",
                             &TaskStatusUpdateEvent {
                                 id: task_id_str.clone(),
@@ -1251,7 +1233,6 @@ pub(crate) async fn run_agent_loop(
                             if task_id.is_some() {
                                 emit_sse(
                                     &sse,
-                                    &mut sse_event_id,
                                     "artifact",
                                     &TaskArtifactUpdateEvent {
                                         id: task_id_str.clone(),
@@ -1335,7 +1316,6 @@ pub(crate) async fn run_agent_loop(
                             if task_id.is_some() {
                                 emit_sse(
                                     &sse,
-                                    &mut sse_event_id,
                                     "artifact",
                                     &TaskArtifactUpdateEvent {
                                         id: task_id_str.clone(),
@@ -1393,7 +1373,6 @@ pub(crate) async fn run_agent_loop(
                     workdir,
                     mode,
                     &sse,
-                    &mut sse_event_id,
                     task_id.as_deref(),
                     &task_id_str,
                     context_id.clone(),
@@ -1423,7 +1402,6 @@ pub(crate) async fn run_agent_loop(
                     workdir,
                     mode,
                     &sse,
-                    &mut sse_event_id,
                     task_id.as_deref(),
                     &task_id_str,
                     context_id.clone(),
@@ -1441,7 +1419,6 @@ pub(crate) async fn run_agent_loop(
                 if task_id.is_some() {
                     emit_sse(
                         &sse,
-                        &mut sse_event_id,
                         "status",
                         &TaskStatusUpdateEvent {
                             id: task_id_str.clone(),
@@ -1472,7 +1449,6 @@ pub(crate) async fn run_agent_loop(
     if task_id.is_some() {
         emit_sse(
             &sse,
-            &mut sse_event_id,
             "status",
             &TaskStatusUpdateEvent {
                 id: task_id_str.clone(),
@@ -1516,7 +1492,6 @@ async fn finish_canceled_turn(
     hooks: &mut HookRuntime,
     record: Option<&mut crate::conversation::ConversationRecord>,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    sse_event_id: &mut u64,
     task_id: Option<&str>,
     task_id_str: &str,
     context_id: Option<String>,
@@ -1550,7 +1525,6 @@ async fn finish_canceled_turn(
     if task_id.is_some() {
         emit_sse(
             sse,
-            sse_event_id,
             "status",
             &TaskStatusUpdateEvent {
                 id: task_id_str.to_string(),
@@ -1587,7 +1561,6 @@ async fn finish_spend_refused_turn(
     otel: &mut OtelEmitter,
     workdir: &Path,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    sse_event_id: &mut u64,
     task_id: Option<&str>,
     task_id_str: &str,
     context_id: Option<String>,
@@ -1611,7 +1584,6 @@ async fn finish_spend_refused_turn(
     if task_id.is_some() {
         emit_sse(
             sse,
-            sse_event_id,
             "status",
             &TaskStatusUpdateEvent {
                 id: task_id_str.to_string(),
@@ -1722,7 +1694,6 @@ async fn finish_completed_turn(
     workdir: &Path,
     mode: ConversationMode,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    sse_event_id: &mut u64,
     task_id: Option<&str>,
     task_id_str: &str,
     context_id: Option<String>,
@@ -1773,7 +1744,6 @@ async fn finish_completed_turn(
         for ha in hook_artifact {
             emit_sse(
                 sse,
-                sse_event_id,
                 "artifact",
                 &TaskArtifactUpdateEvent {
                     id: task_id_str.to_string(),
@@ -1787,12 +1757,10 @@ async fn finish_completed_turn(
         // Non-streaming driver fallback: emit full turn text as a single text event. Streaming
         // drivers already emitted cursor-removal above (final:true, empty).
         if !store_state.a2a_chunks_emitted.load(Ordering::Relaxed) && !final_text.is_empty() {
-            emit_chunk_sse_final(tx, buf, &store_state.a2a_chunk_event_id, tid, &final_text);
-            *sse_event_id = store_state.a2a_chunk_event_id.load(Ordering::Relaxed);
+            emit_chunk_sse_final(tx, buf, tid, &final_text);
         }
         emit_sse(
             sse,
-            sse_event_id,
             "status",
             &TaskStatusUpdateEvent {
                 id: task_id_str.to_string(),

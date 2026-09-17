@@ -1,8 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -18,7 +15,7 @@ pub(crate) const SSE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Durati
 /// The liveness signal written to an idle SSE connection.
 ///
 /// An SSE comment, not a frame: it carries no `id:` line, is written straight to the
-/// socket rather than through [`emit_sse`] or [`SseEventBuffer::push`], and so consumes
+/// socket rather than through [`emit_frame`], and so consumes
 /// no event id and never enters the replay buffer. A client that counts events sees
 /// none of these.
 pub(crate) const SSE_HEARTBEAT_COMMENT: &[u8] = b":heartbeat\n\n";
@@ -138,11 +135,40 @@ pub(crate) fn format_sse_event(event_id: u64, event_type: &str, data: &str) -> S
     format!("id: {event_id}\nevent: {event_type}\ndata: {data}\n\n")
 }
 
+/// Format an SSE event frame with no `id:` line, for a frame that is written straight to one
+/// connection and never takes a place in the session's sequence.
+pub(crate) fn format_unnumbered_sse_event(event_type: &str, data: &str) -> String {
+    format!("event: {event_type}\ndata: {data}\n\n")
+}
+
+/// The id of a frame formatted by [`format_sse_event`], read from its leading `id:` line, or
+/// `None` for a frame that carries no id.
+pub(crate) fn frame_id(frame: &str) -> Option<u64> {
+    frame.strip_prefix("id: ")?.split('\n').next()?.parse().ok()
+}
+
+/// Decide whether a live frame is written to a connection that has already written every id up
+/// to `last_written`, and advance `last_written` when it is.
+///
+/// A frame whose id is at or below `last_written` was already written by the replay (a frame
+/// emitted between subscribing and reading the buffer arrives both ways), so it is dropped. A
+/// frame with no id is always written and leaves `last_written` unchanged.
+pub(crate) fn admit_live_frame(last_written: &mut Option<u64>, frame: &str) -> bool {
+    let Some(id) = frame_id(frame) else {
+        return true;
+    };
+    if last_written.is_some_and(|written| id <= written) {
+        return false;
+    }
+    *last_written = Some(id);
+    true
+}
+
 /// Result of a replay request from `SseEventBuffer::replay_from`.
 pub(crate) enum ReplayResult {
     Complete(Vec<Arc<String>>),
-    /// Some events before `first_available_id` were evicted from the buffer.
-    /// Callers should emit a gap event before the replay events.
+    /// Frames after the cursor are no longer buffered, or the cursor was never issued by this
+    /// session. `events` is the whole buffer; callers write a gap event before it.
     WithGap {
         first_available_id: u64,
         events: Vec<Arc<String>>,
@@ -151,24 +177,35 @@ pub(crate) enum ReplayResult {
 
 /// Format a gap SSE event indicating that buffered history starts at `first_available_id`.
 pub(crate) fn format_gap_event(first_available_id: u64) -> String {
-    format!("event: gap\ndata: {{\"first_available_id\":{first_available_id}}}\n\n")
+    format_unnumbered_sse_event(
+        "gap",
+        &format!("{{\"first_available_id\":{first_available_id}}}"),
+    )
 }
 
 /// Format the frame telling one SSE connection it lost `missed` live frames.
 ///
 /// Written straight to that connection's socket, immediately before the next live frame
-/// it receives: it carries no `id:` line, never passes through [`emit_sse`] or
-/// [`SseEventBuffer::push`], and so consumes no event id, never appears in a replay and
-/// never reaches any other connection. `missed` is the count carried by the broadcast
-/// receiver's `RecvError::Lagged`, always at least 1.
+/// it receives: it carries no `id:` line, never passes through [`emit_frame`], and so
+/// consumes no event id, never appears in a replay and never reaches any other connection.
+/// `missed` is the count carried by the broadcast receiver's `RecvError::Lagged`, always at
+/// least 1.
 pub(crate) fn format_lagged_event(missed: u64) -> String {
     format!("event: lagged\ndata: {{\"missed\":{missed}}}\n\n")
 }
 
-/// Bounded ring-buffer of pre-formatted SSE event strings for reconnect replay.
+/// The session's event-id sequence and a bounded ring-buffer of the most recent frames for
+/// reconnect replay.
+///
+/// One buffer serves a whole capsule session, so every numbered frame of every task takes its
+/// id from `next_id`: the first frame is `1` and each later one is exactly one higher.
 pub(crate) struct SseEventBuffer {
     events: VecDeque<(u64, Arc<String>)>,
     capacity: usize,
+    /// Starts at `1`, not `0`: replay writes frames with an id strictly greater than the
+    /// client's `Last-Event-ID`, and `0` is the cursor for "from the start", so a frame numbered
+    /// `0` could never be replayed.
+    next_id: u64,
 }
 
 impl SseEventBuffer {
@@ -176,27 +213,31 @@ impl SseEventBuffer {
         Self {
             events: VecDeque::new(),
             capacity,
+            next_id: 1,
         }
     }
 
-    pub fn push(&mut self, id: u64, event: Arc<String>) {
+    /// Number, format and store one frame, returning its id and the formatted text.
+    fn append(&mut self, event_type: &str, data: &str) -> (u64, Arc<String>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let event = Arc::new(format_sse_event(id, event_type, data));
         if self.events.len() >= self.capacity {
             self.events.pop_front();
         }
-        self.events.push_back((id, event));
+        self.events.push_back((id, Arc::clone(&event)));
+        (id, event)
     }
 
-    /// Return all events with id > last_id, distinguishing a clean replay from one
-    /// where earlier events have been evicted from the buffer.
+    /// Return the frames written after `last_id`, distinguishing a clean replay from one that
+    /// cannot be: frames after `last_id` were evicted, or `last_id` was never issued by this
+    /// session. Either of those returns the whole buffer as [`ReplayResult::WithGap`].
     pub fn replay_from(&self, last_id: u64) -> ReplayResult {
-        if self.events.is_empty() {
+        let Some(oldest_id) = self.events.front().map(|(id, _)| *id) else {
             return ReplayResult::Complete(vec![]);
-        }
+        };
 
-        let oldest_id = self.events.front().map(|(id, _)| *id).unwrap_or(0);
-
-        if last_id < oldest_id.saturating_sub(1) {
-            // Caller asked for events that have been evicted — signal a gap.
+        if last_id >= self.next_id || last_id < oldest_id - 1 {
             let events = self.events.iter().map(|(_, s)| Arc::clone(s)).collect();
             return ReplayResult::WithGap {
                 first_available_id: oldest_id,
@@ -214,10 +255,26 @@ impl SseEventBuffer {
     }
 }
 
-/// Serialize, buffer, and broadcast one SSE event. No-op when sse is None or no receivers.
+/// Give one frame the session's next id, buffer it and broadcast it, returning the id.
+///
+/// The buffer lock is held across the broadcast send, so frames emitted concurrently — by the
+/// agent loop, a tool's chunk host function and a `request-input` wait — enter the buffer and
+/// reach every live receiver in id order. A send with no receivers is not an error.
+pub(crate) fn emit_frame(
+    tx: &SseBroadcast,
+    buf: &Arc<Mutex<SseEventBuffer>>,
+    event_type: &str,
+    data: &str,
+) -> u64 {
+    let mut buf = buf.lock().unwrap();
+    let (id, event) = buf.append(event_type, data);
+    let _ = tx.send(event);
+    id
+}
+
+/// Serialize and emit one SSE event through [`emit_frame`]. No-op when sse is None.
 pub(crate) async fn emit_sse(
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    event_id: &mut u64,
     event_type: &str,
     data: &impl Serialize,
 ) {
@@ -228,14 +285,7 @@ pub(crate) async fn emit_sse(
         Ok(s) => s,
         Err(_) => return,
     };
-    let event_str = format_sse_event(*event_id, event_type, &data_str);
-    let event_arc = Arc::new(event_str);
-    {
-        let mut buf = sse_buffer.lock().unwrap();
-        buf.push(*event_id, Arc::clone(&event_arc));
-    }
-    let _ = sse_tx.send(event_arc); // ignore "no receivers" error
-    *event_id += 1;
+    emit_frame(sse_tx, sse_buffer, event_type, &data_str);
 }
 
 /// Check whether a pre-formatted SSE event string is a terminal status event.
@@ -253,16 +303,15 @@ pub(crate) fn is_final_sse_event(event: &str) -> bool {
 pub(crate) fn emit_chunk_sse(
     tx: &SseBroadcast,
     buf: &Arc<Mutex<SseEventBuffer>>,
-    event_id: &Arc<AtomicU64>,
     task_id: &str,
     chunk: &str,
 ) {
-    let id = event_id.fetch_add(1, Ordering::Relaxed);
-    let data = format_text_sse_data(task_id, chunk, false);
-    let event_str = format_sse_event(id, "text", &data);
-    let event_arc = Arc::new(event_str);
-    buf.lock().unwrap().push(id, Arc::clone(&event_arc));
-    let _ = tx.send(event_arc);
+    emit_frame(
+        tx,
+        buf,
+        "text",
+        &format_text_sse_data(task_id, chunk, false),
+    );
 }
 
 /// Emit one thinking chunk SSE event (synchronous).
@@ -273,16 +322,15 @@ pub(crate) fn emit_chunk_sse(
 pub(crate) fn emit_thinking_chunk_sse(
     tx: &SseBroadcast,
     buf: &Arc<Mutex<SseEventBuffer>>,
-    event_id: &Arc<AtomicU64>,
     task_id: &str,
     chunk: &str,
 ) {
-    let id = event_id.fetch_add(1, Ordering::Relaxed);
-    let data = format_text_sse_data(task_id, chunk, false);
-    let event_str = format_sse_event(id, "thinking", &data);
-    let event_arc = Arc::new(event_str);
-    buf.lock().unwrap().push(id, Arc::clone(&event_arc));
-    let _ = tx.send(event_arc);
+    emit_frame(
+        tx,
+        buf,
+        "thinking",
+        &format_text_sse_data(task_id, chunk, false),
+    );
 }
 
 /// Emit a final text SSE event (synchronous) — either cursor-removal (empty text) or
@@ -294,16 +342,10 @@ pub(crate) fn emit_thinking_chunk_sse(
 pub(crate) fn emit_chunk_sse_final(
     tx: &SseBroadcast,
     buf: &Arc<Mutex<SseEventBuffer>>,
-    event_id: &Arc<AtomicU64>,
     task_id: &str,
     text: &str,
 ) {
-    let id = event_id.fetch_add(1, Ordering::Relaxed);
-    let data = format_text_sse_data(task_id, text, true);
-    let event_str = format_sse_event(id, "text", &data);
-    let event_arc = Arc::new(event_str);
-    buf.lock().unwrap().push(id, Arc::clone(&event_arc));
-    let _ = tx.send(event_arc);
+    emit_frame(tx, buf, "text", &format_text_sse_data(task_id, text, true));
 }
 
 fn format_text_sse_data(task_id: &str, text: &str, is_final: bool) -> String {
@@ -429,56 +471,149 @@ mod tests {
         assert_eq!(out, "id: 3\nevent: status\ndata: {\"id\":\"x\"}\n\n");
     }
 
-    #[test]
-    fn event_buffer_evicts_oldest_when_full() {
-        let mut buf = SseEventBuffer::new(2);
-        buf.push(1, Arc::new("a".to_string()));
-        buf.push(2, Arc::new("b".to_string()));
-        buf.push(3, Arc::new("c".to_string())); // evicts id=1
-                                                // Requesting from id=0 asks for events that were evicted → WithGap
-        let result = buf.replay_from(0);
-        let (first_id, events) = match result {
+    /// A buffer of `capacity` holding `count` frames, ids `1..=count`, each frame's data its id.
+    fn buffer_with(capacity: usize, count: u64) -> SseEventBuffer {
+        let mut buf = SseEventBuffer::new(capacity);
+        for n in 1..=count {
+            buf.append("status", &n.to_string());
+        }
+        buf
+    }
+
+    fn ids(events: &[Arc<String>]) -> Vec<u64> {
+        events.iter().map(|e| frame_id(e).unwrap()).collect()
+    }
+
+    fn complete(result: ReplayResult) -> Vec<u64> {
+        match result {
+            ReplayResult::Complete(events) => ids(&events),
+            ReplayResult::WithGap { .. } => panic!("expected Complete"),
+        }
+    }
+
+    fn with_gap(result: ReplayResult) -> (u64, Vec<u64>) {
+        match result {
             ReplayResult::WithGap {
                 first_available_id,
                 events,
-            } => (first_available_id, events),
+            } => (first_available_id, ids(&events)),
             ReplayResult::Complete(_) => panic!("expected WithGap"),
-        };
-        assert_eq!(first_id, 2);
-        assert_eq!(events.len(), 2);
-        assert_eq!(*events[0], "b");
-        assert_eq!(*events[1], "c");
+        }
     }
 
     #[test]
-    fn replay_from_returns_events_after_last_id() {
-        let mut buf = SseEventBuffer::new(128);
-        buf.push(1, Arc::new("one".to_string()));
-        buf.push(2, Arc::new("two".to_string()));
-        buf.push(3, Arc::new("three".to_string()));
-        // oldest_id=1, last_id=1: 1 < 1.saturating_sub(1)=0 is false → Complete
-        let result = buf.replay_from(1);
-        let events = match result {
-            ReplayResult::Complete(events) => events,
-            ReplayResult::WithGap { .. } => panic!("expected Complete"),
-        };
-        assert_eq!(events.len(), 2);
-        assert_eq!(*events[0], "two");
-        assert_eq!(*events[1], "three");
+    fn ids_start_at_one_and_rise_by_one() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let buf = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        assert_eq!(emit_frame(&tx, &buf, "status", "{}"), 1);
+        emit_chunk_sse(&tx, &buf, "t", "a");
+        emit_thinking_chunk_sse(&tx, &buf, "t", "b");
+        emit_chunk_sse_final(&tx, &buf, "t", "");
+        assert_eq!(emit_frame(&tx, &buf, "artifact", "{}"), 5);
+        let received: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| frame_id(&e).unwrap())
+            .collect();
+        assert_eq!(received, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
-    fn replay_from_no_gap_when_contiguous() {
-        let mut buf = SseEventBuffer::new(3);
-        buf.push(5, Arc::new("five".to_string()));
-        buf.push(6, Arc::new("six".to_string()));
-        // oldest_id=5, last_id=4: 4 < 5.saturating_sub(1)=4 is false → Complete (no gap)
-        let result = buf.replay_from(4);
-        let events = match result {
-            ReplayResult::Complete(events) => events,
-            ReplayResult::WithGap { .. } => panic!("expected Complete"),
-        };
-        assert_eq!(events.len(), 2);
+    fn replay_after_eviction_writes_a_gap() {
+        let buf = buffer_with(3, 5);
+        assert_eq!(with_gap(buf.replay_from(1)), (3, vec![3, 4, 5]));
+        assert_eq!(with_gap(buf.replay_from(0)), (3, vec![3, 4, 5]));
+        assert_eq!(complete(buf.replay_from(2)), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn replay_from_zero_without_eviction_is_every_frame() {
+        let buf = buffer_with(8, 5);
+        assert_eq!(complete(buf.replay_from(0)), vec![1, 2, 3, 4, 5]);
+        assert_eq!(complete(buf.replay_from(3)), vec![4, 5]);
+        assert_eq!(complete(buf.replay_from(5)), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn replay_from_a_cursor_never_issued_writes_a_gap() {
+        assert_eq!(
+            with_gap(buffer_with(8, 5).replay_from(99)),
+            (1, vec![1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            with_gap(buffer_with(3, 5).replay_from(6)),
+            (3, vec![3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn replay_from_an_empty_buffer_is_empty() {
+        let buf = SseEventBuffer::new(8);
+        assert_eq!(complete(buf.replay_from(0)), Vec::<u64>::new());
+        assert_eq!(complete(buf.replay_from(99)), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn concurrent_emitters_share_one_ascending_sequence() {
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 200;
+        let total = THREADS * PER_THREAD;
+        let (tx, mut rx) = broadcast::channel(total as usize);
+        let buf = Arc::new(Mutex::new(SseEventBuffer::new(total as usize)));
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let (tx, buf) = (tx.clone(), Arc::clone(&buf));
+                scope.spawn(move || {
+                    for _ in 0..PER_THREAD {
+                        if t % 2 == 0 {
+                            emit_chunk_sse(&tx, &buf, "t", "x");
+                        } else {
+                            emit_frame(&tx, &buf, "status", "{}");
+                        }
+                    }
+                });
+            }
+        });
+
+        let buffered = complete(buf.lock().unwrap().replay_from(0));
+        let received: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| frame_id(&e).unwrap())
+            .collect();
+        let expected: Vec<u64> = (1..=total).collect();
+        assert_eq!(buffered, expected, "buffer order is id order");
+        assert_eq!(received, expected, "live delivery order is id order");
+    }
+
+    #[test]
+    fn frame_id_reads_the_leading_id_line() {
+        assert_eq!(frame_id("id: 42\nevent: status\ndata: {}\n\n"), Some(42));
+        assert_eq!(frame_id("event: gap\ndata: {}\n\n"), None);
+        assert_eq!(frame_id(":heartbeat\n\n"), None);
+    }
+
+    #[test]
+    fn live_frames_already_replayed_are_dropped() {
+        let frame = |id| format_sse_event(id, "status", "{}");
+        let mut last = Some(3);
+        assert!(!admit_live_frame(&mut last, &frame(2)));
+        assert!(!admit_live_frame(&mut last, &frame(3)));
+        assert!(admit_live_frame(&mut last, &frame(4)));
+        assert_eq!(last, Some(4));
+        assert!(
+            !admit_live_frame(&mut last, &frame(4)),
+            "an id is written once"
+        );
+        assert!(admit_live_frame(&mut last, &format_gap_event(1)));
+        assert_eq!(last, Some(4), "a frame without an id leaves the cursor");
+
+        let mut fresh = None;
+        assert!(admit_live_frame(&mut fresh, &frame(1)));
+        assert_eq!(fresh, Some(1));
+    }
+
+    #[test]
+    fn unnumbered_frame_has_no_id_line() {
+        let out = format_unnumbered_sse_event("status", r#"{"id":"x"}"#);
+        assert_eq!(out, "event: status\ndata: {\"id\":\"x\"}\n\n");
+        assert_eq!(frame_id(&out), None);
     }
 
     #[test]

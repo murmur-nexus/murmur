@@ -650,6 +650,13 @@ fn event_shape(fn_name: &str) -> EventShape {
     (field "tools" (option string))))"#,
             type_exports: "    (export \"inference-event\" (type $event))",
         },
+        "on-task-end" => EventShape {
+            params: "(param i32 i32 i32 i32)",
+            decls: r#"  (type $event (record
+    (field "task-id" string)
+    (field "exit-status" string)))"#,
+            type_exports: "    (export \"task-end-event\" (type $event))",
+        },
         other => panic!("no event shape for {other}"),
     }
 }
@@ -735,6 +742,17 @@ pub fn artifact_hook_wasm(fn_name: &str, payload: &str) -> Vec<u8> {
         HOOK_OUTPUT,
         payload,
         &return_string_arm(3, payload.len()),
+    )
+}
+
+/// An `on-task-end` hook that returns `reopen-task(reason)` every time. Bind it with
+/// `commit_policy: reopen-task`; `lifecycle.max_task_reopens` is what stops each task reopening.
+pub fn reopen_task_hook_wasm(reason: &str) -> Vec<u8> {
+    policy_component(
+        "on-task-end",
+        HOOK_OUTPUT,
+        reason,
+        &return_string_arm(4, reason.len()),
     )
 }
 

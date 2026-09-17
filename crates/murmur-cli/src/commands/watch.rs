@@ -116,8 +116,8 @@ pub(crate) enum StreamEnd {
     CapsuleClosed,
     /// The stream reached EOF or a read error with no `capsule-closed`. `last_event_id` is the
     /// `id:` of the last complete frame that carried one, or `None` when no such frame arrived.
-    /// Ids are not unique within a session, so it names a position for a person to read, not an
-    /// anchor to resume from.
+    /// Ids are unique and ascending within a capsule session, so it is the `Last-Event-ID` a new
+    /// `stream/watch` connection resumes after.
     ConnectionLost { last_event_id: Option<u64> },
 }
 

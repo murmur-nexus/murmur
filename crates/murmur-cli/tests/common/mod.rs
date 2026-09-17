@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod hook_wat;
+pub mod idle_capsule;
 
 use std::{
     collections::HashSet,

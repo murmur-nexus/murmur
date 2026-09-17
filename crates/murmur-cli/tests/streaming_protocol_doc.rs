@@ -451,7 +451,7 @@ fn the_page_covers_every_frame_a_task_writes() {
     );
     for event in &id_less {
         assert!(
-            page.contains(&format!("| `{event}` | no | — |")),
+            page.contains(&format!("| `{event}` | no |")),
             "the page does not list `{event}` as a frame without an id"
         );
     }

@@ -308,6 +308,7 @@ fn poll_until_state(addr: &str, task_id: &str, expected_state: &str, timeout: Du
 
 #[derive(Debug, Clone)]
 struct SseEvent {
+    id: Option<u64>,
     event_type: String,
     data: String,
 }
@@ -391,6 +392,7 @@ fn collect_sse_events_for_message(
     }
 
     let mut events = Vec::new();
+    let mut cur_id = None;
     let mut cur_type = String::new();
     let mut cur_data = String::new();
 
@@ -404,6 +406,7 @@ fn collect_sse_events_for_message(
             if !cur_type.is_empty() && !cur_data.is_empty() {
                 let is_final = cur_type == "status" && cur_data.contains("\"final\":true");
                 events.push(SseEvent {
+                    id: cur_id,
                     event_type: cur_type.clone(),
                     data: cur_data.clone(),
                 });
@@ -411,8 +414,11 @@ fn collect_sse_events_for_message(
                     break;
                 }
             }
+            cur_id = None;
             cur_type.clear();
             cur_data.clear();
+        } else if let Some(rest) = line.strip_prefix("id: ") {
+            cur_id = rest.parse().ok();
         } else if let Some(rest) = line.strip_prefix("event: ") {
             cur_type = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("data: ") {
@@ -778,6 +784,30 @@ fn input_required_sse_emits_state_event() {
         final_event.unwrap().data.contains("\"completed\""),
         "final SSE event should be completed; got: {}",
         final_event.unwrap().data
+    );
+
+    // Every frame on the stream — the agent loop's, the `request-input` wait's `input-required`
+    // and `resumed`, the chunks and the final status — is numbered from the session's one
+    // sequence, which starts at 1 and rises by one per frame.
+    let ids: Vec<u64> = events
+        .iter()
+        .map(|e| {
+            e.id.unwrap_or_else(|| panic!("frame without an id on the stream: {e:?}"))
+        })
+        .collect();
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "event ids should strictly ascend across every frame kind; got {ids:?}"
+    );
+    assert!(
+        ids.iter().all(|id| *id < 1 << 32),
+        "event ids should come from one sequence starting at 1; got {ids:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "status" && e.data.contains("\"resumed\"")),
+        "the stream should carry the resumed status; got events: {events:?}"
     );
 
     handle.join().expect("launch thread should not panic");

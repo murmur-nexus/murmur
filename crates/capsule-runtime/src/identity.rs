@@ -19,9 +19,9 @@ use crate::resource_plane::{
     handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
 };
 use crate::streaming::{
-    format_gap_event, format_lagged_event, format_sse_event, is_final_sse_event, ReplayResult,
-    SseBroadcast, SseEventBuffer, StreamStatus, TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT,
-    SSE_HEARTBEAT_INTERVAL,
+    admit_live_frame, format_gap_event, format_lagged_event, format_unnumbered_sse_event, frame_id,
+    is_final_sse_event, ReplayResult, SseBroadcast, SseEventBuffer, StreamStatus,
+    TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT, SSE_HEARTBEAT_INTERVAL,
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
 
@@ -523,26 +523,13 @@ async fn handle_message_stream(
         return;
     }
 
-    // Replay buffered events for reconnecting clients
+    // Replay buffered events for reconnecting clients. The highest id written is where the live
+    // loop picks up, so a frame both replayed and received live is written once.
+    let mut last_written = None;
     if let Some(last_id) = last_event_id {
-        let replay = sse_buffer.lock().unwrap().replay_from(last_id);
-        let replay_events = match replay {
-            ReplayResult::Complete(events) => events,
-            ReplayResult::WithGap {
-                first_available_id,
-                events,
-            } => {
-                let gap = format_gap_event(first_available_id);
-                if writer.write_all(gap.as_bytes()).await.is_err() {
-                    return;
-                }
-                events
-            }
-        };
-        for event in replay_events {
-            if writer.write_all(event.as_bytes()).await.is_err() {
-                return;
-            }
+        match write_replay(&mut writer, &sse_buffer, last_id).await {
+            Ok(written) => last_written = written,
+            Err(()) => return,
         }
     }
 
@@ -586,9 +573,9 @@ async fn handle_message_stream(
             },
             r#final: true,
         };
-        let data = serde_json::to_string(&rejected_event).unwrap_or_default();
-        let event_text = format_sse_event(0, "status", &data);
-        let _ = writer.write_all(event_text.as_bytes()).await;
+        let _ = writer
+            .write_all(format_rejected_event(&rejected_event).as_bytes())
+            .await;
         return;
     }
 
@@ -630,6 +617,9 @@ async fn handle_message_stream(
             result = rx.recv() => {
                 match result {
                     Ok(event_arc) => {
+                        if !admit_live_frame(&mut last_written, &event_arc) {
+                            continue;
+                        }
                         let is_final = is_final_sse_event(&event_arc);
                         if writer.write_all(event_arc.as_bytes()).await.is_err() {
                             return;
@@ -654,6 +644,44 @@ async fn handle_message_stream(
             }
         }
     }
+}
+
+/// Write the replay of the frames after `last_id` — preceded by a `gap` frame when the buffer
+/// cannot supply all of them — and return the highest id written, or `None` when the replay was
+/// empty. `Err` means the client is gone.
+async fn write_replay(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    sse_buffer: &Mutex<SseEventBuffer>,
+    last_id: u64,
+) -> Result<Option<u64>, ()> {
+    use tokio::io::AsyncWriteExt;
+
+    let replay = sse_buffer.lock().unwrap().replay_from(last_id);
+    let events = match replay {
+        ReplayResult::Complete(events) => events,
+        ReplayResult::WithGap {
+            first_available_id,
+            events,
+        } => {
+            let gap = format_gap_event(first_available_id);
+            writer.write_all(gap.as_bytes()).await.map_err(|_| ())?;
+            events
+        }
+    };
+    let mut last_written = None;
+    for event in events {
+        writer.write_all(event.as_bytes()).await.map_err(|_| ())?;
+        last_written = frame_id(&event).or(last_written);
+    }
+    Ok(last_written)
+}
+
+/// The `rejected` status written to a `message/stream` connection the capsule is too busy to
+/// accept. It goes to that one connection and is never buffered, so it carries no `id:` line:
+/// it has no place in the session's sequence, and an id would move a client's resume cursor.
+fn format_rejected_event(event: &TaskStatusUpdateEvent) -> String {
+    let data = serde_json::to_string(event).unwrap_or_default();
+    format_unnumbered_sse_event("status", &data)
 }
 
 /// Passive observer handler for `stream/watch`.
@@ -692,26 +720,11 @@ async fn handle_stream_watch(
         return;
     }
 
-    let last_id = last_event_id.unwrap_or(0);
-    let replay = sse_buffer.lock().unwrap().replay_from(last_id);
-    let replay_events = match replay {
-        ReplayResult::Complete(events) => events,
-        ReplayResult::WithGap {
-            first_available_id,
-            events,
-        } => {
-            let gap = format_gap_event(first_available_id);
-            if writer.write_all(gap.as_bytes()).await.is_err() {
-                return;
-            }
-            events
-        }
+    let Ok(mut last_written) =
+        write_replay(&mut writer, &sse_buffer, last_event_id.unwrap_or(0)).await
+    else {
+        return;
     };
-    for event in replay_events {
-        if writer.write_all(event.as_bytes()).await.is_err() {
-            return;
-        }
-    }
 
     let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // consume the immediate first tick
@@ -728,6 +741,9 @@ async fn handle_stream_watch(
             result = rx.recv() => {
                 match result {
                     Ok(event_arc) => {
+                        if !admit_live_frame(&mut last_written, &event_arc) {
+                            continue;
+                        }
                         if writer.write_all(event_arc.as_bytes()).await.is_err() {
                             return;
                         }
@@ -999,6 +1015,7 @@ fn handle_session_stop(
 mod tests {
     use super::*;
     use crate::errors::RuntimeError;
+    use crate::streaming::format_sse_event;
 
     const ACCEPTANCES: [TaskAcceptance; 3] = [
         TaskAcceptance::None,
@@ -1020,6 +1037,24 @@ mod tests {
             acceptance,
             planes,
         )
+    }
+
+    #[test]
+    fn rejected_status_carries_no_event_id() {
+        let frame = format_rejected_event(&TaskStatusUpdateEvent {
+            id: "tsk_1".into(),
+            context_id: Some("ctx_1".into()),
+            status: StreamStatus {
+                state: "rejected".into(),
+                message: "task rejected: capsule is busy".into(),
+                response: None,
+            },
+            r#final: true,
+        });
+        assert!(frame.starts_with("event: status\ndata: {"), "{frame}");
+        assert!(!frame.contains("id: "), "{frame}");
+        assert!(frame.contains(r#""state":"rejected""#), "{frame}");
+        assert!(frame.ends_with("\n\n"), "{frame}");
     }
 
     #[test]
@@ -1631,6 +1666,28 @@ mod tests {
             !protocol_page_section(&page, "lagged").contains("Nothing is written in their place"),
             "the Frames a connection misses section ({{ #lagged }}) of {PROTOCOL_PAGE_PATH} says \
              nothing is written for lost frames"
+        );
+    }
+
+    /// The Event ids section states the id a session's first frame takes, and that a replay from
+    /// `0` of an unevicted buffer starts there.
+    #[test]
+    fn protocol_page_first_event_id_is_the_runtimes() {
+        let page = protocol_page();
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let buffer = std::sync::Arc::new(Mutex::new(SseEventBuffer::new(1)));
+        let first = crate::streaming::emit_frame(&tx, &buffer, "status", "{}");
+
+        let phrase = format!("| First id | `{first}` |");
+        assert!(
+            protocol_page_section(&page, "event-ids").contains(&phrase),
+            "the Event ids section ({{ #event-ids }}) of {PROTOCOL_PAGE_PATH} does not say \
+             `{phrase}`; a session's first frame takes id {first}"
+        );
+        let phrase = format!("starting at id `{first}`");
+        assert!(
+            protocol_page_section(&page, "replay").contains(&phrase),
+            "the Replay section ({{ #replay }}) of {PROTOCOL_PAGE_PATH} does not say `{phrase}`"
         );
     }
 
