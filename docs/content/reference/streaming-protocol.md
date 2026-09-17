@@ -118,8 +118,8 @@ written to `trace.jsonl`.
 On `message/stream`, a lost frame may be the `final` status the client is waiting for. The
 connection then stays open until the next `final` status it is delivered, from any task.
 
-A client that needs every frame reconnects and [replays](#replay) instead of trusting a long-lived
-connection to be complete.
+A client that needs every frame reconnects with the id of the last frame it received and
+[replays](#replay) the rest, which recovers them while they are still in the replay buffer.
 
 ---
 
@@ -129,7 +129,7 @@ A frame is a group of lines ending with a blank line (`\n\n`). Lines end with `\
 
 | Line | Form | On |
 |---|---|---|
-| Id | `id: <unsigned 64-bit integer>` | `status`, `artifact`, `text`, `thinking` — see [Event ids](#event-ids) |
+| Id | `id: <unsigned 64-bit integer>` | `status` except `rejected`, `artifact`, `text`, `thinking` — see [Event ids](#event-ids) |
 | Event type | `event: <type>` | Every frame |
 | Data | `data: <JSON object>` | Every frame. Always exactly one line |
 | Comment | `:<text>` | The [heartbeat](#heartbeat). Stands alone between blank lines and is not a frame |
@@ -168,14 +168,14 @@ for input and resumes, and when a task ends.
 | `completed` | `true` | `session ended` |
 | `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out |
 | `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one |
-| `rejected` | `true` | `task rejected: capsule is busy`. Written only to the `message/stream` connection that submitted the task, with `id: 0`, and never buffered |
+| `rejected` | `true` | `task rejected: capsule is busy`. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered |
 
 A `final` status is the last frame a task writes in the ordinary case, with two exceptions that
 keep writing frames for the same task id afterwards:
 
 | After | What follows |
 |---|---|
-| `completed` or `failed`, when an `on-task-end` hook reopens the task ([`lifecycle.max_task_reopens`](manifest.md#field-lifecycle)) | A new attempt: `working` from `inference turn 1`, with ids starting again at `0` |
+| `completed` or `failed`, when an `on-task-end` hook reopens the task ([`lifecycle.max_task_reopens`](manifest.md#field-lifecycle)) | A new attempt: `working` from `inference turn 1`. Its frames continue the session's [id sequence](#event-ids) |
 | `failed` with message `input-timeout` | The tool that asked for input fails, the model receives that failure as an `artifact`, and the task goes on to its own final status |
 
 A task that ends in an error the agent loop does not report — a driver response that is not JSON,
@@ -273,8 +273,9 @@ A piece of the model's reasoning, emitted by a streaming driver or a tool throug
 
 ## `gap` { #event-gap }
 
-Written before a [replay](#replay) whose `Last-Event-ID` is more than one below the id of the
-oldest frame in the replay buffer. The replay that follows is the whole buffer.
+Written before a [replay](#replay) when frames written after the client's `Last-Event-ID` are no
+longer in the replay buffer, or when that id was never issued by this capsule session. The replay
+that follows is the whole buffer.
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|
@@ -389,12 +390,12 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 
 | Frame | Carries `id:` | Id source |
 |---|---|---|
-| `status` from the agent loop (`working` per turn, `completed`, `failed`, `canceled`) | yes | The task's counter |
-| `artifact` | yes | The task's counter |
-| `text`, `thinking` | yes | The chunk counter |
-| `status` `input-required`, `working` `resumed`, `failed` `input-timeout` | yes | The input-wait counter |
-| `status` `canceled` with message `task canceled before it started` | yes | The queued-cancel counter |
-| `status` `rejected` | yes | Always `0` |
+| `status` from the agent loop (`working` per turn, `completed`, `failed`, `canceled`) | yes | The session's sequence |
+| `artifact` | yes | The session's sequence |
+| `text`, `thinking` | yes | The session's sequence |
+| `status` `input-required`, `working` `resumed`, `failed` `input-timeout` | yes | The session's sequence |
+| `status` `canceled` with message `task canceled before it started` | yes | The session's sequence |
+| `status` `rejected` | no | — |
 | `gap` | no | — |
 | `lagged` | no | — |
 | `connection-ack` | no | — |
@@ -402,21 +403,17 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 | `error` | no | — |
 | Heartbeat | no | — |
 
-| Counter | Starts at | Advances |
-|---|---|---|
-| The task's counter | `0`, again for every task and for every reopened attempt of a task | By one per frame |
-| The chunk counter | `4611686018427387903` at launch | By one per chunk. Set to the task's counter before each inference call, and the task's counter is set to it after the call returns, so a task's chunks and its `status` and `artifact` frames share one run of numbers |
-| The input-wait counter | `9223372036854775807`, again for every `request-input` call | By one per frame |
-| The queued-cancel counter | `2305843009213693951` at launch, once per session | By one per frame |
+A capsule session numbers its frames from one sequence:
 
-!!! warning "Ids are labels, not a sequence"
-    Ids are not consecutive across frame kinds and not unique within a session. Two tasks on one
-    capsule write ids `0, 1, 2, …` each, so a session's frames read `0, 1, 2, 0, 1, 2`. Two
-    `request-input` waits both start at `9223372036854775807`. Chunks a tool emits while it runs
-    are numbered from the same value as the `artifact` frames that follow them, and the whole-reply
-    `text` frame is numbered from the same value as the hook artifacts written before it. Never
-    subtract two ids, never read a jump as lost frames, and never read a repeat as a duplicate. A
-    [`lagged`](#event-lagged) frame is what reports live frames a connection lost.
+| Property | Value |
+|---|---|
+| First id | `1` |
+| Next id | Exactly one higher than the previous frame's, across every task, every reopened attempt and every frame kind, in the order frames are written |
+| Uniqueness | Unique within a capsule session. A new session, including one started with `mur run --resume`, starts again at `1` |
+| On one connection | Strictly ascending. A connection never receives the same id twice |
+
+Frames without an id never take a number, so they leave no hole in the sequence. A
+[`lagged`](#event-lagged) frame is what reports live frames a connection lost.
 
 ---
 
@@ -437,27 +434,17 @@ The header name is case-insensitive. A replay from id `N`:
 | Buffer | Written |
 |---|---|
 | Empty | Nothing |
-| The oldest frame's id is greater than `N + 1` | A `gap` frame naming the oldest id, then every frame in the buffer |
-| Otherwise | Every frame in the buffer whose id is greater than `N`, in buffer order |
+| `N` was never issued by this session: it is the id the next frame will take, or higher | A `gap` frame naming the oldest id, then every frame in the buffer |
+| The oldest frame's id is greater than `N + 1`: frames after `N` were evicted | A `gap` frame naming the oldest id, then every frame in the buffer |
+| Otherwise | Every frame in the buffer whose id is greater than `N`, in order |
 
-Because [ids are not unique](#event-ids), the comparison is made against each frame's id, not its
-position, and that has consequences:
+A replay from `0` of a buffer that has evicted nothing is every frame the session has written,
+starting at id `1`. Live frames follow the replay on the same connection, starting after the
+highest id the replay wrote.
 
-- A replay from an id taken from one task writes every earlier or later frame with a higher id —
-  including frames of earlier tasks — and skips every frame of a later task whose id is not
-  higher.
-- A replay from `0`, which is what `stream/watch` does with no header, never includes a frame
-  whose id is `0` — the first `working` status of every task — unless the `gap` branch fires.
-- `gap` depends on ids, not on eviction. A buffer that has evicted frames writes no `gap` when its
-  oldest remaining frame has a low id, and a buffer that has evicted nothing writes one when its
-  oldest frame has a high id, such as a queued task's `canceled` status.
-
-A reconnecting client:
-
-1. De-duplicates on the frame's contents — the task id in `data`, the event type and the id
-   together — not on the id alone.
-2. Treats a `gap` as "frames before this may be gone", and a replay without one as no promise
-   that none are.
+To reconnect, send the id of the last frame received as `Last-Event-ID`. Without a `gap`, the
+replay is exactly the frames written after it, whichever task they belong to. A `gap` means frames
+between that id and `first_available_id` are gone.
 
 ---
 
@@ -482,7 +469,7 @@ client that follows them.
 |---|---|
 | `Last-Event-ID` | Sends `Last-Event-ID: 0`, so it replays the buffer on attach |
 | `id:` lines | Read, only to report where a lost connection stopped |
-| Reconnecting | Does not reconnect, because [ids are not unique](#event-ids) within a session and a replay from one would repeat and skip frames |
+| Reconnecting | Does not reconnect |
 | `status`, `artifact`, `text` | Printed to stdout |
 | `thinking` | Not shown |
 | `connection-ack` | Read for `conversation_mode`, which sets how `status` lines are labelled |
