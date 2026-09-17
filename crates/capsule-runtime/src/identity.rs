@@ -1669,6 +1669,28 @@ mod tests {
         );
     }
 
+    /// The Event ids section states the id a session's first frame takes, and that a replay from
+    /// `0` of an unevicted buffer starts there.
+    #[test]
+    fn protocol_page_first_event_id_is_the_runtimes() {
+        let page = protocol_page();
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let buffer = std::sync::Arc::new(Mutex::new(SseEventBuffer::new(1)));
+        let first = crate::streaming::emit_frame(&tx, &buffer, "status", "{}");
+
+        let phrase = format!("| First id | `{first}` |");
+        assert!(
+            protocol_page_section(&page, "event-ids").contains(&phrase),
+            "the Event ids section ({{ #event-ids }}) of {PROTOCOL_PAGE_PATH} does not say \
+             `{phrase}`; a session's first frame takes id {first}"
+        );
+        let phrase = format!("starting at id `{first}`");
+        assert!(
+            protocol_page_section(&page, "replay").contains(&phrase),
+            "the Replay section ({{ #replay }}) of {PROTOCOL_PAGE_PATH} does not say `{phrase}`"
+        );
+    }
+
     /// The Replay section states `SSE_REPLAY_CAPACITY` as the number of frames a session keeps.
     #[test]
     fn protocol_page_replay_capacity_is_the_runtime_capacity() {

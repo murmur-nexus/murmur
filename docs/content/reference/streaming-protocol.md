@@ -442,9 +442,11 @@ A replay from `0` of a buffer that has evicted nothing is every frame the sessio
 starting at id `1`. Live frames follow the replay on the same connection, starting after the
 highest id the replay wrote.
 
-To reconnect, send the id of the last frame received as `Last-Event-ID`. Without a `gap`, the
-replay is exactly the frames written after it, whichever task they belong to. A `gap` means frames
-between that id and `first_available_id` are gone.
+To reconnect, send the id of the last frame received as `Last-Event-ID` — a browser `EventSource`
+does this on its own, from the `id:` lines. Without a `gap`, the replay is exactly the frames
+written after that id, whichever task they belong to. With one, the frames between that id and
+`first_available_id` are gone, or the id came from an earlier capsule session, whose ids this
+session numbers again from `1`.
 
 ---
 

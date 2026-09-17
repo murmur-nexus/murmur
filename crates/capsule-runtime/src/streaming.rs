@@ -177,7 +177,10 @@ pub(crate) enum ReplayResult {
 
 /// Format a gap SSE event indicating that buffered history starts at `first_available_id`.
 pub(crate) fn format_gap_event(first_available_id: u64) -> String {
-    format!("event: gap\ndata: {{\"first_available_id\":{first_available_id}}}\n\n")
+    format_unnumbered_sse_event(
+        "gap",
+        &format!("{{\"first_available_id\":{first_available_id}}}"),
+    )
 }
 
 /// Format the frame telling one SSE connection it lost `missed` live frames.
@@ -199,6 +202,9 @@ pub(crate) fn format_lagged_event(missed: u64) -> String {
 pub(crate) struct SseEventBuffer {
     events: VecDeque<(u64, Arc<String>)>,
     capacity: usize,
+    /// Starts at `1`, not `0`: replay writes frames with an id strictly greater than the
+    /// client's `Last-Event-ID`, and `0` is the cursor for "from the start", so a frame numbered
+    /// `0` could never be replayed.
     next_id: u64,
 }
 

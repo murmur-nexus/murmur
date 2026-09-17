@@ -7,291 +7,130 @@
 mod common;
 
 use std::{
-    collections::HashSet,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::Write,
     net::TcpStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use capsule_runtime::{
-    capability_policy_from_runtime_manifest, launch_session, stage_session, AfterTask,
-    ArtifactRequest, LifecycleConfig, StageRequest, TaskAcceptance,
+use common::idle_capsule::{
+    end_turn, end_turn_server, end_turns, http_post_json, launch_idle_capsule,
+    launch_idle_capsule_with, open_watch, read_lines_until, sse_body, submit_task,
+    wait_for_task_ends, IdleCapsule, LineReader,
 };
-use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, LocalRegistry};
 use serde_json::Value;
-use tempfile::TempDir;
 
-const DRIVER_NAME: &str = "murmur-driver-anthropic";
-const DRIVER_VERSION: &str = "0.1.4";
+const TOOL_NAME: &str = "request-input-tool";
+const TOOL_VERSION: &str = "0.1.0";
+const REOPEN_HOOK_NAME: &str = "reopen-every-task";
 
-// ── capsule staging ────────────────────────────────────────────────────────────
+// ── capsule ────────────────────────────────────────────────────────────────────
 
-fn end_turn_server(texts: &[&str]) -> common::ScriptedServer {
-    let responses = texts
-        .iter()
-        .enumerate()
-        .map(|(i, text)| {
-            serde_json::json!({
-                "id": format!("msg_{}", i + 1),
-                "type": "message",
-                "role": "assistant",
-                "model": "test-model",
-                "content": [{"type": "text", "text": text}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })
-            .to_string()
-        })
-        .collect();
-    common::ScriptedServer::start(responses)
+fn request_input_call(n: usize) -> String {
+    serde_json::json!({
+        "id": format!("msg_{n}"),
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{
+            "type": "tool_use",
+            "id": "call_1",
+            "name": TOOL_NAME,
+            "input": {"data": "Which option?"}
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
 }
 
-fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
-    let home = tempfile::tempdir().unwrap();
-    let artifacts = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-
-    let driver_artifact = common::create_driver_artifact(
-        artifacts.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver_artifact).success();
-
-    fs::write(
-        project.path().join("murmur.yaml"),
-        format!(
-            "name: event-id-cursor-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
-        ),
+fn create_tool_artifact(dir: &Path) -> PathBuf {
+    let artifact_path = dir.join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
+    let mut zip = zip::ZipWriter::new(fs::File::create(&artifact_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("murmur.yaml", options).unwrap();
+    write!(
+        zip,
+        "name: {TOOL_NAME}\nversion: {TOOL_VERSION}\nruntime: wasm\n"
     )
     .unwrap();
-
-    (home, project.keep().join("murmur.yaml"))
-}
-
-fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedSession {
-    let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
-    let mut allowlisted_tools = HashSet::new();
-    let mut requested_artifacts = Vec::new();
-
-    for artifact in &runtime_manifest.artifacts {
-        if matches!(artifact.runtime, ArtifactRuntime::Tool) {
-            allowlisted_tools.insert(artifact.name.clone());
-        }
-        requested_artifacts.push(ArtifactRequest {
-            name: artifact.name.clone(),
-            version: artifact.version.clone(),
-            runtime: artifact.runtime.clone(),
-            source: artifact.source.clone(),
-            on_overflow: artifact.on_overflow,
-            config: artifact.config.clone(),
-            capabilities: artifact.capabilities.clone(),
-        });
-    }
-
-    let local_registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
-    stage_session(
-        std::sync::Arc::new(local_registry),
-        StageRequest {
-            credentials_file: None,
-            manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
-            capsule_name: runtime_manifest.name.clone(),
-            capsule_version: runtime_manifest.version.clone(),
-            capsule_component_bytes: Vec::new(),
-            artifacts: requested_artifacts,
-            allowlisted_tools,
-            lock_expectations: None,
-            capability_policy: capability_policy_from_runtime_manifest(&runtime_manifest),
-            inference: runtime_manifest.inference.clone(),
-            system_prompt_overridden: false,
-            context: runtime_manifest.context.clone(),
-            context_id: None,
-            resume: None,
-            otel_endpoint: None,
-            eval_config_json: None,
-            case_id: None,
-            dataset_id: None,
-            // queue + sleep: the capsule never exits on its own, so it can be left idle.
-            lifecycle: Some(LifecycleConfig {
-                task_acceptance: TaskAcceptance::Queue,
-                after_task: AfterTask::Sleep,
-                queue_depth: 2,
-                input_timeout_secs: None,
-                ..Default::default()
-            }),
-            lifecycle_override: None,
-            trace: None,
-            workdir: None,
-            bind_addr: "127.0.0.1".to_string(),
-            internal_port: None,
-            declared_containment_floor: ContainmentClass::Advisory,
-            exports: None,
-            spawn_grant: None,
-            machine_tokens_per_day: None,
-        },
+    zip.start_file("tool.wasm", options).unwrap();
+    zip.write_all(
+        &fs::read(common::fixture_path(
+            "input-required/tool/request-input-tool.wasm",
+        ))
+        .unwrap(),
     )
-    .unwrap()
+    .unwrap();
+    zip.finish().unwrap();
+    artifact_path
 }
 
-/// A launched, idle queue+sleep capsule: its address and its workdir.
-struct IdleCapsule {
-    url: String,
-    workdir: PathBuf,
-    _home: TempDir,
-    _server: common::ScriptedServer,
-}
-
-fn launch_idle_capsule(replies: &[&str]) -> IdleCapsule {
-    let server = end_turn_server(replies);
-    let (home, manifest_path) = setup_agent_project(&server.endpoint);
-    let staged = stage_agent(&home, &manifest_path);
-    let workdir = staged.workdir.clone();
-
-    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
-    // The capsule never exits in queue+sleep, so the join handle is deliberately dropped.
-    std::thread::spawn(move || {
-        launch_session(staged, move |url| {
-            let _ = url_tx.send(url.to_string());
-        })
-        .expect("launch should succeed")
-    });
-    let url = url_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("timed out waiting for capsule_url");
-
-    IdleCapsule {
-        url,
-        workdir,
-        _home: home,
-        _server: server,
-    }
-}
-
-// ── raw SSE reading ────────────────────────────────────────────────────────────
-
-/// Open a `stream/watch` connection and return the socket, positioned at the first byte
-/// of the SSE body.
-fn open_watch(addr: &str, last_event_id: u64) -> TcpStream {
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}"#;
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nLast-Event-ID: {last_event_id}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
-        body.len()
-    );
-
-    let stream = TcpStream::connect(addr).expect("should connect to capsule");
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .unwrap();
-    (&stream).write_all(request.as_bytes()).unwrap();
-    (&stream).flush().unwrap();
-    stream
-}
-
-/// Read raw bytes until `deadline`, returning every complete line with the moment it arrived.
-fn read_lines_until(stream: &TcpStream, deadline: Instant) -> Vec<(Instant, String)> {
-    let mut source: &TcpStream = stream;
-    let mut lines = Vec::new();
-    let mut pending: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 4096];
-
-    while Instant::now() < deadline {
-        match source.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let now = Instant::now();
-                pending.extend_from_slice(&buf[..n]);
-                while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                    let raw: Vec<u8> = pending.drain(..=pos).collect();
-                    let text = String::from_utf8_lossy(&raw[..raw.len() - 1])
-                        .trim_end_matches('\r')
-                        .to_string();
-                    lines.push((now, text));
-                }
-            }
-            // A read timeout is the normal case on an idle stream.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => break,
-        }
-    }
-    lines
-}
-
-/// Drop the HTTP status line and headers, returning only the SSE body lines.
-fn sse_body(lines: &[(Instant, String)]) -> Vec<(Instant, String)> {
-    let mut iter = lines.iter();
-    for (_, line) in iter.by_ref() {
-        if line.is_empty() {
-            break;
-        }
-    }
-    iter.cloned().collect()
-}
-
-// ── task submission ────────────────────────────────────────────────────────────
-
-fn http_post_json(addr: &str, body: &str) -> Value {
-    let mut stream = TcpStream::connect(addr).expect("should connect");
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
-
-    let mut reader = BufReader::new(&stream);
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-    let mut response_body = String::new();
-    reader.read_to_string(&mut response_body).ok();
-    serde_json::from_str(&response_body)
-        .unwrap_or_else(|_| serde_json::json!({"_raw": response_body}))
-}
-
-fn submit_task(addr: &str, message_id: &str, text: &str) {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "message/send",
-        "params": {
-            "message": {
-                "messageId": message_id,
-                "role": "user",
-                "parts": [{"text": text}]
-            }
-        }
+/// Launch a capsule that also declares `request-input-tool` and an `on-task-end` hook that reopens
+/// every task, once each under the default `lifecycle.max_task_reopens`.
+fn launch_with_input_tool_and_reopen_hook(server: common::ScriptedServer) -> IdleCapsule {
+    launch_idle_capsule_with(server, |home, dir| {
+        common::publish_local(home, &create_tool_artifact(dir)).success();
+        let hook = common::hook_wat::create_hook_zip(
+            dir,
+            REOPEN_HOOK_NAME,
+            "on-task-end",
+            "reopen-task",
+            &common::hook_wat::reopen_task_hook_wasm("once more"),
+        );
+        common::publish_local(home, &hook).success();
+        format!(
+            "  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: {REOPEN_HOOK_NAME}\n    version: 0.1.0\n    runtime: hook\n"
+        )
     })
-    .to_string();
-    let response = http_post_json(addr, &body);
-    assert_eq!(
-        response["result"]["status"]["state"], "submitted",
-        "task should be submitted; got: {response}"
-    );
 }
 
-fn wait_for_task_ends(workdir: &Path, expected: usize) {
+// ── tasks and trace ────────────────────────────────────────────────────────────
+
+fn rpc(addr: &str, method: &str, params: Value) -> Value {
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    http_post_json(addr, &body.to_string())
+}
+
+fn wait_for_state(addr: &str, task_id: &str, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let trace = fs::read_to_string(workdir.join("trace.jsonl")).unwrap_or_default();
-        if trace.lines().filter(|l| l.contains("\"task_end\"")).count() >= expected {
+        let response = rpc(addr, "tasks/get", serde_json::json!({"id": task_id}));
+        if response["result"]["status"]["state"] == expected {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {expected} task(s) to finish; trace:\n{trace}"
+            "timed out waiting for {task_id} to reach {expected}; last: {response}"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The session trace's records of `event_type`.
+fn trace_records(workdir: &Path, event_type: &str) -> Vec<Value> {
+    fs::read_to_string(workdir.join("trace.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["event_type"] == event_type)
+        .collect()
+}
+
+/// Wait until the trace holds `task_id`'s `task_end`.
+fn wait_for_task_end(workdir: &Path, task_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !trace_records(workdir, "task_end")
+        .iter()
+        .any(|record| record["task_id"] == task_id)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {task_id} to end"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -344,7 +183,7 @@ fn frames(body: &[(Instant, String)]) -> Vec<Frame> {
 /// Launch a capsule, run two tasks to completion and return it with the full replay a watcher
 /// attached with `Last-Event-ID: 0` receives.
 fn two_tasks_replayed() -> (IdleCapsule, Vec<Frame>) {
-    let capsule = launch_idle_capsule(&["first reply", "second reply"]);
+    let capsule = launch_idle_capsule(end_turn_server(&["first reply", "second reply"]));
     submit_task(&capsule.url, "event-id-cursor-1", "first task");
     wait_for_task_ends(&capsule.workdir, 1);
     submit_task(&capsule.url, "event-id-cursor-2", "second task");
@@ -380,6 +219,27 @@ fn task_order(frames: &[Frame]) -> Vec<String> {
         }
     }
     order
+}
+
+/// Read numbered and unnumbered frames from `conn` until `done` holds for what has arrived, or
+/// 30 s pass.
+fn read_frames_until(conn: &TcpStream, done: impl Fn(&[Frame]) -> bool) -> Vec<Frame> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut reader = LineReader::new(conn);
+    let mut lines = Vec::new();
+    loop {
+        lines.extend(reader.read_until(Instant::now() + Duration::from_millis(250)));
+        let got = frames(&sse_body(&lines));
+        if done(&got) || Instant::now() >= deadline {
+            return got;
+        }
+    }
+}
+
+fn is_final_status_of(frame: &Frame, task_id: &str) -> bool {
+    frame.event == "status"
+        && frame.task_id().as_deref() == Some(task_id)
+        && frame.data.contains(r#""final":true"#)
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -495,4 +355,171 @@ fn resume_from_first_task_cursor() {
             .all(|f| f.task_id().as_deref() != Some(tasks[0].as_str())),
         "the resumed replay should include no frame of the first task; frames were {resumed:#?}"
     );
+}
+
+/// A client that drops its connection mid-task and reconnects with the last id it saw, while a
+/// later task is running, receives every frame written after that id exactly once — the rest of
+/// the first task and the later task, replayed and then live — and nothing written before it.
+#[test]
+fn reconnect_mid_task_receives_every_later_frame_once() {
+    if common::skip_without_host_support("reconnect_mid_task_receives_every_later_frame_once") {
+        return;
+    }
+    // Each reply takes 2 s, so both the disconnect and the reconnect land inside a task.
+    let capsule = launch_idle_capsule(common::ScriptedServer::start_with_delay(
+        end_turns(&["first reply", "second reply"]),
+        Duration::from_secs(2),
+    ));
+    let first = submit_task(&capsule.url, "event-id-mid-1", "first task");
+
+    let dropped = open_watch(&capsule.url, 0);
+    let before = read_frames_until(&dropped, |got| got.iter().any(|f| f.id.is_some()));
+    drop(dropped);
+    let last_seen = before
+        .iter()
+        .filter_map(|f| f.id)
+        .next_back()
+        .unwrap_or_else(|| panic!("no numbered frame before the disconnect: {before:#?}"));
+    assert!(
+        !before.iter().any(|f| is_final_status_of(f, &first)),
+        "the connection should drop mid-task; frames were {before:#?}"
+    );
+
+    let second = submit_task(&capsule.url, "event-id-mid-2", "second task");
+    wait_for_task_end(&capsule.workdir, &first);
+    wait_for_state(&capsule.url, &second, "working");
+
+    let resumed_conn = open_watch(&capsule.url, last_seen);
+    let resumed = read_frames_until(&resumed_conn, |got| {
+        got.iter().any(|f| is_final_status_of(f, &second))
+    });
+    assert!(
+        trace_records(&capsule.workdir, "task_end").len() == 2,
+        "the second task should have finished while the client was reconnected"
+    );
+    let resumed: Vec<Frame> = resumed
+        .into_iter()
+        .filter(|f| f.event != "connection-ack")
+        .collect();
+    assert!(
+        resumed.iter().all(|f| f.event != "gap"),
+        "nothing was evicted, so no gap; frames were {resumed:#?}"
+    );
+
+    let everything = watch_frames(&capsule.url, 0);
+    let expected: Vec<Frame> = everything
+        .iter()
+        .filter(|f| f.id.is_some_and(|id| id > last_seen))
+        .cloned()
+        .collect();
+    assert_eq!(
+        resumed, expected,
+        "the reconnected client should receive exactly the frames after id {last_seen}, once each"
+    );
+    assert!(
+        resumed.iter().any(|f| is_final_status_of(f, &first))
+            && resumed
+                .iter()
+                .any(|f| f.task_id().as_deref() == Some(second.as_str())
+                    && f.data.contains(r#""state":"working""#)),
+        "the rest of the first task and the start of the second should both arrive; frames were {resumed:#?}"
+    );
+}
+
+/// One session holding two tasks that each reopen once, a `request-input` wait and a queued
+/// task cancelled before it started numbers every frame from one sequence: `1..=n`, no repeat, no
+/// jump.
+#[test]
+fn every_kind_of_frame_shares_one_sequence() {
+    if common::skip_without_host_support("every_kind_of_frame_shares_one_sequence") {
+        return;
+    }
+    // The first reply is delayed so the queued task is submitted and cancelled while the first
+    // task is still in inference, not while it waits for input.
+    let capsule = launch_with_input_tool_and_reopen_hook(common::ScriptedServer::start_with_delay(
+        vec![
+            request_input_call(1),
+            end_turn(2, "first task"),
+            end_turn(3, "first task, reopened"),
+            end_turn(4, "third task"),
+            end_turn(5, "third task, reopened"),
+        ],
+        Duration::from_millis(500),
+    ));
+
+    let first = submit_task(&capsule.url, "event-id-all-1", "first task");
+    let queued = submit_task(&capsule.url, "event-id-all-2", "cancelled while queued");
+    let canceled = rpc(
+        &capsule.url,
+        "tasks/cancel",
+        serde_json::json!({"id": queued}),
+    );
+    assert_eq!(
+        canceled["result"]["status"]["state"], "canceled",
+        "the queued task should cancel; got {canceled}"
+    );
+
+    wait_for_state(&capsule.url, &first, "input-required");
+    let input = rpc(
+        &capsule.url,
+        "message/send",
+        serde_json::json!({"message": {"messageId": "event-id-all-input", "role": "user", "parts": [{"text": "option A"}]}}),
+    );
+    assert!(
+        input["result"]["id"] == first.as_str(),
+        "the reply should go to the waiting task; got {input}"
+    );
+    wait_for_task_end(&capsule.workdir, &first);
+
+    let third = submit_task(&capsule.url, "event-id-all-3", "third task");
+    wait_for_task_end(&capsule.workdir, &third);
+
+    let reopened = trace_records(&capsule.workdir, "task_reopened");
+    assert_eq!(
+        reopened.len(),
+        2,
+        "each task should reopen once: {reopened:?}"
+    );
+
+    let replay = watch_frames(&capsule.url, 0);
+    let ids: Vec<u64> = replay
+        .iter()
+        .map(|f| {
+            f.id.unwrap_or_else(|| panic!("replayed frame without an id: {f:?}"))
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=ids.len() as u64).collect::<Vec<_>>(),
+        "ids should be exactly 1..=n across every task and frame kind; frames were {replay:#?}"
+    );
+
+    let has = |task: &str, needle: &str| {
+        replay
+            .iter()
+            .any(|f| f.task_id().as_deref() == Some(task) && f.data.contains(needle))
+    };
+    for (task, needle) in [
+        (&first, r#""state":"input-required""#),
+        (&first, r#""message":"resumed""#),
+        (&queued, "task canceled before it started"),
+    ] {
+        assert!(
+            has(task, needle),
+            "expected a frame of {task} carrying {needle}; frames were {replay:#?}"
+        );
+    }
+    for task in [&first, &third] {
+        let attempts = replay
+            .iter()
+            .filter(|f| {
+                f.task_id().as_deref() == Some(task.as_str())
+                    && f.data.contains(r#""message":"inference turn 1""#)
+            })
+            .count();
+        assert_eq!(
+            attempts, 2,
+            "{task} should start two attempts; frames were {replay:#?}"
+        );
+    }
 }
