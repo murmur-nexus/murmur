@@ -885,7 +885,7 @@ pub(crate) async fn run_agent_loop(
                         .and_then(Value::as_str)
                         .unwrap_or("driver returned error")
                         .to_string();
-                    eprintln!("inference error from driver: {error}");
+                    crate::runtime_err!("inference error from driver: {error}");
                     error
                 }
             };
@@ -966,7 +966,7 @@ pub(crate) async fn run_agent_loop(
                     .await;
                 }
                 if let Err(CompactionFailure::Hook(error)) = compacted {
-                    eprintln!("compaction failed: {error}");
+                    crate::runtime_err!("compaction failed: {error}");
                     record_result(hooks, workdir, &format!("error: {error}"))
                         .map_err(RuntimeError::AgentLoopFailed)?;
                     flush_hook_dispatch_faults(hooks, trace).await;
@@ -1386,7 +1386,7 @@ pub(crate) async fn run_agent_loop(
                 // nothing is retried. What the turn leaves behind is a fragment, and every
                 // surface that carries the result says so.
                 let cap = run_config.max_output_tokens;
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] warning[{W_RUN_001}]: {} ({})",
                     truncation_warning_message(cap),
                     runtime_warning_link(W_RUN_001)
@@ -1412,7 +1412,7 @@ pub(crate) async fn run_agent_loop(
             }
             other => {
                 let error = format!("error: unsupported stop_reason '{other}'");
-                eprintln!("{error}");
+                crate::runtime_err!("{error}");
                 record_result(hooks, workdir, &error).map_err(RuntimeError::AgentLoopFailed)?;
                 flush_hook_dispatch_faults(hooks, trace).await;
                 otel.emit_session_end("failed").await;
@@ -2009,11 +2009,12 @@ pub(crate) async fn record_demotion(
     else {
         return;
     };
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] could not record the demotion of shell command {} ({}) in trace.jsonl \
          ({error}); the command keeps running in the background and its loss will not be \
          reportable on a later resume",
-        detached.work_id, detached.binary
+        detached.work_id,
+        detached.binary
     );
     let _ = trace
         .write_shell_detach_unrecorded(

@@ -252,7 +252,7 @@ pub(crate) async fn serve_http(
                         });
                     }
                     Err(e) => {
-                        eprintln!("[capsule-runtime] HTTP accept error: {e}");
+                        crate::runtime_err!("[capsule-runtime] HTTP accept error: {e}");
                         break true;
                     }
                 }
@@ -630,7 +630,7 @@ async fn handle_message_stream(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[capsule-runtime] SSE broadcast lagged by {n} events");
+                        crate::runtime_err!("[capsule-runtime] SSE broadcast lagged by {n} events");
                         if writer
                             .write_all(format_lagged_event(n).as_bytes())
                             .await
@@ -756,7 +756,7 @@ async fn handle_stream_watch(
                         return;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
+                        crate::runtime_err!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
                         if writer
                             .write_all(format_lagged_event(n).as_bytes())
                             .await
@@ -1012,6 +1012,7 @@ fn handle_session_stop(
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
     use crate::errors::RuntimeError;

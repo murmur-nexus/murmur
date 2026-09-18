@@ -355,7 +355,7 @@ pub fn warn_on_unreachable_toolchain_helpers(
     let report = unreachable_toolchain_helpers_in(policy, declared_floor, &host_path_dirs());
     for warning in &report.uncovered {
         let link = security_warning_link(W_SEC_012);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_012}]: capabilities.shell.allow grants the compiler \
              driver '{}', but its helper '{}' at {} has no grant carrying the Landlock Execute \
              right under the 'sealed' composed root — the fixed sealed runtime tree ({}) is bound \
@@ -377,7 +377,7 @@ pub fn warn_on_unreachable_toolchain_helpers(
     }
     for unprobed in &report.unprobed {
         let link = security_warning_link(W_SEC_029);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_029}]: capabilities.shell.allow grants the compiler \
              driver '{}', but running {} -print-prog-name=<helper> failed ({}), so W-SEC-012 was \
              not evaluated for its helpers [{}] and they may have no Execute grant under the \

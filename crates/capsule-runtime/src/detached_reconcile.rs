@@ -54,7 +54,7 @@ pub(crate) async fn reconcile_prior_session(
     context_id: &str,
 ) -> Option<LostReport> {
     if !is_session_directory_name(from_session) {
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] resumed-from session {from_session:?} is not a session directory \
              name; background work it left unaccounted is not reported"
         );
@@ -64,7 +64,7 @@ pub(crate) async fn reconcile_prior_session(
     let contents = match std::fs::read_to_string(&trace_path) {
         Ok(contents) => contents,
         Err(error) => {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] could not read {} ({error}); background work session \
                  {from_session} left unaccounted is not reported",
                 trace_path.display()
@@ -90,7 +90,7 @@ pub(crate) async fn reconcile_prior_session(
     {
         Ok(appender) => appender,
         Err(error) => {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] could not append to {} ({error}); the {} background command(s) \
                  session {from_session} left unaccounted are not reported",
                 trace_path.display(),
@@ -106,7 +106,7 @@ pub(crate) async fn reconcile_prior_session(
             .write_shell_lost(&work, this_session_id, &task_id)
             .await
         {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] could not mark background command {} of session \
                  {from_session} as lost ({error}); it is not reported",
                 work.work_id

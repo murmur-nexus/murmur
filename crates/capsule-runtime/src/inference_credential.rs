@@ -293,7 +293,7 @@ impl InferenceCredential {
         let (value, change) = self.refresh_locked(after_rejection);
         if let Some(change) = change {
             if let CredentialChange::Unreadable { reason } = change {
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] warning: the inference credential {} could not be read \
                      ({reason}); the value read before stays in use",
                     self.source.label()
@@ -406,8 +406,8 @@ impl InferenceCredential {
     pub(crate) fn report_rejection(&self) -> Option<String> {
         let rejection = self.take_rejection()?;
         let message = self.rejection_message(rejection);
-        eprintln!("error[{E_RUN_027}]: {message}");
-        eprintln!("  hint: {}", self.rejection_hint());
+        crate::runtime_err!("error[{E_RUN_027}]: {message}");
+        crate::runtime_err!("  hint: {}", self.rejection_hint());
         Some(message)
     }
 
@@ -430,6 +430,7 @@ impl InferenceCredential {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use std::sync::atomic::Ordering;
 

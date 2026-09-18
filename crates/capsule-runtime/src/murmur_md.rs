@@ -67,7 +67,7 @@ pub(crate) fn write_murmur_md(
         identity,
     );
     if let Err(err) = fs::write(workdir.join("MURMUR.md"), &content) {
-        eprintln!("warning: failed to write MURMUR.md: {err}");
+        crate::runtime_err!("warning: failed to write MURMUR.md: {err}");
     }
 }
 

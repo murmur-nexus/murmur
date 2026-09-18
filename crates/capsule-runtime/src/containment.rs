@@ -1006,6 +1006,7 @@ fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use super::*;
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant, StagedRuntimeGrant};

@@ -259,7 +259,7 @@ pub(crate) fn io_max_warning(report: &IoMaxReport) -> Option<(&'static str, Stri
 pub(crate) fn warn_for_unenforced_io_max(workdir: &Path, report: &IoMaxReport) {
     if let Some((code, message)) = io_max_warning(report) {
         let link = murmur_artifact::security_warning_link(code);
-        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
         crate::agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{code}]: {message} ({link})"),
@@ -467,7 +467,7 @@ impl Drop for CgroupScope {
             return;
         }
         if let Err(error) = std::fs::remove_dir(&self.path) {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] note: could not remove cgroup scope {} ({error}); \
                  it will be reclaimed once its last task exits",
                 self.path.display()
@@ -1356,7 +1356,7 @@ pub fn skip_without_host_support(test_name: &str) -> bool {
         return true;
     }
     if !cgroup_delegation_available() {
-        eprintln!(
+        crate::runtime_err!(
             "[SKIP-HOST] {test_name}: this host cannot delegate a cgroup v2 scope, so a capsule \
              that can spawn native subprocesses refuses to launch with E-RUN-012 before anything \
              this test observes happens -- see \

@@ -336,7 +336,7 @@ pub(crate) fn resolve_network_allowlist_ips(
             // Skipped like any other host that contributed no address, but said out loud: a
             // resolver that did not answer is a transient condition an operator can act on,
             // where a name that does not exist is a manifest to correct.
-            crate::dns_resolver::Resolution::DidNotAnswer(reason) => eprintln!(
+            crate::dns_resolver::Resolution::DidNotAnswer(reason) => crate::runtime_err!(
                 "[capsule-runtime] warning: the network allowlist host '{host}' could not be \
                  resolved at launch: {reason} (a subprocess reaching it by literal address is \
                  denied for this run)"
@@ -2133,7 +2133,7 @@ pub(crate) fn warn_for_missing_aggregate_bounding(
         aggregate_bounding_warning(is_linux, requires_bounding, has_scope)
     {
         let link = security_warning_link(code);
-        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
         crate::agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{code}]: {message} ({link})"),
@@ -2149,7 +2149,7 @@ pub(crate) fn warn_for_enforcement_tier(
 ) {
     if let Some((code, message)) = tier_warning(tier, policy.shell_allow.is_empty()) {
         let link = security_warning_link(code);
-        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
         crate::agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{code}]: {message} ({link})"),
@@ -4127,7 +4127,7 @@ mod linux_enforce {
         let sockets = match crate::network_namespace::receive_namespace_sockets(sock_fd, expected) {
             Ok(sockets) => sockets,
             Err(error) => {
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] warning: failed to receive the capsule's network \
                      namespace sockets: {error} (the subprocess spawn reports the underlying \
                      pre_exec failure independently)"
@@ -4138,7 +4138,7 @@ mod linux_enforce {
         match crate::egress_proxy::start_egress_proxy(sockets, policy) {
             Ok(proxy) => Some(proxy),
             Err(error) => {
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] warning: failed to serve the capsule's network namespace \
                      sockets: {error} (the subprocess tree has no route off this host, so its \
                      network calls fail closed)"
@@ -4159,6 +4159,7 @@ mod linux_enforce {
     /// rest of the test binary and to everything it spawns. Every load happens in a forked child
     /// that does nothing else and then `_exit`s.
     #[cfg(test)]
+    #[allow(clippy::print_stdout, clippy::print_stderr)]
     mod seccomp_budget {
         use std::io;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -6377,6 +6378,7 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod landlock_probe_isolation {
     /// The Landlock probe must leave the calling process exactly as it found it.
     ///
@@ -6405,6 +6407,7 @@ mod landlock_probe_isolation {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod linux_integration_tests {
     use std::path::Path;
 

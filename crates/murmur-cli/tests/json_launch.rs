@@ -529,3 +529,186 @@ fn json_launch_workdir_flag_is_reflected() {
         murmur_dir.display()
     );
 }
+
+// ── A supervisor that stops reading ───────────────────────────────────────────
+//
+// `mur run --json` writes one readiness line and the supervisor that asked for it is entitled to
+// stop reading there. The write then fails with `EPIPE`, because Rust leaves `SIGPIPE` at
+// `SIG_IGN`. A bare `println!` panics on that error, and the release profile's `panic = "abort"`
+// turns the panic into `SIGABRT` at the print site — the capsule dies the instant it succeeded.
+//
+// `cargo test` builds the `dev` profile, where a panic unwinds instead: the same defect shows up
+// as exit status 101 and `panicked at` on stderr. These tests assert on both shapes — a clean
+// exit code, no terminating signal, and no panic text — so they catch it under either profile.
+
+/// Launch `mur run --json` as a live child with both streams piped.
+fn spawn_json_run(
+    home: &TempDir,
+    manifest_path: &Path,
+    task_file: &Path,
+    workdir: Option<&Path>,
+) -> std::process::Child {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"));
+    command
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--task",
+            task_file.to_str().unwrap(),
+        ]);
+    if let Some(dir) = workdir {
+        command.args(["--workdir", dir.to_str().unwrap()]);
+    }
+    command
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mur should spawn")
+}
+
+/// Drain a piped stream on its own thread, so the child never blocks on a full pipe.
+fn drain_on_thread(stream: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let mut reader = BufReader::new(stream);
+        let mut chunk = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut chunk).ok();
+        text.push_str(&String::from_utf8_lossy(&chunk));
+        text
+    })
+}
+
+/// The whole claim: the session ended on its own terms, not at a print.
+fn assert_capsule_survived(status: std::process::ExitStatus, stderr: &str) {
+    assert!(
+        !stderr.contains("panicked at"),
+        "a write failure must not panic; child stderr was:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("failed printing to stdout"),
+        "a write failure must not reach the `println!` panic path; child stderr was:\n{stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            None,
+            "the capsule must not be killed by a signal (SIGABRT means the print aborted the \
+             process); child stderr was:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the session should exit 0; child stderr was:\n{stderr}"
+    );
+}
+
+/// S1: a supervisor reads the readiness line, stops reading, and the capsule lives.
+#[test]
+fn json_launch_survives_a_supervisor_that_stops_reading_stdout() {
+    let server = end_turn_server("supervisor stops reading");
+    let inputs = tempfile::tempdir().unwrap();
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let task_file = inputs.path().join("task.md");
+    fs::write(&task_file, "supervisor stops reading").unwrap();
+
+    let mut child = spawn_json_run(&home, &manifest_path, &task_file, None);
+    let stderr = drain_on_thread(child.stderr.take().expect("stderr should be piped"));
+
+    let readiness_line = {
+        let mut reader = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("the readiness line should arrive");
+        line
+        // `reader` is dropped here, closing this end of the pipe: every later write from the
+        // capsule to stdout fails with `EPIPE`.
+    };
+
+    let status = child.wait().expect("mur should exit");
+    let stderr = stderr.join().expect("stderr drain should not panic");
+    assert_capsule_survived(status, &stderr);
+
+    let parsed: Value = serde_json::from_str(readiness_line.trim())
+        .expect("the readiness line should parse as JSON");
+    assert!(
+        !parsed["url"].as_str().unwrap_or("").is_empty(),
+        "the readiness line should carry a non-empty url; got: {parsed}"
+    );
+}
+
+/// S2: the reader is gone before the line is written, and the session still runs to completion.
+#[test]
+fn json_launch_survives_a_reader_that_never_reads() {
+    let server = end_turn_server("reader never reads");
+    let inputs = tempfile::tempdir().unwrap();
+    let user_workdir = tempfile::tempdir().unwrap();
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let task_file = inputs.path().join("task.md");
+    fs::write(&task_file, "reader never reads").unwrap();
+
+    let mut child = spawn_json_run(&home, &manifest_path, &task_file, Some(user_workdir.path()));
+    let stderr = drain_on_thread(child.stderr.take().expect("stderr should be piped"));
+    // Nothing is read: by the time the readiness line is written there is no reader left.
+    drop(child.stdout.take().expect("stdout should be piped"));
+
+    let status = child.wait().expect("mur should exit");
+    let stderr = stderr.join().expect("stderr drain should not panic");
+    assert_capsule_survived(status, &stderr);
+
+    let session_dir = fs::read_dir(user_workdir.path().join(".murmur"))
+        .expect("--workdir should hold a .murmur directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("trace.jsonl").is_file())
+        .expect("the session should have written a trace");
+
+    let trace = fs::read_to_string(session_dir.join("trace.jsonl")).expect("should read trace");
+    assert!(
+        trace
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["event_type"].as_str() == Some("task_end")),
+        "the task should have run to completion; trace was:\n{trace}"
+    );
+}
+
+/// S3: standard error is closed on a live session, and the readiness line still lands.
+#[test]
+fn json_launch_survives_a_closed_standard_error() {
+    let server = end_turn_server("stderr closed");
+    let inputs = tempfile::tempdir().unwrap();
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let task_file = inputs.path().join("task.md");
+    fs::write(&task_file, "stderr closed").unwrap();
+
+    let mut child = spawn_json_run(&home, &manifest_path, &task_file, None);
+    drop(child.stderr.take().expect("stderr should be piped"));
+
+    let stdout = drain_on_thread(child.stdout.take().expect("stdout should be piped"));
+    let status = child.wait().expect("mur should exit");
+    let stdout = stdout.join().expect("stdout drain should not panic");
+
+    assert_capsule_survived(status, "<stderr was closed by this test>");
+
+    let readiness_line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with('{'))
+        .expect("the readiness line should still reach stdout");
+    let parsed: Value =
+        serde_json::from_str(readiness_line.trim()).expect("the readiness line should parse");
+    assert!(
+        !parsed["url"].as_str().unwrap_or("").is_empty(),
+        "the readiness line should carry a non-empty url; got: {parsed}"
+    );
+}

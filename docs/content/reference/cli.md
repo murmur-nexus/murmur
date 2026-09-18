@@ -742,6 +742,24 @@ Current runtime constraints:
   - under `--capsule`, the root component of the artifact archive, with no project directory searched
 - Agent capsules require either `transport: http` (with `inference.driver.artifact`) or `transport: process` (with `inference.command`) in `murmur.yaml`; missing driver config exits with `error[E-RUN-005]` or `error[E-RUN-006]` respectively
 
+### A closed stream { #mur-run-closed-stream }
+
+Under `--json`, standard output carries one line: the readiness line, written the moment the
+capsule is addressable. A supervisor that launches `mur run --json`, reads that line and closes
+the pipe leaves the session running to its own end, with the exit status it would have had.
+Closing standard error has the same effect.
+
+A line the runtime could not hand to a closed stream is kept where the session keeps its other
+diagnostics.
+
+| The line was headed for | Where it lands instead |
+|---|---|
+| Either stream, once the session has a workdir | [`logs/bootstrap.log`](workdir.md#session-workdir-files) in the session directory |
+| Standard error, during staging | Nowhere: a warning raised before the session directory exists has no file to fall back to |
+
+The fallback writes to that file alone, so `--json` standard output holds the readiness line and
+nothing else.
+
 ### `SIGTERM` { #mur-run-sigterm }
 
 An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur stop`](#mur-stop),

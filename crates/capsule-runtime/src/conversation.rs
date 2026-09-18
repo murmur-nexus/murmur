@@ -631,7 +631,7 @@ fn decode_cursor(cursor: &str) -> Option<usize> {
 
 /// Both places an operator looks for what the runtime did with a record. Never fatal.
 fn report(workdir: &Path, message: &str) {
-    eprintln!("[capsule-runtime] {message}");
+    crate::runtime_err!("[capsule-runtime] {message}");
     crate::agent::append_bootstrap_log(workdir, message);
 }
 

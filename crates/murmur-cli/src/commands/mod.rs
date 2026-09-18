@@ -48,7 +48,7 @@ pub(crate) fn print_run_output(_session_id: &str, _workdir: &Path, status: RunSt
         RunStatus::Failed => "failed",
         RunStatus::Trapped => "trapped",
     };
-    println!("status:  {status_str}");
+    capsule_runtime::runtime_out!("status:  {status_str}");
 }
 
 /// Prints `status: failed` and returns the error, eliminating the
