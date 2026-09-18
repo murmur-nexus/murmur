@@ -754,8 +754,8 @@ diagnostics.
 
 | The line was headed for | Where it lands instead |
 |---|---|
-| Either stream, once the session has a workdir | [`logs/bootstrap.log`](workdir.md#session-workdir-files) in the session directory |
-| Standard error, during staging | Nowhere: a warning raised before the session directory exists has no file to fall back to |
+| Either stream, once the session directory exists | [`logs/bootstrap.log`](workdir.md#session-workdir-files) in the session directory |
+| Either stream, before the session directory exists | Nowhere: a warning raised while the manifest and its grants are still being read has no file to fall back to |
 
 The fallback writes to that file alone, so `--json` standard output holds the readiness line and
 nothing else.

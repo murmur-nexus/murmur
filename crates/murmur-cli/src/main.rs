@@ -669,7 +669,16 @@ fn main() {
     };
 
     if let Err(err) = result {
-        eprintln!("{err}");
-        std::process::exit(1);
+        exit_with_error(&err);
     }
+}
+
+/// Report a failed command and exit 1.
+///
+/// Reached after a session has announced itself, when standard error may be closed: a bare
+/// `eprintln!` would panic and replace exit status 1 with an abort.
+#[deny(clippy::print_stdout, clippy::print_stderr)]
+fn exit_with_error(err: &impl std::fmt::Display) -> ! {
+    capsule_runtime::runtime_err!("{err}");
+    std::process::exit(1);
 }

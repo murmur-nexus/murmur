@@ -2,9 +2,9 @@
 //!
 //! `println!` and friends panic when the write fails, and `panic = "abort"` in the release
 //! profile turns that panic into `SIGABRT` at the print site — no unwind, no destructors, no
-//! `session_end`. A supervisor that launches `mur run --json`, reads the one readiness line the
-//! flag exists to produce and stops reading is the ordinary success case, and it closed the pipe
-//! the runtime was about to write to. Nothing here panics on a write error.
+//! `session_end`. A reader that takes the readiness line `mur run --json` writes and then closes
+//! the pipe is the ordinary success case, and every later write to that stream fails. Nothing
+//! here panics on a write error.
 //!
 //! A line the stream refused is not discarded where it can be kept: it goes to
 //! `<session workdir>/logs/bootstrap.log` through [`crate::agent::append_bootstrap_log`], the
@@ -43,8 +43,9 @@ static FALLBACK_WORKDIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Arm the fallback with this session's directory — the one that holds `logs/`, not the user
 /// project directory a capsule sees as `"."`.
 ///
-/// Called from `runtime::launch` before the session announces itself. Setting it again replaces
-/// the previous value: a process that runs several sessions in sequence sends each session's
+/// Called from `runtime::stage_session` as soon as it creates the session directory, and again
+/// from `runtime::launch` before the session announces itself. Setting it again replaces the
+/// previous value: a process that runs several sessions in sequence sends each session's
 /// refused lines to the session that is currently launching.
 pub fn set_diagnostic_workdir(workdir: &Path) {
     let mut slot = FALLBACK_WORKDIR

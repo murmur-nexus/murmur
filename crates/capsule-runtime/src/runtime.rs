@@ -963,6 +963,11 @@ pub fn stage_session(
         source,
     })?;
 
+    // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
+    // below this line have somewhere to land when stderr has already been closed. Everything
+    // warned about above it fires before any session directory exists and reaches stderr alone.
+    diagnostic::set_diagnostic_workdir(&workdir);
+
     for (name, manifest_yaml) in &installed_manifests {
         write_tool_manifest(&workdir, name, manifest_yaml)?;
     }
@@ -1152,8 +1157,9 @@ fn launch(
 ) -> Result<LaunchResult, RuntimeError> {
     // First thing this launch does, so every diagnostic from here on — including the readiness
     // line `on_url` writes — has somewhere to land when the stream it was meant for has been
-    // closed. Staging's own warnings fire before this and keep going to stderr alone: there is no
-    // session directory to hold them yet.
+    // closed. `stage_session` arms the same directory once it creates it; this also covers a
+    // caller launching a session staged by some earlier process, and a process that stages
+    // several sessions before launching one of them.
     diagnostic::set_diagnostic_workdir(&staged.workdir);
 
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
