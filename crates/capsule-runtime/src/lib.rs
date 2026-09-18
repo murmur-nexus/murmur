@@ -20,6 +20,9 @@ pub mod delegation;
 pub mod delegation_plane;
 pub mod detached;
 pub(crate) mod detached_reconcile;
+// Public so the `runtime_out!` / `runtime_err!` macros resolve `$crate::diagnostic` from outside
+// this crate, and so `mur run`'s launch path writes its lines the same way the runtime does.
+pub mod diagnostic;
 pub(crate) mod dns_resolver;
 pub(crate) mod egress_proxy;
 pub mod errors;
@@ -79,6 +82,7 @@ pub use containment::{
     render_read_only, ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction,
     PreopenReport, PreopenSurface, ScopeReport, StateStoreReport,
 };
+pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
     EgressNamespaceBlocker,

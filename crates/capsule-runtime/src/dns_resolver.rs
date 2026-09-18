@@ -316,7 +316,7 @@ pub(crate) fn shared() -> Option<&'static DnsResolver> {
         .get_or_init(|| match DnsResolver::from_system() {
             Ok(resolver) => Some(resolver),
             Err(error) => {
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] warning: no name resolver could be built: {error} \
                      (every name lookup this process makes reports that nothing answered)"
                 );

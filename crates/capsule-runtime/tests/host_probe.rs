@@ -5,6 +5,9 @@
 //! at the moment it is called, so nothing in a long-lived process is judged against a reading
 //! taken before it started.
 
+// Test output, not a capsule's: this target's stdout belongs to the `cargo test` harness.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use capsule_runtime::{
     detect_achieved_containment, detect_sealed_blocker, detect_userns_grant, HostProbe,
 };

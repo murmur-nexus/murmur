@@ -353,7 +353,7 @@ pub fn wide_entry_warning(path: &Path, holds: &str, mode: u32, allowed: u32) -> 
 /// group or other bit. Never a refusal, and never names the value.
 pub fn warn_on_wide_credential_file(path: &Path, name: &str, mode: u32) {
     if let Some(warning) = wide_credential_file_warning(path, name, mode) {
-        eprintln!("{warning}");
+        crate::runtime_err!("{warning}");
     }
 }
 

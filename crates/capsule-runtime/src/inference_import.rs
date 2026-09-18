@@ -269,7 +269,7 @@ impl HookInferenceCtx {
             .and_then(|gateway| gateway.credential())
             .and_then(|credential| credential.report_rejection())?;
         if let Err(err) = crate::agent::write_result(&self.workdir, &format!("error: {message}")) {
-            eprintln!("{err}");
+            crate::runtime_err!("{err}");
         }
         Some(message)
     }

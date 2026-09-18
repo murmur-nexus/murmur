@@ -505,7 +505,7 @@ impl WorkdirGuard {
             }
         }
         let message = workdir_breach_message(breach);
-        eprintln!("[capsule-runtime] {message}");
+        crate::runtime_err!("[capsule-runtime] {message}");
         crate::agent::append_bootstrap_log(workdir, &format!("[resources] {message}"));
     }
 }

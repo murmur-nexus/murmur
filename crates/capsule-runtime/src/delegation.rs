@@ -493,7 +493,7 @@ pub fn report_completion(
     outcome.delivered = false;
     outcome.delivery_error = None;
     if let Err(reason) = write_completion(workdir, &outcome) {
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
         );
@@ -505,7 +505,7 @@ pub fn report_completion(
             // The record, and the operator's only other sign that a result went nowhere. Not a
             // failure of the child's own session: the work was done, and where it went is what
             // could not be said.
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] delegation {}: the completion could not be delivered to {}: {reason}; recorded in {}",
                 outcome.delegation_id,
                 address.url,
@@ -515,7 +515,7 @@ pub fn report_completion(
         }
     }
     if let Err(reason) = write_completion(workdir, &outcome) {
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
         );
@@ -532,7 +532,7 @@ pub fn record_terminated(workdir: &Path, outcome: DelegationOutcome) -> Delegati
     outcome.delivered = false;
     outcome.delivery_error = None;
     if let Err(reason) = write_completion(workdir, &outcome) {
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] delegation {}: {reason}",
             outcome.delegation_id
         );

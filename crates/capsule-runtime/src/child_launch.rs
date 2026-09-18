@@ -529,7 +529,7 @@ fn watch_for_completion(
             let retried = delegation::report_completion(&handle, &address, recorded, &workdir);
             if !retried.delivered {
                 // One retry, then the file and the line above it are the record.
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] delegation {}: the child's completion is undelivered after one retry",
                     handle.delegation_id
                 );
@@ -742,7 +742,7 @@ fn drain_stderr(child: &mut Child) -> Arc<StderrTail> {
     let collector = Arc::clone(&tail);
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            eprintln!("{line}");
+            crate::runtime_err!("{line}");
             let mut state = lock(&collector.state);
             if state.lines.len() == CHILD_STDERR_TAIL_LINES {
                 state.lines.remove(0);
@@ -780,13 +780,15 @@ fn first_json_line(
         };
         let _ = tx.send(first);
         // Everything the child says after its launch line goes to this process's own stdout, so
-        // the pipe stays drained for as long as the child lives.
+        // the pipe stays drained for as long as the child lives. This thread outlives the parent's
+        // own readiness line by the whole life of the child, so it is the one relay most likely to
+        // meet a reader that has already gone: it relays the line and keeps draining either way.
         let mut rest = String::new();
         while let Ok(read) = reader.read_line(&mut rest) {
             if read == 0 {
                 break;
             }
-            print!("{rest}");
+            crate::diagnostic::raw_to_stdout(&rest);
             rest.clear();
         }
     });

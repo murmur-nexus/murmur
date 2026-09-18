@@ -59,7 +59,7 @@ task comes from the queue rather than from a stale file.
 | `out/result.txt` | The agent's final output. Written on every terminal outcome; a failure writes `error: <message>`, and a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap |
 | `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's. Only under `lifecycle.conversation: threaded` |
 | `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
-| `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, compaction decisions, and non-fatal write failures |
+| `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, compaction decisions, non-fatal write failures, and any line the runtime could not write to a [closed standard output or standard error](cli.md#mur-run-closed-stream) |
 | `logs/otel.log` | OpenTelemetry exporter diagnostics |
 | `logs/hook-<hook-name>.log` | Errors from one hook, one per line |
 | `tools/<name>/murmur.yaml` | A staged artifact's manifest |

@@ -10,6 +10,15 @@ readme.workspace = true
 [lib]
 path = "src/lib.rs"
 
+# A bare `println!`/`eprintln!` panics when the write fails, and the release profile's
+# `panic = "abort"` turns that into `SIGABRT` at the print site — a supervisor that stops reading
+# `mur run --json`'s stdout would kill the capsule. Every diagnostic in this crate goes through
+# `diagnostic::to_stdout` / `to_stderr` (or the `runtime_out!` / `runtime_err!` macros) instead.
+# `#[cfg(test)]` code opts back out: a test harness's stdout is not a capsule's.
+[lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+
 [dependencies]
 base64 = "0.22"
 bytes = "1"

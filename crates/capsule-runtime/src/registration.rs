@@ -135,6 +135,8 @@ pub fn deregister_session(roost_url: &str, credential: &SpawnCredential, outcome
         Some(&body),
         &[(SPAWN_CREDENTIAL_HEADER, credential.expose())],
     ) {
-        eprintln!("[capsule-runtime] could not deregister from mur-roost at {roost_url}: {reason}");
+        crate::runtime_err!(
+            "[capsule-runtime] could not deregister from mur-roost at {roost_url}: {reason}"
+        );
     }
 }

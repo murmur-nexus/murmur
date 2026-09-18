@@ -51,6 +51,7 @@ use crate::{
         self, demotion_tool_result, AbandonedDisposition, AbandonedWork, DetachPolicy,
         DetachedRegistry, DetachedReport,
     },
+    diagnostic,
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -281,7 +282,7 @@ async fn run_task_with_reopens(
                     // transport's message-building code needs to change.
                     let rewritten = build_reopen_task_md(&original_task, &feedback);
                     if let Err(e) = tokio::fs::write(&task_md_path, rewritten.as_bytes()).await {
-                        eprintln!(
+                        crate::runtime_err!(
                             "[capsule-runtime] failed to inject reopen feedback into task.md: {e}"
                         );
                     }
@@ -962,6 +963,11 @@ pub fn stage_session(
         source,
     })?;
 
+    // Armed as soon as the directory exists rather than in `launch`, so the staging warnings
+    // below this line have somewhere to land when stderr has already been closed. Everything
+    // warned about above it fires before any session directory exists and reaches stderr alone.
+    diagnostic::set_diagnostic_workdir(&workdir);
+
     for (name, manifest_yaml) in &installed_manifests {
         write_tool_manifest(&workdir, name, manifest_yaml)?;
     }
@@ -1040,7 +1046,7 @@ pub fn stage_session(
         let dst = accessible_workdir.join(MANIFEST_FILENAME);
         if src.exists() && !dst.exists() {
             if let Err(e) = fs::copy(&src, &dst) {
-                eprintln!(
+                crate::runtime_err!(
                     "[capsule-runtime] warning: failed to copy {MANIFEST_FILENAME} to workdir: {e}"
                 );
             }
@@ -1149,6 +1155,13 @@ fn launch(
     on_url: impl FnOnce(&str),
     handle_sigterm: bool,
 ) -> Result<LaunchResult, RuntimeError> {
+    // First thing this launch does, so every diagnostic from here on — including the readiness
+    // line `on_url` writes — has somewhere to land when the stream it was meant for has been
+    // closed. `stage_session` arms the same directory once it creates it; this also covers a
+    // caller launching a session staged by some earlier process, and a process that stages
+    // several sessions before launching one of them.
+    diagnostic::set_diagnostic_workdir(&staged.workdir);
+
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
 
     // Before any WASM is instantiated and before any subprocess is bounded: a session that can
@@ -1305,7 +1318,7 @@ fn launch(
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(sigterm) => Some(sigterm),
                 Err(e) => {
-                    eprintln!(
+                    crate::runtime_err!(
                         "[capsule-runtime] could not install a SIGTERM handler; SIGTERM will end this session without its teardown: {e}"
                     );
                     None
@@ -1912,7 +1925,7 @@ fn launch(
                             // on either finds its task already `Canceled`.
                             let _ = task_registry.lock().unwrap().cancel_every_live();
                             terminating.cancel();
-                            eprintln!(
+                            crate::runtime_err!(
                                 "[capsule-runtime] SIGTERM received — cancelling live tasks and ending the session"
                             );
                             std::thread::spawn(|| {
@@ -2232,7 +2245,7 @@ fn launch(
                                                     break 'task_loop;
                                                 }
                                                 Err(_elapsed) => {
-                                                    eprintln!("[capsule-runtime] no A2A message received within timeout; running with empty task");
+                                                    crate::runtime_err!("[capsule-runtime] no A2A message received within timeout; running with empty task");
                                                     otel.begin_session(None);
                                                     state.current_traceparent = otel.outgoing_traceparent();
                                                     final_loop_result = agent::run_agent_loop(
@@ -2304,7 +2317,7 @@ fn launch(
                         if let Err(e) =
                             tokio::fs::write(&workdir_task_md, &incoming.message_text).await
                         {
-                            eprintln!(
+                            crate::runtime_err!(
                                 "[capsule-runtime] failed to write A2A message to task.md: {e}"
                             );
                         }
@@ -2538,7 +2551,7 @@ fn launch(
                     // remaining surface is the operator's.
                     if !abandoned.is_empty() {
                         let report = detached::abandonment_report_text(&session_id, &abandoned);
-                        eprintln!("{report}");
+                        crate::runtime_err!("{report}");
                         agent::append_bootstrap_log(&workdir, &report);
                         for work in &abandoned {
                             let _ = trace
@@ -2837,7 +2850,7 @@ fn write_running_record(
                  `mur watch` and `mur cancel` cannot reach it by session address — only by the \
                  URL it announces: {reason}"
             );
-            eprintln!("[capsule-runtime] warning[{W_SEC_023}]: {message} ({link})");
+            crate::runtime_err!("[capsule-runtime] warning[{W_SEC_023}]: {message} ({link})");
             agent::append_bootstrap_log(
                 workdir,
                 &format!("[running-record] warning[{W_SEC_023}]: {message} ({link})"),
@@ -3139,7 +3152,9 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
     let has_bash = policy.shell_allow.iter().any(|binary| binary == "bash");
     if has_bash && !policy.network_allow.is_empty() {
         let link = security_warning_link(W_SEC_003);
-        eprintln!("[capsule-runtime] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})");
+        crate::runtime_err!(
+            "[capsule-runtime] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"
+        );
         agent::append_bootstrap_log(
             workdir,
             &format!(
@@ -3181,7 +3196,7 @@ pub(crate) fn warn_for_unreachable_delegation_outcomes(
     if let Some((code, message)) = unreachable_delegation_outcomes_warning(can_delegate, lifecycle)
     {
         let link = security_warning_link(code);
-        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
         agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{code}]: {message} ({link})"),
@@ -3220,7 +3235,7 @@ pub(crate) fn warn_for_unreachable_shell_completions(
 ) {
     if let Some((code, message)) = unreachable_shell_completions_warning(can_run_shell, lifecycle) {
         let link = security_warning_link(code);
-        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
         agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{code}]: {message} ({link})"),
@@ -3251,7 +3266,7 @@ pub fn warn_on_interpreter_runtime_grants(grants: &[InterpreterRuntimeGrant]) {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_009}]: capabilities.shell.interpreter_runtime grants \
              '{}' host directories outside the workdir [{dirs}] — this couples the capsule to a \
              specific host distro/interpreter-version layout (e.g. /usr/lib/python3.11 breaks the \
@@ -3279,7 +3294,7 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
         return;
     }
     let link = security_warning_link(W_SEC_011);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_011}]: capabilities.filesystem.workdir_exec is true — \
          the session workdir keeps its Landlock Execute right, so anything the capsule writes \
          there can run regardless of capabilities.shell.allow; this capsule reports containment \
@@ -3388,7 +3403,7 @@ pub fn warn_on_secret_shaped_env_grants(
     let resolved = resolve_lifecycle(lifecycle.cloned(), lifecycle_override);
     for grant in secret_shaped_env_grants(policy, &resolved) {
         let link = security_warning_link(W_SEC_024);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_024}]: {} ({link})",
             secret_shaped_env_grant_message(&grant)
         );
@@ -3409,7 +3424,7 @@ pub fn warn_on_inference_endpoint_in_network_allow(
 ) {
     for entry in inference_endpoint_allow_entries(&policy.network_allow, inference) {
         let link = security_warning_link(W_SEC_025);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_025}]: capabilities.network.allow entry '{entry}' \
              names the inference endpoint; inference no longer uses it — the runtime reaches the \
              provider itself — so the entry now only grants tools, subprocesses and the driver \
@@ -3458,7 +3473,7 @@ pub fn warn_on_launch_only_inference_credential(
         }
     };
     let link = security_warning_link(W_SEC_027);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_027}]: {source}, so the key is read once at launch and \
          this capsule cannot pick up a rotated key until it is restarted; store the key with \
          `mur config set -g credentials.{name} <key>` to have it re-read ({link})"
@@ -3482,7 +3497,7 @@ pub fn warn_on_machine_spend_ceiling_under_process_transport(
         return;
     }
     let link = security_warning_link(W_SEC_026);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_026}]: spend.machine_tokens_per_day is set and this \
          capsule uses transport: process — the CLI reaches its provider with its own credentials, \
          so murmur neither counts nor limits this capsule's spend ({link})"
@@ -3534,7 +3549,7 @@ fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
     // about and the set they print `advisory against` cannot drift apart.
     for binary in crate::containment::read_only_advisory_for(read_only, shell_allow) {
         let link = security_warning_link(W_SEC_017);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_017}]: capabilities.filesystem.read_only is \
              declared and capabilities.shell.allow includes '{binary}', an interpreter that \
              can construct a write the dispatch check cannot read — the declaration is \
@@ -3583,7 +3598,7 @@ fn warn_on_unannotated_tool_schemas(installed_manifests: &[(String, String)]) {
             ("properties", "them")
         };
         let link = security_warning_link(W_SEC_018);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_018}]: capabilities.filesystem.read_only is \
              declared and the tool '{tool}' declares the {noun} {named} with no murmur \
              annotation in effect — calls naming {pronoun} are judged by key name. Annotate a \
@@ -3618,7 +3633,7 @@ pub fn warn_on_userns_restriction_disabled_host_wide(grant: Option<UsernsGrant>)
         return;
     }
     let link = security_warning_link(W_SEC_013);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_013}]: kernel.apparmor_restrict_unprivileged_userns is \
          off on this host, so unprivileged user namespaces are unrestricted for every binary on \
          the machine, not just for mur — this is what makes sealed containment and the capsule \
@@ -3649,7 +3664,7 @@ fn warn_on_inert_capsule_wide_state(state_declared: bool) {
         return;
     }
     let link = security_warning_link(W_SEC_014);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_014}]: capsule-wide capabilities.state is declared, but \
          a durable state store is granted per artifact — nothing reads a top-level declaration, \
          so no store was created and no 'state' preopen exists. Move the block onto the tool, \
@@ -3669,7 +3684,7 @@ fn warn_on_inert_capsule_wide_conversation(conversation_declared: bool) {
         return;
     }
     let link = security_warning_link(W_SEC_016);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_016}]: capsule-wide capabilities.conversation is \
          declared, but the murmur:conversation/read grant is per artifact — nothing reads a \
          top-level declaration, so no artifact can read the conversation record. Move the block \
@@ -3695,7 +3710,7 @@ fn warn_on_inert_hook_capabilities(
     let inert = inert_capability_sub_blocks(capabilities);
     if !inert.is_empty() {
         let link = security_warning_link(W_SEC_006);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_006}]: hook '{hook_name}' declares capabilities.{} \
              which the runtime does not apply per-hook — only capabilities.network, \
              capabilities.filesystem, capabilities.state and capabilities.task_io govern a hook \
@@ -3793,7 +3808,7 @@ fn warn_on_out_of_ceiling_network_entries(artifact_name: &str, dropped: &[String
     }
 
     let link = security_warning_link(W_SEC_007);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_007}]: artifact '{artifact_name}' declares \
          capabilities.network.allow entries the capsule-wide ceiling does not allow ({}) — \
          they are dropped, not granted, because per-artifact capabilities can only narrow \
@@ -3813,7 +3828,7 @@ fn warn_on_inert_tool_capabilities(
     let inert = inert_capability_sub_blocks(capabilities);
     if !inert.is_empty() {
         let link = security_warning_link(W_SEC_008);
-        eprintln!(
+        crate::runtime_err!(
             "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
              capabilities.{} which per-artifact narrowing does not apply — only \
              capabilities.network, capabilities.filesystem and capabilities.state apply to a tool \
@@ -3836,7 +3851,7 @@ fn warn_on_unenforceable_native_capabilities(
     }
 
     let link = security_warning_link(W_SEC_008);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
          per-artifact 'capabilities:' but ships a native implementation — narrowing applies \
          only to WASM tools and drivers, so this grant is not enforced ({link})"
@@ -3854,7 +3869,7 @@ fn warn_on_inert_native_config(artifact_name: &str, config: Option<&serde_yaml::
     }
 
     let link = security_warning_link(W_SEC_015);
-    eprintln!(
+    crate::runtime_err!(
         "[capsule-runtime] warning[{W_SEC_015}]: artifact '{artifact_name}' declares 'config:' \
          but ships a native implementation — a native tool runs as a host subprocess and reads no \
          per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered ({link})"
@@ -7373,7 +7388,7 @@ fn resolve_conversation_root(
                 "[conversation] the record for '{record}' could not be located ({reason}); \
                  this session runs unrecorded"
             );
-            eprintln!("[capsule-runtime] {message}");
+            crate::runtime_err!("[capsule-runtime] {message}");
             agent::append_bootstrap_log(workdir, &message);
             None
         }
@@ -7481,7 +7496,7 @@ async fn apply_retention(
                 "[retention] {} could not be truncated ({reason}); this record keeps growing",
                 path.display()
             );
-            eprintln!("[capsule-runtime] {message}");
+            crate::runtime_err!("[capsule-runtime] {message}");
             agent::append_bootstrap_log(workdir, &message);
         }
     }

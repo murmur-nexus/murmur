@@ -42,13 +42,14 @@ pub(crate) enum RunStatus {
 
 /// Print the post-completion status line. Session and workdir are shown at startup now,
 /// so only `status:` is emitted here to avoid duplication.
+#[deny(clippy::print_stdout, clippy::print_stderr)]
 pub(crate) fn print_run_output(_session_id: &str, _workdir: &Path, status: RunStatus) {
     let status_str = match status {
         RunStatus::Success => "ok",
         RunStatus::Failed => "failed",
         RunStatus::Trapped => "trapped",
     };
-    println!("status:  {status_str}");
+    capsule_runtime::runtime_out!("status:  {status_str}");
 }
 
 /// Prints `status: failed` and returns the error, eliminating the

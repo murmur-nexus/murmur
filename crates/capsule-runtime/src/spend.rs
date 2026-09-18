@@ -387,14 +387,14 @@ impl MachineLedger {
     pub(crate) fn refresh_total(&self) -> u64 {
         let mut state = self.lock();
         if let Err(err) = self.roll_to_today(&mut state) {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] warning: spend ledger in {} could not be opened for today: {err}",
                 self.dir.display()
             );
             return state.total;
         }
         if let Err(err) = read_new_lines(&mut state) {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] warning: spend ledger {} could not be read: {err}",
                 ledger_path(&self.dir, state.date).display()
             );
@@ -419,7 +419,7 @@ impl MachineLedger {
             .roll_to_today(&mut state)
             .and_then(|()| (&state.file).write_all(&bytes));
         if let Err(err) = written {
-            eprintln!(
+            crate::runtime_err!(
                 "[capsule-runtime] warning: spend ledger in {} could not be appended to: {err}",
                 self.dir.display()
             );
@@ -514,6 +514,7 @@ fn prune_ledgers(dir: &Path, today: NaiveDate) {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
     use std::{
         io::Read,

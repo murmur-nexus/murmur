@@ -247,7 +247,7 @@ pub fn detect_egress_namespace_blocker() -> Option<EgressNamespaceBlocker> {
 pub fn skip_without_egress_namespace(test_name: &str) -> bool {
     match detect_egress_namespace_blocker() {
         Some(blocker) => {
-            eprintln!("[SKIP-HOST] {test_name}: {}", blocker.reason());
+            crate::runtime_err!("[SKIP-HOST] {test_name}: {}", blocker.reason());
             true
         }
         None => false,

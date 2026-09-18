@@ -1,3 +1,8 @@
+// `mur run` writes at and after the readiness line, when its reader may already have closed the
+// pipe. A bare print panics on that write error; everything here goes through
+// `capsule_runtime::diagnostic` instead.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::{
     collections::HashSet,
     fs,
@@ -38,7 +43,7 @@ use super::{
 /// nothing recorded which platform it is for, so installing a second platform into that version
 /// directory would overwrite it. Printed once per artifact, at staging.
 fn warn_untagged_native(name: &str, version: &str) {
-    eprintln!(
+    capsule_runtime::runtime_err!(
         "warning[{W_REG_001}]: {name}@{version} is a native artifact with no recorded platform \u{2014} \
          it resolved from the generic store path, where every host resolves the same payload\n  \
          Fix: mur install {name}@{version}\n  {}",
@@ -317,7 +322,7 @@ pub(crate) fn run_run(
     if let Some(required) = &runtime_manifest.mur_version {
         let running = env!("CARGO_PKG_VERSION");
         if required != running {
-            eprintln!(
+            capsule_runtime::runtime_err!(
                 "warning: manifest requires mur {required} but you are running mur {running}"
             );
         }
@@ -493,9 +498,9 @@ pub(crate) fn run_run(
                     format!("failed to serialize scope report: {source}"),
                 )
             })?;
-            println!("{line}");
+            capsule_runtime::runtime_out!("{line}");
         } else {
-            print!("{}", report.render());
+            capsule_runtime::diagnostic::raw_to_stdout(&report.render());
         }
         return Ok(());
     }
@@ -772,7 +777,7 @@ pub(crate) fn run_run(
             None => staged.workdir.clone(),
         };
         launch_session_handling_sigterm(staged, move |url| {
-            println!(
+            capsule_runtime::runtime_out!(
                 "{}",
                 serde_json::json!({
                     "url": url,
@@ -813,17 +818,17 @@ pub(crate) fn run_run(
 
         match launch_session_handling_sigterm(staged, move |url| {
             if !url.is_empty() {
-                println!("murmur: url {url}");
+                capsule_runtime::runtime_out!("murmur: url {url}");
             }
-            println!("session: {session_id_for_startup}");
+            capsule_runtime::runtime_out!("session: {session_id_for_startup}");
             if verbose {
-                println!("workdir: {}", workdir_for_startup.display());
-                println!("manifest: {manifest_name} v{manifest_version}");
+                capsule_runtime::runtime_out!("workdir: {}", workdir_for_startup.display());
+                capsule_runtime::runtime_out!("manifest: {manifest_name} v{manifest_version}");
                 if let Some(ref d) = driver_line {
-                    println!("driver: {d}");
+                    capsule_runtime::runtime_out!("driver: {d}");
                 }
                 if skill_count > 0 {
-                    println!("skills: {skill_count} installed");
+                    capsule_runtime::runtime_out!("skills: {skill_count} installed");
                 }
                 // TODO(formation): print formation_id here once formation IDs are assigned at mur run time
             }
