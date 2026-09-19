@@ -196,6 +196,9 @@ fn stage_fixture_tool_session(
                 "  - name: {driver_name}\n",
                 "    version: {driver_version}\n",
                 "    runtime: driver\n",
+                "    gateway:\n",
+                "      endpoint: {endpoint}\n",
+                "      api_key: test-key\n",
                 "  - name: {tool_name}\n",
                 "    version: {tool_version}\n",
                 "    runtime: tool\n",
@@ -205,9 +208,7 @@ fn stage_fixture_tool_session(
                 "      - {endpoint}\n",
                 "inference:\n",
                 "  transport: http\n",
-                "  endpoint: {endpoint}\n",
                 "  model: test-model\n",
-                "  api_key: test-key\n",
                 "  driver:\n",
                 "    artifact: {driver_name}\n",
             ),
@@ -236,6 +237,7 @@ fn stage_fixture_tool_session(
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

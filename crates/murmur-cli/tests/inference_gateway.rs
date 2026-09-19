@@ -251,9 +251,9 @@ impl Capsule {
             &manifest,
             format!(
                 "name: gateway-capsule\nversion: 0.1.0\nartifacts:\n  - name: {driver}\n    \
-                 version: {DRIVER_VERSION}\n    runtime: driver\n{extra}inference:\n  \
-                 transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-                 api_key: ${{GATEWAY_TEST_KEY}}\n  driver:\n    artifact: {driver}\n"
+                 version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+                 endpoint: {endpoint}\n      api_key: ${{GATEWAY_TEST_KEY}}\n{extra}inference:\n  \
+                 transport: http\n  model: test-model\n  driver:\n    artifact: {driver}\n"
             ),
         )
         .unwrap();
@@ -537,8 +537,8 @@ fn driver_without_inference_auth_refuses() {
     }
 }
 
-/// Naming the provider in `network.allow` is accepted and warned about once, on a real run and
-/// under `--explain-scope`.
+/// Naming the driver's `gateway.endpoint` host in `network.allow` is accepted and warned about
+/// once, naming the entry and the driver, on a real run and under `--explain-scope`.
 #[test]
 fn provider_in_network_allow_warns() {
     let upstream = streamed_upstream();
@@ -555,6 +555,13 @@ fn provider_in_network_allow_warns() {
     assert_eq!(lines.len(), 1, "{}", run.stderr);
     assert!(lines[0].contains(W_SEC_025_LINK), "{}", lines[0]);
     assert!(lines[0].contains(&format!("'{}'", upstream.endpoint)));
+    assert!(
+        lines[0].contains(&format!(
+            "gateway.endpoint host of artifact '{ENV_REPORT_DRIVER}'"
+        )),
+        "{}",
+        lines[0]
+    );
     assert_eq!(reported(&run.result(), "key"), "absent");
 
     let explained = capsule.explain_scope();

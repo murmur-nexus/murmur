@@ -128,7 +128,7 @@ fn setup_agent_project_with_skill(
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: streaming-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n{skill_entry}capabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+            "name: streaming-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n{skill_entry}capabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -152,6 +152,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -625,8 +626,8 @@ fn setup_streaming_driver_project() -> (TempDir, PathBuf) {
         project.path().join("murmur.yaml"),
         format!(
             "name: streaming-test\nversion: 0.1.0\n\
-             artifacts:\n  - name: {STREAMING_DRIVER_NAME}\n    version: {STREAMING_DRIVER_VERSION}\n    runtime: driver\n\
-             inference:\n  transport: http\n  endpoint: http://127.0.0.1:1\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {STREAMING_DRIVER_NAME}\n"
+             artifacts:\n  - name: {STREAMING_DRIVER_NAME}\n    version: {STREAMING_DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      api_key: test-key\n\
+             inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {STREAMING_DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -645,6 +646,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -1056,7 +1058,7 @@ fn stage_skill_and_tool_agent(endpoint: &str) -> capsule_runtime::StagedSession 
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: streaming-tool-agent\nversion: 0.1.0\nartifacts:\n  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+            "name: streaming-tool-agent\nversion: 0.1.0\nartifacts:\n  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    runtime: tool\n  - name: {SKILL_NAME}\n    version: {SKILL_VERSION}\n    runtime: skill\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();

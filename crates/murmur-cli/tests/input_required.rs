@@ -118,6 +118,9 @@ fn setup_project(home: &TempDir, endpoint: &str, extra_lifecycle_yaml: &str) -> 
              \x20 - name: {DRIVER_NAME}\n\
              \x20   version: {DRIVER_VERSION}\n\
              \x20   runtime: driver\n\
+             \x20   gateway:\n\
+             \x20     endpoint: {endpoint}\n\
+             \x20     api_key: test-key\n\
              \x20 - name: {TOOL_NAME}\n\
              \x20   version: {TOOL_VERSION}\n\
              \x20   runtime: tool\n\
@@ -127,9 +130,7 @@ fn setup_project(home: &TempDir, endpoint: &str, extra_lifecycle_yaml: &str) -> 
              \x20     - {endpoint}\n\
              inference:\n\
              \x20 transport: http\n\
-             \x20 endpoint: {endpoint}\n\
              \x20 model: test-model\n\
-             \x20 api_key: test-key\n\
              \x20 driver:\n\
              \x20   artifact: {DRIVER_NAME}\n\
              {extra_lifecycle_yaml}"
@@ -160,6 +161,7 @@ fn stage_agent(
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

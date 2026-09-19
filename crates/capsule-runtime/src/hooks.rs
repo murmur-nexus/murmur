@@ -799,11 +799,12 @@ async fn call_stage_once(
     let state = HookStoreState {
         limits: limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(workdir, env_vars, &staged.grant).map_err(|e| e.to_string())?,
+        wasi: build_wasi_ctx(workdir, env_vars, &staged.grant, staged.gateway.as_deref())
+            .map_err(|e| e.to_string())?,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
-            inference_gateway: None,
+            gateway: staged.gateway.clone(),
         },
     };
     let mut store = Store::new(engine, state);
@@ -1583,11 +1584,16 @@ async fn instantiate_hook(
     let state = HookStoreState {
         limits: limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(project_dir, env_vars, &staged.grant)?,
+        wasi: build_wasi_ctx(
+            project_dir,
+            env_vars,
+            &staged.grant,
+            staged.gateway.as_deref(),
+        )?,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
-            inference_gateway: None,
+            gateway: staged.gateway.clone(),
         },
     };
     let mut store = Store::new(engine, state);
@@ -2047,6 +2053,7 @@ fn build_wasi_ctx(
     root_dir: &Path,
     env: &HookEnvVars<'_>,
     grant: &HookCapabilityGrant,
+    gateway: Option<&crate::credential_gateway::CredentialGateway>,
 ) -> Result<WasiCtx, RuntimeError> {
     // No host env inheritance: the explicit injections below are the entire environment a hook
     // component ever sees. Hooks have no manifest-declared allowlist because no hook artifact
@@ -2064,6 +2071,11 @@ fn build_wasi_ctx(
 
     if let Some(endpoint) = env.otel_endpoint {
         builder.env("MURMUR_OTEL_ENDPOINT", endpoint);
+    }
+    // Only a hook whose own entry declares `gateway:` is told where the gateway is.
+    if let Some(gateway) = gateway {
+        let (name, value) = crate::runtime::gateway_env_pair(gateway);
+        builder.env(name, value);
     }
     if let Ok(formation_id) = std::env::var("MURMUR_FORMATION_ID") {
         builder.env("MURMUR_FORMATION_ID", &formation_id);
@@ -2195,6 +2207,7 @@ mod tests {
             config: HookConfig::default(),
             grant,
             on_overflow: Default::default(),
+            gateway: None,
         }
     }
 
@@ -2372,6 +2385,7 @@ mod tests {
             },
             grant: HookCapabilityGrant::default(),
             on_overflow: Default::default(),
+            gateway: None,
         }
     }
 
@@ -3440,7 +3454,7 @@ mod tests {
             capability_policy: crate::types::CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,
-            inference_gateway: None,
+            gateway: None,
             spend: Arc::new(crate::spend::SpendMeter::unlimited()),
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),
@@ -4387,14 +4401,24 @@ mod tests {
     /// A hook store built exactly as the three instantiation sites build one, so the
     /// network suite exercises the real `WasiHttpView` wiring rather than a stand-in.
     fn hook_store_state(root: &Path, grant: &HookCapabilityGrant) -> HookStoreState {
+        hook_store_state_with_gateway(root, grant, None)
+    }
+
+    /// [`hook_store_state`] for a hook whose entry declares `gateway:`.
+    fn hook_store_state_with_gateway(
+        root: &Path,
+        grant: &HookCapabilityGrant,
+        gateway: Option<Arc<crate::credential_gateway::CredentialGateway>>,
+    ) -> HookStoreState {
         HookStoreState {
             limits: ExecutionLimits::default().limiter(),
             table: ResourceTable::new(),
-            wasi: build_wasi_ctx(root, &HookEnvVars::default(), grant).expect("wasi ctx builds"),
+            wasi: build_wasi_ctx(root, &HookEnvVars::default(), grant, gateway.as_deref())
+                .expect("wasi ctx builds"),
             http: WasiHttpCtx::new(),
             http_hooks: NetworkPolicyHooks {
                 network_allow_rules: grant.network_allow_rules.clone(),
-                inference_gateway: None,
+                gateway,
             },
         }
     }
@@ -4422,6 +4446,101 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async { state.http().hooks.send_request(request, config).is_ok() })
+    }
+
+    /// A hook whose entry declares `gateway:` has its gateway-addressed request sent to the
+    /// gateway's upstream on an empty allow-list, carrying the rendered key in place of a forged
+    /// one, while a request to any host its grant does not name is still denied.
+    #[test]
+    fn hook_store_with_a_gateway_reaches_its_upstream_and_still_denies_an_unlisted_host() {
+        use std::io::Read;
+
+        use http_body_util::{BodyExt, Empty};
+
+        use crate::credential_gateway::{CredentialGateway, GatewayMetering};
+
+        const KEY: &str = "sk-hook-gateway-marker";
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let gateway = Arc::new(
+            CredentialGateway::new(
+                "grafana",
+                &format!("http://{}/otlp", upstream.local_addr().unwrap()),
+                murmur_artifact::InferenceAuth {
+                    header: "Authorization".to_string(),
+                    value: "Bearer {key}".to_string(),
+                },
+                Some(Arc::new(
+                    crate::gateway_credential::GatewayCredential::resolve(
+                        "grafana",
+                        &murmur_artifact::ApiKeyReference::Literal(KEY.to_string()),
+                        None,
+                    )
+                    .unwrap(),
+                )),
+                GatewayMetering::Unmetered,
+            )
+            .unwrap(),
+        );
+        let root = TempDir::new().unwrap();
+        let grant = HookCapabilityGrant::default();
+        let mut state = hook_store_state_with_gateway(root.path(), &grant, Some(gateway));
+
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1:9/otlp/v1/traces")
+            .header("authorization", "Bearer forged")
+            .body(
+                Empty::<bytes::Bytes>::new()
+                    .map_err(|err| match err {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: Duration::from_secs(5),
+            first_byte_timeout: Duration::from_secs(5),
+            between_bytes_timeout: Duration::from_secs(5),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let head = rt.block_on(async {
+            let sent = state.http().hooks.send_request(request, config);
+            assert!(sent.is_ok(), "the gateway-addressed request is admitted");
+            let mut head = String::new();
+            for _ in 0..100 {
+                if let Ok((mut stream, _)) = upstream.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(500)))
+                        .unwrap();
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    head = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(sent);
+            head
+        });
+        let head = head.to_ascii_lowercase();
+        assert!(head.starts_with("post /otlp/v1/traces "), "{head}");
+        assert_eq!(head.matches("authorization:").count(), 1, "{head}");
+        assert!(
+            head.contains(&format!("authorization: bearer {KEY}")),
+            "{head}"
+        );
+
+        assert!(!send_through_hook_store(
+            &mut state,
+            "http://127.0.0.1:1/unlisted",
+            false
+        ));
+        assert!(!send_through_hook_store(
+            &mut state,
+            "https://telemetry.example.com/ingest",
+            true
+        ));
     }
 
     /// Default-deny, network half: a hook whose operator entry declared no `capabilities:`
@@ -4480,6 +4599,7 @@ mod tests {
             &missing,
             &HookEnvVars::default(),
             &HookCapabilityGrant::default(),
+            None,
         )
         .expect("an ungranted hook preopens nothing, so a missing root is not an error");
 
@@ -4503,7 +4623,7 @@ mod tests {
         grant.state_store = Some("hook-store".to_string());
         grant.state_dir = Some(state.path().to_path_buf());
 
-        build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant)
+        build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant, None)
             .expect("both preopens are built");
 
         // The scoped subtree is created under the hook's own root.
@@ -4532,7 +4652,7 @@ mod tests {
             ..HookCapabilityGrant::default()
         };
 
-        build_wasi_ctx(&missing, &HookEnvVars::default(), &grant)
+        build_wasi_ctx(&missing, &HookEnvVars::default(), &grant, None)
             .expect("a state grant alone does not preopen the hook's working directory");
 
         assert!(
@@ -4558,7 +4678,7 @@ mod tests {
             ..HookCapabilityGrant::default()
         };
 
-        let err = match build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant) {
+        let err = match build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant, None) {
             Ok(_) => panic!("a missing store directory must fail the build"),
             Err(err) => err,
         };
@@ -4579,7 +4699,7 @@ mod tests {
         std::fs::create_dir_all(&sibling).unwrap();
 
         let grant = grant_of(None, Some("hook-state"));
-        build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant)
+        build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant, None)
             .expect("a granted scope is created and preopened");
 
         let scoped = root.path().join("hook-state");
@@ -4605,6 +4725,7 @@ mod tests {
             root.path(),
             &HookEnvVars::default(),
             &grant_of(None, Some("hook-state")),
+            None,
         )
         .unwrap();
 
@@ -4627,6 +4748,7 @@ mod tests {
             root.path(),
             &HookEnvVars::default(),
             &grant_of(None, Some("hook-state")),
+            None,
         ) {
             Ok(_) => panic!("an uncreatable scope must be a hard error"),
             Err(err) => err,
@@ -6024,6 +6146,7 @@ artifacts:
             },
             grant,
             on_overflow,
+            gateway: None,
         }
     }
 

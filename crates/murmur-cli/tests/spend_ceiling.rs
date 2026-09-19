@@ -98,8 +98,9 @@ fn set_machine_ceiling(home: &TempDir, ceiling: u64) {
 fn http_manifest(name: &str, endpoint: &str, inference_extra: &str) -> String {
     format!(
         "name: {name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
-         {DRIVER_VERSION}\n    runtime: driver\ninference:\n  transport: http\n  endpoint: \
-         {endpoint}\n  model: test-model\n  api_key: test-key\n  max_tokens: {MAX_OUTPUT}\n\
+         {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
+         api_key: test-key\ninference:\n  transport: http\n  model: test-model\n  max_tokens: \
+         {MAX_OUTPUT}\n\
          {inference_extra}  driver:\n    artifact: {DRIVER}\n"
     )
 }
@@ -400,6 +401,7 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -898,9 +900,10 @@ fn compaction_manifest(endpoint: &str, inference_extra: &str, context_budget: bo
     };
     format!(
         "name: spend-compaction\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
-         {DRIVER_VERSION}\n    runtime: driver\n  - name: compactor\n    version: 0.1.0\n    \
-         runtime: hook\n{context}inference:\n  transport: http\n  endpoint: {endpoint}\n  model: \
-         test-model\n  api_key: test-key\n  max_tokens: {MAX_OUTPUT}\n{inference_extra}  \
+         {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
+         api_key: test-key\n  - name: compactor\n    version: 0.1.0\n    runtime: hook\n\
+         {context}inference:\n  transport: http\n  model: test-model\n  max_tokens: \
+         {MAX_OUTPUT}\n{inference_extra}  \
          compaction:\n    threshold: 0.01\n  driver:\n    artifact: {DRIVER}\n"
     )
 }

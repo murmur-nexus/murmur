@@ -84,15 +84,15 @@ A `${VAR}` reference prints no warning. The variable name must be uppercase lett
 underscores, starting with a letter or underscore — `${MY_ORG_KEY}` is a reference, `${my_key}`
 is a literal and warns.
 
-`mur run` does not read `inference.api_key`. It reads provider keys from
+`mur run` does not read this `inference.api_key`. It reads provider keys from
 [`credentials:`](#credentials), and `mur config set inference.api_key` prints a one-line note saying
 so.
 
 ### `credentials:` section { #credentials }
 
-Provider keys, by credential name. A manifest's
-[`inference.api_key: ${NAME}`](manifest.md#inference-api-key) names a credential, and `mur run`
-reads its value from `credentials.NAME` here.
+Provider and third-party API keys, by credential name. A manifest artifact entry's
+[`gateway.api_key: ${NAME}`](manifest.md#gateway-api-key) names a credential, and `mur run` reads
+its value from `credentials.NAME` here.
 
 ```yaml
 credentials:
@@ -118,13 +118,14 @@ mur config set -g credentials.ANTHROPIC_API_KEY sk-ant-...
 |---|---|---|
 | `credentials.NAME` is a non-empty entry in `~/.murmur/config.yaml` | That entry, even when the environment variable `NAME` is also set | Yes |
 | No entry, and the environment variable `NAME` is set | The variable, with [`W-SEC-027`](diagnostics.md#w-sec-027) | No |
-| Neither | None: `mur run` refuses before any session directory exists, with `E-MAN-003` naming both places | — |
-| `inference.api_key` is a literal, not `${NAME}` | The literal, with [`W-SEC-027`](diagnostics.md#w-sec-027) | No |
-| No `inference.api_key` | None | — |
+| Neither | None: `mur run` refuses before any session directory exists, with `E-MAN-003` naming the artifact and both places | — |
+| `gateway.api_key` is a literal, not `${NAME}` | The literal, with [`W-SEC-027`](diagnostics.md#w-sec-027) | No |
+| No `gateway.api_key` | None | — |
 
 #### Rotating a key { #credentials-rotation }
 
-A replaced entry takes effect on the next inference request that any running capsule sends. Nothing
+A replaced entry takes effect on the next request any running capsule sends with that key — an
+inference request, or a tool's or hook's call through its gateway. Nothing
 restarts. Before each request that carries the key, the runtime reads the entry from the config
 file, however the file was last written.
 
@@ -136,15 +137,20 @@ file, however the file was last written.
 
 Removing an entry does not revoke a running capsule's key; replacing it does.
 
-When the provider answers `401`, the runtime reads the file again before deciding whether to
+When an upstream answers `401`, the runtime reads the file again before deciding whether to
 resend. A changed value is sent in one resend of the same request, and that response goes to the
-driver whatever its status. An unchanged value is not resent. A `401` that stands ends the task with
-[`E-RUN-027`](diagnostics.md#e-run-027). Every rotation and rejection is recorded in the session
-trace as an [`inference_credential`](observability-schemas.md#inference-credential) event, which
-never carries the key.
+artifact whatever its status. An unchanged value is not resent. A `401` that stands on the
+driver's upstream ends the task with [`E-RUN-027`](diagnostics.md#e-run-027); on any other
+artifact's upstream it goes back to that artifact as the response. Every rotation and rejection is
+recorded in the session trace, never with the key:
+
+| Credential | Event |
+|---|---|
+| The configured driver's | [`inference_credential`](observability-schemas.md#inference-credential) |
+| Any other artifact's | [`gateway_credential`](observability-schemas.md#gateway-credential) |
 
 A capsule started by another capsule's `delegate-task` runs with the same `HOME`, so it reads the
-same file and picks up a rotated key too. Only `transport: http` capsules read credentials.
+same file and picks up a rotated key too.
 
 #### File permissions { #credentials-permissions }
 
@@ -291,7 +297,7 @@ A run that cannot create or open the ledger refuses to start with
 | `mur install` source-chain resolution | `registry.default`, `registry.sources` |
 | `mur search` | `registry.index_url` |
 | `mur run`, `mur doctor` — the containment floor | `containment` |
-| `mur run` — the key for `inference.api_key: ${NAME}`, re-read while the capsule runs; `mur doctor` — whether to warn with `W-SEC-027` | `credentials`, from the global file only |
+| `mur run` — the key for each `gateway.api_key: ${NAME}`, re-read while the capsule runs; `mur doctor` — whether to warn with `W-SEC-027` | `credentials`, from the global file only |
 | `mur run` — the machine spend ceiling; `mur run` and `mur doctor` — [`W-SEC-026`](diagnostics.md#w-sec-026) | `spend.machine_tokens_per_day` |
 
 `mur new` and `mur deploy` read `~/.murmur/config.yaml` only; a project-level file does not

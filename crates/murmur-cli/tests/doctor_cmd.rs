@@ -258,20 +258,35 @@ fn create_three_level_formation(home: &TempDir, project_dir: &Path) {
     .unwrap();
 }
 
-/// A capsule that delegates to nobody, whose `inference.api_key` is `api_key` verbatim.
+/// A capsule that delegates to nobody, whose driver's `gateway.api_key` is `api_key` verbatim.
 ///
-/// `endpoint` and `driver` are declared because the `http` transport requires them: `mur doctor`
-/// validates this manifest exactly as `mur run` does, resolving the secret aside.
+/// The driver entry and its `gateway.endpoint` are declared because the `http` transport requires
+/// them: `mur doctor` validates this manifest exactly as `mur run` does, resolving the secret aside.
 fn create_referencing_project(project_dir: &Path, api_key: &str) {
     fs::write(
         project_dir.join("murmur.yaml"),
         format!(
-            "name: solo\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  \
-             endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    \
-             artifact: murmur-driver-anthropic\n  api_key: {api_key}\n"
+            "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+             version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+             endpoint: http://127.0.0.1:8080\n      api_key: {api_key}\ninference:\n  \
+             transport: http\n  model: test-model\n  driver:\n    \
+             artifact: murmur-driver-anthropic\n"
         ),
     )
     .unwrap();
+}
+
+/// Install the driver [`create_referencing_project`] names into `home`'s global store, for the
+/// cases that need its artifact check to pass rather than stop at a missing driver.
+fn install_referenced_driver(home: &TempDir) {
+    let artifacts = tempfile::tempdir().unwrap();
+    let driver = common::create_driver_artifact(
+        artifacts.path(),
+        "murmur-driver-anthropic",
+        "0.1.0",
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(home, &driver).success();
 }
 
 /// Both streams of one invocation, for the substring checks that must hold across the pair.
@@ -966,7 +981,7 @@ fn formation_env_reports_the_whole_closure_three_levels_deep() {
     .stdout(predicate::str::contains("could not inspect").not())
     .stdout(predicate::str::contains("mur-roost will refuse").not())
     // Every name here is a `capabilities.env.allow` entry, and those render bare.
-    .stdout(predicate::str::contains("(inference.api_key)").not());
+    .stdout(predicate::str::contains(".gateway.api_key)").not());
 }
 
 #[test]
@@ -1281,8 +1296,11 @@ fn a_child_manifest_with_an_unresolvable_env_reference_is_still_read() {
         &global_store(&home),
         "worker",
         "0.1.0",
-        "name: worker\nversion: 0.1.0\ninference:\n  driver: anthropic\n  model: claude-x\n  \
-         api_key: ${PROVIDER_KEY}\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY]\n",
+        "name: worker\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+         version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+         endpoint: http://127.0.0.1:8080\n      api_key: ${PROVIDER_KEY}\ninference:\n  \
+         transport: http\n  model: claude-x\n  driver:\n    \
+         artifact: murmur-driver-anthropic\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY]\n",
     );
     fs::write(
         project.path().join("murmur.yaml"),
@@ -1321,7 +1339,9 @@ fn an_unresolvable_reference_in_the_project_manifest_is_reported_not_refused() {
         .stdout(predicate::str::contains("capsules: solo@0.0.1"))
         .stdout(predicate::str::contains("\u{2717}  SOLO_PROVIDER_KEY"))
         .stdout(predicate::str::contains("unset"))
-        .stdout(predicate::str::contains("solo@0.0.1 (inference.api_key)"))
+        .stdout(predicate::str::contains(
+            "solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)",
+        ))
         .stdout(predicate::str::contains("Fix: export SOLO_PROVIDER_KEY"))
         .stdout(predicate::str::contains(format!(
             "murmur.yaml for {}...",
@@ -1352,9 +1372,11 @@ fn every_unset_variable_is_reported_not_only_the_first() {
     );
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: solo\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  \
-         endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    \
-         artifact: murmur-driver-anthropic\n  api_key: ${SOLO_PROVIDER_KEY}\ncapabilities:\n  \
+        "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+         version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+         endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_PROVIDER_KEY}\ninference:\n  \
+         transport: http\n  model: test-model\n  driver:\n    \
+         artifact: murmur-driver-anthropic\ncapabilities:\n  \
          env:\n    allow: [SOLO_PROVIDER_KEY, SECOND_KEY, THIRD_KEY]\n  spawn:\n    \
          allow: [worker]\n",
     )
@@ -1393,6 +1415,7 @@ fn every_unset_variable_is_reported_not_only_the_first() {
 fn a_reference_the_workspace_dotenv_declares_is_not_a_finding() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    install_referenced_driver(&home);
     create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
     fs::write(
         project.path().join(".env"),
@@ -1417,6 +1440,7 @@ fn a_reference_the_workspace_dotenv_declares_is_not_a_finding() {
 fn a_referenced_variables_value_is_never_printed() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    install_referenced_driver(&home);
     create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
 
     let output = mur_doctor_with_env(
@@ -1448,9 +1472,11 @@ fn the_roots_own_reference_joins_the_formations_variable_list() {
     );
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  \
-         endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    \
-         artifact: murmur-driver-anthropic\n  api_key: ${ROOT_PROVIDER_KEY}\ncapabilities:\n  \
+        "name: root-capsule\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+         version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+         endpoint: http://127.0.0.1:8080\n      api_key: ${ROOT_PROVIDER_KEY}\ninference:\n  \
+         transport: http\n  model: test-model\n  driver:\n    \
+         artifact: murmur-driver-anthropic\ncapabilities:\n  \
          env:\n    allow: [WORKER_KEY]\n  spawn:\n    allow: [worker]\n",
     )
     .unwrap();
@@ -1465,7 +1491,8 @@ fn the_roots_own_reference_joins_the_formations_variable_list() {
         "capsules: root-capsule@0.0.1, worker@0.1.0",
     ))
     .stdout(predicate::str::contains(
-        "\u{2717}  ROOT_PROVIDER_KEY   unset   \u{2014} root-capsule@0.0.1 (inference.api_key)",
+        "\u{2717}  ROOT_PROVIDER_KEY   unset   \u{2014} root-capsule@0.0.1 \
+         (artifacts.murmur-driver-anthropic.gateway.api_key)",
     ))
     .stdout(predicate::str::contains(
         "\u{2717}  WORKER_KEY          unset   \u{2014} root-capsule@0.0.1, worker@0.1.0",
@@ -1501,6 +1528,7 @@ fn the_roots_own_reference_joins_the_formations_variable_list() {
 fn a_literal_api_key_is_not_mistaken_for_a_reference() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    install_referenced_driver(&home);
     create_referencing_project(project.path(), "not-a-reference");
 
     let output = mur_doctor(&home, project.path())
@@ -1521,6 +1549,7 @@ fn a_literal_api_key_is_not_mistaken_for_a_reference() {
 fn mur_run_still_refuses_the_reference_mur_doctor_reports() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    install_referenced_driver(&home);
     create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
 
     Command::cargo_bin("mur")
@@ -1533,7 +1562,9 @@ fn mur_run_still_refuses_the_reference_mur_doctor_reports() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("E-MAN-003"))
-        .stderr(predicate::str::contains("inference.api_key"))
+        .stderr(predicate::str::contains(
+            "gateway.api_key on artifact 'murmur-driver-anthropic'",
+        ))
         .stderr(predicate::str::contains("${SOLO_PROVIDER_KEY}"));
 }
 

@@ -342,7 +342,7 @@ The four names above are the runtime's, and a child that lists one of them under
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself
 does not hold is absent from the child even where both manifests declare it, and a child whose
-`inference.api_key` references it fails at manifest load with
+`gateway.api_key` references it fails at manifest load with
 [`E-MAN-003`](diagnostics.md#index).
 
 The daemon resolves a child manifest's `${VARIABLE}` references against its own process
@@ -824,7 +824,7 @@ daemon is made by the capsule's runtime, which holds them; `MURMUR_SESSION_ID` a
 on its own.
 
 The daemon's own environment needs no provider credential. It reads a capsule's manifest for the
-capability policy and declared state stores alone, leaving `inference.api_key` unresolved, so a
+capability policy and declared state stores alone, leaving every `gateway.api_key` unresolved, so a
 registry of capsules referencing `${OPENAI_API_KEY}`, `${ANTHROPIC_API_KEY}` or any other variable
 resolves, registers and spawns in a daemon started with an empty environment. The provider key is
-read where the inference turn happens: in the capsule's own process, by `mur run`.
+read where the keyed request happens: in the capsule's own process, by `mur run`.

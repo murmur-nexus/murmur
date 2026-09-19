@@ -251,13 +251,14 @@ pub const W_SEC_023: &str = "W-SEC-023";
 /// once per distinct credential-shaped entry, in declaration order.
 pub const W_SEC_024: &str = "W-SEC-024";
 
-/// A `transport: http` capsule names its own inference endpoint in `capabilities.network.allow`.
+/// A `capabilities.network.allow` entry — capsule-wide, or on an artifact's own entry — names the
+/// host of an artifact's `gateway.endpoint`.
 ///
-/// The runtime reaches the provider itself, through the inference gateway, and attaches the key
-/// there; the driver's inference request never consults the allow-list. The entry is not inert —
-/// it still grants tools, subprocesses and the driver direct reach to that host, just without the
-/// key — so it is accepted rather than refused, and the warning says what it now grants. Fires
-/// once per matching entry, before any session workdir exists.
+/// The runtime reaches that upstream itself, through the artifact's credential gateway, and
+/// attaches the key there; a gateway-addressed request never consults the allow-list. The entry is
+/// not inert — it still grants tools, subprocesses and artifacts direct reach to that host, just
+/// without the key — so it is accepted rather than refused, and the warning says what it grants.
+/// Fires once per matching entry, before any session workdir exists.
 pub const W_SEC_025: &str = "W-SEC-025";
 
 /// `spend.machine_tokens_per_day` is in effect and the capsule uses `transport: process`.
@@ -268,9 +269,9 @@ pub const W_SEC_025: &str = "W-SEC-025";
 /// session workdir exists.
 pub const W_SEC_026: &str = "W-SEC-026";
 
-/// A `transport: http` capsule's `inference.api_key` can only be read at launch: it is a literal
-/// in the manifest, or a `${NAME}` the global config's `credentials:` map does not hold and the
-/// launching shell's environment supplies.
+/// An artifact's `gateway.api_key` can only be read at launch: it is a literal in the manifest, or
+/// a `${NAME}` the global config's `credentials:` map does not hold and the launching shell's
+/// environment supplies.
 ///
 /// A rotated key reaches every capsule whose key comes from the config on its next request; this
 /// one keeps the key it launched with until it is restarted. Accepted rather than refused, because
@@ -278,8 +279,8 @@ pub const W_SEC_026: &str = "W-SEC-026";
 /// exists, and never names the value.
 pub const W_SEC_027: &str = "W-SEC-027";
 
-/// A file under `~/.murmur` that holds a secret, or the config file a `transport: http` capsule
-/// is resolving its inference key from, has a mode that lets other accounts on the host read it.
+/// A file under `~/.murmur` that holds a secret, or the config file a capsule is resolving a
+/// `gateway.api_key` from, has a mode that lets other accounts on the host read it.
 ///
 /// Never a refusal. Fires once at staging when a `credentials.<NAME>` is read from a config file
 /// granting any group or other bit, and from `mur doctor` once for every owner-only entry, or
@@ -296,6 +297,17 @@ pub const W_SEC_028: &str = "W-SEC-028";
 /// path, the unchecked helpers and the error or signal. A warning rather than a refusal because
 /// `W_SEC_012`, the check it stands in for, never refuses a launch either.
 pub const W_SEC_029: &str = "W-SEC-029";
+
+/// An artifact reaches its upstream through a credential gateway that is not the inference
+/// gateway, so nothing meters it.
+///
+/// Only the configured `transport: http` driver's gateway is admitted against the spend meter;
+/// every other artifact's keyed request is sent without an admission and counts toward neither
+/// `inference.max_session_tokens` nor `spend.machine_tokens_per_day`. Never a refusal — an
+/// unmetered third-party API is an ordinary thing for a tool to call — but stated, so an operator
+/// does not read the spend ceilings as covering it. Fires once per such gateway, at launch and
+/// from `mur doctor`, before any session workdir exists, and never names the key.
+pub const W_SEC_030: &str = "W-SEC-030";
 
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
@@ -317,7 +329,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
-            W_SEC_025, W_SEC_026, W_SEC_027, W_SEC_028, W_SEC_029,
+            W_SEC_025, W_SEC_026, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

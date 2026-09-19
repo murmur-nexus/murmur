@@ -262,10 +262,10 @@ fn write_manifest(project_dir: &Path, endpoint: &str) -> PathBuf {
         &manifest,
         format!(
             "name: workdir-writes-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
-             version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    \
+             version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+             endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    \
              allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\ninference:\n  \
-             transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  \
-             driver:\n    artifact: {DRIVER_NAME}\n"
+             transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();

@@ -244,7 +244,7 @@ fn a_registration_with_an_empty_session_id_is_a_bad_request() {
 
 /// The manifest of a capsule that talks to a provider: the key is an environment reference, and
 /// the variable it names is deliberately one no test process sets.
-const PROVIDER_WORKER_BODY: &str = "artifacts: []\ncapabilities:\n  network:\n    allow: [api.provider.internal]\ninference:\n  transport: http\n  endpoint: https://api.provider.internal/v1\n  model: test-model\n  api_key: ${ROOST_MUST_NEVER_READ}\n  driver:\n    artifact: murmur-driver-anthropic\n";
+const PROVIDER_WORKER_BODY: &str = "artifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.provider.internal/v1\n      api_key: ${ROOST_MUST_NEVER_READ}\ncapabilities:\n  network:\n    allow: [api.provider.internal]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
 
 /// The referee holds no provider credential, so it reads a capsule's manifest for its capability
 /// policy without resolving the key that manifest references.
@@ -289,7 +289,7 @@ fn an_unlisted_name_is_refused_before_the_registry_is_read() {
 #[test]
 fn a_delegation_between_two_provider_capsules_needs_no_key() {
     let daemon = Daemon::with_spawn_allow(vec!["listed".to_string()]);
-    let parent_body = "artifacts: []\ncapabilities:\n  network:\n    allow: [api.provider.internal]\n  spawn:\n    allow: [child]\ninference:\n  transport: http\n  endpoint: https://api.provider.internal/v1\n  model: test-model\n  api_key: ${ROOST_MUST_NEVER_READ}\n  driver:\n    artifact: murmur-driver-anthropic\n";
+    let parent_body = "artifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.provider.internal/v1\n      api_key: ${ROOST_MUST_NEVER_READ}\ncapabilities:\n  network:\n    allow: [api.provider.internal]\n  spawn:\n    allow: [child]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
     daemon.publish_body("listed", "0.1.0", parent_body, "");
     daemon.publish_body("child", "0.1.0", PROVIDER_WORKER_BODY, "");
 

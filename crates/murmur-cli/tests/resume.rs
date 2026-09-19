@@ -56,9 +56,10 @@ fn create_manifest(
         .collect();
     let manifest = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {DRIVER_NAME}\n    \
-         version: {DRIVER_VERSION}\n    runtime: driver\n{hooks}capabilities:\n  network:\n    \
-         allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  \
-         model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n",
+         version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+         endpoint: {endpoint}\n      api_key: test-key\n{hooks}capabilities:\n  network:\n    \
+         allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  \
+         driver:\n    artifact: {DRIVER_NAME}\n",
     );
     fs::write(project_dir.join("murmur.yaml"), manifest).unwrap();
     project_dir.join("murmur.yaml")
@@ -547,6 +548,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "effective_grants",
             "event_id",
             "event_type",
+            "gateways",
             "machine_tokens_per_day",
             "max_session_tokens",
             "max_turns",

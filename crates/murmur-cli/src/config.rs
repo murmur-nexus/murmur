@@ -59,7 +59,7 @@ pub struct MurConfig {
     /// [`merge_containment`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<ContainmentClass>,
-    /// Provider keys by credential name. A manifest's `inference.api_key: ${NAME}` is answered from
+    /// Provider keys by credential name. A manifest's `gateway.api_key: ${NAME}` is answered from
     /// `credentials.NAME` here before the environment, and `mur run` re-reads the file while a
     /// capsule runs. Read from the global file only (see [`merge_mur_configs`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -494,7 +494,7 @@ fn project_credentials_warning(path: &Path, project: &MurConfig) -> Option<Strin
     })
 }
 
-/// Whether `name` can be a credential name: the `${NAME}` grammar a manifest's `inference.api_key`
+/// Whether `name` can be a credential name: the `${NAME}` grammar a manifest's `gateway.api_key`
 /// accepts, `[A-Z_][A-Z0-9_]*`.
 pub(crate) fn is_valid_credential_name(name: &str) -> bool {
     is_valid_env_variable(name)

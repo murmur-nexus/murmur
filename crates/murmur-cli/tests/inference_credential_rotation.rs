@@ -240,9 +240,9 @@ impl Capsule {
             &manifest,
             format!(
                 "name: rotation-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    \
-                 version: {VERSION}\n    runtime: driver\n  - name: {SKILL}\n    version: \
-                 {VERSION}\n    runtime: skill\n{extra}inference:\n  transport: http\n  \
-                 endpoint: {}\n  model: test-model\n  api_key: {api_key}\n  driver:\n    \
+                 version: {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {}\n      \
+                 api_key: {api_key}\n  - name: {SKILL}\n    version: {VERSION}\n    runtime: \
+                 skill\n{extra}inference:\n  transport: http\n  model: test-model\n  driver:\n    \
                  artifact: {DRIVER}\n",
                 upstream.endpoint
             ),
@@ -731,6 +731,11 @@ fn launch_only_credential_warns() {
             assert_eq!(lines.len(), 1, "{surface}: {}", output.context());
             assert!(lines[0].contains(W_SEC_027_LINK), "{}", lines[0]);
             assert!(lines[0].contains(names), "{}", lines[0]);
+            assert!(
+                lines[0].contains(&format!("artifact '{DRIVER}' gateway.api_key")),
+                "{}",
+                lines[0]
+            );
             assert!(
                 lines[0].contains("cannot pick up a rotated key until it is restarted"),
                 "{}",

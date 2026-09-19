@@ -83,13 +83,14 @@ fn spinner_project(endpoint: &str, exports: &str) -> TempDir {
         project.path().join("murmur.yaml"),
         format!(
             "name: busy-door\nversion: 0.1.0\n\
-             artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n  \
+             artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
              - name: spinner\n    version: 0.1.0\n    runtime: hook\n\
              capabilities:\n  network:\n    allow:\n      - {endpoint}\n  \
              limits:\n    deadline_seconds: {SPIN_SECONDS}\n\
              lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 8\n\
-             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-             api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n{exports}"
+             inference:\n  transport: http\n  model: test-model\n  \
+             driver:\n    artifact: {DRIVER_NAME}\n{exports}"
         ),
     )
     .unwrap();

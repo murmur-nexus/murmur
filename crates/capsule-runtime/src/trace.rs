@@ -14,7 +14,7 @@ use tokio::{
 use crate::{
     agent::DriverUsage,
     containment::ScopeReport,
-    inference_credential::CredentialChange,
+    gateway_credential::CredentialChange,
     lanes::TaskLane,
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
@@ -52,6 +52,9 @@ pub(crate) struct TraceWriter {
     /// Where the inference credential came from: `"config"`, `"environment"`, `"manifest"` or
     /// `"none"`. Set by [`Self::set_credential_source`] before `session_start` is written.
     credential_source: &'static str,
+    /// Every credential gateway the session holds. Set by [`Self::set_gateways`] before
+    /// `session_start` is written; empty until then.
+    gateways: Vec<SessionGateway>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -262,6 +265,10 @@ struct SessionStartEvent {
     /// Where the inference credential this session attaches came from: `"config"`,
     /// `"environment"`, `"manifest"` or `"none"`. Never the value.
     credential_source: &'static str,
+    /// Every credential gateway the session holds, the inference gateway first. Always written,
+    /// and empty for a session with none, so an auditor can tell an unmetered third-party
+    /// upstream from spend the ceilings cover.
+    gateways: Vec<SessionGateway>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -1248,6 +1255,7 @@ impl TraceWriter {
             system_prompt_source,
             system_prompt_sha256,
             credential_source: "none",
+            gateways: Vec::new(),
             resumed_from,
             context_id,
             spawned_by,
@@ -1321,9 +1329,14 @@ impl TraceWriter {
     }
 
     /// Records where the inference credential came from, as
-    /// [`crate::inference_credential::CredentialSource::trace_name`] names it. `"none"` until set.
+    /// [`crate::gateway_credential::CredentialSource::trace_name`] names it. `"none"` until set.
     pub(crate) fn set_credential_source(&mut self, source: &'static str) {
         self.credential_source = source;
+    }
+
+    /// Records the session's credential gateways for `session_start.gateways`.
+    pub(crate) fn set_gateways(&mut self, gateways: Vec<SessionGateway>) {
+        self.gateways = gateways;
     }
 
     pub(crate) async fn write_session_start(
@@ -1353,6 +1366,7 @@ impl TraceWriter {
             system_prompt_source: self.system_prompt_source,
             system_prompt_sha256: self.system_prompt_sha256.clone(),
             credential_source: self.credential_source,
+            gateways: self.gateways.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -2156,6 +2170,44 @@ impl TraceWriter {
     }
 }
 
+/// One element of `session_start.gateways`: an artifact's credential gateway. Never the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionGateway {
+    /// The artifact whose entry declares the gateway.
+    pub(crate) artifact: String,
+    /// The upstream's host, with its port when `gateway.endpoint` wrote one.
+    pub(crate) host: String,
+    /// `"config"`, `"environment"`, `"manifest"`, or `"none"` when the entry names no key.
+    pub(crate) credential_source: &'static str,
+    /// Whether the gateway is admitted against the spend meter: true only for the configured
+    /// `transport: http` driver's.
+    pub(crate) metered: bool,
+}
+
+/// `gateway_credential`: the `inference_credential` event for the credential of any artifact other
+/// than the configured inference driver, with the artifact's name.
+#[derive(Serialize)]
+struct GatewayCredentialEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    artifact: &'a str,
+    source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<&'a str>,
+    change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retried: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
 /// `inference_credential`: a rotation, rejection or unreadable source for the session's inference
 /// credential. `trigger` is written only with `change: "rotated"`, `status` and `retried` only with
 /// `"rejected"`, `reason` only with `"unreadable"`, and `credential` whenever the manifest named one.
@@ -2178,6 +2230,27 @@ struct InferenceCredentialEvent<'a> {
     retried: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
+}
+
+/// A credential change as the `change`, `trigger`, `status`, `retried` and `reason` fields of an
+/// `inference_credential` or `gateway_credential` event.
+#[allow(clippy::type_complexity)]
+fn credential_change_fields(
+    change: CredentialChange,
+) -> (
+    &'static str,
+    Option<&'static str>,
+    Option<u16>,
+    Option<bool>,
+    Option<&'static str>,
+) {
+    match change {
+        CredentialChange::Rotated { trigger } => ("rotated", Some(trigger), None, None, None),
+        CredentialChange::Rejected { status, retried } => {
+            ("rejected", None, Some(status), Some(retried), None)
+        }
+        CredentialChange::Unreadable { reason } => ("unreadable", None, None, None, Some(reason)),
+    }
 }
 
 // ── Resource-plane appender ───────────────────────────────────────────────────
@@ -2433,21 +2506,41 @@ impl ResourceTraceAppender {
         credential: Option<&str>,
         change: CredentialChange,
     ) {
-        let (change_name, trigger, status, retried, reason) = match change {
-            CredentialChange::Rotated { trigger } => ("rotated", Some(trigger), None, None, None),
-            CredentialChange::Rejected { status, retried } => {
-                ("rejected", None, Some(status), Some(retried), None)
-            }
-            CredentialChange::Unreadable { reason } => {
-                ("unreadable", None, None, None, Some(reason))
-            }
-        };
+        let (change_name, trigger, status, retried, reason) = credential_change_fields(change);
         let event = InferenceCredentialEvent {
             event_type: "inference_credential",
             event_id: new_event_id(),
             parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
+            source,
+            credential,
+            change: change_name,
+            trigger,
+            status,
+            retried,
+            reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Writes a `gateway_credential` event for `artifact`'s credential: the fields
+    /// [`Self::write_inference_credential`] writes, plus `artifact`.
+    pub(crate) async fn write_gateway_credential(
+        &self,
+        artifact: &str,
+        source: &'static str,
+        credential: Option<&str>,
+        change: CredentialChange,
+    ) {
+        let (change_name, trigger, status, retried, reason) = credential_change_fields(change);
+        let event = GatewayCredentialEvent {
+            event_type: "gateway_credential",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            artifact,
             source,
             credential,
             change: change_name,

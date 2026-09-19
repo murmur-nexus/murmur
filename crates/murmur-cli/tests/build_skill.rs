@@ -301,6 +301,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             source: a.source.clone(),
             on_overflow: a.on_overflow,
             config: a.config.clone(),
+            gateway: a.gateway.clone(),
             capabilities: a.capabilities.clone(),
         });
     }
@@ -310,9 +311,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     // Minimal inference config so stage_session accepts empty capsule bytes
     let stub_inference = Some(InferenceConfig {
         transport: "http".to_string(),
-        endpoint: Some("http://localhost:9999".to_string()),
         model: "test-model".to_string(),
-        api_key: None,
         driver: Some(InferenceDriver {
             artifact: "dummy-driver".to_string(),
             config: None,

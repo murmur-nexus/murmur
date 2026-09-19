@@ -24,9 +24,7 @@ use tempfile::{tempdir, TempDir};
 fn stub_inference() -> Option<InferenceConfig> {
     Some(InferenceConfig {
         transport: "http".to_string(),
-        endpoint: Some("http://localhost:9999".to_string()),
         model: "test-model".to_string(),
-        api_key: None,
         driver: Some(InferenceDriver {
             artifact: "dummy-driver".to_string(),
             config: None,
@@ -53,6 +51,7 @@ fn requested_from(manifest: &murmur_artifact::RuntimeManifest) -> Vec<ArtifactRe
             source: a.source.clone(),
             on_overflow: a.on_overflow,
             config: a.config.clone(),
+            gateway: a.gateway.clone(),
             capabilities: a.capabilities.clone(),
         })
         .collect()
@@ -288,16 +287,33 @@ fn source_on_tool_runtime_fails_fast() {
     assert!(!capsule_dir.path().join("workdir").exists());
 }
 
+/// A home with `dummy-driver@0.1.0` published, so a `mur run` of a manifest naming it as the
+/// inference driver gets past the installed-artifact check and reaches staging.
+fn home_with_dummy_driver() -> TempDir {
+    let home = tempdir().unwrap();
+    let artifacts = tempdir().unwrap();
+    let driver = common::create_driver_artifact(
+        artifacts.path(),
+        "dummy-driver",
+        "0.1.0",
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver).success();
+    home
+}
+
 #[test]
 fn source_path_missing_fails_naming_path() {
     let capsule_dir: TempDir = tempdir().unwrap();
     // Skill source points at a path that does not exist. Inference present so staging is reached.
-    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  endpoint: http://localhost:9999\n  model: test\n  driver:\n    artifact: dummy-driver\nartifacts:\n  - name: ghost\n    source: ./skills/ghost/skill.md\n    runtime: skill\n";
+    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: dummy-driver\nartifacts:\n  - name: ghost\n    source: ./skills/ghost/skill.md\n    runtime: skill\n  - name: dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n";
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 
+    let home = home_with_dummy_driver();
     Command::cargo_bin("mur")
         .unwrap()
+        .env("HOME", home.path())
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .assert()
         .failure()
@@ -315,12 +331,14 @@ fn source_directory_without_skill_md_fails() {
     let empty = capsule_dir.path().join("skills").join("empty");
     fs::create_dir_all(&empty).unwrap();
 
-    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  endpoint: http://localhost:9999\n  model: test\n  driver:\n    artifact: dummy-driver\nartifacts:\n  - name: empty-skill\n    source: ./skills/empty/\n    runtime: skill\n";
+    let manifest_content = "name: cap\nversion: 0.1.0\ninference:\n  transport: http\n  model: test\n  driver:\n    artifact: dummy-driver\nartifacts:\n  - name: empty-skill\n    source: ./skills/empty/\n    runtime: skill\n  - name: dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://localhost:9999\n      keyless: true\n";
     let manifest_path = capsule_dir.path().join("murmur.yaml");
     fs::write(&manifest_path, manifest_content).unwrap();
 
+    let home = home_with_dummy_driver();
     Command::cargo_bin("mur")
         .unwrap()
+        .env("HOME", home.path())
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .assert()
         .failure()

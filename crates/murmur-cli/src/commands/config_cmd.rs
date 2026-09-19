@@ -24,7 +24,7 @@ const CREDENTIALS_PREFIX: &str = "credentials.";
 /// Printed whenever `inference.api_key` is set: `mur new` reads that scalar, and `mur run` does
 /// not.
 const INFERENCE_API_KEY_NOTE: &str =
-    "note: mur run does not read inference.api_key; a manifest's `inference.api_key: ${NAME}` is \
+    "note: mur run does not read inference.api_key; a manifest's `gateway.api_key: ${NAME}` is \
      read from credentials.<NAME> — set it with `mur config set -g credentials.<NAME> <key>`";
 
 #[derive(Debug, Subcommand)]
@@ -65,7 +65,7 @@ fn parse_key(key: &str, global: bool) -> Result<ConfigKey<'_>, CliError> {
                 E_CFG_002,
                 format!("unsupported config key '{key}'"),
                 "a credential name is uppercase letters, digits and underscores, starting with a \
-                 letter or underscore — the NAME a manifest writes as `inference.api_key: ${NAME}`",
+                 letter or underscore — the NAME a manifest writes as `gateway.api_key: ${NAME}`",
             ));
         }
         if !global {

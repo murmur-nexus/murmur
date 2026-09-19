@@ -67,6 +67,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
                 source: None,
                 on_overflow: Default::default(),
                 config: None,
+                gateway: None,
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::new(),
@@ -78,9 +79,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             // Fake inference config — needed so empty capsule_component_bytes is accepted
             inference: Some(InferenceConfig {
                 transport: "http".to_string(),
-                endpoint: Some("http://localhost:9999".to_string()),
                 model: "test-model".to_string(),
-                api_key: None,
                 driver: Some(InferenceDriver {
                     artifact: "fake-driver".to_string(),
                     config: None,
@@ -183,9 +182,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             },
             inference: Some(InferenceConfig {
                 transport: "http".to_string(),
-                endpoint: Some("http://localhost:9999".to_string()),
                 model: "test-model".to_string(),
-                api_key: None,
                 driver: Some(InferenceDriver {
                     artifact: "fake-driver".to_string(),
                     config: None,
@@ -282,6 +279,7 @@ fn shell_desc_driver_respects_custom_manifest() {
                 source: None,
                 on_overflow: Default::default(),
                 config: None,
+                gateway: None,
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::new(),
@@ -292,9 +290,7 @@ fn shell_desc_driver_respects_custom_manifest() {
             },
             inference: Some(InferenceConfig {
                 transport: "http".to_string(),
-                endpoint: Some("http://localhost:9999".to_string()),
                 model: "test-model".to_string(),
-                api_key: None,
                 driver: Some(InferenceDriver {
                     artifact: "fake-driver".to_string(),
                     config: None,

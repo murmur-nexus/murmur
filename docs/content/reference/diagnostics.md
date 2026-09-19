@@ -27,6 +27,8 @@ section that explains it.
 | `E-CAP-014` | A variable this project needs is set by nothing in the environment | [E-CAP-014](#e-cap-014) |
 | `E-CAP-015` | A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold | [E-CAP-015](#e-cap-015) |
 | `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every guest | [E-CAP-016](#e-cap-016) |
+| `E-CAP-017` | A `gateway:` is declared on a native tool, whose requests never pass the credential gateway | [E-CAP-017](#e-cap-017) |
+| `E-CAP-018` | A `gateway:` names an endpoint but binds no `api_key` and does not declare `keyless: true` | [E-CAP-018](#e-cap-018) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -43,7 +45,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure) | — |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), or an `inference.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
 | `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
@@ -75,7 +77,7 @@ section that explains it.
 | `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
 | `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
-| `E-RUN-025` | The `transport: http` inference driver declares no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
+| `E-RUN-025` | An artifact whose entry declares `gateway:` has no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
 | `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
@@ -114,11 +116,12 @@ section that explains it.
 | `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
 | `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker | [W-SEC-024](#w-sec-024) |
-| `W-SEC-025` | `capabilities.network.allow` names the inference endpoint — inference does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
+| `W-SEC-025` | A `capabilities.network.allow` entry names an artifact's `gateway.endpoint` host — the gateway does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
 | `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
-| `W-SEC-027` | The inference key is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
+| `W-SEC-027` | An artifact's `gateway.api_key` is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
 | `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file an inference key was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
 | `W-SEC-029` | A compiler driver could not be run to ask where its helper binaries live, so `W-SEC-012` was not evaluated for it | [W-SEC-029](#w-sec-029) |
+| `W-SEC-030` | An artifact reaches its upstream through an unmetered credential gateway, which the spend ceilings do not cover | [W-SEC-030](#w-sec-030) |
 
 ---
 
@@ -418,17 +421,17 @@ running, so unlinking the record would remove the only handle anyone has on it. 
 session held was cancelled before the signalling started, so the capsule is idle even though it is
 still there.
 
-### E-RUN-025 — the inference driver declares no usable `inference_auth:` block { #e-run-025 }
+### E-RUN-025 — an artifact with a gateway declares no usable `inference_auth:` block { #e-run-025 }
 
-A `transport: http` capsule names a driver whose own `murmur.yaml` does not say how its provider
-takes the API key. The runtime attaches the key to each driver request itself, so without that
-declaration it cannot authenticate the driver, and `mur run` refuses at staging, before any
-component runs or any request is sent. The refusal applies whether or not `inference.api_key` is
-set.
+An artifact entry declares [`gateway:`](manifest.md#artifact-gateway), and the artifact's own
+`murmur.yaml` does not say how its upstream takes the key. The runtime attaches the key to each of
+the artifact's gateway requests itself, so without that declaration it cannot, and `mur run`
+refuses at staging, before any component runs or any request is sent. The refusal applies whether
+or not `gateway.api_key` is set, and to the inference driver, tools and hooks alike.
 
 ```text
-error[E-RUN-025]: inference driver 'murmur-driver-anthropic@1.0.0' declares no usable inference_auth: block
-  hint: the runtime presents the provider key itself and needs the driver to say how; update the driver to a version whose murmur.yaml declares inference_auth:
+error[E-RUN-025]: artifact 'murmur-driver-anthropic@1.0.0' declares no usable inference_auth: block
+  hint: the runtime presents the key itself and needs the artifact to say how; update the artifact to a version whose murmur.yaml declares inference_auth:, or remove gateway: from its entry
 ```
 
 A block that is present and malformed adds the reason in parentheses:
@@ -442,7 +445,7 @@ A block that is present and malformed adds the reason in parentheses:
 | `must contain {key} exactly once` | `value` has no `{key}`, or more than one |
 | `contains characters an HTTP header value cannot hold` | `value` has a control character such as a newline |
 
-The block's shape is in [Driver `inference_auth:` block](default-artifacts.md#inference-auth).
+The block's shape is in [`inference_auth:` block](default-artifacts.md#inference-auth).
 
 ### E-RUN-026 — the spend ledger cannot be used { #e-run-026 }
 
@@ -476,7 +479,7 @@ What the message names depends on where the key came from:
 |---|---|---|
 | `credentials.<NAME>` in the global config | The entry and the config file path | Replace the entry; running capsules use it on their next call |
 | The environment variable `<NAME>` | The variable, and that it is read once at launch | Restart the capsule with a valid key, or store the key as `credentials.<NAME>` |
-| A literal `inference.api_key` in `murmur.yaml` | The manifest literal, and that it is read once at launch | As for the environment |
+| A literal `gateway.api_key` on the driver's entry in `murmur.yaml` | The manifest literal, and that it is read once at launch | As for the environment |
 
 When the single resend was also rejected, the message adds that the credential was re-read and its
 new value was rejected too. The session trace records the rejection as an
@@ -765,7 +768,7 @@ keys name one:
 | Key | Read from |
 |---|---|
 | `capabilities.env.allow` | Any capsule in the `capabilities.spawn.allow` closure `mur doctor` walked |
-| `inference.api_key` | The project manifest, where the value is written `${VAR}` |
+| `artifacts[].gateway.api_key` | The project manifest, where the value is written `${VAR}` |
 
 ```text
 error[E-CAP-014]: this project needs 1 variable nothing in this environment sets: WORKER_TOKEN
@@ -776,14 +779,14 @@ Reported only by [`mur doctor`](cli.md#mur-doctor). A capsule declaring no
 `capabilities.spawn.allow` has no closure to walk and is reported only for a variable its own
 manifest references. What `mur run` does with the same name depends on the key: an unset
 `capabilities.env.allow` name is omitted from the launched environment, and an
-`inference.api_key` reference it cannot resolve is refused with
+`gateway.api_key` reference it cannot resolve is refused with
 [`E-MAN-003`](#index).
 
 Names only: no value is read into the report or printed. A name set to the empty string counts as
 set, because the runtime copies it through as-is. The matching stdout line is
 `✗ NAME   unset   — <capsule>@<version>`, naming every capsule that needs the name. A name reached
 through a field other than `capabilities.env.allow` carries that field in brackets, as
-`✗ NAME   unset   — solo@0.0.1 (inference.api_key)`. This is one of the two formation findings
+`✗ NAME   unset   — solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)`. This is one of the two formation findings
 that make `mur doctor` exit non-zero.
 
 ### E-CAP-015 — a declaration `mur-roost` will refuse { #e-cap-015 }
@@ -813,7 +816,7 @@ environment:
 
 ```text
 error[E-CAP-016]: capabilities.env.allow names 'GITHUB_TOKEN' (credential backstop pattern 'GITHUB_TOKEN'), 'MY_SERVICE_SECRET' (capabilities.shell.strip_env pattern '*_SERVICE_SECRET'); these entries are removed from every guest environment before any guest is built, so the grant would deliver nothing
-  hint: remove these entries from capabilities.env.allow. No manifest setting exempts a name from the credential backstop, and a provider key never belongs in env.allow: the runtime reaches the provider itself through inference.api_key — see docs/content/reference/diagnostics.md#e-cap-016
+  hint: remove these entries from capabilities.env.allow. No manifest setting exempts a name from the credential backstop, and a provider key never belongs in env.allow: the runtime presents it itself through the artifact's gateway.api_key — see docs/content/reference/diagnostics.md#e-cap-016
 ```
 
 **Fires when:** a name matches one of these patterns. The error names every matching entry once, in
@@ -839,12 +842,46 @@ get the same result, and no value ever appears in the message. It is reported by
 grant would deliver nothing, and a capsule that launched with it would look granted and hold
 nothing.
 
-**What to do:** remove the entries. For a provider key, set
-[`inference.api_key`](manifest.md#field-inference) instead: the runtime reaches the provider
-itself. For a variable a guest needs, give it a host name no pattern matches. A name the backstop
-keeps but that looks like a credential is reported by [`W-SEC-024`](#w-sec-024).
+**What to do:** remove the entries. For a provider or third-party API key, set
+[`gateway.api_key`](manifest.md#artifact-gateway) on the entry of the artifact that uses it: the
+runtime presents the key itself. For a variable a guest needs, give it a host name no pattern
+matches. A name the backstop keeps but that looks like a credential is reported by
+[`W-SEC-024`](#w-sec-024).
 
 ---
+
+### E-CAP-017 — a gateway on a native tool { #e-cap-017 }
+
+A `runtime: tool` entry declares [`gateway:`](manifest.md#artifact-gateway), and the artifact it
+names ships a native implementation.
+
+```text
+error[E-CAP-017]: artifact 'my-native-tool' declares 'gateway:' but ships a native implementation, whose requests never pass the credential gateway
+  hint: a native tool's requests leave through the egress proxy and never pass the credential gateway, so no key could be attached; remove gateway: from its entry, or use a WASM build of the tool
+```
+
+`mur run` refuses at staging, before a session directory is created. A native tool runs as a host
+subprocess, so the gateway could never attach its key and the block would do nothing.
+
+### E-CAP-018 — a gateway that binds no credential { #e-cap-018 }
+
+An artifact entry's [`gateway:`](manifest.md#artifact-gateway) names an `endpoint` but has no
+non-blank `api_key` and does not write `keyless: true`. An `api_key` that is absent, `""`,
+whitespace or null counts as none, as does `keyless: false`.
+
+```text
+error[E-CAP-018]: murmur.yaml: invalid artifact declaration at index 0: artifact 'murmur-tool-web-search' declares gateway.endpoint 'https://api.tavily.com' but binds no credential
+  hint: set gateway.api_key: ${NAME} on this entry to have the runtime present a key, or write gateway.keyless: true if this upstream takes no key — the runtime never infers keylessness from the address
+```
+
+Refused when the manifest is parsed, by `mur run`, `mur doctor` and a roost reading a child's
+manifest alike, before a session directory is created or a request is sent. The endpoint's address
+plays no part: a loopback endpoint is refused the same way.
+
+| Remedy | When |
+|---|---|
+| `api_key: ${NAME}` on the entry, with the key stored by `mur config set -g credentials.NAME <key>` | The upstream takes a key |
+| `keyless: true` on the entry | The upstream takes no key, such as a local model server — see [Keyless upstreams](manifest.md#gateway-keyless) |
 
 ## Conversation record errors
 
@@ -1165,7 +1202,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -2025,20 +2062,25 @@ why this is a warning and not a refusal — including with `after_task: sleep`.
 [`lifecycle.after_task`](manifest.md#lifecycle-after-task) is not a trigger on its own: with no
 credential-shaped name declared there is nothing being held.
 
-### W-SEC-025 — `capabilities.network.allow` names the inference endpoint { #w-sec-025 }
+### W-SEC-025 — `capabilities.network.allow` names a gateway's upstream { #w-sec-025 }
 
-**Fires when:** a `transport: http` capsule's [`capabilities.network.allow`](manifest.md#field-capabilities)
-has an entry that matches its [`inference.endpoint`](manifest.md#transport-http). Once per matching
-entry, on stderr, from `mur run` (including `mur run --explain-scope`) and from `mur doctor`.
+**Fires when:** an entry in the capsule-wide
+[`capabilities.network.allow`](manifest.md#field-capabilities) matches any artifact's
+[`gateway.endpoint`](manifest.md#artifact-gateway), or an entry in an artifact's own
+`capabilities.network.allow` matches that artifact's `gateway.endpoint`. Once per matching entry,
+naming the entry and the artifact, on stderr, from `mur run` (including `mur run --explain-scope`)
+and from `mur doctor`.
 
 ```text
-[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the inference endpoint; inference no longer uses it — the runtime reaches the provider itself — so the entry now only grants tools, subprocesses and the driver direct reach to that host without the key (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025)
+[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the gateway.endpoint host of artifact 'murmur-driver-anthropic'; the gateway does not use it — the runtime reaches that upstream itself — so the entry only grants tools, subprocesses and artifacts direct reach to that host without the key (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025)
 ```
 
-The runtime reaches the provider for the driver and attaches the key there, so inference works with
-or without the entry. The entry still grants every tool, shell subprocess and the driver direct
-access to that host, without the key. Remove it unless something other than inference needs that
-host.
+For an entry on an artifact's own `capabilities:`, the warning begins
+`artifact '<name>' capabilities.network.allow entry`.
+
+The runtime reaches the upstream for the artifact and attaches the key there, so the gateway works
+with or without the entry. The entry still grants direct access to that host, without the key.
+Remove it unless something other than the gateway needs that host.
 
 ### W-SEC-026 — a machine spend ceiling does not cover a `transport: process` capsule { #w-sec-026 }
 
@@ -2054,29 +2096,29 @@ The CLI that `transport: process` drives holds its own credentials, so none of i
 the runtime, and the capsule runs with no ledger lines and no machine refusal. Bound that CLI's
 spend with its provider's own controls.
 
-### W-SEC-027 — the inference key is read only at launch { #w-sec-027 }
+### W-SEC-027 — a gateway key is read only at launch { #w-sec-027 }
 
-**Fires when:** a `transport: http` capsule's [`inference.api_key`](manifest.md#inference-api-key)
-can only be read at launch. That is either a literal value in `murmur.yaml`, or a `${NAME}` that
+**Fires when:** an artifact's [`gateway.api_key`](manifest.md#gateway-api-key) can only be read at
+launch. That is either a literal value in `murmur.yaml`, or a `${NAME}` that
 [`credentials.<NAME>`](config.md#credentials) does not hold and the launching shell's environment
-supplies. It fires once per launch, on stderr, from `mur run` (including `mur run --explain-scope`)
-and from `mur doctor`.
+supplies. It fires once per such key, naming the artifact, on stderr, from `mur run` (including
+`mur run --explain-scope`) and from `mur doctor`.
 
 ```text
-[capsule-runtime] warning[W-SEC-027]: inference.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027)
+[capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027)
 ```
 
-For a literal, the warning names `inference.api_key is written literally in murmur.yaml` and never
-prints the value.
+For a literal, the warning names `artifact '<name>' gateway.api_key is written literally in
+murmur.yaml` and never prints the value.
 
 **Why it matters:** a key stored with `mur config set -g credentials.<NAME>` reaches every running
-capsule on its next inference request. This capsule keeps the key it launched with, so revoking
-that key breaks it until it restarts, with [`E-RUN-027`](#e-run-027).
+capsule on its next keyed request. This capsule keeps the key it launched with, so revoking that key
+breaks it until it restarts — for the driver's key, with [`E-RUN-027`](#e-run-027).
 
 **What the runtime does about it:** nothing is refused. Exporting the key is how CI runs are keyed.
 
 **What to do:** store the key with `mur config set -g credentials.<NAME> <key>` and write
-`inference.api_key: ${NAME}` in the manifest. A `${NAME}` that neither the config nor the
+`gateway.api_key: ${NAME}` on the artifact's entry. A `${NAME}` that neither the config nor the
 environment holds does not warn: the launch is refused with [`E-MAN-003`](#index).
 
 ### W-SEC-028 — a file holding a secret is readable by other accounts { #w-sec-028 }
@@ -2086,11 +2128,11 @@ that. It fires from two places, on stderr:
 
 | Source | Fires for | How often |
 |---|---|---|
-| `mur run` | The config file a `transport: http` capsule reads its key from, as [`credentials.<NAME>`](config.md#credentials), when its mode grants any group or other permission | Once per launch. A key from the environment or a literal never fires it, and neither does a re-read while the capsule runs |
+| `mur run` | The config file a capsule reads a `gateway.api_key` from, as [`credentials.<NAME>`](config.md#credentials), when its mode grants any group or other permission | Once per launch. A key from the environment or a literal never fires it, and neither does a re-read while the capsule runs |
 | `mur doctor` | Every owner-only entry in [the `~/.murmur` modes table](config.md#murmur-home-permissions) wider than its mode, and every directory wider than `0700` or file wider than `0600` beneath one | Once per path |
 
 ```text
-[capsule-runtime] warning[W-SEC-028]: the inference credential credentials.ANTHROPIC_API_KEY is read from /home/alice/.murmur/config.yaml, which is mode 0644 and readable by other accounts on this host; run `chmod 600 /home/alice/.murmur/config.yaml` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
+[capsule-runtime] warning[W-SEC-028]: the credential credentials.ANTHROPIC_API_KEY is read from /home/alice/.murmur/config.yaml, which is mode 0644 and readable by other accounts on this host; run `chmod 600 /home/alice/.murmur/config.yaml` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
 ```
 
 ```text
@@ -2135,3 +2177,24 @@ toolchain it cannot run under `sealed` even though no `W-SEC-012` names it.
 **What to do:** make the driver named in the warning runnable by the user launching the capsule,
 then run `mur doctor`. A `Text file busy` or resource error that clears on its own is gone on
 the next `mur doctor`.
+### W-SEC-030 — an unmetered credential gateway { #w-sec-030 }
+
+**Fires when:** an artifact entry declares [`gateway:`](manifest.md#artifact-gateway) and is not the
+`transport: http` driver `inference.driver.artifact` names. Once per such gateway, on stderr, from
+`mur run` (including `mur run --explain-scope`) and from `mur doctor`. Never for the configured
+driver.
+
+```text
+[capsule-runtime] warning[W-SEC-030]: artifact 'murmur-tool-web-search' reaches api.tavily.com through the credential gateway, unmetered — murmur neither counts nor limits what its calls spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not cover it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-030)
+```
+
+**Why it matters:** only the driver's gateway is admitted against the spend meter. The artifact's
+calls are sent without an admission and count toward neither ceiling, so a capsule that stops at
+its token ceiling can keep spending on this upstream.
+
+**What the runtime does about it:** nothing is refused. [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl)
+records the gateway with `metered: false`.
+
+**What to do:** bound the artifact's spend with the upstream's own controls, such as a key with its
+own quota.
+

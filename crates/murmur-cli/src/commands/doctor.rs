@@ -6,9 +6,9 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
-    warn_on_inference_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_inference_credential,
-    warn_on_machine_spend_ceiling_under_process_transport, warn_on_secret_shaped_env_grants,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_machine_spend_ceiling_under_process_transport,
+    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
     warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
     SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
@@ -581,7 +581,8 @@ fn report_formation_env(
 ///
 /// A `capabilities.env.allow` source is rendered bare, because that key is what the whole block is
 /// about and naming it on every line would say nothing. Any other key is named, so an operator
-/// reading `root@0.0.1 (inference.api_key)` knows which declaration to look at.
+/// reading `root@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)` knows which declaration
+/// to look at.
 fn render_sources(variable: &RequiredVariable) -> String {
     variable
         .sources
@@ -762,7 +763,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     })?;
     let manifest_path = resolve_manifest_path(&project_root);
     // The text is kept for the reference scan below, so the file is read once. The parse keeps
-    // what `inference.api_key` names without reading any value, so a manifest referencing a
+    // what each `gateway.api_key` names without reading any value, so a manifest referencing a
     // variable this shell does not hold still loads — that is exactly the manifest an operator runs
     // `mur doctor` to diagnose.
     let manifest_yaml =
@@ -824,18 +825,25 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         );
     }
 
-    // And `W-SEC-025`, from the same emitter `mur run` calls: an allow-list entry naming the
-    // inference endpoint grants direct reach without the key and does not serve inference.
-    warn_on_inference_endpoint_in_network_allow(
+    // And `W-SEC-025`, from the same emitter `mur run` calls: an allow-list entry naming a
+    // gateway's host grants direct reach without the key and does not serve the gateway.
+    warn_on_gateway_endpoint_in_network_allow(
         &capability_policy_from_runtime_manifest(&runtime_manifest),
-        runtime_manifest.inference.as_ref(),
+        &runtime_manifest.artifacts,
     );
 
     // And `W-SEC-027`, from the same emitter `mur run` calls: a key read only at launch cannot be
     // rotated into a running capsule.
-    warn_on_launch_only_inference_credential(
-        runtime_manifest.inference.as_ref(),
+    warn_on_launch_only_gateway_credential(
+        &runtime_manifest.artifacts,
         crate::config::mur_config_path().ok().as_deref(),
+    );
+
+    // And `W-SEC-030`, from the same emitter `mur run` calls: a gateway the spend ceilings do not
+    // cover.
+    warn_on_unmetered_gateways(
+        runtime_manifest.inference.as_ref(),
+        &runtime_manifest.artifacts,
     );
 
     // And `W-SEC-026`, from the same emitter `mur run` calls: a machine spend ceiling does not
@@ -1033,6 +1041,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         };
         let name = &artifact.name;

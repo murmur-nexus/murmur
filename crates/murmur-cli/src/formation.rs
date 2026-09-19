@@ -67,8 +67,9 @@ pub(crate) struct RequiredVariable {
 pub(crate) struct VariableSource {
     /// The capsule, `name@version`.
     pub(crate) capsule: String,
-    /// The manifest key naming the variable: `capabilities.env.allow` or `inference.api_key`.
-    pub(crate) manifest_key: &'static str,
+    /// The manifest key naming the variable: `capabilities.env.allow`, or an artifact entry's
+    /// `gateway.api_key` as `artifacts.<name>.gateway.api_key`.
+    pub(crate) manifest_key: String,
 }
 
 /// A child declaring an `env.allow` entry the capsule that spawns it does not hold — the spawn
@@ -121,7 +122,7 @@ pub(crate) struct EnvironmentNames {
     /// unit test's expectations do not depend on what the machine running it exports.
     include_process_env: bool,
     /// Credential names the global config's `credentials:` map holds a non-empty value for. An
-    /// `inference.api_key: ${NAME}` is answered from there before the environment is consulted.
+    /// `gateway.api_key: ${NAME}` is answered from there before the environment is consulted.
     credentials: BTreeSet<String>,
 }
 
@@ -188,10 +189,10 @@ impl EnvironmentNames {
         self
     }
 
-    /// Whether `reference` is answered before the environment is asked: an `inference.api_key`
-    /// whose name the global config's `credentials:` map holds.
+    /// Whether `reference` is answered before the environment is asked: a `gateway.api_key` whose
+    /// name the global config's `credentials:` map holds.
     fn answers_from_credentials(&self, reference: &ReferencedEnvVariable) -> bool {
-        reference.field == "inference.api_key" && self.credentials.contains(&reference.variable)
+        reference.is_gateway_credential() && self.credentials.contains(&reference.variable)
     }
 
     /// A name set to the empty string counts as present, because `child_environment` copies it
@@ -279,7 +280,7 @@ fn merge_references(
                 {
                     existing.sources.push(VariableSource {
                         capsule: capsule.to_string(),
-                        manifest_key: reference.field,
+                        manifest_key: reference.field.clone(),
                     });
                 }
             }
@@ -287,7 +288,7 @@ fn merge_references(
                 name: reference.variable.clone(),
                 sources: vec![VariableSource {
                     capsule: capsule.to_string(),
-                    manifest_key: reference.field,
+                    manifest_key: reference.field.clone(),
                 }],
                 set: false,
             }),
@@ -490,7 +491,7 @@ impl Walk<'_> {
     /// The `env.allow` and `spawn.allow` one capsule's packed manifest declares.
     ///
     /// Read through the two narrow readers rather than a whole-manifest parse: a child declaring
-    /// `inference.api_key: ${PROVIDER_KEY}` is exactly the capsule this preflight exists for, and
+    /// `gateway.api_key: ${PROVIDER_KEY}` is exactly the capsule this preflight exists for, and
     /// a full parse would demand the operator already hold the variable before it could report
     /// that the variable is needed.
     fn declarations_for(&mut self, name: &str, version: &str) -> Result<Declarations, String> {
@@ -555,7 +556,7 @@ impl Walk<'_> {
                     {
                         sources.push(VariableSource {
                             capsule: declaring_ref.to_string(),
-                            manifest_key,
+                            manifest_key: manifest_key.to_string(),
                         });
                     }
                 }
@@ -566,7 +567,7 @@ impl Walk<'_> {
                         name: variable.clone(),
                         sources: vec![VariableSource {
                             capsule: declaring_ref.to_string(),
-                            manifest_key,
+                            manifest_key: manifest_key.to_string(),
                         }],
                         set: self.environment.contains(variable),
                     });
@@ -900,7 +901,7 @@ mod tests {
             project.path(),
             "infer-worker",
             "0.1.0",
-            "name: infer-worker\nversion: 0.1.0\ninference:\n  driver: anthropic\n  model: some-model\n  api_key: ${PROVIDER_KEY_4C7E05B1}\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n",
+            "name: infer-worker\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${PROVIDER_KEY_4C7E05B1}\ninference:\n  transport: http\n  model: some-model\n  driver:\n    artifact: murmur-driver-anthropic\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n",
         );
 
         let root = root_manifest(
@@ -929,7 +930,7 @@ mod tests {
     #[test]
     fn a_solo_capsule_reports_its_unset_reference_and_nothing_else() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SOLO_REFERENCE_4C7E05B1}\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
         let report = formation_env_report(
@@ -954,7 +955,7 @@ mod tests {
         assert!(!report.variables[0].set);
         assert_eq!(
             report.variables[0].sources[0].manifest_key,
-            "inference.api_key"
+            "artifacts.murmur-driver-anthropic.gateway.api_key"
         );
         assert!(report.refusals.is_empty());
         assert!(report.uninspectable.is_empty());
@@ -966,7 +967,7 @@ mod tests {
     #[test]
     fn a_solo_capsule_holding_every_reference_reports_nothing() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SOLO_REFERENCE_4C7E05B1}\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
         assert!(formation_env_report(
@@ -979,12 +980,12 @@ mod tests {
         .is_none());
     }
 
-    /// An `inference.api_key` whose name the global config's `credentials:` map holds is not a
+    /// A `gateway.api_key` whose name the global config's `credentials:` map holds is not a
     /// variable the operator lacks, even with the environment variable unset.
     #[test]
     fn a_reference_held_in_global_credentials_is_not_reported_missing() {
         let project = TempDir::new().unwrap();
-        let yaml = "name: solo\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SOLO_REFERENCE_4C7E05B1}\n";
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
         assert!(formation_env_report(
@@ -1020,7 +1021,7 @@ mod tests {
             "0.1.0",
             "name: src-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n",
         );
-        let yaml = "name: src-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n  spawn:\n    allow: [src-worker]\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SHARED_KEY_4C7E05B1}\n";
+        let yaml = "name: src-root\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SHARED_KEY_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n  spawn:\n    allow: [src-worker]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
         let report = formation_env_report(
@@ -1039,7 +1040,10 @@ mod tests {
             source_refs(variable),
             ["src-root@0.0.1", "src-worker@0.1.0", "src-root@0.0.1"]
         );
-        assert_eq!(variable.sources[2].manifest_key, "inference.api_key");
+        assert_eq!(
+            variable.sources[2].manifest_key,
+            "artifacts.murmur-driver-anthropic.gateway.api_key"
+        );
     }
 
     #[test]

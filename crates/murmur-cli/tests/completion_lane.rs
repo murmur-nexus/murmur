@@ -62,11 +62,11 @@ fn queue_sleep_project(endpoint: &str) -> (TempDir, PathBuf) {
         project.path().join("murmur.yaml"),
         format!(
             "name: completion-lane\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
-             version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    \
+             version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+             endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    \
              allow:\n      - {endpoint}\nlifecycle:\n  task_acceptance: queue\n  \
              after_task: sleep\n  queue_depth: 8\ninference:\n  transport: http\n  \
-             endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    \
-             artifact: {DRIVER_NAME}\n"
+             model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -402,9 +402,10 @@ fn a_capsule_that_never_delegates_is_unaffected() {
         project.path().join("murmur.yaml"),
         format!(
             "name: no-delegation\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
-             version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    \
-             allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  \
-             model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n",
+             version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+             endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    \
+             allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  \
+             driver:\n    artifact: {DRIVER_NAME}\n",
             endpoint = server.endpoint,
         ),
     )

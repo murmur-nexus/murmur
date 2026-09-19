@@ -26,12 +26,13 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       - name: murmur-driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.anthropic.com
+          api_key: ${ANTHROPIC_API_KEY}
 
     inference:
       transport: http
-      endpoint: https://api.anthropic.com
       model: {{ v.model_anthropic }}
-      api_key: ${ANTHROPIC_API_KEY}
       driver:
         artifact: murmur-driver-anthropic
     ```
@@ -46,12 +47,13 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       - name: murmur-driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.openai.com
+          api_key: ${OPENAI_API_KEY}
 
     inference:
       transport: http
-      endpoint: https://api.openai.com
       model: {{ v.model_openai }}
-      api_key: ${OPENAI_API_KEY}
       driver:
         artifact: murmur-driver-openai
     ```
@@ -66,17 +68,18 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.deepseek.com
+          api_key: ${DEEPSEEK_API_KEY}
 
     inference:
       transport: http
-      endpoint: https://api.deepseek.com
       model: {{ v.model_deepseek }}
-      api_key: ${DEEPSEEK_API_KEY}
       driver:
         artifact: murmur-driver-deepseek
     ```
 
-The `api_key` field reads from the environment at run time. Export your provider key in the shell you will run from:
+The driver entry's `gateway.api_key` field reads from the environment at run time. Export your provider key in the shell you will run from:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...

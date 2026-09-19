@@ -11,8 +11,8 @@ This page also documents the environment the runtime hands hook and driver compo
 ## Inference drivers
 
 An inference driver turns the runtime's provider-agnostic request into one provider's wire format.
-Declare one with `runtime: driver` and name it in
-[`inference.driver.artifact`](manifest.md#field-inference).
+Declare one with `runtime: driver` and a [`gateway:`](manifest.md#artifact-gateway) block naming the
+provider, and name it in [`inference.driver.artifact`](manifest.md#field-inference).
 
 | Artifact | Provider |
 |---|---|
@@ -178,6 +178,7 @@ nothing from the host is inherited.
 | `MURMUR_OTEL_ENDPOINT` | `observability.otel_endpoint` is set | The configured OTLP endpoint URL |
 | `MURMUR_EVAL_CONFIG` | `observability.eval` is set | The eval block as JSON: `dataset_id` and the parsed `scorers` list |
 | `MURMUR_ARTIFACT_CONFIG` | This hook's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
+| `MURMUR_GATEWAY_ENDPOINT` | This hook's entry in the operator's manifest declares [`gateway:`](manifest.md#artifact-gateway) | `http://127.0.0.1:9` followed by the path of `gateway.endpoint` |
 | `MURMUR_DATASET_ID` | `mur eval run` is driving a dataset and `observability.eval.dataset_id` is set | `observability.eval.dataset_id` |
 | `MURMUR_CASE_ID` | `mur eval run` is driving a dataset | The `case_id` of the case being run |
 | `MURMUR_FORMATION_ID` | `MURMUR_FORMATION_ID` is set in the host environment | Forwarded unchanged |
@@ -191,7 +192,7 @@ into every tool artifact.
 |---|---|---|
 | `MURMUR_INFERENCE_TRANSPORT` | `inference.transport` | `process` |
 | `MURMUR_INFERENCE_MODEL` | `inference.model` | The configured model, empty when `inference.model` is omitted |
-| `MURMUR_INFERENCE_ENDPOINT` | `http://127.0.0.1:9` followed by the path of `inference.endpoint` — `https://api.moonshot.ai/v1` gives `http://127.0.0.1:9/v1`. Nothing listens there: the runtime sends the driver's requests to this address on to `inference.endpoint` with the key attached | Empty |
+| `MURMUR_INFERENCE_ENDPOINT` | `http://127.0.0.1:9` followed by the path of the driver entry's `gateway.endpoint` — `https://api.moonshot.ai/v1` gives `http://127.0.0.1:9/v1`. Nothing listens there: the runtime sends the driver's requests to this address on to `gateway.endpoint` with the key attached | Empty |
 | `MURMUR_INFERENCE_DRIVER` | `inference.driver.artifact` | Empty |
 | `MURMUR_INFERENCE_DRIVER_CONFIG` | `inference.driver.config` as JSON. Not set when the field is absent | Not set |
 | `MURMUR_CAPSULE_NAME` | `name` from the manifest | Same |
@@ -199,26 +200,31 @@ into every tool artifact.
 | `MURMUR_SESSION_ID` | The session ID | Same |
 | `MURMUR_CAPSULE_URL` | `localhost:<port>`, the address the capsule's HTTP server bound | Same |
 
-One further variable is injected per artifact rather than per session:
+Two further variables are injected per artifact rather than per session:
 
 | Env var | Injected when | Value |
 |---|---|---|
 | `MURMUR_ARTIFACT_CONFIG` | This artifact's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
+| `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint` |
 
-It reaches the declaring artifact and no other, and the runtime sets it whether or not `inference:`
-is configured. A native tool receives no per-artifact environment, so a `config:` block there is
-reported as [`W-SEC-015`](diagnostics.md#w-sec-015) and delivers nothing.
+Each reaches the declaring artifact and no other, and the runtime sets it whether or not
+`inference:` is configured. The configured driver receives `MURMUR_GATEWAY_ENDPOINT` on its agent
+turns and a hook's `run-inference`; a driver called by name as a tool receives neither the variable
+nor its gateway. A native tool receives no per-artifact environment, so a `config:` block there is
+reported as [`W-SEC-015`](diagnostics.md#w-sec-015) and delivers nothing, and a `gateway:` block
+there is refused with [`E-CAP-017`](diagnostics.md#e-cap-017).
 
-`transport: process` loads no driver component: `inference.endpoint`, `inference.driver` and
-`inference.api_key` are rejected in the manifest, and the agent loop spawns `inference.command`
-instead. Tool artifacts still receive the whole table.
+`transport: process` loads no driver component: `inference.driver` is rejected in the manifest, and
+the agent loop spawns `inference.command` instead. Tool artifacts still receive the whole table.
 
-### Driver `inference_auth:` block { #inference-auth }
+### `inference_auth:` block { #inference-auth }
 
-No component receives `inference.api_key`. A driver's own `murmur.yaml` declares how its provider
-takes the key, and the runtime attaches that header to each request the driver sends to
-`MURMUR_INFERENCE_ENDPOINT`. A `transport: http` driver without a usable block refuses to start with
-[`E-RUN-025`](diagnostics.md#e-run-025).
+No component receives a `gateway.api_key`. An artifact whose capsule entry declares
+[`gateway:`](manifest.md#artifact-gateway) — a driver, tool or hook — declares in its own
+`murmur.yaml` how its upstream takes the key, and the runtime attaches that header to each request
+the artifact sends to `MURMUR_GATEWAY_ENDPOINT` (for the driver, also `MURMUR_INFERENCE_ENDPOINT`).
+An artifact with a `gateway:` and without a usable block refuses to start with
+[`E-RUN-025`](diagnostics.md#e-run-025); an artifact without a `gateway:` is never asked for one.
 
 ```yaml
 inference_auth:
@@ -229,4 +235,4 @@ inference_auth:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `inference_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the driver sets, in any case, is replaced |
-| `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by `inference.api_key`. With no `api_key`, no header is sent |
+| `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by the entry's `gateway.api_key`. With no `api_key`, no header is sent |

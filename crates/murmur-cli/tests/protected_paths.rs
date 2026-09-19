@@ -159,6 +159,9 @@ fn create_manifest(project_dir: &Path, endpoint: &str, capsule: &Capsule<'_>) ->
          \x20 - name: {DRIVER_NAME}\n\
          \x20   version: {DRIVER_VERSION}\n\
          \x20   runtime: driver\n\
+         \x20   gateway:\n\
+         \x20     endpoint: {endpoint}\n\
+         \x20     api_key: test-key\n\
          {tool_yaml}\
          capabilities:\n\
          \x20 network:\n\
@@ -172,9 +175,7 @@ fn create_manifest(project_dir: &Path, endpoint: &str, capsule: &Capsule<'_>) ->
          {read_only_yaml}\
          inference:\n\
          \x20 transport: http\n\
-         \x20 endpoint: {endpoint}\n\
          \x20 model: test-model\n\
-         \x20 api_key: test-key\n\
          \x20 driver:\n\
          \x20   artifact: {DRIVER_NAME}\n"
     );

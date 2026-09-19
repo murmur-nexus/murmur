@@ -82,7 +82,7 @@ Temporal separation alone is insufficient. Passing raw text, HTML, repository in
 
 Edit the top-level `capabilities:` block first:
 
-1. **Network:** allow only exact required endpoints. Prefer scheme-bound entries such as `https://api.example.com`; include a port only when required. Usually the inference endpoint is the first and only host.
+1. **Network:** allow only exact required endpoints. Prefer scheme-bound entries such as `https://api.example.com`; include a port only when required. Never list a host that a `gateway:` block names: the gateway does not need the entry, and it gives every tool and shell subprocess direct reach to that host without the key (`W-SEC-025`). A capsule whose only outbound traffic is inference needs no allow-list entry at all.
 2. **Filesystem:** set `capabilities.filesystem.scope` to the smallest session-workdir-relative subtree that contains the workload. Do not use host-absolute paths or traversal.
 3. **Shell:** omit shell access if possible. Otherwise replace a general shell with the smallest set of bare binary names the task genuinely needs.
 
@@ -100,7 +100,7 @@ Subprocesses start from Murmur's small baseline rather than the complete host en
 - remember that built-in credential-shaped variables are stripped before spawn;
 - remember the composition order: baseline, explicit additions, removals, then synthetic `HOME`/`USERPROFILE`; removals win and the synthetic home cannot be overridden.
 
-The same environment construction applies to native tool subprocesses even when `shell.allow` is absent. Passing a secret to an inference driver or constrained tool is different from exposing it to a shell environment; grant it only to the component that uses it.
+The same environment construction applies to native tool subprocesses even when `shell.allow` is absent. Give a WASM tool, hook, or the inference driver its third-party key through `gateway: {endpoint, api_key}` on its own `artifacts:` entry: the runtime attaches the key to that artifact's requests and the artifact never holds it. A native tool cannot take a gateway (`E-CAP-017`). A gateway for anything but the configured driver is unmetered by the spend ceilings, reported as `W-SEC-030`. An upstream that takes no key is declared `keyless: true`; a gateway with neither `api_key` nor `keyless: true` is refused with `E-CAP-018`. Never pass a key through `env.allow` or an artifact's `config:` block.
 
 ## Narrow artifacts below the ceiling
 
@@ -120,10 +120,9 @@ artifacts:
   - name: murmur-driver-example
     version: "1.0.0"
     runtime: driver
-    capabilities:
-      network:
-        allow:
-          - https://api.example.com
+    gateway:
+      endpoint: https://api.example.com
+      api_key: ${EXAMPLE_API_KEY}
 
   - name: murmur-tool-reader
     version: "1.0.0"
@@ -136,14 +135,14 @@ artifacts:
 
 capabilities:
   network:
-    allow:
-      - https://api.example.com
+    allow: []
   filesystem:
     scope: inputs
 
 inference:
-  endpoint: https://api.example.com
-  api_key: ${EXAMPLE_API_KEY}
+  model: example-model
+  driver:
+    artifact: murmur-driver-example
 ```
 
 Do not copy this example unchanged. It demonstrates a ceiling and explicit narrowing, not a complete manifest.
@@ -209,7 +208,7 @@ Warnings are the difference between intended and effective policy. Capture them 
 
 - Give a gathering capsule allowlisted fetch/read capabilities and no shell or write authority.
 - Emit citations and bounded extracted facts, not raw pages, to a synthesis or action capsule.
-- Give the synthesis capsule only its inference endpoint and output scope; set artifact network access explicitly to empty where unused.
+- Give the synthesis capsule only its driver's `gateway:` and output scope; set artifact network access explicitly to empty where unused.
 
 ### Data or reporting capsule
 

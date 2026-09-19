@@ -135,9 +135,10 @@ fn suite() -> &'static Suite {
                 "0.1.0",
                 &format!(
                     "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    \
-                     runtime: driver\ncapabilities:\n  network:\n    allow: [{endpoint}]\n\
-                     {containment}inference:\n  transport: http\n  endpoint: {url}\n  \
-                     model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
+                     runtime: driver\n    gateway:\n      endpoint: {url}\n      \
+                     api_key: test-key\ncapabilities:\n  network:\n    allow: [{endpoint}]\n\
+                     {containment}inference:\n  transport: http\n  \
+                     model: test-model\n  driver:\n    artifact: {DRIVER}\n",
                     endpoint = inference.authority(),
                     url = inference.endpoint,
                 ),

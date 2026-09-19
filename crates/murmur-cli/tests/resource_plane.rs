@@ -213,10 +213,9 @@ impl Drop for Capsule {
 fn manifest_yaml(endpoint: &str, exports: Option<&str>) -> String {
     format!(
         "name: resource-plane-agent\nversion: 0.1.0\n\
-         artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+         artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
          capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
-         inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-         api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n{}",
+         inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n{}",
         exports.unwrap_or("")
     )
 }
@@ -265,6 +264,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         })
         .collect();

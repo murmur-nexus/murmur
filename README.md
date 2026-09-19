@@ -49,6 +49,9 @@ artifacts:
   - name: murmur-driver-anthropic
     version: "1.0.0"
     runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
 
 capabilities:
   network:
@@ -57,9 +60,7 @@ capabilities:
 
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-haiku-4-5
-  api_key: ${ANTHROPIC_API_KEY}
   driver:
     artifact: murmur-driver-anthropic
 ```

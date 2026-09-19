@@ -451,10 +451,11 @@ fn launch(spec: CapsuleSpec<'_>) -> Capsule {
     let manifest = format!(
         "name: {name}\nversion: 0.1.0\n\
          artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+         \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
          network:\n  internal_port: {port}\n\
          capabilities:\n  network:\n    allow:\n{network_allow}{capabilities}\
-         inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-         api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n{exports}",
+         inference:\n  transport: http\n  model: test-model\n  \
+         driver:\n    artifact: {DRIVER_NAME}\n{exports}",
         name = spec.name,
         port = spec.port,
         endpoint = server.endpoint,
@@ -518,6 +519,7 @@ fn stage_request(
                 source: artifact.source.clone(),
                 on_overflow: artifact.on_overflow,
                 config: artifact.config.clone(),
+                gateway: artifact.gateway.clone(),
                 capabilities: artifact.capabilities.clone(),
             })
             .collect(),

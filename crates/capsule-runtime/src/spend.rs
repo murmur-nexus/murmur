@@ -536,7 +536,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{inference_gateway::InferenceGateway, runtime::NetworkPolicyHooks};
+    use crate::{
+        credential_gateway::{CredentialGateway, GatewayMetering},
+        gateway_credential::GatewayCredential,
+        runtime::NetworkPolicyHooks,
+    };
 
     fn fixed_clock() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap()
@@ -645,15 +649,12 @@ mod tests {
 
     // ── the gateway rule ───────────────────────────────────────────────────────
 
-    #[test]
-    fn gateway_refuses_without_open_admission() {
-        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
-        upstream.set_nonblocking(true).unwrap();
+    /// A store's HTTP hooks holding one gateway for `the-driver`, keyed with a marker literal,
+    /// whose upstream is `upstream`.
+    fn gateway_hooks(upstream: &TcpListener, metering: GatewayMetering) -> NetworkPolicyHooks {
         let endpoint = format!("http://{}", upstream.local_addr().unwrap());
-
-        let meter = Arc::new(SpendMeter::unlimited());
         let gateway = Arc::new(
-            InferenceGateway::new(
+            CredentialGateway::new(
                 "the-driver",
                 &endpoint,
                 murmur_artifact::InferenceAuth {
@@ -661,7 +662,8 @@ mod tests {
                     value: "{key}".to_string(),
                 },
                 Some(Arc::new(
-                    crate::inference_credential::InferenceCredential::resolve(
+                    GatewayCredential::resolve(
+                        "the-driver",
                         &murmur_artifact::ApiKeyReference::Literal(
                             "sk-spend-gateway-marker".to_string(),
                         ),
@@ -669,62 +671,81 @@ mod tests {
                     )
                     .unwrap(),
                 )),
-                Arc::clone(&meter),
+                metering,
             )
             .unwrap(),
         );
-        let mut hooks = NetworkPolicyHooks {
+        NetworkPolicyHooks {
             network_allow_rules: Vec::new(),
-            inference_gateway: Some(gateway),
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
+            gateway: Some(gateway),
+        }
+    }
 
-        // Sends one gateway-addressed request, keeping the in-flight response alive long enough
-        // for its connection to land, and reports whether it was denied and whether the upstream
-        // accepted a connection.
-        let attempt = |hooks: &mut NetworkPolicyHooks| -> (bool, bool) {
-            let request = hyper::Request::builder()
-                .method("POST")
-                .uri("http://127.0.0.1:9/v1/messages")
-                .body(
-                    Empty::<bytes::Bytes>::new()
-                        .map_err(|err| match err {})
-                        .boxed_unsync(),
-                )
-                .unwrap();
-            let config = OutgoingRequestConfig {
-                use_tls: false,
-                connect_timeout: Duration::from_secs(5),
-                first_byte_timeout: Duration::from_secs(5),
-                between_bytes_timeout: Duration::from_secs(5),
-            };
-            rt.block_on(async {
-                let sent = hooks.send_request(request, config);
-                let denied = match &sent {
-                    Err(err) => {
-                        assert!(matches!(
-                            err.downcast_ref(),
-                            Some(ErrorCode::HttpRequestDenied)
-                        ));
-                        assert!(!format!("{err:?}").contains("sk-spend-gateway-marker"));
-                        true
-                    }
-                    Ok(_) => false,
-                };
-                let mut connected = false;
-                for _ in 0..50 {
-                    if let Ok((mut stream, _)) = upstream.accept() {
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                        let _ = stream.read(&mut [0u8; 64]);
-                        connected = true;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                drop(sent);
-                (denied, connected)
-            })
+    /// Sends one gateway-addressed request, keeping the in-flight response alive long enough for
+    /// its connection to land, and reports whether it was denied and whether the upstream accepted
+    /// a connection.
+    fn attempt_through_gateway(
+        rt: &tokio::runtime::Runtime,
+        upstream: &TcpListener,
+        hooks: &mut NetworkPolicyHooks,
+    ) -> (bool, bool) {
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1:9/v1/messages")
+            .body(
+                Empty::<bytes::Bytes>::new()
+                    .map_err(|err| match err {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: Duration::from_secs(5),
+            first_byte_timeout: Duration::from_secs(5),
+            between_bytes_timeout: Duration::from_secs(5),
         };
+        rt.block_on(async {
+            let sent = hooks.send_request(request, config);
+            let denied = match &sent {
+                Err(err) => {
+                    assert!(matches!(
+                        err.downcast_ref(),
+                        Some(ErrorCode::HttpRequestDenied)
+                    ));
+                    assert!(!format!("{err:?}").contains("sk-spend-gateway-marker"));
+                    true
+                }
+                Ok(_) => false,
+            };
+            let mut connected = false;
+            for _ in 0..50 {
+                if let Ok((mut stream, _)) = upstream.accept() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = stream.read(&mut [0u8; 64]);
+                    connected = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(sent);
+            (denied, connected)
+        })
+    }
+
+    fn loopback_upstream() -> TcpListener {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        upstream
+    }
+
+    #[test]
+    fn gateway_refuses_without_open_admission() {
+        let upstream = loopback_upstream();
+        let meter = Arc::new(SpendMeter::unlimited());
+        let mut hooks = gateway_hooks(&upstream, GatewayMetering::Inference(Arc::clone(&meter)));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let attempt =
+            |hooks: &mut NetworkPolicyHooks| attempt_through_gateway(&rt, &upstream, hooks);
 
         assert_eq!(attempt(&mut hooks), (true, false), "no admission open");
 
@@ -735,6 +756,69 @@ mod tests {
 
         drop(meter.admit(10, 10).unwrap());
         assert_eq!(attempt(&mut hooks), (true, false), "after drop");
+    }
+
+    /// An unmetered gateway is never gated on the meter: it sends with no admission open, and
+    /// with the session ceiling already spent.
+    #[test]
+    fn unmetered_gateway_sends_without_an_admission() {
+        let upstream = loopback_upstream();
+        let meter = session_meter(100);
+        meter.admit(50, 50).unwrap().settle(50, 50);
+        assert_eq!(meter.used(), 100);
+        assert!(meter.admit(1, 1).is_err(), "the session ceiling is spent");
+        assert!(!meter.has_open_admission());
+
+        let mut hooks = gateway_hooks(&upstream, GatewayMetering::Unmetered);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            attempt_through_gateway(&rt, &upstream, &mut hooks),
+            (false, true),
+            "no admission and an exhausted ceiling"
+        );
+    }
+
+    /// A request through an unmetered gateway changes no spend total and opens no admission, and
+    /// while the driver holds an admission it neither rides nor settles it: only the driver's own
+    /// tokens are charged.
+    #[test]
+    fn unmetered_gateway_spends_no_tokens() {
+        let upstream = loopback_upstream();
+        let meter = session_meter(1_000);
+        meter.admit(10, 10).unwrap().settle(10, 3);
+        let used = meter.used();
+
+        let mut hooks = gateway_hooks(&upstream, GatewayMetering::Unmetered);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                attempt_through_gateway(&rt, &upstream, &mut hooks),
+                (false, true)
+            );
+        }
+        assert_eq!(meter.used(), used);
+        assert!(!meter.has_open_admission());
+
+        let driver_admission = meter.admit(20, 20).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                attempt_through_gateway(&rt, &upstream, &mut hooks),
+                (false, true),
+                "the driver holds an admission"
+            );
+        }
+        assert_eq!(meter.used(), used, "unmetered calls charge nothing");
+        assert!(
+            meter.has_open_admission(),
+            "unmetered calls leave the driver's admission open"
+        );
+        driver_admission.settle(20, 5);
+        assert_eq!(
+            meter.used(),
+            used + 25,
+            "only the driver's tokens are charged"
+        );
+        assert!(!meter.has_open_admission());
     }
 
     // ── the machine ledger under concurrent admissions ─────────────────────────

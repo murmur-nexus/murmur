@@ -586,8 +586,10 @@ fn missing_system_prompt_file_fails_before_ssh_attempt() {
     let manifest_p = dir.path().join("murmur.yaml");
     fs::write(
         &manifest_p,
-        "name: my-agent\nversion: 0.1.0\nartifacts: []\n\
-         inference:\n  endpoint: http://localhost:8080\n  model: gpt-4\n  \
+        "name: my-agent\nversion: 0.1.0\n\
+         artifacts:\n  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n    \
+         gateway:\n      endpoint: http://localhost:8080\n      keyless: true\n\
+         inference:\n  model: gpt-4\n  \
          system_prompt_file: instructions.md\n  \
          driver:\n    artifact: murmur-driver-openai\n",
     )

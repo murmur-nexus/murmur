@@ -28,8 +28,9 @@ const RESERVED: [&str; 4] = [
 fn manifest(project: &Path, artifact_name: &str, blocks: &str) -> std::path::PathBuf {
     let yaml = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {artifact_name}\n    \
-         version: 0.1.0\n    runtime: tool\ninference:\n  transport: http\n  \
-         endpoint: http://127.0.0.1:1\n  model: test-model\n  api_key: test-key\n  driver:\n    \
+         version: 0.1.0\n    runtime: tool\n  - name: murmur-driver-anthropic\n    version: \
+         0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      \
+         api_key: test-key\ninference:\n  transport: http\n  model: test-model\n  driver:\n    \
          artifact: murmur-driver-anthropic\n",
     );
     let path = project.join("murmur.yaml");

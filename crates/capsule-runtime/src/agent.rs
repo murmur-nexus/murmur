@@ -3433,8 +3433,8 @@ fn read_task(workdir: &Path) -> String {
 /// credential came from — so its message replaces the driver's text rather than sitting beside it.
 fn credential_failure(store_state: &CapsuleStoreState) -> Option<String> {
     store_state
-        .inference_gateway
-        .as_ref()
+        .gateways
+        .inference()
         .and_then(|gateway| gateway.credential())
         .and_then(|credential| credential.report_rejection())
 }

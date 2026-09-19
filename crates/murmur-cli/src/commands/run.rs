@@ -365,20 +365,27 @@ pub(crate) fn run_run(
         lifecycle_override.as_ref(),
     );
 
-    // Same seam, same reasons: the runtime reaches the provider itself, so an allow-list entry
-    // naming the inference endpoint does not serve inference, and what it does grant should be
-    // said before `--explain-scope` returns. Never a refusal.
-    capsule_runtime::warn_on_inference_endpoint_in_network_allow(
+    // Same seam, same reasons: the runtime reaches every gateway's upstream itself, so an
+    // allow-list entry naming a gateway host does not serve the gateway, and what it does grant
+    // should be said before `--explain-scope` returns. Never a refusal.
+    capsule_runtime::warn_on_gateway_endpoint_in_network_allow(
         &capability_policy,
-        runtime_manifest.inference.as_ref(),
+        &runtime_manifest.artifacts,
     );
 
     // Same seam again: a key read only at launch is what an operator rotating keys needs to hear
     // about before the capsule is running, and `--explain-scope` should say it too. Never a
     // refusal.
-    capsule_runtime::warn_on_launch_only_inference_credential(
-        runtime_manifest.inference.as_ref(),
+    capsule_runtime::warn_on_launch_only_gateway_credential(
+        &runtime_manifest.artifacts,
         crate::config::mur_config_path().ok().as_deref(),
+    );
+
+    // And a gateway nothing meters, so an operator does not read the spend ceilings as covering
+    // it. Never a refusal.
+    capsule_runtime::warn_on_unmetered_gateways(
+        runtime_manifest.inference.as_ref(),
+        &runtime_manifest.artifacts,
     );
 
     // The same set, and the same checker, `stage_session` consults — called here only because the
@@ -555,6 +562,7 @@ pub(crate) fn run_run(
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -600,6 +608,7 @@ pub(crate) fn run_run(
                             source: None,
                             on_overflow: artifact.on_overflow,
                             config: artifact.config.clone(),
+                            gateway: artifact.gateway.clone(),
                             capabilities: artifact.capabilities.clone(),
                         });
                         // The hash to verify against is this host's, never another

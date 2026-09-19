@@ -15,10 +15,11 @@ use murmur_artifact::{
     security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask, ApiKeyReference,
     ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedSha256, LockfileError,
-    MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeType, TaskAcceptance,
-    LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007,
-    W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
-    W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026, W_SEC_027,
+    MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType,
+    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006,
+    W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
+    W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026,
+    W_SEC_027, W_SEC_030,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -46,6 +47,7 @@ use crate::{
     },
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
+    credential_gateway::{CredentialGateway, GatewayMetering, GatewayTable},
     delegation::SpawnerHandle,
     detached::{
         self, demotion_tool_result, AbandonedDisposition, AbandonedWork, DetachPolicy,
@@ -53,13 +55,12 @@ use crate::{
     },
     diagnostic,
     errors::RuntimeError,
+    gateway_credential::{config_holds_credential, CredentialEvent, GatewayCredential},
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
         SessionContextData, ShellDispatchInfo, TaskReopen,
     },
     identity::{self, CapsuleIdentity},
-    inference_credential::{config_holds_credential, InferenceCredential},
-    inference_gateway::InferenceGateway,
     inference_import::HookInferenceCtx,
     lanes::LaneQueue,
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
@@ -854,6 +855,8 @@ pub fn stage_session(
                     // agent's telemetry may be dropped to keep the loop moving is the
                     // operator's call, not the hook author's.
                     on_overflow: artifact.on_overflow,
+                    // Filled from the session's gateway table once it is staged below.
+                    gateway: None,
                 });
             }
             ArtifactRuntime::Skill => {
@@ -881,21 +884,25 @@ pub fn stage_session(
     let session_id = generate_session_id();
 
     // Before `dispatch_stage` runs any on-stage hook and before the session directory exists: a
-    // machine ceiling that cannot be kept, or a `transport: http` driver that does not say how its
-    // provider takes the key (it could only be run by handing it the key), refuses the launch here
-    // rather than at the first turn.
+    // machine ceiling that cannot be kept, or an artifact with a `gateway:` that does not say how
+    // its upstream takes the key (it could only be run by handing it the key), refuses the launch
+    // here rather than at its first call.
     let spend = stage_spend_meter(
         request.inference.as_ref(),
         request.machine_tokens_per_day,
         &session_id,
     )?;
-    let inference_gateway = stage_inference_gateway(
+    let gateways = stage_gateways(
         request.inference.as_ref(),
+        &request.artifacts,
         request.credentials_file.as_deref(),
         &installed_manifests,
         &installed_artifacts,
         &spend,
     )?;
+    for hook in &mut hook_components {
+        hook.gateway = gateways.for_artifact(&hook.name).cloned();
+    }
 
     // Asked as soon as the hook artifacts are staged and their bindings are known, and before
     // the session directory is created: a resume that cannot continue anything must leave no
@@ -1067,7 +1074,7 @@ pub fn stage_session(
         resolved_lock_artifacts,
         installed_artifacts,
         inference: request.inference,
-        inference_gateway,
+        gateways,
         spend,
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
@@ -1223,9 +1230,9 @@ fn launch(
     let inference_env = staged
         .inference
         .as_ref()
-        .map(|inference| inference_env_pairs(inference, staged.inference_gateway.as_deref()))
+        .map(|inference| inference_env_pairs(inference, staged.gateways.inference()))
         .unwrap_or_default();
-    let inference_gateway = staged.inference_gateway.clone();
+    let gateways = staged.gateways.clone();
     let spend = Arc::clone(&staged.spend);
 
     if let Some(ref inference) = staged.inference {
@@ -1588,15 +1595,16 @@ fn launch(
                     .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
                     .map(str::to_string)
                     .collect();
-            let inference_credential = inference_gateway
-                .as_ref()
+            let inference_credential = gateways
+                .inference()
                 .and_then(|gateway| gateway.credential())
                 .cloned();
-            trace.set_credential_source(
-                inference_credential
-                    .as_ref()
-                    .map_or("none", |credential| credential.source().trace_name()),
-            );
+            trace.set_credential_source(match (gateways.inference(), &inference_credential) {
+                (_, Some(credential)) => credential.source().trace_name(),
+                (Some(_), None) => "keyless",
+                (None, None) => "none",
+            });
+            trace.set_gateways(session_gateways(&gateways));
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -1632,8 +1640,17 @@ fn launch(
             // The credential records a rotation or rejection through the same kind of handle, and
             // for the same reason: the gateway sends from a task the loop's writer cannot reach,
             // and the record should land when the request does.
-            if let (Some(credential), Some(appender)) = (&inference_credential, &resource_trace) {
-                credential.attach_trace(Arc::clone(appender));
+            if let Some(appender) = &resource_trace {
+                for gateway in gateways.iter() {
+                    if let Some(credential) = gateway.credential() {
+                        let event = if gateway.is_metered() {
+                            CredentialEvent::Inference
+                        } else {
+                            CredentialEvent::Gateway
+                        };
+                        credential.attach_trace(Arc::clone(appender), event);
+                    }
+                }
             }
             // The same file again, for the same reason and on the same terms: a plan's steps run
             // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
@@ -1727,9 +1744,12 @@ fn launch(
                             &capability_policy,
                         )?,
                         http: WasiHttpCtx::new(),
+                        // The capsule's own store holds no gateway: it is no artifact, and a
+                        // request it addresses to the gateway authority is an ordinary
+                        // allow-list-checked request with no key.
                         http_hooks: NetworkPolicyHooks {
                             network_allow_rules: network_allow_rules.clone(),
-                            inference_gateway: None,
+                            gateway: None,
                         },
                         network_allow_rules,
                         peer_fetch_rules,
@@ -1740,7 +1760,7 @@ fn launch(
                         plan_trace,
                         plan_counter: AtomicU64::new(0),
                         inference_env: all_env,
-                        inference_gateway,
+                        gateways,
                         spend,
                         engine: engine.clone(),
                         workdir: workdir.clone(),
@@ -1790,6 +1810,8 @@ fn launch(
                             // Same grant `dispatch_tool_async` would apply to this driver, so
                             // a hook's `run-inference` cannot route around its narrowing.
                             let driver_grant = state.artifact_grants.get(&driver_name).cloned();
+                            let gateway =
+                                gateway_for_store(state.gateways.inference(), &driver_name);
                             Arc::new(HookInferenceCtx {
                                 driver_name,
                                 driver_component,
@@ -1801,7 +1823,7 @@ fn launch(
                                 capability_policy: state.capability_policy.clone(),
                                 network_allow_rules: state.network_allow_rules.clone(),
                                 driver_grant,
-                                inference_gateway: state.inference_gateway.clone(),
+                                gateway,
                                 spend: Arc::clone(&state.spend),
                                 records: std::sync::Mutex::new(Vec::new()),
                                 spend_refusals: std::sync::Mutex::new(Vec::new()),
@@ -2652,7 +2674,7 @@ fn launch(
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: network_allow_rules.clone(),
-            inference_gateway: None,
+            gateway: None,
         },
         network_allow_rules,
         // A script capsule has no peer-handoff surface: `share-file` and `fetch-peer-file` are
@@ -2673,7 +2695,7 @@ fn launch(
         // `capsule` plan step would delegate with — it simply has no tool to call.
         delegation: None,
         inference_env,
-        inference_gateway: staged.inference_gateway.clone(),
+        gateways: staged.gateways.clone(),
         spend: Arc::clone(&staged.spend),
         engine: staged.engine.clone(),
         workdir: staged.workdir.clone(),
@@ -3410,74 +3432,139 @@ pub fn warn_on_secret_shaped_env_grants(
     }
 }
 
-/// Warns (non-fatal, once per matching entry) when a `transport: http` capsule names its inference
-/// endpoint in `capabilities.network.allow`.
+/// Warns (non-fatal, once per matching entry) when a `capabilities.network.allow` entry names the
+/// host of an artifact's `gateway.endpoint`: a capsule-wide entry against every artifact's gateway,
+/// an entry on an artifact's own `capabilities:` against that artifact's.
 ///
-/// The runtime reaches the provider itself, so inference no longer uses the entry. It still grants
-/// tools, subprocesses and the driver direct reach to that host, without the key, which is why this
+/// The runtime reaches the upstream itself, so the gateway does not use the entry. It still grants
+/// tools, subprocesses and artifacts direct reach to that host, without the key, which is why this
 /// is a warning and not a refusal. Shared between `mur run` and `mur doctor` on the same terms as
 /// [`warn_on_secret_shaped_env_grants`], and decided before any session workdir exists, so it goes
 /// to stderr only.
-pub fn warn_on_inference_endpoint_in_network_allow(
+pub fn warn_on_gateway_endpoint_in_network_allow(
     policy: &CapabilityPolicy,
-    inference: Option<&InferenceConfig>,
+    artifacts: &[RuntimeArtifact],
 ) {
-    for entry in inference_endpoint_allow_entries(&policy.network_allow, inference) {
+    for (entry, owner, named) in gateway_endpoint_allow_entries(&policy.network_allow, artifacts) {
         let link = security_warning_link(W_SEC_025);
+        let location = match owner {
+            None => "capabilities.network.allow".to_string(),
+            Some(owner) => format!("artifact '{owner}' capabilities.network.allow"),
+        };
+        let named = named
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         crate::runtime_err!(
-            "[capsule-runtime] warning[{W_SEC_025}]: capabilities.network.allow entry '{entry}' \
-             names the inference endpoint; inference no longer uses it — the runtime reaches the \
-             provider itself — so the entry now only grants tools, subprocesses and the driver \
-             direct reach to that host without the key ({link})"
+            "[capsule-runtime] warning[{W_SEC_025}]: {location} entry '{entry}' names the \
+             gateway.endpoint host of artifact {named}; the gateway does not use it — the runtime \
+             reaches that upstream itself — so the entry only grants tools, subprocesses and \
+             artifacts direct reach to that host without the key ({link})"
         );
     }
 }
 
-/// Warns (non-fatal, once) when a `transport: http` capsule's `inference.api_key` can only be read
-/// at launch: a literal in the manifest, or a `${NAME}` that the global config's `credentials:`
-/// map does not hold and the environment supplies.
+/// Warns (non-fatal, once per gateway credential) when an artifact's `gateway.api_key` can only be
+/// read at launch: a literal in the manifest, or a `${NAME}` that the global config's
+/// `credentials:` map does not hold and the environment supplies.
 ///
 /// Such a capsule keeps the key it launched with, so a key rotated with `mur config set -g
 /// credentials.NAME` does not reach it until it restarts. Reads only whether `credentials_file`
 /// holds the name, never prints a value, and stays silent for a `${NAME}` found nowhere — staging
 /// refuses that one. Shared between `mur run` and `mur doctor` on the same terms as
-/// [`warn_on_inference_endpoint_in_network_allow`].
-pub fn warn_on_launch_only_inference_credential(
-    inference: Option<&InferenceConfig>,
+/// [`warn_on_gateway_endpoint_in_network_allow`].
+pub fn warn_on_launch_only_gateway_credential(
+    artifacts: &[RuntimeArtifact],
     credentials_file: Option<&Path>,
 ) {
-    let Some(reference) = inference
-        .filter(|inference| inference.transport == "http")
-        .and_then(|inference| inference.api_key.as_ref())
-    else {
-        return;
-    };
-    let (source, name) = match reference {
-        ApiKeyReference::Literal(_) => (
-            "inference.api_key is written literally in murmur.yaml".to_string(),
-            "<NAME>",
-        ),
-        ApiKeyReference::Environment(name) => {
-            if credentials_file.is_some_and(|path| config_holds_credential(path, name))
-                || std::env::var_os(name).is_none_or(|value| value.is_empty())
-            {
-                return;
-            }
-            (
+    for artifact in artifacts {
+        let Some(reference) = artifact
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.api_key.as_ref())
+        else {
+            continue;
+        };
+        let (source, name) = match reference {
+            ApiKeyReference::Literal(_) => (
                 format!(
-                    "inference.api_key: ${{{name}}} is read from the environment variable {name}, \
-                     because credentials.{name} is not set in the global config"
+                    "artifact '{}' gateway.api_key is written literally in murmur.yaml",
+                    artifact.name
                 ),
-                name.as_str(),
-            )
+                "<NAME>",
+            ),
+            ApiKeyReference::Environment(name) => {
+                if credentials_file.is_some_and(|path| config_holds_credential(path, name))
+                    || std::env::var_os(name).is_none_or(|value| value.is_empty())
+                {
+                    continue;
+                }
+                (
+                    format!(
+                        "artifact '{}' gateway.api_key: ${{{name}}} is read from the environment \
+                         variable {name}, because credentials.{name} is not set in the global config",
+                        artifact.name
+                    ),
+                    name.as_str(),
+                )
+            }
+        };
+        let link = security_warning_link(W_SEC_027);
+        crate::runtime_err!(
+            "[capsule-runtime] warning[{W_SEC_027}]: {source}, so the key is read once at launch \
+             and this capsule cannot pick up a rotated key until it is restarted; store the key \
+             with `mur config set -g credentials.{name} <key>` to have it re-read ({link})"
+        );
+    }
+}
+
+/// Warns (non-fatal, once per gateway) when an artifact reaches its upstream through a credential
+/// gateway that is not the configured `transport: http` driver's, and so is not metered.
+///
+/// Such a gateway sends without a spend admission and counts toward neither
+/// `inference.max_session_tokens` nor `spend.machine_tokens_per_day`. Shared between `mur run` and
+/// `mur doctor` on the same terms as [`warn_on_gateway_endpoint_in_network_allow`]. Never a refusal
+/// and never a key.
+pub fn warn_on_unmetered_gateways(
+    inference: Option<&InferenceConfig>,
+    artifacts: &[RuntimeArtifact],
+) {
+    let inference_driver = inference
+        .filter(|inference| inference.transport == "http")
+        .and_then(|inference| inference.driver.as_ref())
+        .map(|driver| driver.artifact.as_str());
+    for artifact in artifacts {
+        let Some(gateway) = artifact.gateway.as_ref() else {
+            continue;
+        };
+        if inference_driver == Some(artifact.name.as_str()) {
+            continue;
         }
+        let host = gateway_endpoint_host(&gateway.endpoint);
+        let link = security_warning_link(W_SEC_030);
+        crate::runtime_err!(
+            "[capsule-runtime] warning[{W_SEC_030}]: artifact '{}' reaches {host} through the \
+             credential gateway, unmetered — murmur neither counts nor limits what its calls \
+             spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not \
+             cover it ({link})",
+            artifact.name
+        );
+    }
+}
+
+/// A `gateway.endpoint`'s host, with its port when one was written, as the warnings name it.
+/// Falls back to the endpoint as written when it does not parse; the manifest parser refuses that
+/// one before any warning runs.
+fn gateway_endpoint_host(endpoint: &str) -> String {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return endpoint.to_string();
     };
-    let link = security_warning_link(W_SEC_027);
-    crate::runtime_err!(
-        "[capsule-runtime] warning[{W_SEC_027}]: {source}, so the key is read once at launch and \
-         this capsule cannot pick up a rotated key until it is restarted; store the key with \
-         `mur config set -g credentials.{name} <key>` to have it re-read ({link})"
-    );
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => endpoint.to_string(),
+    }
 }
 
 /// Print `W-SEC-026` when `spend.machine_tokens_per_day` is in effect and the capsule uses
@@ -3504,31 +3591,65 @@ pub fn warn_on_machine_spend_ceiling_under_process_transport(
     );
 }
 
-/// The `network_allow` entries whose rule matches the `transport: http` inference endpoint, in
+/// The `network_allow` entries whose rule matches some artifact's `gateway.endpoint`, each with
+/// the artifact whose `capabilities:` declares it (`None` for the capsule-wide block) and the
+/// artifacts whose endpoint it matches. Capsule-wide entries first, then each artifact's own, in
 /// declaration order. An entry that does not parse matches nothing: validation refuses it
 /// elsewhere.
-fn inference_endpoint_allow_entries<'a>(
+fn gateway_endpoint_allow_entries<'a>(
     network_allow: &'a [String],
-    inference: Option<&InferenceConfig>,
-) -> Vec<&'a str> {
-    let Some(endpoint) = inference
-        .filter(|inference| inference.transport == "http")
-        .and_then(|inference| inference.endpoint.as_deref())
-    else {
-        return Vec::new();
-    };
-    let Some(target) = endpoint
-        .parse::<http::Uri>()
-        .ok()
-        .and_then(|uri| RequestTarget::from_request(&uri, uri.scheme_str() == Some("https")))
-    else {
-        return Vec::new();
-    };
-    network_allow
+    artifacts: &'a [RuntimeArtifact],
+) -> Vec<(&'a str, Option<&'a str>, Vec<&'a str>)> {
+    let targets: Vec<(&str, RequestTarget)> = artifacts
         .iter()
-        .filter(|entry| NetworkAllowRule::parse(entry).is_ok_and(|rule| rule.matches(&target)))
-        .map(String::as_str)
-        .collect()
+        .filter_map(|artifact| {
+            let endpoint = artifact
+                .gateway
+                .as_ref()?
+                .endpoint
+                .parse::<http::Uri>()
+                .ok()?;
+            let target =
+                RequestTarget::from_request(&endpoint, endpoint.scheme_str() == Some("https"))?;
+            Some((artifact.name.as_str(), target))
+        })
+        .collect();
+    let matching = |entry: &str, only: Option<&str>| -> Vec<&'a str> {
+        let Ok(rule) = NetworkAllowRule::parse(entry) else {
+            return Vec::new();
+        };
+        targets
+            .iter()
+            .filter(|(name, _)| only.is_none_or(|only| only == *name))
+            .filter(|(_, target)| rule.matches(target))
+            .map(|(name, _)| *name)
+            .collect()
+    };
+
+    let mut entries = Vec::new();
+    for entry in network_allow {
+        let named = matching(entry, None);
+        if !named.is_empty() {
+            entries.push((entry.as_str(), None, named));
+        }
+    }
+    for artifact in artifacts {
+        let Some(allow) = artifact
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.network.as_ref())
+            .map(|network| &network.allow)
+        else {
+            continue;
+        };
+        for entry in allow {
+            let named = matching(entry, Some(&artifact.name));
+            if !named.is_empty() {
+                entries.push((entry.as_str(), Some(artifact.name.as_str()), named));
+            }
+        }
+    }
+    entries
 }
 
 /// Warns (non-fatal, once per allowlisted interpreter) when `capabilities.filesystem.read_only`
@@ -3982,13 +4103,23 @@ fn build_wasi_ctx(
     Ok(builder.build())
 }
 
+/// The variable naming a store's own credential gateway, set only in the WASI environment of a
+/// store that holds one.
+pub(crate) const GATEWAY_ENDPOINT_ENV: &str = "MURMUR_GATEWAY_ENDPOINT";
+
+/// `MURMUR_GATEWAY_ENDPOINT` for a store holding `gateway`. Never the key.
+pub(crate) fn gateway_env_pair(gateway: &CredentialGateway) -> (String, String) {
+    (GATEWAY_ENDPOINT_ENV.to_string(), gateway.guest_endpoint())
+}
+
 /// The `MURMUR_INFERENCE_*` variables every guest of an inference session sees.
 ///
-/// Never the key: under `transport: http` the endpoint is the gateway's, and the runtime attaches
-/// the credential itself. `gateway` is `None` for `transport: process`, whose endpoint is empty.
+/// Never the key: under `transport: http` the endpoint is the inference gateway's, and the runtime
+/// attaches the credential itself. `gateway` is `None` for `transport: process`, whose endpoint is
+/// empty.
 fn inference_env_pairs(
     inference: &murmur_artifact::InferenceConfig,
-    gateway: Option<&InferenceGateway>,
+    gateway: Option<&Arc<CredentialGateway>>,
 ) -> Vec<(String, String)> {
     let mut pairs = vec![
         (
@@ -3998,7 +4129,7 @@ fn inference_env_pairs(
         (
             "MURMUR_INFERENCE_ENDPOINT".to_string(),
             gateway
-                .map(InferenceGateway::driver_endpoint)
+                .map(|gateway| gateway.guest_endpoint())
                 .unwrap_or_default(),
         ),
         (
@@ -4141,11 +4272,12 @@ enum InputWaitEnd {
 
 pub(crate) struct NetworkPolicyHooks {
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
-    /// Set only on the configured inference driver's own store. A request addressed to the gateway
-    /// authority is then sent to the provider by the runtime, on the runtime's grant — neither
-    /// `network_allow_rules` nor the driver's per-artifact narrowing is consulted for it. Every
-    /// other request from the same store is checked exactly as it is without a gateway.
-    pub(crate) inference_gateway: Option<Arc<InferenceGateway>>,
+    /// Set only on a store of the artifact the gateway belongs to. A request addressed to the
+    /// gateway authority is then sent to that gateway's one operator-pinned upstream by the
+    /// runtime, on the operator's `gateway.endpoint` grant — neither `network_allow_rules` nor the
+    /// artifact's per-artifact narrowing is consulted for it. Every other request from the same
+    /// store is checked exactly as it is without a gateway.
+    pub(crate) gateway: Option<Arc<CredentialGateway>>,
 }
 
 impl WasiHttpHooks for NetworkPolicyHooks {
@@ -4154,16 +4286,19 @@ impl WasiHttpHooks for NetworkPolicyHooks {
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
-        if let Some(gateway) = self.inference_gateway.as_ref() {
-            if InferenceGateway::is_addressed_to_gateway(request.uri()) {
-                // Refused before the key is attached unless some admission is open. The check is
-                // session-wide, not per-request: it holds only because the gateway is attached to
-                // the agent loop's driver dispatch and hooks' `run-inference`, both of which admit
-                // first, and never to a driver reached by name through tool dispatch.
-                if !gateway.spend.has_open_admission() {
-                    return Err(wasmtime_wasi_http::p2::HttpError::from(
-                        WasiHttpErrorCode::HttpRequestDenied,
-                    ));
+        if let Some(gateway) = self.gateway.as_ref() {
+            if CredentialGateway::is_addressed_to_gateway(request.uri()) {
+                // The inference gateway's request is refused before the key is attached unless
+                // some admission is open. The check is session-wide, not per-request: it holds only
+                // because the inference gateway is attached to the agent loop's driver dispatch and
+                // hooks' `run-inference`, both of which admit first, and never to a driver reached
+                // by name through tool dispatch. An unmetered gateway never reads the meter.
+                if let GatewayMetering::Inference(spend) = &gateway.metering {
+                    if !spend.has_open_admission() {
+                        return Err(wasmtime_wasi_http::p2::HttpError::from(
+                            WasiHttpErrorCode::HttpRequestDenied,
+                        ));
+                    }
                 }
                 let gateway = Arc::clone(gateway);
                 return Ok(HostFutureIncomingResponse::pending(
@@ -4233,10 +4368,10 @@ pub(crate) struct CapsuleStoreState {
     /// anything the model wrote, so a plan `id` reaches no path.
     pub(crate) plan_counter: AtomicU64,
     pub(crate) inference_env: Vec<(String, String)>,
-    /// Moved over from [`StagedSession::inference_gateway`]. Handed only to
-    /// [`Self::dispatch_driver_async`], and attached by [`invoke_tool_component`] only to the
-    /// configured driver's store.
-    pub(crate) inference_gateway: Option<Arc<InferenceGateway>>,
+    /// Moved over from [`StagedSession::gateways`]. The inference gateway is handed only to
+    /// [`Self::dispatch_driver_async`]; every other artifact's gateway to that artifact's own
+    /// dispatch through [`Self::dispatch_tool_async`].
+    pub(crate) gateways: GatewayTable,
     /// Moved over from [`StagedSession::spend`]. The agent loop admits every driver turn against
     /// it; hooks' `run-inference` and the gateway hold clones of the same account.
     pub(crate) spend: Arc<SpendMeter>,
@@ -4677,75 +4812,122 @@ impl manage::Host for CapsuleStoreState {
     }
 }
 
-/// The gateway a store for artifact `name` is built with: the session's, and only when `name` is
-/// the driver it was built for. Every other tool, hook and capsule store gets none, so a request
-/// they address to the gateway authority is an ordinary allow-list-checked request with no key.
+/// The gateway a store for artifact `name` is built with: `gateway`, and only when it is `name`'s
+/// own. Callers pass the table lookup for the dispatch they make; this is the one check that keeps
+/// a store from ever holding another artifact's gateway. Every other store gets none, so a request
+/// it addresses to the gateway authority is an ordinary allow-list-checked request with no key.
 fn gateway_for_store(
-    gateway: Option<&Arc<InferenceGateway>>,
+    gateway: Option<&Arc<CredentialGateway>>,
     name: &str,
-) -> Option<Arc<InferenceGateway>> {
-    gateway
-        .filter(|gateway| gateway.driver_name == name)
-        .cloned()
+) -> Option<Arc<CredentialGateway>> {
+    gateway.filter(|gateway| gateway.artifact == name).cloned()
 }
 
-/// Builds the session's inference gateway from the configured driver's bundled `inference_auth:`
-/// block, or refuses the launch with [`RuntimeError::DriverDeclaresNoInferenceAuth`].
+/// Builds the credential gateway of every staged artifact whose operator entry declares
+/// `gateway:`, in declaration order.
 ///
-/// `None` for `transport: process`, for no inference, and for a driver that is not among the staged
-/// artifacts — dispatch already refuses that one by name. The refusal depends on the declaration
-/// alone, never on whether `inference.api_key` is set.
+/// For each such artifact the `gateway.api_key` is resolved first, against `credentials_file` and
+/// the environment, so a credential found nowhere refuses with
+/// [`RuntimeError::GatewayCredentialNotFound`]. A native implementation is then refused with
+/// [`RuntimeError::GatewayOnNativeArtifact`] — its requests leave through the egress proxy and
+/// would never reach the gateway — and the artifact's own bundled `inference_auth:` block is read,
+/// refusing with [`RuntimeError::GatewayArtifactDeclaresNoInferenceAuth`] when it is absent or
+/// malformed. A keyless gateway needs that block too: its header is the one stripped from every
+/// request. A gateway with neither a credential nor `keyless: true` is refused with
+/// [`RuntimeError::GatewayWithoutCredential`] before anything is resolved.
 ///
-/// A `transport: http` `inference.api_key` is resolved first, against `credentials_file` and the
-/// environment, so a credential found nowhere refuses the launch with
-/// [`RuntimeError::InferenceCredentialNotFound`] even when no gateway would be built.
-fn stage_inference_gateway(
+/// The configured `transport: http` driver's gateway is metered against `spend` and becomes the
+/// table's inference gateway; every other gateway is unmetered. An artifact without `gateway:` is
+/// never asked for `inference_auth:`.
+fn stage_gateways(
     inference: Option<&InferenceConfig>,
+    artifacts: &[ArtifactRequest],
     credentials_file: Option<&Path>,
     installed_manifests: &[(String, String)],
     installed_artifacts: &[InstalledArtifactSummary],
     spend: &Arc<SpendMeter>,
-) -> Result<Option<Arc<InferenceGateway>>, RuntimeError> {
-    let Some(inference) = inference.filter(|inference| inference.transport == "http") else {
-        return Ok(None);
-    };
-    let credential = inference
-        .api_key
-        .as_ref()
-        .map(|reference| InferenceCredential::resolve(reference, credentials_file).map(Arc::new))
-        .transpose()?;
-    let (Some(driver), Some(endpoint)) = (inference.driver.as_ref(), inference.endpoint.as_deref())
-    else {
-        return Ok(None);
-    };
-    let Some((_, manifest_yaml)) = installed_manifests
-        .iter()
-        .find(|(name, _)| *name == driver.artifact)
-    else {
-        return Ok(None);
-    };
-    let refuse = |reason: Option<String>| RuntimeError::DriverDeclaresNoInferenceAuth {
-        name: driver.artifact.clone(),
-        version: installed_artifacts
+) -> Result<GatewayTable, RuntimeError> {
+    let inference_driver = inference
+        .filter(|inference| inference.transport == "http")
+        .and_then(|inference| inference.driver.as_ref())
+        .map(|driver| driver.artifact.as_str());
+    let mut table = GatewayTable::default();
+    for artifact in artifacts {
+        let Some(declared) = artifact.gateway.as_ref() else {
+            continue;
+        };
+        if declared.api_key.is_none() && !declared.keyless {
+            return Err(RuntimeError::GatewayWithoutCredential {
+                name: artifact.name.clone(),
+                endpoint: declared.endpoint.clone(),
+            });
+        }
+        let credential = declared
+            .api_key
+            .as_ref()
+            .map(|reference| {
+                GatewayCredential::resolve(&artifact.name, reference, credentials_file)
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        let installed = installed_artifacts
             .iter()
-            .find(|artifact| artifact.name == driver.artifact)
-            .map(|artifact| artifact.version.clone())
-            .unwrap_or_default(),
-        reason,
-    };
-    let auth = match murmur_artifact::parse_inference_auth(manifest_yaml) {
-        Ok(Some(auth)) => auth,
-        Ok(None) => return Err(refuse(None)),
-        Err(err) => return Err(refuse(Some(err.to_string()))),
-    };
-    InferenceGateway::new(
-        driver.artifact.clone(),
-        endpoint,
-        auth,
-        credential,
-        Arc::clone(spend),
-    )
-    .map(|gateway| Some(Arc::new(gateway)))
+            .find(|installed| installed.name == artifact.name);
+        if installed.is_some_and(|installed| {
+            installed.implementation == Some(ArtifactImplementation::Native)
+        }) {
+            return Err(RuntimeError::GatewayOnNativeArtifact {
+                name: artifact.name.clone(),
+            });
+        }
+        let refuse =
+            |reason: Option<String>| RuntimeError::GatewayArtifactDeclaresNoInferenceAuth {
+                name: artifact.name.clone(),
+                version: installed
+                    .map(|installed| installed.version.clone())
+                    .unwrap_or_else(|| artifact.version.clone()),
+                reason,
+            };
+        let manifest_yaml = installed_manifests
+            .iter()
+            .find(|(name, _)| *name == artifact.name)
+            .map(|(_, yaml)| yaml.as_str())
+            .ok_or_else(|| refuse(Some("the artifact has no bundled murmur.yaml".to_string())))?;
+        let auth = match murmur_artifact::parse_inference_auth(manifest_yaml) {
+            Ok(Some(auth)) => auth,
+            Ok(None) => return Err(refuse(None)),
+            Err(err) => return Err(refuse(Some(err.to_string()))),
+        };
+        let metering = if inference_driver == Some(artifact.name.as_str()) {
+            GatewayMetering::Inference(Arc::clone(spend))
+        } else {
+            GatewayMetering::Unmetered
+        };
+        table.insert(CredentialGateway::new(
+            artifact.name.clone(),
+            &declared.endpoint,
+            auth,
+            credential,
+            metering,
+        )?);
+    }
+    Ok(table)
+}
+
+/// `session_start.gateways`: every gateway of the session, the inference gateway first. Never a
+/// key.
+fn session_gateways(gateways: &GatewayTable) -> Vec<crate::trace::SessionGateway> {
+    gateways
+        .iter()
+        .map(|gateway| crate::trace::SessionGateway {
+            artifact: gateway.artifact.clone(),
+            host: gateway.upstream_host().to_string(),
+            credential_source: gateway
+                .credential()
+                .map_or("keyless", |credential| credential.source().trace_name()),
+            metered: gateway.is_metered(),
+        })
+        .collect()
 }
 
 /// Builds the session's spend account: `inference.max_session_tokens` as its session ceiling and,
@@ -4793,9 +4975,9 @@ pub(crate) struct ToolInvokeEnv<'a> {
     /// no `capabilities:` block on the entry — means the ceiling applies untouched and the
     /// whole `accessible_workdir` is preopened, exactly as before narrowing existed.
     pub(crate) artifact_grant: Option<&'a ToolCapabilityGrant>,
-    /// The session's inference gateway, attached to this store only when `name` is the driver it
-    /// was built for.
-    pub(crate) inference_gateway: Option<&'a Arc<InferenceGateway>>,
+    /// The gateway the caller chose for this dispatch, attached to the store only when it is
+    /// `name`'s own. The store's guest then also sees `MURMUR_GATEWAY_ENDPOINT`.
+    pub(crate) gateway: Option<&'a Arc<CredentialGateway>>,
 }
 
 /// Per-session A2A wiring registered on a tool linker.
@@ -4849,7 +5031,7 @@ pub(crate) async fn invoke_tool_component(
         capability_policy,
         network_allow_rules,
         artifact_grant,
-        inference_gateway,
+        gateway,
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
@@ -4967,6 +5149,12 @@ pub(crate) async fn invoke_tool_component(
     // no `MURMUR_ARTIFACT_CONFIG` in its environment at all. Read off this artifact's own grant,
     // which is what keeps one artifact's config out of every other artifact's guest.
     let config_json = artifact_grant.and_then(|grant| grant.config_json.as_deref());
+    // Same scoping as the config block: only the store that holds the gateway is told where it is.
+    let gateway = gateway_for_store(gateway, name);
+    let mut guest_env = inference_env.to_vec();
+    if let Some(gateway) = gateway.as_deref() {
+        guest_env.push(gateway_env_pair(gateway));
+    }
     let state = ToolStoreState {
         limits: tool_limits.limiter(),
         table: ResourceTable::new(),
@@ -4975,14 +5163,14 @@ pub(crate) async fn invoke_tool_component(
             filesystem_scope,
             state_dir,
             config_json,
-            inference_env,
+            &guest_env,
             capability_policy,
         )
         .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: effective_network_rules.to_vec(),
-            inference_gateway: gateway_for_store(inference_gateway, name),
+            gateway,
         },
     };
 
@@ -5075,15 +5263,16 @@ fn fence_and_label(name: &str, outcome: &mut DispatchOutcome) {
 }
 
 impl CapsuleStoreState {
-    /// Async WASM tool dispatch for a guest's `invoke` and the model's tool calls. Never carries the
-    /// inference gateway: a driver reached by name here gets no keyed route to its provider, and
-    /// so cannot spend outside an admission.
+    /// Async WASM tool dispatch for a guest's `invoke`, the model's tool calls and plan steps.
+    /// Carries the artifact's own unmetered gateway, never the inference gateway: a driver reached
+    /// by name here gets no keyed route to its provider, and so cannot spend outside an admission.
     pub(crate) async fn dispatch_tool_async(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        self.dispatch_component_async(name, input, None).await
+        self.dispatch_component_async(name, input, self.gateways.for_artifact(name))
+            .await
     }
 
     /// The agent loop's driver turn: the one dispatch the inference gateway is attached to, and
@@ -5093,7 +5282,7 @@ impl CapsuleStoreState {
         name: &str,
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        self.dispatch_component_async(name, input, self.inference_gateway.as_ref())
+        self.dispatch_component_async(name, input, self.gateways.inference())
             .await
     }
 
@@ -5101,7 +5290,7 @@ impl CapsuleStoreState {
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
-        inference_gateway: Option<&Arc<InferenceGateway>>,
+        gateway: Option<&Arc<CredentialGateway>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
@@ -5117,7 +5306,7 @@ impl CapsuleStoreState {
                 // anything pulled in at runtime via `manage.pull()` (which has no operator
                 // manifest entry to narrow from) — both keep the full ceiling.
                 artifact_grant: self.artifact_grants.get(name),
-                inference_gateway,
+                gateway,
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -7918,10 +8107,15 @@ mod tests {
     const CONTEXT_WINDOW_MANIFEST: &str = r#"name: windowed
 version: 0.1.0
 runtime: capsule
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_tokens: 4096
   driver:
@@ -8379,9 +8573,7 @@ inference:
     fn inference_without_prompt() -> murmur_artifact::InferenceConfig {
         murmur_artifact::InferenceConfig {
             transport: "http".to_string(),
-            endpoint: Some("http://127.0.0.1:1".to_string()),
             model: "test-model".to_string(),
-            api_key: None,
             driver: None,
             command: None,
             compaction: None,
@@ -8829,6 +9021,7 @@ inference:
                 on_overflow: Default::default(),
                 capabilities: None,
                 config: None,
+                gateway: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: None,
@@ -8920,6 +9113,7 @@ inference:
                 on_overflow: Default::default(),
                 capabilities: None,
                 config: None,
+                gateway: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -9001,6 +9195,7 @@ inference:
                 on_overflow: Default::default(),
                 capabilities: None,
                 config: None,
+                gateway: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -9081,6 +9276,7 @@ inference:
                 on_overflow: Default::default(),
                 capabilities: None,
                 config: None,
+                gateway: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -9218,6 +9414,7 @@ inference:
                 on_overflow: Default::default(),
                 capabilities: None,
                 config: None,
+                gateway: None,
             }],
             allowlisted_tools: HashSet::new(),
             lock_expectations: None,
@@ -9286,9 +9483,7 @@ inference:
 
         let inference = InferenceConfig {
             transport: "http".into(),
-            endpoint: Some("http://localhost".into()),
             model: "claude-3-haiku".into(),
-            api_key: None,
             driver: Some(InferenceDriver {
                 artifact: "test-driver".into(),
                 config: None,
@@ -9317,6 +9512,7 @@ inference:
                 on_overflow: Default::default(),
                 capabilities: None,
                 config: None,
+                gateway: None,
             }],
             allowlisted_tools: HashSet::new(),
             lock_expectations: None,
@@ -9409,7 +9605,7 @@ inference:
             http: WasiHttpCtx::new(),
             http_hooks: NetworkPolicyHooks {
                 network_allow_rules: Vec::new(),
-                inference_gateway: None,
+                gateway: None,
             },
             network_allow_rules: Vec::new(),
             peer_fetch_rules: Vec::new(),
@@ -9420,7 +9616,7 @@ inference:
             plan_counter: AtomicU64::new(0),
             delegation: None,
             inference_env: Vec::new(),
-            inference_gateway: None,
+            gateways: GatewayTable::default(),
             spend: Arc::new(SpendMeter::unlimited()),
             engine,
             workdir: workdir.clone(),
@@ -10657,7 +10853,7 @@ inference:
 
         let mut hooks = NetworkPolicyHooks {
             network_allow_rules: rules.to_vec(),
-            inference_gateway: None,
+            gateway: None,
         };
         let body = Empty::<bytes::Bytes>::new()
             .map_err(|err| match err {})
@@ -10686,36 +10882,87 @@ inference:
         }
     }
 
-    /// A tool store that is not the configured driver's gets no gateway, so its request to the
-    /// gateway authority is an ordinary allow-list-checked request — denied here — and is never
-    /// rewritten or given the key.
+    /// A keyed gateway for `artifact`, with `key` as a literal credential.
+    fn test_gateway(
+        artifact: &str,
+        endpoint: &str,
+        key: &str,
+        metering: GatewayMetering,
+    ) -> CredentialGateway {
+        CredentialGateway::new(
+            artifact,
+            endpoint,
+            murmur_artifact::InferenceAuth {
+                header: "Authorization".to_string(),
+                value: "Bearer {key}".to_string(),
+            },
+            Some(Arc::new(
+                GatewayCredential::resolve(
+                    artifact,
+                    &ApiKeyReference::Literal(key.to_string()),
+                    None,
+                )
+                .unwrap(),
+            )),
+            metering,
+        )
+        .unwrap()
+    }
+
+    /// Each store is handed its own artifact's gateway and never another's: the inference gateway
+    /// only on the driver dispatch, a tool's gateway only on that tool's dispatch, and none to any
+    /// other store — whose request to the gateway authority is then an ordinary
+    /// allow-list-checked request, denied here, never rewritten or given a key.
     #[test]
-    fn gateway_is_driver_only() {
+    fn gateway_table_attaches_only_the_artifacts_own_gateway() {
         use http_body_util::{BodyExt, Empty};
 
         const KEY: &str = "sk-driver-only-marker";
-        let gateway = Arc::new(
-            InferenceGateway::new(
-                "the-driver",
-                "http://127.0.0.1:1",
-                murmur_artifact::InferenceAuth {
-                    header: "x-api-key".to_string(),
-                    value: "{key}".to_string(),
-                },
-                Some(Arc::new(
-                    InferenceCredential::resolve(&ApiKeyReference::Literal(KEY.to_string()), None)
-                        .unwrap(),
-                )),
-                Arc::new(SpendMeter::unlimited()),
-            )
-            .unwrap(),
+        let mut table = GatewayTable::default();
+        table.insert(test_gateway(
+            "the-driver",
+            "http://127.0.0.1:1",
+            KEY,
+            GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
+        ));
+        table.insert(test_gateway(
+            "web-search",
+            "http://127.0.0.1:2/v1",
+            KEY,
+            GatewayMetering::Unmetered,
+        ));
+
+        let inference = table
+            .inference()
+            .expect("the driver's gateway is the inference one");
+        assert_eq!(inference.artifact, "the-driver");
+        assert!(inference.is_metered());
+        assert!(
+            table.for_artifact("the-driver").is_none(),
+            "a driver reached by name through tool dispatch gets no gateway"
         );
-        assert!(gateway_for_store(Some(&gateway), "the-driver").is_some());
-        assert!(gateway_for_store(Some(&gateway), "other-tool").is_none());
+        let tool = table
+            .for_artifact("web-search")
+            .expect("the tool's own gateway");
+        assert_eq!(tool.artifact, "web-search");
+        assert!(!tool.is_metered());
+        assert!(table.for_artifact("other-tool").is_none());
+        assert_eq!(
+            table
+                .iter()
+                .map(|gateway| gateway.artifact.as_str())
+                .collect::<Vec<_>>(),
+            vec!["the-driver", "web-search"]
+        );
+
+        assert!(gateway_for_store(table.inference(), "the-driver").is_some());
+        assert!(gateway_for_store(table.inference(), "other-tool").is_none());
+        assert!(gateway_for_store(table.for_artifact("web-search"), "web-search").is_some());
+        assert!(gateway_for_store(table.for_artifact("web-search"), "other-tool").is_none());
 
         let mut hooks = NetworkPolicyHooks {
             network_allow_rules: Vec::new(),
-            inference_gateway: gateway_for_store(Some(&gateway), "other-tool"),
+            gateway: gateway_for_store(table.for_artifact("other-tool"), "other-tool"),
         };
         let request = hyper::Request::builder()
             .uri("http://127.0.0.1:9/")
@@ -10728,7 +10975,7 @@ inference:
         let rt = tokio::runtime::Runtime::new().unwrap();
         let Err(denied) = rt.block_on(async { hooks.send_request(request, gateway_test_config()) })
         else {
-            panic!("a non-driver store's request to the gateway authority is denied");
+            panic!("a store without a gateway has its request to the gateway authority denied");
         };
         assert!(matches!(
             denied.downcast_ref(),
@@ -10737,12 +10984,10 @@ inference:
         assert!(!format!("{denied:?}").contains(KEY));
     }
 
-    fn http_inference(endpoint: &str, api_key: Option<&str>) -> InferenceConfig {
+    fn http_inference() -> InferenceConfig {
         InferenceConfig {
             transport: "http".to_string(),
-            endpoint: Some(endpoint.to_string()),
             model: "test-model".to_string(),
-            api_key: api_key.map(|key| ApiKeyReference::Literal(key.to_string())),
             driver: Some(murmur_artifact::InferenceDriver {
                 artifact: "the-driver".to_string(),
                 config: None,
@@ -10758,27 +11003,28 @@ inference:
         }
     }
 
+    /// Neither the `MURMUR_INFERENCE_*` variables nor `MURMUR_GATEWAY_ENDPOINT` ever carry a key:
+    /// both name the gateway authority and the upstream's path, nothing else.
     #[test]
     fn inference_env_pairs_never_carries_the_api_key() {
         const KEY: &str = "sk-env-pairs-marker";
-        let inference = http_inference("https://api.moonshot.ai/v1", Some(KEY));
-        let gateway = InferenceGateway::new(
+        let inference = http_inference();
+        let gateway = Arc::new(test_gateway(
             "the-driver",
             "https://api.moonshot.ai/v1",
-            murmur_artifact::InferenceAuth {
-                header: "Authorization".to_string(),
-                value: "Bearer {key}".to_string(),
-            },
-            inference
-                .api_key
-                .as_ref()
-                .map(|reference| Arc::new(InferenceCredential::resolve(reference, None).unwrap())),
-            Arc::new(SpendMeter::unlimited()),
-        )
-        .unwrap();
+            KEY,
+            GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
+        ));
+        let tool = test_gateway(
+            "web-search",
+            "https://api.tavily.com/search/",
+            KEY,
+            GatewayMetering::Unmetered,
+        );
         for pairs in [
             inference_env_pairs(&inference, Some(&gateway)),
             inference_env_pairs(&inference, None),
+            vec![gateway_env_pair(&gateway), gateway_env_pair(&tool)],
         ] {
             assert!(pairs
                 .iter()
@@ -10789,27 +11035,51 @@ inference:
             "MURMUR_INFERENCE_ENDPOINT".to_string(),
             "http://127.0.0.1:9/v1".to_string()
         )));
+        assert_eq!(
+            gateway_env_pair(&tool),
+            (
+                "MURMUR_GATEWAY_ENDPOINT".to_string(),
+                "http://127.0.0.1:9/search".to_string()
+            )
+        );
     }
 
     #[test]
-    fn inference_endpoint_allow_entries_names_only_entries_matching_the_endpoint() {
+    fn gateway_endpoint_allow_entries_names_only_entries_matching_a_gateway() {
         let allow = vec![
             "api.anthropic.com".to_string(),
             "https://api.anthropic.com".to_string(),
             "http://api.anthropic.com".to_string(),
             "example.com".to_string(),
         ];
-        let inference = http_inference("https://api.anthropic.com", None);
+        let artifacts = murmur_artifact::RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+             version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: \
+             https://api.anthropic.com\n      api_key: test-key\n  - name: web-search\n    version: 0.1.0\n    \
+             capabilities:\n      network:\n        allow: [api.tavily.com, api.anthropic.com]\n    \
+             gateway:\n      endpoint: https://api.tavily.com\n      api_key: test-key\ninference:\n  model: m\n  \
+             driver:\n    artifact: murmur-driver-anthropic\n",
+        )
+        .expect("fixture parses")
+        .artifacts;
         assert_eq!(
-            inference_endpoint_allow_entries(&allow, Some(&inference)),
-            vec!["api.anthropic.com", "https://api.anthropic.com"]
+            gateway_endpoint_allow_entries(&allow, &artifacts),
+            vec![
+                ("api.anthropic.com", None, vec!["murmur-driver-anthropic"]),
+                (
+                    "https://api.anthropic.com",
+                    None,
+                    vec!["murmur-driver-anthropic"]
+                ),
+                ("api.tavily.com", Some("web-search"), vec!["web-search"]),
+            ],
+            "an artifact's own entry is matched against its own gateway only"
         );
-        let process = InferenceConfig {
-            transport: "process".to_string(),
-            endpoint: None,
-            ..inference
+        let no_gateway = RuntimeArtifact {
+            gateway: None,
+            ..artifacts[0].clone()
         };
-        assert!(inference_endpoint_allow_entries(&allow, Some(&process)).is_empty());
+        assert!(gateway_endpoint_allow_entries(&allow, &[no_gateway]).is_empty());
     }
 
     /// The no-op invariant, network half: a tool with no per-artifact entry dispatches on the
@@ -10983,7 +11253,7 @@ inference:
                     capability_policy: &CapabilityPolicy::default(),
                     network_allow_rules: &ceiling,
                     artifact_grant: Some(&grant),
-                    inference_gateway: None,
+                    gateway: None,
                 },
                 ToolA2aWiring::silent(),
                 "scoped-tool",
@@ -11026,7 +11296,7 @@ inference:
                     capability_policy: &CapabilityPolicy::default(),
                     network_allow_rules: &ceiling,
                     artifact_grant: None,
-                    inference_gateway: None,
+                    gateway: None,
                 },
                 ToolA2aWiring::silent(),
                 "plain-tool",
@@ -11064,6 +11334,7 @@ inference:
             source: None,
             on_overflow: Default::default(),
             config: None,
+            gateway: None,
             capabilities: Some(murmur_artifact::Capabilities {
                 peer_fetch: None,
                 network: Some(murmur_artifact::NetworkCapabilities {
@@ -11091,6 +11362,7 @@ inference:
             on_overflow: Default::default(),
             capabilities: None,
             config: None,
+            gateway: None,
         };
 
         stage_artifact_grant(&declared, &ceiling, "test-capsule", &mut grants).unwrap();
@@ -11123,6 +11395,7 @@ inference:
             on_overflow: Default::default(),
             capabilities: None,
             config: Some(serde_yaml::from_str("who: a\n").unwrap()),
+            gateway: None,
         };
 
         stage_artifact_grant(&configured, &ceiling, "test-capsule", &mut grants).unwrap();
@@ -11204,6 +11477,7 @@ inference:
             on_overflow: Default::default(),
             capabilities: None,
             config: Some(serde_yaml::from_str("[a, b]").unwrap()),
+            gateway: None,
         };
 
         let err =
@@ -11226,6 +11500,7 @@ inference:
             source: None,
             on_overflow: Default::default(),
             config: None,
+            gateway: None,
             capabilities: Some(murmur_artifact::Capabilities {
                 peer_fetch: None,
                 network: None,
@@ -11424,9 +11699,7 @@ inference:
 
         let inference = InferenceConfig {
             transport: "process".into(),
-            endpoint: None,
             model: "test-model".into(),
-            api_key: None,
             driver: None,
             command: Some(cli.to_string_lossy().to_string()),
             compaction: None,
@@ -11487,6 +11760,7 @@ inference:
             },
             grant: HookCapabilityGrant::default(),
             on_overflow: Default::default(),
+            gateway: None,
         };
 
         let mut hooks = HookRuntime::new(
@@ -11711,6 +11985,7 @@ inference:
                 config_json: None,
             },
             on_overflow: Default::default(),
+            gateway: None,
         };
 
         let mut hooks = HookRuntime::new(
@@ -11796,9 +12071,7 @@ inference:
     fn task_io_inference_config() -> InferenceConfig {
         InferenceConfig {
             transport: String::new(),
-            endpoint: None,
             model: "test-model".into(),
-            api_key: None,
             driver: None,
             command: None,
             compaction: None,
