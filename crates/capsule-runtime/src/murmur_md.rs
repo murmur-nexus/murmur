@@ -466,9 +466,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let inference = InferenceConfig {
             transport: "http".into(),
-            endpoint: Some("http://localhost".into()),
             model: "claude-3-haiku".into(),
-            api_key: None,
             driver: Some(InferenceDriver {
                 artifact: "test-driver".into(),
                 config: None,
@@ -808,9 +806,7 @@ mod tests {
 
         let inference = InferenceConfig {
             transport: "http".into(),
-            endpoint: Some("http://localhost".into()),
             model: "test-model".into(),
-            api_key: None,
             driver: Some(InferenceDriver {
                 artifact: "test-driver".into(),
                 config: None,

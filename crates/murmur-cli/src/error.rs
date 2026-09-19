@@ -41,7 +41,7 @@ pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built
 pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
 pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
-pub const E_RUN_025: &str = "E-RUN-025"; // the inference driver declares no usable inference_auth: block
+pub const E_RUN_025: &str = "E-RUN-025"; // an artifact with a gateway: declares no usable inference_auth: block
 pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
 pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
 
@@ -62,6 +62,14 @@ pub const E_CAP_013: &str = "E-CAP-013"; // an artifact claims the name of a too
 pub const E_CAP_014: &str = "E-CAP-014"; // a capsule in the spawn.allow closure declares an env.allow name unset in this environment
 pub const E_CAP_015: &str = "E-CAP-015"; // a capsule declares an env.allow entry the capsule that spawns it does not hold
 pub const E_CAP_016: &str = "E-CAP-016"; // a capabilities.env.allow entry names a variable the credential backstop strips from every guest
+pub const E_CAP_017: &str = "E-CAP-017"; // a gateway: is declared on a native tool, whose requests never pass the credential gateway
+pub const E_CAP_018: &str = "E-CAP-018"; // a gateway: names an endpoint but binds no api_key and does not declare keyless: true
+
+/// The hint on every `E-CAP-018` refusal, from the manifest parser and from staging alike.
+pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
+    "set gateway.api_key: ${NAME} on this entry to have the runtime present a key, or write \
+     gateway.keyless: true if this upstream takes no key — the runtime never infers keylessness \
+     from the address";
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -301,7 +309,7 @@ impl From<RuntimeError> for CliError {
                 error.to_string(),
                 "remove these entries from capabilities.env.allow. No manifest setting exempts a \
                  name from the credential backstop, and a provider key never belongs in env.allow: \
-                 the runtime reaches the provider itself through inference.api_key — see \
+                 the runtime presents it itself through the artifact's gateway.api_key — see \
                  docs/content/reference/diagnostics.md#e-cap-016",
             ),
             error @ RuntimeError::RuntimeProvidedToolNotReserved { .. } => CliError::with_hint(
@@ -486,13 +494,28 @@ impl From<RuntimeError> for CliError {
                 format!("inference driver '{name}' is not installed in the local tool registry"),
                 "declare the driver artifact in murmur.yaml artifacts: and run `mur run` to install it",
             ),
-            error @ RuntimeError::DriverDeclaresNoInferenceAuth { .. } => CliError::with_hint(
-                E_RUN_025,
+            error @ RuntimeError::GatewayArtifactDeclaresNoInferenceAuth { .. } => {
+                CliError::with_hint(
+                    E_RUN_025,
+                    error.to_string(),
+                    "the runtime presents the key itself and needs the artifact to say how; \
+                     update the artifact to a version whose murmur.yaml declares inference_auth:, \
+                     or remove gateway: from its entry",
+                )
+            }
+            error @ RuntimeError::GatewayWithoutCredential { .. } => CliError::with_hint(
+                E_CAP_018,
                 error.to_string(),
-                "the runtime presents the provider key itself and needs the driver to say how; \
-                 update the driver to a version whose murmur.yaml declares inference_auth:",
+                GATEWAY_WITHOUT_CREDENTIAL_HINT,
             ),
-            ref error @ RuntimeError::InferenceCredentialNotFound { ref variable, .. } => {
+            error @ RuntimeError::GatewayOnNativeArtifact { .. } => CliError::with_hint(
+                E_CAP_017,
+                error.to_string(),
+                "a native tool's requests leave through the egress proxy and never pass the \
+                 credential gateway, so no key could be attached; remove gateway: from its entry, \
+                 or use a WASM build of the tool",
+            ),
+            ref error @ RuntimeError::GatewayCredentialNotFound { ref variable, .. } => {
                 CliError::with_hint(
                     E_MAN_003,
                     error.to_string(),

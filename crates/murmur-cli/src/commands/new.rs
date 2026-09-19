@@ -50,13 +50,36 @@ impl Drop for TempDir {
     }
 }
 
+/// The `gateway.api_key` [`build_meta_manifest`] writes on the driver entry. A reference, so the
+/// entry parses as keyed; [`inject_driver_key`] replaces it before staging, so the variable is
+/// never read.
+const META_MANIFEST_KEY_PLACEHOLDER: &str = "${MURMUR_NEW_API_KEY}";
+
+/// Replaces the configured driver's `gateway.api_key` with `key` as a literal, in the parsed
+/// manifest only.
+fn inject_driver_key(runtime_manifest: &mut RuntimeManifest, key: &str) {
+    let driver_name = runtime_manifest
+        .inference
+        .as_ref()
+        .and_then(|inference| inference.driver.as_ref())
+        .map(|driver| driver.artifact.clone());
+    if let Some(gateway) = runtime_manifest
+        .artifacts
+        .iter_mut()
+        .find(|artifact| Some(&artifact.name) == driver_name.as_ref())
+        .and_then(|artifact| artifact.gateway.as_mut())
+    {
+        gateway.api_key = Some(murmur_artifact::ApiKeyReference::Literal(key.to_string()));
+    }
+}
+
 pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError> {
     // Resolve inference config: config file → env var → interactive wizard.
     let inf = resolve_inference_config()?;
 
     let local_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
 
-    // Build the dynamic meta-manifest with a neutral api_key placeholder — parsing never
+    // Build the dynamic meta-manifest with a placeholder key reference — parsing never
     // touches the environment — then inject the real key directly into the parsed struct.
     // This keeps the resolved key a Rust `String` in memory only; it is never round-tripped
     // through this process's own environment (which a /proc/<pid>/environ read could expose).
@@ -67,11 +90,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             format!("internal: generator meta-manifest is invalid: {e}"),
         )
     })?;
-    if let Some(inference) = runtime_manifest.inference.as_mut() {
-        inference.api_key = Some(murmur_artifact::ApiKeyReference::Literal(
-            inf.api_key.clone(),
-        ));
-    }
+    inject_driver_key(&mut runtime_manifest, &inf.api_key);
 
     // Check that all generator capsule artifacts are installed before staging.
     let generator_artifacts: Vec<ArtifactRequest> = runtime_manifest
@@ -84,6 +103,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             source: a.source.clone(),
             on_overflow: a.on_overflow,
             config: a.config.clone(),
+            gateway: a.gateway.clone(),
             capabilities: a.capabilities.clone(),
         })
         .collect();
@@ -370,6 +390,9 @@ artifacts:
   - name: {driver_name}
     version: "{driver_version}"
     runtime: driver
+    gateway:
+      endpoint: {endpoint}
+      api_key: {META_MANIFEST_KEY_PLACEHOLDER}
   - name: murmur-tool-registry-search
     version: "0.4.13"
     runtime: tool
@@ -383,9 +406,7 @@ lifecycle:
   task_acceptance: single
   after_task: exit
 inference:
-  endpoint: {endpoint}
   model: {model}
-  api_key: ""
   driver:
     artifact: {driver_name}
 "#,
@@ -538,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn build_meta_manifest_uses_neutral_api_key_placeholder() {
+    fn build_meta_manifest_uses_a_key_placeholder() {
         let config = InferenceConfig {
             provider: "anthropic".to_string(),
             model: "claude-haiku-4-5-20251001".to_string(),
@@ -547,12 +568,13 @@ mod tests {
         };
         let yaml = build_meta_manifest(&config);
         assert!(
-            yaml.contains("api_key: \"\""),
-            "api_key field must be a neutral empty-string placeholder"
+            yaml.contains(&format!("api_key: {META_MANIFEST_KEY_PLACEHOLDER}")),
+            "the driver entry must carry the placeholder key reference"
         );
-        assert!(
-            !yaml.contains("${"),
-            "manifest must not contain any ${{...}} env-reference token"
+        assert_eq!(
+            yaml.matches("${").count(),
+            1,
+            "the placeholder must be the manifest's only env-reference token"
         );
         assert!(
             !yaml.contains("MUR_INFERENCE_API_KEY"),
@@ -587,11 +609,29 @@ mod tests {
         let yaml = build_meta_manifest(&config);
         let runtime_manifest = RuntimeManifest::from_yaml_str(&yaml)
             .expect("build_meta_manifest should produce a valid runtime manifest without any env var present");
+        let driver = runtime_manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "murmur-driver-anthropic")
+            .expect("the driver entry is declared");
         assert_eq!(
-            runtime_manifest.inference.and_then(|i| i.api_key),
-            None,
-            "parsed api_key should be None until the caller injects the real key in memory"
+            driver
+                .gateway
+                .as_ref()
+                .map(|gateway| gateway.endpoint.as_str()),
+            Some("https://api.anthropic.com")
         );
+        assert_eq!(
+            driver
+                .gateway
+                .as_ref()
+                .and_then(|gateway| gateway.api_key.clone()),
+            Some(murmur_artifact::ApiKeyReference::Environment(
+                "MURMUR_NEW_API_KEY".to_string()
+            )),
+            "parsed gateway.api_key holds the placeholder until the caller injects the real key"
+        );
+        assert!(runtime_manifest.inference.is_some());
 
         unsafe {
             match &saved_mur {
@@ -627,11 +667,7 @@ mod tests {
                     format!("internal: generator meta-manifest is invalid: {e}"),
                 )
             })?;
-            if let Some(inference) = runtime_manifest.inference.as_mut() {
-                inference.api_key = Some(murmur_artifact::ApiKeyReference::Literal(
-                    inf.api_key.clone(),
-                ));
-            }
+            inject_driver_key(&mut runtime_manifest, &inf.api_key);
             Ok(runtime_manifest)
         })();
 
@@ -659,10 +695,20 @@ mod tests {
 
         let runtime_manifest =
             result.expect("generator flow should succeed with ANTHROPIC_API_KEY set");
-        let resolved_api_key = runtime_manifest.inference.and_then(|i| i.api_key);
-        assert!(
-            resolved_api_key.is_some(),
-            "resolved runtime_manifest.inference.api_key must still hold the real key in memory"
+        let driver_key = runtime_manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == "murmur-driver-anthropic")
+            .and_then(|artifact| artifact.gateway.as_ref())
+            .and_then(|gateway| gateway.api_key.clone());
+        assert_eq!(
+            driver_key,
+            Some(murmur_artifact::ApiKeyReference::Literal(fake_key(&[
+                "sk-",
+                "ant-",
+                "regression-test"
+            ]))),
+            "the driver entry's gateway.api_key must hold the real key in memory"
         );
     }
 

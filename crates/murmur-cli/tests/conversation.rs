@@ -132,9 +132,10 @@ fn create_manifest_named(
         .collect();
     let manifest = format!(
         "name: {CAPSULE_NAME}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {DRIVER_NAME}\n    \
-         version: {DRIVER_VERSION}\n    runtime: driver\n{hooks}capabilities:\n  network:\n    \
-         allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  \
-         model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n",
+         version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+         endpoint: {endpoint}\n      api_key: test-key\n{hooks}capabilities:\n  network:\n    \
+         allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  \
+         driver:\n    artifact: {DRIVER_NAME}\n",
     );
     let path = project_dir.join(file_name);
     fs::write(&path, manifest).unwrap();
@@ -934,8 +935,8 @@ fn the_record_labels_a_fenced_tool_message() {
             "capabilities:\n  shell:\n    allow:\n      - bash\n  network:\n",
         )
         .replace(
-            "    runtime: driver\n",
-            &format!("    runtime: driver\n  - name: {SKILL_NAME}\n    version: 0.1.0\n    runtime: skill\n"),
+            "      api_key: test-key\n",
+            &format!("      api_key: test-key\n  - name: {SKILL_NAME}\n    version: 0.1.0\n    runtime: skill\n"),
         );
     fs::write(&f.manifest, manifest).unwrap();
 

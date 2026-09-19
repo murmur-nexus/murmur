@@ -363,7 +363,7 @@ fn wide_credential_file_warning(path: &Path, name: &str, mode: u32) -> Option<St
     }
     let path = path.display();
     Some(format!(
-        "[capsule-runtime] warning[{W_SEC_028}]: the inference credential credentials.{name} is \
+        "[capsule-runtime] warning[{W_SEC_028}]: the credential credentials.{name} is \
          read from {path}, which is mode {:04o} and readable by other accounts on this host; run \
          `chmod 600 {path}` ({})",
         mode & 0o777,

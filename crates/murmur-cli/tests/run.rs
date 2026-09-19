@@ -490,11 +490,11 @@ fn run_filesystem_escape_attempt_fails_and_does_not_write_outside_workdir() {
 }
 
 /// Sets up a manifest-only "agent capsule" project (murmur.yaml, no capsule.wasm
-/// needed since `inference` is present) whose `inference.api_key` references an env
+/// needed since `inference` is present) whose driver's `gateway.api_key` references an env
 /// var, plus a workspace-root `.env` that sets that var. The `murmur.yaml` doubles as
-/// the workspace-root marker that `.env` auto-loading keys on. `artifacts` is the manifest's
-/// `artifacts:` block verbatim: a launch that would otherwise get past staging needs an
-/// uninstalled artifact in it, so `mur run` fails fast with E-RUN-008 rather than starting an
+/// the workspace-root marker that `.env` auto-loading keys on. `artifacts` is appended verbatim
+/// to the `artifacts:` block after the driver's entry: a launch that would otherwise get past
+/// staging needs an uninstalled artifact in it, so `mur run` fails fast with E-RUN-008 rather than starting an
 /// HTTP server and blocking forever.
 fn create_dotenv_project(project_dir: &Path, env_var: &str, artifacts: &str) -> PathBuf {
     fs::write(project_dir.join(".env"), format!("{env_var}=from-dotenv\n")).unwrap();
@@ -502,7 +502,7 @@ fn create_dotenv_project(project_dir: &Path, env_var: &str, artifacts: &str) -> 
     fs::write(
         project_dir.join("murmur.yaml"),
         format!(
-            "name: capsule\nversion: 0.0.1\nartifacts:{artifacts}\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{env_var}}}\n  driver:\n    artifact: dummy-driver\n"
+            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: dummy-driver\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${{{env_var}}}{artifacts}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: dummy-driver\n"
         ),
     )
     .unwrap();
@@ -511,13 +511,22 @@ fn create_dotenv_project(project_dir: &Path, env_var: &str, artifacts: &str) -> 
 }
 
 /// With `.env` skipped and no config entry, the credential is held nowhere, so staging refuses
-/// before anything launches. No artifacts are declared, so nothing earlier stops the run.
+/// before anything launches. The only artifact declared is the driver, and it is installed, so
+/// nothing earlier stops the run.
 #[test]
 fn run_no_env_file_skips_dotenv_and_refuses_the_unresolved_credential() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let driver = common::create_driver_artifact(
+        artifact_dir.path(),
+        "dummy-driver",
+        "0.1.0",
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver).success();
 
-    let manifest_path = create_dotenv_project(project.path(), "CI_TEST_VAR", " []");
+    let manifest_path = create_dotenv_project(project.path(), "CI_TEST_VAR", "");
 
     Command::cargo_bin("mur")
         .unwrap()
@@ -533,7 +542,7 @@ fn run_no_env_file_skips_dotenv_and_refuses_the_unresolved_credential() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("E-MAN-003"))
-        .stderr(predicate::str::contains("inference.api_key"))
+        .stderr(predicate::str::contains("gateway.api_key"))
         .stderr(predicate::str::contains("${CI_TEST_VAR}"));
 }
 

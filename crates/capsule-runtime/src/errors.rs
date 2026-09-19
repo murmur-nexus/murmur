@@ -460,32 +460,48 @@ pub enum RuntimeError {
     #[error("inference driver '{0}' is not installed in the local tool registry")]
     DriverNotInstalled(String),
 
-    /// The configured `transport: http` driver's bundled manifest has no usable `inference_auth:`
-    /// block, so the runtime cannot tell how its provider expects the key. Refused at staging,
-    /// before any component runs, whether or not `inference.api_key` is set. `reason` is `None`
-    /// when the block is absent and says what is wrong when it is malformed.
+    /// An artifact whose operator entry declares `gateway:` has a bundled manifest with no usable
+    /// `inference_auth:` block, so the runtime cannot tell how its upstream expects the key.
+    /// Refused at staging, before any component runs, whether or not `gateway.api_key` is set.
+    /// `reason` is `None` when the block is absent and says what is wrong when it is malformed.
     #[error(
-        "inference driver '{name}@{version}' declares no usable inference_auth: block{}",
+        "artifact '{name}@{version}' declares no usable inference_auth: block{}",
         .reason.as_ref().map(|reason| format!(" ({reason})")).unwrap_or_default()
     )]
-    DriverDeclaresNoInferenceAuth {
+    GatewayArtifactDeclaresNoInferenceAuth {
         name: String,
         version: String,
         reason: Option<String>,
     },
 
-    /// `inference.api_key: ${variable}` names a credential that neither the global config's
-    /// `credentials:` map nor the launching environment holds. Refused at staging, before the
-    /// session directory exists.
+    /// A `gateway:` block is declared on a `runtime: tool` entry whose artifact ships a native
+    /// implementation. A native tool's requests leave through the egress proxy and never pass the
+    /// credential gateway, so the key could never be attached. Refused at staging.
     #[error(
-        "murmur.yaml: inference.api_key references ${{{variable}}}, but neither \
-         credentials.{variable} in {} nor the environment variable {variable} is set",
+        "artifact '{name}' declares 'gateway:' but ships a native implementation, whose requests \
+         never pass the credential gateway"
+    )]
+    GatewayOnNativeArtifact { name: String },
+
+    /// An [`crate::types::ArtifactRequest`]'s gateway carries neither a credential nor the
+    /// operator's `keyless: true`. The manifest parser refuses that shape first; staging refuses
+    /// it again so no caller can build a gateway that sends keyless by omission.
+    #[error("artifact '{name}' declares gateway.endpoint '{endpoint}' but binds no credential")]
+    GatewayWithoutCredential { name: String, endpoint: String },
+
+    /// `gateway.api_key: ${variable}` on artifact `artifact` names a credential that neither the
+    /// global config's `credentials:` map nor the launching environment holds. Refused at staging,
+    /// before the session directory exists.
+    #[error(
+        "murmur.yaml: gateway.api_key on artifact '{artifact}' references ${{{variable}}}, but \
+         neither credentials.{variable} in {} nor the environment variable {variable} is set",
         .credentials_file
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "the global config".to_string())
     )]
-    InferenceCredentialNotFound {
+    GatewayCredentialNotFound {
+        artifact: String,
         variable: String,
         credentials_file: Option<std::path::PathBuf>,
     },

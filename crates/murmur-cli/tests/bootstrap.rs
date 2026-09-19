@@ -468,15 +468,16 @@ fn agent_system_prompt_includes_capsule_context() {
                 "  - name: {driver}\n",
                 "    version: {dver}\n",
                 "    runtime: driver\n",
+                "    gateway:\n",
+                "      endpoint: {endpoint}\n",
+                "      api_key: test-key\n",
                 "capabilities:\n",
                 "  network:\n",
                 "    allow:\n",
                 "      - {endpoint}\n",
                 "inference:\n",
                 "  transport: http\n",
-                "  endpoint: {endpoint}\n",
                 "  model: test-model\n",
-                "  api_key: test-key\n",
                 "  driver:\n",
                 "    artifact: {driver}\n",
                 "  system_prompt: \"{prompt}\"\n",
@@ -708,7 +709,7 @@ fn prompt_cache_key_over_long_capsule_name_completes_a_session() {
     fs::write(
         &manifest_path,
         format!(
-            "name: {capsule_name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_ANTHROPIC_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_ANTHROPIC_NAME}\n",
+            "name: {capsule_name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_ANTHROPIC_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_ANTHROPIC_NAME}\n",
             endpoint = server.endpoint
         ),
     )
@@ -751,13 +752,13 @@ fn create_agent_project(
     };
 
     artifacts_yaml.push_str(&format!(
-        "  - name: {driver_name}\n    version: {DRIVER_VERSION}\n    runtime: driver\n"
+        "  - name: {driver_name}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n"
     ));
 
     fs::write(
         project_dir.join("murmur.yaml"),
         format!(
-            "name: agent-capsule\nversion: 0.1.0\nartifacts:\n{artifacts_yaml}capabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {driver_name}\n"
+            "name: agent-capsule\nversion: 0.1.0\nartifacts:\n{artifacts_yaml}capabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {driver_name}\n"
         ),
     )
     .unwrap();

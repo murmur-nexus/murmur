@@ -1091,9 +1091,7 @@ mod tests {
     fn test_inference(command: &str, model: &str) -> InferenceConfig {
         InferenceConfig {
             transport: "process".into(),
-            endpoint: None,
             model: model.into(),
-            api_key: None,
             driver: None,
             command: Some(command.into()),
             compaction: None,

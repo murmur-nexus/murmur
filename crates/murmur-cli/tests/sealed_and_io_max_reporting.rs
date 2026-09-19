@@ -33,10 +33,11 @@ fn write_agent_project(project_dir: &Path, endpoint: &str, containment: &str) ->
         format!(
             "name: sealed-io-fixture\nversion: 0.1.0\n\
              artifacts:\n  - name: {DRIVER_ANTHROPIC_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
              capabilities:\n  containment: {containment}\n  network:\n    allow:\n      - {endpoint}\n\
              \x20 shell:\n    allow:\n      - echo\n\
-             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-             api_key: test-key\n  driver:\n    artifact: {DRIVER_ANTHROPIC_NAME}\n"
+             inference:\n  transport: http\n  model: test-model\n  \
+             driver:\n    artifact: {DRIVER_ANTHROPIC_NAME}\n"
         ),
     )
     .unwrap();

@@ -316,9 +316,9 @@ delegation, so spawning the same capsule twice yields two directories rather tha
 
 **The parent retains write access to a running child's directory.** That is deliberate: the parent
 creates the directory and places the child's inputs in it before launch, and the directory sits
-beneath the parent's own accessible workdir, which is a single preopen the WASI layer cannot carve
-a hole in. It is convenient — it is how a parent streams inputs to a child that is already running
-— and it is a channel the spawn envelope does not cover. A child cannot reach out of its own
+beneath the parent's own accessible workdir, which the parent is granted as one directory with no
+subtree excluded. It is convenient — it is how a parent streams inputs to a child that is already
+running — and it is a channel the spawn envelope does not cover. A child cannot reach out of its own
 directory, so nothing flows the other way, but a parent can write into a running child's workspace
 without any grant saying so.
 
@@ -342,13 +342,8 @@ The four names above are the runtime's, and a child that lists one of them under
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself
 does not hold is absent from the child even where both manifests declare it, and a child whose
-`inference.api_key` references it fails at manifest load with
+`gateway.api_key` references it fails at manifest load with
 [`E-MAN-003`](diagnostics.md#index).
-
-The daemon resolves a child manifest's `${VARIABLE}` references against its own process
-environment when it referees a spawn. Start `mur-roost` in an environment holding every variable
-the capsules it referees reference: a reference the daemon cannot resolve fails the spawn, for a
-manifest the child itself would have loaded.
 
 ---
 
@@ -471,8 +466,8 @@ cannot be read refuses to launch with [`E-RUN-020`](diagnostics.md#e-run-020).
 ### What the completion carries
 
 The delegation's identity, the outcome and where the result is — never the child's output. The
-result stays in the child's own directory, which is inside the parent's single preopen, so a parent
-that wants it reads the file deliberately through an ordinary tool call.
+result stays in the child's own directory, which is inside the parent's accessible workdir, so a
+parent that wants it reads the file deliberately through an ordinary tool call.
 
 | Field | Meaning |
 |---|---|
@@ -824,7 +819,7 @@ daemon is made by the capsule's runtime, which holds them; `MURMUR_SESSION_ID` a
 on its own.
 
 The daemon's own environment needs no provider credential. It reads a capsule's manifest for the
-capability policy and declared state stores alone, leaving `inference.api_key` unresolved, so a
+capability policy and declared state stores alone, leaving every `gateway.api_key` unresolved, so a
 registry of capsules referencing `${OPENAI_API_KEY}`, `${ANTHROPIC_API_KEY}` or any other variable
 resolves, registers and spawns in a daemon started with an empty environment. The provider key is
-read where the inference turn happens: in the capsule's own process, by `mur run`.
+read where the keyed request happens: in the capsule's own process, by `mur run`.

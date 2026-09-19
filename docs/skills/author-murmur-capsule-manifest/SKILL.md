@@ -77,7 +77,9 @@ Never place credentials, tokens, passwords, or API keys literally in `murmur.yam
 Use environment references such as:
 
 ```yaml
-api_key: ${PROVIDER_API_KEY}
+gateway:
+  endpoint: https://<provider-host>
+  api_key: ${PROVIDER_API_KEY}
 ```
 
 A manifest is plaintext that will be committed, diffed, shared, logged, and pasted into incidents. A literal secret in it is already a disclosure.
@@ -252,28 +254,26 @@ artifacts:
   - name: <driver-artifact>
     version: "<pinned-version>"
     runtime: driver
-
-capabilities:
-  network:
-    allow:
-      - https://<provider-host>
+    gateway:
+      endpoint: https://<provider-host>
+      api_key: ${PROVIDER_API_KEY}
 
 inference:
-  endpoint: https://<provider-host>
   model: <model-id>
-  api_key: ${PROVIDER_API_KEY}
   driver:
     artifact: <driver-artifact>
 ```
 
 Rules:
 
-- remote endpoints must use `https://`; `http://` is only valid for loopback hosts;
-- the driver artifact named under `inference.driver.artifact` must also appear in `artifacts:` as `runtime: driver`;
-- add only the provider/network destinations actually required;
+- the provider's URL and key go in `gateway:` on the driver's own `artifacts:` entry; `inference.endpoint` and `inference.api_key` are refused with `E-MAN-003`;
+- the driver artifact named under `inference.driver.artifact` must also appear in `artifacts:` as `runtime: driver`, and its entry must carry `gateway:`;
+- `gateway.endpoint` must use `https://`; `http://` is only valid for loopback hosts, and userinfo (`user@`), `${`, a query or a fragment are refused;
+- never list the provider host in `network.allow`: the gateway does not use that entry, and it gives every tool and shell subprocess direct, unkeyed reach to the provider (`W-SEC-025`);
+- a provider that takes no key, such as a local model server, is declared with `keyless: true` in place of `api_key`; a `gateway:` with neither is refused with `E-CAP-018`, whatever its address;
 - use `inference.driver.config` for settings that make sense for the driver role generally;
-- use the driver's own artifact `config:` for implementation-specific settings;
-- if no secret is required, omit `api_key`.
+- use the driver's own artifact `config:` for implementation-specific settings, never for a key;
+- a WASM tool or hook that calls a third-party API takes its key the same way, through `gateway:` on its own entry; those gateways are not metered by the spend ceilings, which `W-SEC-030` reports at launch.
 
 #### Process inference
 
@@ -286,7 +286,7 @@ inference:
   model: <optional-model-id>
 ```
 
-Do not add `endpoint`, `driver`, or `api_key` under `transport: process`.
+Do not add `inference.driver` under `transport: process`, and do not give any `runtime: driver` entry a `gateway:`; both are refused with `E-MAN-003`.
 
 Treat process inference as a deliberate host-process boundary. Keep the rest of the capsule's shell, filesystem, environment, and resource posture narrow.
 
@@ -350,7 +350,7 @@ Both require the binary to already be in `shell.allow`. They are mutually exclus
 
 #### Environment
 
-`capabilities.env.allow` exposes selected **non-secret** host environment values to WASM guests. Do not use it as a secret-delivery mechanism; credential-shaped variables are intentionally filtered.
+`capabilities.env.allow` exposes selected **non-secret** host environment values to WASM components. Do not use it as a secret-delivery mechanism; credential-shaped variables are intentionally filtered.
 
 #### Resource bounds
 

@@ -565,6 +565,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -584,6 +585,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         source: None,
                         on_overflow: artifact.on_overflow,
                         config: artifact.config.clone(),
+                        gateway: artifact.gateway.clone(),
                         capabilities: artifact.capabilities.clone(),
                     });
                     // This host's hash, never another platform's — the same selection

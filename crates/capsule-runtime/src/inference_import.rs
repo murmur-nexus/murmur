@@ -94,8 +94,8 @@ pub(crate) struct HookInferenceCtx {
     /// grant the agent loop's own turns do, rather than an unnarrowed copy of the ceiling.
     pub(crate) driver_grant: Option<ToolCapabilityGrant>,
     /// The session's inference gateway, so a hook's `run-inference` reaches the provider exactly
-    /// as the agent loop's own turns do.
-    pub(crate) inference_gateway: Option<Arc<crate::inference_gateway::InferenceGateway>>,
+    /// as the agent loop's own turns do. Never another artifact's gateway.
+    pub(crate) gateway: Option<Arc<crate::credential_gateway::CredentialGateway>>,
     /// The session's spend account — the same one the agent loop admits its turns against — so a
     /// hook's completion counts toward, and is refused by, the same ceilings.
     pub(crate) spend: Arc<SpendMeter>,
@@ -216,7 +216,7 @@ impl HookInferenceCtx {
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
                 artifact_grant: self.driver_grant.as_ref(),
-                inference_gateway: self.inference_gateway.as_ref(),
+                gateway: self.gateway.as_ref(),
             },
             // A hook's completion is not part of the user-facing turn: it must
             // not stream chunks into the SSE stream or ask the user for input.
@@ -264,7 +264,7 @@ impl HookInferenceCtx {
     /// written to `out/result.txt` in place of the driver's error, or `None` when there is none.
     fn credential_failure(&self) -> Option<String> {
         let message = self
-            .inference_gateway
+            .gateway
             .as_ref()
             .and_then(|gateway| gateway.credential())
             .and_then(|credential| credential.report_rejection())?;
@@ -491,7 +491,7 @@ mod tests {
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,
-            inference_gateway: None,
+            gateway: None,
             spend,
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),

@@ -1,7 +1,7 @@
-//! The inference credential: the value the gateway attaches to each `transport: http` driver
-//! request, and where it comes from.
+//! A gateway credential: the value an artifact's credential gateway attaches to each of that
+//! artifact's keyed requests, and where it comes from.
 //!
-//! A `${NAME}` in `inference.api_key` is looked up at staging, first in the global config's
+//! A `${NAME}` in an artifact entry's `gateway.api_key` is looked up at staging, first in the global config's
 //! `credentials:` map and then in the launching environment. A value from the config stays
 //! re-readable for the whole session: every keyed request reads `credentials.NAME` from the file
 //! and compares it with the value last read, so a key replaced by `mur config set -g` or by any
@@ -31,20 +31,20 @@ use crate::{errors::RuntimeError, trace::ResourceTraceAppender};
 /// The diagnostic code a session fails with when the provider keeps rejecting its credential.
 pub(crate) const E_RUN_027: &str = "E-RUN-027";
 
-/// Where a session's inference credential comes from. Carries names and paths, never a value.
+/// Where a gateway credential comes from. Carries names and paths, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
     /// `credentials.<name>` in the global config file at `path`. Read before every keyed request.
     Config { path: PathBuf, name: String },
     /// The launching environment's variable `name`. Read once at launch.
     Environment { name: String },
-    /// A literal `inference.api_key` in the manifest. Read once at launch.
+    /// A literal `gateway.api_key` in the manifest. Read once at launch.
     ManifestLiteral,
 }
 
 impl CredentialSource {
-    /// Names the source for an operator, without the value.
-    pub fn label(&self) -> String {
+    /// Names the source of `artifact`'s credential for an operator, without the value.
+    pub fn label(&self, artifact: &str) -> String {
         match self {
             Self::Config { path, name } => {
                 format!("credentials.{name} in {}", path.display())
@@ -52,13 +52,15 @@ impl CredentialSource {
             Self::Environment { name } => {
                 format!("from the environment variable {name}, which is read once at launch")
             }
-            Self::ManifestLiteral => "written literally as inference.api_key in murmur.yaml, \
-                                      which is read once at launch"
-                .to_string(),
+            Self::ManifestLiteral => format!(
+                "written literally as gateway.api_key on artifact '{artifact}' in murmur.yaml, \
+                 which is read once at launch"
+            ),
         }
     }
 
-    /// The value of `session_start.credential_source` and `inference_credential.source`.
+    /// The value of `session_start.credential_source`, `session_start.gateways[].credential_source`
+    /// and the `source` of an `inference_credential` or `gateway_credential` event.
     pub fn trace_name(&self) -> &'static str {
         match self {
             Self::Config { .. } => "config",
@@ -84,7 +86,7 @@ pub(crate) struct CredentialRejection {
     pub(crate) retried: bool,
 }
 
-/// What an `inference_credential` trace event records.
+/// What an `inference_credential` or `gateway_credential` trace event records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CredentialChange {
     /// A re-read found a different value. `trigger` is `"file_changed"` or `"rejection"`.
@@ -183,43 +185,60 @@ struct CredentialState {
     pending_rejection: Option<CredentialRejection>,
 }
 
-/// One session's inference credential, shared by the gateway and the code that reports a
-/// rejection.
-pub(crate) struct InferenceCredential {
+/// Which trace event a credential's changes are written as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialEvent {
+    /// `inference_credential`: the configured inference driver's credential.
+    Inference,
+    /// `gateway_credential`: any other artifact's, carrying the artifact's name.
+    Gateway,
+}
+
+/// One artifact's credential for one session, shared by its gateway and, for the inference
+/// driver, the code that reports a rejection.
+pub(crate) struct GatewayCredential {
+    /// The artifact whose `gateway.api_key` this is.
+    artifact: String,
     source: CredentialSource,
     state: Mutex<CredentialState>,
-    /// The session trace's `O_APPEND` handle, set once the trace is open. Events are written only
-    /// when it is set.
-    trace: OnceLock<Arc<ResourceTraceAppender>>,
+    /// The session trace's `O_APPEND` handle and the event changes are written as, set once the
+    /// trace is open. Events are written only when it is set.
+    trace: OnceLock<(Arc<ResourceTraceAppender>, CredentialEvent)>,
     #[cfg(test)]
     reads: std::sync::atomic::AtomicUsize,
 }
 
-impl std::fmt::Debug for InferenceCredential {
+impl std::fmt::Debug for GatewayCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InferenceCredential")
+        f.debug_struct("GatewayCredential")
+            .field("artifact", &self.artifact)
             .field("source", &self.source)
             .field("value", &"<redacted>")
             .finish()
     }
 }
 
-impl InferenceCredential {
-    /// Resolves `reference` in precedence order: a non-empty `credentials.<NAME>` in
+impl GatewayCredential {
+    /// Resolves `artifact`'s `reference` in precedence order: a non-empty `credentials.<NAME>` in
     /// `credentials_file`, then a non-empty environment variable `NAME`. A literal is used as is.
     ///
-    /// Refuses with [`RuntimeError::InferenceCredentialNotFound`] when neither place holds a
+    /// Refuses with [`RuntimeError::GatewayCredentialNotFound`] when neither place holds a
     /// `${NAME}`.
     ///
     /// A value found in `credentials_file` prints `W-SEC-028` when the handle it was read through
     /// reports a mode granting any group or other bit. Re-reads during the session never do.
     pub(crate) fn resolve(
+        artifact: &str,
         reference: &ApiKeyReference,
         credentials_file: Option<&Path>,
     ) -> Result<Self, RuntimeError> {
         let name = match reference {
             ApiKeyReference::Literal(value) => {
-                return Ok(Self::new(CredentialSource::ManifestLiteral, value.clone()))
+                return Ok(Self::new(
+                    artifact,
+                    CredentialSource::ManifestLiteral,
+                    value.clone(),
+                ))
             }
             ApiKeyReference::Environment(name) => name,
         };
@@ -230,6 +249,7 @@ impl InferenceCredential {
                     crate::murmur_home::warn_on_wide_credential_file(path, name, mode);
                 }
                 let credential = Self::new(
+                    artifact,
                     CredentialSource::Config {
                         path: path.to_path_buf(),
                         name: name.clone(),
@@ -242,18 +262,21 @@ impl InferenceCredential {
         }
         match std::env::var(name) {
             Ok(value) if !value.is_empty() => Ok(Self::new(
+                artifact,
                 CredentialSource::Environment { name: name.clone() },
                 value,
             )),
-            _ => Err(RuntimeError::InferenceCredentialNotFound {
+            _ => Err(RuntimeError::GatewayCredentialNotFound {
+                artifact: artifact.to_string(),
                 variable: name.clone(),
                 credentials_file: credentials_file.map(Path::to_path_buf),
             }),
         }
     }
 
-    fn new(source: CredentialSource, value: String) -> Self {
+    fn new(artifact: &str, source: CredentialSource, value: String) -> Self {
         Self {
+            artifact: artifact.to_string(),
             source,
             state: Mutex::new(CredentialState {
                 value,
@@ -270,9 +293,15 @@ impl InferenceCredential {
         &self.source
     }
 
-    /// Hands the credential the session trace's appender. A second call is ignored.
-    pub(crate) fn attach_trace(&self, trace: Arc<ResourceTraceAppender>) {
-        let _ = self.trace.set(trace);
+    /// The source named for an operator, without the value.
+    pub(crate) fn label(&self) -> String {
+        self.source.label(&self.artifact)
+    }
+
+    /// Hands the credential the session trace's appender and the event its changes are written
+    /// as. A second call is ignored.
+    pub(crate) fn attach_trace(&self, trace: Arc<ResourceTraceAppender>, event: CredentialEvent) {
+        let _ = self.trace.set((trace, event));
     }
 
     /// The value to attach to the next request. For a config source, reads `credentials.NAME` from
@@ -294,9 +323,10 @@ impl InferenceCredential {
         if let Some(change) = change {
             if let CredentialChange::Unreadable { reason } = change {
                 crate::runtime_err!(
-                    "[capsule-runtime] warning: the inference credential {} could not be read \
-                     ({reason}); the value read before stays in use",
-                    self.source.label()
+                    "[capsule-runtime] warning: the gateway credential of artifact '{}' {} could \
+                     not be read ({reason}); the value read before stays in use",
+                    self.artifact,
+                    self.label()
                 );
             }
             self.write_event(change).await;
@@ -372,7 +402,7 @@ impl InferenceCredential {
     pub(crate) fn rejection_message(&self, rejection: CredentialRejection) -> String {
         let mut message = format!(
             "the provider rejected the inference credential {} (HTTP {})",
-            self.source.label(),
+            self.label(),
             rejection.status
         );
         if rejection.retried {
@@ -412,14 +442,21 @@ impl InferenceCredential {
     }
 
     async fn write_event(&self, change: CredentialChange) {
-        if let Some(trace) = self.trace.get() {
-            trace
-                .write_inference_credential(
-                    self.source.trace_name(),
-                    self.source.credential_name(),
-                    change,
-                )
-                .await;
+        let Some((trace, event)) = self.trace.get() else {
+            return;
+        };
+        let (source, credential) = (self.source.trace_name(), self.source.credential_name());
+        match event {
+            CredentialEvent::Inference => {
+                trace
+                    .write_inference_credential(source, credential, change)
+                    .await
+            }
+            CredentialEvent::Gateway => {
+                trace
+                    .write_gateway_credential(&self.artifact, source, credential, change)
+                    .await
+            }
         }
     }
 
@@ -455,10 +492,11 @@ mod tests {
         fs::rename(tmp, path).unwrap();
     }
 
-    fn config_credential(dir: &tempfile::TempDir) -> (PathBuf, InferenceCredential) {
+    fn config_credential(dir: &tempfile::TempDir) -> (PathBuf, GatewayCredential) {
         let path = dir.path().join("config.yaml");
         write_config(&path, OLD);
-        let credential = InferenceCredential::resolve(
+        let credential = GatewayCredential::resolve(
+            "driver",
             &ApiKeyReference::Environment(NAME.to_string()),
             Some(&path),
         )
@@ -466,7 +504,7 @@ mod tests {
         (path, credential)
     }
 
-    fn reads(credential: &InferenceCredential) -> usize {
+    fn reads(credential: &GatewayCredential) -> usize {
         credential.reads.load(Ordering::SeqCst)
     }
 
@@ -488,7 +526,7 @@ mod tests {
     /// Any metadata check that skips the read makes this fail: on kernels with multigrain
     /// timestamps a test cannot write a stamp-identical edit, so the read count stands in for it.
     #[tokio::test]
-    async fn inference_credential_every_call_reads_the_file() {
+    async fn gateway_credential_every_call_reads_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let (_, credential) = config_credential(&dir);
         assert_eq!(credential.source().trace_name(), "config");
@@ -501,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_rename_replace_is_seen_on_the_next_call() {
+    async fn gateway_credential_rename_replace_is_seen_on_the_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         assert_eq!(credential.current().await, OLD);
@@ -512,7 +550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_in_place_write_of_a_different_size_is_seen_on_the_next_call() {
+    async fn gateway_credential_in_place_write_of_a_different_size_is_seen_on_the_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         write_config(&path, &format!("{NEW}-longer"));
@@ -521,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_same_size_in_place_edit_is_seen_on_the_next_call() {
+    async fn gateway_credential_same_size_in_place_edit_is_seen_on_the_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         assert_eq!(OLD.len(), NEW.len());
@@ -538,7 +576,7 @@ mod tests {
 
     /// An editor that truncates and then writes can be read between the two.
     #[tokio::test]
-    async fn inference_credential_torn_read_keeps_the_last_good_value_then_rotates() {
+    async fn gateway_credential_torn_read_keeps_the_last_good_value_then_rotates() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         fs::OpenOptions::new()
@@ -572,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_read_cost() {
+    async fn gateway_credential_read_cost() {
         const CALLS: u32 = 10_000;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -587,7 +625,8 @@ mod tests {
         }
         assert!(text.len() >= 2048, "{}", text.len());
         fs::write(&path, text).unwrap();
-        let credential = InferenceCredential::resolve(
+        let credential = GatewayCredential::resolve(
+            "driver",
             &ApiKeyReference::Environment(NAME.to_string()),
             Some(&path),
         )
@@ -607,10 +646,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_unreadable_source_keeps_the_last_good_value() {
+    async fn gateway_credential_unreadable_source_keeps_the_last_good_value() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
-        let unreadable = |credential: &InferenceCredential, after_rejection| {
+        let unreadable = |credential: &GatewayCredential, after_rejection| {
             credential.refresh_locked(after_rejection).1
         };
 
@@ -680,14 +719,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_environment_and_literal_sources_never_touch_the_filesystem() {
+    async fn gateway_credential_environment_and_literal_sources_never_touch_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         write_config(&path, OLD);
         let variable = "UNIT_CREDENTIAL_ENVIRONMENT_ONLY_KEY";
         // The variable name is unique to this test, so no other test reads or writes it.
         std::env::set_var(variable, NEW);
-        let environment = InferenceCredential::resolve(
+        let environment = GatewayCredential::resolve(
+            "driver",
             &ApiKeyReference::Environment(variable.to_string()),
             Some(&path),
         )
@@ -700,9 +740,12 @@ mod tests {
             }
         );
 
-        let literal =
-            InferenceCredential::resolve(&ApiKeyReference::Literal(OLD.to_string()), Some(&path))
-                .unwrap();
+        let literal = GatewayCredential::resolve(
+            "driver",
+            &ApiKeyReference::Literal(OLD.to_string()),
+            Some(&path),
+        )
+        .unwrap();
         assert_eq!(literal.source(), &CredentialSource::ManifestLiteral);
 
         fs::remove_file(&path).unwrap();
@@ -714,13 +757,14 @@ mod tests {
     }
 
     #[test]
-    fn inference_credential_config_wins_over_the_environment_and_absence_refuses() {
+    fn gateway_credential_config_wins_over_the_environment_and_absence_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         write_config(&path, OLD);
         // `NAME` is set by this test alone.
         std::env::set_var(NAME, NEW);
-        let credential = InferenceCredential::resolve(
+        let credential = GatewayCredential::resolve(
+            "driver",
             &ApiKeyReference::Environment(NAME.to_string()),
             Some(&path),
         );
@@ -734,7 +778,8 @@ mod tests {
         );
 
         let missing = "UNIT_CREDENTIAL_NOWHERE_KEY";
-        let err = InferenceCredential::resolve(
+        let err = GatewayCredential::resolve(
+            "driver",
             &ApiKeyReference::Environment(missing.to_string()),
             Some(&path),
         )
@@ -749,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_rejection_is_taken_once_and_names_the_source() {
+    async fn gateway_credential_rejection_is_taken_once_and_names_the_source() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         assert_eq!(credential.take_rejection(), None);
@@ -777,13 +822,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_debug_and_labels_carry_no_value() {
+    async fn gateway_credential_debug_and_labels_carry_no_value() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         replace_config(&path, NEW);
         credential.current().await;
         let literal =
-            InferenceCredential::resolve(&ApiKeyReference::Literal(OLD.to_string()), None).unwrap();
+            GatewayCredential::resolve("driver", &ApiKeyReference::Literal(OLD.to_string()), None)
+                .unwrap();
         for credential in [&credential, &literal] {
             let rejection = CredentialRejection {
                 status: 401,
@@ -791,12 +837,39 @@ mod tests {
             };
             for text in [
                 format!("{credential:?}"),
-                credential.source().label(),
+                credential.label(),
                 credential.rejection_message(rejection),
                 credential.rejection_hint(),
             ] {
                 assert!(!text.contains(OLD) && !text.contains(NEW), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn gateway_credential_labels_name_the_artifact_and_field() {
+        let literal = GatewayCredential::resolve(
+            "web-search",
+            &ApiKeyReference::Literal(OLD.to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            literal.label(),
+            "written literally as gateway.api_key on artifact 'web-search' in murmur.yaml, which \
+             is read once at launch"
+        );
+        let missing = GatewayCredential::resolve(
+            "web-search",
+            &ApiKeyReference::Environment("UNIT_GATEWAY_NOWHERE_KEY".to_string()),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.contains("gateway.api_key on artifact 'web-search'"),
+            "{missing}"
+        );
+        assert!(missing.contains("${UNIT_GATEWAY_NOWHERE_KEY}"), "{missing}");
     }
 }

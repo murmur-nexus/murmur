@@ -98,12 +98,13 @@ fn write_project_with(
 
     let manifest = format!(
         "name: plan-capsule\nversion: 0.1.0\nartifacts:\n  \
-         - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n  \
+         - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+         \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n  \
          - name: {SKILL}\n    source: ./skills/{SKILL}/skill.md\n    runtime: skill\n\
          capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
          {plan_block}{shell_block}{filesystem_block}\
-         inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-         api_key: test-key\n  driver:\n    artifact: {DRIVER}\n"
+         inference:\n  transport: http\n  model: test-model\n  \
+         driver:\n    artifact: {DRIVER}\n"
     );
     let manifest_path = project.join("murmur.yaml");
     fs::write(&manifest_path, manifest).unwrap();

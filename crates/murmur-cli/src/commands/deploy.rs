@@ -407,7 +407,7 @@ fn collect_deploy_artifacts(manifest: &RuntimeManifest) -> Vec<(String, String)>
 /// Fields NOT checked (not local file paths):
 ///   - `inference.system_prompt` — inline string content
 ///   - `inference.compaction.system_prompt` — inline string content
-///   - `inference.api_key` — literal value or `${ENV_VAR}` reference
+///   - `artifacts[].gateway.api_key` — literal value or `${ENV_VAR}` reference
 ///   - `inference.driver.config` — inline JSON object
 ///   - `observability.otel_endpoint` — HTTP endpoint URL
 ///   - All other fields — scalars, version strings, or nested configs
@@ -1765,8 +1765,10 @@ mod tests {
         let instructions = dir.path().join("instructions.md");
         fs::write(&instructions, "You are an assistant.").unwrap();
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
-             inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+             version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+             endpoint: http://localhost:8080\n      keyless: true\n\
+             inference:\n  model: test\n  \
              system_prompt_file: instructions.md\n  \
              driver:\n    artifact: murmur-driver-anthropic\n"
             .to_string();
@@ -1784,8 +1786,10 @@ mod tests {
         let dir = tempdir().unwrap();
         // Do NOT create instructions.md
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
-                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+                    version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+                    endpoint: http://localhost:8080\n      keyless: true\n\
+                    inference:\n  model: test\n  \
                     system_prompt_file: instructions.md\n  \
                     driver:\n    artifact: murmur-driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
@@ -1804,8 +1808,10 @@ mod tests {
         let instructions = dir.path().join("compaction-instructions.md");
         fs::write(&instructions, "Summarize aggressively.").unwrap();
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
-                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+                    version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+                    endpoint: http://localhost:8080\n      keyless: true\n\
+                    inference:\n  model: test\n  \
                     compaction:\n    system_prompt_file: compaction-instructions.md\n  \
                     driver:\n    artifact: murmur-driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
@@ -1822,8 +1828,10 @@ mod tests {
         let dir = tempdir().unwrap();
         // Do NOT create compaction-instructions.md
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
-                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+                    version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+                    endpoint: http://localhost:8080\n      keyless: true\n\
+                    inference:\n  model: test\n  \
                     compaction:\n    system_prompt_file: compaction-instructions.md\n  \
                     driver:\n    artifact: murmur-driver-anthropic\n";
         let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
@@ -1846,8 +1854,10 @@ mod tests {
         fs::write(dir.path().join("instructions.md"), "You are an assistant.").unwrap();
         fs::write(dir.path().join("compaction.md"), "Summarize.").unwrap();
 
-        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
-                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+                    version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+                    endpoint: http://localhost:8080\n      keyless: true\n\
+                    inference:\n  model: test\n  \
                     system_prompt_file: instructions.md\n  \
                     compaction:\n    system_prompt_file: compaction.md\n  \
                     driver:\n    artifact: murmur-driver-anthropic\n";

@@ -127,9 +127,7 @@ fn write_capsule_manifest(project_dir: &Path) -> RuntimeManifest {
 fn stub_inference() -> Option<InferenceConfig> {
     Some(InferenceConfig {
         transport: "http".to_string(),
-        endpoint: Some("http://localhost:9999".to_string()),
         model: "test-model".to_string(),
-        api_key: None,
         driver: Some(InferenceDriver {
             artifact: "dummy-driver".to_string(),
             config: None,
@@ -156,6 +154,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         })
         .collect();

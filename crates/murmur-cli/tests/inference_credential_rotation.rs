@@ -11,7 +11,7 @@ mod common;
 use std::{
     collections::HashSet,
     fs,
-    io::{Read, Write},
+    io::Write,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -153,50 +153,15 @@ impl Upstream {
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok()?;
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let head_end = loop {
-        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            return None;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-    };
-    let arrived = Instant::now();
-    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
-    let headers: Vec<(String, String)> = head
-        .split("\r\n")
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
-        .collect();
-    let length = headers
-        .iter()
-        .find(|(n, _)| n == "content-length")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = buffer[head_end + 4..].to_vec();
-    while body.len() < length {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..read]);
-    }
+    let request = common::recording_upstream::read_request(stream)?;
     Some(Recorded {
-        keys: headers
+        keys: request
+            .header_values("x-api-key")
             .into_iter()
-            .filter(|(n, _)| n == "x-api-key")
-            .map(|(_, v)| v)
+            .map(str::to_string)
             .collect(),
-        body,
-        arrived,
+        body: request.body,
+        arrived: request.arrived,
     })
 }
 
@@ -240,9 +205,9 @@ impl Capsule {
             &manifest,
             format!(
                 "name: rotation-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    \
-                 version: {VERSION}\n    runtime: driver\n  - name: {SKILL}\n    version: \
-                 {VERSION}\n    runtime: skill\n{extra}inference:\n  transport: http\n  \
-                 endpoint: {}\n  model: test-model\n  api_key: {api_key}\n  driver:\n    \
+                 version: {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {}\n      \
+                 api_key: {api_key}\n  - name: {SKILL}\n    version: {VERSION}\n    runtime: \
+                 skill\n{extra}inference:\n  transport: http\n  model: test-model\n  driver:\n    \
                  artifact: {DRIVER}\n",
                 upstream.endpoint
             ),
@@ -732,6 +697,11 @@ fn launch_only_credential_warns() {
             assert!(lines[0].contains(W_SEC_027_LINK), "{}", lines[0]);
             assert!(lines[0].contains(names), "{}", lines[0]);
             assert!(
+                lines[0].contains(&format!("artifact '{DRIVER}' gateway.api_key")),
+                "{}",
+                lines[0]
+            );
+            assert!(
                 lines[0].contains("cannot pick up a rotated key until it is restarted"),
                 "{}",
                 lines[0]
@@ -766,7 +736,7 @@ fn launch_only_credential_warns() {
     }
 }
 
-/// S9 through the binary: `mur config set -g credentials.NAME` confirms without the value, and
+/// Through the binary: `mur config set -g credentials.NAME` confirms without the value, and
 /// setting the `inference.api_key` scalar prints the note pointing at `credentials.<NAME>`.
 #[test]
 fn config_set_confirms_the_credential_without_its_value() {

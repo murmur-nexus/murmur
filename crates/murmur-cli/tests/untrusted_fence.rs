@@ -135,7 +135,7 @@ fn write_manifest(
     };
 
     let manifest = format!(
-        "name: fence-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n{tool_entries}capabilities:\n  network:\n    allow:\n      - {endpoint}\n{shell_section}inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+        "name: fence-capsule\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n{tool_entries}capabilities:\n  network:\n    allow:\n      - {endpoint}\n{shell_section}inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
     );
     let manifest_path = project_dir.join("murmur.yaml");
     fs::write(&manifest_path, manifest).unwrap();

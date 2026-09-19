@@ -128,10 +128,11 @@ fn start_capsule(server: &common::ScriptedServer, name: &str) -> Capsule {
         format!(
             "name: {name}\nversion: 0.1.0\n\
              artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
              capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
              lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 8\n\
-             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-             api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+             inference:\n  transport: http\n  model: test-model\n  \
+             driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();

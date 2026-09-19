@@ -63,7 +63,7 @@ fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
     fs::write(
         project.path().join("murmur.yaml"),
         format!(
-            "name: json-launch-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+            "name: json-launch-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -92,6 +92,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

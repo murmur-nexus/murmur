@@ -19,6 +19,9 @@ artifacts:
   - name: murmur-driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
 
 capabilities:
   shell:
@@ -27,9 +30,7 @@ capabilities:
 
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: {{ v.model_anthropic }}
-  api_key: ${ANTHROPIC_API_KEY}
   driver:
     artifact: murmur-driver-anthropic
 ```

@@ -115,11 +115,10 @@ fn agent_project(endpoint: &str, name: &str, env_allow: &[&str]) -> TempDir {
         project.path().join("murmur.yaml"),
         format!(
             "name: {name}\nversion: 0.1.0\n\
-             artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      api_key: ${{{API_KEY_ENV}}}\n\
              capabilities:\n  network:\n    allow:\n      - {endpoint}\n{env_block}\
              lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 8\n\
-             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-             api_key: ${{{API_KEY_ENV}}}\n  driver:\n    artifact: {DRIVER_NAME}\n"
+             inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -1100,6 +1099,7 @@ fn stage_in_process(
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

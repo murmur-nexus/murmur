@@ -257,23 +257,21 @@ artifacts:
   - name: murmur-driver-anthropic
     version: "1.0.0"
     runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
   - name: fdprobe-native
     version: "0.1.0"
     runtime: tool
 
 capabilities:
-  network:
-    allow:
-      - https://api.anthropic.com
   shell:
     allow:
       - fdprobe
 
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-sonnet-5
-  api_key: ${ANTHROPIC_API_KEY}
   driver:
     artifact: murmur-driver-anthropic
   max_turns: 6

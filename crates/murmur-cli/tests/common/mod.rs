@@ -2,6 +2,7 @@
 
 pub mod hook_wat;
 pub mod idle_capsule;
+pub mod recording_upstream;
 
 use std::{
     collections::HashSet,
@@ -319,6 +320,7 @@ fn stage_agent_session_inner(
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

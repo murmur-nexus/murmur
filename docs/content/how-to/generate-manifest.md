@@ -159,6 +159,9 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.anthropic.com
+          api_key: ${ANTHROPIC_API_KEY}
       - name: murmur-tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
@@ -168,9 +171,7 @@ The generator picks one of two shapes based on the task description.
       after_task: exit
 
     inference:
-      endpoint: https://api.anthropic.com
       model: {{ v.model_anthropic }}
-      api_key: ${ANTHROPIC_API_KEY}
       driver:
         artifact: murmur-driver-anthropic
     ```
@@ -185,6 +186,9 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.openai.com
+          api_key: ${OPENAI_API_KEY}
       - name: murmur-tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
@@ -194,9 +198,7 @@ The generator picks one of two shapes based on the task description.
       after_task: exit
 
     inference:
-      endpoint: https://api.openai.com
       model: {{ v.model_openai }}
-      api_key: ${OPENAI_API_KEY}
       driver:
         artifact: murmur-driver-openai
     ```
@@ -211,6 +213,9 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.deepseek.com
+          api_key: ${DEEPSEEK_API_KEY}
       - name: murmur-tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
@@ -220,9 +225,7 @@ The generator picks one of two shapes based on the task description.
       after_task: exit
 
     inference:
-      endpoint: https://api.deepseek.com
       model: {{ v.model_deepseek }}
-      api_key: ${DEEPSEEK_API_KEY}
       driver:
         artifact: murmur-driver-deepseek
     ```
@@ -240,6 +243,9 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.anthropic.com
+          api_key: ${ANTHROPIC_API_KEY}
 
     capabilities:
       spawn:
@@ -251,9 +257,7 @@ The generator picks one of two shapes based on the task description.
       after_task: exit
 
     inference:
-      endpoint: https://api.anthropic.com
       model: {{ v.model_anthropic }}
-      api_key: ${ANTHROPIC_API_KEY}
       driver:
         artifact: murmur-driver-anthropic
     ```
@@ -268,6 +272,9 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.openai.com
+          api_key: ${OPENAI_API_KEY}
 
     capabilities:
       spawn:
@@ -279,9 +286,7 @@ The generator picks one of two shapes based on the task description.
       after_task: exit
 
     inference:
-      endpoint: https://api.openai.com
       model: {{ v.model_openai }}
-      api_key: ${OPENAI_API_KEY}
       driver:
         artifact: murmur-driver-openai
     ```
@@ -296,6 +301,9 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.deepseek.com
+          api_key: ${DEEPSEEK_API_KEY}
 
     capabilities:
       spawn:
@@ -307,9 +315,7 @@ The generator picks one of two shapes based on the task description.
       after_task: exit
 
     inference:
-      endpoint: https://api.deepseek.com
       model: {{ v.model_deepseek }}
-      api_key: ${DEEPSEEK_API_KEY}
       driver:
         artifact: murmur-driver-deepseek
     ```

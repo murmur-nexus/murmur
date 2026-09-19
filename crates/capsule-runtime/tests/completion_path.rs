@@ -92,14 +92,15 @@ fn suite() -> &'static Suite {
             "0.1.0",
             &format!(
                 "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    \
-                 runtime: driver\ncapabilities:\n  \
+                 runtime: driver\n    gateway:\n      endpoint: {url}\n      \
+                 api_key: test-key\ncapabilities:\n  \
                  network:\n    allow: [{endpoint}]\n  \
                  env:\n    allow: [{MARKER_VAR}]\n  \
                  spawn:\n    allow: [worker, waiting-worker, slow-worker]\n\
                  lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
                  trace:\n  capture: content\n\
-                 inference:\n  transport: http\n  endpoint: {url}\n  model: test-model\n  \
-                 api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
+                 inference:\n  transport: http\n  model: test-model\n  \
+                 driver:\n    artifact: {DRIVER}\n",
                 endpoint = inference.authority(),
                 url = inference.endpoint,
             ),
@@ -136,10 +137,11 @@ fn suite() -> &'static Suite {
             "0.1.0",
             &format!(
                 "mur_version: \"0.0.1\"\nartifacts:\n  - name: {DRIVER}\n    version: \
-                 {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    \
+                 {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {url}\n      \
+                 api_key: test-key\ncapabilities:\n  network:\n    \
                  allow: [{endpoint}]\nlifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
-                 inference:\n  transport: http\n  endpoint: {url}\n  model: test-model\n  \
-                 api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
+                 inference:\n  transport: http\n  model: test-model\n  \
+                 driver:\n    artifact: {DRIVER}\n",
                 endpoint = inference.authority(),
                 url = inference.endpoint,
             ),

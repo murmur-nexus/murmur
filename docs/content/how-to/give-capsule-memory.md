@@ -34,6 +34,9 @@ Create a `murmur.yaml` file:
       - name: murmur-driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.anthropic.com
+          api_key: ${ANTHROPIC_API_KEY}
       - name: murmur-hook-memory
         version: "{{ v.murmur_hook_memory }}"
         runtime: hook
@@ -43,9 +46,7 @@ Create a `murmur.yaml` file:
 
     inference:
       transport: http
-      endpoint: https://api.anthropic.com
       model: {{ v.model_anthropic }}
-      api_key: ${ANTHROPIC_API_KEY}
       driver:
         artifact: murmur-driver-anthropic
     ```
@@ -63,6 +64,9 @@ Create a `murmur.yaml` file:
       - name: murmur-driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.openai.com
+          api_key: ${OPENAI_API_KEY}
       - name: murmur-hook-memory
         version: "{{ v.murmur_hook_memory }}"
         runtime: hook
@@ -72,9 +76,7 @@ Create a `murmur.yaml` file:
 
     inference:
       transport: http
-      endpoint: https://api.openai.com
       model: {{ v.model_openai }}
-      api_key: ${OPENAI_API_KEY}
       driver:
         artifact: murmur-driver-openai
     ```
@@ -92,6 +94,9 @@ Create a `murmur.yaml` file:
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.deepseek.com
+          api_key: ${DEEPSEEK_API_KEY}
       - name: murmur-hook-memory
         version: "{{ v.murmur_hook_memory }}"
         runtime: hook
@@ -101,9 +106,7 @@ Create a `murmur.yaml` file:
 
     inference:
       transport: http
-      endpoint: https://api.deepseek.com
       model: {{ v.model_deepseek }}
-      api_key: ${DEEPSEEK_API_KEY}
       driver:
         artifact: murmur-driver-deepseek
     ```

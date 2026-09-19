@@ -110,9 +110,10 @@ fn setup_project(endpoint: &str, name: &str, extra: &str) -> (TempDir, PathBuf) 
         format!(
             "name: {name}\nversion: 0.1.0\n\
              artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
              {extra}\
-             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-             api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+             inference:\n  transport: http\n  model: test-model\n  \
+             driver:\n    artifact: {DRIVER_NAME}\n"
         ),
     )
     .unwrap();
@@ -165,6 +166,7 @@ fn stage_agent(
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
             config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

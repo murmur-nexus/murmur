@@ -28,15 +28,16 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       - name: murmur-driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.anthropic.com
+          api_key: ${ANTHROPIC_API_KEY}
       - name: murmur-tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
     inference:
       transport: http
-      endpoint: https://api.anthropic.com
       model: {{ v.model_anthropic }}
-      api_key: ${ANTHROPIC_API_KEY}
       driver:
         artifact: murmur-driver-anthropic
       system_prompt: |
@@ -58,15 +59,16 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       - name: murmur-driver-openai
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.openai.com
+          api_key: ${OPENAI_API_KEY}
       - name: murmur-tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
     inference:
       transport: http
-      endpoint: https://api.openai.com
       model: {{ v.model_openai }}
-      api_key: ${OPENAI_API_KEY}
       driver:
         artifact: murmur-driver-openai
       system_prompt: |
@@ -88,15 +90,16 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
+        gateway:
+          endpoint: https://api.deepseek.com
+          api_key: ${DEEPSEEK_API_KEY}
       - name: murmur-tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
     inference:
       transport: http
-      endpoint: https://api.deepseek.com
       model: {{ v.model_deepseek }}
-      api_key: ${DEEPSEEK_API_KEY}
       driver:
         artifact: murmur-driver-deepseek
       system_prompt: |

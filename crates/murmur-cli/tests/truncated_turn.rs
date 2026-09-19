@@ -53,9 +53,10 @@ fn write_project(project_dir: &Path, config_mode: Option<&str>) -> PathBuf {
         "name: truncation-capsule\n\
          version: 0.1.0\n\
          artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+         \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
          capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
-         inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-         api_key: test-key\n  max_tokens: {CAP}\n  driver:\n    artifact: {DRIVER_NAME}\n\
+         inference:\n  transport: http\n  model: test-model\n  \
+         max_tokens: {CAP}\n  driver:\n    artifact: {DRIVER_NAME}\n\
          {config_section}"
     );
     let path = project_dir.join("murmur.yaml");

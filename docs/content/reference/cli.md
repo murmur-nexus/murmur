@@ -508,7 +508,7 @@ For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilit
 
 For the same capsule, `mur doctor` also prints a `Formation environment` block: what the whole formation — that capsule and the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule to an exact version: `murmur.lock` pins it if the lockfile holds an entry for the name, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). No version is guessed — a name that no single source settles is listed as one the walk could not inspect. Nothing is launched and no daemon is contacted.
 
-The block also reports every variable the project manifest itself references as `${VAR}` and neither this shell nor the workspace `.env` sets. [`inference.api_key`](manifest.md#field-inference) is the manifest field that takes such a reference. A capsule declaring no `spawn.allow` has no formation to walk, so it gets a block only when it has such a reference to report.
+The block also reports every variable the project manifest itself references as `${VAR}` and neither this shell nor the workspace `.env` sets. [`gateway.api_key`](manifest.md#gateway-api-key) on an artifact entry is the manifest field that takes such a reference. A capsule declaring no `spawn.allow` has no formation to walk, so it gets a block only when it has such a reference to report.
 
 `mur doctor` parses the project manifest without resolving what it references, so a reference this shell cannot satisfy is a line in this block rather than a refusal ahead of it. `mur run` needs the value, and refuses the same manifest with [`E-MAN-003`](diagnostics.md#index).
 
@@ -525,7 +525,7 @@ This block is stricter than the manifest blocks above, which report a refusal of
 
 Only names are printed. No variable's value is read into the report or written anywhere, and set/unset is decided by presence alone, so a name set to the empty string counts as set. The workspace `.env` counts because `mur run` loads it; a `.env` that cannot be parsed is reported by file and line, adds a `Fix:` entry, and leaves the variable list computed from this shell's environment alone.
 
-A variable line names every capsule that needs the name. A name a capsule declares in `capabilities.env.allow` is attributed to that capsule alone; a name reached through any other manifest field carries that field in brackets, as `solo@0.0.1 (inference.api_key)`.
+A variable line names every capsule that needs the name. A name a capsule declares in `capabilities.env.allow` is attributed to that capsule alone; a name reached through any other manifest field carries that field in brackets, as `solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)`.
 
 **Output — a formation with one unset variable:**
 
@@ -543,7 +543,7 @@ Formation environment
 Formation environment
   capsules: solo@0.0.1
   variables:
-    ✗  SOLO_PROVIDER_KEY   unset   — solo@0.0.1 (inference.api_key)
+    ✗  SOLO_PROVIDER_KEY   unset   — solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)
 ```
 
 **Output — happy path:**
@@ -1993,7 +1993,7 @@ mur config set inference.model claude-haiku-4-5-20251001 -g
 # Set inference.model in ~/.murmur/config.yaml
 ```
 
-Any other dotted key — known `MurConfig` field or not — is rejected with `E-CFG-002` and writes
+Any other dotted key — a known config field or not — is rejected with `E-CFG-002` and writes
 nothing:
 
 ```bash

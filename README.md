@@ -38,7 +38,7 @@ cargo install murmur-cli
 
 ### Create a manifest
 
-Declare a capsule in `murmur.yaml` — its driver, the host it may reach, and how inference runs.
+Declare a capsule in `murmur.yaml` — its driver, the provider that driver reaches, and how inference runs.
 
 `murmur.yaml`
 ```yaml
@@ -49,17 +49,13 @@ artifacts:
   - name: murmur-driver-anthropic
     version: "1.0.0"
     runtime: driver
-
-capabilities:
-  network:
-    allow:
-      - https://api.anthropic.com
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
 
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-haiku-4-5
-  api_key: ${ANTHROPIC_API_KEY}
   driver:
     artifact: murmur-driver-anthropic
 ```

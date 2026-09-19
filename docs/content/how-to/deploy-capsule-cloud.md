@@ -51,12 +51,13 @@ artifacts:
   - name: murmur-driver-anthropic
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
 
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: {{ v.model_anthropic }}
-  api_key: ${ANTHROPIC_API_KEY}
   driver:
     artifact: murmur-driver-anthropic
 ```
@@ -257,9 +258,7 @@ If your capsule reads its system prompt from a file rather than inline YAML, set
 ```yaml
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: {{ v.model_anthropic }}
-  api_key: ${ANTHROPIC_API_KEY}
   system_prompt_file: instructions.md
   driver:
     artifact: murmur-driver-anthropic
@@ -294,13 +293,13 @@ Both `KEY=VALUE` and `export KEY=VALUE` formats are accepted; the `export ` pref
 In the manifest, reference variables with `${VAR_NAME}`:
 
 ```yaml
-inference:
-  transport: http
-  endpoint: https://api.anthropic.com
-  model: {{ v.model_anthropic }}
-  api_key: ${ANTHROPIC_API_KEY}
-  driver:
-    artifact: murmur-driver-anthropic
+artifacts:
+  - name: murmur-driver-anthropic
+    version: "{{ v.murmur_driver_anthropic }}"
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
 ```
 
 When the capsule starts, `mur run` reads `ANTHROPIC_API_KEY` from its environment and substitutes it wherever `${ANTHROPIC_API_KEY}` appears in the manifest. If the variable is not set, `mur run` exits with `E-MAN-003`.

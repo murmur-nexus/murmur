@@ -105,9 +105,10 @@ impl Fixture {
 fn write_manifest(dir: &Path, name: &str, endpoint: &str, blocks: &str) -> PathBuf {
     let manifest = format!(
         "name: {name}\nversion: 0.1.0\n{blocks}artifacts:\n  - name: {DRIVER_NAME}\n    \
-         version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    \
-         allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  \
-         model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n",
+         version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+         endpoint: {endpoint}\n      api_key: test-key\ncapabilities:\n  network:\n    \
+         allow:\n      - {endpoint}\ninference:\n  transport: http\n  model: test-model\n  \
+         driver:\n    artifact: {DRIVER_NAME}\n",
     );
     let path = dir.join(format!("{name}.yaml"));
     fs::write(&path, manifest).unwrap();

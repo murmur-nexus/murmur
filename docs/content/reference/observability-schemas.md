@@ -36,7 +36,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
-| `inference_credential` | The session node — written as the inference request is sent, outside any turn |
+| `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation` | The session node |
@@ -70,7 +70,8 @@ before the first task begins
 | `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
-| `credential_source` | string | `"config"` \| `"environment"` \| `"manifest"` \| `"none"` — where the inference key this session attaches came from: [`credentials.<NAME>`](config.md#credentials) in the global config, the launching environment, a literal `inference.api_key`, or no key. Never the key, a hash of it, its length or any part of it |
+| `credential_source` | string | `"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` \| `"none"` — where the inference key this session attaches came from: [`credentials.<NAME>`](config.md#credentials) in the global config, the launching environment, a literal `gateway.api_key` on the driver's entry, a driver entry with [`keyless: true`](manifest.md#gateway-keyless), or no inference gateway at all. Never the key, a hash of it, its length or any part of it |
+| `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's name), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"`, as `credential_source` above, for that artifact's key) and `metered` (`true` only for the configured `transport: http` driver's gateway, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself. Under [`trace.capture: content`](manifest.md#field-trace) those bytes are also stored as `blobs/<system_prompt_sha256>`. Deliberately a different value from `inference.system_sha`, which covers the augmented prompt that went on the wire |
 | `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `read_only_paths` (the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects; `[]` when the manifest declares none), `read_only_advisory_for` (the entries of `shell_allow` that protection is only advisory against; `[]` when it is enforced for every call the runtime can read as a write), `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants`, `preopens` (one entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry — `artifact`, `role`, the declared `scope` or `null`, and a `surface` of `whole-workdir`, `scoped-subtree` or `nothing`; `[]` when the capsule declares only skills), `state_stores` (`[]` when no artifact declares [`capabilities.state`](manifest.md#field-capabilities)), `configured_artifacts` (`[]` when no artifact declares [`config:`](manifest.md#artifact-config)), `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)), `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)), `runtime_writes`, `filesystem_boundary` (always present; a `restriction` of `advisory`, `enforced` or `absent` naming the filesystem mechanism this session installs rather than the class this host can back, and `not_protected`, the statements `mur run --explain-scope` prints under `Not protected here` — `[]` at `absent`, and two statements otherwise, one about the filesystem and one about the `HOME` rewrite; see [Testing containment honestly](containment.md#testing-containment)) and `io_max` (always present; `declared_bytes_per_sec`, a `status` of `enforced`, `unavailable`, `not-required` or `not-probed`, and a `reason` absent only when the status is `enforced` — see [Whether the I/O ceiling applied](resource-limits.md#io-max-report)). Where `capabilities` above names categories, this names the actual destinations, binaries, capsule names and paths |
 | `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the accessible workdir, so a consumer for whom that workdir is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`), `scope` (`"accessible"` \| `"session"`) and `condition` (`"always"`, `"workdir-provided"`, `"agent-session"`, `"script-session"`, `"shell"`, `"peer-fetch"`, `"spawn"`, `"delegated"` or `"sealed"`). Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which `session_id` on this same line supplies. The `"sealed"` rows are present exactly when this session composes a sealed root, which needs both a host that reaches the sealed tier and a containment class that asked for it — so a sealed-capable host running an `advisory` capsule reports the sealed `enforcement_tier` with no `"sealed"` rows. Every other condition names when the path appears rather than deciding whether the row is listed. See [Session workdir](workdir.md) |
@@ -106,13 +107,13 @@ runtime does with it.
 
 ### `inference_credential` { #inference-credential }
 
-Written when the inference credential of a `transport: http` session is rotated, rejected or cannot
+Written when the configured `transport: http` driver's credential is rotated, rejected or cannot
 be read, at the moment it happens.
 
 | Field | Type | Notes |
 |---|---|---|
 | `source` | string | `"config"` \| `"environment"` \| `"manifest"` — as `session_start.credential_source` |
-| `credential` | string | The credential name `inference.api_key: ${NAME}` referenced. Absent for a manifest literal |
+| `credential` | string | The credential name the driver entry's `gateway.api_key: ${NAME}` referenced. Absent for a manifest literal |
 | `change` | string | `"rotated"` — a re-read found a different key; `"rejected"` — the provider answered `401` and the rejection stood; `"unreadable"` — the config file or its entry could not supply a key, and the last key read stays in use |
 | `trigger` | string | `"file_changed"` — the config file held a different key when a request read it; `"rejection"` — the re-read after a `401`. Only with `change: "rotated"` |
 | `status` | u16 | The provider's status, `401`. Only with `change: "rejected"` |
@@ -121,6 +122,19 @@ be read, at the moment it happens.
 
 No field carries the key, a hash of it, its length or any part of it. See
 [Rotating a key](config.md#credentials-rotation).
+
+### `gateway_credential` { #gateway-credential }
+
+Written when the credential of any other artifact's [gateway](manifest.md#artifact-gateway) is
+rotated, rejected or cannot be read, at the moment it happens. Its fields are those of
+[`inference_credential`](#inference-credential), read against that artifact's `gateway.api_key`
+and upstream, plus:
+
+| Field | Type | Notes |
+|---|---|---|
+| `artifact` | string | The artifact entry whose `gateway.api_key` this is |
+
+A `change: "rejected"` here fails nothing: the `401` went back to the artifact as its response.
 
 ### What the wire hashes cover { #wire-hashes }
 

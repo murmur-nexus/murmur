@@ -110,6 +110,12 @@ pub struct ArtifactRequest {
     /// `runtime: skill`, and a native tool warns `W-SEC-015` because it reads no per-artifact
     /// environment at all.
     pub config: Option<serde_yaml::Value>,
+    /// This artifact's operator-declared `gateway:` block, copied verbatim from its entry in the
+    /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::gateway`) — the same
+    /// operator-only sourcing rule `capabilities` above follows. Built into the artifact's
+    /// credential gateway at staging, which is also where the artifact's own `inference_auth:`
+    /// declaration is read; an artifact without this block is never asked for one.
+    pub gateway: Option<murmur_artifact::ArtifactGateway>,
 }
 
 /// What `murmur.lock` pins one artifact at, already narrowed to this host.
@@ -292,6 +298,10 @@ pub(crate) struct StagedHookArtifact {
     /// from `config`. Read only when `config.execution_mode` is `Async`; a blocking hook has
     /// no queue to overflow.
     pub on_overflow: murmur_artifact::HookOverflowPolicy,
+    /// This hook's own credential gateway, when its operator entry declares `gateway:`. Attached
+    /// to every store the hook is instantiated on, `on-stage` included. Filled once the session's
+    /// gateways are staged, before any hook runs.
+    pub gateway: Option<Arc<crate::credential_gateway::CredentialGateway>>,
 }
 
 /// How `mur run --resume` puts the loaded conversation in front of the model.
@@ -332,7 +342,7 @@ pub struct StageRequest {
     pub lock_expectations: Option<Vec<LockExpectation>>,
     pub capability_policy: CapabilityPolicy,
     pub inference: Option<InferenceConfig>,
-    /// The global config file a `${NAME}` in `inference.api_key` is looked up in first, as
+    /// The global config file a `${NAME}` in an artifact's `gateway.api_key` is looked up in first, as
     /// `credentials.NAME`, and re-read from while the session runs. `None` looks in the launching
     /// environment only.
     pub credentials_file: Option<PathBuf>,
@@ -416,10 +426,10 @@ pub struct StagedSession {
     pub resolved_lock_artifacts: Vec<ResolvedLockArtifact>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     pub(crate) inference: Option<InferenceConfig>,
-    /// The gateway the configured `transport: http` driver reaches its provider through, built at
-    /// staging from `inference` and the driver's own `inference_auth:` declaration. `None` for
-    /// `transport: process` and for a capsule with no inference.
-    pub(crate) inference_gateway: Option<Arc<crate::inference_gateway::InferenceGateway>>,
+    /// Every credential gateway of the session, built at staging from each artifact entry's
+    /// `gateway:` block and the artifact's own `inference_auth:` declaration. Empty when no entry
+    /// declares one.
+    pub(crate) gateways: crate::credential_gateway::GatewayTable,
     /// This session's spend account, built at staging from `inference.max_session_tokens` and
     /// [`StageRequest::machine_tokens_per_day`]. Always present: a session with no ceiling gets a
     /// meter that admits everything, so every driver call has an admission to open.

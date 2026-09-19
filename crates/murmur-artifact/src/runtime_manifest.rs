@@ -845,6 +845,34 @@ pub struct RuntimeArtifact {
     /// Plaintext in a file that is also an audit record: secrets belong in `${VAR}` references
     /// and the credential-stripping path, not here.
     pub config: Option<serde_yaml::Value>,
+    /// The third-party upstream this artifact reaches through the credential gateway, and the
+    /// key the runtime presents there on its behalf, declared via `gateway:` on this entry.
+    ///
+    /// Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver` entries; a
+    /// `runtime: skill` entry carrying the key is rejected at parse time, on the same terms as
+    /// [`Self::capabilities`]. A `runtime: driver` entry may carry it only when it is the
+    /// configured `transport: http` driver, whose gateway is the metered inference gateway.
+    ///
+    /// Operator-sourced only, and never read from the artifact's own bundled `murmur.yaml`: the
+    /// artifact says how the key is presented (`inference_auth:`), never where it goes.
+    pub gateway: Option<ArtifactGateway>,
+}
+
+/// One artifact's credential gateway, as the operator declared it on the artifact's entry.
+///
+/// Debug never prints a literal key: [`ApiKeyReference`]'s own `Debug` redacts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactGateway {
+    /// Absolute `http`/`https` upstream URL with a host and no query or fragment. Plain `http`
+    /// only to `localhost` or a loopback IP literal.
+    pub endpoint: String,
+    /// The key presented upstream. `None` for a keyless gateway, or when the manifest was parsed
+    /// with [`RuntimeManifest::from_yaml_str_without_secrets`].
+    pub api_key: Option<ApiKeyReference>,
+    /// `keyless: true` as the operator wrote it: this upstream takes no key, and the gateway
+    /// forwards with no credential header. Exclusive with `api_key`; kept as written in both
+    /// secret modes. Never derived from the endpoint's address.
+    pub keyless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -853,7 +881,7 @@ pub struct InferenceDriver {
     pub config: Option<String>,
 }
 
-/// What `inference.api_key` names, as the manifest wrote it. Parsing never resolves it: the
+/// What a `gateway.api_key` names, as the manifest wrote it. Parsing never resolves it: the
 /// runtime looks the value up at staging, where it knows where credentials are kept.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ApiKeyReference {
@@ -876,10 +904,7 @@ impl std::fmt::Debug for ApiKeyReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceConfig {
     pub transport: String,
-    /// HTTP endpoint for the WASM driver. Present for `transport: http`, absent for `transport: process`.
-    pub endpoint: Option<String>,
     pub model: String,
-    pub api_key: Option<ApiKeyReference>,
     /// WASM driver artifact. Present for `transport: http`, absent for `transport: process`.
     pub driver: Option<InferenceDriver>,
     /// CLI binary to spawn. Present for `transport: process`, absent for `transport: http`.
@@ -1447,6 +1472,19 @@ pub enum RuntimeManifestError {
     InvalidExports { field: String, message: String },
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
+    /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
+    /// `keyless: true`. Decided on what the manifest wrote, so it fires identically with and
+    /// without secret resolution.
+    #[error(
+        "{}: invalid artifact declaration at index {index}: artifact '{name}' declares \
+         gateway.endpoint '{endpoint}' but binds no credential",
+        MANIFEST_FILENAME
+    )]
+    GatewayWithoutCredential {
+        index: usize,
+        name: String,
+        endpoint: String,
+    },
     #[error("failed to read {} at {path}: {source}", MANIFEST_FILENAME)]
     Io {
         path: String,
@@ -1673,6 +1711,25 @@ struct RawArtifact {
     /// while an empty declaration is a written statement that carries nothing and is refused.
     #[serde(default, deserialize_with = "deserialize_present")]
     config: Option<serde_yaml::Value>,
+    /// `Some(None)` is `gateway:` written with nothing under it, refused as a block with no
+    /// endpoint rather than collapsed into the absent case.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    gateway: Option<Option<RawArtifactGateway>>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawArtifactGateway {
+    #[serde(default)]
+    endpoint: Option<String>,
+    /// `Some(None)` is `api_key:` written as YAML null: present for the contradiction with
+    /// `keyless: true`, and no credential for the missing-credential refusal.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    api_key: Option<Option<String>>,
+    /// Untyped, so a non-boolean is refused as an invalid declaration naming the field.
+    #[serde(default)]
+    keyless: Option<serde_yaml::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -1911,10 +1968,15 @@ struct RawStagedRuntimeGrant {
 #[derive(Debug, Deserialize)]
 struct RawInferenceConfig {
     transport: Option<String>,
-    endpoint: Option<String>,
+    /// Removed: the driver's upstream is `gateway.endpoint` on its artifact entry. Deserialized
+    /// only so `parse_inference` can refuse it by name, naming where it moved.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    endpoint: Option<serde_yaml::Value>,
     model: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
+    /// Removed: the driver's key is `gateway.api_key` on its artifact entry. Deserialized only so
+    /// `parse_inference` can refuse it by name, naming where it moved.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    api_key: Option<serde_yaml::Value>,
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
@@ -2172,6 +2234,7 @@ impl RawBlock for RawArtifact {
         "capabilities",
         "on_overflow",
         "config",
+        "gateway",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -2181,6 +2244,16 @@ impl RawBlock for RawArtifact {
         if let Some(capabilities) = &self.capabilities {
             collect_block(capabilities, &child_path(path, "capabilities"), out);
         }
+        if let Some(Some(gateway)) = &self.gateway {
+            collect_block(gateway, &child_path(path, "gateway"), out);
+        }
+    }
+}
+
+impl RawBlock for RawArtifactGateway {
+    const KNOWN_KEYS: &'static [&'static str] = &["endpoint", "api_key", "keyless"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -2514,10 +2587,18 @@ pub fn load_runtime_manifest(path: &Path) -> Result<RuntimeManifest, RuntimeMani
 /// One `${VAR}` reference a manifest makes, and the field that makes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferencedEnvVariable {
-    /// The manifest field holding the reference, e.g. `inference.api_key`.
-    pub field: &'static str,
+    /// The manifest field holding the reference, e.g. `artifacts.murmur-driver-anthropic.gateway.api_key`.
+    pub field: String,
     /// The variable the reference names.
     pub variable: String,
+}
+
+impl ReferencedEnvVariable {
+    /// Whether the reference is a gateway's `api_key` — a credential the runtime also answers
+    /// from the global config's `credentials:` map, not only from the environment.
+    pub fn is_gateway_credential(&self) -> bool {
+        self.field.starts_with("artifacts.") && self.field.ends_with(".gateway.api_key")
+    }
 }
 
 /// The narrow view of a manifest this scan needs: the fields whose value may be an `${ENV_REF}`,
@@ -2530,11 +2611,19 @@ pub struct ReferencedEnvVariable {
 #[derive(Deserialize)]
 struct ReferencedManifestFields {
     #[serde(default)]
-    inference: Option<ReferencedInferenceFields>,
+    artifacts: Vec<ReferencedArtifactFields>,
 }
 
 #[derive(Deserialize)]
-struct ReferencedInferenceFields {
+struct ReferencedArtifactFields {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    gateway: Option<ReferencedGatewayFields>,
+}
+
+#[derive(Deserialize)]
+struct ReferencedGatewayFields {
     #[serde(default)]
     api_key: Option<String>,
 }
@@ -2552,16 +2641,20 @@ pub fn referenced_env_variables(manifest_yaml: &str) -> Vec<ReferencedEnvVariabl
     };
 
     let mut referenced: Vec<ReferencedEnvVariable> = Vec::new();
-    if let Some(api_key) = raw.inference.and_then(|inference| inference.api_key) {
+    for artifact in raw.artifacts {
+        let Some(api_key) = artifact.gateway.and_then(|gateway| gateway.api_key) else {
+            continue;
+        };
         if let Some(variable) = parse_env_reference(api_key.trim()) {
+            let name = artifact.name.unwrap_or_default();
             referenced.push(ReferencedEnvVariable {
-                field: "inference.api_key",
+                field: format!("artifacts.{}.gateway.api_key", name.trim()),
                 variable: variable.to_string(),
             });
         }
     }
 
-    referenced.sort_by(|a, b| a.variable.cmp(&b.variable).then(a.field.cmp(b.field)));
+    referenced.sort_by(|a, b| a.variable.cmp(&b.variable).then(a.field.cmp(&b.field)));
     referenced.dedup();
     referenced
 }
@@ -2573,9 +2666,9 @@ pub fn referenced_env_variables(manifest_yaml: &str) -> Vec<ReferencedEnvVariabl
 /// process environment.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SecretResolution {
-    /// `inference.api_key` is kept as an [`ApiKeyReference`], unresolved.
+    /// Every `gateway.api_key` is kept as an [`ApiKeyReference`], unresolved.
     Resolve,
-    /// `inference.api_key` is left unread. The parsed [`InferenceConfig::api_key`] is `None`
+    /// Every `gateway.api_key` is left unread. Each parsed [`ArtifactGateway::api_key`] is `None`
     /// whatever the manifest wrote.
     Skip,
 }
@@ -2587,9 +2680,9 @@ impl RuntimeManifest {
 
     /// Parse a manifest without resolving any secret it references.
     ///
-    /// Validation is identical to [`RuntimeManifest::from_yaml_str`] on every block, `inference`
-    /// included, with one difference: the resulting [`InferenceConfig::api_key`] is always
-    /// `None`, whether the manifest wrote an `${ENV_REF}` or a literal key.
+    /// Validation is identical to [`RuntimeManifest::from_yaml_str`] on every block, `artifacts`
+    /// included, with one difference: every resulting [`ArtifactGateway::api_key`] is `None`,
+    /// whether the manifest wrote an `${ENV_REF}` or a literal key.
     ///
     /// For a caller that reads a foreign capsule's manifest for its capability policy alone —
     /// `mur-roost` refereeing a delegation — and is entitled to none of the credentials that
@@ -2824,6 +2917,24 @@ impl RuntimeManifest {
                     });
                 }
 
+                let gateway = match artifact.gateway {
+                    None => None,
+                    Some(raw_gateway) => {
+                        if runtime == ArtifactRuntime::Skill {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares 'gateway:' but has 'runtime: {}'; \
+                                     the key is recognized only on 'runtime: hook', \
+                                     'runtime: tool', and 'runtime: driver' entries",
+                                    runtime.as_str()
+                                ),
+                            });
+                        }
+                        Some(parse_artifact_gateway(index, &name, raw_gateway, secrets)?)
+                    }
+                };
+
                 Ok(RuntimeArtifact {
                     name,
                     version,
@@ -2834,6 +2945,7 @@ impl RuntimeManifest {
                     capabilities,
                     on_overflow,
                     config: artifact.config,
+                    gateway,
                 })
             })
             .collect::<Result<Vec<_>, RuntimeManifestError>>()?;
@@ -2867,7 +2979,8 @@ impl RuntimeManifest {
             });
         }
         let capabilities = parse_capabilities(raw.capabilities)?;
-        let inference = parse_inference(raw.inference, secrets)?;
+        let inference = parse_inference(raw.inference)?;
+        validate_driver_gateways(&artifacts, inference.as_ref())?;
 
         // Validate system_prompt_artifact: must name a declared artifact whose payload may be
         // bound as the system prompt (`prompt_payload`, defaulted from the role when absent).
@@ -3685,7 +3798,6 @@ fn parse_resource_capabilities(
 
 fn parse_inference(
     raw: Option<RawInferenceConfig>,
-    secrets: SecretResolution,
 ) -> Result<Option<InferenceConfig>, RuntimeManifestError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -3741,26 +3853,34 @@ fn parse_inference(
         });
     }
 
+    // Left to the unknown-key pass, either field would only draw a warning and the capsule would
+    // launch with no upstream or credential bound, so each is refused by name, pointing at the
+    // driver entry's `gateway:` block. Nothing translates it.
+    for (present, removed, moved_to) in [
+        (raw.endpoint.is_some(), "endpoint", "gateway.endpoint"),
+        (raw.api_key.is_some(), "api_key", "gateway.api_key"),
+    ] {
+        if !present {
+            continue;
+        }
+        let entry = raw
+            .driver
+            .as_ref()
+            .or(raw.provider.as_ref())
+            .and_then(|driver| driver.artifact.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("on the artifacts: entry '{name}'"))
+            .unwrap_or_else(|| "on the artifacts: entry inference.driver.artifact names".into());
+        return Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: format!("inference.{removed}"),
+            message: format!("was removed; set {moved_to} {entry} instead"),
+        });
+    }
+
     match transport.as_str() {
         "http" => {
-            let endpoint = required_inference_field(raw.endpoint, "endpoint")?;
-            validate_inference_endpoint(&endpoint)?;
             let model = required_inference_field(raw.model, "model")?;
-
-            let api_key = match (raw.api_key, secrets) {
-                (None, _) | (Some(_), SecretResolution::Skip) => None,
-                (Some(value), SecretResolution::Resolve) => {
-                    let trimmed = value.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(match parse_env_reference(trimmed) {
-                            Some(name) => ApiKeyReference::Environment(name.to_string()),
-                            None => ApiKeyReference::Literal(trimmed.to_string()),
-                        })
-                    }
-                }
-            };
 
             let driver_raw = raw.driver.or(raw.provider).ok_or_else(|| {
                 RuntimeManifestError::InvalidInferenceConfig {
@@ -3788,9 +3908,7 @@ fn parse_inference(
 
             Ok(Some(InferenceConfig {
                 transport,
-                endpoint: Some(endpoint),
                 model,
-                api_key,
                 driver: Some(driver),
                 command: None,
                 compaction,
@@ -3807,28 +3925,6 @@ fn parse_inference(
             if raw.driver.is_some() || raw.provider.is_some() {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.driver.artifact".to_string(),
-                    message: "is not valid with transport: process".to_string(),
-                });
-            }
-            if raw
-                .endpoint
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            {
-                return Err(RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.endpoint".to_string(),
-                    message: "is not valid with transport: process".to_string(),
-                });
-            }
-            if raw
-                .api_key
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            {
-                return Err(RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.api_key".to_string(),
                     message: "is not valid with transport: process".to_string(),
                 });
             }
@@ -3859,9 +3955,7 @@ fn parse_inference(
 
             Ok(Some(InferenceConfig {
                 transport,
-                endpoint: None,
                 model,
-                api_key: None,
                 driver: None,
                 command: Some(command),
                 compaction,
@@ -4162,50 +4256,264 @@ fn required_inference_field(
         })
 }
 
-/// Rejects `inference.endpoint` values that would let a manifest redirect the
-/// inference trust root to an unencrypted, non-loopback host (murmur-security-assessment.md C-3).
+/// One artifact entry's `gateway:` block, checked and with its key reference kept unresolved.
 ///
-/// Accepted: any `https://` URL, or `http://` URLs whose host is `localhost` or an
-/// IP literal for which [`IpAddr::is_loopback`] returns true (e.g. `127.0.0.1`, `::1`).
-/// Rejected: malformed URLs, unsupported schemes (anything but `http`/`https`), and
-/// `http://` URLs whose host is not loopback.
-fn validate_inference_endpoint(endpoint: &str) -> Result<(), RuntimeManifestError> {
-    let url =
-        Url::parse(endpoint).map_err(|source| RuntimeManifestError::InvalidInferenceConfig {
-            field: "inference.endpoint".to_string(),
-            message: format!("failed to parse '{endpoint}' as a URL: {source}"),
-        })?;
+/// The credential rule reads what the manifest wrote, never a resolved value, so it decides the
+/// same under [`SecretResolution::Resolve`] and [`SecretResolution::Skip`]: a non-blank `api_key`
+/// is keyed, `keyless: true` with no `api_key` key is keyless, both together is
+/// [`RuntimeManifestError::InvalidArtifact`], and anything else is
+/// [`RuntimeManifestError::GatewayWithoutCredential`]. The endpoint's address plays no part.
+fn parse_artifact_gateway(
+    index: usize,
+    name: &str,
+    raw: Option<RawArtifactGateway>,
+    secrets: SecretResolution,
+) -> Result<ArtifactGateway, RuntimeManifestError> {
+    let (endpoint, api_key, keyless) = match raw {
+        Some(raw) => (
+            optional_trimmed_string(raw.endpoint),
+            raw.api_key,
+            raw.keyless,
+        ),
+        None => (None, None, None),
+    };
+    let endpoint = endpoint.ok_or_else(|| RuntimeManifestError::InvalidArtifact {
+        index,
+        message: format!(
+            "artifact '{name}' declares 'gateway:' without 'gateway.endpoint'; the block needs \
+             the upstream URL the runtime sends this artifact's keyed requests to"
+        ),
+    })?;
+    validate_gateway_endpoint(name, &endpoint)
+        .map_err(|message| RuntimeManifestError::InvalidArtifact { index, message })?;
 
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" => {
-            let host = url.host_str().unwrap_or("");
-            let is_loopback = host == "localhost"
-                || host
-                    .parse::<IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false);
-
-            if is_loopback {
-                Ok(())
-            } else {
-                Err(RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.endpoint".to_string(),
-                    message: format!(
-                        "'{endpoint}' uses plain http:// with non-loopback host '{host}' — \
-                         use https:// for remote endpoints, or http://localhost or \
-                         a loopback IP literal for local inference"
-                    ),
-                })
-            }
+    let keyless = match keyless {
+        None | Some(serde_yaml::Value::Null) | Some(serde_yaml::Value::Bool(false)) => false,
+        Some(serde_yaml::Value::Bool(true)) => true,
+        Some(_) => {
+            return Err(RuntimeManifestError::InvalidArtifact {
+                index,
+                message: format!(
+                    "artifact '{name}' declares gateway.keyless with a value that is not a \
+                     boolean; write keyless: true for an upstream that takes no key"
+                ),
+            })
         }
-        other => Err(RuntimeManifestError::InvalidInferenceConfig {
-            field: "inference.endpoint".to_string(),
+    };
+    if keyless && api_key.is_some() {
+        return Err(RuntimeManifestError::InvalidArtifact {
+            index,
             message: format!(
-                "unsupported scheme '{other}' in '{endpoint}' — expected http or https"
+                "artifact '{name}' declares both gateway.api_key and gateway.keyless: true; a \
+                 gateway either presents a key or is keyless"
             ),
-        }),
+        });
     }
+    if keyless {
+        return Ok(ArtifactGateway {
+            endpoint,
+            api_key: None,
+            keyless: true,
+        });
+    }
+
+    let written = api_key
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(written) = written else {
+        return Err(RuntimeManifestError::GatewayWithoutCredential {
+            index,
+            name: name.to_string(),
+            endpoint,
+        });
+    };
+    let api_key = match secrets {
+        SecretResolution::Skip => None,
+        SecretResolution::Resolve => Some(match parse_env_reference(&written) {
+            Some(variable) => ApiKeyReference::Environment(variable.to_string()),
+            None => ApiKeyReference::Literal(written),
+        }),
+    };
+
+    Ok(ArtifactGateway {
+        endpoint,
+        api_key,
+        keyless: false,
+    })
+}
+
+/// Checks a `gateway.endpoint`, the only control on where an artifact's key is sent: a
+/// gateway-addressed request is readdressed before any `network.allow` rule is consulted, so
+/// nothing else confines the destination.
+///
+/// Accepted: an `https://` URL with a host, or an `http://` URL whose host is `localhost` or an
+/// IP literal for which [`IpAddr::is_loopback`] returns true (`127.0.0.0/8`, `::1`). An optional
+/// port and path are kept.
+///
+/// Refused:
+/// - `${` anywhere, checked before parsing: the field is never interpolated, and the URL parser
+///   accepts `$`, `{` and `}` in a host, so `https://${HOST}` would otherwise parse as a literal
+///   host.
+/// - A malformed URL, a scheme other than `http`/`https`, or no host.
+/// - Userinfo (`user@`, `user:pass@`): `https://api.example.com@evil.example` addresses
+///   `evil.example`, and the gateway never sends userinfo, so a password there is a second,
+///   unmanaged credential. The message names the host the URL addresses.
+/// - A query or a fragment: the gateway readdresses each request by its own path and query, so
+///   either would be silently dropped.
+/// - `http://` to any host that is not loopback, including `0.0.0.0` and `::ffff:127.0.0.1`.
+///
+/// The endpoint confines the origin only. The guest chooses the whole path and query of every
+/// gateway request.
+///
+/// The error is the whole message, naming `gateway.endpoint` and the artifact entry `artifact`.
+/// It quotes the endpoint with any userinfo masked, so a password written into the URL is never
+/// echoed.
+fn validate_gateway_endpoint(artifact: &str, endpoint: &str) -> Result<(), String> {
+    let shown = mask_endpoint_userinfo(endpoint);
+    let refuse =
+        |why: String| format!("artifact '{artifact}' declares gateway.endpoint '{shown}', {why}");
+    if endpoint.contains("${") {
+        return Err(refuse(
+            "which contains '${' — gateway.endpoint is not interpolated; write the upstream \
+             literally"
+                .to_string(),
+        ));
+    }
+    let url = Url::parse(endpoint)
+        .map_err(|source| refuse(format!("which does not parse as a URL: {source}")))?;
+    let host = match url.scheme() {
+        "http" | "https" => url
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| refuse("which has no host".to_string()))?,
+        other => {
+            return Err(refuse(format!(
+                "whose scheme '{other}' is unsupported — expected http or https"
+            )))
+        }
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse(format!(
+            "which carries userinfo before '@' — the gateway never sends it, and this URL \
+             addresses host '{host}'; write the upstream as scheme://host[:port][/path] and give \
+             the key through gateway.api_key"
+        )));
+    }
+    if url.query().is_some() {
+        return Err(refuse(
+            "which carries a query — the gateway keeps each request's own query, so write the \
+             upstream without one"
+                .to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(refuse(
+            "which carries a fragment — write the upstream without one".to_string(),
+        ));
+    }
+    if url.scheme() == "http" {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = bare == "localhost"
+            || bare
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !is_loopback {
+            return Err(refuse(format!(
+                "which uses plain http:// with non-loopback host '{host}' — use https:// for a \
+                 remote upstream, or http://localhost or a loopback IP literal for a local one"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `endpoint` with everything before the last `@` of its authority replaced by `***`.
+///
+/// Textual rather than parsed, so it also masks an endpoint the URL parser rejects.
+fn mask_endpoint_userinfo(endpoint: &str) -> std::borrow::Cow<'_, str> {
+    let authority_start = endpoint.find("://").map_or(0, |at| at + 3);
+    let rest = &endpoint[authority_start..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_len].rfind('@') {
+        Some(at) => format!(
+            "{}***{}",
+            &endpoint[..authority_start],
+            &endpoint[authority_start + at..]
+        )
+        .into(),
+        None => endpoint.into(),
+    }
+}
+
+/// The cross-entry rules for a `gateway:` on a driver, which need the parsed `inference:` block.
+///
+/// A driver's gateway is the metered inference gateway only when that driver is the configured
+/// `transport: http` driver. On any other driver entry it could be spent only through tool
+/// dispatch, where nothing meters it, so it is refused. Under `transport: http` the configured
+/// driver's entry must exist and must carry the upstream.
+fn validate_driver_gateways(
+    artifacts: &[RuntimeArtifact],
+    inference: Option<&InferenceConfig>,
+) -> Result<(), RuntimeManifestError> {
+    let configured_driver = inference
+        .filter(|inference| inference.transport == "http")
+        .and_then(|inference| inference.driver.as_ref())
+        .map(|driver| driver.artifact.as_str());
+    let under_process = inference.is_some_and(|inference| inference.transport == "process");
+
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if artifact.runtime != ArtifactRuntime::Driver || artifact.gateway.is_none() {
+            continue;
+        }
+        if under_process {
+            return Err(RuntimeManifestError::InvalidArtifact {
+                index,
+                message: format!(
+                    "artifact '{}' declares 'gateway:' on a 'runtime: driver' entry, which is not \
+                     valid with transport: process — the CLI subprocess holds its own \
+                     credentials and no driver is dispatched",
+                    artifact.name
+                ),
+            });
+        }
+        if configured_driver != Some(artifact.name.as_str()) {
+            return Err(RuntimeManifestError::InvalidArtifact {
+                index,
+                message: format!(
+                    "artifact '{}' declares 'gateway:' on a 'runtime: driver' entry that is not \
+                     the configured inference driver; a driver's gateway is accepted only on the \
+                     entry inference.driver.artifact names under transport: http",
+                    artifact.name
+                ),
+            });
+        }
+    }
+
+    if let Some(driver) = configured_driver {
+        let Some((index, entry)) = artifacts
+            .iter()
+            .enumerate()
+            .find(|(_, artifact)| artifact.name == driver)
+        else {
+            return Err(RuntimeManifestError::InvalidInferenceConfig {
+                field: "inference.driver.artifact".to_string(),
+                message: format!("artifact '{driver}' is not declared in artifacts:"),
+            });
+        };
+        if entry.gateway.is_none() {
+            return Err(RuntimeManifestError::InvalidArtifact {
+                index,
+                message: format!(
+                    "artifact '{driver}' is the transport: http inference driver but declares no \
+                     gateway.endpoint; set 'gateway: {{ endpoint: <provider URL>, api_key: ... }}' \
+                     on its entry"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_inference_driver(
@@ -5878,12 +6186,16 @@ capabilities:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      api_key: literal-key
 inference:
   transport: http
-  endpoint: http://127.0.0.1:8080
   model: test-model
-  api_key: literal-key
   driver:
     artifact: murmur-driver-anthropic
     config:
@@ -5894,17 +6206,17 @@ inference:
         )
         .unwrap();
 
+        assert_eq!(
+            manifest.artifacts[0].gateway,
+            Some(ArtifactGateway {
+                endpoint: "http://127.0.0.1:8080".to_string(),
+                api_key: Some(ApiKeyReference::Literal("literal-key".to_string())),
+                keyless: false,
+            })
+        );
         let inference = manifest.inference.expect("inference should exist");
         assert_eq!(inference.transport, "http");
-        assert_eq!(
-            inference.endpoint,
-            Some("http://127.0.0.1:8080".to_string())
-        );
         assert_eq!(inference.model, "test-model");
-        assert_eq!(
-            inference.api_key,
-            Some(ApiKeyReference::Literal("literal-key".to_string()))
-        );
         let driver = inference.driver.as_ref().expect("driver should be present");
         assert_eq!(driver.artifact, "murmur-driver-anthropic");
         assert_eq!(
@@ -5915,161 +6227,550 @@ inference:
         assert!(inference.system_prompt_file.is_none());
     }
 
-    #[test]
-    fn https_endpoint_accepted() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: https://api.anthropic.com
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
+    /// A capsule whose one tool entry declares `gateway:` with `block` as its body, indented
+    /// under the key.
+    fn tool_gateway_manifest(block: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: web-search\n    version: 0.1.0\n    runtime: tool\n    gateway:{block}\n"
         )
-        .unwrap();
+    }
 
+    fn gateway_endpoint_error(endpoint: &str) -> String {
+        RuntimeManifest::from_yaml_str(&tool_gateway_manifest(&format!(
+            "\n      endpoint: \"{endpoint}\""
+        )))
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[test]
+    fn gateway_endpoint_https_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(&tool_gateway_manifest(
+            "\n      endpoint: https://api.tavily.com\n      api_key: ${TAVILY_API_KEY}",
+        ))
+        .unwrap();
         assert_eq!(
-            manifest.inference.unwrap().endpoint,
-            Some("https://api.anthropic.com".to_string())
+            manifest.artifacts[0].gateway,
+            Some(ArtifactGateway {
+                endpoint: "https://api.tavily.com".to_string(),
+                api_key: Some(ApiKeyReference::Environment("TAVILY_API_KEY".to_string())),
+                keyless: false,
+            })
         );
     }
 
     #[test]
-    fn http_localhost_endpoint_accepted() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: http://localhost:11434
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
-        )
+    fn gateway_endpoint_http_localhost_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(&tool_gateway_manifest(
+            "\n      endpoint: http://localhost:11434\n      keyless: true",
+        ))
         .unwrap();
+        let gateway = manifest.artifacts[0].gateway.clone().unwrap();
+        assert_eq!(gateway.endpoint, "http://localhost:11434");
+        assert_eq!(gateway.api_key, None);
+        assert!(gateway.keyless);
+    }
 
+    #[test]
+    fn gateway_endpoint_http_loopback_ip_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(&tool_gateway_manifest(
+            "\n      endpoint: http://127.0.0.1:8080\n      api_key: ${LOCAL_KEY}",
+        ))
+        .unwrap();
+        let gateway = manifest.artifacts[0].gateway.clone().unwrap();
+        assert_eq!(gateway.endpoint, "http://127.0.0.1:8080");
         assert_eq!(
-            manifest.inference.unwrap().endpoint,
-            Some("http://localhost:11434".to_string())
+            gateway.api_key,
+            Some(ApiKeyReference::Environment("LOCAL_KEY".to_string()))
         );
     }
 
     #[test]
-    fn http_loopback_ip_endpoint_accepted() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: http://127.0.0.1:11434
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
-        )
-        .unwrap();
+    fn gateway_endpoint_without_scheme_is_refused() {
+        let msg = gateway_endpoint_error("api.tavily.com");
+        assert!(msg.contains("gateway.endpoint"), "{msg}");
+        assert!(msg.contains("artifact 'web-search'"), "{msg}");
+        assert!(msg.contains("does not parse as a URL"), "{msg}");
+    }
 
-        assert_eq!(
-            manifest.inference.unwrap().endpoint,
-            Some("http://127.0.0.1:11434".to_string())
+    #[test]
+    fn gateway_endpoint_ftp_scheme_is_refused() {
+        let msg = gateway_endpoint_error("ftp://example.com");
+        assert!(msg.contains("gateway.endpoint"), "{msg}");
+        assert!(msg.contains("scheme 'ftp' is unsupported"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_endpoint_plain_http_to_a_remote_host_is_refused() {
+        let msg = gateway_endpoint_error("http://api.attacker.example.com");
+        assert!(msg.contains("gateway.endpoint"), "{msg}");
+        assert!(msg.contains("api.attacker.example.com"), "{msg}");
+        assert!(msg.contains("non-loopback"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_endpoint_with_a_query_is_refused() {
+        let msg = gateway_endpoint_error("https://api.tavily.com/v1?key=x");
+        assert!(msg.contains("gateway.endpoint"), "{msg}");
+        assert!(msg.contains("carries a query"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_endpoint_with_a_fragment_is_refused() {
+        let msg = gateway_endpoint_error("https://api.tavily.com/v1#frag");
+        assert!(msg.contains("gateway.endpoint"), "{msg}");
+        assert!(msg.contains("carries a fragment"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_endpoint_with_userinfo_is_refused() {
+        let msg = gateway_endpoint_error("https://user:sk-in-url@api.example.com");
+        assert!(msg.contains("artifact 'web-search'"), "{msg}");
+        assert!(msg.contains("carries userinfo before '@'"), "{msg}");
+        assert!(msg.contains("host 'api.example.com'"), "{msg}");
+        assert!(msg.contains("gateway.api_key"), "{msg}");
+        assert!(msg.contains("'https://***@api.example.com'"), "{msg}");
+        assert!(
+            !msg.contains("sk-in-url"),
+            "a password in the URL is never echoed: {msg}"
         );
     }
 
     #[test]
-    fn http_non_localhost_endpoint_rejected() {
-        let err = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: http://api.attacker.example.com
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
-        )
-        .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("inference.endpoint"), "error was: {msg}");
-        assert!(msg.contains("api.attacker.example.com"), "error was: {msg}");
+    fn gateway_endpoint_refusal_masks_userinfo_the_parser_rejects() {
+        let msg = gateway_endpoint_error("https://user:sk-in-url@");
+        assert!(msg.contains("does not parse as a URL"), "{msg}");
+        assert!(
+            !msg.contains("sk-in-url"),
+            "a password in the URL is never echoed: {msg}"
+        );
     }
 
     #[test]
-    fn schemeless_endpoint_rejected() {
-        let err = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: api.anthropic.com
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
-        )
-        .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("inference.endpoint"), "error was: {msg}");
-        assert!(msg.contains("failed to parse"), "error was: {msg}");
+    fn gateway_endpoint_with_a_masquerading_host_is_refused() {
+        let msg = gateway_endpoint_error("https://api.example.com@127.0.0.1:8443");
+        assert!(msg.contains("carries userinfo before '@'"), "{msg}");
+        assert!(
+            msg.contains("addresses host '127.0.0.1'"),
+            "the message names the host the URL really addresses: {msg}"
+        );
     }
 
     #[test]
-    fn malformed_endpoint_rejected() {
-        let err = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: "not a url"
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
-        )
-        .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("inference.endpoint"), "error was: {msg}");
-        assert!(msg.contains("failed to parse"), "error was: {msg}");
+    fn gateway_endpoint_with_interpolation_is_refused() {
+        let msg = gateway_endpoint_error("https://${PROVIDER_HOST}/v1");
+        assert!(msg.contains("artifact 'web-search'"), "{msg}");
+        assert!(msg.contains("contains '${'"), "{msg}");
+        assert!(msg.contains("not interpolated"), "{msg}");
     }
 
     #[test]
-    fn unsupported_scheme_endpoint_rejected() {
-        let err = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: http
-  endpoint: ftp://example.com
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
-        )
-        .unwrap_err();
+    fn gateway_endpoint_http_unspecified_address_is_refused() {
+        let msg = gateway_endpoint_error("http://0.0.0.0:8080");
+        assert!(msg.contains("non-loopback host '0.0.0.0'"), "{msg}");
+    }
 
-        let msg = err.to_string();
-        assert!(msg.contains("inference.endpoint"), "error was: {msg}");
-        assert!(msg.contains("unsupported scheme 'ftp'"), "error was: {msg}");
+    #[test]
+    fn gateway_endpoint_http_ipv6_loopback_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(&tool_gateway_manifest(
+            "\n      endpoint: http://[::1]:8080\n      api_key: ${LOCAL_KEY}",
+        ))
+        .unwrap();
+        assert_eq!(
+            manifest.artifacts[0].gateway.as_ref().unwrap().endpoint,
+            "http://[::1]:8080"
+        );
+    }
+
+    /// The error a tool entry whose `gateway:` body is `block` draws, parsed with secrets resolved.
+    fn gateway_credential_error(block: &str) -> RuntimeManifestError {
+        RuntimeManifest::from_yaml_str(&tool_gateway_manifest(block)).unwrap_err()
+    }
+
+    fn assert_without_credential(error: RuntimeManifestError, endpoint: &str) {
+        match &error {
+            RuntimeManifestError::GatewayWithoutCredential {
+                index,
+                name,
+                endpoint: refused,
+            } => {
+                assert_eq!(*index, 0);
+                assert_eq!(name, "web-search");
+                assert_eq!(refused, endpoint);
+            }
+            other => panic!("expected GatewayWithoutCredential, got {other:?}"),
+        }
+        let msg = error.to_string();
+        assert!(
+            msg.contains(&format!(
+                "artifact 'web-search' declares gateway.endpoint '{endpoint}' but binds no \
+                 credential"
+            )),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn gateway_credential_absent_is_refused() {
+        assert_without_credential(
+            gateway_credential_error("\n      endpoint: https://api.tavily.com"),
+            "https://api.tavily.com",
+        );
+    }
+
+    #[test]
+    fn gateway_credential_blank_is_refused() {
+        for key in ["\"\"", "\"   \"", "''"] {
+            assert_without_credential(
+                gateway_credential_error(&format!(
+                    "\n      endpoint: https://api.tavily.com\n      api_key: {key}"
+                )),
+                "https://api.tavily.com",
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_credential_null_is_refused() {
+        for key in ["~", "null", ""] {
+            assert_without_credential(
+                gateway_credential_error(&format!(
+                    "\n      endpoint: https://api.tavily.com\n      api_key: {key}"
+                )),
+                "https://api.tavily.com",
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_credential_keyless_false_is_refused() {
+        assert_without_credential(
+            gateway_credential_error(
+                "\n      endpoint: https://api.tavily.com\n      keyless: false",
+            ),
+            "https://api.tavily.com",
+        );
+    }
+
+    #[test]
+    fn gateway_credential_keyless_is_accepted() {
+        for (parse, mode) in [
+            (
+                RuntimeManifest::from_yaml_str as fn(&str) -> _,
+                "with secrets",
+            ),
+            (
+                RuntimeManifest::from_yaml_str_without_secrets,
+                "without secrets",
+            ),
+        ] {
+            let manifest = parse(&tool_gateway_manifest(
+                "\n      endpoint: https://api.example.com\n      keyless: true",
+            ))
+            .unwrap();
+            assert_eq!(
+                manifest.artifacts[0].gateway,
+                Some(ArtifactGateway {
+                    endpoint: "https://api.example.com".to_string(),
+                    api_key: None,
+                    keyless: true,
+                }),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_credential_keyless_not_a_boolean_is_refused() {
+        for value in ["\"true\"", "yes please", "1"] {
+            let error = gateway_credential_error(&format!(
+                "\n      endpoint: https://api.tavily.com\n      keyless: {value}"
+            ));
+            assert!(
+                matches!(
+                    error,
+                    RuntimeManifestError::InvalidArtifact { index: 0, .. }
+                ),
+                "{value}: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("gateway.keyless with a value that is not a boolean"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_credential_and_keyless_together_are_refused() {
+        for key in ["${TAVILY_API_KEY}", "\"\"", "~"] {
+            let error = gateway_credential_error(&format!(
+                "\n      endpoint: https://api.tavily.com\n      api_key: {key}\n      keyless: true"
+            ));
+            assert!(
+                matches!(
+                    error,
+                    RuntimeManifestError::InvalidArtifact { index: 0, .. }
+                ),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().contains(
+                    "artifact 'web-search' declares both gateway.api_key and gateway.keyless: \
+                     true; a gateway either presents a key or is keyless"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_credential_absent_is_refused_without_secrets() {
+        for block in [
+            "\n      endpoint: https://api.tavily.com",
+            "\n      endpoint: https://api.tavily.com\n      api_key: \"\"",
+            "\n      endpoint: https://api.tavily.com\n      keyless: false",
+        ] {
+            assert_without_credential(
+                RuntimeManifest::from_yaml_str_without_secrets(&tool_gateway_manifest(block))
+                    .unwrap_err(),
+                "https://api.tavily.com",
+            );
+        }
+        let keyed = RuntimeManifest::from_yaml_str_without_secrets(&tool_gateway_manifest(
+            "\n      endpoint: https://api.tavily.com\n      api_key: ${TAVILY_API_KEY}",
+        ))
+        .unwrap();
+        let gateway = keyed.artifacts[0].gateway.as_ref().unwrap();
+        assert_eq!(gateway.api_key, None, "the key reference is left unread");
+        assert!(!gateway.keyless, "a keyed gateway is never keyless");
+    }
+
+    /// The refusal reads what the manifest wrote, never the address: a loopback or private
+    /// endpoint with no credential is refused exactly as a public one is.
+    #[test]
+    fn gateway_credential_loopback_endpoint_is_not_assumed_keyless() {
+        for endpoint in [
+            "http://127.0.0.1:11434",
+            "http://localhost:11434",
+            "http://[::1]:11434",
+            "https://10.0.0.5",
+            "https://192.168.1.10:8443",
+        ] {
+            assert_without_credential(
+                gateway_credential_error(&format!("\n      endpoint: {endpoint}")),
+                endpoint,
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_endpoint_missing_from_the_block_is_refused() {
+        for block in [
+            "\n      api_key: ${TAVILY_API_KEY}",
+            "",
+            " {}",
+            "\n      endpoint: \"  \"",
+        ] {
+            let msg = RuntimeManifest::from_yaml_str(&tool_gateway_manifest(block))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains("without 'gateway.endpoint'"),
+                "{block:?}: {msg}"
+            );
+            assert!(msg.contains("artifact 'web-search'"), "{block:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn gateway_block_unknown_key_is_reported() {
+        let manifest = RuntimeManifest::from_yaml_str(&tool_gateway_manifest(
+            "\n      endpoint: https://api.tavily.com\n      keyless: true\n      api_kee: x",
+        ))
+        .unwrap();
+        let unknown = manifest.unknown_keys;
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert_eq!(unknown[0].key, "api_kee");
+        assert_eq!(unknown[0].nearest_known.as_deref(), Some("api_key"));
+    }
+
+    #[test]
+    fn gateway_on_skill_entry_is_refused() {
+        let msg = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: notes\n    version: 0.1.0\n    runtime: skill\n    gateway:\n      endpoint: https://api.tavily.com\n      api_key: test-key\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("artifact 'notes' declares 'gateway:'"),
+            "{msg}"
+        );
+        assert!(msg.contains("runtime: skill"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_on_hook_entry_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: grafana\n    version: 0.1.0\n    runtime: hook\n    gateway:\n      endpoint: https://grafana.example.com/otlp\n      api_key: glc_literal\n",
+        )
+        .unwrap();
+        assert!(manifest.artifacts[0].gateway.is_some());
+    }
+
+    /// An `http` driver capsule. `driver_entry` is the YAML of the driver's artifact entry, or
+    /// empty for none.
+    fn http_driver_manifest(artifacts: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:{artifacts}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n"
+        )
+    }
+
+    #[test]
+    fn http_driver_entry_without_gateway_endpoint_is_refused() {
+        let msg = RuntimeManifest::from_yaml_str(&http_driver_manifest(
+            "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("'murmur-driver-anthropic'"), "{msg}");
+        assert!(msg.contains("gateway.endpoint"), "{msg}");
+    }
+
+    #[test]
+    fn http_driver_absent_from_artifacts_is_refused() {
+        let msg = RuntimeManifest::from_yaml_str(&http_driver_manifest(" []"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("inference.driver.artifact"), "{msg}");
+        assert!(msg.contains("not declared in artifacts:"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_on_unconfigured_driver_entry_is_refused() {
+        let msg = RuntimeManifest::from_yaml_str(&http_driver_manifest(
+            "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\n  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.openai.com\n      api_key: test-key",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("'murmur-driver-openai'"), "{msg}");
+        assert!(
+            msg.contains("accepted only on the entry inference.driver.artifact names"),
+            "{msg}"
+        );
+
+        let no_inference = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-openai\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.openai.com\n      api_key: test-key\n";
+        let msg = RuntimeManifest::from_yaml_str(no_inference)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("not the configured inference driver"), "{msg}");
+    }
+
+    #[test]
+    fn gateway_on_driver_entry_under_process_transport_is_refused() {
+        let msg = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\ninference:\n  transport: process\n  command: claude\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("'murmur-driver-anthropic'"), "{msg}");
+        assert!(msg.contains("transport: process"), "{msg}");
+    }
+
+    #[test]
+    fn inference_api_key_is_refused_naming_gateway_api_key() {
+        let entry = "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key";
+        for value in ["${ANTHROPIC_API_KEY}", "sk-literal", "\"\""] {
+            let manifest = http_driver_manifest(entry)
+                .replace("  model:", &format!("  api_key: {value}\n  model:"));
+            let err = RuntimeManifest::from_yaml_str(&manifest).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("'inference.api_key'"), "{msg}");
+            assert!(msg.contains("was removed"), "{msg}");
+            assert!(
+                msg.contains(
+                    "set gateway.api_key on the artifacts: entry 'murmur-driver-anthropic'"
+                ),
+                "{msg}"
+            );
+            assert!(!msg.contains("sk-literal"), "{msg}");
+        }
+
+        let process = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  api_key: ${KEY}\n";
+        let msg = RuntimeManifest::from_yaml_str(process)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("'inference.api_key'"), "{msg}");
+        assert!(
+            msg.contains("on the artifacts: entry inference.driver.artifact names"),
+            "{msg}"
+        );
+        assert!(
+            RuntimeManifest::from_yaml_str_without_secrets(process).is_err(),
+            "the refusal does not depend on resolving secrets"
+        );
+    }
+
+    #[test]
+    fn inference_endpoint_is_refused_naming_gateway_endpoint() {
+        let manifest = http_driver_manifest(
+            "\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key",
+        )
+        .replace("  model:", "  endpoint: https://api.anthropic.com\n  model:");
+        let msg = RuntimeManifest::from_yaml_str(&manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("'inference.endpoint'"), "{msg}");
+        assert!(
+            msg.contains("set gateway.endpoint on the artifacts: entry 'murmur-driver-anthropic'"),
+            "{msg}"
+        );
+
+        let process = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  endpoint: http://localhost:8080\n";
+        let msg = RuntimeManifest::from_yaml_str(process)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("'inference.endpoint'"), "{msg}");
+        assert!(msg.contains("was removed"), "{msg}");
+    }
+
+    #[test]
+    fn without_secrets_leaves_gateway_api_key_unread() {
+        let manifest = tool_gateway_manifest(
+            "\n      endpoint: https://api.tavily.com\n      api_key: tvly-literal",
+        );
+        let resolved = RuntimeManifest::from_yaml_str(&manifest).unwrap();
+        assert_eq!(
+            resolved.artifacts[0].gateway.as_ref().unwrap().api_key,
+            Some(ApiKeyReference::Literal("tvly-literal".to_string()))
+        );
+        let skipped = RuntimeManifest::from_yaml_str_without_secrets(&manifest).unwrap();
+        let gateway = skipped.artifacts[0].gateway.as_ref().unwrap();
+        assert_eq!(gateway.endpoint, "https://api.tavily.com");
+        assert_eq!(gateway.api_key, None);
+    }
+
+    #[test]
+    fn referenced_env_variables_reads_gateway_api_key() {
+        let manifest = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: web-search\n    version: 0.1.0\n    gateway:\n      endpoint: https://api.tavily.com\n      api_key: ${TAVILY_API_KEY}\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: ${ANTHROPIC_API_KEY}\n  - name: literal\n    version: 0.1.0\n    gateway:\n      endpoint: https://example.com\n      api_key: not-a-reference\ninference:\n  model: m\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let referenced = referenced_env_variables(manifest);
+        assert_eq!(
+            referenced,
+            vec![
+                ReferencedEnvVariable {
+                    field: "artifacts.murmur-driver-anthropic.gateway.api_key".to_string(),
+                    variable: "ANTHROPIC_API_KEY".to_string(),
+                },
+                ReferencedEnvVariable {
+                    field: "artifacts.web-search.gateway.api_key".to_string(),
+                    variable: "TAVILY_API_KEY".to_string(),
+                },
+            ]
+        );
+        assert!(referenced
+            .iter()
+            .all(ReferencedEnvVariable::is_gateway_credential));
     }
 
     #[test]
@@ -6078,9 +6779,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt: "Always begin with CONFIRMED:"
   driver:
@@ -6103,9 +6809,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     model: compaction-model
@@ -6132,9 +6843,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     model: compaction-model
@@ -6159,9 +6875,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     model: compaction-model
@@ -6189,9 +6910,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     threshold: 0.5
@@ -6221,9 +6947,14 @@ inference:
                 r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     model: compaction-model
@@ -6258,9 +6989,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     threshold: 0.5
@@ -6291,9 +7027,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     dump_summaries: true
@@ -6315,9 +7056,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     dump_summaries: true
@@ -6343,9 +7089,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   compaction:
     system_prompt: "inline"
@@ -6378,9 +7129,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt: "be helpful"
   compaction:
@@ -6405,9 +7161,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt_file: "conventions.md"
   driver:
@@ -6430,9 +7191,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt: "inline"
   system_prompt_file: "conventions.md"
@@ -6453,13 +7219,13 @@ inference:
     fn api_key_env_reference_parses_to_its_name_without_reading_the_environment() {
         let key = "MURMUR_TEST_INFERENCE_KEY_NEVER_SET";
         let yaml = format!(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{key}}}\n  driver:\n    artifact: murmur-driver-anthropic\n"
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${{{key}}}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n"
         );
 
         assert_eq!(
-            RuntimeManifest::from_yaml_str(&yaml)
-                .unwrap()
-                .inference
+            RuntimeManifest::from_yaml_str(&yaml).unwrap().artifacts[0]
+                .gateway
+                .clone()
                 .unwrap()
                 .api_key,
             Some(ApiKeyReference::Environment(key.to_string()))
@@ -6467,7 +7233,9 @@ inference:
         assert_eq!(
             RuntimeManifest::from_yaml_str_without_secrets(&yaml)
                 .unwrap()
-                .inference
+                .artifacts[0]
+                .gateway
+                .clone()
                 .unwrap()
                 .api_key,
             None
@@ -6493,13 +7261,13 @@ inference:
         // credential-shaped literal that secret scanners could flag.
         let literal = ["sk-", "ant-", "literal"].concat();
         let yaml = format!(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: {literal}\n  driver:\n    artifact: murmur-driver-anthropic\n"
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: {literal}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n"
         );
 
         assert_eq!(
-            RuntimeManifest::from_yaml_str(&yaml)
-                .unwrap()
-                .inference
+            RuntimeManifest::from_yaml_str(&yaml).unwrap().artifacts[0]
+                .gateway
+                .clone()
                 .unwrap()
                 .api_key,
             Some(ApiKeyReference::Literal(literal))
@@ -6507,7 +7275,9 @@ inference:
         assert_eq!(
             RuntimeManifest::from_yaml_str_without_secrets(&yaml)
                 .unwrap()
-                .inference
+                .artifacts[0]
+                .gateway
+                .clone()
                 .unwrap()
                 .api_key,
             None
@@ -6522,7 +7292,7 @@ inference:
             "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  model: test-model\n  api_key: {}\n",
             ["sk-", "ant-", "secret"].concat()
         );
-        let http_without_model = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let http_without_model = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  transport: http\n  driver:\n    artifact: murmur-driver-anthropic\n";
 
         for yaml in [process_with_key.as_str(), http_without_model] {
             let resolving = RuntimeManifest::from_yaml_str(yaml)
@@ -6540,13 +7310,17 @@ inference:
     /// does not parse at all.
     #[test]
     fn referenced_env_variables_reports_a_reference_and_nothing_else() {
-        let referencing = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${MURMUR_TEST_REFERENCED_KEY}\n";
+        let referencing = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${MURMUR_TEST_REFERENCED_KEY}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let referenced = referenced_env_variables(referencing);
         assert_eq!(referenced.len(), 1);
-        assert_eq!(referenced[0].field, "inference.api_key");
+        assert_eq!(
+            referenced[0].field,
+            "artifacts.murmur-driver-anthropic.gateway.api_key"
+        );
+        assert!(referenced[0].is_gateway_credential());
         assert_eq!(referenced[0].variable, "MURMUR_TEST_REFERENCED_KEY");
 
-        let literal = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: not-a-reference\n";
+        let literal = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: not-a-reference\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         assert!(referenced_env_variables(literal).is_empty());
 
         let no_inference = "name: cap\nversion: 0.0.1\nartifacts: []\n";
@@ -6562,10 +7336,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-openai
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
   transport: http
-  endpoint: http://127.0.0.1:8080
   model: test-model
   provider:
     artifact: murmur-driver-openai
@@ -6591,10 +7370,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
   transport: http
-  endpoint: http://127.0.0.1:8080
   model: test-model
   driver:
     artifact: murmur-driver-anthropic
@@ -6829,8 +7613,13 @@ artifacts:
     version: 1.0.0
     runtime: tool
     prompt_payload: true
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt_artifact: my-tool
   driver:
@@ -6852,8 +7641,13 @@ artifacts:
     version: 1.0.0
     runtime: skill
     prompt_payload: false
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt_artifact: my-skill
   driver:
@@ -6946,7 +7740,6 @@ version: 0.0.1
 artifacts: []
 inference:
   transport: grpc
-  endpoint: ignored
   model: test-model
   driver:
     artifact: murmur-driver-anthropic
@@ -6982,8 +7775,6 @@ inference:
         assert_eq!(inference.model, "claude-haiku-4-5-20251001");
         assert_eq!(inference.max_turns, 20);
         assert!(inference.driver.is_none());
-        assert!(inference.endpoint.is_none());
-        assert!(inference.api_key.is_none());
     }
 
     #[test]
@@ -7074,10 +7865,7 @@ inference:
 
         let msg = err.to_string();
         assert!(msg.contains("inference.endpoint"), "error was: {msg}");
-        assert!(
-            msg.contains("not valid with transport: process"),
-            "error was: {msg}"
-        );
+        assert!(msg.contains("was removed"), "error was: {msg}");
     }
 
     #[test]
@@ -7101,10 +7889,8 @@ inference:
 
         let msg = err.to_string();
         assert!(msg.contains("inference.api_key"), "error was: {msg}");
-        assert!(
-            msg.contains("not valid with transport: process"),
-            "error was: {msg}"
-        );
+        assert!(msg.contains("was removed"), "error was: {msg}");
+        assert!(!msg.contains(&key), "error was: {msg}");
     }
 
     #[test]
@@ -7166,10 +7952,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_session_tokens: 5000000000
   driver:
@@ -7190,10 +7981,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   driver:
     artifact: murmur-driver-anthropic
@@ -7210,10 +8006,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_session_tokens: 0
   driver:
@@ -7236,10 +8037,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_tokens: 4096
   driver:
@@ -7260,10 +8066,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   driver:
     artifact: murmur-driver-anthropic
@@ -7280,10 +8091,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_tokens: 0
   driver:
@@ -7305,10 +8121,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_tokens: 999999
   driver:
@@ -7328,10 +8149,15 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: https://api.anthropic.com
+      api_key: test-key
 inference:
   transport: http
-  endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   max_tokens: 4096
   driver:
@@ -7873,7 +8699,7 @@ context:
     #[test]
     fn inference_max_turns_defaults_to_10() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n",
         ).unwrap();
         assert_eq!(manifest.inference.unwrap().max_turns, 10);
     }
@@ -7881,7 +8707,7 @@ context:
     #[test]
     fn inference_max_turns_explicit_value() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_turns: 20\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 20\n  driver:\n    artifact: murmur-driver-anthropic\n",
         ).unwrap();
         assert_eq!(manifest.inference.unwrap().max_turns, 20);
     }
@@ -7889,7 +8715,7 @@ context:
     #[test]
     fn inference_max_turns_zero_is_rejected() {
         let err = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_turns: 0\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_turns: 0\n  driver:\n    artifact: murmur-driver-anthropic\n",
         ).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("inference.max_turns"), "error was: {msg}");
@@ -8072,7 +8898,7 @@ context:
     #[test]
     fn inference_max_task_reopens_is_rejected_under_http_transport() {
         let err = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_task_reopens: 3\n  driver:\n    artifact: murmur-driver-anthropic\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\ninference:\n  model: test-model\n  max_task_reopens: 3\n  driver:\n    artifact: murmur-driver-anthropic\n",
         ).unwrap_err();
         assert!(
             matches!(
@@ -8146,8 +8972,13 @@ artifacts:
   - name: my-skill
     version: 1.0.0
     runtime: skill
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt_artifact: my-skill
   driver:
@@ -8175,8 +9006,13 @@ artifacts:
   - name: my-skill
     version: 1.0.0
     runtime: skill
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt: "inline"
   system_prompt_artifact: my-skill
@@ -8200,8 +9036,13 @@ artifacts:
   - name: my-tool
     version: 1.0.0
     runtime: tool
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt_artifact: my-tool
   driver:
@@ -8221,9 +9062,14 @@ inference:
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt_artifact: missing-skill
   driver:
@@ -8247,8 +9093,13 @@ artifacts:
   - name: my-skill
     version: 1.0.0
     runtime: skill
+  - name: murmur-driver-anthropic
+    version: 0.1.0
+    runtime: driver
+    gateway:
+      endpoint: http://127.0.0.1:8080
+      keyless: true
 inference:
-  endpoint: http://127.0.0.1:8080
   model: test-model
   system_prompt: "inline"
   system_prompt_file: "conventions.md"
@@ -9482,9 +10333,11 @@ capabilities:
     #[test]
     fn the_build_side_keys_change_nothing_the_run_path_reads() {
         let body = "artifacts:\n  - name: notes-tool\n    version: 0.1.0\n    runtime: tool\n\
+                    \x20 - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: \
+                    driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n\
                     capabilities:\n  filesystem:\n    read_only:\n      - tests\n\
-                    inference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: \
-                    test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+                    inference:\n  transport: http\n  model: test-model\n  driver:\n    \
+                    artifact: murmur-driver-anthropic\n";
         let plain = RuntimeManifest::from_yaml_str(&format!("name: cap\nversion: 0.1.0\n{body}"))
             .expect("fixture must parse");
         let with_build_keys = RuntimeManifest::from_yaml_str(&format!(

@@ -11,7 +11,7 @@ mod common;
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::Write,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -20,44 +20,25 @@ use std::{
 };
 
 use assert_cmd::Command;
+use common::recording_upstream::{read_request, RecordedRequest};
 use tempfile::TempDir;
 
 const ANTHROPIC_DRIVER: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.0";
 const ANTHROPIC_AUTH: &str = "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 
-/// One request as the upstream read it off the socket.
-#[derive(Clone, Debug)]
-struct RecordedRequest {
-    method: String,
-    target: String,
-    /// Names lowercased, in arrival order.
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl RecordedRequest {
-    fn header_values(&self, name: &str) -> Vec<&str> {
-        self.headers
-            .iter()
-            .filter(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
-            .collect()
+/// Method, target, headers sorted by name, blank line, body — with the upstream's ephemeral port
+/// replaced so the rendering is stable across runs.
+fn render(request: &RecordedRequest, port: u16) -> String {
+    let mut headers = request.headers.clone();
+    headers.sort();
+    let mut out = format!("{} {}\n", request.method, request.target);
+    for (name, value) in headers {
+        out.push_str(&format!("{name}: {value}\n"));
     }
-
-    /// Method, target, headers sorted by name, blank line, body — with the upstream's ephemeral
-    /// port replaced so the rendering is stable across runs.
-    fn render(&self, port: u16) -> String {
-        let mut headers = self.headers.clone();
-        headers.sort();
-        let mut out = format!("{} {}\n", self.method, self.target);
-        for (name, value) in headers {
-            out.push_str(&format!("{name}: {value}\n"));
-        }
-        out.push('\n');
-        out.push_str(&String::from_utf8_lossy(&self.body));
-        out.replace(&format!("127.0.0.1:{port}"), "127.0.0.1:<upstream-port>")
-    }
+    out.push('\n');
+    out.push_str(&String::from_utf8_lossy(&request.body));
+    out.replace(&format!("127.0.0.1:{port}"), "127.0.0.1:<upstream-port>")
 }
 
 /// What the upstream writes back for every request.
@@ -114,82 +95,6 @@ impl RecordingUpstream {
     fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().unwrap().clone()
     }
-}
-
-fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok()?;
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let head_end = loop {
-        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            return None;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-    };
-    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
-    let mut body = buffer[head_end + 4..].to_vec();
-    let mut lines = head.split("\r\n");
-    let mut request_line = lines.next()?.split(' ');
-    let method = request_line.next()?.to_string();
-    let target = request_line.next()?.to_string();
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
-        .collect();
-
-    let content_length = headers
-        .iter()
-        .find(|(n, _)| n == "content-length")
-        .and_then(|(_, v)| v.parse::<usize>().ok());
-    let chunked = headers
-        .iter()
-        .any(|(n, v)| n == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
-    if let Some(length) = content_length {
-        while body.len() < length {
-            let read = stream.read(&mut chunk).ok()?;
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-    } else if chunked {
-        while !body.windows(5).any(|w| w == b"0\r\n\r\n") {
-            let read = stream.read(&mut chunk).ok()?;
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-        body = dechunk(&body);
-    }
-    Some(RecordedRequest {
-        method,
-        target,
-        headers,
-        body,
-    })
-}
-
-fn dechunk(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut rest = raw;
-    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
-        let size =
-            usize::from_str_radix(String::from_utf8_lossy(&rest[..pos]).trim(), 16).unwrap_or(0);
-        if size == 0 {
-            break;
-        }
-        let start = pos + 2;
-        out.extend_from_slice(&rest[start..start + size]);
-        rest = &rest[start + size + 2..];
-    }
-    out
 }
 
 fn write_reply(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
@@ -251,9 +156,9 @@ impl Capsule {
             &manifest,
             format!(
                 "name: gateway-capsule\nversion: 0.1.0\nartifacts:\n  - name: {driver}\n    \
-                 version: {DRIVER_VERSION}\n    runtime: driver\n{extra}inference:\n  \
-                 transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-                 api_key: ${{GATEWAY_TEST_KEY}}\n  driver:\n    artifact: {driver}\n"
+                 version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      \
+                 endpoint: {endpoint}\n      api_key: ${{GATEWAY_TEST_KEY}}\n{extra}inference:\n  \
+                 transport: http\n  model: test-model\n  driver:\n    artifact: {driver}\n"
             ),
         )
         .unwrap();
@@ -338,7 +243,7 @@ fn upstream_request_matches_recording() {
         request.header_values("host"),
         vec![format!("127.0.0.1:{}", upstream.port).as_str()]
     );
-    let rendered = request.render(upstream.port);
+    let rendered = render(request, upstream.port);
 
     if std::env::var_os("MURMUR_RECORD_GOLDEN").is_some() {
         fs::create_dir_all(golden_path().parent().unwrap()).unwrap();
@@ -537,8 +442,8 @@ fn driver_without_inference_auth_refuses() {
     }
 }
 
-/// Naming the provider in `network.allow` is accepted and warned about once, on a real run and
-/// under `--explain-scope`.
+/// Naming the driver's `gateway.endpoint` host in `network.allow` is accepted and warned about
+/// once, naming the entry and the driver, on a real run and under `--explain-scope`.
 #[test]
 fn provider_in_network_allow_warns() {
     let upstream = streamed_upstream();
@@ -555,6 +460,13 @@ fn provider_in_network_allow_warns() {
     assert_eq!(lines.len(), 1, "{}", run.stderr);
     assert!(lines[0].contains(W_SEC_025_LINK), "{}", lines[0]);
     assert!(lines[0].contains(&format!("'{}'", upstream.endpoint)));
+    assert!(
+        lines[0].contains(&format!(
+            "gateway.endpoint host of artifact '{ENV_REPORT_DRIVER}'"
+        )),
+        "{}",
+        lines[0]
+    );
     assert_eq!(reported(&run.result(), "key"), "absent");
 
     let explained = capsule.explain_scope();

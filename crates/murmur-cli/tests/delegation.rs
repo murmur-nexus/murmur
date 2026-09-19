@@ -703,11 +703,13 @@ fn agent_capsule_manifest(endpoint: &str) -> String {
 fn agent_capsule_manifest_with(endpoint: &str, lifecycle: &str) -> String {
     format!(
         "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+         \x20   gateway:\n      endpoint: {endpoint}\n      \
+         api_key: ${{{PROVIDER_KEY_VAR}}}\n\
          capabilities:\n  network:\n    allow: [{authority}]\n  \
          env:\n    allow: [{PROVIDER_KEY_VAR}]\n\
          lifecycle:\n  {lifecycle}\n\
-         inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-         api_key: ${{{PROVIDER_KEY_VAR}}}\n  driver:\n    artifact: {DRIVER}\n",
+         inference:\n  transport: http\n  model: test-model\n  \
+         driver:\n    artifact: {DRIVER}\n",
         authority = endpoint.trim_start_matches("http://"),
     )
 }
@@ -747,11 +749,12 @@ impl Parent {
         let manifest_body = format!(
             "name: {name}\nversion: {VERSION}\n\
              artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             \x20   gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
              capabilities:\n  network:\n    allow: [127.0.0.1]\n  \
              env:\n    allow: [{PROVIDER_KEY_VAR}]\n{spawn_yaml}\
              lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
-             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-             api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
+             inference:\n  transport: http\n  model: test-model\n  \
+             driver:\n    artifact: {DRIVER}\n",
             endpoint = server.endpoint,
         );
         let manifest_path = project.join("murmur.yaml");
@@ -983,6 +986,7 @@ fn stage_request(
                 source: artifact.source.clone(),
                 on_overflow: artifact.on_overflow,
                 config: artifact.config.clone(),
+                gateway: artifact.gateway.clone(),
                 capabilities: artifact.capabilities.clone(),
             })
             .collect(),
