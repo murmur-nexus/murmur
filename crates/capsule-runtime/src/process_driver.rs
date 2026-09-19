@@ -30,8 +30,9 @@ const PROCESS_DRIVER_IFACE_PREFIX: &str = "murmur:driver/process@";
 
 /// Checks the inference driver's exports against the transport that names it.
 ///
-/// Under `process` the driver must export exactly [`PROCESS_DRIVER_IFACE`]; under `http` it must
-/// export no version of the process interface. `contracts` is what
+/// Under `process` the driver's exports must include [`PROCESS_DRIVER_IFACE`] under that exact
+/// name — a neighbouring version does not satisfy it, and other instances alongside it are
+/// ignored. Under `http` it must export no version of the process interface. `contracts` is what
 /// [`murmur_artifact::extract_wit_contracts`] read out of the driver's wasm; `None` (a core
 /// module, or bytes it could not read) counts as exporting nothing. Any other transport passes.
 pub fn check_driver_interface(
@@ -190,11 +191,7 @@ impl ProcessDriver {
                 };
                 self.load_error(message)
             })?;
-        if let Some(bad) = description
-            .required_env
-            .iter()
-            .find(|var| var.is_empty() || var.contains('=') || var.contains('\0'))
-        {
+        if let Some(bad) = unusable_env_name(&description) {
             return Err(self.load_error(format!(
                 "describe() names {bad:?} in required-env, which is not a usable variable name"
             )));
@@ -209,6 +206,19 @@ impl ProcessDriver {
             message,
         }
     }
+}
+
+/// The first `required-env` name that could not be set as an environment variable, if any.
+///
+/// A name carrying `=` would set a second variable when the harness's environment is built, and
+/// one carrying NUL truncates it; an empty name is neither. Rejected where the driver's word is
+/// first taken, rather than wherever it is later spent.
+fn unusable_env_name(description: &Description) -> Option<&str> {
+    description
+        .required_env
+        .iter()
+        .find(|var| var.is_empty() || var.contains('=') || var.contains('\0'))
+        .map(String::as_str)
 }
 
 /// Compiles `wasm` as a process driver on a fresh engine, instantiates it with no grants, and
@@ -350,6 +360,26 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("'d@1.0.0'"), "{message}");
         assert!(message.contains("Z, A"), "{message}");
+    }
+
+    #[test]
+    fn required_env_usable_names_pass() {
+        assert_eq!(
+            unusable_env_name(&description(&["HOME", "PROFILE_2"])),
+            None
+        );
+        assert_eq!(unusable_env_name(&description(&[])), None);
+    }
+
+    #[test]
+    fn required_env_refuses_a_name_that_is_not_a_variable() {
+        for bad in ["", "A=B", "A\0B"] {
+            assert_eq!(
+                unusable_env_name(&description(&["HOME", bad, "TAIL"])),
+                Some(bad),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     #[test]
