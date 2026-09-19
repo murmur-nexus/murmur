@@ -4367,10 +4367,12 @@ fn parse_artifact_gateway(
 /// gateway request.
 ///
 /// The error is the whole message, naming `gateway.endpoint` and the artifact entry `artifact`.
+/// It quotes the endpoint with any userinfo masked, so a password written into the URL is never
+/// echoed.
 fn validate_gateway_endpoint(artifact: &str, endpoint: &str) -> Result<(), String> {
-    let refuse = |why: String| {
-        format!("artifact '{artifact}' declares gateway.endpoint '{endpoint}', {why}")
-    };
+    let shown = mask_endpoint_userinfo(endpoint);
+    let refuse =
+        |why: String| format!("artifact '{artifact}' declares gateway.endpoint '{shown}', {why}");
     if endpoint.contains("${") {
         return Err(refuse(
             "which contains '${' — gateway.endpoint is not interpolated; write the upstream \
@@ -4425,6 +4427,24 @@ fn validate_gateway_endpoint(artifact: &str, endpoint: &str) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+/// `endpoint` with everything before the last `@` of its authority replaced by `***`.
+///
+/// Textual rather than parsed, so it also masks an endpoint the URL parser rejects.
+fn mask_endpoint_userinfo(endpoint: &str) -> std::borrow::Cow<'_, str> {
+    let authority_start = endpoint.find("://").map_or(0, |at| at + 3);
+    let rest = &endpoint[authority_start..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_len].rfind('@') {
+        Some(at) => format!(
+            "{}***{}",
+            &endpoint[..authority_start],
+            &endpoint[authority_start + at..]
+        )
+        .into(),
+        None => endpoint.into(),
+    }
 }
 
 /// The cross-entry rules for a `gateway:` on a driver, which need the parsed `inference:` block.
@@ -6304,11 +6324,26 @@ inference:
 
     #[test]
     fn gateway_endpoint_with_userinfo_is_refused() {
-        let msg = gateway_endpoint_error("https://user:pass@api.example.com");
+        let msg = gateway_endpoint_error("https://user:sk-in-url@api.example.com");
         assert!(msg.contains("artifact 'web-search'"), "{msg}");
         assert!(msg.contains("carries userinfo before '@'"), "{msg}");
         assert!(msg.contains("host 'api.example.com'"), "{msg}");
         assert!(msg.contains("gateway.api_key"), "{msg}");
+        assert!(msg.contains("'https://***@api.example.com'"), "{msg}");
+        assert!(
+            !msg.contains("sk-in-url"),
+            "a password in the URL is never echoed: {msg}"
+        );
+    }
+
+    #[test]
+    fn gateway_endpoint_refusal_masks_userinfo_the_parser_rejects() {
+        let msg = gateway_endpoint_error("https://user:sk-in-url@");
+        assert!(msg.contains("does not parse as a URL"), "{msg}");
+        assert!(
+            !msg.contains("sk-in-url"),
+            "a password in the URL is never echoed: {msg}"
+        );
     }
 
     #[test]

@@ -6,16 +6,20 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// One request as the upstream read it off the socket.
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
+    pub method: String,
     pub target: String,
     /// Names lowercased, in arrival order.
     pub headers: Vec<(String, String)>,
+    /// Dechunked when the request was sent `transfer-encoding: chunked`.
     pub body: Vec<u8>,
+    /// When the request head was complete.
+    pub arrived: Instant,
 }
 
 impl RecordedRequest {
@@ -114,8 +118,8 @@ impl RecordingUpstream {
     }
 }
 
-/// Reads one request head and a `content-length` body. `None` when the peer closes before a
-/// complete head.
+/// Reads one request head and its body, sized by `content-length` or `transfer-encoding:
+/// chunked`. `None` when the peer closes before a complete head.
 pub fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -132,31 +136,64 @@ pub fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
         }
         buffer.extend_from_slice(&chunk[..read]);
     };
+    let arrived = Instant::now();
     let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
     let mut body = buffer[head_end + 4..].to_vec();
     let mut lines = head.split("\r\n");
     let mut request_line = lines.next()?.split(' ');
-    let _method = request_line.next()?;
+    let method = request_line.next()?.to_string();
     let target = request_line.next()?.to_string();
     let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
+
     let content_length = headers
         .iter()
         .find(|(n, _)| n == "content-length")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    while body.len() < content_length {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
+        .and_then(|(_, v)| v.parse::<usize>().ok());
+    let chunked = headers
+        .iter()
+        .any(|(n, v)| n == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+    if let Some(length) = content_length {
+        while body.len() < length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
         }
-        body.extend_from_slice(&chunk[..read]);
+    } else if chunked {
+        while !body.windows(5).any(|w| w == b"0\r\n\r\n") {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body = dechunk(&body);
     }
     Some(RecordedRequest {
+        method,
         target,
         headers,
         body,
+        arrived,
     })
+}
+
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+        let size =
+            usize::from_str_radix(String::from_utf8_lossy(&rest[..pos]).trim(), 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let start = pos + 2;
+        out.extend_from_slice(&rest[start..start + size]);
+        rest = &rest[start + size + 2..];
+    }
+    out
 }

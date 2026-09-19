@@ -255,9 +255,9 @@ pub const W_SEC_024: &str = "W-SEC-024";
 /// host of an artifact's `gateway.endpoint`.
 ///
 /// The runtime reaches that upstream itself, through the artifact's credential gateway, and
-/// attaches the key there; a gateway-addressed request never consults the allow-list. The entry is
-/// not inert — it still grants tools, subprocesses and artifacts direct reach to that host, just
-/// without the key — so it is accepted rather than refused, and the warning says what it grants.
+/// attaches the key there; a gateway-addressed request never consults the allow-list. The entry
+/// still grants tools, subprocesses and artifacts direct reach to that host, without the key, so
+/// the warning says what it grants. Never a refusal.
 /// Fires once per matching entry, before any session workdir exists.
 pub const W_SEC_025: &str = "W-SEC-025";
 
@@ -303,9 +303,8 @@ pub const W_SEC_029: &str = "W-SEC-029";
 ///
 /// Only the configured `transport: http` driver's gateway is admitted against the spend meter;
 /// every other artifact's keyed request is sent without an admission and counts toward neither
-/// `inference.max_session_tokens` nor `spend.machine_tokens_per_day`. Never a refusal — an
-/// unmetered third-party API is an ordinary thing for a tool to call — but stated, so an operator
-/// does not read the spend ceilings as covering it. Fires once per such gateway, at launch and
+/// `inference.max_session_tokens` nor `spend.machine_tokens_per_day`. Never a refusal; stated so an
+/// operator does not read the spend ceilings as covering it. Fires once per such gateway, at launch and
 /// from `mur doctor`, before any session workdir exists, and never names the key.
 pub const W_SEC_030: &str = "W-SEC-030";
 

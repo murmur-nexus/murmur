@@ -3572,7 +3572,7 @@ fn gateway_endpoint_host(endpoint: &str) -> String {
 ///
 /// That transport's CLI reaches its provider with its own credentials, so nothing it spends passes
 /// the inference gateway and the machine ceiling does not cover it. Shared between `mur run` and
-/// `mur doctor` on the same terms as [`warn_on_inference_endpoint_in_network_allow`]: decided
+/// `mur doctor` on the same terms as [`warn_on_gateway_endpoint_in_network_allow`]: decided
 /// before any session workdir exists, so it goes to stderr only. Never a refusal.
 pub fn warn_on_machine_spend_ceiling_under_process_transport(
     machine_tokens_per_day: Option<u64>,

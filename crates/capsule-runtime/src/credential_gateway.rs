@@ -170,9 +170,10 @@ impl CredentialGateway {
         metering: GatewayMetering,
     ) -> Result<Self, RuntimeError> {
         let artifact = artifact.into();
+        // The endpoint is not quoted: a refused one may carry a password in its userinfo.
         let refuse = |message: &str| {
             RuntimeError::Runtime(format!(
-                "gateway.endpoint '{endpoint}' on artifact '{artifact}' {message}"
+                "gateway.endpoint on artifact '{artifact}' {message}"
             ))
         };
         if endpoint.contains("${") {
@@ -607,7 +608,7 @@ mod tests {
     #[test]
     fn credential_gateway_refuses_userinfo() {
         for endpoint in [
-            "https://user:pass@api.example.com",
+            "https://user:sk-in-url@api.example.com",
             "https://user@api.example.com",
             "https://api.example.com@127.0.0.1:8443",
             "https://${PROVIDER_HOST}/v1",
@@ -622,6 +623,7 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("gateway.endpoint"), "{err}");
             assert!(err.to_string().contains("artifact 'web-search'"), "{err}");
+            assert!(!err.to_string().contains("sk-in-url"), "{err}");
         }
     }
 

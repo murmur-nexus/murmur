@@ -100,7 +100,14 @@ Subprocesses start from Murmur's small baseline rather than the complete host en
 - remember that built-in credential-shaped variables are stripped before spawn;
 - remember the composition order: baseline, explicit additions, removals, then synthetic `HOME`/`USERPROFILE`; removals win and the synthetic home cannot be overridden.
 
-The same environment construction applies to native tool subprocesses even when `shell.allow` is absent. Give a WASM tool, hook, or the inference driver its third-party key through `gateway: {endpoint, api_key}` on its own `artifacts:` entry: the runtime attaches the key to that artifact's requests and the artifact never holds it. A native tool cannot take a gateway (`E-CAP-017`). A gateway for anything but the configured driver is unmetered by the spend ceilings, reported as `W-SEC-030`. An upstream that takes no key is declared `keyless: true`; a gateway with neither `api_key` nor `keyless: true` is refused with `E-CAP-018`. Never pass a key through `env.allow` or an artifact's `config:` block.
+The same environment construction applies to native tool subprocesses even when `shell.allow` is absent.
+
+Give a WASM tool, hook, or the inference driver its third-party key through `gateway: {endpoint, api_key}` on its own `artifacts:` entry. The runtime attaches the key to that artifact's requests and the artifact never holds it.
+
+- A native tool cannot take a gateway (`E-CAP-017`).
+- A gateway for anything but the configured driver is not metered by the spend ceilings, reported as `W-SEC-030`.
+- An upstream that takes no key is declared `keyless: true`; a gateway with neither `api_key` nor `keyless: true` is refused with `E-CAP-018`.
+- Never pass a key through `env.allow` or an artifact's `config:` block.
 
 ## Narrow artifacts below the ceiling
 
@@ -110,7 +117,7 @@ Do this after the ceiling is minimal.
 - An explicit per-artifact `network.allow: []` narrows that artifact to no outbound network; omission inherits the ceiling and is not equivalent.
 - Per-artifact network entries must be at least as specific as the corresponding ceiling entry. Match scheme, host, and port exactly when possible.
 - Use per-artifact `filesystem.scope` to give each WASM tool only its required subtree.
-- In current Murmur behavior, only per-artifact `network` and `filesystem` narrowing is effective. Per-artifact `shell`, `spawn`, `env`, `limits`, `resources`, or `containment` entries are inert and trigger `W-SEC-008`; put subprocess controls at capsule scope or move the operation into WASM.
+- Only per-artifact `network`, `filesystem` and `state` take effect on a tool or driver. Per-artifact `shell`, `spawn`, `env`, `limits`, `resources`, or `containment` entries are inert and trigger `W-SEC-008`; put subprocess controls at capsule scope or move the operation into WASM.
 - Hooks start with no network, directory, or task visibility unless granted. Tools and drivers start from the opposite default by inheriting the ceiling. Audit unnarrowed tools and widened hooks.
 
 Example shape; adapt endpoints, scopes, artifact names, versions, and provider fields to the actual use case:

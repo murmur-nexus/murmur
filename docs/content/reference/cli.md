@@ -1993,7 +1993,7 @@ mur config set inference.model claude-haiku-4-5-20251001 -g
 # Set inference.model in ~/.murmur/config.yaml
 ```
 
-Any other dotted key — known `MurConfig` field or not — is rejected with `E-CFG-002` and writes
+Any other dotted key — a known config field or not — is rejected with `E-CFG-002` and writes
 nothing:
 
 ```bash

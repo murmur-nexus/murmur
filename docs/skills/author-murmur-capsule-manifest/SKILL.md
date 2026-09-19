@@ -77,7 +77,9 @@ Never place credentials, tokens, passwords, or API keys literally in `murmur.yam
 Use environment references such as:
 
 ```yaml
-api_key: ${PROVIDER_API_KEY}
+gateway:
+  endpoint: https://<provider-host>
+  api_key: ${PROVIDER_API_KEY}
 ```
 
 A manifest is plaintext that will be committed, diffed, shared, logged, and pasted into incidents. A literal secret in it is already a disclosure.
@@ -284,7 +286,7 @@ inference:
   model: <optional-model-id>
 ```
 
-Do not add `endpoint`, `driver`, or `api_key` under `transport: process`.
+Do not add `inference.driver` under `transport: process`, and do not give any `runtime: driver` entry a `gateway:`; both are refused with `E-MAN-003`.
 
 Treat process inference as a deliberate host-process boundary. Keep the rest of the capsule's shell, filesystem, environment, and resource posture narrow.
 
@@ -348,7 +350,7 @@ Both require the binary to already be in `shell.allow`. They are mutually exclus
 
 #### Environment
 
-`capabilities.env.allow` exposes selected **non-secret** host environment values to WASM guests. Do not use it as a secret-delivery mechanism; credential-shaped variables are intentionally filtered.
+`capabilities.env.allow` exposes selected **non-secret** host environment values to WASM components. Do not use it as a secret-delivery mechanism; credential-shaped variables are intentionally filtered.
 
 #### Resource bounds
 

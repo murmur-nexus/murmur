@@ -342,7 +342,7 @@ pub struct StageRequest {
     pub lock_expectations: Option<Vec<LockExpectation>>,
     pub capability_policy: CapabilityPolicy,
     pub inference: Option<InferenceConfig>,
-    /// The global config file a `${NAME}` in `inference.api_key` is looked up in first, as
+    /// The global config file a `${NAME}` in an artifact's `gateway.api_key` is looked up in first, as
     /// `credentials.NAME`, and re-read from while the session runs. `None` looks in the launching
     /// environment only.
     pub credentials_file: Option<PathBuf>,

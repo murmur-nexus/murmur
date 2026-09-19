@@ -234,5 +234,5 @@ inference_auth:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the driver sets, in any case, is replaced |
-| `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by the entry's `gateway.api_key`. With no `api_key`, no header is sent |
+| `inference_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the artifact sets, in any case, is replaced. Cannot be `Host`, `Origin`, `Referer`, `Cookie`, `Connection`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Expect`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding` or `Upgrade` |
+| `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by the entry's `gateway.api_key`. Under `gateway.keyless: true`, no header is sent |

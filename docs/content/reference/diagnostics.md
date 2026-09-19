@@ -26,7 +26,7 @@ section that explains it.
 | `E-CAP-013` | An artifact claims the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
 | `E-CAP-014` | A variable this project needs is set by nothing in the environment | [E-CAP-014](#e-cap-014) |
 | `E-CAP-015` | A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold | [E-CAP-015](#e-cap-015) |
-| `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every guest | [E-CAP-016](#e-cap-016) |
+| `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every WASM component | [E-CAP-016](#e-cap-016) |
 | `E-CAP-017` | A `gateway:` is declared on a native tool, whose requests never pass the credential gateway | [E-CAP-017](#e-cap-017) |
 | `E-CAP-018` | A `gateway:` names an endpoint but binds no `api_key` and does not declare `keyless: true` | [E-CAP-018](#e-cap-018) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
@@ -119,7 +119,7 @@ section that explains it.
 | `W-SEC-025` | A `capabilities.network.allow` entry names an artifact's `gateway.endpoint` host — the gateway does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
 | `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
 | `W-SEC-027` | An artifact's `gateway.api_key` is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
-| `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file an inference key was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
+| `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file a `gateway.api_key` was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
 | `W-SEC-029` | A compiler driver could not be run to ask where its helper binaries live, so `W-SEC-012` was not evaluated for it | [W-SEC-029](#w-sec-029) |
 | `W-SEC-030` | An artifact reaches its upstream through an unmetered credential gateway, which the spend ceilings do not cover | [W-SEC-030](#w-sec-030) |
 
@@ -442,6 +442,7 @@ A block that is present and malformed adds the reason in parentheses:
 | `missing required field 'inference_auth.header'` or `'inference_auth.value'` | A child is absent |
 | `'inference_auth.header' has invalid type` or `'inference_auth.value' has invalid type` | A child is not a string |
 | `is not a valid HTTP header name` | `header` cannot be sent as a header |
+| `cannot carry the key` | `header` names a header that routes or frames the request, or that upstreams commonly echo back, such as `Host` or `Origin` |
 | `must contain {key} exactly once` | `value` has no `{key}`, or more than one |
 | `contains characters an HTTP header value cannot hold` | `value` has a control character such as a newline |
 
@@ -811,8 +812,8 @@ Add the name to the parent's `capabilities.env.allow`, or drop it from the child
 
 ### E-CAP-016 — an `env.allow` entry the credential backstop strips { #e-cap-016 }
 
-A `capabilities.env.allow` entry names a variable the credential backstop removes from every guest
-environment:
+A `capabilities.env.allow` entry names a variable the credential backstop removes from every WASM
+component's environment:
 
 ```text
 error[E-CAP-016]: capabilities.env.allow names 'GITHUB_TOKEN' (credential backstop pattern 'GITHUB_TOKEN'), 'MY_SERVICE_SECRET' (capabilities.shell.strip_env pattern '*_SERVICE_SECRET'); these entries are removed from every guest environment before any guest is built, so the grant would deliver nothing
@@ -844,7 +845,7 @@ nothing.
 
 **What to do:** remove the entries. For a provider or third-party API key, set
 [`gateway.api_key`](manifest.md#artifact-gateway) on the entry of the artifact that uses it: the
-runtime presents the key itself. For a variable a guest needs, give it a host name no pattern
+runtime presents the key itself. For a variable a component needs, give it a host name no pattern
 matches. A name the backstop keeps but that looks like a credential is reported by
 [`W-SEC-024`](#w-sec-024).
 
@@ -861,7 +862,7 @@ error[E-CAP-017]: artifact 'my-native-tool' declares 'gateway:' but ships a nati
 ```
 
 `mur run` refuses at staging, before a session directory is created. A native tool runs as a host
-subprocess, so the gateway could never attach its key and the block would do nothing.
+subprocess whose requests the runtime cannot attach a key to.
 
 ### E-CAP-018 — a gateway that binds no credential { #e-cap-018 }
 
@@ -1662,8 +1663,8 @@ Local customisation belongs in `/etc/apparmor.d/local/mur-sealed`, which both sh
 staging, on stderr.
 
 **Why it matters:** a [durable state store](workdir.md#state-store) is granted per *artifact* — it
-is the `runtime: tool`, `runtime: driver` or `runtime: hook` entry that receives the second preopen.
-The capsule's own guest is built with no artifact grant at all, so a top-level declaration reaches
+is the `runtime: tool`, `runtime: driver` or `runtime: hook` entry that receives the second directory.
+The capsule's own component is built with no artifact grant at all, so a top-level declaration reaches
 nothing: no directory is created and no `state` path exists for anybody. Without this warning the
 only signal is a store that never appears.
 
@@ -1724,7 +1725,7 @@ delivered normally.
 staging, on stderr.
 
 **Why it matters:** the `murmur:conversation/read` grant is per *hook* — it is the `runtime: hook`
-entry whose component imports the interface that receives it. The capsule's own guest holds no
+entry whose component imports the interface that receives it. The capsule's own component holds no
 artifact grant and compiles against a world with no such import, so a top-level declaration reaches
 nothing and no artifact can read the [conversation record](workdir.md#the-conversation-record).
 
@@ -2006,14 +2007,14 @@ set `HOME` to a directory this user owns, and the next launch records itself.
 ### W-SEC-024 — `capabilities.env.allow` names a credential-shaped variable { #w-sec-024 }
 
 **Fires when:** an entry in [`capabilities.env.allow`](manifest.md#field-capabilities) reaches every
-WASM guest and its name is credential-shaped. Either rule makes a name credential-shaped:
+WASM component and its name is credential-shaped. Either rule makes a name credential-shaped:
 
 1. It contains `api_key`, `token`, `secret` or `password`, in any case.
 2. One of its segments, split on every character that is not a letter or a digit, is `KEY`, `KEYS`,
    `PASS`, `PASSWD`, `PASSPHRASE`, `CREDENTIAL`, `CREDENTIALS`, `CREDS`, `DSN`, `AUTH`, `PAT` or
    `COOKIE`, in any case.
 
-A name the credential backstop strips never reaches a guest and is refused with
+A name the credential backstop strips never reaches a component and is refused with
 [`E-CAP-016`](#e-cap-016) instead. The warning prints once per distinct entry, in declaration order,
 on stderr, from `mur run` (including `mur run --explain-scope`) and from `mur doctor` in identical
 words.
@@ -2027,7 +2028,7 @@ The rule is measured against a fixed list of 26 names that carry credentials and
 | Warned about but carry no credential | `TOKENIZERS_PARALLELISM`, `CACHE_KEY_PREFIX` |
 | Never warned about | `PATH`, `PWD`, `AUTHOR_NAME`, `KEYBOARD_LAYOUT`, `PASSENGER_COUNT` and the other ordinary names on the list |
 
-A name the rule misses is still delivered to every guest, so review a connection-string entry such
+A name the rule misses is still delivered to every WASM component, so review a connection-string entry such
 as `DATABASE_URL` yourself.
 
 A credential-shaped name:
@@ -2177,6 +2178,7 @@ toolchain it cannot run under `sealed` even though no `W-SEC-012` names it.
 **What to do:** make the driver named in the warning runnable by the user launching the capsule,
 then run `mur doctor`. A `Text file busy` or resource error that clears on its own is gone on
 the next `mur doctor`.
+
 ### W-SEC-030 — an unmetered credential gateway { #w-sec-030 }
 
 **Fires when:** an artifact entry declares [`gateway:`](manifest.md#artifact-gateway) and is not the
@@ -2188,13 +2190,12 @@ driver.
 [capsule-runtime] warning[W-SEC-030]: artifact 'murmur-tool-web-search' reaches api.tavily.com through the credential gateway, unmetered — murmur neither counts nor limits what its calls spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not cover it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-030)
 ```
 
-**Why it matters:** only the driver's gateway is admitted against the spend meter. The artifact's
-calls are sent without an admission and count toward neither ceiling, so a capsule that stops at
-its token ceiling can keep spending on this upstream.
+**Why it matters:** only the configured driver's calls count toward the spend ceilings. This
+artifact's calls count toward neither, so a capsule that stops at its token ceiling can keep
+spending on this upstream.
 
 **What the runtime does about it:** nothing is refused. [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl)
 records the gateway with `metered: false`.
 
 **What to do:** bound the artifact's spend with the upstream's own controls, such as a key with its
 own quota.
-

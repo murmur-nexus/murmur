@@ -121,7 +121,7 @@ pub(crate) struct EnvironmentNames {
     /// Whether this process's own environment counts. False only for the test constructor, so a
     /// unit test's expectations do not depend on what the machine running it exports.
     include_process_env: bool,
-    /// Credential names the global config's `credentials:` map holds a non-empty value for. An
+    /// Credential names the global config's `credentials:` map holds a non-empty value for. A
     /// `gateway.api_key: ${NAME}` is answered from there before the environment is consulted.
     credentials: BTreeSet<String>,
 }

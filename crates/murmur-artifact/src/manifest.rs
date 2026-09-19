@@ -232,8 +232,8 @@ fn yaml_type_name(value: &Value) -> String {
 /// The substitution point for the inference credential in [`InferenceAuth::value`].
 pub const INFERENCE_AUTH_KEY_PLACEHOLDER: &str = "{key}";
 
-/// How a driver's provider expects the inference credential to be presented, from the driver's
-/// own bundled `murmur.yaml`:
+/// How an artifact's upstream expects its credential to be presented, from the artifact's own
+/// bundled `murmur.yaml`:
 ///
 /// ```yaml
 /// inference_auth:
@@ -241,8 +241,9 @@ pub const INFERENCE_AUTH_KEY_PLACEHOLDER: &str = "{key}";
 ///   value: "Bearer {key}"
 /// ```
 ///
-/// The runtime attaches `header` to each request the driver sends through the inference gateway,
-/// with `{key}` replaced by `inference.api_key`. Holds the template only, never a key.
+/// The runtime attaches `header` to each request the artifact sends through its credential
+/// gateway, with `{key}` replaced by the entry's `gateway.api_key`. Holds the template only, never
+/// a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceAuth {
     /// A valid HTTP header name, as written. Compared case-insensitively on the wire.
@@ -258,6 +259,28 @@ impl InferenceAuth {
         self.value.replacen(INFERENCE_AUTH_KEY_PLACEHOLDER, key, 1)
     }
 }
+
+/// Header names `inference_auth.header` may not use.
+///
+/// The artifact picks the header, so it must not be able to pick one the upstream reflects into
+/// the response it reads back (`Host` into a redirect or error page, `Origin` into CORS headers,
+/// `Referer`, `Cookie`), nor one that routes or frames the request.
+const RESERVED_AUTH_HEADERS: &[&str] = &[
+    "host",
+    "origin",
+    "referer",
+    "cookie",
+    "connection",
+    "content-length",
+    "content-type",
+    "content-encoding",
+    "expect",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 /// Reads the top-level `inference_auth:` block from a driver's bundled manifest text.
 ///
@@ -291,6 +314,18 @@ pub fn parse_inference_auth(manifest_yaml: &str) -> Result<Option<InferenceAuth>
         return Err(ManifestError::InvalidValue {
             field: format!("{FIELD}.header"),
             message: format!("'{header}' is not a valid HTTP header name"),
+        });
+    }
+    if RESERVED_AUTH_HEADERS
+        .iter()
+        .any(|reserved| header.eq_ignore_ascii_case(reserved))
+    {
+        return Err(ManifestError::InvalidValue {
+            field: format!("{FIELD}.header"),
+            message: format!(
+                "'{header}' cannot carry the key: it controls how the request is routed or \
+                 framed, or upstreams commonly echo it back in the response"
+            ),
         });
     }
     let placeholders = template.matches(INFERENCE_AUTH_KEY_PLACEHOLDER).count();
@@ -430,6 +465,19 @@ mod inference_auth_tests {
             assert!(
                 message.contains(expected),
                 "{block:?}: expected {expected:?} in {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inference_auth_refuses_a_header_the_upstream_echoes_or_routes_by() {
+        for header in ["Host", "origin", "Referer", "Cookie", "Content-Length"] {
+            let message = refused(&format!(
+                "inference_auth:\n  header: {header}\n  value: \"{{key}}\"\n"
+            ));
+            assert!(
+                message.contains("'inference_auth.header'") && message.contains("cannot carry"),
+                "{header}: {message}"
             );
         }
     }

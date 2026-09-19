@@ -96,7 +96,7 @@ capabilities:
         source_path: /opt/testbed/conda/envs/django__django   # absolute host path to an already-pinned tree
         pin: conda-4.10.3/python-3.9.19/testbed-2024-05-01    # required; never inferred
   env:
-    allow:             # optional: host env vars a WASM guest (capsule/tool/driver) may observe
+    allow:             # optional: host env vars a WASM component (capsule/tool/driver) may observe
       - MY_APP_REGION
 
 network:
@@ -215,10 +215,10 @@ mur_version: "1.0.0"
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 | `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. Declaring it on `runtime: skill` fails with `E-MAN-003`. |
 | `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config) and [Choosing a config block](#which-config-block). |
-| `artifacts[].gateway` | map | no | The third-party upstream this artifact reaches through the credential gateway, and the key the runtime presents there. Recognized on `runtime: tool`, `runtime: hook` and `runtime: driver`; on `runtime: skill` it fails with `E-MAN-003`. On a `runtime: driver` entry it is accepted only on the `transport: http` driver `inference.driver.artifact` names, and that entry requires it. See [Credential gateway](#artifact-gateway). |
-| `artifacts[].gateway.endpoint` | string | yes (when `gateway` is set) | Upstream URL. See [`gateway.endpoint` validation](#gateway-endpoint-validation). |
+| `artifacts[].gateway` | map | no | The third-party upstream this artifact reaches through the credential gateway, and the key the runtime presents there. Required on the `transport: http` driver `inference.driver.artifact` names. Which other entries accept it is in [Credential gateway](#artifact-gateway). |
+| `artifacts[].gateway.endpoint` | string | yes (when `gateway` is set) | Upstream URL. A `gateway:` without it fails with `E-MAN-003`. See [`gateway.endpoint` validation](#gateway-endpoint-validation). |
 | `artifacts[].gateway.api_key` | string | yes, unless `keyless: true` | Literal value or `${NAME}` reference. A gateway with neither a non-blank `api_key` nor `keyless: true` fails with [`E-CAP-018`](diagnostics.md#e-cap-018). See [`gateway.api_key` resolution](#gateway-api-key). |
-| `artifacts[].gateway.keyless` | boolean | no | `true` declares an upstream that takes no key: requests go out with no credential header. Default: `false`. Exclusive with `api_key`. See [Keyless upstreams](#gateway-keyless). |
+| `artifacts[].gateway.keyless` | boolean | no | `true` declares an upstream that takes no key: requests go out with no credential header. Default: `false`. Writing it with `api_key` fails with `E-MAN-003`. See [Keyless upstreams](#gateway-keyless). |
 | `artifacts[].on_overflow` | `drop \| block` | no | Default: `drop`. Recognized only on `runtime: hook`; declaring it on any other role fails with `E-MAN-003`. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook execution](#hook-overflow). Legal but inert on a hook that turns out to be `execution_mode: blocking`, which has no queue. |
 
 ##### Hook capabilities { #hook-capabilities }
@@ -291,7 +291,7 @@ Rules:
   are unreachable. An absolute scope, or one that escapes the workdir via `..`, fails at launch with
   [`E-CAP-002`](diagnostics.md#e-cap-002) before any hook component is instantiated.
 - **`state` is a second, independent directory grant.** A hook holding one reaches
-  `~/.murmur/state/<store>/` as `state/` in its guest, alongside — or instead of — the
+  `~/.murmur/state/<store>/` as `state/`, alongside — or instead of — the
   `filesystem.scope` directory mounted as `.`. The two do not imply each other in either
   direction, so a hook can hold durable state without being handed the project directory. The
   store is keyed by capsule, so it survives a launch that gets a fresh session workdir. See
@@ -380,8 +380,8 @@ Rules:
 - **Drivers narrow identically.** The artifact named by `inference.driver.artifact` dispatches
   through the same path as any WASM tool, so a `capabilities:` block on its entry applies to every
   driver call — including one made by a hook's `run-inference`.
-- **`state` is the one sub-block that widens rather than narrows.** It grants a second preopen,
-  `~/.murmur/state/<store>/`, mounted in the guest as `state/` beside the workdir mounted as `.`.
+- **`state` is the one sub-block that widens rather than narrows.** It grants a second directory,
+  `~/.murmur/state/<store>/`, mounted in the artifact as `state/` beside the workdir mounted as `.`.
   It opens exactly that one directory: never a workdir path, and never another capsule's store.
   Declaring it does not change the capsule's achieved containment class. A store name must be a
   single path segment — see [State store name](#state-store-name). See
@@ -478,17 +478,12 @@ artifacts:
       api_key: ${TAVILY_API_KEY}
 ```
 
-| Key | Required | Notes |
-|---|---:|---|
-| `endpoint` | yes | Upstream URL — see [`gateway.endpoint` validation](#gateway-endpoint-validation). A block without it fails with `E-MAN-003`. |
-| `api_key` | yes, unless `keyless: true` | `${NAME}` reference or literal — see [`gateway.api_key` resolution](#gateway-api-key). |
-| `keyless` | no | `true` for an upstream that takes no key — see [Keyless upstreams](#gateway-keyless). Default: `false`. |
-
-The block is read only from **your own** manifest. How the key is presented comes from the
-artifact's own bundled manifest, its [`inference_auth:`](default-artifacts.md#inference-auth)
-block; an artifact whose entry declares `gateway:` and whose manifest has no usable
-`inference_auth:` refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). An artifact
-without `gateway:` is never asked for one.
+The fields are in the [`artifacts:` table](#field-artifacts). The block is read only from the
+capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`. How the
+key is presented comes from the artifact's bundled manifest, its
+[`inference_auth:`](default-artifacts.md#inference-auth) block. An artifact whose entry declares
+`gateway:` and whose manifest has no usable `inference_auth:` refuses the launch with
+[`E-RUN-025`](diagnostics.md#e-run-025); an artifact without `gateway:` needs no such block.
 
 Which entries accept the block:
 
@@ -505,18 +500,17 @@ What the artifact sees and what the runtime does:
 
 | Aspect | Behaviour |
 |---|---|
-| Environment | `MURMUR_GATEWAY_ENDPOINT`, set only for the artifact whose entry declares the block: `http://127.0.0.1:9` plus the path of `gateway.endpoint`, without a trailing `/`. The configured driver also receives it as `MURMUR_INFERENCE_ENDPOINT`. Never the key. |
+| Environment | `MURMUR_GATEWAY_ENDPOINT`, set only for the artifact whose entry declares the block: `http://127.0.0.1:9` plus the path of `gateway.endpoint`, without a trailing `/`. The configured driver also receives it as `MURMUR_INFERENCE_ENDPOINT`. |
 | Request | A request to `127.0.0.1:9` is readdressed at `gateway.endpoint`'s scheme, host and port, keeping its own path and query; `https` upstreams get TLS. Every header named like `inference_auth.header` is removed and exactly one is attached, rendered from the key. |
 | Network grant | `gateway.endpoint` is the grant for these requests: they are not checked against `capabilities.network.allow` or the entry's own `capabilities.network`. Every other request from the artifact is checked as usual. An allow-list entry naming the upstream warns [`W-SEC-025`](diagnostics.md#w-sec-025). |
-| Scope | Only the declaring artifact's own calls use its gateway. Another artifact addressing `127.0.0.1:9` gets an ordinary allow-list-checked request with no key. |
+| Scope | Only the declaring artifact's own calls use its gateway. A request another artifact sends to `127.0.0.1:9` carries no key and is checked against the allow-list. |
 | Spend | Only the configured `transport: http` driver's gateway is metered by [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend). Every other gateway is unmetered and warns [`W-SEC-030`](diagnostics.md#w-sec-030) at launch and from `mur doctor`. |
 | Rejection | A `401` from the driver's upstream fails the task with [`E-RUN-027`](diagnostics.md#e-run-027). A `401` from any other gateway's upstream goes back to the artifact as the response, and is recorded in the trace. |
 | Trace | Each gateway is listed in [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl). |
 
 ###### `gateway.endpoint` validation { #gateway-endpoint-validation }
 
-`gateway.endpoint` alone decides where the key is sent. Requests through the gateway are not
-checked against `capabilities.network.allow`, so the endpoint is validated when the manifest is
+`gateway.endpoint` alone decides where the key is sent, so it is validated when the manifest is
 parsed, before any capsule launches or any network call is made.
 
 | Value | Result |
@@ -533,16 +527,14 @@ parsed, before any capsule launches or any network call is made.
 Each rejection is `E-MAN-003` naming `gateway.endpoint`, the artifact entry, the endpoint and the
 reason.
 
-What the endpoint does not confine:
+The endpoint confines the key to its scheme, host and port. Within that origin:
 
-- **The path.** The artifact chooses the whole path and query of every request; the endpoint's
-  path only seeds `MURMUR_GATEWAY_ENDPOINT`. An artifact can send the key to any path on the
-  endpoint's scheme, host and port, and to no other host.
-- **The response.** An upstream path that echoes request headers back hands the key to the
-  artifact. Bind keys only to API hosts.
-
-Redirects are not followed: a `3xx` goes back to the artifact as the response, and the key is
-never sent to its `Location`.
+- **The artifact chooses the path.** It sets the whole path and query of every request; the
+  endpoint's path only seeds `MURMUR_GATEWAY_ENDPOINT`.
+- **The response reaches the artifact.** An upstream path that echoes request headers back hands
+  the key to the artifact. Bind keys only to API hosts.
+- **Redirects are returned, not followed.** A `3xx` goes back to the artifact as the response, and
+  the key is never sent to its `Location`.
 
 ###### `gateway.api_key` resolution { #gateway-api-key }
 
@@ -565,7 +557,7 @@ Only `${UPPER_SNAKE_CASE}` is a reference. Anything else is a literal value.
 
 A literal is read once at launch, also with `W-SEC-027`. The re-read cadence, the single retry
 after a `401`, and what removing an entry does are in [`credentials:`](config.md#credentials).
-They apply to every gateway, not only the driver's.
+They apply to every gateway.
 
 ###### Keyless upstreams { #gateway-keyless }
 
@@ -589,11 +581,10 @@ artifacts:
 | `api_key` (any value, blank included) and `keyless: true` | `E-MAN-003` |
 | No `api_key`, or one that is blank or null, without `keyless: true` | [`E-CAP-018`](diagnostics.md#e-cap-018) |
 
-Keylessness is never inferred from the address: a loopback endpoint with no key and no
-`keyless: true` is refused like any other. The rule reads what the manifest writes, so `mur run`,
-`mur doctor` and a roost refuse the same manifests. A keyless artifact still needs its own
-`inference_auth:` block ([`E-RUN-025`](diagnostics.md#e-run-025)), which names the header to
-remove. A keyless gateway is recorded as `credential_source: "keyless"` in
+A loopback endpoint needs `keyless: true` like any other: the address is never read as a
+declaration. A keyless artifact still needs its own `inference_auth:` block
+([`E-RUN-025`](diagnostics.md#e-run-025)), which names the header to remove. A keyless gateway is
+recorded as `credential_source: "keyless"` in
 [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl).
 
 ##### Local-source artifacts { #local-source-skills }
@@ -687,7 +678,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.shell.staged_runtime[].binary` | string | yes | A binary that must already appear in `capabilities.shell.allow`, and must not also have a `capabilities.shell.interpreter_runtime` grant. This says where an existing exec grant's runtime comes from; it never grants exec. |
 | `capabilities.shell.staged_runtime[].source_path` | string | yes | Absolute host path (must start with `/`) of an already-pinned runtime tree — a vendored toolchain directory, a baked-in conda env. Not resolved, discovered or version-sniffed by the runtime, and not required to exist on the machine that merely *parses* the manifest. |
 | `capabilities.shell.staged_runtime[].pin` | string | yes | Non-empty, opaque identifier of which build the tree is. Never inferred: it exists so a human can compare the declared pin across two hosts and confirm the same runtime shipped to both. |
-| `capabilities.env.allow` | list<string> | no | Host env var names a WASM guest (capsule, tool or driver component) may observe. Omitted or `[]` grants nothing beyond the runtime's own `MURMUR_*` injections. |
+| `capabilities.env.allow` | list<string> | no | Host env var names a WASM component (capsule, tool or driver) may observe. Omitted or `[]` grants nothing beyond the runtime's own `MURMUR_*` injections. |
 | `capabilities.limits.memory_bytes` | integer | no | Cap on how much memory a component may allocate, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
 | `capabilities.limits.table_elements` | integer | no | Cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | Cap on the number of component instances one call may create. Default: 1000. Must be > 0. |
@@ -704,7 +695,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp`, which is backed by a directory inside the session workdir — see [the fixed capsule device set](containment.md#capsule-device-set). |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
-| `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` preopen exists — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
+| `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory, and the runtime's guidance on when to plan in its system prompt; a capsule that declares nothing is offered neither. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
 | `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
@@ -727,17 +718,17 @@ see [Capsule name resolution](containment.md#capsule-name-resolution). Malformed
 opposed to a resolution failure, is still rejected outright with
 [`E-CAP-001`](diagnostics.md#e-cap-001).
 
-A WASM guest never inherits the host process's environment. `capabilities.env.allow` is the only
+A WASM component never inherits the host process's environment. `capabilities.env.allow` is the only
 way to expose a host variable. A declared-but-unset host variable is omitted rather than reported.
 A declared name is judged by name alone:
 
 | The name | Result |
 |---|---|
 | Matches a credential backstop pattern (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the list) or a `capabilities.shell.strip_env` pattern | The capsule is refused with [`E-CAP-016`](diagnostics.md#e-cap-016) |
-| Credential-shaped: contains `api_key`, `token`, `secret` or `password`, or has a segment such as `KEY`, `PASS`, `CREDENTIALS`, `DSN` or `AUTH` | Reaches every guest, reported once by [`W-SEC-024`](diagnostics.md#w-sec-024), which lists the full rule |
-| Anything else | Reaches every guest |
+| Credential-shaped: contains `api_key`, `token`, `secret` or `password`, or has a segment such as `KEY`, `PASS`, `CREDENTIALS`, `DSN` or `AUTH` | Reaches every WASM component, reported once by [`W-SEC-024`](diagnostics.md#w-sec-024), which lists the full rule |
+| Anything else | Reaches every WASM component |
 
-The field governs WASM guests and capsules delegated to through
+The field governs WASM components and capsules delegated to through
 [`capabilities.spawn.allow`](#field-capabilities) — never the capsule process itself, which is
 started by the operator's own shell and inherits that shell wholesale. So a root capsule needs no
 `env.allow` entry for a variable only its own process reads; the field is about what the capsule
@@ -1378,7 +1369,7 @@ An entry names a subtree of the workdir root, matched a path component at a time
 A candidate path is resolved against the workdir before it is matched: an absolute path, a
 relative one and a symlink into the subtree all produce the same rule and the same recorded path.
 A path that resolves outside the workdir is not covered by any entry — what reaches it is decided
-by the preopen and, on a kernel-enforcing host, by Landlock.
+by the directory the artifact is granted and, on a kernel-enforcing host, by Landlock.
 
 **What the runtime refuses.** The check runs on the resolved call, before dispatch and before any
 [policy hook](../concepts/hooks.md#policy-hooks) is asked. It refuses what it can positively

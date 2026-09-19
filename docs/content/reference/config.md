@@ -125,8 +125,8 @@ mur config set -g credentials.ANTHROPIC_API_KEY sk-ant-...
 #### Rotating a key { #credentials-rotation }
 
 A replaced entry takes effect on the next request any running capsule sends with that key — an
-inference request, or a tool's or hook's call through its gateway. Nothing
-restarts. Before each request that carries the key, the runtime reads the entry from the config
+inference request, or a tool's or hook's call through its gateway. Nothing restarts. Before each
+request that carries the key, the runtime reads the entry from the config
 file, however the file was last written.
 
 | Change | When a running capsule uses it |
@@ -169,7 +169,7 @@ A file loosened after it was written stays loose until the next write, and is re
 
 | Reports it | When | Output |
 |---|---|---|
-| `mur run` | A `transport: http` capsule reads its key from `credentials.<NAME>` in a file that grants any group or other permission | [`W-SEC-028`](diagnostics.md#w-sec-028) on stderr, once per launch |
+| `mur run` | A capsule reads a `gateway.api_key` from `credentials.<NAME>` in a file that grants any group or other permission | [`W-SEC-028`](diagnostics.md#w-sec-028) on stderr, once per launch |
 | `mur doctor` | Always | The mode of every entry in `~/.murmur`, and `W-SEC-028` for each one wider than the table below — see [`mur doctor`](cli.md#doctor-murmur-home) |
 
 Neither changes a mode or refuses. Tighten the file by hand:

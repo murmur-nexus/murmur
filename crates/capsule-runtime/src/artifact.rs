@@ -177,7 +177,7 @@ fn extract_manifest_yaml_capped(
 /// The `capabilities.env.allow` a packed manifest declares, read on its own.
 ///
 /// Narrow on purpose. `murmur_artifact::RuntimeManifest::from_yaml_str` validates the whole
-/// manifest, and that resolves every `${VAR}` in `inference.api_key` against the reading
+/// manifest, and that resolves every `${VAR}` in a `gateway.api_key` against the reading
 /// process's environment — so a parent asking what its child declares would have to already hold
 /// the child's variables before it could read which ones they are. Reading the one key answers
 /// that without the circle.
