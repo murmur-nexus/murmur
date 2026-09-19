@@ -1,0 +1,238 @@
+package murmur:driver@0.1.0;
+
+/// The contract between the runtime and a process driver: an artifact that knows how to drive
+/// one harness CLI. Pure translation; the runtime grants it nothing.
+///
+/// The runtime keeps one driver instance for a whole run, so `parse` may rely on what `launch`
+/// was given.
+interface process {
+  /// How a turn in progress can be stopped gracefully.
+  enum interrupt-method {
+    /// Writing `launch-plan.interrupt-stdin` to the harness's stdin interrupts the turn.
+    stdin-message,
+    /// Sending `SIGINT` to the harness interrupts the turn.
+    signal-int,
+    /// The harness cannot be interrupted gracefully; the runtime kills it instead.
+    unsupported,
+  }
+
+  /// What the driver drives, read once when the driver is loaded.
+  record description {
+    /// The name of the harness this driver drives.
+    harness: string,
+    /// The executable the runtime resolves and runs, by name or path.
+    binary: string,
+    /// The arguments after `binary` that make the harness print its version.
+    version-args: list<string>,
+    /// The harness versions this driver release was tested against.
+    tested-versions: list<string>,
+    /// How a turn in progress is stopped.
+    interrupt: interrupt-method,
+    /// Environment variable names the harness cannot run without. Each must be declared in
+    /// the manifest's `capabilities.env.allow`, or the capsule is refused at load.
+    required-env: list<string>,
+    /// Whether `parse` emits `text-delta` events.
+    streams-text: bool,
+  }
+
+  /// The endpoint through which the harness calls the capsule's tools.
+  record bridge {
+    /// The server name the driver registers the bridge under in the harness's configuration.
+    server-name: string,
+    /// The URL the bridge listens on.
+    url: string,
+    /// The bearer token every request to `url` must carry.
+    bearer-token: string,
+    /// The capsule's tool names, bare. The driver names them the way its harness needs, and
+    /// strips that naming again in `parse`.
+    tool-names: list<string>,
+  }
+
+  /// Whether a turn starts a harness session or continues one.
+  enum session-mode {
+    /// Start a session with the given id.
+    new,
+    /// Continue the session with the given id.
+    resume,
+  }
+
+  /// The harness session a turn runs in.
+  record session {
+    /// The harness session id.
+    id: string,
+    /// Whether the session is started or continued.
+    mode: session-mode,
+  }
+
+  /// Everything the driver needs to plan one turn.
+  record launch-request {
+    /// The manifest's `inference.model`; `none` leaves the choice to the harness.
+    model: option<string>,
+    /// The runtime's full system prompt for the turn, notices included.
+    system-prompt: string,
+    /// The manifest's `inference.driver.config` as JSON; `none` when the manifest wrote none.
+    config: option<string>,
+    /// The tool bridge; `none` when the capsule exposes no tools to the harness.
+    bridge: option<bridge>,
+    /// The harness session this turn runs in.
+    session: session,
+    /// The version the harness printed for `description.version-args`; `none` when it could
+    /// not be read.
+    harness-version: option<string>,
+    /// The task text for this turn.
+    task: string,
+  }
+
+  /// A file the runtime writes before spawning the harness.
+  record driver-file {
+    /// The file name, relative to the files directory.
+    name: string,
+    /// The file's contents.
+    contents: string,
+  }
+
+  /// How to spawn the harness for one turn.
+  ///
+  /// The runtime writes `files` into a private directory readable only by the capsule's user,
+  /// and replaces the token `{files_dir}` in `args` and in `env-set` values with that
+  /// directory's path.
+  record launch-plan {
+    /// The full argument list after the binary.
+    args: list<string>,
+    /// Variables to set in the harness's environment, after the ones
+    /// `capabilities.env.allow` passes through.
+    env-set: list<tuple<string, string>>,
+    /// Files to write before spawning.
+    files: list<driver-file>,
+    /// Bytes written to stdin once the harness starts; `none` writes nothing.
+    stdin: option<list<u8>>,
+    /// Whether stdin stays open after `stdin` is written.
+    keep-stdin-open: bool,
+    /// Bytes that interrupt the turn when written to stdin, for `interrupt-method.stdin-message`.
+    interrupt-stdin: option<list<u8>>,
+  }
+
+  /// The harness's report of the session it started.
+  record session-info {
+    /// The harness session id.
+    id: string,
+    /// How the harness is billing: `subscription`, `api-key`, or another value the driver
+    /// reads from its harness. Anything but `subscription` is warned about and traced.
+    auth: string,
+    /// The model the harness reports it is running; `none` when it does not say.
+    model: option<string>,
+  }
+
+  /// A tool the agent called.
+  record tool-call-info {
+    /// The call id, matching the `tool-result-info.id` of its result.
+    id: string,
+    /// The bare artifact name, with any prefix the driver added in `launch` stripped.
+    name: string,
+    /// The call's input as JSON.
+    input: string,
+  }
+
+  /// The result of a tool call.
+  record tool-result-info {
+    /// The id of the `tool-call-info` this answers.
+    id: string,
+    /// The tool's output.
+    output: string,
+    /// Whether the tool reported failure.
+    is-error: bool,
+  }
+
+  /// The harness is retrying a request to its provider.
+  record retry-info {
+    /// Which attempt this is.
+    attempt: u32,
+    /// Why the previous attempt failed.
+    reason: string,
+  }
+
+  /// Why a turn failed.
+  enum failure-kind {
+    /// The harness could not authenticate.
+    auth,
+    /// The harness ran out of quota or was rate limited.
+    quota,
+    /// The harness stopped at its turn limit.
+    max-turns,
+    /// The turn was interrupted.
+    canceled,
+    /// The harness reported an error of its own.
+    harness-error,
+    /// Anything else.
+    other,
+  }
+
+  /// A failed turn.
+  record turn-failure {
+    /// Why it failed.
+    kind: failure-kind,
+    /// The failure as the harness described it.
+    message: string,
+  }
+
+  /// One thing the harness did, read out of its output.
+  variant event {
+    /// The harness's session id, and how it is billing.
+    session-started(session-info),
+    /// Streamed text, appended to the message in progress.
+    text-delta(string),
+    /// The complete text of one message. It replaces any `text-delta` already streamed for
+    /// that message; it is never appended to them.
+    text(string),
+    /// Streamed thinking, appended to the thinking in progress.
+    thinking-delta(string),
+    /// The complete thinking of one message, replacing any `thinking-delta` streamed for it.
+    thinking(string),
+    /// A tool the agent called.
+    tool-call(tool-call-info),
+    /// The result of a tool call.
+    tool-result(tool-result-info),
+    /// The harness is retrying a request to its provider.
+    retry(retry-info),
+    /// The turn finished; the payload is the final answer.
+    turn-end(string),
+    /// The turn failed.
+    turn-failed(turn-failure),
+    /// A diagnostic for the trace only, such as a line the driver could not read.
+    note(string),
+  }
+
+  /// How the harness exited, for a run whose output ended without a terminal event.
+  record exit-status {
+    /// The exit code; `none` when the harness was ended by a signal.
+    code: option<s32>,
+    /// The signal that ended the harness; `none` when it exited.
+    signal: option<s32>,
+    /// The last part of the harness's stderr.
+    stderr-tail: string,
+    /// Whether the runtime interrupted the turn.
+    interrupted: bool,
+    /// Whether `parse` returned a `turn-end` or `turn-failed` for this run.
+    saw-terminal: bool,
+  }
+
+  /// What the driver drives. Called once, when the driver is loaded.
+  describe: func() -> description;
+
+  /// Plans one turn; `err` refuses it with a message the runtime reports.
+  launch: func(request: launch-request) -> result<launch-plan, string>;
+
+  /// Reads a batch of complete stdout lines into events. May return none.
+  parse: func(lines: list<string>) -> list<event>;
+
+  /// Classifies a run whose output ended without `turn-end` or `turn-failed`. Returns only
+  /// `turn-end` or `turn-failed`; when `exit.interrupted` is true and no terminal event was
+  /// seen it must return `turn-failed` with kind `canceled`, whatever the exit code says.
+  classify-exit: func(exit: exit-status) -> event;
+}
+
+/// A process driver exports the `process` interface and imports nothing of Murmur's: it is
+/// granted nothing.
+world process-driver {
+  export process;
+}

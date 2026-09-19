@@ -45,6 +45,7 @@ pub(crate) mod otel;
 pub(crate) mod outgoing;
 pub mod peer_handoff;
 pub mod plan;
+pub mod process_driver;
 pub(crate) mod protected_paths;
 pub(crate) mod reachability;
 pub(crate) mod recipes;

@@ -11,3 +11,11 @@ pub mod hook {
         world: "hook",
     });
 }
+
+pub mod process_driver {
+    wasmtime::component::bindgen!({
+        path: "wit/process-driver",
+        world: "process-driver",
+        exports: { default: async },
+    });
+}

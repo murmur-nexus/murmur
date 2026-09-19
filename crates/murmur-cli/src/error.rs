@@ -46,6 +46,10 @@ pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is 
 pub const E_RUN_025: &str = "E-RUN-025"; // an artifact with a gateway: declares no usable upstream_auth: block
 pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
 pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
+pub const E_RUN_029: &str = "E-RUN-029"; // the transport: process driver does not export the process driver interface
+pub const E_RUN_030: &str = "E-RUN-030"; // the transport: http inference driver exports the process driver interface
+pub const E_RUN_031: &str = "E-RUN-031"; // a process driver passed its checks, but this runtime does not run process drivers
+pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded with no grants, or described itself unusably
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -66,6 +70,7 @@ pub const E_CAP_015: &str = "E-CAP-015"; // a capsule declares an env.allow entr
 pub const E_CAP_016: &str = "E-CAP-016"; // a capabilities.env.allow entry names a variable the credential backstop strips from every guest
 pub const E_CAP_017: &str = "E-CAP-017"; // a gateway: is declared on a native tool, whose requests never pass the credential gateway
 pub const E_CAP_018: &str = "E-CAP-018"; // a gateway: names an endpoint but binds no api_key and does not declare keyless: true
+pub const E_CAP_019: &str = "E-CAP-019"; // a process driver requires a variable capabilities.env.allow does not declare
 
 /// The hint on every `E-CAP-018` refusal, from the manifest parser and from staging alike.
 pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
@@ -506,6 +511,33 @@ impl From<RuntimeError> for CliError {
                      or remove gateway: from its entry",
                 )
             }
+            error @ RuntimeError::ProcessDriverInterfaceMissing { .. } => CliError::with_hint(
+                E_RUN_029,
+                error.to_string(),
+                "rebuild the driver against murmur:driver/process@0.1.0, or name a process driver",
+            ),
+            error @ RuntimeError::HttpDriverExportsProcessInterface { .. } => CliError::with_hint(
+                E_RUN_030,
+                error.to_string(),
+                "set inference.transport: process to use this driver, or name an http driver",
+            ),
+            error @ RuntimeError::ProcessDriverRequiredEnvNotAllowed { .. } => CliError::with_hint(
+                E_CAP_019,
+                error.to_string(),
+                "add each variable to capabilities.env.allow — the harness sees only variables \
+                 the manifest declares",
+            ),
+            error @ RuntimeError::ProcessDriverNotWired { .. } => CliError::with_hint(
+                E_RUN_031,
+                error.to_string(),
+                "to run the CLI directly for now, remove inference.driver and set \
+                 inference.command",
+            ),
+            error @ RuntimeError::ProcessDriverLoad { .. } => CliError::with_hint(
+                E_RUN_032,
+                error.to_string(),
+                "the driver must export murmur:driver/process@0.1.0 and import nothing but WASI",
+            ),
             error @ RuntimeError::GatewayWithoutCredential { .. } => CliError::with_hint(
                 E_CAP_018,
                 error.to_string(),

@@ -9,6 +9,7 @@ so this file records who binds what. Versioning policy lives in
 | --- | --- |
 | `host/` | `wasmtime::component::bindgen!({ path: "wit/host", world: "runtime-host" })` in `src/bindings.rs` — the host-side bindings for every interface the runtime provides to guests (`tool-registry`, `artifact-manager`, `shell`, `message`). |
 | `hook/` | `wasmtime::component::bindgen!({ path: "wit/hook", world: "hook" })` in `src/bindings.rs` — the host-side view of the hook lifecycle contract. |
+| `process-driver/` | `wasmtime::component::bindgen!({ path: "wit/process-driver", world: "process-driver" })` in `src/bindings.rs` — the host-side view of the process driver contract (`murmur:driver/process`) — **and** process drivers in the out-of-repo `default-artifacts` repository, which vendors this tree the same way as `hook/`. |
 | `guest/` | `wit_bindgen::generate!` in guest components: the test fixtures under `crates/murmur-cli/tests/fixtures/*/src/*` (worlds `tool`, `capsule`) **and the out-of-repo `default-artifacts` repository**, which vendors this tree (drivers, tools, and hooks there compile against its copy — see below). |
 | top-level `*.wit`, `worlds.wit`, `host.wit` | Nothing compiles these. They are the reference copies quoted by `docs/content/reference/wit-interfaces.md`. Keep them byte-identical to the bindgen copies of the same package (same version ⇒ same content, doc comments included). |
 

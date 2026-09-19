@@ -569,8 +569,86 @@ pub enum RuntimeError {
         host_platform: String,
     },
 
+    /// The artifact a `transport: process` manifest names under `inference.driver` does not
+    /// export [`crate::process_driver::PROCESS_DRIVER_IFACE`]. `found` holds every
+    /// `murmur:driver/process@*` instance it does export, so a driver built against another
+    /// version is told which one it has; it is empty when the artifact exports none.
+    #[error(
+        "artifact '{name}@{version}' is the transport: process driver but does not export \
+         {expected}{}",
+        process_interface_found_tail(.found)
+    )]
+    ProcessDriverInterfaceMissing {
+        name: String,
+        version: String,
+        expected: String,
+        found: Vec<String>,
+    },
+
+    /// The artifact a `transport: http` manifest names under `inference.driver` exports a
+    /// `murmur:driver/process@*` instance, so it drives a CLI rather than an HTTP API.
+    #[error(
+        "artifact '{name}@{version}' is the transport: http inference driver but exports {}, the \
+         process driver interface; name it under transport: process, or name an http driver",
+        .exported.join(", ")
+    )]
+    HttpDriverExportsProcessInterface {
+        name: String,
+        version: String,
+        exported: Vec<String>,
+    },
+
+    /// A process driver's `describe().required-env` names variables the manifest's
+    /// `capabilities.env.allow` does not declare. `missing` is in the driver's order, each name
+    /// once.
+    #[error(
+        "process driver '{name}@{version}' requires {} in its environment, which \
+         capabilities.env.allow does not declare",
+        .missing.join(", ")
+    )]
+    ProcessDriverRequiredEnvNotAllowed {
+        name: String,
+        version: String,
+        missing: Vec<String>,
+    },
+
+    /// A process driver could not be instantiated with no grants, trapped in `describe`, or
+    /// described itself with an unusable `required-env` name. `message` is wasmtime's error, which
+    /// names an unsatisfied import, or names the unusable variable.
+    #[error("process driver '{name}@{version}' could not be loaded with no grants: {message}")]
+    ProcessDriverLoad {
+        name: String,
+        version: String,
+        message: String,
+    },
+
+    /// A process driver passed every load-time check, but this runtime has no runner for it.
+    #[error(
+        "process driver '{name}@{version}' (harness {harness}, binary {binary}) loaded and passed \
+         its checks, but this runtime does not run process drivers yet"
+    )]
+    ProcessDriverNotWired {
+        name: String,
+        version: String,
+        harness: String,
+        binary: String,
+    },
+
     #[error("runtime failure: {0}")]
     Runtime(String),
+}
+
+/// The tail of [`RuntimeError::ProcessDriverInterfaceMissing`]'s message: which process
+/// interface versions the driver does export, or that it exports none.
+fn process_interface_found_tail(found: &[String]) -> String {
+    if found.is_empty() {
+        "; a process driver must be built against the process-driver world".to_string()
+    } else {
+        format!(
+            "; it exports {}, built against another version — rebuild it",
+            found.join(", ")
+        )
+    }
 }
 
 impl RuntimeError {
