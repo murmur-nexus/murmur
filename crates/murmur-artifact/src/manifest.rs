@@ -282,10 +282,8 @@ const RESERVED_AUTH_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-/// The name [`UpstreamAuth`]'s block carried before it was renamed to `upstream_auth`.
-///
-/// A manifest that still declares it is refused by [`refuse_retired_auth_block`]; nothing under
-/// this name is ever read.
+/// The retired name of the [`UpstreamAuth`] block. A manifest that declares it is refused by
+/// [`refuse_retired_auth_block`]; nothing under this name is ever read.
 pub const RETIRED_AUTH_BLOCK: &str = "inference_auth";
 
 /// Refuses a manifest whose top level declares [`RETIRED_AUTH_BLOCK`], whatever it holds and

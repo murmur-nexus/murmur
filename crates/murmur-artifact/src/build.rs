@@ -97,8 +97,8 @@ pub enum BuildError {
     /// author sees at build time is the text the runtime would have printed at launch.
     #[error(transparent)]
     PayloadShape(#[from] PayloadShapeError),
-    /// The manifest declares a block under a name murmur no longer reads. Packing it would ship
-    /// an artifact the runtime refuses at launch.
+    /// The manifest declares [`crate::RETIRED_AUTH_BLOCK`]. The runtime refuses such an artifact at
+    /// launch whenever its entry declares `gateway:`, so it is never packed.
     #[error(transparent)]
     RetiredAuthBlock(ManifestError),
 }

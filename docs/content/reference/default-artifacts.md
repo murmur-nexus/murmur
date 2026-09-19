@@ -205,7 +205,7 @@ Two further variables are injected per artifact rather than per session:
 | Env var | Injected when | Value |
 |---|---|---|
 | `MURMUR_ARTIFACT_CONFIG` | This artifact's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
-| `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint` |
+| `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint`. Requests sent there reach `gateway.endpoint` with the key attached as the artifact's [`upstream_auth:`](manifest.md#upstream-auth) block declares |
 
 Each reaches the declaring artifact and no other, and the runtime sets it whether or not
 `inference:` is configured. The configured driver receives `MURMUR_GATEWAY_ENDPOINT` on its agent

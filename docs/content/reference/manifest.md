@@ -34,10 +34,11 @@ requires_files:
 
 ### `upstream_auth:` block { #upstream-auth }
 
-No component receives a `gateway.api_key`. An artifact whose capsule entry may declare
-[`gateway:`](#artifact-gateway) — a tool, hook or driver — declares in its own `murmur.yaml` how its
-upstream takes the key. The runtime attaches that header to each request the artifact sends to
-`MURMUR_GATEWAY_ENDPOINT` (for the inference driver, also `MURMUR_INFERENCE_ENDPOINT`).
+How the artifact's upstream takes its key. Any artifact whose capsule entry may declare
+[`gateway:`](#artifact-gateway) — a tool, hook or driver — declares this block in its own
+`murmur.yaml`. The runtime renders the header from the entry's `gateway.api_key` and attaches it to
+each request the artifact sends to `MURMUR_GATEWAY_ENDPOINT` (for the inference driver, also
+`MURMUR_INFERENCE_ENDPOINT`). The artifact itself never receives the key.
 
 A web search tool whose upstream takes a bearer token:
 
@@ -59,11 +60,11 @@ upstream_auth:
 
 When the block is read and refused:
 
-| Manifest | Result |
+| Case | Result |
 |---|---|
 | Capsule entry declares no `gateway:` | The block is never read |
 | Capsule entry declares `gateway:`, block absent or malformed | `mur run` refuses with [`E-RUN-025`](diagnostics.md#e-run-025) |
-| Declares `inference_auth:`, the block's former name, with or without `upstream_auth:` | `mur build` refuses with [`E-BLD-004`](diagnostics.md#e-bld-004); an artifact already packed refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025) when its entry declares `gateway:` |
+| Artifact manifest declares `inference_auth:`, the block's former name, with or without `upstream_auth:` | `mur build` refuses with [`E-BLD-004`](diagnostics.md#e-bld-004); an artifact already packed refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025) when its entry declares `gateway:` |
 
 ---
 
