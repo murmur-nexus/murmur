@@ -38,8 +38,8 @@ pub use lockfile::{
     LOCK_VERSION,
 };
 pub use manifest::{
-    load_manifest, parse_inference_auth, InferenceAuth, Manifest, ManifestError,
-    INFERENCE_AUTH_KEY_PLACEHOLDER,
+    load_manifest, parse_upstream_auth, refuse_retired_auth_block, Manifest, ManifestError,
+    UpstreamAuth, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{

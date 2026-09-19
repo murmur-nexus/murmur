@@ -4466,7 +4466,7 @@ mod tests {
             CredentialGateway::new(
                 "grafana",
                 &format!("http://{}/otlp", upstream.local_addr().unwrap()),
-                murmur_artifact::InferenceAuth {
+                murmur_artifact::UpstreamAuth {
                     header: "Authorization".to_string(),
                     value: "Bearer {key}".to_string(),
                 },

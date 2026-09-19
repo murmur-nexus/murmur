@@ -1,6 +1,6 @@
 //! The credential gateway for any artifact: a tool, hook or driver whose operator entry declares
 //! `gateway: {endpoint, api_key}` reaches that upstream through the runtime, which attaches the
-//! operator's key the way the artifact's own `inference_auth:` block says. The artifact never
+//! operator's key the way the artifact's own `upstream_auth:` block says. The artifact never
 //! holds the key.
 //!
 //! Driven through the real `mur` binary against recording upstreams on loopback, so every
@@ -42,8 +42,8 @@ const DRIVER_MARKER: &str = "gwk-2a94f6c1-driver-marker";
 const CREDENTIAL: &str = "GW_PROBE_KEY";
 const DRIVER_CREDENTIAL: &str = "GW_DRIVER_KEY";
 
-const BEARER_AUTH: &str = "inference_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n";
-const ANTHROPIC_AUTH: &str = "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+const BEARER_AUTH: &str = "upstream_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n";
+const ANTHROPIC_AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 /// What the tool upstream answers every request with.
 const UPSTREAM_REPLY: &str = r#"{"results":["gateway-probe"]}"#;
 
@@ -549,11 +549,11 @@ fn gateway_is_per_artifact() {
 /// refuses the launch by name and version, before anything is sent or created. An artifact with
 /// neither is never asked.
 #[test]
-fn gateway_without_inference_auth_refuses() {
+fn gateway_without_upstream_auth_refuses() {
     for (auth_block, reason, keyless) in [
         ("", None, false),
         (
-            "inference_auth:\n  header: Authorization\n  value: \"Bearer\"\n",
+            "upstream_auth:\n  header: Authorization\n  value: \"Bearer\"\n",
             Some("exactly once"),
             false,
         ),
@@ -599,6 +599,56 @@ fn gateway_without_inference_auth_refuses() {
         "absent"
     );
     assert!(run.warning_lines("W-SEC-030").is_empty(), "{}", run.stderr);
+}
+
+/// The block's old name is refused outright, never read in place of `upstream_auth:`: a tool
+/// whose manifest declares it, alone or beside a valid `upstream_auth:`, refuses the launch by
+/// name and version before its upstream is reached.
+#[test]
+fn gateway_with_the_retired_block_name_refuses() {
+    let retired = "inference_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n";
+    for auth_block in [retired.to_string(), format!("{BEARER_AUTH}{retired}")] {
+        let upstream = RecordingUpstream::replying(UPSTREAM_REPLY);
+        let mut project = Project::new();
+        project.publish_tool(TOOL, &auth_block);
+        project.set_credential(CREDENTIAL, MARKER);
+        project.script_manifest(&tool_entry(&upstream.endpoint), "");
+
+        let run = project.run(&[], &[]);
+        println!("{}", run.stderr.trim());
+        assert!(!run.ok(), "{}", run.context());
+        for expected in [
+            "E-RUN-025",
+            &format!("artifact '{TOOL}@{VERSION}' declares no usable upstream_auth: block"),
+            "was renamed to 'upstream_auth'",
+        ] {
+            assert!(
+                run.stderr.contains(expected),
+                "{expected}: {}",
+                run.context()
+            );
+        }
+        assert!(upstream.requests().is_empty());
+        project.assert_key_recorded_nowhere(&run, MARKER);
+    }
+}
+
+/// The old name is refused only where the block would be read: an entry without `gateway:`
+/// never asks for it, so the tool launches and its call runs.
+#[test]
+fn retired_block_without_a_gateway_is_never_read() {
+    let project = Project::new();
+    project.publish_tool(
+        TOOL,
+        "inference_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n",
+    );
+    project.script_manifest(&bare_entry(TOOL), "");
+    let run = project.run(&[], &[]);
+    assert!(!run.stderr.contains("E-RUN-025"), "{}", run.context());
+    assert_eq!(
+        reported(&run.published("result.txt"), "gateway_env"),
+        "absent"
+    );
 }
 
 /// The runtime never reads `gateway:` from an artifact's own bundled `murmur.yaml`: both tools

@@ -657,7 +657,7 @@ mod tests {
             CredentialGateway::new(
                 "the-driver",
                 &endpoint,
-                murmur_artifact::InferenceAuth {
+                murmur_artifact::UpstreamAuth {
                     header: "x-api-key".to_string(),
                     value: "{key}".to_string(),
                 },

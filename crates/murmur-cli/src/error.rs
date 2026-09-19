@@ -1,7 +1,9 @@
 use std::fmt;
 
 use capsule_runtime::{RuntimeError, MAX_ARTIFACT_CONFIG_BYTES};
-use murmur_artifact::{BuildError, ManifestError, RegistryError, MANIFEST_FILENAME};
+use murmur_artifact::{
+    BuildError, ManifestError, RegistryError, MANIFEST_FILENAME, RETIRED_AUTH_BLOCK,
+};
 
 // Manifest parsing
 pub const E_MAN_001: &str = "E-MAN-001"; // missing required field
@@ -41,7 +43,7 @@ pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built
 pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
 pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
-pub const E_RUN_025: &str = "E-RUN-025"; // an artifact with a gateway: declares no usable inference_auth: block
+pub const E_RUN_025: &str = "E-RUN-025"; // an artifact with a gateway: declares no usable upstream_auth: block
 pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
 pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
 
@@ -75,6 +77,7 @@ pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
 pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or collides in the archive
 pub const E_BLD_003: &str = "E-BLD-003"; // packed entry set is not a launchable payload
+pub const E_BLD_004: &str = "E-BLD-004"; // artifact manifest declares a retired block name
 
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
@@ -494,12 +497,12 @@ impl From<RuntimeError> for CliError {
                 format!("inference driver '{name}' is not installed in the local tool registry"),
                 "declare the driver artifact in murmur.yaml artifacts: and run `mur run` to install it",
             ),
-            error @ RuntimeError::GatewayArtifactDeclaresNoInferenceAuth { .. } => {
+            error @ RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth { .. } => {
                 CliError::with_hint(
                     E_RUN_025,
                     error.to_string(),
                     "the runtime presents the key itself and needs the artifact to say how; \
-                     update the artifact to a version whose murmur.yaml declares inference_auth:, \
+                     update the artifact to a version whose murmur.yaml declares upstream_auth:, \
                      or remove gateway: from its entry",
                 )
             }
@@ -707,6 +710,14 @@ impl From<BuildError> for CliError {
                 E_BLD_003,
                 error.to_string(),
                 "declare exactly one root *.wasm in requires_files: (or name it capsule.wasm)",
+            ),
+            error @ BuildError::RetiredAuthBlock(_) => CliError::with_hint(
+                E_BLD_004,
+                error.to_string(),
+                format!(
+                    "rename the block to upstream_auth: — an artifact published with \
+                     {RETIRED_AUTH_BLOCK}: is refused at launch with E-RUN-025"
+                ),
             ),
         }
     }

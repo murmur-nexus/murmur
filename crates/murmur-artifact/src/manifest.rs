@@ -229,14 +229,14 @@ fn yaml_type_name(value: &Value) -> String {
     }
 }
 
-/// The substitution point for the inference credential in [`InferenceAuth::value`].
-pub const INFERENCE_AUTH_KEY_PLACEHOLDER: &str = "{key}";
+/// The substitution point for the entry's `gateway.api_key` in [`UpstreamAuth::value`].
+pub const UPSTREAM_AUTH_KEY_PLACEHOLDER: &str = "{key}";
 
 /// How an artifact's upstream expects its credential to be presented, from the artifact's own
 /// bundled `murmur.yaml`:
 ///
 /// ```yaml
-/// inference_auth:
+/// upstream_auth:
 ///   header: Authorization
 ///   value: "Bearer {key}"
 /// ```
@@ -245,22 +245,22 @@ pub const INFERENCE_AUTH_KEY_PLACEHOLDER: &str = "{key}";
 /// gateway, with `{key}` replaced by the entry's `gateway.api_key`. Holds the template only, never
 /// a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferenceAuth {
+pub struct UpstreamAuth {
     /// A valid HTTP header name, as written. Compared case-insensitively on the wire.
     pub header: String,
-    /// The header value template. Contains [`INFERENCE_AUTH_KEY_PLACEHOLDER`] exactly once.
+    /// The header value template. Contains [`UPSTREAM_AUTH_KEY_PLACEHOLDER`] exactly once.
     pub value: String,
 }
 
-impl InferenceAuth {
+impl UpstreamAuth {
     /// The header value for `key`.
     #[must_use]
     pub fn render(&self, key: &str) -> String {
-        self.value.replacen(INFERENCE_AUTH_KEY_PLACEHOLDER, key, 1)
+        self.value.replacen(UPSTREAM_AUTH_KEY_PLACEHOLDER, key, 1)
     }
 }
 
-/// Header names `inference_auth.header` may not use.
+/// Header names `upstream_auth.header` may not use.
 ///
 /// The artifact picks the header, so it must not be able to pick one the upstream reflects into
 /// the response it reads back (`Host` into a redirect or error page, `Origin` into CORS headers,
@@ -282,17 +282,46 @@ const RESERVED_AUTH_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-/// Reads the top-level `inference_auth:` block from a driver's bundled manifest text.
-///
-/// `Ok(None)` means the manifest has no `inference_auth` key. `Err` means the block is present
-/// and unusable: not a mapping, `header` or `value` missing or not a string, `header` not a valid
-/// HTTP header name, or `value` not containing `{key}` exactly once or carrying characters no
-/// header value may hold.
-pub fn parse_inference_auth(manifest_yaml: &str) -> Result<Option<InferenceAuth>, ManifestError> {
-    const FIELD: &str = "inference_auth";
-    let value: Value = serde_yaml::from_str(manifest_yaml).map_err(|err| {
+/// The retired name of the [`UpstreamAuth`] block. A manifest that declares it is refused by
+/// [`refuse_retired_auth_block`]; nothing under this name is ever read.
+pub const RETIRED_AUTH_BLOCK: &str = "inference_auth";
+
+/// Refuses a manifest whose top level declares [`RETIRED_AUTH_BLOCK`], whatever it holds and
+/// whether or not `upstream_auth:` sits beside it.
+pub fn refuse_retired_auth_block(manifest_yaml: &str) -> Result<(), ManifestError> {
+    refuse_retired_key(&parse_manifest_value(manifest_yaml)?)
+}
+
+fn refuse_retired_key(value: &Value) -> Result<(), ManifestError> {
+    let declared = value
+        .as_mapping()
+        .is_some_and(|root| root.contains_key(Value::String(RETIRED_AUTH_BLOCK.to_string())));
+    if declared {
+        return Err(ManifestError::InvalidValue {
+            field: RETIRED_AUTH_BLOCK.to_string(),
+            message: "was renamed to 'upstream_auth'; this murmur reads only the new name"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_manifest_value(manifest_yaml: &str) -> Result<Value, ManifestError> {
+    serde_yaml::from_str(manifest_yaml).map_err(|err| {
         ManifestError::YamlSyntax(format!("{MANIFEST_FILENAME}: YAML syntax error: {err}"))
-    })?;
+    })
+}
+
+/// Reads the top-level `upstream_auth:` block from an artifact's bundled manifest text.
+///
+/// `Ok(None)` means the manifest has no `upstream_auth` key. `Err` means the manifest declares
+/// [`RETIRED_AUTH_BLOCK`], or the block is present and unusable: not a mapping, `header` or
+/// `value` missing or not a string, `header` not a valid HTTP header name, or `value` not
+/// containing `{key}` exactly once or carrying characters no header value may hold.
+pub fn parse_upstream_auth(manifest_yaml: &str) -> Result<Option<UpstreamAuth>, ManifestError> {
+    const FIELD: &str = "upstream_auth";
+    let value = parse_manifest_value(manifest_yaml)?;
+    refuse_retired_key(&value)?;
     let Some(block) = value
         .as_mapping()
         .and_then(|root| root.get(Value::String(FIELD.to_string())))
@@ -328,23 +357,23 @@ pub fn parse_inference_auth(manifest_yaml: &str) -> Result<Option<InferenceAuth>
             ),
         });
     }
-    let placeholders = template.matches(INFERENCE_AUTH_KEY_PLACEHOLDER).count();
+    let placeholders = template.matches(UPSTREAM_AUTH_KEY_PLACEHOLDER).count();
     if placeholders != 1 {
         return Err(ManifestError::InvalidValue {
             field: format!("{FIELD}.value"),
             message: format!(
-                "must contain {INFERENCE_AUTH_KEY_PLACEHOLDER} exactly once (found {placeholders})"
+                "must contain {UPSTREAM_AUTH_KEY_PLACEHOLDER} exactly once (found {placeholders})"
             ),
         });
     }
-    if http::HeaderValue::from_str(&template.replace(INFERENCE_AUTH_KEY_PLACEHOLDER, "")).is_err() {
+    if http::HeaderValue::from_str(&template.replace(UPSTREAM_AUTH_KEY_PLACEHOLDER, "")).is_err() {
         return Err(ManifestError::InvalidValue {
             field: format!("{FIELD}.value"),
             message: "contains characters an HTTP header value cannot hold".to_string(),
         });
     }
 
-    Ok(Some(InferenceAuth {
+    Ok(Some(UpstreamAuth {
         header,
         value: template,
     }))
@@ -370,93 +399,93 @@ fn prefix_field(err: ManifestError, block: &str) -> ManifestError {
 }
 
 #[cfg(test)]
-mod inference_auth_tests {
+mod upstream_auth_tests {
     use super::*;
 
     /// Each block exactly as the four shipped drivers write it, comment line included.
     const ANTHROPIC: &str = "name: murmur-driver-anthropic\nversion: 0.1.0\nruntime: driver\n\n\
         # How this provider expects the inference credential to be presented; the runtime substitutes {key}.\n\
-        inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+        upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
     const BEARER: &str = "\n# How this provider expects the inference credential to be presented; the runtime substitutes {key}.\n\
-        inference_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n";
+        upstream_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n";
 
     fn bearer(name: &str) -> String {
         format!("name: {name}\nversion: 0.1.0\nruntime: driver\n{BEARER}")
     }
 
     #[test]
-    fn inference_auth_parses_the_anthropic_block() {
-        let auth = parse_inference_auth(ANTHROPIC).unwrap().unwrap();
+    fn upstream_auth_parses_the_anthropic_block() {
+        let auth = parse_upstream_auth(ANTHROPIC).unwrap().unwrap();
         assert_eq!(auth.header, "x-api-key");
         assert_eq!(auth.render("sk-1"), "sk-1");
     }
 
     #[test]
-    fn inference_auth_parses_the_three_bearer_blocks() {
+    fn upstream_auth_parses_the_three_bearer_blocks() {
         for driver in [
             "murmur-driver-openai",
             "murmur-driver-deepseek",
             "murmur-driver-moonshotai",
         ] {
-            let auth = parse_inference_auth(&bearer(driver)).unwrap().unwrap();
+            let auth = parse_upstream_auth(&bearer(driver)).unwrap().unwrap();
             assert_eq!(auth.header, "Authorization", "{driver}");
             assert_eq!(auth.render("sk-2"), "Bearer sk-2", "{driver}");
         }
     }
 
     #[test]
-    fn inference_auth_absent_is_none() {
+    fn upstream_auth_absent_is_none() {
         let yaml = "name: d\nversion: 0.1.0\nruntime: driver\n";
-        assert_eq!(parse_inference_auth(yaml).unwrap(), None);
+        assert_eq!(parse_upstream_auth(yaml).unwrap(), None);
     }
 
     fn refused(block: &str) -> String {
         let yaml = format!("name: d\nversion: 0.1.0\nruntime: driver\n{block}");
-        parse_inference_auth(&yaml).unwrap_err().to_string()
+        parse_upstream_auth(&yaml).unwrap_err().to_string()
     }
 
     #[test]
-    fn inference_auth_refuses_each_malformed_block() {
+    fn upstream_auth_refuses_each_malformed_block() {
         let cases = [
             (
-                "inference_auth: x-api-key\n",
-                "'inference_auth' has invalid type",
+                "upstream_auth: x-api-key\n",
+                "'upstream_auth' has invalid type",
             ),
-            ("inference_auth:\n", "'inference_auth' has invalid type"),
+            ("upstream_auth:\n", "'upstream_auth' has invalid type"),
             (
-                "inference_auth:\n  value: \"{key}\"\n",
-                "'inference_auth.header'",
-            ),
-            (
-                "inference_auth:\n  header: x-api-key\n",
-                "'inference_auth.value'",
+                "upstream_auth:\n  value: \"{key}\"\n",
+                "'upstream_auth.header'",
             ),
             (
-                "inference_auth:\n  header: [x]\n  value: \"{key}\"\n",
-                "'inference_auth.header' has invalid type",
+                "upstream_auth:\n  header: x-api-key\n",
+                "'upstream_auth.value'",
             ),
             (
-                "inference_auth:\n  header: x-api-key\n  value: 42\n",
-                "'inference_auth.value' has invalid type",
+                "upstream_auth:\n  header: [x]\n  value: \"{key}\"\n",
+                "'upstream_auth.header' has invalid type",
             ),
             (
-                "inference_auth:\n  header: \"bad header\"\n  value: \"{key}\"\n",
+                "upstream_auth:\n  header: x-api-key\n  value: 42\n",
+                "'upstream_auth.value' has invalid type",
+            ),
+            (
+                "upstream_auth:\n  header: \"bad header\"\n  value: \"{key}\"\n",
                 "not a valid HTTP header name",
             ),
             (
-                "inference_auth:\n  header: \"\"\n  value: \"{key}\"\n",
+                "upstream_auth:\n  header: \"\"\n  value: \"{key}\"\n",
                 "not a valid HTTP header name",
             ),
             (
-                "inference_auth:\n  header: Authorization\n  value: Bearer\n",
+                "upstream_auth:\n  header: Authorization\n  value: Bearer\n",
                 "exactly once (found 0)",
             ),
             (
-                "inference_auth:\n  header: Authorization\n  value: \"{key}{key}\"\n",
+                "upstream_auth:\n  header: Authorization\n  value: \"{key}{key}\"\n",
                 "exactly once (found 2)",
             ),
             (
-                "inference_auth:\n  header: Authorization\n  value: \"Bearer\\n{key}\"\n",
+                "upstream_auth:\n  header: Authorization\n  value: \"Bearer\\n{key}\"\n",
                 "cannot hold",
             ),
         ];
@@ -470,16 +499,47 @@ mod inference_auth_tests {
     }
 
     #[test]
-    fn inference_auth_refuses_a_header_the_upstream_echoes_or_routes_by() {
+    fn upstream_auth_refuses_a_header_the_upstream_echoes_or_routes_by() {
         for header in ["Host", "origin", "Referer", "Cookie", "Content-Length"] {
             let message = refused(&format!(
-                "inference_auth:\n  header: {header}\n  value: \"{{key}}\"\n"
+                "upstream_auth:\n  header: {header}\n  value: \"{{key}}\"\n"
             ));
             assert!(
-                message.contains("'inference_auth.header'") && message.contains("cannot carry"),
+                message.contains("'upstream_auth.header'") && message.contains("cannot carry"),
                 "{header}: {message}"
             );
         }
+    }
+
+    const RETIRED: &str = "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+    const RENAMED: &str = "field 'inference_auth' was renamed to 'upstream_auth'";
+
+    #[test]
+    fn retired_block_alone_is_refused() {
+        let message = refused(RETIRED);
+        assert!(message.contains(RENAMED), "{message}");
+    }
+
+    #[test]
+    fn retired_block_beside_a_valid_upstream_auth_is_refused() {
+        let message = refused(&format!(
+            "upstream_auth:\n  header: Authorization\n  value: \"Bearer {{key}}\"\n{RETIRED}"
+        ));
+        assert!(message.contains(RENAMED), "{message}");
+    }
+
+    #[test]
+    fn retired_block_check_passes_a_manifest_without_the_old_name() {
+        let base = "name: d\nversion: 0.1.0\nruntime: tool\n";
+        refuse_retired_auth_block(base).unwrap();
+        refuse_retired_auth_block(&format!(
+            "{base}upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
+        ))
+        .unwrap();
+        assert!(matches!(
+            refuse_retired_auth_block(&format!("{base}{RETIRED}")),
+            Err(ManifestError::InvalidValue { field, .. }) if field == RETIRED_AUTH_BLOCK
+        ));
     }
 }
 

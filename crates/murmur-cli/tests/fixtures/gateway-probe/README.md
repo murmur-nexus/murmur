@@ -17,7 +17,7 @@ JSON object — never through its environment, and reports only whether any envi
 contains it.
 
 `murmur.yaml` is the bundled manifest the tests pack with the tool. It declares
-`inference_auth: {header: Authorization, value: "Bearer {key}"}`.
+`upstream_auth: {header: Authorization, value: "Bearer {key}"}`.
 
 `capsule/capsule-gateway-probe.wasm` is built against `world capsule`. It passes the task text
 (`task.md`, the hex-encoded marker) as input to `gateway-probe` and `gateway-probe-b` and writes

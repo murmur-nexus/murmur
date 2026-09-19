@@ -27,7 +27,7 @@ use http::{
     HeaderMap, Method, StatusCode, Uri, Version,
 };
 use http_body_util::{BodyExt, Full};
-use murmur_artifact::InferenceAuth;
+use murmur_artifact::UpstreamAuth;
 use wasmtime_wasi_http::p2::{
     bindings::http::types::ErrorCode,
     body::HyperOutgoingBody,
@@ -64,7 +64,7 @@ pub(crate) struct CredentialGateway {
     /// `upstream`'s authority as it goes on the wire: host plus the port only when one was written.
     upstream_authority: String,
     /// The artifact's own declaration of how its upstream takes the key.
-    auth: InferenceAuth,
+    auth: UpstreamAuth,
     /// `gateway.api_key`, resolved at staging. `None` attaches nothing.
     credential: Option<Arc<GatewayCredential>>,
     pub(crate) metering: GatewayMetering,
@@ -165,7 +165,7 @@ impl CredentialGateway {
     pub(crate) fn new(
         artifact: impl Into<String>,
         endpoint: &str,
-        auth: InferenceAuth,
+        auth: UpstreamAuth,
         credential: Option<Arc<GatewayCredential>>,
         metering: GatewayMetering,
     ) -> Result<Self, RuntimeError> {
@@ -349,14 +349,14 @@ mod tests {
 
     const KEY: &str = "sk-unit-gateway-marker";
 
-    fn auth(header: &str, value: &str) -> InferenceAuth {
-        InferenceAuth {
+    fn auth(header: &str, value: &str) -> UpstreamAuth {
+        UpstreamAuth {
             header: header.to_string(),
             value: value.to_string(),
         }
     }
 
-    fn gateway(endpoint: &str, auth: InferenceAuth, key: Option<&str>) -> CredentialGateway {
+    fn gateway(endpoint: &str, auth: UpstreamAuth, key: Option<&str>) -> CredentialGateway {
         let credential = key.map(|key| {
             Arc::new(
                 GatewayCredential::resolve(

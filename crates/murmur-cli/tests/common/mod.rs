@@ -379,7 +379,7 @@ pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: 
         name,
         version,
         wasm_path,
-        "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n",
+        "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n",
     )
 }
 

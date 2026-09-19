@@ -354,7 +354,7 @@ fn publish_driver(registry_root: &Path) {
         zip.write_all(
             format!(
                 "name: {DRIVER}\nversion: {DRIVER_VERSION}\nruntime: driver\n\
-                 inference_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
+                 upstream_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
             )
             .as_bytes(),
         )

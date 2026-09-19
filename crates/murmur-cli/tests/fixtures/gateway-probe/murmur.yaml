@@ -1,6 +1,6 @@
 name: gateway-probe
 version: 0.1.0
 runtime: wasm
-inference_auth:
+upstream_auth:
   header: Authorization
   value: "Bearer {key}"

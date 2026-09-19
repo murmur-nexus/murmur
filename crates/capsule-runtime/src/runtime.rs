@@ -4830,15 +4830,15 @@ fn gateway_for_store(
 /// the environment, so a credential found nowhere refuses with
 /// [`RuntimeError::GatewayCredentialNotFound`]. A native implementation is then refused with
 /// [`RuntimeError::GatewayOnNativeArtifact`] — its requests leave through the egress proxy and
-/// would never reach the gateway — and the artifact's own bundled `inference_auth:` block is read,
-/// refusing with [`RuntimeError::GatewayArtifactDeclaresNoInferenceAuth`] when it is absent or
+/// would never reach the gateway — and the artifact's own bundled `upstream_auth:` block is read,
+/// refusing with [`RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth`] when it is absent or
 /// malformed. A keyless gateway needs that block too: its header is the one stripped from every
 /// request. A gateway with neither a credential nor `keyless: true` is refused with
 /// [`RuntimeError::GatewayWithoutCredential`] before anything is resolved.
 ///
 /// The configured `transport: http` driver's gateway is metered against `spend` and becomes the
 /// table's inference gateway; every other gateway is unmetered. An artifact without `gateway:` is
-/// never asked for `inference_auth:`.
+/// never asked for `upstream_auth:`.
 fn stage_gateways(
     inference: Option<&InferenceConfig>,
     artifacts: &[ArtifactRequest],
@@ -4880,20 +4880,19 @@ fn stage_gateways(
                 name: artifact.name.clone(),
             });
         }
-        let refuse =
-            |reason: Option<String>| RuntimeError::GatewayArtifactDeclaresNoInferenceAuth {
-                name: artifact.name.clone(),
-                version: installed
-                    .map(|installed| installed.version.clone())
-                    .unwrap_or_else(|| artifact.version.clone()),
-                reason,
-            };
+        let refuse = |reason: Option<String>| RuntimeError::GatewayArtifactDeclaresNoUpstreamAuth {
+            name: artifact.name.clone(),
+            version: installed
+                .map(|installed| installed.version.clone())
+                .unwrap_or_else(|| artifact.version.clone()),
+            reason,
+        };
         let manifest_yaml = installed_manifests
             .iter()
             .find(|(name, _)| *name == artifact.name)
             .map(|(_, yaml)| yaml.as_str())
             .ok_or_else(|| refuse(Some("the artifact has no bundled murmur.yaml".to_string())))?;
-        let auth = match murmur_artifact::parse_inference_auth(manifest_yaml) {
+        let auth = match murmur_artifact::parse_upstream_auth(manifest_yaml) {
             Ok(Some(auth)) => auth,
             Ok(None) => return Err(refuse(None)),
             Err(err) => return Err(refuse(Some(err.to_string()))),
@@ -10892,7 +10891,7 @@ inference:
         CredentialGateway::new(
             artifact,
             endpoint,
-            murmur_artifact::InferenceAuth {
+            murmur_artifact::UpstreamAuth {
                 header: "Authorization".to_string(),
                 value: "Bearer {key}".to_string(),
             },

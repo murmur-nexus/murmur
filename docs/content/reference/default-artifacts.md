@@ -205,7 +205,7 @@ Two further variables are injected per artifact rather than per session:
 | Env var | Injected when | Value |
 |---|---|---|
 | `MURMUR_ARTIFACT_CONFIG` | This artifact's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
-| `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint` |
+| `MURMUR_GATEWAY_ENDPOINT` | This artifact's entry declares [`gateway:`](manifest.md#artifact-gateway), and the call uses its gateway | `http://127.0.0.1:9` followed by the path of `gateway.endpoint`. Requests sent there reach `gateway.endpoint` with the key attached as the artifact's [`upstream_auth:`](manifest.md#upstream-auth) block declares |
 
 Each reaches the declaring artifact and no other, and the runtime sets it whether or not
 `inference:` is configured. The configured driver receives `MURMUR_GATEWAY_ENDPOINT` on its agent
@@ -216,23 +216,3 @@ there is refused with [`E-CAP-017`](diagnostics.md#e-cap-017).
 
 `transport: process` loads no driver component: `inference.driver` is rejected in the manifest, and
 the agent loop spawns `inference.command` instead. Tool artifacts still receive the whole table.
-
-### `inference_auth:` block { #inference-auth }
-
-No component receives a `gateway.api_key`. An artifact whose capsule entry declares
-[`gateway:`](manifest.md#artifact-gateway) — a driver, tool or hook — declares in its own
-`murmur.yaml` how its upstream takes the key, and the runtime attaches that header to each request
-the artifact sends to `MURMUR_GATEWAY_ENDPOINT` (for the driver, also `MURMUR_INFERENCE_ENDPOINT`).
-An artifact with a `gateway:` and without a usable block refuses to start with
-[`E-RUN-025`](diagnostics.md#e-run-025); an artifact without a `gateway:` is never asked for one.
-
-```yaml
-inference_auth:
-  header: Authorization
-  value: "Bearer {key}"
-```
-
-| Field | Type | Required | Notes |
-|---|---|---:|---|
-| `inference_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the artifact sets, in any case, is replaced. Cannot be `Host`, `Origin`, `Referer`, `Cookie`, `Connection`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Expect`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding` or `Upgrade` |
-| `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by the entry's `gateway.api_key`. Under `gateway.keyless: true`, no header is sent |

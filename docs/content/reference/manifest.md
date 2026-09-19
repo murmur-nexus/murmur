@@ -18,7 +18,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `implementation` | `wasm \| native` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. |
 | `execution` | `wasm \| native \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime` and `implementation`. Case-insensitive. An unrecognized value is a parse error. |
 | `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
-| `inference_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`inference_auth:` block](default-artifacts.md#inference-auth). |
+| `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
 
 A hook artifact's own manifest carries three more fields — see
 [Hook contract fields](#hook-contract-fields).
@@ -31,6 +31,40 @@ execution: static
 requires_files:
   - config.json
 ```
+
+### `upstream_auth:` block { #upstream-auth }
+
+How the artifact's upstream takes its key. Any artifact whose capsule entry may declare
+[`gateway:`](#artifact-gateway) — a tool, hook or driver — declares this block in its own
+`murmur.yaml`. The runtime renders the header from the entry's `gateway.api_key` and attaches it to
+each request the artifact sends to `MURMUR_GATEWAY_ENDPOINT` (for the inference driver, also
+`MURMUR_INFERENCE_ENDPOINT`). The artifact itself never receives the key.
+
+A web search tool whose upstream takes a bearer token:
+
+```yaml
+name: my-web-search
+version: "0.1.0"
+runtime: tool
+requires_files:
+  - tool.wasm
+upstream_auth:
+  header: Authorization
+  value: "Bearer {key}"
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `upstream_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the artifact sets, in any case, is replaced. Cannot be `Host`, `Origin`, `Referer`, `Cookie`, `Connection`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Expect`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding` or `Upgrade` |
+| `upstream_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by the entry's `gateway.api_key`. Under `gateway.keyless: true`, no header is sent |
+
+When the block is read and refused:
+
+| Case | Result |
+|---|---|
+| Capsule entry declares no `gateway:` | The block is never read |
+| Capsule entry declares `gateway:`, block absent or malformed | `mur run` refuses with [`E-RUN-025`](diagnostics.md#e-run-025) |
+| Artifact manifest declares `inference_auth:`, the block's former name, with or without `upstream_auth:` | `mur build` refuses with [`E-BLD-004`](diagnostics.md#e-bld-004); an artifact already packed refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025) when its entry declares `gateway:` |
 
 ---
 
@@ -481,8 +515,8 @@ artifacts:
 The fields are in the [`artifacts:` table](#field-artifacts). The block is read only from the
 capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`. How the
 key is presented comes from the artifact's bundled manifest, its
-[`inference_auth:`](default-artifacts.md#inference-auth) block. An artifact whose entry declares
-`gateway:` and whose manifest has no usable `inference_auth:` refuses the launch with
+[`upstream_auth:`](#upstream-auth) block. An artifact whose entry declares
+`gateway:` and whose manifest has no usable `upstream_auth:` refuses the launch with
 [`E-RUN-025`](diagnostics.md#e-run-025); an artifact without `gateway:` needs no such block.
 
 Which entries accept the block:
@@ -501,7 +535,7 @@ What the artifact sees and what the runtime does:
 | Aspect | Behaviour |
 |---|---|
 | Environment | `MURMUR_GATEWAY_ENDPOINT`, set only for the artifact whose entry declares the block: `http://127.0.0.1:9` plus the path of `gateway.endpoint`, without a trailing `/`. The configured driver also receives it as `MURMUR_INFERENCE_ENDPOINT`. |
-| Request | A request to `127.0.0.1:9` is readdressed at `gateway.endpoint`'s scheme, host and port, keeping its own path and query; `https` upstreams get TLS. Every header named like `inference_auth.header` is removed and exactly one is attached, rendered from the key. |
+| Request | A request to `127.0.0.1:9` is readdressed at `gateway.endpoint`'s scheme, host and port, keeping its own path and query; `https` upstreams get TLS. Every header named like [`upstream_auth.header`](#upstream-auth) is removed and exactly one is attached, rendered from the key. |
 | Network grant | `gateway.endpoint` is the grant for these requests: they are not checked against `capabilities.network.allow` or the entry's own `capabilities.network`. Every other request from the artifact is checked as usual. An allow-list entry naming the upstream warns [`W-SEC-025`](diagnostics.md#w-sec-025). |
 | Scope | Only the declaring artifact's own calls use its gateway. A request another artifact sends to `127.0.0.1:9` carries no key and is checked against the allow-list. |
 | Spend | Only the configured `transport: http` driver's gateway is metered by [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend). Every other gateway is unmetered and warns [`W-SEC-030`](diagnostics.md#w-sec-030) at launch and from `mur doctor`. |
@@ -577,12 +611,12 @@ artifacts:
 | `gateway:` writes | Result |
 |---|---|
 | A non-blank `api_key` | Keyed: the runtime attaches the key |
-| `keyless: true`, no `api_key` | Keyless: every header named like `inference_auth.header` is removed and none is attached |
+| `keyless: true`, no `api_key` | Keyless: every header named like [`upstream_auth.header`](#upstream-auth) is removed and none is attached |
 | `api_key` (any value, blank included) and `keyless: true` | `E-MAN-003` |
 | No `api_key`, or one that is blank or null, without `keyless: true` | [`E-CAP-018`](diagnostics.md#e-cap-018) |
 
 A loopback endpoint needs `keyless: true` like any other: the address is never read as a
-declaration. A keyless artifact still needs its own `inference_auth:` block
+declaration. A keyless artifact still needs its own [`upstream_auth:`](#upstream-auth) block
 ([`E-RUN-025`](diagnostics.md#e-run-025)), which names the header to remove. A keyless gateway is
 recorded as `credential_source: "keyless"` in
 [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl).

@@ -11,6 +11,7 @@ section that explains it.
 | `E-BLD-001` | Manifest `name:` is not a valid artifact identifier | [E-BLD-001](#e-bld-001) |
 | `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive | [E-BLD-002](#e-bld-002) |
 | `E-BLD-003` | Packed entry set is not a launchable wasm payload | [E-BLD-003](#e-bld-003) |
+| `E-BLD-004` | Artifact manifest declares `inference_auth:`, the former name of `upstream_auth:` | [E-BLD-004](#e-bld-004) |
 | `E-CAP-001` | A `capabilities.network.allow` entry could not be parsed | [E-CAP-001](#e-cap-001) |
 | `E-CAP-002` | A `filesystem.scope` is not relative to the workdir, or escapes it via `..` | [E-CAP-002](#e-cap-002) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host | [E-CAP-003](#e-cap-003) |
@@ -77,7 +78,7 @@ section that explains it.
 | `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
 | `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
-| `E-RUN-025` | An artifact whose entry declares `gateway:` has no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
+| `E-RUN-025` | An artifact whose entry declares `gateway:` has no usable `upstream_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
 | `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
@@ -421,7 +422,7 @@ running, so unlinking the record would remove the only handle anyone has on it. 
 session held was cancelled before the signalling started, so the capsule is idle even though it is
 still there.
 
-### E-RUN-025 — an artifact with a gateway declares no usable `inference_auth:` block { #e-run-025 }
+### E-RUN-025 — an artifact with a gateway declares no usable `upstream_auth:` block { #e-run-025 }
 
 An artifact entry declares [`gateway:`](manifest.md#artifact-gateway), and the artifact's own
 `murmur.yaml` does not say how its upstream takes the key. The runtime attaches the key to each of
@@ -430,23 +431,24 @@ refuses at staging, before any component runs or any request is sent. The refusa
 or not `gateway.api_key` is set, and to the inference driver, tools and hooks alike.
 
 ```text
-error[E-RUN-025]: artifact 'murmur-driver-anthropic@1.0.0' declares no usable inference_auth: block
-  hint: the runtime presents the key itself and needs the artifact to say how; update the artifact to a version whose murmur.yaml declares inference_auth:, or remove gateway: from its entry
+error[E-RUN-025]: artifact 'murmur-driver-anthropic@1.0.0' declares no usable upstream_auth: block
+  hint: the runtime presents the key itself and needs the artifact to say how; update the artifact to a version whose murmur.yaml declares upstream_auth:, or remove gateway: from its entry
 ```
 
 A block that is present and malformed adds the reason in parentheses:
 
 | Reason names | Means |
 |---|---|
-| `'inference_auth' has invalid type` | The block is not a mapping |
-| `missing required field 'inference_auth.header'` or `'inference_auth.value'` | A child is absent |
-| `'inference_auth.header' has invalid type` or `'inference_auth.value' has invalid type` | A child is not a string |
+| `field 'inference_auth' was renamed to 'upstream_auth'` | The artifact declares the block under its former name. Nothing under that name is read; update the artifact to a version that declares `upstream_auth:` |
+| `'upstream_auth' has invalid type` | The block is not a mapping |
+| `missing required field 'upstream_auth.header'` or `'upstream_auth.value'` | A child is absent |
+| `'upstream_auth.header' has invalid type` or `'upstream_auth.value' has invalid type` | A child is not a string |
 | `is not a valid HTTP header name` | `header` cannot be sent as a header |
 | `cannot carry the key` | `header` names a header that routes or frames the request, or that upstreams commonly echo back, such as `Host` or `Origin` |
 | `must contain {key} exactly once` | `value` has no `{key}`, or more than one |
 | `contains characters an HTTP header value cannot hold` | `value` has a control character such as a newline |
 
-The block's shape is in [`inference_auth:` block](default-artifacts.md#inference-auth).
+The block's shape is in [`upstream_auth:` block](manifest.md#upstream-auth).
 
 ### E-RUN-026 — the spend ledger cannot be used { #e-run-026 }
 
@@ -1010,6 +1012,18 @@ payload selection at `mur run` time:
 A `*.wasm` in a subdirectory is not a root entry and does not count. This check applies only to
 wasm artifacts — native (`implementation: native`) and static (`runtime: skill`,
 `execution: static`) artifacts are packed without it.
+
+### E-BLD-004 — manifest declares a retired block name { #e-bld-004 }
+
+```text
+error[E-BLD-004]: murmur.yaml: field 'inference_auth' was renamed to 'upstream_auth'; this murmur reads only the new name
+  hint: rename the block to upstream_auth: — an artifact published with inference_auth: is refused at launch with E-RUN-025
+```
+
+The artifact's `murmur.yaml` declares `inference_auth:`, the former name of the
+[`upstream_auth:` block](manifest.md#upstream-auth). `mur build` refuses before writing the
+`.mur.zip`, including when `upstream_auth:` is also declared. Rename the block; its fields are
+unchanged.
 
 ### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 
