@@ -461,14 +461,14 @@ pub enum RuntimeError {
     DriverNotInstalled(String),
 
     /// An artifact whose operator entry declares `gateway:` has a bundled manifest with no usable
-    /// `inference_auth:` block, so the runtime cannot tell how its upstream expects the key.
+    /// `upstream_auth:` block, so the runtime cannot tell how its upstream expects the key.
     /// Refused at staging, before any component runs, whether or not `gateway.api_key` is set.
     /// `reason` is `None` when the block is absent and says what is wrong when it is malformed.
     #[error(
-        "artifact '{name}@{version}' declares no usable inference_auth: block{}",
+        "artifact '{name}@{version}' declares no usable upstream_auth: block{}",
         .reason.as_ref().map(|reason| format!(" ({reason})")).unwrap_or_default()
     )]
-    GatewayArtifactDeclaresNoInferenceAuth {
+    GatewayArtifactDeclaresNoUpstreamAuth {
         name: String,
         version: String,
         reason: Option<String>,

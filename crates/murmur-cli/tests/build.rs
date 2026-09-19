@@ -198,6 +198,48 @@ fn two_root_wasm_files_fail_the_build_with_no_artifact_written() {
     assert!(!dir.path().join("ambiguous-tool-0.1.0.mur.zip").exists());
 }
 
+/// A manifest still declaring `inference_auth:` is refused before anything is written: the
+/// runtime would refuse the packed artifact at launch. The same source under the new name builds.
+#[test]
+fn a_retired_auth_block_fails_the_build_with_no_artifact_written() {
+    let dir = tempdir().unwrap();
+    let manifest = |block: &str| {
+        format!(
+            "name: search-tool\nversion: 0.1.0\nruntime: wasm\nrequires_files:\n  - tool.wasm\n\
+             {block}:\n  header: Authorization\n  value: \"Bearer {{key}}\"\n"
+        )
+    };
+    fs::write(dir.path().join("murmur.yaml"), manifest("inference_auth")).unwrap();
+    fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
+    let artifact = dir.path().join("out.mur.zip");
+    let build = || {
+        Command::cargo_bin("mur")
+            .unwrap()
+            .args([
+                "build",
+                dir.path().to_str().unwrap(),
+                "--output",
+                artifact.to_str().unwrap(),
+            ])
+            .assert()
+    };
+
+    build().failure().stderr(
+        predicate::str::contains("error[E-BLD-004]:")
+            .and(predicate::str::contains(
+                "field 'inference_auth' was renamed to 'upstream_auth'",
+            ))
+            .and(predicate::str::contains(
+                "hint: rename the block to upstream_auth:",
+            )),
+    );
+    assert!(!artifact.exists());
+
+    fs::write(dir.path().join("murmur.yaml"), manifest("upstream_auth")).unwrap();
+    build().success();
+    assert!(artifact.exists());
+}
+
 #[test]
 fn an_invalid_artifact_name_fails_the_build() {
     let dir = tempdir().unwrap();

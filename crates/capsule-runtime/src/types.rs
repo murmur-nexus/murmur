@@ -113,7 +113,7 @@ pub struct ArtifactRequest {
     /// This artifact's operator-declared `gateway:` block, copied verbatim from its entry in the
     /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::gateway`) — the same
     /// operator-only sourcing rule `capabilities` above follows. Built into the artifact's
-    /// credential gateway at staging, which is also where the artifact's own `inference_auth:`
+    /// credential gateway at staging, which is also where the artifact's own `upstream_auth:`
     /// declaration is read; an artifact without this block is never asked for one.
     pub gateway: Option<murmur_artifact::ArtifactGateway>,
 }
@@ -427,7 +427,7 @@ pub struct StagedSession {
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     pub(crate) inference: Option<InferenceConfig>,
     /// Every credential gateway of the session, built at staging from each artifact entry's
-    /// `gateway:` block and the artifact's own `inference_auth:` declaration. Empty when no entry
+    /// `gateway:` block and the artifact's own `upstream_auth:` declaration. Empty when no entry
     /// declares one.
     pub(crate) gateways: crate::credential_gateway::GatewayTable,
     /// This session's spend account, built at staging from `inference.max_session_tokens` and

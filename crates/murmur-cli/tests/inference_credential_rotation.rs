@@ -26,7 +26,7 @@ use tempfile::TempDir;
 const DRIVER: &str = "murmur-driver-anthropic";
 const SKILL: &str = "rotation-skill";
 const VERSION: &str = "0.1.0";
-const AUTH: &str = "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+const AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 const NAME: &str = "ROTATION_TEST_KEY";
 const OLD: &str = "sk-rotation-old-7a41c9e2";
 const NEW: &str = "sk-rotation-new-3d82e0b5";

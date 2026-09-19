@@ -11,7 +11,7 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
-use crate::manifest::{load_manifest, Manifest, ManifestError};
+use crate::manifest::{load_manifest, refuse_retired_auth_block, Manifest, ManifestError};
 use crate::manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 use crate::payload_shape::{select_root_wasm_from_entries, PayloadShapeError};
 use crate::registry::RuntimeType;
@@ -97,6 +97,10 @@ pub enum BuildError {
     /// author sees at build time is the text the runtime would have printed at launch.
     #[error(transparent)]
     PayloadShape(#[from] PayloadShapeError),
+    /// The manifest declares a block under a name murmur no longer reads. Packing it would ship
+    /// an artifact the runtime refuses at launch.
+    #[error(transparent)]
+    RetiredAuthBlock(ManifestError),
 }
 
 /// One file the packer will write into the archive.
@@ -126,6 +130,12 @@ pub(crate) struct PackedPlan {
 pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, BuildError> {
     let manifest_path = resolve_manifest_path(source_dir);
     let manifest = load_manifest(&manifest_path)?;
+    let manifest_yaml =
+        fs::read_to_string(&manifest_path).map_err(|source| BuildError::ReadSource {
+            path: manifest_path.display().to_string(),
+            source,
+        })?;
+    refuse_retired_auth_block(&manifest_yaml).map_err(BuildError::RetiredAuthBlock)?;
 
     // Everything that decides *what* ships — name validation, per-entry path safety, curation
     // and archive-name collisions — happens here, and is the same computation the build lints

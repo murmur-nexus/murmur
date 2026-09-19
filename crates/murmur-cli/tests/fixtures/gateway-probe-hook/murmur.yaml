@@ -3,6 +3,6 @@ version: 0.1.0
 runtime: hook
 binding: on-stage
 execution_mode: blocking
-inference_auth:
+upstream_auth:
   header: Authorization
   value: "Bearer {key}"

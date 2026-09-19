@@ -1,5 +1,5 @@
 //! The inference gateway: a `transport: http` driver reaches its provider through the runtime,
-//! which attaches the credential the driver's own `inference_auth:` block declares. The driver
+//! which attaches the credential the driver's own `upstream_auth:` block declares. The driver
 //! never holds the key.
 //!
 //! Driven through the real `mur` binary against a recording upstream on loopback, so every
@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 const ANTHROPIC_DRIVER: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.0";
-const ANTHROPIC_AUTH: &str = "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+const ANTHROPIC_AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
 
 /// Method, target, headers sorted by name, blank line, body — with the upstream's ephemeral port
 /// replaced so the rendering is stable across runs.
@@ -406,14 +406,14 @@ fn gateway_happy_path() {
     assert!(run.warning_lines("W-SEC-025").is_empty(), "{}", run.stderr);
 }
 
-/// A driver that declares no usable `inference_auth:` refuses to start, by name and version,
+/// A driver that declares no usable `upstream_auth:` refuses to start, by name and version,
 /// before anything reaches the provider.
 #[test]
-fn driver_without_inference_auth_refuses() {
+fn driver_without_upstream_auth_refuses() {
     for (auth_block, reason) in [
         ("", None),
         (
-            "inference_auth:\n  header: Authorization\n  value: \"Bearer\"\n",
+            "upstream_auth:\n  header: Authorization\n  value: \"Bearer\"\n",
             Some("exactly once"),
         ),
     ] {
@@ -440,6 +440,33 @@ fn driver_without_inference_auth_refuses() {
         assert!(!combined.contains(MARKER), "{combined}");
         assert!(upstream.requests().is_empty());
     }
+}
+
+/// A driver still declaring the block under its old name refuses to start, by name and version,
+/// and nothing reaches the provider: the old name is never read as `upstream_auth:`.
+#[test]
+fn driver_with_the_retired_block_name_refuses() {
+    let upstream = streamed_upstream();
+    let capsule = Capsule::new(
+        ENV_REPORT_DRIVER,
+        &env_report_wasm(),
+        "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n",
+        &upstream.endpoint,
+        "",
+    );
+    let run = Run::of(capsule.run(MARKER, &[]));
+    let combined = format!("{}{}", run.stdout, run.stderr);
+    println!("{}", combined.trim());
+    assert!(!run.output.status.success(), "{combined}");
+    for expected in [
+        "E-RUN-025",
+        &format!("{ENV_REPORT_DRIVER}@{DRIVER_VERSION}"),
+        "was renamed to 'upstream_auth'",
+    ] {
+        assert!(combined.contains(expected), "{expected}: {combined}");
+    }
+    assert!(!combined.contains(MARKER), "{combined}");
+    assert!(upstream.requests().is_empty());
 }
 
 /// Naming the driver's `gateway.endpoint` host in `network.allow` is accepted and warned about

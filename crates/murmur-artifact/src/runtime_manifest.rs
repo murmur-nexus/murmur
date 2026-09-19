@@ -854,7 +854,7 @@ pub struct RuntimeArtifact {
     /// configured `transport: http` driver, whose gateway is the metered inference gateway.
     ///
     /// Operator-sourced only, and never read from the artifact's own bundled `murmur.yaml`: the
-    /// artifact says how the key is presented (`inference_auth:`), never where it goes.
+    /// artifact says how the key is presented (`upstream_auth:`), never where it goes.
     pub gateway: Option<ArtifactGateway>,
 }
 

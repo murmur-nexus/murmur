@@ -17,7 +17,7 @@ them without the hook being told the key. A hook holds no preopened directory by
 report travels through the gateway rather than a file. Every lifecycle event returns `none`.
 
 `murmur.yaml` is the bundled manifest the tests pack with the hook: `binding: on-stage`,
-`execution_mode: blocking`, and `inference_auth: {header: Authorization, value: "Bearer {key}"}`.
+`execution_mode: blocking`, and `upstream_auth: {header: Authorization, value: "Bearer {key}"}`.
 
 ## Rebuild
 
