@@ -41,20 +41,13 @@ use std::sync::{
 
 use crate::{
     agent::AgentLoopExit,
-    errors::RuntimeError,
+    errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035},
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
         SseEventBuffer, StreamArtifact, StreamStatus, TaskArtifactUpdateEvent,
         TaskStatusUpdateEvent,
     },
 };
-
-/// The diagnostic codes a reader of a terminal `failed` message needs to look the failure up.
-/// The authority for which code renders which error is murmur-cli's `CliError` mapping; these
-/// three are the errors this transport raises once an attempt is under way.
-const E_RUN_033: &str = "E-RUN-033";
-const E_RUN_034: &str = "E-RUN-034";
-const E_RUN_035: &str = "E-RUN-035";
 
 /// Where one attempt's frames go. Absent for a run with no A2A task — `mur run`, a `task.md`
 /// launch — which writes nothing.
@@ -282,8 +275,8 @@ fn failure_message(error: &RuntimeError) -> String {
     }
 }
 
-/// The code murmur-cli renders `error` under, for the failures this transport raises once an
-/// attempt is under way. Every other error reaches the client as its message alone.
+/// The code `error` renders under, for the failures this transport raises once an attempt is
+/// under way. Every other error reaches the client as its message alone.
 fn diagnostic_code(error: &RuntimeError) -> Option<&'static str> {
     match error {
         RuntimeError::HarnessTurnFailed { .. } => Some(E_RUN_033),

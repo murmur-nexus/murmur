@@ -381,8 +381,8 @@ impl<'a> ProcessEventSink<'a> {
     }
 
     /// The number, 1-based, that the turn counter would record a turn opening now under — which
-    /// is the number the A2A segment opening with it carries. Reads the counter; never advances
-    /// it, so `max_turns` counts exactly what it counted before segments existed.
+    /// is the number the A2A segment opening with it carries. Reads the counter and never
+    /// advances it: a segment is not a turn, and must not spend `max_turns` budget.
     fn segment_turn(&self) -> u32 {
         match self.open.as_ref() {
             Some(open) => open.index + 1,
@@ -658,9 +658,9 @@ mod tests {
             let plan = plan_session(&policy);
             let planned_id = plan.session.id.clone();
             // A real broadcast and buffer, so the frames these tests read are the bytes a client
-            // would have received. The receiver is held for the same reason: a broadcast with no
-            // receiver still buffers, but keeping one proves the frames were sendable.
-            let (tx, rx) = tokio::sync::broadcast::channel(256);
+            // would have received. The buffer records them whether or not a receiver is attached,
+            // which is what these tests read back.
+            let (tx, _rx) = tokio::sync::broadcast::channel(256);
             let frames = Arc::new(Mutex::new(SseEventBuffer::new(256)));
             Self {
                 _dir: dir,
@@ -681,7 +681,6 @@ mod tests {
                 map,
                 planned_id,
             }
-            .keeping(rx)
         }
 
         /// The sink is built per batch because it borrows the stream; its turn state is a
@@ -695,11 +694,6 @@ mod tests {
                 .await;
             sink.finish(&mut self.trace).await;
             outcome
-        }
-
-        fn keeping(self, rx: tokio::sync::broadcast::Receiver<Arc<String>>) -> Self {
-            drop(rx);
-            self
         }
 
         /// Each frame the A2A stream wrote, labelled by kind, in order.

@@ -49,9 +49,13 @@ pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory
 pub const E_RUN_029: &str = "E-RUN-029"; // the transport: process driver does not export the process driver interface
 pub const E_RUN_030: &str = "E-RUN-030"; // the transport: http inference driver exports the process driver interface
 pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded with no grants, or described itself unusably
-pub const E_RUN_033: &str = "E-RUN-033"; // the harness ended a turn in failure
-pub const E_RUN_034: &str = "E-RUN-034"; // a call into the process driver refused, trapped or ran out of time
-pub const E_RUN_035: &str = "E-RUN-035"; // the harness went silent for the whole inactivity window
+
+// E-RUN-033 (the harness ended a turn in failure), E-RUN-034 (a call into the process driver
+// refused, trapped or ran out of time) and E-RUN-035 (the harness went silent for the whole
+// inactivity window) are defined beside the errors that raise them, because the A2A terminal
+// status a process attempt writes carries the same code this renders.
+pub use capsule_runtime::errors::{E_RUN_033, E_RUN_034, E_RUN_035};
+
 pub const E_RUN_036: &str = "E-RUN-036"; // a resumed harness session could not be found by the harness
 pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inference.transport: process
 

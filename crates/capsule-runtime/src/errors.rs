@@ -33,6 +33,18 @@ impl std::fmt::Display for UnreachableEntrypoint {
     }
 }
 
+// The three codes below live beside the variants that raise them because two callers name them:
+// murmur-cli renders them on the terminal, and the A2A terminal status a process attempt writes
+// carries the same code. Defining them twice would let a client and an operator be shown
+// different codes for one failure.
+
+/// The code [`RuntimeError::HarnessTurnFailed`] renders under.
+pub const E_RUN_033: &str = "E-RUN-033";
+/// The code [`RuntimeError::ProcessDriverCallFailed`] renders under.
+pub const E_RUN_034: &str = "E-RUN-034";
+/// The code [`RuntimeError::ProcessHarnessInactive`] renders under.
+pub const E_RUN_035: &str = "E-RUN-035";
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("artifact {name}@{version} not found in registry")]
@@ -640,10 +652,10 @@ pub enum RuntimeError {
         binary_source: String,
     },
 
-    /// The harness ended a turn in failure. `kind` is the driver's `failure-kind`, spelled as it
-    /// is in the WIT, or `max-turns` when this runtime stopped the harness at the attempt's turn
-    /// budget; `origin` distinguishes those two (`harness` / `runtime`) and is what the trace's
-    /// `harness_failed.source` records.
+    /// The harness ended a turn in failure. Renders as [`E_RUN_033`]. `kind` is the driver's
+    /// `failure-kind`, spelled as it is in the WIT, or `max-turns` when this runtime stopped the
+    /// harness at the attempt's turn budget; `origin` distinguishes those two (`harness` /
+    /// `runtime`) and is what the trace's `harness_failed.source` records.
     #[error("the harness turn failed ({kind}): {message}")]
     HarnessTurnFailed {
         kind: String,
@@ -670,8 +682,9 @@ pub enum RuntimeError {
         detail: String,
     },
 
-    /// A call into the process driver trapped, ran out of time, or refused. `call` is the WIT
-    /// function name; `message` is the driver's own refusal or the failure's description.
+    /// A call into the process driver trapped, ran out of time, or refused. Renders as
+    /// [`E_RUN_034`]. `call` is the WIT function name; `message` is the driver's own refusal or
+    /// the failure's description.
     #[error("process driver '{name}@{version}' failed in {call}: {message}")]
     ProcessDriverCallFailed {
         name: String,
@@ -682,6 +695,7 @@ pub enum RuntimeError {
 
     /// The harness went quiet: no stdout line and no bridge request for the whole inactivity
     /// window, so the runtime killed it rather than waiting on a process that had stopped working.
+    /// Renders as [`E_RUN_035`].
     #[error(
         "the harness produced neither a line of output nor a tool call for {seconds}s and was \
          killed"
