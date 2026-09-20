@@ -130,6 +130,7 @@ fn parse_line(line: String) -> Event {
         }
         "delta" => Event::TextDelta(rest.to_string()),
         "text" => Event::Text(rest.to_string()),
+        "tdelta" => Event::ThinkingDelta(rest.to_string()),
         "thinking" => Event::Thinking(rest.to_string()),
         "tool" => parse_tool_call(rest, &line),
         "result" => parse_tool_result(rest, &line),

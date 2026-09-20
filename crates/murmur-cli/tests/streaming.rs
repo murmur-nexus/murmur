@@ -577,6 +577,10 @@ fn streaming_agent_card_has_streaming_capability() {
         card["capabilities"]["streaming"], true,
         "agent card should include capabilities.streaming: true; got: {card}"
     );
+    assert_eq!(
+        card["capabilities"]["cancellation"], true,
+        "an http capsule can stop a task, and its card says so; got: {card}"
+    );
 
     handle.join().expect("launch thread should not panic");
 }

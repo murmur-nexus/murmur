@@ -430,6 +430,25 @@ fn check_resume_launchable(
     Ok(())
 }
 
+/// What this session's inference transport can do, for the capability booleans on the agent card.
+///
+/// A `transport: process` session can do only what the harness its driver drives can: the driver's
+/// `describe().streams-text` says whether text arrives in fragments, and nothing in this runtime
+/// stops a harness mid-turn, so a task on it cannot be cancelled. Every other transport runs
+/// inside this runtime, which streams and cancels.
+fn transport_capabilities(staged: &StagedSession) -> identity::TransportCapabilities {
+    match staged.process_driver.as_ref() {
+        Some(driver) => identity::TransportCapabilities {
+            streams_text: driver.description.streams_text,
+            cancellable: false,
+        },
+        None => identity::TransportCapabilities {
+            streams_text: true,
+            cancellable: true,
+        },
+    }
+}
+
 /// Resolves the executable a process capsule's harness runs as.
 ///
 /// `command` is the manifest's `inference.command` when it set one, which overrides the binary the
@@ -1556,6 +1575,7 @@ fn launch(
                 files: staged.exports_files.is_some(),
                 peer_files: staged.exports_peer_files.is_some(),
             },
+            transport_capabilities(&staged),
         );
         let agent_card_json = agent_card.to_string();
 

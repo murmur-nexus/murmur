@@ -138,6 +138,16 @@ pub(crate) struct DeclaredPlanes {
     pub peer_files: bool,
 }
 
+/// What the capsule's inference transport can actually do, for the two capability booleans that
+/// are otherwise read off the served method list alone.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TransportCapabilities {
+    /// Whether the transport emits streaming text frames.
+    pub streams_text: bool,
+    /// Whether a task on this transport can be stopped.
+    pub cancellable: bool,
+}
+
 /// Build the Agent Card JSON derived from capsule identity and capability policy.
 ///
 /// `session_id` is served alongside the rest because the card is how a caller confirms that the
@@ -147,15 +157,22 @@ pub(crate) struct DeclaredPlanes {
 ///
 /// `capabilities` is what this capsule may do; `serves` is what this door answers. `serves.methods`
 /// is [`served_methods`] for the acceptance the door is given, so it cannot list a method the
-/// dispatcher refuses or omit one it serves, and `capabilities.streaming` is `true` exactly when
-/// it contains `message/stream`. `serves.planes` lists `files` then `peer_files`, each only when
-/// declared.
+/// dispatcher refuses or omit one it serves. `serves.planes` lists `files` then `peer_files`, each
+/// only when declared.
+///
+/// The two capability booleans a client reads before it waits on anything are each the door's
+/// answer *and* the transport's: `capabilities.streaming` is `true` when `serves.methods` contains
+/// `message/stream` and `transport.streams_text`, `capabilities.cancellation` when it contains
+/// `tasks/cancel` and `transport.cancellable`. A door that answers a method whose effect its
+/// transport cannot deliver still lists the method — `serves.methods` names what the dispatcher
+/// answers — and says so here.
 pub(crate) fn build_agent_card(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
     capability_policy: &CapabilityPolicy,
     task_acceptance: &TaskAcceptance,
     planes: DeclaredPlanes,
+    transport: TransportCapabilities,
 ) -> serde_json::Value {
     let tools: Vec<&str> = installed_artifacts
         .iter()
@@ -164,7 +181,10 @@ pub(crate) fn build_agent_card(
         .collect();
 
     let methods = served_methods(task_acceptance);
-    let streaming = methods.contains(&DoorMethod::MessageStream.wire_name());
+    let streaming =
+        methods.contains(&DoorMethod::MessageStream.wire_name()) && transport.streams_text;
+    let cancellation =
+        methods.contains(&DoorMethod::TasksCancel.wire_name()) && transport.cancellable;
     let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
         .into_iter()
         .filter_map(|(declared, name)| declared.then_some(name))
@@ -180,6 +200,7 @@ pub(crate) fn build_agent_card(
             "shell": !capability_policy.shell_allow.is_empty(),
             "network": !capability_policy.network_allow.is_empty(),
             "streaming": streaming,
+            "cancellation": cancellation,
         },
         "serves": {
             "methods": methods,
@@ -1024,7 +1045,21 @@ mod tests {
         TaskAcceptance::Queue,
     ];
 
+    /// The card an http capsule serves: that transport streams text and stops a task.
+    const HTTP_TRANSPORT: TransportCapabilities = TransportCapabilities {
+        streams_text: true,
+        cancellable: true,
+    };
+
     fn card_for(acceptance: &TaskAcceptance, planes: DeclaredPlanes) -> Value {
+        card_for_transport(acceptance, planes, HTTP_TRANSPORT)
+    }
+
+    fn card_for_transport(
+        acceptance: &TaskAcceptance,
+        planes: DeclaredPlanes,
+        transport: TransportCapabilities,
+    ) -> Value {
         let identity = CapsuleIdentity {
             capsule_name: "probe".to_string(),
             capsule_version: "0.1.0".to_string(),
@@ -1037,7 +1072,70 @@ mod tests {
             &CapabilityPolicy::default(),
             acceptance,
             planes,
+            transport,
         )
+    }
+
+    /// Each capability boolean is the served method AND the transport's answer, so a door that
+    /// answers a method its transport cannot deliver advertises the method and not the capability.
+    #[test]
+    fn card_capabilities_are_the_method_and_the_transport() {
+        let cases = [
+            (
+                TransportCapabilities {
+                    streams_text: false,
+                    cancellable: true,
+                },
+                false,
+                true,
+            ),
+            (
+                TransportCapabilities {
+                    streams_text: true,
+                    cancellable: false,
+                },
+                true,
+                false,
+            ),
+        ];
+        for (transport, streaming, cancellation) in cases {
+            let card = card_for_transport(
+                &TaskAcceptance::Single,
+                DeclaredPlanes::default(),
+                transport,
+            );
+            assert_eq!(card["capabilities"]["streaming"], streaming, "{card}");
+            assert_eq!(card["capabilities"]["cancellation"], cancellation, "{card}");
+            assert!(
+                card["serves"]["methods"]
+                    .as_array()
+                    .expect("serves.methods is an array")
+                    .contains(&Value::from("tasks/cancel")),
+                "a capsule that cannot stop a task still answers tasks/cancel: {card}"
+            );
+        }
+    }
+
+    /// A door that starts no task streams nothing, whatever its transport can do: neither
+    /// task-starting method is served under `TaskAcceptance::None`. It still answers
+    /// `tasks/cancel`, so that capability is the transport's answer alone.
+    #[test]
+    fn a_door_that_starts_no_task_advertises_no_streaming() {
+        for transport in [
+            HTTP_TRANSPORT,
+            TransportCapabilities {
+                streams_text: true,
+                cancellable: false,
+            },
+        ] {
+            let card =
+                card_for_transport(&TaskAcceptance::None, DeclaredPlanes::default(), transport);
+            assert_eq!(card["capabilities"]["streaming"], false, "{card}");
+            assert_eq!(
+                card["capabilities"]["cancellation"], transport.cancellable,
+                "{card}"
+            );
+        }
     }
 
     #[test]
@@ -1140,6 +1238,11 @@ mod tests {
             assert_eq!(
                 card["capabilities"]["streaming"],
                 methods.contains(&"message/stream"),
+                "{acceptance:?}"
+            );
+            assert_eq!(
+                card["capabilities"]["cancellation"],
+                methods.contains(&"tasks/cancel"),
                 "{acceptance:?}"
             );
         }

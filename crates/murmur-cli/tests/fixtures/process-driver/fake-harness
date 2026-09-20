@@ -193,6 +193,40 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
       echo "end $(recall "$REPORTED")"
     fi
     ;;
+  parity)
+    # The http capsule's provider script, in harness events: one turn that says something and
+    # calls a tool, then one that answers. Its A2A frames must match that capsule's exactly.
+    echo "started s1 subscription"
+    echo "text working on it"
+    echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping\"}"
+    answer="$(call_bridge)"
+    echo "result c1 ok $answer"
+    echo "text PARITY-ANSWER"
+    echo "end PARITY-ANSWER"
+    ;;
+  stream)
+    # The streaming-driver fixture's three chunks, in harness events.
+    echo "started s1 subscription"
+    echo "delta chunk_one "
+    echo "delta chunk_two "
+    echo "delta chunk_three"
+    echo "text chunk_one chunk_two chunk_three"
+    echo "end chunk_one chunk_two chunk_three"
+    ;;
+  think)
+    echo "started s1 subscription"
+    echo "tdelta step "
+    echo "tdelta one"
+    echo "thinking step one"
+    echo "text done"
+    echo "end DONE"
+    ;;
+  think-whole)
+    echo "started s1 subscription"
+    echo "thinking whole thought"
+    echo "text done"
+    echo "end DONE"
+    ;;
   linger)
     # Prints its terminal event and then ignores stdin closing, so the exit grace has to kill it.
     record_pid
