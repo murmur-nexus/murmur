@@ -905,9 +905,11 @@ impl std::fmt::Debug for ApiKeyReference {
 pub struct InferenceConfig {
     pub transport: String,
     pub model: String,
-    /// WASM driver artifact. Present for `transport: http`, absent for `transport: process`.
+    /// WASM driver artifact. Always present for `transport: http`, where it is the inference
+    /// driver. Under `transport: process` it is the process driver, and it or `command` is present.
     pub driver: Option<InferenceDriver>,
-    /// CLI binary to spawn. Present for `transport: process`, absent for `transport: http`.
+    /// CLI binary to spawn. Absent for `transport: http`. Under `transport: process` it or
+    /// `driver` is present.
     pub command: Option<String>,
     pub compaction: Option<CompactionConfig>,
     pub system_prompt: Option<String>,
@@ -2981,6 +2983,7 @@ impl RuntimeManifest {
         let capabilities = parse_capabilities(raw.capabilities)?;
         let inference = parse_inference(raw.inference)?;
         validate_driver_gateways(&artifacts, inference.as_ref())?;
+        validate_process_driver_entry(&artifacts, inference.as_ref())?;
 
         // Validate system_prompt_artifact: must name a declared artifact whose payload may be
         // bound as the system prompt (`prompt_payload`, defaulted from the role when absent).
@@ -3921,11 +3924,12 @@ fn parse_inference(
             }))
         }
         "process" => {
-            // Fields that are invalid with transport: process
-            if raw.driver.is_some() || raw.provider.is_some() {
+            if raw.provider.is_some() {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.driver.artifact".to_string(),
-                    message: "is not valid with transport: process".to_string(),
+                    field: "inference.provider.artifact".to_string(),
+                    message: "is not valid with transport: process; name the process driver \
+                              under inference.driver"
+                        .to_string(),
                 });
             }
             // The CLI subprocess path never builds a driver payload, so this value would be
@@ -3946,7 +3950,16 @@ fn parse_inference(
                 });
             }
 
-            let command = required_inference_field(raw.command, "command")?;
+            let driver = raw.driver.map(parse_inference_driver).transpose()?;
+            let command = optional_trimmed_string(raw.command);
+            if driver.is_none() && command.is_none() {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.driver".to_string(),
+                    message: "missing required field; name a process driver artifact under \
+                              inference.driver (or, for now, a CLI under inference.command)"
+                        .to_string(),
+                });
+            }
             // model is OPTIONAL for transport: process — an empty string means "use the CLI's
             // configured/account-default model" (e.g. a codex subscription's default; passing an
             // unsupported model there is a hard 400). The Claude dialect still needs a real model
@@ -3956,8 +3969,8 @@ fn parse_inference(
             Ok(Some(InferenceConfig {
                 transport,
                 model,
-                driver: None,
-                command: Some(command),
+                driver,
+                command,
                 compaction,
                 system_prompt,
                 system_prompt_file,
@@ -4473,7 +4486,7 @@ fn validate_driver_gateways(
                 message: format!(
                     "artifact '{}' declares 'gateway:' on a 'runtime: driver' entry, which is not \
                      valid with transport: process — the CLI subprocess holds its own \
-                     credentials and no driver is dispatched",
+                     credentials and a process driver is granted nothing",
                     artifact.name
                 ),
             });
@@ -4512,6 +4525,56 @@ fn validate_driver_gateways(
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// The cross-entry rules for the `transport: process` driver, which need the parsed
+/// `inference:` block.
+///
+/// The artifact `inference.driver.artifact` names must be declared in `artifacts:` with
+/// `runtime: driver`. A process driver is granted nothing, so its entry may carry neither
+/// `capabilities:` nor `config:`; its settings travel in `inference.driver.config`. A `gateway:`
+/// on it is refused by [`validate_driver_gateways`].
+fn validate_process_driver_entry(
+    artifacts: &[RuntimeArtifact],
+    inference: Option<&InferenceConfig>,
+) -> Result<(), RuntimeManifestError> {
+    let Some(driver) = inference
+        .filter(|inference| inference.transport == "process")
+        .and_then(|inference| inference.driver.as_ref())
+        .map(|driver| driver.artifact.as_str())
+    else {
+        return Ok(());
+    };
+    let Some((index, entry)) = artifacts
+        .iter()
+        .enumerate()
+        .find(|(_, artifact)| artifact.name == driver)
+    else {
+        return Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: "inference.driver.artifact".to_string(),
+            message: format!("artifact '{driver}' is not declared in artifacts:"),
+        });
+    };
+    if entry.runtime != ArtifactRuntime::Driver {
+        return Err(RuntimeManifestError::InvalidArtifact {
+            index,
+            message: format!(
+                "artifact '{driver}' is the transport: process driver and must be declared with \
+                 runtime: driver"
+            ),
+        });
+    }
+    if entry.capabilities.is_some() || entry.config.is_some() {
+        return Err(RuntimeManifestError::InvalidArtifact {
+            index,
+            message: format!(
+                "artifact '{driver}' is the transport: process driver, which is granted nothing; \
+                 remove capabilities:/config: from its entry — driver settings go in \
+                 inference.driver.config"
+            ),
+        });
     }
     Ok(())
 }
@@ -7819,32 +7882,110 @@ inference:
         );
     }
 
-    #[test]
-    fn process_transport_rejects_driver_artifact() {
-        let err = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: process
-  command: claude
-  model: claude-haiku-4-5-20251001
-  driver:
-    artifact: murmur-driver-anthropic
-"#,
+    fn process_driver_manifest(entry: &str, inference_extra: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n{entry}\ninference:\n  transport: process\n  \
+             driver:\n    artifact: fixture-process-driver\n{inference_extra}"
         )
-        .unwrap_err();
+    }
 
-        let msg = err.to_string();
-        assert!(
-            msg.contains("inference.driver.artifact"),
-            "error was: {msg}"
+    const PROCESS_DRIVER_ENTRY: &str =
+        "  - name: fixture-process-driver\n    version: 0.1.0\n    runtime: driver";
+
+    #[test]
+    fn process_transport_accepts_driver() {
+        let manifest = RuntimeManifest::from_yaml_str(&process_driver_manifest(
+            PROCESS_DRIVER_ENTRY,
+            "    config:\n      profile: work\n  command: /usr/local/bin/fixture-cli\n",
+        ))
+        .unwrap();
+
+        let inference = manifest.inference.expect("inference should exist");
+        assert_eq!(inference.transport, "process");
+        let driver = inference.driver.expect("driver should be parsed");
+        assert_eq!(driver.artifact, "fixture-process-driver");
+        assert_eq!(driver.config.as_deref(), Some(r#"{"profile":"work"}"#));
+        assert_eq!(
+            inference.command.as_deref(),
+            Some("/usr/local/bin/fixture-cli")
         );
-        assert!(
-            msg.contains("not valid with transport: process"),
-            "error was: {msg}"
+    }
+
+    #[test]
+    fn process_transport_accepts_driver_without_command() {
+        let manifest =
+            RuntimeManifest::from_yaml_str(&process_driver_manifest(PROCESS_DRIVER_ENTRY, ""))
+                .unwrap();
+
+        let inference = manifest.inference.expect("inference should exist");
+        assert_eq!(
+            inference.driver.map(|d| d.artifact).as_deref(),
+            Some("fixture-process-driver")
         );
+        assert!(inference.command.is_none());
+        assert_eq!(inference.model, "");
+    }
+
+    #[test]
+    fn process_transport_rejects_provider_alias() {
+        let msg = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  \
+             command: fixture-cli\n  provider:\n    artifact: fixture-process-driver\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("inference.provider.artifact"), "{msg}");
+        assert!(msg.contains("inference.driver"), "{msg}");
+    }
+
+    #[test]
+    fn process_driver_entry_must_be_declared() {
+        let msg = RuntimeManifest::from_yaml_str(&process_driver_manifest(
+            "  - name: other\n    version: 0.1.0\n    runtime: tool",
+            "",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("inference.driver.artifact"), "{msg}");
+        assert!(
+            msg.contains("artifact 'fixture-process-driver' is not declared in artifacts:"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn process_driver_entry_must_be_runtime_driver() {
+        let msg = RuntimeManifest::from_yaml_str(&process_driver_manifest(
+            "  - name: fixture-process-driver\n    version: 0.1.0\n    runtime: tool",
+            "",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("must be declared with runtime: driver"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn process_driver_entry_refuses_capabilities() {
+        let entry =
+            format!("{PROCESS_DRIVER_ENTRY}\n    capabilities:\n      env:\n        allow: [HOME]");
+        let msg = RuntimeManifest::from_yaml_str(&process_driver_manifest(&entry, ""))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("granted nothing"), "{msg}");
+        assert!(msg.contains("inference.driver.config"), "{msg}");
+    }
+
+    #[test]
+    fn process_driver_entry_refuses_config() {
+        let entry = format!("{PROCESS_DRIVER_ENTRY}\n    config:\n      profile: work");
+        let msg = RuntimeManifest::from_yaml_str(&process_driver_manifest(&entry, ""))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("granted nothing"), "{msg}");
+        assert!(msg.contains("remove capabilities:/config:"), "{msg}");
     }
 
     #[test]

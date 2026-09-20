@@ -836,14 +836,12 @@ model. These fields are read under both transports:
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
 | `inference.system_prompt_artifact` | string | no | Name of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 
-These fields are read under `transport: http`, and setting any of them under
+These fields are read under `transport: http`. Setting any of them except `inference.model` under
 `transport: process` is a manifest error:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `inference.model` | string | yes | Model identifier passed to the driver. |
-| `inference.driver.artifact` | string | yes | Inference driver artifact name; must be declared in `artifacts:` with `runtime: driver`, and that entry must carry [`gateway.endpoint`](#artifact-gateway). |
-| `inference.driver.config` | object | no | Settings any driver of this role would act on, serialized to compact JSON and set as `MURMUR_INFERENCE_DRIVER_CONFIG` for the driver, every WASM tool and every shell tool in the session. A value that is not a mapping fails the manifest parse with `E-MAN-003`. See [Choosing a config block](#which-config-block). |
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
 | `inference.max_session_tokens` | integer | no | Most tokens this session's driver calls may use in total, as the runtime measures them. No default: absent sets no session ceiling. Must be > 0. See [Session spend ceiling](#inference-max-session-tokens). |
@@ -859,11 +857,20 @@ entry. A manifest that writes either under `inference:`, under any transport, fa
 
 With no driver named, the message reads `on the artifacts: entry inference.driver.artifact names`.
 
+`inference.driver` is read under both transports, with a meaning per transport. Under either, the
+artifact it names must be declared in `artifacts:` with `runtime: driver`, and a value of `config`
+that is not a mapping fails the manifest parse with `E-MAN-003`.
+
+| Field | `transport: http` | `transport: process` |
+|---|---|---|
+| `inference.driver.artifact` | Required. The inference driver. Its entry must carry [`gateway.endpoint`](#artifact-gateway). | Required unless `inference.command` is set. The [process driver](#process-driver). Its entry may carry none of `gateway:`, `capabilities:` or `config:`. |
+| `inference.driver.config` | Optional object. Settings any driver of this role would act on, serialized to compact JSON and set as `MURMUR_INFERENCE_DRIVER_CONFIG` for the driver, every WASM tool and every shell tool in the session. See [Choosing a config block](#which-config-block). | Optional object, handed to the process driver as JSON. |
+
 These fields are read under `transport: process`:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.command` | string | yes | CLI binary to spawn; must be on `PATH`. A command whose base name is `codex` selects the codex wire protocol; anything else selects the Claude Code protocol. Invalid for `transport: http`. |
+| `inference.command` | string | no | CLI binary to spawn; must be on `PATH`. A command whose base name is `codex` selects the codex wire protocol; anything else selects the Claude Code protocol. Invalid for `transport: http`. A process manifest sets `inference.driver.artifact`, `inference.command`, or both; with neither the manifest parse fails with `E-MAN-003`. |
 | `inference.model` | string | no | Model identifier passed to the CLI. Omitted, the CLI uses its own configured default. |
 
 The `inference.compaction` block parses under either transport but takes effect only under
@@ -1181,7 +1188,8 @@ Murmur spawns `inference.command` as a subprocess and communicates over stdin/st
 `ANTHROPIC_API_KEY` is required — authentication uses whatever the CLI is already configured with.
 Credentials under this transport are the CLI's own, and murmur neither holds nor controls them.
 The base name of `command` selects the wire protocol: `codex` speaks the codex-exec dialect,
-anything else speaks the Claude Code dialect. No WASM driver artifact is needed or staged.
+anything else speaks the Claude Code dialect. With no `inference.driver` named, no WASM driver
+artifact is staged.
 
 ```yaml
 inference:
@@ -1193,7 +1201,7 @@ inference:
 
 | Behaviour | Details |
 |---|---|
-| Pre-flight check | `mur run` verifies `command` is on `PATH` before staging the session. If it is not found the run exits with `E-RUN-006` and a hint naming that CLI's install page. |
+| Pre-flight check | With no `inference.driver` named, `mur run` verifies `command` is on `PATH` before staging the session. If it is not found the run exits with `E-RUN-006` and a hint naming that CLI's install page. |
 | Tool dispatch | When the capsule declares tool artifacts, murmur stands up a loopback MCP server and points the CLI at it, so the model calls the capsule's own tools and murmur executes them. The CLI's built-in host tools are disabled. With no tools declared, the CLI runs as pure inference. |
 | Turn limit | Each assistant response counts as one turn, bounded by `inference.max_turns`. |
 | Wall-clock limit | One subprocess run — all turns and tool calls — is capped at 10 minutes. |
@@ -1201,6 +1209,41 @@ inference:
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. Token counts are reported as 0, which the subprocess protocol does not carry. |
 | Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the CLI manages its own context. |
 | Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |
+
+#### Process driver { #process-driver }
+
+A process driver is a `runtime: driver` artifact that exports the
+[`murmur:driver/process`](wit-interfaces.md#murmurdriverprocess) interface: it knows how to drive
+one CLI. It is granted nothing: no environment, no files, no network, and no Murmur host interface.
+It needs no `inference_auth:` block.
+
+```yaml
+capabilities:
+  env:
+    allow: [HOME]            # every variable the driver's describe() requires
+artifacts:
+  - name: my-process-driver
+    version: "0.1.0"
+    runtime: driver
+inference:
+  transport: process
+  driver:
+    artifact: my-process-driver
+    config: {}               # optional; handed to the driver as JSON
+```
+
+`mur run` loads the named driver and checks it in this order. The first check that fails refuses the
+launch:
+
+| Check | Refused with |
+|---|---|
+| The artifact exports `murmur:driver/process@0.1.0` | [`E-RUN-029`](diagnostics.md#e-run-029) |
+| It instantiates with no grants, and `describe()` returns usable variable names | [`E-RUN-032`](diagnostics.md#e-run-032) |
+| Every variable `describe()` requires is declared in `capabilities.env.allow` | [`E-CAP-019`](diagnostics.md#e-cap-019) |
+
+A driver that passes every check is refused with [`E-RUN-031`](diagnostics.md#e-run-031): this
+runtime does not run process drivers. A `transport: http` manifest whose driver exports the process
+interface is refused with [`E-RUN-030`](diagnostics.md#e-run-030).
 
 ### `inference.system_prompt` / `system_prompt_file` { #inference-system-prompt }
 

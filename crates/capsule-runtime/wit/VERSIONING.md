@@ -24,6 +24,7 @@ Current versions:
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
+| `murmur:driver`          | `0.1.0`  |
 
 `murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
 already reflected one prior additive evolution — the original 7-function baseline
@@ -181,6 +182,15 @@ one. Widening the variant with a permitting case would be a different kind of ch
 every bump recorded above — it would let an artifact grant authority a manifest withheld —
 and this entry records that no such case exists so a later bump does not add one by
 analogy.
+
+`murmur:driver` was created at `0.1.0` for the `process` interface — `describe`,
+`launch`, `parse` and `classify-exit`, the contract a process driver exports so
+the runtime can drive one harness CLI without knowing anything about it. Its
+instance name is `murmur:driver/process@0.1.0`. It is a new package because
+nothing existing moves: no published artifact exports or imports anything it
+contains, so no instance name changes and nothing is rebuilt. Its world,
+`process-driver`, imports nothing of Murmur's, because a process driver is
+granted nothing; it lives in its own bindgen tree, `process-driver/`.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

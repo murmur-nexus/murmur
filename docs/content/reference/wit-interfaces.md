@@ -24,6 +24,7 @@ version each one carries.
 | [`murmur:runtime/tokens`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/tokens.wit) | Provided by the runtime to hook components | Count the tokens in a string the way the runtime counts them |
 | [`murmur:task-io/read`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-task-io/read.wit) | Provided by the runtime to hook components | Read the task's input text and the agent's result text |
 | [`murmur:conversation/read`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-conversation/read.wit) | Provided by the runtime to hook components | Read the capsule's durable conversation record |
+| [`murmur:driver/process`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver.wit) | Exported by process drivers | Describe the CLI a `transport: process` capsule drives, plan each turn and read the CLI's output |
 
 ## Worlds
 
@@ -36,6 +37,7 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | `driver` | `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read`, `conversation/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
+| `process-driver` | — | `driver/process` | [`process-driver/process.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver/process.wit) |
 
 Agent capsules compile against no world — the agent loop runs inside the runtime, and the capsule
 is defined by its manifest alone.
@@ -598,6 +600,28 @@ conversation its task is about to continue.
 
 ---
 
+## `murmur:driver/process` { #murmurdriverprocess }
+
+Exported by the [process driver](manifest.md#process-driver) a `transport: process` manifest names
+under `inference.driver`. The `process-driver` world imports nothing of Murmur's: the runtime loads
+the driver with an empty WASI context and grants it nothing.
+
+| Function | Called | Returns |
+|---|---|---|
+| `describe` | Once, when the driver is loaded | The CLI's name and binary, how to read its version, how to interrupt a turn, and the variables it requires |
+| `launch` | Once per turn | The arguments, environment, files and stdin to spawn the CLI with, or an error |
+| `parse` | For each batch of complete stdout lines | The events those lines describe |
+| `classify-exit` | When the CLI's output ends without a terminal event | `turn-end` or `turn-failed` |
+
+`mur run` refuses a capsule whose driver fails a load-time check — see
+[Process driver](manifest.md#process-driver). A driver that passes every check is refused with
+[`E-RUN-031`](diagnostics.md#e-run-031); `launch`, `parse` and `classify-exit` are not called.
+
+Every record, field and event is documented in
+[`process-driver.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver.wit).
+
+---
+
 ## Package versioning
 
 Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract a compiled
@@ -619,6 +643,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
+| `murmur:driver` | `0.1.0` |
 
 | Tier | When |
 |---|---|

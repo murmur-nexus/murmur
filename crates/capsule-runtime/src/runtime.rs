@@ -73,6 +73,7 @@ use crate::{
     origin::{stamp_for_peer, TaskOrigin, TaskProvenance, TrustClass},
     otel::OtelEmitter,
     outgoing,
+    process_driver::{check_driver_interface, check_required_env, ProcessDriver},
     protected_paths::{ProtectedPathRefusal, ProtectedPaths},
     registration::SessionOutcome,
     resources, running, sandbox,
@@ -658,6 +659,17 @@ pub fn stage_session(
     let mut native_binaries: Vec<(String, Vec<u8>)> = Vec::new();
     // (name, skill_md_bytes) for skill artifacts — installed after workdir creation
     let mut skill_files: Vec<(String, Vec<u8>)> = Vec::new();
+    // The inference driver's transport and artifact name. Its exports are checked against the
+    // transport in the driver arm below; the other driver entries are not inference drivers.
+    let inference_driver = request.inference.as_ref().and_then(|inference| {
+        inference
+            .driver
+            .as_ref()
+            .map(|driver| (inference.transport.as_str(), driver.artifact.as_str()))
+    });
+    // (name, version, component) of the `transport: process` driver, compiled but never granted
+    // or dispatched as a tool.
+    let mut process_driver: Option<(String, String, Component)> = None;
 
     for artifact in &request.artifacts {
         // Local-source skill: resolve skill.md directly from the filesystem and skip the
@@ -783,6 +795,39 @@ pub fn stage_session(
                     }
                 }
             }
+            ArtifactRuntime::Driver
+                if inference_driver.is_some_and(|(transport, name)| {
+                    transport == "process" && name == artifact.name
+                }) =>
+            {
+                let driver_wasm =
+                    extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
+                // Read from the bytes about to be compiled rather than the registry's metadata,
+                // which a remote resolve leaves empty.
+                let contracts = murmur_artifact::extract_wit_contracts(&driver_wasm)
+                    .ok()
+                    .flatten();
+                check_driver_interface(
+                    "process",
+                    &artifact.name,
+                    &resolved_version,
+                    contracts.as_ref(),
+                )?;
+                // A process driver is granted nothing: no `stage_artifact_grant`, and it never
+                // enters `tool_components`, so nothing can dispatch it as a tool.
+                let driver_component = Component::new(&engine, driver_wasm).map_err(|err| {
+                    RuntimeError::ToolComponentCompile {
+                        name: artifact.name.clone(),
+                        version: resolved_version.clone(),
+                        message: err.to_string(),
+                    }
+                })?;
+                process_driver = Some((
+                    artifact.name.clone(),
+                    resolved_version.clone(),
+                    driver_component,
+                ));
+            }
             ArtifactRuntime::Driver => {
                 // Same call as the WASM-tool arm above, and deliberately so: a driver is
                 // staged into `tool_components` and dispatched through
@@ -796,6 +841,19 @@ pub fn stage_session(
                 )?;
                 let tool_wasm =
                     extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
+                if let Some((transport, _)) =
+                    inference_driver.filter(|(_, name)| *name == artifact.name)
+                {
+                    let contracts = murmur_artifact::extract_wit_contracts(&tool_wasm)
+                        .ok()
+                        .flatten();
+                    check_driver_interface(
+                        transport,
+                        &artifact.name,
+                        &resolved_version,
+                        contracts.as_ref(),
+                    )?;
+                }
                 let tool_component = Component::new(&engine, tool_wasm).map_err(|err| {
                     RuntimeError::ToolComponentCompile {
                         name: artifact.name.clone(),
@@ -877,6 +935,34 @@ pub fn stage_session(
             version: resolved_version,
             runtime: artifact.runtime.clone(),
             implementation: artifact_implementation,
+        });
+    }
+
+    if let Some((name, version, component)) = process_driver {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
+            })?;
+        let description = rt.block_on(async {
+            let mut driver =
+                ProcessDriver::instantiate(&engine, &component, &name, &version).await?;
+            driver.describe().await
+        })?;
+        check_required_env(
+            &name,
+            &version,
+            &description,
+            &request.capability_policy.env_allow,
+        )?;
+        // The seam the process driver runner replaces: a driver that passed every load-time
+        // check is refused here, because nothing in this runtime runs one.
+        return Err(RuntimeError::ProcessDriverNotWired {
+            name,
+            version,
+            harness: description.harness,
+            binary: description.binary,
         });
     }
 

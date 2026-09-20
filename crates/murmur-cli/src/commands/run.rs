@@ -526,9 +526,10 @@ pub(crate) fn run_run(
         json,
     )?;
 
-    // Pre-flight: for process transport, verify the CLI binary is on PATH before staging.
+    // Pre-flight: for process transport, verify the CLI binary is on PATH before staging. A
+    // process driver names its own binary, so a capsule that names one is not checked here.
     if let Some(ref inference) = runtime_manifest.inference {
-        if inference.transport == "process" {
+        if inference.transport == "process" && inference.driver.is_none() {
             let command = inference.command.as_deref().unwrap_or("claude");
             if !is_on_path(command) {
                 return Err(fail(

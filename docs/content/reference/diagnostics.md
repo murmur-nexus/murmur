@@ -30,6 +30,7 @@ section that explains it.
 | `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every WASM component | [E-CAP-016](#e-cap-016) |
 | `E-CAP-017` | A `gateway:` is declared on a native tool, whose requests never pass the credential gateway | [E-CAP-017](#e-cap-017) |
 | `E-CAP-018` | A `gateway:` names an endpoint but binds no `api_key` and does not declare `keyless: true` | [E-CAP-018](#e-cap-018) |
+| `E-CAP-019` | A process driver requires a variable `capabilities.env.allow` does not declare | [E-CAP-019](#e-cap-019) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -82,6 +83,10 @@ section that explains it.
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
 | `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
+| `E-RUN-029` | The `transport: process` driver does not export the process driver interface | [E-RUN-029](#e-run-029) |
+| `E-RUN-030` | The `transport: http` inference driver exports the process driver interface | [E-RUN-030](#e-run-030) |
+| `E-RUN-031` | A process driver passed its checks, and this runtime does not run process drivers | [E-RUN-031](#e-run-031) |
+| `E-RUN-032` | A process driver could not be loaded with no grants, or described itself unusably | [E-RUN-032](#e-run-032) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -510,6 +515,56 @@ The message ends with the path and the operating system's error.
 | `File exists` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
 
+### E-RUN-029 — the process driver lacks the process interface { #e-run-029 }
+
+A `transport: process` manifest names an artifact under `inference.driver` that does not export
+`murmur:driver/process@0.1.0`. `mur run` refuses at staging, before the driver runs.
+
+```text
+error[E-RUN-029]: artifact 'my-http-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.1.0; a process driver must be built against the process-driver world
+  hint: rebuild the driver against murmur:driver/process@0.1.0, or name a process driver
+```
+
+A driver built against another version of the interface is told which one it exports instead:
+`; it exports murmur:driver/process@<version>, built against another version — rebuild it`.
+
+### E-RUN-030 — the http driver is a process driver { #e-run-030 }
+
+A `transport: http` manifest names an artifact under `inference.driver` that exports the process
+driver interface. `mur run` refuses at staging, before the driver runs.
+
+```text
+error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.1.0, the process driver interface; name it under transport: process, or name an http driver
+  hint: set inference.transport: process to use this driver, or name an http driver
+```
+
+### E-RUN-031 — process drivers do not run { #e-run-031 }
+
+A `transport: process` manifest names a [process driver](manifest.md#process-driver) that passed
+every load-time check. This runtime has no process driver runner, so `mur run` refuses at staging
+and names what the driver described.
+
+```text
+error[E-RUN-031]: process driver 'my-process-driver@1.0.0' (harness my-harness, binary my-cli) loaded and passed its checks, but this runtime does not run process drivers yet
+  hint: to run the CLI directly for now, remove inference.driver and set inference.command
+```
+
+### E-RUN-032 — the process driver could not be loaded { #e-run-032 }
+
+A [process driver](manifest.md#process-driver) is loaded with no grants: no environment, no files,
+no network and no Murmur host interface. `mur run` refuses at staging when the driver:
+
+- imports anything but WASI,
+- fails or runs out of time while describing itself, or
+- names a required variable that is empty or contains `=`.
+
+The message ends with the reason; for an import, it names the interface.
+
+```text
+error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:text/chunks@0.1.0`, but a matching implementation was not found in the linker
+  hint: the driver must export murmur:driver/process@0.1.0 and import nothing but WASI
+```
+
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
 A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
@@ -885,6 +940,17 @@ plays no part: a loopback endpoint is refused the same way.
 |---|---|
 | `api_key: ${NAME}` on the entry, with the key stored by `mur config set -g credentials.NAME <key>` | The upstream takes a key |
 | `keyless: true` on the entry | The upstream takes no key, such as a local model server — see [Keyless upstreams](manifest.md#gateway-keyless) |
+
+### E-CAP-019 — a process driver needs an undeclared variable { #e-cap-019 }
+
+A [process driver](manifest.md#process-driver) requires variables in its CLI's environment, and
+`capabilities.env.allow` does not declare every one of them. The CLI sees only the variables the
+manifest declares. `mur run` refuses at staging and names each missing variable.
+
+```text
+error[E-CAP-019]: process driver 'my-process-driver@1.0.0' requires MY_PROFILE in its environment, which capabilities.env.allow does not declare
+  hint: add each variable to capabilities.env.allow — the harness sees only variables the manifest declares
+```
 
 ## Conversation record errors
 
