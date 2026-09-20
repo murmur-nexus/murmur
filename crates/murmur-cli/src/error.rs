@@ -52,6 +52,8 @@ pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded
 pub const E_RUN_033: &str = "E-RUN-033"; // the harness ended a turn in failure
 pub const E_RUN_034: &str = "E-RUN-034"; // a call into the process driver refused, trapped or ran out of time
 pub const E_RUN_035: &str = "E-RUN-035"; // the harness went silent for the whole inactivity window
+pub const E_RUN_036: &str = "E-RUN-036"; // a resumed harness session could not be found by the harness
+pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inference.transport: process
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -351,10 +353,18 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ResumeRecordMissing { .. } => CliError::with_hint(
                 E_RUN_017,
                 error.to_string(),
-                "a session is resumable only if its capsule kept a conversation record: an \
-                 http-transport capsule that did not declare context.record: off. Run `mur trace \
+                "a session is resumable only if its capsule kept something to continue it with: a \
+                 conversation record under transport: http, or a harness-session.json under \
+                 transport: process. Either way context.record: off keeps neither. Run `mur trace \
                  show <session>` to see what that session did, and omit --resume to start a fresh \
                  conversation — see docs/content/reference/cli.md",
+            ),
+            error @ RuntimeError::ResumeCompactUnsupportedTransport => CliError::with_hint(
+                E_RUN_037,
+                error.to_string(),
+                "use --resume-mode full, which hands the harness the session id this context \
+                 already has and lets it answer from everything it was told — see \
+                 docs/content/reference/cli.md",
             ),
             error @ RuntimeError::ResumeCompactionHookMissing => CliError::with_hint(
                 E_RUN_018,
@@ -541,6 +551,14 @@ impl From<RuntimeError> for CliError {
                 "see `mur trace show` for the turn; auth means the harness is not signed in on \
                  this host, quota means wait or raise the plan's limit, and max-turns means \
                  raise inference.max_turns",
+            ),
+            error @ RuntimeError::HarnessSessionGone { .. } => CliError::with_hint(
+                E_RUN_036,
+                error.to_string(),
+                "the harness no longer holds that conversation. murmur left the id where it is, \
+                 so the next task in this context fails the same way rather than answering from \
+                 nothing: delete that file to start a new conversation under the same context, or \
+                 use a different --context — see docs/content/reference/workdir.md",
             ),
             error @ RuntimeError::ProcessDriverCallFailed { .. } => CliError::with_hint(
                 E_RUN_034,

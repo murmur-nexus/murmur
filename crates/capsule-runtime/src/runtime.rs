@@ -358,10 +358,16 @@ fn has_compaction_hook(hooks: &[StagedHookArtifact]) -> bool {
 /// Whether `mur run --resume` can do what it was asked, checked at staging so a launch that
 /// cannot continue anything never creates a session directory.
 ///
-/// Two ways to be unlaunchable, and each is refused rather than degraded: `compact` with nothing
-/// bound to `on-compaction` has nothing to produce the summary, and a context with no record on
-/// disk has nothing to continue. Silently falling back to `full`, or starting fresh, would both
-/// be indistinguishable to the operator from a resume that worked.
+/// Three ways to be unlaunchable, and each is refused rather than degraded: `compact` with nothing
+/// bound to `on-compaction` has nothing to produce the summary, `compact` under
+/// `transport: process` has no history of its own to summarize, and a context with nothing on disk
+/// has nothing to continue. Silently falling back to `full`, or starting fresh, would all be
+/// indistinguishable to the operator from a resume that worked.
+///
+/// What "nothing on disk" means is the one thing the transport decides: a
+/// [`conversation record`](crate::conversation) under `http`, and a
+/// [`harness session`](crate::harness_session) under `process`, where continuing means handing the
+/// harness back the session id this context already has.
 fn check_resume_launchable(
     resume: &ResumeRequest,
     context_id: Option<&str>,
@@ -370,38 +376,50 @@ fn check_resume_launchable(
     inference: Option<&InferenceConfig>,
     hooks: &[StagedHookArtifact],
 ) -> Result<(), RuntimeError> {
-    if resume.mode == ResumeMode::Compact && !has_compaction_hook(hooks) {
-        return Err(RuntimeError::ResumeCompactionHookMissing);
+    let process = inference.is_some_and(|inference| inference.transport == "process");
+    if resume.mode == ResumeMode::Compact {
+        if process {
+            return Err(RuntimeError::ResumeCompactUnsupportedTransport);
+        }
+        if !has_compaction_hook(hooks) {
+            return Err(RuntimeError::ResumeCompactionHookMissing);
+        }
     }
-    // A resume that reached staging with no context id resolved nothing, so there is no record to
+    // A resume that reached staging with no context id resolved nothing, so there is nothing to
     // look for; the placeholder keeps the refusal's wording honest about that.
-    let context_id = context_id.unwrap_or("<unresolved>").to_string();
+    let context_id = context_id
+        .unwrap_or(crate::conversation::UNRESOLVED_CONTEXT)
+        .to_string();
     let missing = |reason: String| RuntimeError::ResumeRecordMissing {
         session: resume.from_session.clone(),
         context_id: context_id.clone(),
         reason,
     };
-    // The same three ways `resolve_conversation_root` returns `None`, plus the two this check
-    // adds: a capsule with no `inference:` block at all, and a record path that resolves but
-    // holds no file.
-    let Some(inference) = inference else {
+    // The same ways `resolve_conversation_root` and `resolve_harness_session_root` return `None`,
+    // plus the two this check adds: a capsule with no `inference:` block at all, and a path that
+    // resolves but holds no file.
+    if inference.is_none() {
         return Err(missing(
             "the capsule declares no inference block and keeps no conversation record".to_string(),
-        ));
-    };
-    if inference.transport == "process" {
-        return Err(missing(
-            "the capsule declares inference.transport: process, whose CLI owns its own \
-             conversation, and kept no conversation record"
-                .to_string(),
         ));
     }
     let Some(record) = crate::conversation::resolve_record_name(context, capsule_name) else {
         return Err(missing(
-            "the capsule declares context.record: off and kept no conversation record".to_string(),
+            "the capsule declares context.record: off and kept nothing to continue".to_string(),
         ));
     };
     let root = crate::conversation::record_root(&record).map_err(&missing)?;
+    if process {
+        let path = crate::harness_session::entry_file(&root, &context_id);
+        if !path.is_file() {
+            return Err(missing(format!(
+                "the capsule declares inference.transport: process, whose harness owns the \
+                 conversation, and there is no harness session at {}",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
     let path = crate::conversation::record_file(&root, &context_id);
     if !path.is_file() {
         return Err(missing(format!(
@@ -1423,6 +1441,19 @@ fn launch(
                 .and_then(|context| context.retain)
                 .map(|_| staged.capsule_name.clone()),
             resume: staged.resume.as_ref().map(|resume| resume.mode),
+            // Built here rather than per task, so every task of one launch reads and writes one
+            // map — which is what threads a capsule whose host keeps no file.
+            harness_sessions: (inference.transport == "process").then(|| {
+                Arc::new(crate::harness_session::HarnessSessionMap::new(
+                    crate::harness_session::resolve_harness_session_root(
+                        staged.context.as_ref(),
+                        &staged.capsule_name,
+                        inference,
+                        &workdir,
+                    ),
+                    &workdir,
+                ))
+            }),
         };
 
         // --- Identity and HTTP server setup ---
@@ -11980,6 +12011,7 @@ inference:
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,
             record_owner: None,
+            harness_sessions: None,
             resume: None,
         };
 
@@ -12209,6 +12241,7 @@ inference:
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,
             record_owner: None,
+            harness_sessions: None,
             resume: None,
         };
 

@@ -31,6 +31,8 @@ use crate::{
     trace::TraceWriter,
 };
 
+use super::process::RunSession;
+
 /// The billing mode the process transport exists for. Compared as a plain string: what any other
 /// value means is the harness's business, and the runtime only reports that it is not this one.
 const SUBSCRIPTION_AUTH: &str = "subscription";
@@ -83,10 +85,15 @@ pub(super) struct ProcessEventSink {
     pending: HashMap<String, PendingToolCall>,
     /// Set by the first terminal event, so the rest of its batch is ignored.
     finished: bool,
+    /// The conversation this run belongs to, and where its session id is remembered.
+    session: RunSession,
+    /// The id the harness reported for this run, if it reported one at all. What it says wins
+    /// over what the runtime asked for, and its absence is half of the session-gone predicate.
+    reported_session: Option<String>,
 }
 
 impl ProcessEventSink {
-    pub(super) fn new(workdir: &Path, max_turns: u32) -> Self {
+    pub(super) fn new(workdir: &Path, max_turns: u32, session: RunSession) -> Self {
         Self {
             workdir: workdir.to_path_buf(),
             max_turns,
@@ -94,6 +101,8 @@ impl ProcessEventSink {
             open: None,
             pending: HashMap::new(),
             finished: false,
+            session,
+            reported_session: None,
         }
     }
 
@@ -153,6 +162,12 @@ impl ProcessEventSink {
                 let _ = trace
                     .write_harness_session(&info.id, &info.auth, info.model.as_deref())
                     .await;
+                // Remembered the moment the harness names it, not at the end of the turn: the
+                // conversation exists from here on, whatever the turn goes on to do.
+                if !info.id.is_empty() {
+                    self.reported_session = Some(info.id.clone());
+                    self.session.remember(&info.id);
+                }
                 if info.auth != SUBSCRIPTION_AUTH {
                     let message = format!(
                         "the harness session reports auth '{}', not '{SUBSCRIPTION_AUTH}' — this \
@@ -272,6 +287,13 @@ impl ProcessEventSink {
             }
             Event::TurnEnd(result) => {
                 self.close_turn(hooks, trace, otel).await;
+                // A harness that finished a turn without ever naming its session answers to the
+                // id it was handed: that is the conversation, and this is the only chance to say
+                // so.
+                if self.reported_session.is_none() {
+                    let id = self.session.id().to_string();
+                    self.session.remember(&id);
+                }
                 match super::record_result(hooks, &self.workdir, &result) {
                     Ok(()) => SinkOutcome::Ended,
                     Err(message) => SinkOutcome::Failed(RuntimeError::AgentLoopFailed(message)),
@@ -283,6 +305,16 @@ impl ProcessEventSink {
                 let _ = trace
                     .write_harness_failed(kind, &failure.message, "harness")
                     .await;
+                // A turn that failed without ever reporting a session established nothing, so
+                // nothing is remembered. When it was a resume, that is the harness saying it does
+                // not hold the conversation this context names, which is its own failure.
+                if let Some(gone) = self.session.session_gone(
+                    failure.kind,
+                    self.reported_session.is_some(),
+                    &failure.message,
+                ) {
+                    return SinkOutcome::Failed(gone);
+                }
                 SinkOutcome::Failed(RuntimeError::HarnessTurnFailed {
                     kind: kind.to_string(),
                     message: failure.message,
@@ -403,9 +435,19 @@ pub(super) fn failure_kind_name(kind: FailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::agent::process::{plan_session, HarnessSessionPolicy};
+    use crate::harness_session::HarnessSessionMap;
     use crate::process_driver::{SessionInfo, ToolCallInfo, ToolResultInfo, TurnFailure};
     use serde_json::Value as Json;
+
+    /// The context every sink below runs a task under.
+    const CONTEXT: &str = "ctx_test";
+
+    /// The harness name every sink below records with the session it remembers.
+    const HARNESS: &str = "fixture-harness";
 
     /// A sink, its sinks, and the workdir they write into. Held together so a test can drop the
     /// tempdir only after reading `trace.jsonl` back.
@@ -416,10 +458,24 @@ mod tests {
         hooks: HookRuntime,
         trace: TraceWriter,
         otel: OtelEmitter,
+        /// The map the sink writes back into, so a test can read what the run remembered.
+        map: Arc<HarnessSessionMap>,
+        /// The id the runtime handed the harness for this run.
+        planned_id: String,
     }
 
     impl Harness {
         async fn new(max_turns: u32) -> Self {
+            Self::threading(
+                max_turns,
+                Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
+            )
+            .await
+        }
+
+        /// A sink threading `CONTEXT` through `map`: `mode: resume` when the map already holds an
+        /// id for it, `mode: new` otherwise.
+        async fn threading(max_turns: u32, map: Arc<HarnessSessionMap>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let workdir = dir.path().to_path_buf();
             std::fs::create_dir_all(workdir.join("tools")).unwrap();
@@ -473,13 +529,24 @@ mod tests {
             .await
             .unwrap();
             let otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+            let policy = HarnessSessionPolicy {
+                map: Arc::clone(&map),
+                context_id: Some(CONTEXT.to_string()),
+                continue_conversation: true,
+            };
+            let plan = plan_session(&policy);
+            let planned_id = plan.session.id.clone();
+            let session =
+                crate::agent::process::RunSession::new(&plan, &policy, HARNESS, "fixture-driver");
             Self {
                 _dir: dir,
                 workdir: workdir.clone(),
-                sink: ProcessEventSink::new(&workdir, max_turns),
+                sink: ProcessEventSink::new(&workdir, max_turns, session),
                 hooks,
                 trace,
                 otel,
+                map,
+                planned_id,
             }
         }
 
@@ -748,5 +815,112 @@ mod tests {
         assert!(notes[0]["text"].as_str().unwrap().contains("ghost"));
         assert!(notes[1]["text"].as_str().unwrap().contains("c9"));
         assert!(h.of_type("tool_call").await.is_empty());
+    }
+
+    /// Whatever the harness calls its session is what the context is keyed on from then on.
+    #[tokio::test]
+    async fn harness_session_the_reported_id_replaces_the_one_the_runtime_minted() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![Event::SessionStarted(SessionInfo {
+            id: "harness-chose-this".into(),
+            auth: SUBSCRIPTION_AUTH.into(),
+            model: None,
+        })])
+        .await;
+        assert_eq!(h.map.get(CONTEXT).as_deref(), Some("harness-chose-this"));
+        assert_ne!(h.planned_id, "harness-chose-this");
+    }
+
+    /// A harness that says nothing about its session answers to the id it was handed.
+    #[tokio::test]
+    async fn harness_session_a_silent_run_that_ends_remembers_the_minted_id() {
+        let mut h = Harness::new(10).await;
+        assert_eq!(h.map.get(CONTEXT), None);
+        h.feed(vec![Event::TurnEnd("done".into())]).await;
+        assert_eq!(h.map.get(CONTEXT).as_deref(), Some(h.planned_id.as_str()));
+    }
+
+    /// Nothing was established, so nothing is remembered.
+    #[tokio::test]
+    async fn harness_session_a_failed_run_with_no_session_remembers_nothing() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![Event::TurnFailed(TurnFailure {
+            kind: FailureKind::Auth,
+            message: "not signed in".into(),
+        })])
+        .await;
+        assert_eq!(h.map.get(CONTEXT), None);
+    }
+
+    /// A resumed turn the harness never acknowledged fails as a missing conversation, and leaves
+    /// the entry exactly as it was so the next task fails the same way.
+    #[tokio::test]
+    async fn harness_session_a_resume_the_harness_never_acknowledged_fails_as_gone() {
+        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
+        let mut h = Harness::threading(10, map).await;
+        assert_eq!(h.planned_id, "remembered");
+
+        let outcome = h
+            .feed(vec![Event::TurnFailed(TurnFailure {
+                kind: FailureKind::HarnessError,
+                message: "no conversation found with session id remembered".into(),
+            })])
+            .await;
+        let SinkOutcome::Failed(error) = outcome else {
+            panic!("a resume the harness could not find fails the turn");
+        };
+        assert!(
+            matches!(error, RuntimeError::HarnessSessionGone { .. }),
+            "{error}"
+        );
+        assert_eq!(h.map.get(CONTEXT).as_deref(), Some("remembered"));
+        // The harness still said what happened, in the trace, under its own kind.
+        assert_eq!(
+            h.of_type("harness_failed").await[0]["kind"],
+            "harness-error"
+        );
+    }
+
+    /// An expired login is not a missing conversation.
+    #[tokio::test]
+    async fn harness_session_an_auth_failure_on_a_resume_is_still_a_turn_failure() {
+        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
+        let mut h = Harness::threading(10, map).await;
+
+        let outcome = h
+            .feed(vec![Event::TurnFailed(TurnFailure {
+                kind: FailureKind::Auth,
+                message: "not signed in".into(),
+            })])
+            .await;
+        let SinkOutcome::Failed(error) = outcome else {
+            panic!("a failed turn fails the run");
+        };
+        assert!(
+            matches!(error, RuntimeError::HarnessTurnFailed { .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_session_a_resumed_turn_that_ends_keeps_its_id() {
+        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
+        let mut h = Harness::threading(10, map).await;
+        assert_eq!(h.planned_id, "remembered");
+
+        h.feed(vec![
+            Event::SessionStarted(SessionInfo {
+                id: "remembered".into(),
+                auth: SUBSCRIPTION_AUTH.into(),
+                model: None,
+            }),
+            Event::Text("here it is".into()),
+            Event::TurnEnd("here it is".into()),
+        ])
+        .await;
+        assert_eq!(h.map.get(CONTEXT).as_deref(), Some("remembered"));
     }
 }
