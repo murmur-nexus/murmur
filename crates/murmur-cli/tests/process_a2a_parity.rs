@@ -756,7 +756,7 @@ fn thinking_reaches_the_client_once() {
 }
 
 /// S6. A process capsule's card advertises what its transport can do: cancellation, which every
-/// transport can now, and streaming, which is its driver's answer.
+/// transport supports, and streaming, which is its driver's answer.
 #[test]
 fn a_process_capsule_advertises_cancellation_and_streaming() {
     if common::skip_without_host_support("a_process_capsule_advertises_cancellation_and_streaming")

@@ -557,7 +557,7 @@ pub(crate) async fn run_process_inference_loop(
     _version: &str,
     session_policy: HarnessSessionPolicy,
     // This task's cancel flag, or `None` for a run with no task to stop — `mur run`, a `task.md`
-    // launch. Without one the harness is never interrupted and the loop below is what it was.
+    // launch. Without one the harness is never interrupted.
     cancel: Option<CancelSignal>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let cancel = cancel.map(|signal| TaskCancel {

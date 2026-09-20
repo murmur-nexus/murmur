@@ -858,8 +858,7 @@ struct TraceMetrics {
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
     /// The `harness_warning`, `harness_failed` and `harness_interrupt` lines of a
-    /// `transport: process` run, in the
-    /// order they were written.
+    /// `transport: process` run, in the order they were written.
     harness_lines: Vec<HarnessLine>,
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
     /// anything at this session's launch.

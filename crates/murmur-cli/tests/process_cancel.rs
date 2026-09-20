@@ -110,6 +110,9 @@ struct Built {
     /// Whether the capsule stays up after its task. `false` ends the session with the task, which
     /// is what a case that reads `mur trace show` needs: that command renders a finished session.
     sleeps: bool,
+    /// How long the wrapper stalls the version probe, widening the window between the run
+    /// starting and the harness being spawned so a case can land a cancel inside it.
+    probe_stall: Duration,
 }
 
 /// One launched process capsule, and everything a case reads it back through.
@@ -130,7 +133,15 @@ impl Built {
             interrupt: Interrupt::StdinMessage,
             profile: profile.to_string(),
             sleeps: true,
+            probe_stall: Duration::ZERO,
         }
+    }
+
+    /// Stall the version probe, so a cancel sent while it runs arrives after the run has started
+    /// and before anything has been spawned.
+    fn stalls_the_version_probe(mut self, stall: Duration) -> Self {
+        self.probe_stall = stall;
+        self
     }
 
     fn driver(mut self, interrupt: Interrupt) -> Self {
@@ -172,10 +183,18 @@ impl Built {
         let profile_file = project.path().join("profile");
         fs::write(&profile_file, &self.profile).unwrap();
         let wrapper = project.path().join("harness");
+        let stall = if self.probe_stall.is_zero() {
+            String::new()
+        } else {
+            format!(
+                "if [ \"${{1:-}}\" = \"--version\" ]; then sleep {}; fi\n",
+                self.probe_stall.as_secs_f32()
+            )
+        };
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=\"$(cat {})\"\nexec {} \"$@\"\n",
+                "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=\"$(cat {})\"\n{stall}exec {} \"$@\"\n",
                 profile_file.display(),
                 harness.display()
             ),
@@ -601,23 +620,6 @@ impl Capsule {
     }
 }
 
-/// Whether a process id is still alive, by `kill(pid, 0)`.
-fn pid_alive(pid: i32) -> bool {
-    // SAFETY: signal 0 performs the permission and existence check and delivers nothing.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
-fn assert_dead_within(pid: i32, limit: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
-        if !pid_alive(pid) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("the harness (pid {pid}) was still alive after {limit:?}");
-}
-
 /// Cancel `task_id` and return how long the door took to answer.
 fn cancel_now(url: &str, task_id: &str) -> Duration {
     let started = Instant::now();
@@ -655,7 +657,7 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
     capsule.wait_for_trace("the cancelled task's records", |events| {
         events.iter().any(|e| e["event_type"] == "task_end")
     });
-    assert_dead_within(pid, REAPED_WITHIN);
+    common::assert_dead_within(pid, REAPED_WITHIN);
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
         "canceled"
@@ -718,7 +720,7 @@ fn s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace() {
         took >= Duration::from_millis(GRACE_MS / 2),
         "the harness was killed without being given its grace: {took:?}"
     );
-    assert_dead_within(pid, REAPED_WITHIN);
+    common::assert_dead_within(pid, REAPED_WITHIN);
     assert_eq!(status["status"]["state"], "canceled", "{status}");
     let message = status["status"]["message"].as_str().unwrap();
     assert!(message.contains("the harness was killed"), "{message}");
@@ -757,7 +759,7 @@ fn s2_mur_trace_show_prints_the_interrupt_under_harness() {
     capsule.wait_for_trace("the session to end", |events| {
         events.iter().any(|e| e["event_type"] == "session_end")
     });
-    assert_dead_within(pid, REAPED_WITHIN);
+    common::assert_dead_within(pid, REAPED_WITHIN);
 
     let shown = capsule.trace_show();
     assert!(shown.contains("── Harness ──"), "{shown}");
@@ -791,7 +793,7 @@ fn s3_a_harness_interrupted_by_sigint_stops() {
         took < STOPS_BEFORE_THE_GRACE,
         "the signal was waited out rather than honoured: {took:?}"
     );
-    assert_dead_within(pid, REAPED_WITHIN);
+    common::assert_dead_within(pid, REAPED_WITHIN);
     assert_eq!(status["status"]["state"], "canceled", "{status}");
     assert_eq!(
         status["status"]["message"], "task canceled",
@@ -831,7 +833,7 @@ fn s4_a_driver_declaring_unsupported_has_its_harness_killed_at_once() {
         took < STOPS_BEFORE_THE_GRACE,
         "a driver with no graceful interrupt spends no grace: {took:?}"
     );
-    assert_dead_within(pid, REAPED_WITHIN);
+    common::assert_dead_within(pid, REAPED_WITHIN);
     assert_eq!(status["status"]["state"], "canceled", "{status}");
     let message = status["status"]["message"].as_str().unwrap();
     assert!(
@@ -904,6 +906,43 @@ fn s6_a_process_capsule_advertises_cancellation() {
     );
 }
 
+// ── S8: a task stopped before its harness existed ─────────────────────────────
+
+/// A cancel that lands before the harness is spawned leaves no record of a harness that never
+/// ran: no `harness_start`, no `harness_exit`, and no process to kill. The run is still
+/// `canceled`, and the `task_canceled` record still names the harness phase.
+#[test]
+fn s8_a_task_stopped_before_its_harness_spawns_leaves_no_harness_records() {
+    println!("S8: a cancel that beats the spawn leaves no harness on record");
+    let capsule = Built::new("process-cancel-prespawn", "interrupt-ignores")
+        .stalls_the_version_probe(Duration::from_secs(6))
+        .launch();
+
+    let submitted = send_message(&capsule.url, "msg-1", "do the thing", "ctx-cancel-8");
+    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    // Inside the stalled probe: the run has started and nothing has been spawned.
+    std::thread::sleep(Duration::from_secs(2));
+    cancel_now(&capsule.url, &task_id);
+
+    capsule.wait_for_trace("the cancelled task's records", |events| {
+        events.iter().any(|e| e["event_type"] == "task_end")
+    });
+    assert!(
+        capsule.of_type("harness_start").is_empty(),
+        "a harness that never existed leaves no start: {:#?}",
+        capsule.events()
+    );
+    assert!(capsule.of_type("harness_exit").is_empty());
+    assert!(capsule.of_type("harness_interrupt").is_empty());
+    let canceled = capsule.one("task_canceled");
+    assert_eq!(canceled["phase"], "harness", "{canceled}");
+    assert_eq!(capsule.one("task_end")["exit_status"], "canceled");
+    assert_eq!(
+        tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
+        "canceled"
+    );
+}
+
 // ── S9: the driver is told the run was interrupted ────────────────────────────
 
 /// The runner hands `classify-exit` an `interrupted: true` exit, which is the only thing that can
@@ -920,7 +959,7 @@ fn s9_an_interrupted_run_hands_the_driver_interrupted_true() {
     cancel_now(&capsule.url, &task_id);
 
     let status = only_terminal_status(&stream.frames());
-    assert_dead_within(pid, REAPED_WITHIN);
+    common::assert_dead_within(pid, REAPED_WITHIN);
     assert_eq!(status["status"]["state"], "canceled", "{status}");
     let message = status["status"]["message"].as_str().unwrap();
     assert!(

@@ -340,23 +340,6 @@ impl Run {
     }
 }
 
-/// Whether a process id is still alive, by `kill(pid, 0)`.
-fn pid_alive(pid: i32) -> bool {
-    // SAFETY: signal 0 performs the permission and existence check and delivers nothing.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
-fn assert_dead_within(pid: i32, limit: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
-        if !pid_alive(pid) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("the harness (pid {pid}) was still alive after {limit:?}");
-}
-
 // ── S1: the happy path ────────────────────────────────────────────────────────
 
 #[test]
@@ -540,7 +523,7 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
         started.elapsed()
     );
     assert!(run.text.contains("E-RUN-035"), "{}", run.text);
-    assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "inactivity");
     assert_eq!(exit["killed"], true);
@@ -572,7 +555,7 @@ fn s6_a_harness_that_lingers_after_its_terminal_event_is_killed() {
         "the grace kill should have ended it, took {:?}",
         started.elapsed()
     );
-    assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "terminal");
     assert_eq!(exit["killed"], true);
@@ -700,7 +683,7 @@ fn s9_a_turn_past_max_turns_kills_the_harness() {
     assert_eq!(failed["source"], "runtime");
     assert_eq!(run.of_type("inference").len(), 2);
     assert_eq!(run.one("harness_exit")["cause"], "max_turns");
-    assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+    common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
 }
 
 #[test]
