@@ -892,7 +892,7 @@ these fields are accepted and inert:
 | `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
 | `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of `context.max_tokens` an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`. Requires `context.max_tokens`: without it there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
 | `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires `context.max_tokens` and is inert under `transport: process`, exactly like `context.seed_budget`. |
-| `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Inert under `transport: process`, which writes no record either way. |
+| `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Under `transport: process` no record is written either way, and `off` additionally turns off the [harness session map](workdir.md#harness-session-map). |
 | `context.record_store` | string | no | Default: the capsule name. Directory under `~/.murmur/conversations/` this capsule's records live in. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011). Accepted and inert alongside `record: off`. |
 | `context.retain` { #context-retain } | block | no | What bounds this capsule's [conversation records](workdir.md#the-conversation-record). Omitted, nothing is ever deleted. See [Retention](#retention). |
 | `context.retain.max_messages` | integer ≥ 1 | no | Messages to keep. At each launch, the record that launch opens — the context named by `mur run --context` — is truncated to its newest N; the older ones are dropped and the [header line](workdir.md#record-header) records the drop. A launch with no `--context` mints a context per task and opens no record to truncate; bound those with `context.retain.max_age`. |
@@ -1216,6 +1216,7 @@ inference:
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. Token counts are reported as 0, which the subprocess protocol does not carry. |
 | Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the harness manages its own context. |
 | Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |
+| Conversation | The harness's. Murmur keeps no message list and writes no `conversation.jsonl`; it maps each context to the harness's own session id in a [harness session map](workdir.md#harness-session-map), which is what [`lifecycle.conversation: threaded`](#lifecycle-conversation) and [`mur run --resume`](cli.md#mur-run) continue. A session the harness cannot find fails the turn with [`E-RUN-036`](diagnostics.md#e-run-036). |
 
 #### Process driver { #process-driver }
 
@@ -1880,6 +1881,11 @@ record, which [`context.record`](#context-record) is what turns off.
 |---|---|
 | `stateless` (default) | Every task starts with an empty message history. The `contextId` on the incoming message is recorded but has no effect on context. |
 | `threaded` | A task that arrives with a `contextId` starts from the whole [conversation record](workdir.md#the-conversation-record) for that context, including messages an earlier session wrote. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` alongside the shared `workdir/out/result.txt`. |
+
+Under [`transport: process`](#transport-process) the harness holds the conversation, so the setting
+decides what the harness is handed rather than what the runtime loads: `stateless` launches it on a
+new session every task, and `threaded` launches it on the session the
+[harness session map](workdir.md#harness-session-map) already holds for that context.
 
 This setting is the capsule's own policy, and
 [`mur run --resume <session>`](cli.md#mur-run) overrides it for one launch: that launch loads the

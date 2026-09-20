@@ -14,7 +14,8 @@
 //! 3. **Bridge** — `claude_bridge::bind_bridge`, when the capsule declares tools. The driver is
 //!    handed the URL, the token and the capsule's **bare** tool names.
 //! 4. **System prompt** — [`build_process_system_prompt`], the same value on every launch.
-//! 5. **Launch** — [`build_launch_request`], then the driver's `launch`, which returns the plan.
+//! 5. **Launch** — [`plan_session`] decides whether this turn starts a conversation or continues
+//!    one, then [`build_launch_request`], then the driver's `launch`, which returns the plan.
 //! 6. **Spawn** — an environment that starts empty and holds only what `capabilities.env.allow`
 //!    delivers plus the plan's `env-set`, in the accessible workdir the capsule's tools see.
 //! 7. **Read** — complete stdout lines, batched into `parse`, fed to [`ProcessEventSink`].
@@ -36,16 +37,19 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::mpsc,
 };
+
 use uuid::Uuid;
 
 use crate::{
     agent::{AgentLoopExit, PLAN_TOOL_NOTICE, UNTRUSTED_CONTENT_NOTICE},
     errors::RuntimeError,
+    harness_session::{new_harness_session_id, HarnessSessionMap},
     hooks::HookRuntime,
     murmur_md::MURMUR_MD_TRUST_NOTICE,
     otel::OtelEmitter,
     process_driver::{
-        Bridge, ExitStatus, LaunchPlan, LaunchRequest, ProcessDriver, Session, SessionMode,
+        Bridge, ExitStatus, FailureKind, LaunchPlan, LaunchRequest, ProcessDriver, Session,
+        SessionMode,
     },
     runtime::CapsuleStoreState,
     shell,
@@ -126,6 +130,166 @@ pub(super) fn build_process_system_prompt(
     }
 }
 
+/// What one turn knows about the conversation it belongs to, before the harness is asked for
+/// anything.
+///
+/// Built once per task, in `agent::run_agent_loop`, from the launch's map and the task's own
+/// context id. `continue_conversation` is the same rule the `http` path's `load_recorded_history`
+/// uses — `lifecycle.conversation: threaded`, or any launch under `mur run --resume` — so
+/// `--resume` keeps its meaning as a one-launch override of the capsule's own policy.
+pub(crate) struct HarnessSessionPolicy {
+    pub(crate) map: Arc<HarnessSessionMap>,
+    pub(crate) context_id: Option<String>,
+    pub(crate) continue_conversation: bool,
+}
+
+/// Which session this turn launches with, and what it may remember afterwards.
+pub(super) struct SessionPlan {
+    pub(super) session: Session,
+    /// The context to store this turn's session id under, or `None` when nothing is remembered:
+    /// a turn that starts every conversation from nothing, and a turn whose context id is
+    /// unresolved.
+    pub(super) context_key: Option<String>,
+}
+
+/// Decide what to hand the harness for this turn.
+///
+/// | `continue_conversation` | The map holds an id for this context | Launched with |
+/// |---|---|---|
+/// | no | not read | `mode: new`, a fresh id |
+/// | yes | no | `mode: new`, a fresh id |
+/// | yes | yes | `mode: resume`, the stored id |
+///
+/// A turn with no context id resolved launches `mode: new` and remembers nothing: there is
+/// nothing to key a conversation on.
+pub(super) fn plan_session(policy: &HarnessSessionPolicy) -> SessionPlan {
+    let new = |context_key: Option<String>| SessionPlan {
+        session: Session {
+            id: new_harness_session_id(),
+            mode: SessionMode::New,
+        },
+        context_key,
+    };
+    let Some(context_id) = policy.context_id.as_deref().filter(|id| !id.is_empty()) else {
+        return new(None);
+    };
+    if !policy.continue_conversation {
+        return new(None);
+    }
+    match policy.map.get(context_id) {
+        Some(id) => SessionPlan {
+            session: Session {
+                id,
+                mode: SessionMode::Resume,
+            },
+            context_key: Some(context_id.to_string()),
+        },
+        None => new(Some(context_id.to_string())),
+    }
+}
+
+/// How a session mode is spelled in the trace, and in the args a driver's `launch` builds from it.
+fn session_mode_name(mode: SessionMode) -> &'static str {
+    match mode {
+        SessionMode::New => "new",
+        SessionMode::Resume => "resume",
+    }
+}
+
+/// The session one run is driving, and everything needed to remember it or to say it is gone.
+///
+/// Held by [`ProcessEventSink`], which is where both answers arrive: a `session-started` event
+/// naming the conversation, and a `turn-failed` that never came with one.
+pub(super) struct RunSession {
+    map: Arc<HarnessSessionMap>,
+    /// The context this run's session id is stored under, or `None` when nothing is remembered.
+    context_key: Option<String>,
+    /// What the context id is called in a diagnostic, including when it resolved to nothing.
+    context_id: String,
+    /// The id handed to the driver for this run.
+    id: String,
+    mode: SessionMode,
+    harness: String,
+    driver: String,
+}
+
+/// What a turn with no resolved context id is called in a diagnostic.
+const UNRESOLVED_CONTEXT: &str = "<unresolved>";
+
+impl RunSession {
+    pub(super) fn new(
+        plan: &SessionPlan,
+        policy: &HarnessSessionPolicy,
+        harness: &str,
+        driver: &str,
+    ) -> Self {
+        Self {
+            map: Arc::clone(&policy.map),
+            context_key: plan.context_key.clone(),
+            context_id: policy
+                .context_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| UNRESOLVED_CONTEXT.to_string()),
+            id: plan.session.id.clone(),
+            mode: plan.session.mode,
+            harness: harness.to_string(),
+            driver: driver.to_string(),
+        }
+    }
+
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn mode(&self) -> SessionMode {
+        self.mode
+    }
+
+    /// Store `id` as this context's conversation.
+    ///
+    /// Whatever the harness reported wins over whatever the runtime asked for: a harness that
+    /// mints its own session ids says so with `session-started`, and that is the id it will answer
+    /// to next time.
+    pub(super) fn remember(&self, id: &str) {
+        let Some(context_key) = self.context_key.as_deref() else {
+            return;
+        };
+        self.map.put(context_key, id, &self.harness, &self.driver);
+    }
+
+    /// The failure a resumed turn produces when the harness never reported the session it was
+    /// handed.
+    ///
+    /// `None` for every other ending. A turn launched `mode: new` established nothing to lose; a
+    /// turn that reported a `session-started` was continuing something; and `auth`, `quota`,
+    /// `max-turns` and `canceled` each name a cause of their own — an expired login is not a
+    /// missing conversation.
+    pub(super) fn session_gone(
+        &self,
+        kind: FailureKind,
+        reported_session: bool,
+        message: &str,
+    ) -> Option<RuntimeError> {
+        if self.mode != SessionMode::Resume
+            || reported_session
+            || !matches!(kind, FailureKind::HarnessError | FailureKind::Other)
+        {
+            return None;
+        }
+        Some(RuntimeError::HarnessSessionGone {
+            context_id: self.context_id.clone(),
+            session_id: self.id.clone(),
+            harness: self.harness.clone(),
+            path: self
+                .context_key
+                .as_deref()
+                .and_then(|context| self.map.entry_path(context)),
+            detail: message.to_string(),
+        })
+    }
+}
+
 /// Everything the driver needs to plan one run.
 ///
 /// `model` is `none` when the manifest set none, so a driver never has to decide what an empty
@@ -136,7 +300,7 @@ pub(super) fn build_launch_request(
     system_prompt: Option<&str>,
     plan_tool_present: bool,
     bridge: Option<&claude_bridge::BridgeHandle>,
-    harness_session_id: &str,
+    session: Session,
     harness_version: Option<String>,
     task: String,
 ) -> LaunchRequest {
@@ -153,11 +317,7 @@ pub(super) fn build_launch_request(
             bearer_token: b.token.clone(),
             tool_names: b.tool_names.clone(),
         }),
-        session: Session {
-            id: harness_session_id.to_string(),
-            // Every run is a fresh session: nothing here resumes one.
-            mode: SessionMode::New,
-        },
+        session,
         harness_version,
         task,
     }
@@ -371,6 +531,7 @@ pub(crate) async fn run_process_inference_loop(
     accessible_workdir: &Path,
     _name: &str,
     _version: &str,
+    session_policy: HarnessSessionPolicy,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let Some(staged) = store_state.process_driver.clone() else {
         return Err(RuntimeError::DriverNotConfigured);
@@ -391,6 +552,7 @@ pub(crate) async fn run_process_inference_loop(
         trace,
         otel,
         accessible_workdir,
+        session_policy,
     )
     .await;
 
@@ -410,6 +572,7 @@ async fn run_harness(
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
     accessible_workdir: &Path,
+    session_policy: HarnessSessionPolicy,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // One driver instance for the whole run, so `parse` may answer from what `launch` was given.
     let mut driver = ProcessDriver::instantiate(
@@ -457,13 +620,19 @@ async fn run_harness(
         read_task_from_workdir(accessible_workdir),
     );
 
-    let harness_session_id = Uuid::new_v4().to_string();
+    let session_plan = plan_session(&session_policy);
+    let session = RunSession::new(
+        &session_plan,
+        &session_policy,
+        &description.harness,
+        &staged.name,
+    );
     let request = build_launch_request(
         inference,
         system_prompt,
         store_state.capability_policy.plan_submit,
         bridge.as_ref(),
-        &harness_session_id,
+        session_plan.session.clone(),
         harness_version.clone(),
         task,
     );
@@ -500,8 +669,8 @@ async fn run_harness(
             binary_source: staged.binary_source.clone(),
             harness_version,
             version_tested,
-            harness_session_id,
-            session_mode: "new".to_string(),
+            harness_session_id: session.id().to_string(),
+            session_mode: session_mode_name(session.mode()).to_string(),
             args_count: args.len(),
             env_names: env.keys().cloned().collect(),
             files,
@@ -514,7 +683,7 @@ async fn run_harness(
         })
         .await;
 
-    let mut sink = ProcessEventSink::new(workdir, inference.max_turns);
+    let mut sink = ProcessEventSink::new(workdir, inference.max_turns, session);
     let outcome = drive_harness(
         store_state,
         staged,
@@ -954,6 +1123,156 @@ mod tests {
         }
     }
 
+    /// A policy over a map that keeps nothing on disk, which is all `plan_session` reads.
+    fn policy(context_id: Option<&str>, continue_conversation: bool) -> HarnessSessionPolicy {
+        HarnessSessionPolicy {
+            map: Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
+            context_id: context_id.map(str::to_string),
+            continue_conversation,
+        }
+    }
+
+    fn run_session(plan: &SessionPlan, policy: &HarnessSessionPolicy) -> RunSession {
+        RunSession::new(plan, policy, "fixture-harness", "fixture-process-driver")
+    }
+
+    /// `lifecycle.conversation: stateless`, the default: every task starts a conversation from
+    /// nothing, and the map is neither read nor written.
+    #[test]
+    fn harness_session_stateless_always_launches_new() {
+        let policy = policy(Some("ctx_1"), false);
+        policy.map.put("ctx_1", "remembered", "h", "d");
+
+        let plan = plan_session(&policy);
+        assert_eq!(plan.session.mode, SessionMode::New);
+        assert_ne!(plan.session.id, "remembered");
+        assert_eq!(plan.context_key, None);
+
+        // And the next one gets a different id again.
+        assert_ne!(plan_session(&policy).session.id, plan.session.id);
+    }
+
+    #[test]
+    fn harness_session_threaded_with_no_entry_launches_new() {
+        let policy = policy(Some("ctx_1"), true);
+        let plan = plan_session(&policy);
+        assert_eq!(plan.session.mode, SessionMode::New);
+        assert_eq!(plan.context_key.as_deref(), Some("ctx_1"));
+    }
+
+    #[test]
+    fn harness_session_threaded_with_an_entry_launches_resume() {
+        let policy = policy(Some("ctx_1"), true);
+        policy.map.put("ctx_1", "remembered", "h", "d");
+
+        let plan = plan_session(&policy);
+        assert_eq!(plan.session.mode, SessionMode::Resume);
+        assert_eq!(plan.session.id, "remembered");
+        assert_eq!(plan.context_key.as_deref(), Some("ctx_1"));
+    }
+
+    /// Another context's entry is another conversation.
+    #[test]
+    fn harness_session_reads_only_its_own_context() {
+        let policy = policy(Some("ctx_2"), true);
+        policy.map.put("ctx_1", "remembered", "h", "d");
+        assert_eq!(plan_session(&policy).session.mode, SessionMode::New);
+    }
+
+    #[test]
+    fn harness_session_an_unresolved_context_launches_new_and_remembers_nothing() {
+        for context_id in [None, Some("")] {
+            let policy = policy(context_id, true);
+            let plan = plan_session(&policy);
+            assert_eq!(plan.session.mode, SessionMode::New);
+            assert_eq!(plan.context_key, None);
+
+            run_session(&plan, &policy).remember("anything");
+            assert_eq!(policy.map.get(""), None);
+        }
+    }
+
+    /// `mur run --resume` is a launch-scoped override of `lifecycle.conversation`, which is why
+    /// the runner is handed one flag rather than the mode and the flag separately.
+    #[test]
+    fn harness_session_resume_overrides_stateless() {
+        let policy = policy(Some("ctx_1"), true);
+        policy.map.put("ctx_1", "remembered", "h", "d");
+        let plan = plan_session(&policy);
+        assert_eq!(plan.session.mode, SessionMode::Resume);
+        assert_eq!(plan.session.id, "remembered");
+    }
+
+    #[test]
+    fn harness_session_remembers_what_the_harness_reported() {
+        let policy = policy(Some("ctx_1"), true);
+        let plan = plan_session(&policy);
+        run_session(&plan, &policy).remember("harness-chose-this");
+        assert_eq!(
+            policy.map.get("ctx_1").as_deref(),
+            Some("harness-chose-this")
+        );
+    }
+
+    /// The one ending that means the harness does not hold the conversation this context names.
+    #[test]
+    fn harness_session_gone_only_for_a_resume_the_harness_never_acknowledged() {
+        let policy = policy(Some("ctx_1"), true);
+        policy.map.put("ctx_1", "remembered", "h", "d");
+        let plan = plan_session(&policy);
+        let session = run_session(&plan, &policy);
+
+        for kind in [FailureKind::HarnessError, FailureKind::Other] {
+            let gone = session
+                .session_gone(kind, false, "no conversation found")
+                .expect("a resume with no session-started is a missing conversation");
+            let message = gone.to_string();
+            assert!(message.contains("ctx_1"), "{message}");
+            assert!(message.contains("remembered"), "{message}");
+            assert!(message.contains("fixture-harness"), "{message}");
+            assert!(message.contains("no conversation found"), "{message}");
+        }
+
+        // A harness that named its session was continuing something, whatever went wrong after.
+        for kind in [FailureKind::HarnessError, FailureKind::Other] {
+            assert!(session.session_gone(kind, true, "boom").is_none());
+        }
+
+        // Every other kind names its own cause.
+        for kind in [
+            FailureKind::Auth,
+            FailureKind::Quota,
+            FailureKind::MaxTurns,
+            FailureKind::Canceled,
+        ] {
+            assert!(session.session_gone(kind, false, "boom").is_none());
+        }
+    }
+
+    #[test]
+    fn harness_session_gone_never_fires_on_a_new_session() {
+        let policy = policy(Some("ctx_1"), true);
+        let plan = plan_session(&policy);
+        assert_eq!(plan.session.mode, SessionMode::New);
+        let session = run_session(&plan, &policy);
+        assert!(session
+            .session_gone(FailureKind::HarnessError, false, "boom")
+            .is_none());
+    }
+
+    #[test]
+    fn session_mode_names_match_the_wit_spelling() {
+        assert_eq!(session_mode_name(SessionMode::New), "new");
+        assert_eq!(session_mode_name(SessionMode::Resume), "resume");
+    }
+
+    fn new_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            mode: SessionMode::New,
+        }
+    }
+
     #[test]
     fn launch_request_carries_the_prompt_config_and_a_new_session() {
         let inference = process_inference("a-model", Some(r#"{"profile":"work"}"#));
@@ -962,7 +1281,7 @@ mod tests {
             Some("be brief"),
             true,
             None,
-            "sess-1",
+            new_session("sess-1"),
             Some("harness 1.0.0".to_string()),
             "do the thing".to_string(),
         );
@@ -988,7 +1307,7 @@ mod tests {
                 None,
                 false,
                 None,
-                "sess-1",
+                new_session("sess-1"),
                 None,
                 "t".to_string(),
             );
@@ -1013,7 +1332,7 @@ mod tests {
             None,
             false,
             Some(&handle),
-            "sess-1",
+            new_session("sess-1"),
             None,
             "t".to_string(),
         );

@@ -16,8 +16,27 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 
+# The driver puts the session on the harness's own command line, which is where a profile with a
+# memory of its own reads it: `--session <id> --mode new|resume`, plus `--model <m>` when set.
+SESSION=""
+MODE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session) SESSION="${2:-}"; shift 2 ;;
+    --mode) MODE="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
 # Profiles a test must prove dead leave their pid where the test can read it.
 record_pid() { echo $$ > harness.pid; }
+
+# The `memory` profiles keep one file per session here — the harness's own store, which is not
+# murmur's map and which a test deletes to make a resume fail.
+SESSION_STORE="${HOME:-.}/fake-harness-sessions"
+
+# Every task line this session has been told, on one line.
+recall() { tr '\n' ' ' < "$SESSION_STORE/$1"; }
 
 # One `tools/call` against the bridge, over bash's own /dev/tcp — no curl in the environment.
 # Prints the response body on one line.
@@ -137,6 +156,42 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
   api-key)
     echo "started fixture-session-1 api-key"
     echo "end API-KEY-RESULT"
+    ;;
+  memory|memory-renames)
+    # A task that arrived over A2A is fenced, so the payload is several lines rather than one.
+    # Read to the closing marker — which is already on stdin, so nothing here waits on the runtime,
+    # which keeps the handle open after writing.
+    case "$TASK" in
+      '<untrusted-content'*)
+        FENCED=""
+        while IFS= read -r line; do
+          [ "$line" = "</untrusted-content>" ] && break
+          FENCED="$FENCED$line "
+        done
+        TASK="$FENCED"
+        ;;
+    esac
+    # On a new session the harness picks the id it will answer to; under `memory` that is the one
+    # it was handed, and under `memory-renames` it is one of its own, reported back on `started`.
+    if [ "$MODE" = "resume" ]; then
+      if [ ! -f "$SESSION_STORE/$SESSION" ]; then
+        echo "fail harness-error no conversation found with session id $SESSION"
+        exit 1
+      fi
+      echo "started $SESSION"
+      printf '%s\n' "$TASK" >> "$SESSION_STORE/$SESSION"
+      echo "end $(recall "$SESSION")"
+    else
+      if [ "${FIXTURE_HARNESS_PROFILE:-}" = "memory-renames" ]; then
+        REPORTED="renamed-$SESSION"
+      else
+        REPORTED="$SESSION"
+      fi
+      mkdir -p "$SESSION_STORE"
+      printf '%s\n' "$TASK" > "$SESSION_STORE/$REPORTED"
+      echo "started $REPORTED"
+      echo "end $(recall "$REPORTED")"
+    fi
     ;;
   linger)
     # Prints its terminal event and then ignores stdin closing, so the exit grace has to kill it.

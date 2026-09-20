@@ -186,6 +186,15 @@ pub enum RuntimeError {
     )]
     ResumeCompactionHookMissing,
 
+    /// `mur run --resume-mode compact` on a `transport: process` capsule. The harness holds the
+    /// conversation and the runtime has no message list to hand a compaction hook, so there is
+    /// nothing `compact` could summarize.
+    #[error(
+        "--resume-mode compact is not available under inference.transport: process; the harness \
+         holds this conversation and murmur has no history to compact"
+    )]
+    ResumeCompactUnsupportedTransport,
+
     /// The state store directory a validated name resolves to could not be resolved or created.
     /// Distinct from [`Self::InvalidStateStore`]: the declaration is well-formed and the failure is
     /// the host's — an unset `HOME`, or a path that cannot be made a `0700` directory.
@@ -642,6 +651,25 @@ pub enum RuntimeError {
         origin: String,
     },
 
+    /// A turn launched `mode: resume` failed without the harness ever reporting the session it
+    /// was handed: the conversation this context names is gone from the harness's own store.
+    ///
+    /// `path` is the map file that still holds the id, or `None` on a launch that kept none. The
+    /// entry is deliberately left as it is — the next task in this context fails the same way
+    /// rather than quietly starting a new conversation.
+    #[error(
+        "the harness '{harness}' could not continue session {session_id}, which context \
+         '{context_id}' names: {detail}{}",
+        harness_session_file_tail(.path)
+    )]
+    HarnessSessionGone {
+        context_id: String,
+        session_id: String,
+        harness: String,
+        path: Option<PathBuf>,
+        detail: String,
+    },
+
     /// A call into the process driver trapped, ran out of time, or refused. `call` is the WIT
     /// function name; `message` is the driver's own refusal or the failure's description.
     #[error("process driver '{name}@{version}' failed in {call}: {message}")]
@@ -674,6 +702,16 @@ fn process_interface_found_tail(found: &[String]) -> String {
             "; it exports {}, built against another version — rebuild it",
             found.join(", ")
         )
+    }
+}
+
+/// The tail of [`RuntimeError::HarnessSessionGone`]'s message: where the session id that could
+/// not be continued is recorded, so the operator can read it, or that this launch recorded it
+/// nowhere.
+fn harness_session_file_tail(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(path) => format!(" (that id is recorded in {})", path.display()),
+        None => " (this launch recorded that id in memory only)".to_string(),
     }
 }
 

@@ -269,8 +269,7 @@ record like any other and simply starts every task from nothing;
 context. [`mur run --resume`](cli.md#mur-run) loads the record either way, for that launch only.
 
 **Turning it off creates nothing.** [`context.record: off`](manifest.md#context-record) means no
-`~/.murmur/conversations/` directory at all. So does `inference.transport: process`, whose CLI owns
-its own conversation.
+`~/.murmur/conversations/` directory at all.
 
 **A failure to write never fails a task.** An unresolvable `HOME`, a full disk or an unwritable
 directory is reported once to stderr and to `logs/bootstrap.log`, and the task runs on unrecorded.
@@ -285,8 +284,74 @@ No artifact ever gets a filesystem path into `~/.murmur/conversations/`. The onl
 |---|---|
 | `~/.murmur`, the conversation root and each directory under it | `0700` |
 | `conversation.jsonl` | `0600` |
+| `harness-session.json` | `0600` |
 
 Each mode is set again on every append and every rewrite.
+
+## The harness session map { #harness-session-map }
+
+On [`inference.transport: process`](manifest.md#transport-process) the harness owns the
+conversation. The runtime keeps no message list for that capsule and records one thing per context
+— the opaque session id the harness answers to — in the directory the record would have been in:
+
+```
+~/.murmur/conversations/<record>/<context-id>/harness-session.json
+```
+
+`<record>` and `<context-id>` are the two segments above, so
+[`context.record_store`](manifest.md#field-context) points both transports at the same place.
+
+```json
+{"type":"murmur.harness-session","session_id":"0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55","harness":"claude-code","driver":"murmur-driver-claude-code","created_ms":1758326400000,"updated_ms":1758326461000}
+```
+
+| Key | Value |
+|---|---|
+| `type` | Always `murmur.harness-session`. A file carrying anything else is read as no entry |
+| `session_id` | What the harness calls this conversation. Opaque: the runtime only ever hands it back |
+| `harness` | The harness its process driver named, for a person reading the directory |
+| `driver` | The process driver artifact that drove it, for a person reading the directory |
+| `created_ms` | When this context first got a session |
+| `updated_ms` | When the entry was last written |
+
+The runtime never compares `harness` or `driver` against the capsule it is launching. Whether a
+session still exists is a question only the harness can answer, and it answers it by failing the
+turn — see [E-RUN-036](diagnostics.md#e-run-036).
+
+### What decides the launch
+
+| [`lifecycle.conversation`](manifest.md#lifecycle-conversation) | The map holds an id for this context | The harness is launched |
+|---|---|---|
+| `stateless` | Not read | Starting a new conversation, under a fresh id |
+| `threaded`, or any launch under [`mur run --resume`](cli.md#mur-run) | No | Starting a new conversation, under a fresh id |
+| `threaded`, or any launch under `mur run --resume` | Yes | Continuing that conversation, under the stored id |
+
+A task whose context id resolved to nothing starts a new conversation and writes no entry.
+
+The id the runtime mints is a bare UUID. A harness that mints its own reports it back, and **that**
+is what the context is keyed on from then on. A turn that ends without the harness ever naming a
+session is keyed on the id it was handed; a turn that fails without ever naming one writes nothing,
+because nothing was established.
+
+### What it does not keep
+
+`context.record` is inert on this transport, exactly as
+[`context.record: off`](manifest.md#context-record) is everywhere:
+
+| | Under `transport: process` |
+|---|---|
+| `conversation.jsonl` | Never written |
+| [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | Reads an empty page, however the hook is granted |
+| An `on-task-start` `seed-context` | Rejected, recorded as a [`context_seed`](observability-schemas.md#context-seed) with reason `unsupported_transport` |
+| [`context.retain`](manifest.md#context-retain) | Prunes nothing — it is wired to the conversation record, which this transport keeps none of, and a deleted session id is a person's conversation lost with no way back |
+
+This is the design, not a stage on the way to a richer one. A capsule whose harness holds the
+history has exactly one thing worth keeping outside it, and this is it.
+
+`context.record: off` and a host whose `HOME` cannot be resolved both mean no file at all: the
+capsule still threads the contexts it serves for as long as it is running, and forgets them when it
+stops. A map that cannot be written is reported once to stderr and to `logs/bootstrap.log`, and the
+task runs on.
 
 ---
 

@@ -332,30 +332,8 @@ impl ConversationRecord {
             .map_err(|err| err.to_string())
     }
 
-    /// Create the record root, the record directory and the context directory if they are
-    /// missing, oldest ancestor first, so a context directory is never reachable through a parent
-    /// a wider mode left open.
-    ///
-    /// When the record root sits in `~/.murmur`, the home itself is held at `0700` first.
     fn ensure_dirs(&self) -> Result<(), String> {
-        let mut chain = Vec::new();
-        let mut dir = Some(self.dir.as_path());
-        for _ in 0..3 {
-            if let Some(current) = dir {
-                chain.push(current);
-                dir = current.parent();
-            }
-        }
-        if let (Some(owner), Ok(home)) = (dir, crate::state_store::murmur_home_dir()) {
-            if owner == home {
-                crate::murmur_home::ensure_murmur_home()?;
-            }
-        }
-        for path in chain.into_iter().rev() {
-            crate::state_store::ensure_private_dir(path, RECORD_DIR_MODE)
-                .map_err(|reason| format!("{}: {reason}", path.display()))?;
-        }
-        Ok(())
+        ensure_context_dirs(&self.dir)
     }
 
     /// Put a [`RecordHeader`] at the front of this record, once, before its first new line.
@@ -629,8 +607,38 @@ fn decode_cursor(cursor: &str) -> Option<usize> {
     cursor.strip_prefix(CURSOR_PREFIX)?.parse().ok()
 }
 
+/// Create the conversation root, the record directory and `dir` itself if they are missing,
+/// oldest ancestor first, so a context directory is never reachable through a parent a wider mode
+/// left open.
+///
+/// When the conversation root sits in `~/.murmur`, the home itself is held at `0700` first.
+///
+/// `dir` is `<conversation root>/<record>/<context-id>` — the directory holding this context's
+/// record, and the one [`crate::harness_session`] puts its map file in for a capsule whose harness
+/// owns the conversation instead.
+pub(crate) fn ensure_context_dirs(dir: &Path) -> Result<(), String> {
+    let mut chain = Vec::new();
+    let mut ancestor = Some(dir);
+    for _ in 0..3 {
+        if let Some(current) = ancestor {
+            chain.push(current);
+            ancestor = current.parent();
+        }
+    }
+    if let (Some(owner), Ok(home)) = (ancestor, crate::state_store::murmur_home_dir()) {
+        if owner == home {
+            crate::murmur_home::ensure_murmur_home()?;
+        }
+    }
+    for path in chain.into_iter().rev() {
+        crate::state_store::ensure_private_dir(path, RECORD_DIR_MODE)
+            .map_err(|reason| format!("{}: {reason}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Both places an operator looks for what the runtime did with a record. Never fatal.
-fn report(workdir: &Path, message: &str) {
+pub(crate) fn report(workdir: &Path, message: &str) {
     crate::runtime_err!("[capsule-runtime] {message}");
     crate::agent::append_bootstrap_log(workdir, message);
 }

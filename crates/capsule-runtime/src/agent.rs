@@ -86,6 +86,12 @@ pub(crate) struct AgentRunConfig {
     /// runs the bound `on-compaction` hook over the loaded history once, before the task message
     /// is minted and regardless of `inference.compaction.threshold`.
     pub resume: Option<ResumeMode>,
+    /// Context id → harness session id, for a `transport: process` capsule, whose harness owns
+    /// the conversation instead of this runtime. `None` on every other transport.
+    ///
+    /// `Some` with no root behind it — `context.record: off`, or a host with no usable `HOME` —
+    /// still threads the tasks of one launch; it just forgets when the capsule stops.
+    pub harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
 }
 
 /// How many multiples of the seed budget an overflow may reach before the seed is refused
@@ -335,6 +341,19 @@ pub(crate) async fn run_agent_loop(
             )
             .await;
         }
+        // The harness owns the conversation on this transport, so "continue it" is a session id
+        // handed back rather than a message list reloaded. The condition is the one
+        // `load_recorded_history` uses below, so `--resume` means the same thing on both.
+        let session_policy = process::HarnessSessionPolicy {
+            map: run_config.harness_sessions.clone().unwrap_or_else(|| {
+                Arc::new(crate::harness_session::HarnessSessionMap::new(
+                    None, workdir,
+                ))
+            }),
+            context_id: context_id.clone(),
+            continue_conversation: matches!(mode, ConversationMode::Threaded)
+                || run_config.resume.is_some(),
+        };
         // `store_state` (shared &) is threaded through so the process path can start the
         // Claude Bridge and execute declared tool artifacts — see agent/claude_bridge.rs.
         // The HTTP path below is unaffected.
@@ -351,6 +370,7 @@ pub(crate) async fn run_agent_loop(
             accessible_workdir,
             name,
             version,
+            session_policy,
         )
         .await;
     }

@@ -96,6 +96,8 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `turns` | Two turns closed by tool results, then a third opened by `text`, then sleeps |
 | `thinking` | `thinking` and `delta` events around one `text`, then `end THINKING-RESULT` |
 | `api-key` | `started fixture-session-1 api-key`, then `end API-KEY-RESULT` |
+| `memory` | Keeps one conversation per session id and answers with everything it holds |
+| `memory-renames` | `memory`, but a new session is reported back under an id of the harness's own |
 | `linger` | `end LINGER`, then ignores stdin closing and sleeps, so the exit grace kills it |
 
 `silent`, `turns` and `linger` write their pid to `harness.pid` in their working directory, which
@@ -104,6 +106,23 @@ is how a test proves the harness is dead.
 The bridge request is made with bash's own `/dev/tcp` — no `curl` — and the harness's environment
 is only what the capsule declared plus the driver's `env-set`, so a test that wants `sleep`, `ls`
 or `env` to resolve has to declare `PATH`.
+
+### The `memory` profiles
+
+The session is on the harness's own command line — `--session <id> --mode new|resume`, which is
+where the driver's `launch` puts it — and the conversation is one file per session under
+`$HOME/fake-harness-sessions/`. That directory is the *harness's* store, not murmur's map: a test
+deletes it to make a resume fail the way a harness that has forgotten a session does.
+
+| Called with | What it does |
+| --- | --- |
+| `--mode new` | Writes the task line to `$HOME/fake-harness-sessions/<reported id>`, then `started <reported id>` and `end <every task line so far>` |
+| `--mode resume`, that file present | Appends the task line, then `started <session id>` and `end <every task line so far>` |
+| `--mode resume`, no such file | `fail harness-error no conversation found with session id <session id>`, no `started` line, exit `1` |
+
+`memory` reports the id it was handed. `memory-renames` reports `renamed-<session id>` on a new
+session and keys its store on that, which is how a test proves the runtime stores what the harness
+said rather than what it asked for; on a resume it reports the id it was handed, like `memory`.
 
 ## Rebuild
 

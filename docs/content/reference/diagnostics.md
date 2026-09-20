@@ -89,6 +89,8 @@ section that explains it.
 | `E-RUN-033` | A `transport: process` turn failed — the harness reported it, or the runtime ended it at the turn limit | [E-RUN-033](#e-run-033) |
 | `E-RUN-034` | A call into the process driver refused, trapped or ran out of time | [E-RUN-034](#e-run-034) |
 | `E-RUN-035` | A `transport: process` harness went silent and was killed | [E-RUN-035](#e-run-035) |
+| `E-RUN-036` | The harness could not find the session it was asked to continue | [E-RUN-036](#e-run-036) |
+| `E-RUN-037` | `--resume-mode compact` under `inference.transport: process` | [E-RUN-037](#e-run-037) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -262,21 +264,25 @@ Run [`mur trace show <session>`](cli.md#mur-trace-show) to see what that session
 
 ### E-RUN-017 — the resumed context kept no record { #e-run-017 }
 
-The context id `--resume` resolved has no
-[conversation record](workdir.md#the-conversation-record) on disk. Resuming it would start a fresh
-conversation while reporting success, so it is refused instead, naming the session, the context and
-which of the reasons applies:
+The context id `--resume` resolved has nothing on disk to continue. Resuming it would start a
+fresh conversation while reporting success, so it is refused instead, naming the session, the
+context and which of the reasons applies:
 
 ```text
-error[E-RUN-017]: cannot resume session ses_0193f2…: context 'ctx_0193f2…' has no conversation record (the capsule declares inference.transport: process, whose CLI owns its own conversation, and kept no conversation record)
-  hint: a session is resumable only if its capsule kept a conversation record: an http-transport capsule that did not declare context.record: off. Run `mur trace show <session>` to see what that session did, and omit --resume to start a fresh conversation — see docs/content/reference/cli.md
+error[E-RUN-017]: cannot resume session ses_0193f2…: context 'ctx_0193f2…' has no conversation record (no conversation record at /home/you/.murmur/conversations/shey/ctx_0193f2…/conversation.jsonl)
+  hint: a session is resumable only if its capsule kept something to continue it with: a conversation record under transport: http, or a harness-session.json under transport: process. Either way context.record: off keeps neither. Run `mur trace show <session>` to see what that session did, and omit --resume to start a fresh conversation — see docs/content/reference/cli.md
 ```
 
-The reasons: [`context.record: off`](manifest.md#field-context),
-[`inference.transport: process`](manifest.md#inference-config) — whose CLI owns its own
-conversation — a capsule with no `inference:` block, a host whose home directory cannot be
-resolved, and a record path that resolves but holds no file. Refused at staging, before this
-launch's session directory is created.
+What "nothing to continue" means is the one thing the transport decides:
+
+| Transport | What is looked for |
+|---|---|
+| `http` | The context's [`conversation.jsonl`](workdir.md#the-conversation-record) |
+| `process` | The context's [`harness-session.json`](workdir.md#harness-session-map), which holds the session id the harness answers to |
+
+The other reasons apply to both: [`context.record: off`](manifest.md#context-record), a capsule
+with no `inference:` block, and a host whose home directory cannot be resolved. Refused at staging,
+before this launch's session directory is created.
 
 ### E-RUN-018 — `--resume-mode compact` with no compaction hook { #e-run-018 }
 
@@ -632,6 +638,41 @@ error[E-RUN-035]: the harness produced neither a line of output nor a tool call 
 
 There is no limit on how long a run may take: any output, and any tool call, starts the window
 again. Output on stderr does not. The trace's `harness_exit` event records `cause: "inactivity"`.
+
+### E-RUN-036 — the harness could not find the session { #e-run-036 }
+
+A turn on [`transport: process`](manifest.md#transport-process) was launched to continue the
+session this context's [harness session map](workdir.md#harness-session-map) holds, and the harness
+failed it without ever reporting that session. The conversation is gone from the harness's own
+store:
+
+```text
+error[E-RUN-036]: the harness 'claude-code' could not continue session 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55, which context 'ctx_0193f2…' names: no conversation found with session id 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55 (that id is recorded in /home/you/.murmur/conversations/shey/ctx_0193f2…/harness-session.json)
+  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing: delete that file to start a new conversation under the same context, or use a different --context — see docs/content/reference/workdir.md
+```
+
+The map entry is left exactly as it was. Starting a new conversation instead would be silent memory
+loss: the next message would be answered as if nothing had been said.
+
+The turn must have been launched to continue a session, the harness must never have reported one,
+and the failure kind must be `harness-error` or `other`. A turn that started a new conversation had
+nothing to lose, and `auth`, `quota`, `max-turns` and `canceled` each name a cause of their own —
+an expired login is not a missing conversation — so all of those stay
+[`E-RUN-033`](#e-run-033).
+
+### E-RUN-037 — `--resume-mode compact` under `transport: process` { #e-run-037 }
+
+`--resume-mode compact` runs the capsule's `on-compaction` hook over the conversation and continues
+from its summary. On [`transport: process`](manifest.md#transport-process) the harness holds the
+conversation, so there is no history to hand that hook:
+
+```text
+error[E-RUN-037]: --resume-mode compact is not available under inference.transport: process; the harness holds this conversation and murmur has no history to compact
+  hint: use --resume-mode full, which hands the harness the session id this context already has and lets it answer from everything it was told — see docs/content/reference/cli.md
+```
+
+`--resume-mode full` is what this transport resumes with: the harness is launched on the session id
+the map holds and answers from everything it was told before.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
