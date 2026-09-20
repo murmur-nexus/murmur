@@ -351,8 +351,7 @@ pub(crate) async fn run_agent_loop(
                 ))
             }),
             context_id: context_id.clone(),
-            continue_conversation: matches!(mode, ConversationMode::Threaded)
-                || run_config.resume.is_some(),
+            continue_conversation: process::continues_conversation(mode, run_config.resume),
         };
         // `store_state` (shared &) is threaded through so the process path can start the
         // Claude Bridge and execute declared tool artifacts — see agent/claude_bridge.rs.

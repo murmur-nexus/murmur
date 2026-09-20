@@ -344,9 +344,10 @@ because nothing was established.
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | Reads an empty page, however the hook is granted |
 | An `on-task-start` `seed-context` | Rejected, recorded as a [`context_seed`](observability-schemas.md#context-seed) with reason `unsupported_transport` |
 | [`context.retain`](manifest.md#context-retain) | Prunes nothing — it is wired to the conversation record, which this transport keeps none of, and a deleted session id is a person's conversation lost with no way back |
+| [`mur conversation ls`](cli.md#mur-conversation) and `rm` | Neither lists nor removes these contexts: both work on conversation records, and `rm` answers [`E-CNV-001`](diagnostics.md#e-cnv-001). Delete `harness-session.json` to drop a context's session |
 
-This is the design, not a stage on the way to a richer one. A capsule whose harness holds the
-history has exactly one thing worth keeping outside it, and this is it.
+The session id is the whole of what murmur keeps for such a capsule. To read or export the
+conversation itself, use whatever the harness offers for its own sessions.
 
 `context.record: off` and a host whose `HOME` cannot be resolved both mean no file at all: the
 capsule still threads the contexts it serves for as long as it is running, and forgets them when it

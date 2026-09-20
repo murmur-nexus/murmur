@@ -36,6 +36,10 @@ pub(crate) const RECORD_FILE_NAME: &str = "conversation.jsonl";
 /// The `type` value on a record's header line, and the only value a header is recognised by.
 pub(crate) const RECORD_HEADER_TYPE: &str = "murmur.record";
 
+/// What a context is called in a diagnostic when the task resolved no context id. Shared so the
+/// refusal to resume and the failure to continue a harness session name the same non-context.
+pub(crate) const UNRESOLVED_CONTEXT: &str = "<unresolved>";
+
 /// Mode applied to the conversation root, each record directory and each context directory:
 /// owner-only, because a record is the whole of one capsule's conversation.
 const RECORD_DIR_MODE: u32 = 0o700;

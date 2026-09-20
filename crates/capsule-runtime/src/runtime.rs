@@ -387,7 +387,9 @@ fn check_resume_launchable(
     }
     // A resume that reached staging with no context id resolved nothing, so there is nothing to
     // look for; the placeholder keeps the refusal's wording honest about that.
-    let context_id = context_id.unwrap_or("<unresolved>").to_string();
+    let context_id = context_id
+        .unwrap_or(crate::conversation::UNRESOLVED_CONTEXT)
+        .to_string();
     let missing = |reason: String| RuntimeError::ResumeRecordMissing {
         session: resume.from_session.clone(),
         context_id: context_id.clone(),

@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use murmur_artifact::{runtime_warning_link, InferenceConfig, W_RUN_002};
+use murmur_artifact::{runtime_warning_link, ConversationMode, InferenceConfig, W_RUN_002};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
@@ -55,7 +55,7 @@ use crate::{
     shell,
     streaming::{SseBroadcast, SseEventBuffer},
     trace::{HarnessExit, HarnessStart, TraceWriter},
-    types::StagedProcessDriver,
+    types::{ResumeMode, StagedProcessDriver},
     CapabilityPolicy,
 };
 
@@ -152,6 +152,15 @@ pub(super) struct SessionPlan {
     pub(super) context_key: Option<String>,
 }
 
+/// Whether this turn continues the conversation its context already has, or starts a new one.
+///
+/// `lifecycle.conversation: threaded` is the capsule's own policy. `mur run --resume` overrides it
+/// for one launch, which is what keeps `--resume` meaning the same thing on both transports: the
+/// `http` path's `load_recorded_history` reloads a message list on exactly this condition.
+pub(crate) fn continues_conversation(mode: ConversationMode, resume: Option<ResumeMode>) -> bool {
+    matches!(mode, ConversationMode::Threaded) || resume.is_some()
+}
+
 /// Decide what to hand the harness for this turn.
 ///
 /// | `continue_conversation` | The map holds an id for this context | Launched with |
@@ -213,9 +222,6 @@ pub(super) struct RunSession {
     driver: String,
 }
 
-/// What a turn with no resolved context id is called in a diagnostic.
-const UNRESOLVED_CONTEXT: &str = "<unresolved>";
-
 impl RunSession {
     pub(super) fn new(
         plan: &SessionPlan,
@@ -230,7 +236,7 @@ impl RunSession {
                 .context_id
                 .clone()
                 .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| UNRESOLVED_CONTEXT.to_string()),
+                .unwrap_or_else(|| crate::conversation::UNRESOLVED_CONTEXT.to_string()),
             id: plan.session.id.clone(),
             mode: plan.session.mode,
             harness: harness.to_string(),
@@ -1192,11 +1198,23 @@ mod tests {
         }
     }
 
-    /// `mur run --resume` is a launch-scoped override of `lifecycle.conversation`, which is why
-    /// the runner is handed one flag rather than the mode and the flag separately.
+    /// `mur run --resume` is a launch-scoped override of `lifecycle.conversation`: a `stateless`
+    /// capsule continues its context's session for that launch only, exactly as an `http` capsule
+    /// loads its record for that launch only.
     #[test]
     fn harness_session_resume_overrides_stateless() {
-        let policy = policy(Some("ctx_1"), true);
+        assert!(!continues_conversation(ConversationMode::Stateless, None));
+        assert!(continues_conversation(
+            ConversationMode::Stateless,
+            Some(ResumeMode::Full)
+        ));
+        assert!(continues_conversation(ConversationMode::Threaded, None));
+
+        // And the override reaches the plan: the stored id is handed back, not a fresh one.
+        let policy = policy(
+            Some("ctx_1"),
+            continues_conversation(ConversationMode::Stateless, Some(ResumeMode::Full)),
+        );
         policy.map.put("ctx_1", "remembered", "h", "d");
         let plan = plan_session(&policy);
         assert_eq!(plan.session.mode, SessionMode::Resume);
