@@ -1,6 +1,7 @@
 mod claude_bridge;
 pub(crate) mod inventory;
-mod process;
+pub(crate) mod process;
+mod process_events;
 
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::{
@@ -3442,7 +3443,7 @@ fn credential_failure(store_state: &CapsuleStoreState) -> Option<String> {
 /// Record `value` as the in-scope task attempt's result text, then write `out/result.txt`.
 ///
 /// The single result-text write funnel for both transports: every terminal arm of
-/// [`run_agent_loop`] and both dialect readers in [`process`] call this. That is what makes
+/// [`run_agent_loop`] and the process transport's event sink call this. That is what makes
 /// `murmur:task-io/read`'s `read-output` serve exactly what the loop produced. [`write_result`]
 /// has one other caller: a hook's `run-inference` that ends in a credential rejection writes
 /// `out/result.txt` directly, without recording task output. A terminal path that returns `Err`

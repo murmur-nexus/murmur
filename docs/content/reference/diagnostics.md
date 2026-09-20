@@ -60,7 +60,7 @@ section that explains it.
 | `E-RUN-003` | Unsupported `lock_version`, missing lock entry, or a lock entry with no hash for this host's platform | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
-| `E-RUN-006` | Inference driver artifact not installed, or `inference.command` is not on `PATH` | [Inference configuration](manifest.md#inference-config) |
+| `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
 | `E-RUN-007` | Agent loop failed at runtime | — |
 | `E-RUN-008` | Required artifact not installed locally | [`mur run`](cli.md#mur-run) |
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read | [`inference.system_prompt`](manifest.md#inference-system-prompt) |
@@ -85,8 +85,10 @@ section that explains it.
 | `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
 | `E-RUN-029` | The `transport: process` driver does not export the process driver interface | [E-RUN-029](#e-run-029) |
 | `E-RUN-030` | The `transport: http` inference driver exports the process driver interface | [E-RUN-030](#e-run-030) |
-| `E-RUN-031` | A process driver passed its checks, and this runtime does not run process drivers | [E-RUN-031](#e-run-031) |
 | `E-RUN-032` | A process driver could not be loaded with no grants, or described itself unusably | [E-RUN-032](#e-run-032) |
+| `E-RUN-033` | A `transport: process` turn failed — the harness reported it, or the runtime ended it at the turn limit | [E-RUN-033](#e-run-033) |
+| `E-RUN-034` | A call into the process driver refused, trapped or ran out of time | [E-RUN-034](#e-run-034) |
+| `E-RUN-035` | A `transport: process` harness went silent and was killed | [E-RUN-035](#e-run-035) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -98,6 +100,7 @@ section that explains it.
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
+| `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -128,6 +131,7 @@ section that explains it.
 | `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file a `gateway.api_key` was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
 | `W-SEC-029` | A compiler driver could not be run to ask where its helper binaries live, so `W-SEC-012` was not evaluated for it | [W-SEC-029](#w-sec-029) |
 | `W-SEC-030` | An artifact reaches its upstream through an unmetered credential gateway, which the spend ceilings do not cover | [W-SEC-030](#w-sec-030) |
+| `W-SEC-031` | A `transport: process` harness session reports it is authenticating as something other than a subscription | [W-SEC-031](#w-sec-031) |
 
 ---
 
@@ -208,6 +212,26 @@ and the message names the failing step and its errno:
   policy changed. Re-probe with `mur run --explain-scope`.
 
 Neither means the declared floor was wrong; `E-CAP-003` covers that.
+
+### E-RUN-006 — a harness binary was not found { #e-run-006 }
+
+A `transport: process` capsule names an executable that is not installed on this host. `mur run`
+refuses at staging, before the session directory exists.
+
+```text
+error[E-RUN-006]: harness binary 'my-cli', named by the process driver's describe(), was not found on this host
+  hint: install the harness this capsule's process driver drives, or point inference.command at the executable to run
+```
+
+The name comes from one of two places, and the message says which:
+
+| Named by | Resolved as |
+|---|---|
+| `inference.command` | A value containing `/` is used as a path and must be an executable file; a bare name is looked up on `PATH` |
+| The process driver's `describe()` | Looked up on `PATH` |
+
+The same code covers a `transport: http` inference driver artifact that is not installed in the
+local artifact store.
 
 ### E-RUN-015 — `--resume` and `--context` together { #e-run-015 }
 
@@ -538,17 +562,6 @@ error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http infe
   hint: set inference.transport: process to use this driver, or name an http driver
 ```
 
-### E-RUN-031 — process drivers do not run { #e-run-031 }
-
-A `transport: process` manifest names a [process driver](manifest.md#process-driver) that passed
-every load-time check. This runtime has no process driver runner, so `mur run` refuses at staging
-and names what the driver described.
-
-```text
-error[E-RUN-031]: process driver 'my-process-driver@1.0.0' (harness my-harness, binary my-cli) loaded and passed its checks, but this runtime does not run process drivers yet
-  hint: to run the CLI directly for now, remove inference.driver and set inference.command
-```
-
 ### E-RUN-032 — the process driver could not be loaded { #e-run-032 }
 
 A [process driver](manifest.md#process-driver) is loaded with no grants: no environment, no files,
@@ -564,6 +577,61 @@ The message ends with the reason; for an import, it names the interface.
 error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:text/chunks@0.1.0`, but a matching implementation was not found in the linker
   hint: the driver must export murmur:driver/process@0.1.0 and import nothing but WASI
 ```
+
+### E-RUN-033 — a harness turn failed { #e-run-033 }
+
+A `transport: process` turn ended in failure. The kind names what went wrong, and the message is
+the harness's own.
+
+```text
+error[E-RUN-033]: the harness turn failed (auth): not signed in on this host
+  hint: see `mur trace show` for the turn; auth means the harness is not signed in on this host, quota means wait or raise the plan's limit, and max-turns means raise inference.max_turns
+```
+
+| Kind | Means |
+|---|---|
+| `auth` | The harness could not authenticate |
+| `quota` | The harness ran out of quota, or was rate limited |
+| `max-turns` | The turn limit was reached — the harness's own, or [`inference.max_turns`](manifest.md#inference-config) |
+| `canceled` | The turn was interrupted |
+| `harness-error` | The harness reported an error of its own |
+| `other` | Anything else the harness reported |
+
+The trace carries the same failure as a `harness_failed` event, whose `source` says whether the
+harness reported it (`harness`) or the runtime ended the turn itself (`runtime`, which is what a
+turn past `inference.max_turns` is). `mur trace show` prints it as one line.
+
+### E-RUN-034 — a process driver call failed { #e-run-034 }
+
+A call into the [process driver](manifest.md#process-driver) refused, trapped, or ran out of time.
+The message names the WIT function and what came back.
+
+```text
+error[E-RUN-034]: process driver 'my-process-driver@1.0.0' failed in launch: launch refused by config
+  hint: the driver refused or failed to translate for its harness; check inference.driver.config, or use a driver release built for this harness version
+```
+
+| Call | Made |
+|---|---|
+| `launch` | Once per run, to plan the harness's arguments, environment, files and stdin |
+| `parse` | For each batch of complete stdout lines |
+| `classify-exit` | When the harness's output ended without a terminal event |
+
+A driver that runs past its 30-second per-call deadline, or whose launch plan names an unusable
+environment variable or file, fails the same way.
+
+### E-RUN-035 — the harness went silent { #e-run-035 }
+
+A `transport: process` run went 600 seconds with neither a line of harness output nor a tool call
+through the bridge, so the harness was killed.
+
+```text
+error[E-RUN-035]: the harness produced neither a line of output nor a tool call for 600s and was killed
+  hint: the harness was waiting on something that never came; check `mur trace show` for the last thing it did
+```
+
+There is no limit on how long a run may take: any output, and any tool call, starts the window
+again. Output on stderr does not. The trace's `harness_exit` event records `cause: "inactivity"`.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1263,6 +1331,30 @@ The turn is a result, not a failure: the session ends `ok`, the A2A task reaches
 the runtime attempts no continuation turn. Raising `inference.max_tokens` gives the next run room to
 finish; a task whose answer is genuinely long is better split across turns the agent drives itself.
 
+### W-RUN-002 — an untested harness version { #w-run-002 }
+
+```text
+[capsule-runtime] warning[W-RUN-002]: the harness reports version 'my-cli 0.9.0', which this process driver was not tested against (tested against 1.0.0)
+  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-002)
+```
+
+Before each run, `mur run` runs the harness binary with the version arguments the
+[process driver](manifest.md#process-driver)'s `describe()` names, and compares what it printed
+against the versions that driver release was tested against. A harness whose flags or output format
+have moved since may be driven wrongly in ways that only show up mid-run.
+
+The version could also not be read at all, in which case the warning says why:
+
+| Reason | Message ends |
+|---|---|
+| The binary exited non-zero | `it exited non-zero` |
+| It did not answer within 10 seconds | `it did not answer within 10s` |
+| It printed nothing | `it printed nothing` |
+| It could not be run | `it could not be run: <error>` |
+
+Nothing is refused: the run proceeds on the driver as written. The trace carries the same text as a
+`harness_warning` event, and `harness_start.version_tested` records the verdict.
+
 ---
 
 ## Security warnings
@@ -1285,6 +1377,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
+| `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -2279,3 +2372,22 @@ records the gateway with `metered: false`.
 
 **What to do:** bound the artifact's spend with the upstream's own controls, such as a key with its
 own quota.
+
+### W-SEC-031 — a harness that is not on a subscription { #w-sec-031 }
+
+```text
+[capsule-runtime] warning[W-SEC-031]: the harness session reports auth 'api-key', not 'subscription' — this run's spend may be billed to an API key, which murmur neither counts nor limits (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-031)
+```
+
+**Why it matters:** a [`transport: process`](manifest.md#transport-process) capsule runs on a
+harness the operator is already signed in to, and the point of that is spend on that plan. A harness
+billing another way spends money murmur neither holds nor counts:
+[`inference.max_session_tokens`](manifest.md#inference-config) and
+[`spend.machine_tokens_per_day`](config.md#spend) do not cover it.
+
+**What the runtime does about it:** nothing is refused. The value is whatever the harness reported
+through its process driver, compared only against `subscription`. The trace carries the same text as
+a `harness_warning` event, beside the `harness_session` event that reported it.
+
+**What to do:** sign the harness in on the plan the run should spend from, or bound the key's spend
+with the provider's own controls.

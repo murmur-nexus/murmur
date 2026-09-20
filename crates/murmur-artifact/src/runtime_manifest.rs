@@ -905,11 +905,12 @@ impl std::fmt::Debug for ApiKeyReference {
 pub struct InferenceConfig {
     pub transport: String,
     pub model: String,
-    /// WASM driver artifact. Always present for `transport: http`, where it is the inference
-    /// driver. Under `transport: process` it is the process driver, and it or `command` is present.
+    /// WASM driver artifact. Always present: the inference driver under `transport: http`, the
+    /// process driver under `transport: process`.
     pub driver: Option<InferenceDriver>,
-    /// CLI binary to spawn. Absent for `transport: http`. Under `transport: process` it or
-    /// `driver` is present.
+    /// The executable to run instead of the one the process driver's `describe()` names. Absent
+    /// for `transport: http`, and optional under `transport: process`, where the driver names its
+    /// own binary.
     pub command: Option<String>,
     pub compaction: Option<CompactionConfig>,
     pub system_prompt: Option<String>,
@@ -3799,6 +3800,15 @@ fn parse_resource_capabilities(
     })
 }
 
+/// Why a `transport: process` manifest with no `inference.driver` is refused. Names one driver
+/// artifact by way of example: this is the one message a reader reaches with nothing to go on, and
+/// an abstract instruction to "name a process driver" leaves them no way to find one.
+const PROCESS_DRIVER_REQUIRED: &str =
+    "missing required field; a transport: process capsule must name the process driver that \
+     knows how to drive its harness. inference.command no longer selects a harness — it only \
+     overrides the binary the driver names. Add inference.driver.artifact naming a process \
+     driver, for example murmur-driver-claude-code";
+
 fn parse_inference(
     raw: Option<RawInferenceConfig>,
 ) -> Result<Option<InferenceConfig>, RuntimeManifestError> {
@@ -3952,18 +3962,18 @@ fn parse_inference(
 
             let driver = raw.driver.map(parse_inference_driver).transpose()?;
             let command = optional_trimmed_string(raw.command);
-            if driver.is_none() && command.is_none() {
+            // The driver is what knows how to drive a harness CLI: its flags, its output format,
+            // its version probe. `command` only says which executable to run instead of the one
+            // the driver names, so it selects nothing on its own.
+            if driver.is_none() {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.driver".to_string(),
-                    message: "missing required field; name a process driver artifact under \
-                              inference.driver (or, for now, a CLI under inference.command)"
-                        .to_string(),
+                    field: "inference.driver.artifact".to_string(),
+                    message: PROCESS_DRIVER_REQUIRED.to_string(),
                 });
             }
-            // model is OPTIONAL for transport: process — an empty string means "use the CLI's
-            // configured/account-default model" (e.g. a codex subscription's default; passing an
-            // unsupported model there is a hard 400). The Claude dialect still needs a real model
-            // and will surface the CLI's own error if given none.
+            // model is OPTIONAL for transport: process — an empty string leaves the choice of
+            // model to the harness, which has an account default of its own. The driver is handed
+            // `none` rather than an empty string, so it never passes a model flag with no value.
             let model = optional_trimmed_string(raw.model).unwrap_or_default();
 
             Ok(Some(InferenceConfig {
@@ -6733,7 +6743,7 @@ inference:
     #[test]
     fn gateway_on_driver_entry_under_process_transport_is_refused() {
         let msg = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\ninference:\n  transport: process\n  command: claude\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.anthropic.com\n      api_key: test-key\ninference:\n  transport: process\n  driver:\n    artifact: murmur-driver-anthropic\n",
         )
         .unwrap_err()
         .to_string();
@@ -7816,32 +7826,10 @@ inference:
         assert!(msg.contains("grpc"), "error was: {msg}");
     }
 
+    /// The driver is what knows a harness, so `command:` alone selects nothing: a manifest that
+    /// names only a command is refused and told which field to add.
     #[test]
-    fn parses_process_transport() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts: []
-inference:
-  transport: process
-  command: claude
-  model: claude-haiku-4-5-20251001
-  max_turns: 20
-"#,
-        )
-        .unwrap();
-
-        let inference = manifest.inference.expect("inference should exist");
-        assert_eq!(inference.transport, "process");
-        assert_eq!(inference.command, Some("claude".to_string()));
-        assert_eq!(inference.model, "claude-haiku-4-5-20251001");
-        assert_eq!(inference.max_turns, 20);
-        assert!(inference.driver.is_none());
-    }
-
-    #[test]
-    fn process_transport_requires_command() {
+    fn process_transport_with_command_and_no_driver_is_refused() {
         let err = RuntimeManifest::from_yaml_str(
             r#"
 name: cap
@@ -7849,36 +7837,63 @@ version: 0.0.1
 artifacts: []
 inference:
   transport: process
-  model: claude-haiku-4-5-20251001
+  command: some-cli
+  model: some-model
+  max_turns: 20
 "#,
         )
         .unwrap_err();
 
         let msg = err.to_string();
+        assert!(
+            msg.contains("inference.driver.artifact"),
+            "error was: {msg}"
+        );
         assert!(msg.contains("inference.command"), "error was: {msg}");
+        assert!(
+            msg.contains("murmur-driver-claude-code"),
+            "error was: {msg}"
+        );
     }
 
     #[test]
-    fn process_transport_allows_absent_model() {
-        // model is optional for transport: process — an empty/absent model means "use the CLI's
-        // account-default model" (e.g. a codex subscription default). The command is still required.
-        let manifest = RuntimeManifest::from_yaml_str(
+    fn process_transport_with_neither_driver_nor_command_is_refused() {
+        let err = RuntimeManifest::from_yaml_str(
             r#"
 name: cap
 version: 0.0.1
 artifacts: []
 inference:
   transport: process
-  command: codex
+  model: some-model
 "#,
         )
-        .expect("process transport should parse without a model");
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inference.driver.artifact"),
+            "error was: {msg}"
+        );
+        assert!(
+            msg.contains("murmur-driver-claude-code"),
+            "error was: {msg}"
+        );
+    }
+
+    #[test]
+    fn process_transport_allows_absent_model() {
+        // model is optional for transport: process — an absent model leaves the choice to the
+        // harness, which has an account default of its own.
+        let manifest =
+            RuntimeManifest::from_yaml_str(&process_driver_manifest(PROCESS_DRIVER_ENTRY, ""))
+                .expect("process transport should parse without a model");
         let inference = manifest.inference.expect("inference present");
         assert_eq!(inference.transport, "process");
-        assert_eq!(inference.command.as_deref(), Some("codex"));
+        assert!(inference.command.is_none());
         assert_eq!(
             inference.model, "",
-            "absent model resolves to empty (provider default)"
+            "absent model resolves to empty (harness default)"
         );
     }
 
@@ -9031,7 +9046,7 @@ context:
     #[test]
     fn lifecycle_max_task_reopens_with_process_transport() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\nlifecycle:\n  max_task_reopens: 2\n",
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: fixture-process-driver\n    version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: fixture-process-driver\nlifecycle:\n  max_task_reopens: 2\n",
         ).unwrap();
         assert_eq!(manifest.lifecycle.unwrap().max_task_reopens, 2);
     }

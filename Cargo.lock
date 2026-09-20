@@ -1948,6 +1948,7 @@ dependencies = [
  "console",
  "dialoguer",
  "indicatif",
+ "libc",
  "log",
  "mimalloc",
  "mur-roost",

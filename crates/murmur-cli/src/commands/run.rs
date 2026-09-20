@@ -27,10 +27,7 @@ use murmur_artifact::{
 use crate::{
     commands::trace::{first_task_context_id, resolve_session_dir},
     config::load_effective_mur_config_if_any_exists,
-    error::{
-        CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008, E_RUN_015, E_RUN_016,
-        E_RUN_019,
-    },
+    error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019},
     registry_client::FallbackRegistry,
 };
 
@@ -526,26 +523,6 @@ pub(crate) fn run_run(
         json,
     )?;
 
-    // Pre-flight: for process transport, verify the CLI binary is on PATH before staging. A
-    // process driver names its own binary, so a capsule that names one is not checked here.
-    if let Some(ref inference) = runtime_manifest.inference {
-        if inference.transport == "process" && inference.driver.is_none() {
-            let command = inference.command.as_deref().unwrap_or("claude");
-            if !is_on_path(command) {
-                return Err(fail(
-                    &session_id,
-                    &workdir,
-                    CliError::with_hint(
-                        E_RUN_006,
-                        format!("inference.command '{command}' not found on PATH"),
-                        "install the claude CLI from https://claude.ai/download",
-                    ),
-                    json,
-                ));
-            }
-        }
-    }
-
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::with_capacity(runtime_manifest.artifacts.len());
 
@@ -813,15 +790,14 @@ pub(crate) fn run_run(
         let manifest_name = runtime_manifest.name.clone();
         let manifest_version = runtime_manifest.version.clone();
         let driver_line = runtime_manifest.inference.as_ref().map(|inf| {
+            let artifact = inf
+                .driver
+                .as_ref()
+                .map(|d| d.artifact.as_str())
+                .unwrap_or("<driver>");
             if inf.transport == "process" {
-                let cmd = inf.command.as_deref().unwrap_or("claude");
-                format!("{cmd} process ({})", inf.model)
+                format!("{artifact} process ({})", inf.model)
             } else {
-                let artifact = inf
-                    .driver
-                    .as_ref()
-                    .map(|d| d.artifact.as_str())
-                    .unwrap_or("<driver>");
                 format!("{artifact} ({})", inf.model)
             }
         });
@@ -855,18 +831,6 @@ pub(crate) fn run_run(
             Err(error) => Err(fail_run(&session_id, &workdir, CliError::from(error))),
         }
     }
-}
-
-/// Return true if `name` resolves to an executable on the current PATH.
-fn is_on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path_val| {
-            std::env::split_paths(&path_val).any(|dir| {
-                let candidate = dir.join(name);
-                candidate.is_file()
-            })
-        })
-        .unwrap_or(false)
 }
 
 /// Whether one declared artifact is available to a session on the current platform.

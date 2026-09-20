@@ -25,7 +25,7 @@ use crate::errors::RuntimeError;
 /// The guest environment variable a configured artifact reads its block out of.
 ///
 /// Runtime-owned: it is never copied out of the host environment, even when
-/// `capabilities.env.allow` names it (see [`crate::shell::build_wasi_env_allowlist`]), and both
+/// `capabilities.env.allow` names it (see [`crate::shell::build_declared_env`]), and both
 /// `build_wasi_ctx` functions inject it ahead of anything a manifest can reach.
 pub const ARTIFACT_CONFIG_ENV: &str = "MURMUR_ARTIFACT_CONFIG";
 

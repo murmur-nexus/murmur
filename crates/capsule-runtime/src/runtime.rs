@@ -79,7 +79,7 @@ use crate::{
     resources, running, sandbox,
     sealed::UsernsGrant,
     shell::{
-        build_shell_env, build_wasi_env_allowlist, is_shell_interpreter, run_shell,
+        build_declared_env, build_shell_env, is_shell_interpreter, run_shell,
         shell_tool_manifest_yaml, split_shell_words, ShellOutcome, ShellResult,
     },
     spawn_credential::SpawnCredential,
@@ -94,7 +94,7 @@ use crate::{
     types::{
         ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
         ResolvedLockArtifact, ResumeMode, ResumeRequest, StageRequest, StagedHookArtifact,
-        StagedSession,
+        StagedProcessDriver, StagedSession,
     },
 };
 
@@ -410,6 +410,40 @@ fn check_resume_launchable(
         )));
     }
     Ok(())
+}
+
+/// Resolves the executable a process capsule's harness runs as.
+///
+/// `command` is the manifest's `inference.command` when it set one, which overrides the binary the
+/// driver's `describe()` names. A value containing `/` is a path and is used as given; a bare name
+/// is looked up on the runtime's own `PATH`. Either way the result must be an executable file, or
+/// the launch is refused here rather than at the first spawn. Returns the absolute path and the
+/// name of the field it came from.
+fn resolve_harness_binary(
+    command: Option<&str>,
+    described_binary: &str,
+) -> Result<(PathBuf, String), RuntimeError> {
+    let (name, source) = match command.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(command) => (command, "inference.command"),
+        None => (described_binary, "the process driver's describe()"),
+    };
+    let not_found = || RuntimeError::HarnessBinaryNotFound {
+        binary: name.to_string(),
+        binary_source: source.to_string(),
+    };
+    let path = if name.contains('/') {
+        let path = PathBuf::from(name);
+        if !sandbox::is_executable_file(&path) {
+            return Err(not_found());
+        }
+        path
+    } else {
+        sandbox::find_on_path(name).ok_or_else(not_found)?
+    };
+    // The trace and every diagnostic name the path that was spawned, not the name that was asked
+    // for, so a relative `inference.command` cannot be read as some other file of the same name.
+    let absolute = std::fs::canonicalize(&path).unwrap_or(path);
+    Ok((absolute, source.to_string()))
 }
 
 /// Resolves and verifies all artifacts, compiles components, and prepares session state.
@@ -938,33 +972,45 @@ pub fn stage_session(
         });
     }
 
-    if let Some((name, version, component)) = process_driver {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
+    let staged_process_driver = match process_driver {
+        Some((name, version, component)) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
+                })?;
+            let description = rt.block_on(async {
+                let mut driver =
+                    ProcessDriver::instantiate(&engine, &component, &name, &version).await?;
+                driver.describe().await
             })?;
-        let description = rt.block_on(async {
-            let mut driver =
-                ProcessDriver::instantiate(&engine, &component, &name, &version).await?;
-            driver.describe().await
-        })?;
-        check_required_env(
-            &name,
-            &version,
-            &description,
-            &request.capability_policy.env_allow,
-        )?;
-        // The seam the process driver runner replaces: a driver that passed every load-time
-        // check is refused here, because nothing in this runtime runs one.
-        return Err(RuntimeError::ProcessDriverNotWired {
-            name,
-            version,
-            harness: description.harness,
-            binary: description.binary,
-        });
-    }
+            check_required_env(
+                &name,
+                &version,
+                &description,
+                &request.capability_policy.env_allow,
+            )?;
+            // Resolved here rather than at the first run: a harness that is not installed is a
+            // launch the operator should be told about before any session directory exists.
+            let (binary, binary_source) = resolve_harness_binary(
+                request
+                    .inference
+                    .as_ref()
+                    .and_then(|inference| inference.command.as_deref()),
+                &description.binary,
+            )?;
+            Some(Arc::new(StagedProcessDriver {
+                name,
+                version,
+                component,
+                description,
+                binary,
+                binary_source,
+            }))
+        }
+        None => None,
+    };
 
     // Minted before the spend meter rather than beside the workdir it names: the ledger records it.
     let session_id = generate_session_id();
@@ -1169,6 +1215,7 @@ pub fn stage_session(
         engine,
         capsule_component,
         tool_components,
+        process_driver: staged_process_driver,
         artifact_grants,
         hook_components,
         allowlisted_tools: request.allowlisted_tools,
@@ -1594,6 +1641,7 @@ fn launch(
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
+        let process_driver_for_state = staged.process_driver.clone();
         let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
         let installed_artifacts = staged.installed_artifacts;
@@ -1852,6 +1900,7 @@ fn launch(
                         workdir: workdir.clone(),
                         accessible_workdir: accessible_workdir.clone(),
                         tool_components,
+                        process_driver: process_driver_for_state.clone(),
                         artifact_grants,
                         allowlisted_tools,
                         installed_artifacts,
@@ -2787,6 +2836,8 @@ fn launch(
         workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
         tool_components: staged.tool_components,
+        // A script capsule runs no agent loop, so nothing here would ever drive a harness.
+        process_driver: None,
         artifact_grants: staged.artifact_grants,
         allowlisted_tools: staged.allowlisted_tools,
         installed_artifacts: staged.installed_artifacts,
@@ -3432,7 +3483,7 @@ pub struct SecretShapedEnvGrant {
 /// the grant it describes is one grant. A name the backstop drops is passed over: it is refused at
 /// staging with `E-CAP-016` by [`check_env_allow_reaches_guests`], and the skip reads
 /// [`crate::credential_backstop_drops`] so the two agree with what
-/// [`crate::shell::build_wasi_env_allowlist`] passes through.
+/// [`crate::shell::build_declared_env`] passes through.
 ///
 /// `outlives_launcher` reads `lifecycle.after_task` directly instead of
 /// [`LifecycleConfig::can_receive_background_tasks`]: that predicate also requires
@@ -4154,7 +4205,7 @@ fn build_wasi_ctx(
 ) -> Result<WasiCtx, RuntimeError> {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
-    for (key, value) in build_wasi_env_allowlist(policy) {
+    for (key, value) in build_declared_env(policy) {
         builder.env(key, value);
     }
     if let Some(config_json) = config_json {
@@ -4465,6 +4516,10 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) workdir: PathBuf,
     pub(crate) accessible_workdir: PathBuf,
     pub(crate) tool_components: HashMap<String, Component>,
+    /// The `transport: process` driver this session drives its harness through, shared from
+    /// [`StagedSession::process_driver`]. `None` on every other transport, and on the
+    /// script-capsule path, which runs no agent loop.
+    pub(crate) process_driver: Option<Arc<crate::types::StagedProcessDriver>>,
     /// Per-artifact narrowing keyed by artifact name, moved over from
     /// [`StagedSession::artifact_grants`]. A name absent here dispatches on the full ceiling.
     pub(crate) artifact_grants: HashMap<String, ToolCapabilityGrant>,
@@ -6699,7 +6754,7 @@ pub fn stripped_env_allow_entries(policy: &CapabilityPolicy) -> Vec<StrippedEnvA
 /// Refuses a capsule whose `capabilities.env.allow` names a variable the credential backstop
 /// strips, naming every such entry at once.
 ///
-/// [`crate::shell::build_wasi_env_allowlist`] drops those names whatever the manifest says, so the
+/// [`crate::shell::build_declared_env`] drops those names whatever the manifest says, so the
 /// grant would deliver nothing. Called from `stage_session` ahead of every registry resolve, from
 /// `mur run` ahead of `--explain-scope`, and from `mur doctor` as a warning, so all three judge
 /// one set of manifests.
@@ -9707,6 +9762,7 @@ inference:
             workdir: workdir.clone(),
             accessible_workdir: workdir,
             tool_components: HashMap::new(),
+            process_driver: None,
             artifact_grants: HashMap::new(),
             allowlisted_tools: HashSet::new(),
             installed_artifacts: Vec::new(),
@@ -11659,23 +11715,64 @@ inference:
 
     // ── End-to-end reopen loop (real Wasmtime hook + real process transport) ──────
 
-    /// Write an executable fake `claude`-dialect CLI that, on each spawn, consumes its
-    /// stdin then emits exactly one assistant text turn and a success result — so every
-    /// agent-loop attempt burns exactly one turn and returns `Ok`.
-    fn write_fake_claude_cli(dir: &Path) -> PathBuf {
-        let script = dir.join("claude");
-        fs::write(
-            &script,
-            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}'\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\n",
-        )
-        .unwrap();
+    /// The committed fixture process driver, staged as this session's. Its toy line format is
+    /// what the fake harnesses below speak; see the fixture's README.
+    ///
+    /// Built by hand rather than through `describe()` so the helper stays synchronous: the two
+    /// fields the runner reads before spawning are the version arguments and the tested versions,
+    /// and the scripts answer `--version` with a version in that list so no `W-RUN-002` is raised.
+    fn staged_fixture_driver(engine: &Engine, binary: &Path) -> Arc<StagedProcessDriver> {
+        const WASM: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../murmur-cli/tests/fixtures/process-driver/tool/process-driver.wasm"
+        ));
+        Arc::new(StagedProcessDriver {
+            name: "fixture-process-driver".to_string(),
+            version: "0.1.0".to_string(),
+            component: Component::new(engine, WASM).expect("fixture process driver compiles"),
+            description: crate::process_driver::Description {
+                harness: "fixture-harness".to_string(),
+                binary: "fixture-cli".to_string(),
+                version_args: vec!["--version".to_string()],
+                tested_versions: vec!["1.0.0".to_string()],
+                interrupt: crate::process_driver::InterruptMethod::StdinMessage,
+                required_env: Vec::new(),
+                streams_text: true,
+            },
+            binary: binary.to_path_buf(),
+            binary_source: "inference.command".to_string(),
+        })
+    }
+
+    /// Make `script` executable, as a staged harness binary has to be.
+    fn make_executable(script: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script).unwrap().permissions();
+            let mut perms = fs::metadata(script).unwrap().permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&script, perms).unwrap();
+            fs::set_permissions(script, perms).unwrap();
         }
+    }
+
+    /// Write an executable fake harness that, on each spawn, consumes one line of stdin then
+    /// emits exactly one text event and one terminal event — so every agent-loop attempt burns
+    /// exactly one turn and returns `Ok`.
+    ///
+    /// Shell builtins only: the harness's environment is exactly what the manifest declared,
+    /// which here is nothing, so no `PATH` lookup can succeed.
+    fn write_fake_harness(dir: &Path) -> PathBuf {
+        let script = dir.join("fake-harness");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then echo \"fake-harness 1.0.0\"; exit 0; fi\n\
+             read -r _\n\
+             echo \"text done\"\n\
+             echo \"end done\"\n",
+        )
+        .unwrap();
+        make_executable(&script);
         script
     }
 
@@ -11780,13 +11877,16 @@ inference:
         let workdir = dir.path().to_path_buf();
         fs::create_dir_all(workdir.join("tools")).unwrap();
         fs::write(workdir.join("task.md"), "Original task: build the thing.").unwrap();
-        let cli = write_fake_claude_cli(dir.path());
+        let harness = write_fake_harness(dir.path());
 
         let inference = InferenceConfig {
             transport: "process".into(),
             model: "test-model".into(),
-            driver: None,
-            command: Some(cli.to_string_lossy().to_string()),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "fixture-process-driver".to_string(),
+                config: None,
+            }),
+            command: None,
             compaction: None,
             system_prompt: None,
             system_prompt_file: None,
@@ -11801,6 +11901,7 @@ inference:
             workdir.clone(),
             workdir.join("murmur.lock"),
         );
+        state.process_driver = Some(staged_fixture_driver(&state.engine, &harness));
 
         let mut trace = TraceWriter::open(
             &workdir,
@@ -11932,34 +12033,34 @@ inference:
 
     use crate::task_io_import::test_support::{reader_double, REPORT_SEP};
 
-    /// A `claude` CLI double that emits a different result sentinel on each invocation,
-    /// counted through a file next to the script. A reopened task runs the agent loop more
-    /// than once, and telling attempt 2's output from attempt 1's is the whole point of
-    /// clearing the slot at attempt start.
-    fn write_counting_fake_claude_cli(dir: &Path) -> PathBuf {
-        let script = dir.join("claude-counting");
+    /// A fake harness that emits a different result sentinel on each invocation, counted through
+    /// a file next to the script. A reopened task runs the agent loop more than once, and telling
+    /// attempt 2's output from attempt 1's is the whole point of clearing the slot at attempt
+    /// start.
+    ///
+    /// The counter is kept with builtins — a redirection, arithmetic expansion and `echo` — for
+    /// the same reason [`write_fake_harness`] uses none: the harness's environment is empty, so
+    /// `cat` would not resolve.
+    fn write_counting_fake_harness(dir: &Path) -> PathBuf {
+        let script = dir.join("fake-harness-counting");
         let counter = dir.join("attempt-counter");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\ncat > /dev/null\nn=$(cat '{c}' 2>/dev/null || echo 0)\n\
-                 n=$((n+1))\necho \"$n\" > '{c}'\n\
-                 printf '%s\\n' \"{{\\\"type\\\":\\\"assistant\\\",\\\"message\\\":\
-                 {{\\\"content\\\":[{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\
-                 \\\"RESULT-$n\\\"}}]}}}}\"\n\
-                 printf '%s\\n' \"{{\\\"type\\\":\\\"result\\\",\\\"subtype\\\":\
-                 \\\"success\\\",\\\"result\\\":\\\"RESULT-$n\\\"}}\"\n",
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then echo \"fake-harness 1.0.0\"; exit 0; fi\n\
+                 read -r _\n\
+                 n=0\n\
+                 read -r n < '{c}' 2>/dev/null\n\
+                 n=$((n+1))\n\
+                 echo \"$n\" > '{c}'\n\
+                 echo \"text RESULT-$n\"\n\
+                 echo \"end RESULT-$n\"\n",
                 c = counter.display()
             ),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script, perms).unwrap();
-        }
+        make_executable(&script);
         script
     }
 
@@ -11990,11 +12091,15 @@ inference:
         );
 
         let inference = if transport == "process" {
-            let cli = write_counting_fake_claude_cli(dir.path());
+            let harness = write_counting_fake_harness(dir.path());
+            state.process_driver = Some(staged_fixture_driver(&state.engine, &harness));
             InferenceConfig {
                 transport: "process".into(),
-                command: Some(cli.to_string_lossy().to_string()),
-                driver: None,
+                command: None,
+                driver: Some(murmur_artifact::InferenceDriver {
+                    artifact: "fixture-process-driver".to_string(),
+                    config: None,
+                }),
                 ..task_io_inference_config()
             }
         } else {
