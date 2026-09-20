@@ -609,13 +609,14 @@ the driver with an empty WASI context and grants it nothing.
 | Function | Called | Returns |
 |---|---|---|
 | `describe` | Once, when the driver is loaded | The CLI's name and binary, how to read its version, how to interrupt a turn, and the variables it requires |
-| `launch` | Once per turn | The arguments, environment, files and stdin to spawn the CLI with, or an error |
+| `launch` | Once per run | The arguments, environment, files and stdin to spawn the CLI with, or an error |
 | `parse` | For each batch of complete stdout lines | The events those lines describe |
 | `classify-exit` | When the CLI's output ends without a terminal event | `turn-end` or `turn-failed` |
 
-`mur run` refuses a capsule whose driver fails a load-time check — see
-[Process driver](manifest.md#process-driver). A driver that passes every check is refused with
-[`E-RUN-031`](diagnostics.md#e-run-031); `launch`, `parse` and `classify-exit` are not called.
+One driver instance serves a whole run, so `parse` may answer from what `launch` was given. A call
+that refuses, traps or runs out of time ends the run with
+[`E-RUN-034`](diagnostics.md#e-run-034). `mur run` refuses a capsule whose driver fails a load-time
+check — see [Process driver](manifest.md#process-driver).
 
 Every record, field and event is documented in
 [`process-driver.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver.wit).

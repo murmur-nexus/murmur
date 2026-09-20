@@ -1,7 +1,9 @@
 //! A `transport: process` capsule names its process driver under `inference.driver`. The runtime
 //! loads the driver with no grants, checks its exports against the transport, asks it to describe
-//! itself and checks its required environment, then refuses the launch because nothing runs a
-//! process driver yet.
+//! itself and checks its required environment.
+//!
+//! What happens once all of that passes is `tests/process_runner.rs`; this file covers the
+//! load-time refusals.
 //!
 //! Driven through the real `mur` binary against a temp `HOME` local store and a temp project.
 
@@ -159,20 +161,21 @@ fn fixture_describes_itself() {
     assert!(description.streams_text);
 }
 
+/// Every load-time check passes and the runtime reaches the binary: with no `fixture-cli` on
+/// `PATH` the launch stops at `E-RUN-006`, which is the first thing past the checks this file
+/// covers.
 #[test]
-fn process_driver_is_refused_as_not_wired() {
+fn a_loadable_driver_reaches_the_binary_it_names() {
     let capsule = Capsule::process(
         DRIVER,
         &fixture_wasm(),
         &["HOME", "FIXTURE_HARNESS_PROFILE"],
     );
     let text = capsule.run_refused();
-    assert!(text.contains("E-RUN-031"), "{text}");
-    assert!(text.contains("fixture-process-driver@0.1.0"), "{text}");
-    assert!(text.contains("fixture-harness"), "{text}");
+    assert!(text.contains("E-RUN-006"), "{text}");
     assert!(text.contains("fixture-cli"), "{text}");
     assert!(!text.contains("E-RUN-025"), "{text}");
-    assert!(!text.contains("E-RUN-006"), "{text}");
+    assert!(!text.contains("E-CAP-019"), "{text}");
 }
 
 #[test]
@@ -182,7 +185,7 @@ fn missing_required_env_is_refused() {
     assert!(text.contains("E-CAP-019"), "{text}");
     assert!(text.contains("FIXTURE_HARNESS_PROFILE"), "{text}");
     assert!(text.contains("fixture-process-driver"), "{text}");
-    assert!(!text.contains("E-RUN-031"), "{text}");
+    assert!(!text.contains("E-RUN-006"), "{text}");
 }
 
 #[test]

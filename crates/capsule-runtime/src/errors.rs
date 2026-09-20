@@ -249,7 +249,7 @@ pub enum RuntimeError {
     /// A capsule's `capabilities.env.allow` names variables the credential backstop strips from
     /// every guest environment.
     ///
-    /// The strip in `build_wasi_env_allowlist` is not negotiable from a manifest, so the entries
+    /// The strip in `build_declared_env` is not negotiable from a manifest, so the entries
     /// can only ever deliver nothing; the declaration is refused rather than left silently inert.
     #[error(
         "capabilities.env.allow names {}; these entries are removed from every guest environment \
@@ -622,17 +622,43 @@ pub enum RuntimeError {
         message: String,
     },
 
-    /// A process driver passed every load-time check, but this runtime has no runner for it.
-    #[error(
-        "process driver '{name}@{version}' (harness {harness}, binary {binary}) loaded and passed \
-         its checks, but this runtime does not run process drivers yet"
-    )]
-    ProcessDriverNotWired {
+    /// The executable a process capsule's harness runs as could not be resolved at staging.
+    /// `binary_source` names where the name came from, so the operator knows which field to
+    /// change: `inference.command`, or the process driver's own `describe()`.
+    #[error("harness binary '{binary}', named by {binary_source}, was not found on this host")]
+    HarnessBinaryNotFound {
+        binary: String,
+        binary_source: String,
+    },
+
+    /// The harness ended a turn in failure. `kind` is the driver's `failure-kind`, spelled as it
+    /// is in the WIT, or `max-turns` when this runtime stopped the harness at the attempt's turn
+    /// budget; `origin` distinguishes those two (`harness` / `runtime`) and is what the trace's
+    /// `harness_failed.source` records.
+    #[error("the harness turn failed ({kind}): {message}")]
+    HarnessTurnFailed {
+        kind: String,
+        message: String,
+        origin: String,
+    },
+
+    /// A call into the process driver trapped, ran out of time, or refused. `call` is the WIT
+    /// function name; `message` is the driver's own refusal or the failure's description.
+    #[error("process driver '{name}@{version}' failed in {call}: {message}")]
+    ProcessDriverCallFailed {
         name: String,
         version: String,
-        harness: String,
-        binary: String,
+        call: String,
+        message: String,
     },
+
+    /// The harness went quiet: no stdout line and no bridge request for the whole inactivity
+    /// window, so the runtime killed it rather than waiting on a process that had stopped working.
+    #[error(
+        "the harness produced neither a line of output nor a tool call for {seconds}s and was \
+         killed"
+    )]
+    ProcessHarnessInactive { seconds: u64 },
 
     #[error("runtime failure: {0}")]
     Runtime(String),

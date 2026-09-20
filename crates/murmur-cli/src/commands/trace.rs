@@ -459,6 +459,22 @@ struct HookDispatchErrorEvent {
     arm: String,
 }
 
+/// A warning a `transport: process` run raised. Rendered where it cannot be scrolled past: the
+/// stderr line it was printed beside is long gone by the time a trace is read back.
+#[derive(Debug, Deserialize)]
+struct HarnessWarningEvent {
+    code: String,
+    message: String,
+}
+
+/// A turn the harness, or this runtime, ended in failure. Rendered for the same reason: it is
+/// why the session has no result.
+#[derive(Debug, Deserialize)]
+struct HarnessFailedEvent {
+    kind: String,
+    message: String,
+}
+
 /// The resource-plane and peer-file records are rendered as counts by outcome, so `outcome`
 /// is the only field five of the nine event types contribute.
 #[derive(Debug, Deserialize)]
@@ -610,6 +626,8 @@ enum TraceEvent {
     PlanStep(PlanStepEvent),
     PlanEnd(PlanEndEvent),
     SpendCeilingReached(SpendCeilingReachedEvent),
+    HarnessWarning(HarnessWarningEvent),
+    HarnessFailed(HarnessFailedEvent),
     #[serde(other)]
     Unknown,
 }
@@ -688,6 +706,10 @@ struct ContextSeedRecord {
     reason: Option<String>,
     message_ids: Vec<String>,
 }
+
+/// One `harness_warning` or `harness_failed` record, already rendered as the single line
+/// `mur trace show` prints for it.
+struct HarnessLine(String);
 
 /// One `hook_dispatch_error` record — a hook that failed without failing the session.
 struct HookFailureRecord {
@@ -825,6 +847,9 @@ struct TraceMetrics {
     protected_path_denials: Vec<ProtectedPathDenialRecord>,
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
+    /// The `harness_warning` and `harness_failed` lines of a `transport: process` run, in the
+    /// order they were written.
+    harness_lines: Vec<HarnessLine>,
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
     /// anything at this session's launch.
     retentions: Vec<RetentionRecord>,
@@ -1226,6 +1251,7 @@ fn compute_metrics(
     let mut denials: Vec<DenialRecord> = Vec::new();
     let mut protected_path_denials: Vec<ProtectedPathDenialRecord> = Vec::new();
     let mut hook_failures: Vec<HookFailureRecord> = Vec::new();
+    let mut harness_lines: Vec<HarnessLine> = Vec::new();
     let mut retentions: Vec<RetentionRecord> = Vec::new();
     let mut resource_lists = OutcomeCounts::new();
     let mut resource_reads = OutcomeCounts::new();
@@ -1420,6 +1446,15 @@ fn compute_metrics(
                     arm: e.arm,
                 });
             }
+            TraceEvent::HarnessWarning(e) => {
+                harness_lines.push(HarnessLine(format!("warning {}: {}", e.code, e.message)));
+            }
+            TraceEvent::HarnessFailed(e) => {
+                harness_lines.push(HarnessLine(format!(
+                    "harness failed ({}): {}",
+                    e.kind, e.message
+                )));
+            }
             TraceEvent::Retention(e) => {
                 retentions.push(RetentionRecord {
                     store: e.store,
@@ -1601,6 +1636,7 @@ fn compute_metrics(
             denials,
             protected_path_denials,
             hook_failures,
+            harness_lines,
             retentions,
             resource_lists,
             resource_reads,
@@ -1861,6 +1897,16 @@ fn print_show(m: &TraceMetrics) {
         println!("{:<11} {}{}", "prompt:", source, sha);
     }
     println!();
+
+    // Beside the hook failures: on a `transport: process` session these are the only account of
+    // an untested harness version, an unexpected auth mode, or a turn the harness refused.
+    if !m.harness_lines.is_empty() {
+        println!("── Harness ──────────────────────────────────────");
+        for line in &m.harness_lines {
+            println!("{}", line.0);
+        }
+        println!();
+    }
 
     // Placed where it cannot be scrolled past: a hook that failed left the session running
     // as if it had returned nothing, and no other section says so.

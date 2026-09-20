@@ -1,7 +1,6 @@
-//! Claude Bridge — a loopback tool server for the `transport: process` (subscription CLI)
-//! inference path **only**. Nothing here is used by the primary `transport: http` driver
-//! path; it exists solely to give process-transport capsules the same artifact tool calling
-//! the HTTP path gets.
+//! The tool bridge — a loopback tool server for the `transport: process` inference path
+//! **only**. Nothing here is used by the primary `transport: http` driver path; it exists solely
+//! to give process-transport capsules the same artifact tool calling the HTTP path gets.
 //!
 //! # Why this exists
 //!
@@ -9,26 +8,26 @@
 //! schemas`, the model returns a structured tool-call request, murmur executes the WASM tool,
 //! and appends the result. The tool boundary sits between murmur and the model.
 //!
-//! With `transport: process` we drive the `claude` CLI, which is a self-contained agent that
-//! runs its *own* loop and executes its *own* tools on the host — the tool boundary sits
-//! inside the subprocess, out of murmur's reach. So a plain process capsule can only do
-//! inference; declared tool artifacts are invisible to it.
+//! With `transport: process` we drive a harness CLI, which is a self-contained agent that runs
+//! its *own* loop and executes its *own* tools on the host — the tool boundary sits inside the
+//! subprocess, out of murmur's reach. So a plain process capsule could only do inference;
+//! declared tool artifacts would be invisible to it.
 //!
 //! This bridge relocates the tool boundary back out to murmur. It is a tiny loopback HTTP
 //! server that advertises the capsule's tool **schemas only** (no logic) over the protocol
-//! the CLI speaks to externally-hosted tool servers. When the model calls a tool, the request
+//! harnesses speak to externally-hosted tool servers. When the model calls a tool, the request
 //! comes here, and murmur executes it through the *same* `CapsuleStoreState` dispatch the HTTP
 //! path uses — under the capsule's declared capabilities and sandbox. The model gets native,
 //! structured tool calling; murmur keeps ownership of execution, capabilities, and the trace.
 //!
 //! # Scope / invariants (process transport only)
 //!
-//! - Bound to loopback with a per-run bearer token; the CLI is pointed at it with a strict
-//!   config so it uses *only* this server and none of the operator's own tool servers.
-//! - Only the capsule's declared tools are advertised; the CLI's built-in host tools stay off.
-//! - Request/response is plain JSON (the CLI's client does not require a streaming channel for
-//!   tool calls — verified against the real CLI), so the transport is a minimal manual HTTP/1.1
-//!   handler mirroring `identity.rs`, not a full server stack.
+//! - Bound to loopback with a per-run bearer token. The process driver is handed the URL, the
+//!   token and the bare tool names, and is what writes them into whatever configuration its
+//!   harness reads: the runtime builds no harness configuration and no harness tool name.
+//! - Only the capsule's declared tools are advertised.
+//! - Request/response is plain JSON, so the transport is a minimal manual HTTP/1.1 handler
+//!   mirroring `identity.rs`, not a full server stack.
 
 use serde_json::{json, Value};
 use tokio::{
@@ -42,31 +41,31 @@ use crate::{
     runtime::CapsuleStoreState,
 };
 
-/// The server key the CLI uses to namespace this bridge's tools. Tools are addressed by the
-/// CLI as `mcp__<server_key>__<tool_name>`, so this also forms the `--tools` allowlist names.
-pub(super) const BRIDGE_SERVER_KEY: &str = "claude_bridge";
+/// The name this bridge registers itself under. Handed to the process driver as
+/// `bridge.server-name`; how — and whether — a harness uses it to namespace tool names is the
+/// driver's business, not the runtime's.
+pub(super) const BRIDGE_SERVER_NAME: &str = "murmur";
 
-/// Path the bridge listens on. Arbitrary; the CLI is told the full URL in its config.
+/// Path the bridge listens on. Arbitrary; the driver is handed the full URL.
 const BRIDGE_PATH: &str = "/bridge";
 
-/// Everything the process loop needs to point the CLI at a freshly-bound bridge.
+/// Everything the process runner needs to hand a freshly-bound bridge to the driver.
 pub(super) struct BridgeHandle {
     pub(super) listener: TcpListener,
     /// e.g. `http://127.0.0.1:52344/bridge`
     pub(super) url: String,
-    /// Per-run bearer token the CLI must present on every request.
+    /// Per-run bearer token every request must present.
     pub(super) token: String,
-    /// Session id echoed back to the CLI on `initialize`.
+    /// Session id echoed back on `initialize`.
     pub(super) session_id: String,
-    /// Fully-qualified tool names for the CLI's `--tools` allowlist
-    /// (`mcp__claude_bridge__<tool>`), restricting it to exactly the capsule's tools.
-    pub(super) allowed_tool_names: Vec<String>,
+    /// The capsule's tool names, bare. The driver names them the way its harness needs.
+    pub(super) tool_names: Vec<String>,
     /// MCP-shaped tool schemas advertised on `tools/list`.
     mcp_tools: Vec<Value>,
 }
 
 /// Convert murmur's tool inventory (`{name, parameters, description?}`) into the tool-server
-/// schema shape (`{name, description, inputSchema}`) the CLI expects on `tools/list`.
+/// schema shape (`{name, description, inputSchema}`) `tools/list` answers with.
 fn inventory_to_mcp_tools(inventory: &[Value]) -> Vec<Value> {
     inventory
         .iter()
@@ -85,8 +84,8 @@ fn inventory_to_mcp_tools(inventory: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Bind the bridge on loopback (ephemeral port) and precompute its config. Returns `None`
-/// when the capsule declares no tools — the process loop then keeps its plain inference path.
+/// Bind the bridge on loopback (ephemeral port) and precompute what the driver is told about it.
+/// Returns `None` when the capsule declares no tools — the harness then runs with none.
 pub(super) async fn bind_bridge(bind_addr: &str, inventory: &[Value]) -> Option<BridgeHandle> {
     let mcp_tools = inventory_to_mcp_tools(inventory);
     if mcp_tools.is_empty() {
@@ -102,10 +101,10 @@ pub(super) async fn bind_bridge(bind_addr: &str, inventory: &[Value]) -> Option<
         bind_addr
     };
 
-    let allowed_tool_names = mcp_tools
+    let tool_names = mcp_tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
-        .map(|n| format!("mcp__{BRIDGE_SERVER_KEY}__{n}"))
+        .map(str::to_string)
         .collect();
 
     Some(BridgeHandle {
@@ -113,55 +112,26 @@ pub(super) async fn bind_bridge(bind_addr: &str, inventory: &[Value]) -> Option<
         url: format!("http://{host}:{port}{BRIDGE_PATH}"),
         token: Uuid::new_v4().simple().to_string(),
         session_id: Uuid::new_v4().simple().to_string(),
-        allowed_tool_names,
+        tool_names,
         mcp_tools,
     })
 }
 
 impl BridgeHandle {
-    /// The `--mcp-config` JSON value the Claude CLI loads to reach this bridge. Kept internal to
-    /// the process transport; never surfaced in the manifest or to the user.
-    pub(super) fn mcp_config_json(&self) -> String {
-        json!({
-            "mcpServers": {
-                BRIDGE_SERVER_KEY: {
-                    "type": "http",
-                    "url": self.url,
-                    "headers": { "Authorization": format!("Bearer {}", self.token) }
-                }
-            }
-        })
-        .to_string()
-    }
-
-    /// Codex-dialect equivalent of [`Self::mcp_config_json`]: the `-c key=value` overrides that
-    /// register this bridge as a codex MCP server for one `codex exec` run (no persistent config
-    /// change) and auto-approve its tool calls (codex exec is non-interactive and cannot prompt).
-    /// Values are TOML literals — hence the embedded quotes. Process transport / codex dialect only.
-    pub(super) fn codex_config_args(&self) -> Vec<String> {
-        let key = BRIDGE_SERVER_KEY;
-        vec![
-            "-c".into(),
-            format!("mcp_servers.{key}.url=\"{}\"", self.url),
-            "-c".into(),
-            format!(
-                "mcp_servers.{key}.http_headers.Authorization=\"Bearer {}\"",
-                self.token
-            ),
-            "-c".into(),
-            format!("mcp_servers.{key}.default_tools_approval_mode=\"approve\""),
-        ]
-    }
-
-    /// Accept-and-serve loop. Runs concurrently with the CLI's stdout read loop (same task,
+    /// Accept-and-serve loop. Runs concurrently with the harness's stdout read loop (same task,
     /// via `select!`), so it shares an immutable `&CapsuleStoreState` — tool dispatch is
-    /// `&self`, and connections are served one at a time (the CLI issues tool calls
+    /// `&self`, and connections are served one at a time (the harness issues tool calls
     /// sequentially), so no locking or `&mut` is needed. Never returns on its own; the process
-    /// loop drops this future once the CLI produces its result.
-    pub(super) async fn serve(&self, store: &CapsuleStoreState) {
+    /// runner drops this future once the run ends.
+    ///
+    /// `on_request` is called once per accepted connection, before it is read. A harness working
+    /// through a long tool call writes nothing to stdout, so this is the other half of the
+    /// evidence that it is still alive — see the runner's inactivity clock.
+    pub(super) async fn serve(&self, store: &CapsuleStoreState, on_request: &dyn Fn()) {
         // Serve inline (not spawned): keeps the borrow of `store` non-'static and serializes
-        // tool execution, which is what we want for a single CLI client.
+        // tool execution, which is what we want for a single harness client.
         while let Ok((stream, _)) = self.listener.accept().await {
+            on_request();
             self.handle_connection(stream, store).await;
         }
     }
@@ -203,7 +173,7 @@ impl BridgeHandle {
             }
         }
 
-        // The CLI may open a GET stream for server->client messages; we don't need one.
+        // A client may open a GET stream for server->client messages; we don't need one.
         if method == "GET" {
             write_response(&mut writer, "405 Method Not Allowed", None, None).await;
             return;
@@ -246,7 +216,7 @@ impl BridgeHandle {
                 let result = json!({
                     "protocolVersion": protocol,
                     "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "murmur-claude-bridge", "version": env!("CARGO_PKG_VERSION") }
+                    "serverInfo": { "name": "murmur-bridge", "version": env!("CARGO_PKG_VERSION") }
                 });
                 let session_header = format!("Mcp-Session-Id: {}", self.session_id);
                 write_json_rpc(&mut writer, &id, result, Some(&session_header)).await;
@@ -276,7 +246,7 @@ impl BridgeHandle {
 
     /// Execute one `tools/call` through murmur's WASM tool dispatch — the same executor the
     /// HTTP transport uses — and shape the outcome as a tool-server result. Tool execution
-    /// stays entirely in murmur's sandbox under the capsule's declared capabilities; the CLI
+    /// stays entirely in murmur's sandbox under the capsule's declared capabilities; the harness
     /// never runs anything itself.
     async fn dispatch_tool_call(&self, params: Option<&Value>, store: &CapsuleStoreState) -> Value {
         let name = params
@@ -309,7 +279,7 @@ impl BridgeHandle {
             Ok(outcome) => {
                 let is_error = !matches!(outcome.result.status, Status::Passed);
                 // `outcome.fatal` is deliberately not acted on here: this bridge is a tool server
-                // for an external Claude Code process and owns no murmur session to end. The
+                // for an external harness process and owns no murmur session to end. The
                 // failure still reaches the caller in full — `result.data` carries the same named
                 // text (`RuntimeError`'s Display) that the agent loop would end the session with.
                 let text = outcome
@@ -357,7 +327,7 @@ async fn write_response(
     write_response_with_header(writer, status, content_type, body, None).await;
 }
 
-/// Build and write a minimal HTTP/1.1 response with `connection: close` (so the CLI opens a
+/// Build and write a minimal HTTP/1.1 response with `connection: close` (so the client opens a
 /// fresh connection per request — the simplest correct behaviour for this short-lived server).
 async fn write_response_with_header(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -411,23 +381,20 @@ mod tests {
 
     #[tokio::test]
     async fn bind_bridge_is_none_without_tools() {
-        // No tools declared → no bridge, so the process path stays pure inference.
+        // No tools declared → no bridge, so the harness runs with no tools.
         assert!(bind_bridge("127.0.0.1", &[]).await.is_none());
     }
 
+    /// The driver is handed bare names and builds whatever its harness needs from them: the
+    /// runtime never spells a harness's tool naming.
     #[tokio::test]
-    async fn bind_bridge_builds_config_and_allowlist() {
+    async fn bind_bridge_names_tools_bare() {
         let inventory = vec![json!({"name": "editor", "parameters": {"type": "object"}})];
         let handle = bind_bridge("127.0.0.1", &inventory)
             .await
             .expect("bridge should bind when tools are declared");
-        assert_eq!(
-            handle.allowed_tool_names,
-            vec!["mcp__claude_bridge__editor"]
-        );
-        let cfg = handle.mcp_config_json();
-        assert!(cfg.contains("\"type\":\"http\""));
-        assert!(cfg.contains(&handle.url));
-        assert!(cfg.contains(&format!("Bearer {}", handle.token)));
+        assert_eq!(handle.tool_names, vec!["editor"]);
+        assert!(handle.url.starts_with("http://127.0.0.1:"));
+        assert!(!handle.token.is_empty());
     }
 }

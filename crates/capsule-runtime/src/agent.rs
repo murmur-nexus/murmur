@@ -1,6 +1,7 @@
 mod claude_bridge;
 pub(crate) mod inventory;
-mod process;
+pub(crate) mod process;
+mod process_events;
 
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::{

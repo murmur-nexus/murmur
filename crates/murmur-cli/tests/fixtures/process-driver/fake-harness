@@ -1,0 +1,151 @@
+#!/bin/bash
+# A fake harness for the process driver runner's integration tests. It speaks the fixture process
+# driver's toy line format (see ../README.md) and does whatever $FIXTURE_HARNESS_PROFILE says.
+#
+# Its environment is exactly what the capsule's `capabilities.env.allow` declared plus the driver's
+# `env-set`, so tests that use `sleep`, `ls` or `env` have to declare PATH.
+
+set -u
+
+if [ "${1:-}" = "--version" ]; then
+  if [ "${FIXTURE_HARNESS_PROFILE:-}" = "old-version" ]; then
+    echo "fixture-harness 0.9.0"
+  else
+    echo "fixture-harness 1.0.0"
+  fi
+  exit 0
+fi
+
+# Profiles a test must prove dead leave their pid where the test can read it.
+record_pid() { echo $$ > harness.pid; }
+
+# One `tools/call` against the bridge, over bash's own /dev/tcp — no curl in the environment.
+# Prints the response body on one line.
+call_bridge() {
+  local host_port path body request line
+  host_port="${FIXTURE_BRIDGE_URL#http://}"
+  path="/${host_port#*/}"
+  host_port="${host_port%%/*}"
+  body='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo-tool","arguments":{"msg":"ping-7"}}}'
+  exec 3<>"/dev/tcp/${host_port%%:*}/${host_port##*:}"
+  printf 'POST %s HTTP/1.1\r\n' "$path" >&3
+  printf 'Host: %s\r\n' "$host_port" >&3
+  printf 'Authorization: Bearer %s\r\n' "$FIXTURE_BRIDGE_TOKEN" >&3
+  printf 'Content-Type: application/json\r\n' >&3
+  printf 'Content-Length: %s\r\n' "${#body}" >&3
+  printf 'Connection: close\r\n\r\n' >&3
+  printf '%s' "$body" >&3
+  # Skip the status line and headers, then print what is left on one line. The body carries no
+  # trailing newline, so it is read with `-d ''` (up to a NUL, i.e. to EOF) rather than by lines.
+  while IFS= read -r line <&3; do
+    line="${line%$'\r'}"
+    [ -z "$line" ] && break
+  done
+  request=""
+  IFS= read -r -d '' request <&3 || true
+  exec 3<&-
+  echo "${request//$'\n'/}"
+}
+
+# The task arrives as one line on stdin.
+read -r TASK || TASK=""
+
+case "${FIXTURE_HARNESS_PROFILE:-happy}" in
+  happy)
+    echo "started fixture-session-1"
+    echo "text HAPPY-RESULT"
+    echo "end HAPPY-RESULT"
+    ;;
+  tool)
+    echo "started fixture-session-1"
+    echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping-7\"}"
+    answer="$(call_bridge)"
+    echo "result c1 ok $answer"
+    echo "text $answer"
+    echo "end $answer"
+    ;;
+  fail-auth|fail-quota|fail-max-turns|fail-canceled|fail-harness-error|fail-other)
+    echo "started fixture-session-1"
+    echo "fail ${FIXTURE_HARNESS_PROFILE#fail-} the harness says so"
+    ;;
+  exit-0)
+    echo "started fixture-session-1"
+    echo "text no terminal event here"
+    exit 0
+    ;;
+  exit-3)
+    echo "started fixture-session-1"
+    echo "boom-on-stderr" >&2
+    exit 3
+    ;;
+  silent)
+    record_pid
+    echo "started fixture-session-1"
+    sleep 600
+    ;;
+  chatty)
+    # Outlives the debug inactivity window several times over, saying something each time.
+    echo "started fixture-session-1"
+    for i in 1 2 3 4 5 6; do
+      echo "note tick $i"
+      sleep 0.5
+    done
+    echo "end CHATTY-RESULT"
+    ;;
+  bridge-busy)
+    # Says nothing on stdout while it works, and keeps the bridge busy instead.
+    echo "started fixture-session-1"
+    echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping-7\"}"
+    for i in 1 2 3 4 5 6; do
+      answer="$(call_bridge)"
+      sleep 0.5
+    done
+    echo "result c1 ok $answer"
+    echo "end BRIDGE-BUSY-RESULT"
+    ;;
+  env)
+    echo "started fixture-session-1"
+    echo "env $(env | cut -d= -f1 | sort | tr '\n' ',')"
+    echo "files $(ls -ld "$FIXTURE_FILES" | cut -d' ' -f1) $FIXTURE_FILES"
+    echo "end ENV-RESULT"
+    ;;
+  old-version)
+    echo "started fixture-session-1"
+    echo "end OLD-VERSION-RESULT"
+    ;;
+  turns)
+    # Three turns: two closed by a tool result, the third opened by text.
+    echo "started fixture-session-1"
+    echo "tool c1 probe {}"
+    echo "result c1 ok one"
+    echo "tool c2 probe {}"
+    echo "result c2 ok two"
+    record_pid
+    echo "text three"
+    sleep 30
+    ;;
+  thinking)
+    # Thinking and deltas must not open a turn: one turn, one inference record.
+    echo "started fixture-session-1"
+    echo "thinking pondering"
+    echo "delta par"
+    echo "delta tial"
+    echo "thinking still pondering"
+    echo "text THINKING-RESULT"
+    echo "end THINKING-RESULT"
+    ;;
+  api-key)
+    echo "started fixture-session-1 api-key"
+    echo "end API-KEY-RESULT"
+    ;;
+  linger)
+    # Prints its terminal event and then ignores stdin closing, so the exit grace has to kill it.
+    record_pid
+    echo "started fixture-session-1"
+    echo "end LINGER"
+    sleep 60
+    ;;
+  *)
+    echo "fail other unknown profile ${FIXTURE_HARNESS_PROFILE:-}"
+    ;;
+esac

@@ -896,6 +896,150 @@ struct SpendCeilingReachedEvent<'a> {
     origin: Option<&'a str>,
 }
 
+/// What a `transport: process` session spawned, and what the driver planned for it.
+///
+/// Separate from [`HarnessStartEvent`] so the runner builds one value rather than passing a dozen
+/// positional arguments. Flattened into the event, so the record has no nested object.
+#[derive(Serialize)]
+pub(crate) struct HarnessStart {
+    /// The process driver artifact and its version.
+    pub driver: String,
+    pub driver_version: String,
+    /// What the driver said it drives, and the executable actually spawned.
+    pub harness: String,
+    /// The absolute path spawned — not the name the manifest or the driver asked for.
+    pub binary: String,
+    /// `inference.command`, or the process driver's `describe()`.
+    pub binary_source: String,
+    /// What the harness printed for its version arguments, or `null` when it could not be read.
+    pub harness_version: Option<String>,
+    /// Whether [`Self::harness_version`] matched one of the driver's `tested-versions`.
+    pub version_tested: bool,
+    /// The harness session id the runtime minted for this run, and whether it started or resumed.
+    pub harness_session_id: String,
+    pub session_mode: String,
+    /// How many arguments the plan carried. Never the arguments themselves: a driver is free to
+    /// put the bridge's bearer token in one.
+    pub args_count: usize,
+    /// The names of the variables actually delivered, sorted. Never their values.
+    pub env_names: Vec<String>,
+    /// The names of the files written into the run's private directory. Never their contents.
+    pub files: Vec<String>,
+    /// The capsule tool names the bridge offered, bare. Empty when no bridge was bound.
+    pub bridge_tools: Vec<String>,
+    /// How many bytes were written to the harness's stdin, and whether it stayed open after.
+    pub stdin_bytes: usize,
+    pub keep_stdin_open: bool,
+}
+
+#[derive(Serialize)]
+struct HarnessStartEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    #[serde(flatten)]
+    start: HarnessStart,
+}
+
+/// A `W-*` warning the run raised. The same text goes to stderr; this is the durable copy, so a
+/// run read back later still says what it warned about.
+#[derive(Serialize)]
+struct HarnessWarningEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    code: String,
+    message: String,
+}
+
+/// The session the harness itself reports, which is not this session: the runtime's `session_id`
+/// names the capsule run, `harness_session_id` names the conversation inside the harness.
+#[derive(Serialize)]
+struct HarnessSessionEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    harness_session_id: String,
+    /// How the harness says it is billing. Anything but `subscription` is also warned about.
+    auth: String,
+    /// The model the harness says it is running, when it says.
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HarnessRetryEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    attempt: u32,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct HarnessNoteEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct HarnessFailedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    /// The driver's `failure-kind`, spelled as the WIT spells it, or `max-turns` from the runtime.
+    kind: String,
+    message: String,
+    /// `harness` when the harness reported it, `runtime` when this runtime ended the turn.
+    source: String,
+}
+
+/// How one spawned harness ended. Written once per spawn, on every path out of the run.
+#[derive(Serialize)]
+pub(crate) struct HarnessExit {
+    /// The process's exit code, or `null` when a signal ended it.
+    pub code: Option<i32>,
+    /// The signal that ended the process, or `null` when it exited on its own.
+    pub signal: Option<i32>,
+    /// What ended the run: `terminal`, `eof`, `inactivity`, `max_turns` or `driver_error`.
+    pub cause: String,
+    /// Whether the runtime had to kill the process rather than wait for it.
+    pub killed: bool,
+    /// Wall time from spawn to reaped.
+    pub duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct HarnessExitEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    #[serde(flatten)]
+    exit: HarnessExit,
+}
+
 /// A policy hook refused a call before it ran. The one record that says a call the model asked
 /// for never happened — there is no `tool_call` or `shell` line for a denied call, because
 /// nothing ran.
@@ -2109,6 +2253,139 @@ impl TraceWriter {
             hook_name: hook_name.to_string(),
             event: event.to_string(),
             arm: arm.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    // ── The harness a `transport: process` session drives ────────────────────────────────
+    //
+    // Seven events account for one harness run: what was spawned, what it said about itself,
+    // what it warned or noted, how it failed, and how it ended. None of them ever carries an
+    // argument value, an environment value or a file's contents — the bridge's bearer token
+    // reaches the harness through exactly those three, and `trace.jsonl` is durable.
+
+    /// Record the harness about to be spawned: written after the driver planned the run and
+    /// before the process exists, so a spawn that goes wrong still has its plan on record.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_harness_start(&mut self, start: HarnessStart) -> std::io::Result<()> {
+        let event = HarnessStartEvent {
+            event_type: "harness_start",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            start,
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record a warning the run raised, beside the line it printed to stderr.
+    pub(crate) async fn write_harness_warning(
+        &mut self,
+        code: &str,
+        message: &str,
+    ) -> std::io::Result<()> {
+        let event = HarnessWarningEvent {
+            event_type: "harness_warning",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            code: code.to_string(),
+            message: message.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record the session the harness reports it opened, and how it is billing for it.
+    pub(crate) async fn write_harness_session(
+        &mut self,
+        harness_session_id: &str,
+        auth: &str,
+        model: Option<&str>,
+    ) -> std::io::Result<()> {
+        let event = HarnessSessionEvent {
+            event_type: "harness_session",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            harness_session_id: harness_session_id.to_string(),
+            auth: auth.to_string(),
+            model: model.map(str::to_string),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that the harness is retrying a request to its own provider.
+    pub(crate) async fn write_harness_retry(
+        &mut self,
+        attempt: u32,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = HarnessRetryEvent {
+            event_type: "harness_retry",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            attempt,
+            reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record a diagnostic the driver produced for the trace alone — a line it could not read,
+    /// or a result the runtime could not pair with a call.
+    pub(crate) async fn write_harness_note(&mut self, text: &str) -> std::io::Result<()> {
+        let event = HarnessNoteEvent {
+            event_type: "harness_note",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            text: text.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record a failed turn. `source` is `"harness"` when the harness reported the failure and
+    /// `"runtime"` when this runtime ended the turn itself.
+    pub(crate) async fn write_harness_failed(
+        &mut self,
+        kind: &str,
+        message: &str,
+        source: &str,
+    ) -> std::io::Result<()> {
+        let event = HarnessFailedEvent {
+            event_type: "harness_failed",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            kind: kind.to_string(),
+            message: message.to_string(),
+            source: source.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record how the harness ended: once per spawned process, whatever ended it.
+    pub(crate) async fn write_harness_exit(&mut self, exit: HarnessExit) -> std::io::Result<()> {
+        let event = HarnessExitEvent {
+            event_type: "harness_exit",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            exit,
         };
         self.write_event(&event).await
     }

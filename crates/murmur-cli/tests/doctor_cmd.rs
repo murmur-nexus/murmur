@@ -751,8 +751,10 @@ fn doctor_rejects_inference_max_task_reopens() {
 
     fs::write(
         project.path().join("murmur.yaml"),
-        "name: reopen-fixture\nversion: 0.0.1\nartifacts: []\n\
-         inference:\n  transport: process\n  command: claude\n  max_task_reopens: 3\n",
+        "name: reopen-fixture\nversion: 0.0.1\nartifacts:\n  - name: fixture-process-driver\n    \
+         version: 0.1.0\n    runtime: driver\n\
+         inference:\n  transport: process\n  driver:\n    artifact: fixture-process-driver\n  \
+         max_task_reopens: 3\n",
     )
     .unwrap();
 

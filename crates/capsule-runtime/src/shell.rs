@@ -712,7 +712,7 @@ pub(crate) fn build_shell_env(
 ///
 /// This is the single credential backstop for both environments the runtime builds: the
 /// native subprocess env ([`build_shell_env`]) and the WASI guest env
-/// ([`build_wasi_env_allowlist`]). It runs *after* whatever allowlist populated `env`, so a
+/// ([`build_declared_env`]). It runs *after* whatever allowlist populated `env`, so a
 /// declared name never bypasses the filter.
 pub(crate) fn strip_credential_shaped_vars(
     env: &mut BTreeMap<String, String>,
@@ -768,15 +768,20 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
     credential_backstop_match(name, extra_patterns).is_some()
 }
 
-/// Resolve the host variables a WASM guest may observe: only names the manifest declared in
-/// `capabilities.env.allow` and that the host actually has set, minus anything
-/// credential-shaped. A declared name absent from the host is simply omitted, not an error.
+/// Resolve the host variables the manifest declared: only names in `capabilities.env.allow` that
+/// the host actually has set, minus anything credential-shaped. A declared name absent from the
+/// host is simply omitted, not an error.
+///
+/// This is what every WASM guest observes, and what a `transport: process` harness starts from
+/// before its driver's `env-set` is applied. Native shell subprocesses are the exception: they
+/// run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`, built by
+/// [`build_shell_env`].
 ///
 /// [`ARTIFACT_CONFIG_ENV`] is reserved and never resolved from the host, whatever a manifest
 /// allowlists: the name is runtime-owned, and its value comes from the declaring artifact's own
 /// `config:` block or from nowhere. Skipped here rather than relied on being overwritten later,
 /// so a host value cannot reach a guest whose entry declared no config at all.
-pub(crate) fn build_wasi_env_allowlist(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
+pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
     for key in &policy.env_allow {
@@ -1190,17 +1195,17 @@ mod tests {
     }
 
     #[test]
-    fn build_wasi_env_allowlist_is_empty_without_declarations() {
+    fn declared_env_is_empty_without_declarations() {
         std::env::set_var("MURMUR_TEST_WASI_UNDECLARED", "host-value");
         let policy = CapabilityPolicy::default();
 
-        let env = build_wasi_env_allowlist(&policy);
+        let env = build_declared_env(&policy);
 
         assert!(env.is_empty());
     }
 
     #[test]
-    fn build_wasi_env_allowlist_passes_through_declared_host_var() {
+    fn declared_env_passes_through_declared_host_var() {
         std::env::set_var("MURMUR_TEST_WASI_ALLOWED", "host-value");
         let policy = CapabilityPolicy {
             env_allow: vec![
@@ -1211,7 +1216,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
 
-        let env = build_wasi_env_allowlist(&policy);
+        let env = build_declared_env(&policy);
 
         assert_eq!(
             env.get("MURMUR_TEST_WASI_ALLOWED"),
@@ -1221,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn build_wasi_env_allowlist_strips_credential_shaped_declarations() {
+    fn declared_env_strips_credential_shaped_declarations() {
         std::env::set_var("GITHUB_TOKEN", "leaked-token");
         std::env::set_var("STRIPE_API_KEY", "leaked-key");
         std::env::set_var("MURMUR_TEST_WASI_CUSTOM_SECRET", "leaked-secret");
@@ -1235,7 +1240,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
 
-        let env = build_wasi_env_allowlist(&policy);
+        let env = build_declared_env(&policy);
 
         // Declaring a credential-shaped name does not bypass the backstop.
         assert!(env.is_empty(), "expected all names stripped, got {env:?}");
@@ -1244,7 +1249,7 @@ mod tests {
     /// A credential-shaped name outside every backstop pattern is delivered like any other
     /// declared name: `W-SEC-024` reports that grant, and nothing withholds it.
     #[test]
-    fn build_wasi_env_allowlist_delivers_a_credential_shaped_name_the_backstop_keeps() {
+    fn declared_env_delivers_a_credential_shaped_name_the_backstop_keeps() {
         std::env::set_var("PRIVATE_KEY", "host-private-key");
         std::env::set_var("MURMUR_TEST_WASI_PLAIN", "host-plain");
         let policy = CapabilityPolicy {
@@ -1255,7 +1260,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
 
-        let env = build_wasi_env_allowlist(&policy);
+        let env = build_declared_env(&policy);
 
         assert_eq!(
             env.get("PRIVATE_KEY"),

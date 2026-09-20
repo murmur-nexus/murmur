@@ -76,7 +76,7 @@ pub use runtime_manifest::{
     DEFAULT_SEED_BUDGET, DEFAULT_SEED_OVERFLOW_MARGIN, DURATION_ACCEPTED_FORM,
     PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
-pub use runtime_warnings::{runtime_warning_link, W_RUN_001};
+pub use runtime_warnings::{runtime_warning_link, W_RUN_001, W_RUN_002};
 pub use secrets::{
     is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,
 };
@@ -85,6 +85,7 @@ pub use security_warnings::{
     W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014,
     W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022,
     W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030,
+    W_SEC_031,
 };
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,

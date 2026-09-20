@@ -17,6 +17,14 @@
 /// session ends `ok` and the truncation is named instead.
 pub const W_RUN_001: &str = "W-RUN-001";
 
+/// The harness a `transport: process` capsule runs was not one its process driver was tested
+/// against, or its version could not be read at all.
+///
+/// The driver translates for a harness whose flags and output format move between releases, so an
+/// untested version may be driven wrongly in ways that only show up mid-run. Nothing is refused:
+/// the run proceeds on the driver as written, and the version gap is named instead.
+pub const W_RUN_002: &str = "W-RUN-002";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -33,7 +41,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_RUN_001];
+        let codes = [W_RUN_001, W_RUN_002];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

@@ -174,6 +174,7 @@ impl ProcessDriver {
     /// A trap, an exceeded deadline, or a `required-env` entry that is not a usable variable
     /// name (empty, or containing `=` or NUL) is [`RuntimeError::ProcessDriverLoad`].
     pub async fn describe(&mut self) -> Result<Description, RuntimeError> {
+        self.reset_deadline();
         let description = self
             .bindings
             .murmur_driver_process()
@@ -197,6 +198,67 @@ impl ProcessDriver {
             )));
         }
         Ok(description)
+    }
+
+    /// Asks the driver to plan one harness run. The inner `Err` is the driver's own refusal,
+    /// reported to the operator verbatim; the outer one is a trap or an exceeded deadline.
+    pub async fn launch(
+        &mut self,
+        request: LaunchRequest,
+    ) -> Result<Result<LaunchPlan, String>, RuntimeError> {
+        self.reset_deadline();
+        self.bindings
+            .murmur_driver_process()
+            .call_launch(&mut self.store, &request)
+            .await
+            .map_err(|e| self.call_error("launch", &e))
+    }
+
+    /// Reads one batch of complete stdout lines into events. The same instance serves a whole
+    /// run, so the driver may answer from what `launch` was given.
+    pub async fn parse(&mut self, lines: Vec<String>) -> Result<Vec<Event>, RuntimeError> {
+        self.reset_deadline();
+        self.bindings
+            .murmur_driver_process()
+            .call_parse(&mut self.store, &lines)
+            .await
+            .map_err(|e| self.call_error("parse", &e))
+    }
+
+    /// Asks the driver what a run whose output ended without a terminal event amounts to.
+    pub async fn classify_exit(&mut self, exit: ExitStatus) -> Result<Event, RuntimeError> {
+        self.reset_deadline();
+        self.bindings
+            .murmur_driver_process()
+            .call_classify_exit(&mut self.store, &exit)
+            .await
+            .map_err(|e| self.call_error("classify-exit", &e))
+    }
+
+    /// Gives the next call its own deadline. Without this the ticks the previous call spent
+    /// would count against it, so a long run would eventually interrupt a driver that had done
+    /// nothing wrong.
+    fn reset_deadline(&mut self) {
+        let deadline = self.store.data().limits.limits().deadline_ticks();
+        self.store.set_epoch_deadline(deadline);
+    }
+
+    fn call_error(&self, call: &str, error: &wasmtime::Error) -> RuntimeError {
+        let message = match classify_guest_failure(error, &self.store.data().limits) {
+            GuestFailure::DeadlineExceeded { seconds } => {
+                format!("exceeded its {seconds}s deadline and was interrupted")
+            }
+            GuestFailure::ResourceLimit { message } => {
+                format!("exceeded its resource limits: {message}")
+            }
+            GuestFailure::Other => format!("trapped: {error:#}"),
+        };
+        RuntimeError::ProcessDriverCallFailed {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            call: call.to_string(),
+            message,
+        }
     }
 
     fn load_error(&self, message: String) -> RuntimeError {
@@ -380,6 +442,66 @@ mod tests {
                 "{bad:?} should be refused"
             );
         }
+    }
+
+    /// What one `parse` call costs, and what instantiating a driver costs.
+    ///
+    /// Ignored: it measures rather than asserts, and the numbers only mean anything in a release
+    /// build. Run it with
+    /// `cargo test -p capsule-runtime --release process_driver_parse_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not an assertion; run with --release --ignored --nocapture"]
+    fn process_driver_parse_cost() {
+        use std::time::Instant;
+
+        const WASM: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../murmur-cli/tests/fixtures/process-driver/tool/process-driver.wasm"
+        ));
+        let engine = crate::runtime::build_engine().expect("engine");
+        let _ticker = EpochTicker::spawn(&engine);
+        let component = Component::new(&engine, WASM).expect("fixture compiles");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let instantiations = 50;
+        let start = Instant::now();
+        for _ in 0..instantiations {
+            rt.block_on(ProcessDriver::instantiate(
+                &engine, &component, "d", "0.1.0",
+            ))
+            .expect("instantiates");
+        }
+        let per_instantiation = start.elapsed() / instantiations;
+
+        let mut driver = rt
+            .block_on(ProcessDriver::instantiate(
+                &engine, &component, "d", "0.1.0",
+            ))
+            .expect("instantiates");
+        for lines in [1usize, 64] {
+            let batch: Vec<String> = (0..lines).map(|i| format!("text line {i}")).collect();
+            let runs = 2_000;
+            let mut samples = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let start = Instant::now();
+                let events = rt.block_on(driver.parse(batch.clone())).expect("parses");
+                samples.push(start.elapsed());
+                assert_eq!(events.len(), lines);
+            }
+            samples.sort_unstable();
+            let median = samples[samples.len() / 2];
+            let p95 = samples[samples.len() * 95 / 100];
+            crate::diagnostic::raw_to_stdout(&format!(
+                "parse {lines}-line batch on one reused instance: median {median:?}, p95 {p95:?} \
+                 ({runs} calls)\n"
+            ));
+        }
+        crate::diagnostic::raw_to_stdout(&format!(
+            "instantiate one driver: {per_instantiation:?} (mean of {instantiations})\n"
+        ));
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub const E_RUN_002: &str = "E-RUN-002"; // missing linker import (WASI interfac
 pub const E_RUN_003: &str = "E-RUN-003"; // lock version mismatch or missing lock entry
 pub const E_RUN_004: &str = "E-RUN-004"; // capsule wasm not found at expected path
 pub const E_RUN_005: &str = "E-RUN-005"; // inference driver not configured in manifest
-pub const E_RUN_006: &str = "E-RUN-006"; // inference driver artifact not installed
+pub const E_RUN_006: &str = "E-RUN-006"; // inference driver artifact not installed, or a process harness binary was not found
 pub const E_RUN_007: &str = "E-RUN-007"; // agent loop failed at runtime
 pub const E_RUN_008: &str = "E-RUN-008"; // required artifact not installed locally
 pub const E_RUN_009: &str = "E-RUN-009"; // system prompt file could not be read
@@ -48,8 +48,10 @@ pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set 
 pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
 pub const E_RUN_029: &str = "E-RUN-029"; // the transport: process driver does not export the process driver interface
 pub const E_RUN_030: &str = "E-RUN-030"; // the transport: http inference driver exports the process driver interface
-pub const E_RUN_031: &str = "E-RUN-031"; // a process driver passed its checks, but this runtime does not run process drivers
 pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded with no grants, or described itself unusably
+pub const E_RUN_033: &str = "E-RUN-033"; // the harness ended a turn in failure
+pub const E_RUN_034: &str = "E-RUN-034"; // a call into the process driver refused, trapped or ran out of time
+pub const E_RUN_035: &str = "E-RUN-035"; // the harness went silent for the whole inactivity window
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -527,11 +529,30 @@ impl From<RuntimeError> for CliError {
                 "add each variable to capabilities.env.allow — the harness sees only variables \
                  the manifest declares",
             ),
-            error @ RuntimeError::ProcessDriverNotWired { .. } => CliError::with_hint(
-                E_RUN_031,
+            error @ RuntimeError::HarnessBinaryNotFound { .. } => CliError::with_hint(
+                E_RUN_006,
                 error.to_string(),
-                "to run the CLI directly for now, remove inference.driver and set \
-                 inference.command",
+                "install the harness this capsule's process driver drives, or point \
+                 inference.command at the executable to run",
+            ),
+            error @ RuntimeError::HarnessTurnFailed { .. } => CliError::with_hint(
+                E_RUN_033,
+                error.to_string(),
+                "see `mur trace show` for the turn; auth means the harness is not signed in on \
+                 this host, quota means wait or raise the plan's limit, and max-turns means \
+                 raise inference.max_turns",
+            ),
+            error @ RuntimeError::ProcessDriverCallFailed { .. } => CliError::with_hint(
+                E_RUN_034,
+                error.to_string(),
+                "the driver refused or failed to translate for its harness; check \
+                 inference.driver.config, or use a driver release built for this harness version",
+            ),
+            error @ RuntimeError::ProcessHarnessInactive { .. } => CliError::with_hint(
+                E_RUN_035,
+                error.to_string(),
+                "the harness was waiting on something that never came; check `mur trace show` \
+                 for the last thing it did",
             ),
             error @ RuntimeError::ProcessDriverLoad { .. } => CliError::with_hint(
                 E_RUN_032,

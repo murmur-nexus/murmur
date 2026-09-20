@@ -295,6 +295,15 @@ const DECLARED_WRITES: &[DeclaredWrite] = &[
         condition: RuntimeWriteCondition::AgentSession,
     },
     DeclaredWrite {
+        // One `0700` directory per harness run, holding the files the process driver asked for.
+        // Removed when the run ends, so it is present only while a `transport: process` harness
+        // is alive.
+        entry: ".process-driver",
+        kind: RuntimeWriteKind::Directory,
+        scope: RuntimeWriteScope::Session,
+        condition: RuntimeWriteCondition::AgentSession,
+    },
+    DeclaredWrite {
         entry: "MURMUR.md",
         kind: RuntimeWriteKind::File,
         scope: RuntimeWriteScope::Session,
@@ -429,6 +438,7 @@ mod tests {
             "SYNTHETIC_HOME_DIR_NAME",
             crate::shell::SYNTHETIC_HOME_DIR_NAME,
         ),
+        ("FILES_DIR_NAME", crate::agent::process::FILES_DIR_NAME),
     ];
 
     /// Entry names the scanner resolves that are deliberately not declared, each with the reason.

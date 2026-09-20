@@ -1093,10 +1093,22 @@ fn process_transport_warns_under_machine_ceiling() {
     println!("S13 process_transport_warns_under_machine_ceiling");
     let home = home_with_driver();
     set_machine_ceiling(&home, 1_000_000);
+    // A process capsule names its process driver, so the fixture has to be in this home's store
+    // for `mur doctor` to find it installed.
+    let process_driver_artifacts = TempDir::new().unwrap();
+    let process_driver = common::create_driver_artifact_with_auth(
+        process_driver_artifacts.path(),
+        "fixture-process-driver",
+        "0.1.0",
+        &common::fixture_path("process-driver/tool/process-driver.wasm"),
+        "",
+    );
+    common::publish_local(&home, &process_driver).success();
 
     let process = project(
-        "name: spend-process\nversion: 0.1.0\nartifacts: []\ninference:\n  transport: process\n  \
-         command: claude\n  model: test-model\n",
+        "name: spend-process\nversion: 0.1.0\nartifacts:\n  - name: fixture-process-driver\n    \
+         version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    \
+         artifact: fixture-process-driver\n  model: test-model\n",
     );
     let http = project(&http_manifest("spend-http", "http://127.0.0.1:1", ""));
 

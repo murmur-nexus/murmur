@@ -414,6 +414,24 @@ pub struct StageRequest {
     pub machine_tokens_per_day: Option<u64>,
 }
 
+/// The `transport: process` driver this session runs its harness through, compiled and described
+/// once at staging.
+///
+/// Not a tool: it is granted nothing, never enters `tool_components`, and is reached only by the
+/// process runner, which instantiates a fresh [`crate::process_driver::ProcessDriver`] from
+/// `component` per harness run.
+pub struct StagedProcessDriver {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) component: Component,
+    pub(crate) description: crate::process_driver::Description,
+    /// The absolute path of the executable to spawn, already resolved and checked.
+    pub(crate) binary: PathBuf,
+    /// Where [`Self::binary`]'s name came from, for diagnostics and the trace: `inference.command`
+    /// or the process driver's `describe()`.
+    pub(crate) binary_source: String,
+}
+
 pub struct StagedSession {
     pub session_id: String,
     pub workdir: PathBuf,
@@ -449,6 +467,9 @@ pub struct StagedSession {
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,
     pub(crate) tool_components: HashMap<String, Component>,
+    /// The process driver, for a `transport: process` session that named one. `None` on every
+    /// other transport.
+    pub(crate) process_driver: Option<Arc<StagedProcessDriver>>,
     /// Per-artifact narrowing for the tool/driver dispatch path, keyed by artifact name and
     /// lowered at staging time from the operator's own manifest entries. Holds an entry only
     /// for artifacts that actually declared a `capabilities:` block — a name absent from this
