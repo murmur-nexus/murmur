@@ -155,7 +155,7 @@ pub(super) fn build_launch_request(
         }),
         session: Session {
             id: harness_session_id.to_string(),
-            // Every run is a fresh session; resuming one is its own card.
+            // Every run is a fresh session: nothing here resumes one.
             mode: SessionMode::New,
         },
         harness_version,
@@ -182,7 +182,7 @@ pub(super) fn build_harness_env(
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = shell::build_declared_env(policy);
     for (name, value) in env_set {
-        if name.is_empty() || name.contains('=') || name.contains('\0') {
+        if !crate::process_driver::is_usable_env_name(name) {
             return Err(format!(
                 "the launch plan's env-set names {name:?}, which is not a usable variable name"
             ));
@@ -734,7 +734,8 @@ async fn drive_harness(
                 code: exit.code,
                 signal: exit.signal,
                 stderr_tail: stderr_tail.lock().map(|t| t.clone()).unwrap_or_default(),
-                // Cancellation is its own card; nothing here interrupts a turn on purpose yet.
+                // Nothing here interrupts a turn on purpose, so a classified exit is never a
+                // cancellation.
                 interrupted: false,
                 saw_terminal: false,
             };
@@ -1072,6 +1073,35 @@ mod tests {
             env.get("FILES").map(String::as_str),
             Some("/tmp/run/config.json")
         );
+    }
+
+    /// The credential backstop is the same one every WASM guest gets: declaring a
+    /// credential-shaped name delivers nothing, so the harness cannot be handed a host key that
+    /// way. A value the driver's own `env-set` composes — the bridge's bearer token among them —
+    /// is not a host credential and is delivered as written.
+    #[test]
+    fn harness_env_never_delivers_a_credential_shaped_host_variable() {
+        std::env::set_var("MURMUR_TEST_HARNESS_API_KEY", "leaked");
+        let env = build_harness_env(
+            &policy_allowing(&["MURMUR_TEST_HARNESS_API_KEY"]),
+            &[],
+            "/files",
+        )
+        .unwrap();
+        assert!(
+            env.is_empty(),
+            "a credential-shaped host name reached the harness: {env:?}"
+        );
+    }
+
+    /// A run is bounded by silence, not by how long it takes: this window is the only limit a
+    /// harness can trip, and it is what the runner uses unless a debug build overrides it.
+    #[test]
+    fn the_only_bound_on_a_run_is_the_inactivity_window() {
+        assert_eq!(PROCESS_INACTIVITY_TIMEOUT, Duration::from_secs(600));
+        if std::env::var_os("MURMUR_DEBUG_PROCESS_INACTIVITY_MS").is_none() {
+            assert_eq!(inactivity_timeout(), PROCESS_INACTIVITY_TIMEOUT);
+        }
     }
 
     #[test]

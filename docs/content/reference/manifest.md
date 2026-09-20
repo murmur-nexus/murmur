@@ -188,11 +188,11 @@ inference:
   # system_prompt_file: conventions.md  # alternative: load from file
   # max_turns: 10               # optional; default 10
 
-# Alternative: spawn a CLI as a subprocess (no ANTHROPIC_API_KEY required)
+# Alternative: run a harness CLI as a subprocess (no ANTHROPIC_API_KEY required)
 # inference:
 #   transport: process
-#   command: claude              # CLI binary name; must be on PATH
-#   model: claude-haiku-4-5-20251001
+#   driver:
+#     artifact: my-process-driver   # the process driver that knows this harness
 #   max_turns: 10
 
 lifecycle:
@@ -830,7 +830,7 @@ model. These fields are read under both transports:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.transport` | `http \| process` | no | Default: `http`. `http` routes every call through a WASM driver artifact; `process` spawns a CLI subprocess. See [Inference configuration](#inference-config). |
+| `inference.transport` | `http \| process` | no | Default: `http`. `http` routes every call through a WASM driver artifact; `process` runs a harness CLI as a subprocess. See [Inference configuration](#inference-config). |
 | `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: `10`. Must be > 0. |
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
@@ -874,7 +874,7 @@ These fields are read under `transport: process`:
 | `inference.model` | string | no | Model identifier handed to the driver. Omitted, the harness uses its own configured default. |
 
 The `inference.compaction` block parses under either transport but takes effect only under
-`transport: http`; the CLI subprocess loop has no compaction step, so under `transport: process`
+`transport: http`; the process transport has no compaction step, so under `transport: process`
 these fields are accepted and inert:
 
 | Field | Type | Required | Notes |
@@ -1177,17 +1177,17 @@ can be larger than the cap the provider applied.
 | [`context.max_tokens`](#field-context) | The conversation's size, which drives compaction |
 | [`spend.machine_tokens_per_day`](config.md#spend) | Tokens across every run on the machine per UTC day |
 
-`transport: http` only: under `transport: process` the CLI reaches its provider with its own
+`transport: http` only: under `transport: process` the harness reaches its provider with its own
 credentials, murmur sees no spend, and the field is a manifest error. A delegated child is bounded
 by its own `inference.max_session_tokens` and by the machine ceiling, not by its parent's session
 ceiling.
 
-### `transport: process` — CLI subprocess { #transport-process }
+### `transport: process` — harness subprocess { #transport-process }
 
-Murmur spawns a harness CLI as a subprocess and communicates over stdin/stdout, driving it through
-the [process driver](#process-driver) the manifest names. Authentication is whatever that CLI is
-already configured with: credentials under this transport are the CLI's own, and murmur neither
-holds nor controls them.
+Murmur runs a harness CLI as a subprocess and communicates over stdin/stdout, driving it through
+the [process driver](#process-driver) the manifest names. Authentication is whatever that harness
+is already configured with: credentials under this transport are the harness's own, and murmur
+neither holds nor controls them.
 
 ```yaml
 artifacts:
@@ -1221,7 +1221,8 @@ inference:
 
 A process driver is a `runtime: driver` artifact that exports the
 [`murmur:driver/process`](wit-interfaces.md#murmurdriverprocess) interface: it knows how to drive
-one CLI. It is granted nothing: no environment, no files, no network, and no Murmur host interface.
+one harness. It is granted nothing: no environment, no files, no network, and no Murmur host
+interface.
 It needs no `inference_auth:` block.
 
 ```yaml

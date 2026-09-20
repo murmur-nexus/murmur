@@ -213,6 +213,26 @@ and the message names the failing step and its errno:
 
 Neither means the declared floor was wrong; `E-CAP-003` covers that.
 
+### E-RUN-006 — a harness binary was not found { #e-run-006 }
+
+A `transport: process` capsule names an executable that is not installed on this host. `mur run`
+refuses at staging, before the session directory exists.
+
+```text
+error[E-RUN-006]: harness binary 'my-cli', named by the process driver's describe(), was not found on this host
+  hint: install the harness this capsule's process driver drives, or point inference.command at the executable to run
+```
+
+The name comes from one of two places, and the message says which:
+
+| Named by | Resolved as |
+|---|---|
+| `inference.command` | A value containing `/` is used as a path and must be an executable file; a bare name is looked up on `PATH` |
+| The process driver's `describe()` | Looked up on `PATH` |
+
+The same code covers a `transport: http` inference driver artifact that is not installed in the
+local artifact store.
+
 ### E-RUN-015 — `--resume` and `--context` together { #e-run-015 }
 
 [`mur run --resume <session>`](cli.md#mur-run) resolves a session address to the context id that
@@ -557,26 +577,6 @@ The message ends with the reason; for an import, it names the interface.
 error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:text/chunks@0.1.0`, but a matching implementation was not found in the linker
   hint: the driver must export murmur:driver/process@0.1.0 and import nothing but WASI
 ```
-
-### E-RUN-006 — a harness binary was not found { #e-run-006 }
-
-A `transport: process` capsule names an executable that is not installed on this host. `mur run`
-refuses at staging, before the session directory exists.
-
-```text
-error[E-RUN-006]: harness binary 'my-cli', named by the process driver's describe(), was not found on this host
-  hint: install the harness this capsule's process driver drives, or point inference.command at the executable to run
-```
-
-The name comes from one of two places, and the message says which:
-
-| Named by | Resolved as |
-|---|---|
-| `inference.command` | A value containing `/` is used as a path and must be an executable file; a bare name is looked up on `PATH` |
-| The process driver's `describe()` | Looked up on `PATH` |
-
-The same code covers a `transport: http` inference driver artifact that is not installed in the
-local artifact store.
 
 ### E-RUN-033 — a harness turn failed { #e-run-033 }
 

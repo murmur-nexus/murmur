@@ -608,10 +608,10 @@ the driver with an empty WASI context and grants it nothing.
 
 | Function | Called | Returns |
 |---|---|---|
-| `describe` | Once, when the driver is loaded | The CLI's name and binary, how to read its version, how to interrupt a turn, and the variables it requires |
-| `launch` | Once per run | The arguments, environment, files and stdin to spawn the CLI with, or an error |
+| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, and the variables it requires |
+| `launch` | Once per run | The arguments, environment, files and stdin to run the harness with, or an error |
 | `parse` | For each batch of complete stdout lines | The events those lines describe |
-| `classify-exit` | When the CLI's output ends without a terminal event | `turn-end` or `turn-failed` |
+| `classify-exit` | When the harness's output ends without a terminal event | `turn-end` or `turn-failed` |
 
 One driver instance serves a whole run, so `parse` may answer from what `launch` was given. A call
 that refuses, traps or runs out of time ends the run with

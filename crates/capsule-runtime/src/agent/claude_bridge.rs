@@ -8,8 +8,8 @@
 //! schemas`, the model returns a structured tool-call request, murmur executes the WASM tool,
 //! and appends the result. The tool boundary sits between murmur and the model.
 //!
-//! With `transport: process` we drive a harness CLI, which is a self-contained agent that runs
-//! its *own* loop and executes its *own* tools on the host — the tool boundary sits inside the
+//! With `transport: process` the runtime drives a harness CLI, which is a self-contained agent
+//! that runs its *own* loop and executes its *own* tools on the host — the tool boundary sits inside the
 //! subprocess, out of murmur's reach. So a plain process capsule could only do inference;
 //! declared tool artifacts would be invisible to it.
 //!
@@ -129,7 +129,7 @@ impl BridgeHandle {
     /// evidence that it is still alive — see the runner's inactivity clock.
     pub(super) async fn serve(&self, store: &CapsuleStoreState, on_request: &dyn Fn()) {
         // Serve inline (not spawned): keeps the borrow of `store` non-'static and serializes
-        // tool execution, which is what we want for a single harness client.
+        // tool execution, which is what a single harness client needs.
         while let Ok((stream, _)) = self.listener.accept().await {
             on_request();
             self.handle_connection(stream, store).await;
@@ -173,7 +173,7 @@ impl BridgeHandle {
             }
         }
 
-        // A client may open a GET stream for server->client messages; we don't need one.
+        // A client may open a GET stream for server->client messages; this bridge needs none.
         if method == "GET" {
             write_response(&mut writer, "405 Method Not Allowed", None, None).await;
             return;

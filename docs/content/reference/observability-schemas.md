@@ -35,6 +35,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
+| `harness_start`, `harness_warning`, `harness_session`, `harness_retry`, `harness_note`, `harness_failed`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
@@ -550,6 +551,81 @@ and for the three failures nothing else can surface. `on-stage` faults never rea
 because staging runs before `trace.jsonl` exists. Every fault is also written to
 `workdir/logs/hook-<name>.log`. Faults are flushed just before the `session_end` they precede, so
 they always appear earlier in the file than the event that flushed them.
+
+**Harness records**{ #harness-records } — written only under
+[`transport: process`](manifest.md#transport-process), where a harness CLI runs the turn and a
+[process driver](manifest.md#process-driver) reads its output. No argument value, environment
+value or file content is recorded on any of them — only names and counts.
+
+**`harness_start`** — written once per harness run, after the driver plans it and before the
+process exists
+
+| Field | Type | Notes |
+|---|---|---|
+| `driver` | string | Artifact name of the process driver |
+| `driver_version` | string | Its version |
+| `harness` | string | The harness the driver names in its `describe()` |
+| `binary` | string | Absolute path of the executable spawned |
+| `binary_source` | string | `"inference.command"` or `"the process driver's describe()"` — which named the binary |
+| `harness_version` | string \| null | The line the binary printed for its version arguments. `null` when it could not be read |
+| `version_tested` | bool | Whether that line names a version the driver lists as tested. See [`W-RUN-002`](diagnostics.md#w-run-002) |
+| `harness_session_id` | string | The session id handed to the driver. Distinct from `session_id`, the murmur session |
+| `session_mode` | string | `"new"` — every run starts the harness on a fresh session |
+| `args_count` | u32 | How many arguments the driver asked for. Never the arguments |
+| `env_names` | array of string | Names of the environment variables the harness was given, sorted. Never their values |
+| `files` | array of string | Names of the files the driver asked to be written into the run's private directory. Never their contents |
+| `bridge_tools` | array of string | The capsule's tool names offered over the loopback tool server. `[]` when the capsule declares no tools |
+| `stdin_bytes` | u64 | Bytes written to the harness's stdin |
+| `keep_stdin_open` | bool | Whether stdin stayed open after those bytes |
+
+**`harness_session`** — written when the harness reports the session it opened
+
+| Field | Type | Notes |
+|---|---|---|
+| `harness_session_id` | string | The session id the harness itself reports, which need not be the one it was given |
+| `auth` | string | How the harness is authenticating. Anything other than `"subscription"` also raises [`W-SEC-031`](diagnostics.md#w-sec-031) |
+| `model` | string \| null | The model the harness chose. `null` when it reported none |
+
+**`harness_warning`** — written beside each warning the run printed to stderr
+
+| Field | Type | Notes |
+|---|---|---|
+| `code` | string | [`W-RUN-002`](diagnostics.md#w-run-002) or [`W-SEC-031`](diagnostics.md#w-sec-031) |
+| `message` | string | The same text the stderr line carried |
+
+**`harness_failed`** — written when the turn failed
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | string | `"auth"`, `"quota"`, `"max-turns"`, `"canceled"`, `"harness-error"` or `"other"` |
+| `message` | string | What failed, from the harness or from the runtime |
+| `source` | string | `"harness"` when the harness reported the failure, `"runtime"` when a turn opened past `inference.max_turns` |
+
+The run ends with [`E-RUN-033`](diagnostics.md#e-run-033) naming the same kind.
+
+**`harness_retry`** — written when the harness reports that it is retrying
+
+| Field | Type | Notes |
+|---|---|---|
+| `attempt` | u32 | Which attempt the harness is on |
+| `reason` | string | Why it is retrying |
+
+**`harness_note`** — written for anything else the harness said, for a tool result that matched no
+call, and once per tool call the run ended without a result for
+
+| Field | Type | Notes |
+|---|---|---|
+| `text` | string | The note |
+
+**`harness_exit`** — written once per spawned harness, after it is gone
+
+| Field | Type | Notes |
+|---|---|---|
+| `code` | i32 \| null | Exit code. `null` when a signal ended it |
+| `signal` | i32 \| null | Signal that ended it. `null` when it exited normally |
+| `cause` | string | `"terminal"` (the harness finished the turn), `"eof"` (its output ended first), `"inactivity"` ([`E-RUN-035`](diagnostics.md#e-run-035)), `"max_turns"` or `"driver_error"` |
+| `killed` | bool | Whether the runtime had to kill it rather than wait for it |
+| `duration_ms` | u64 | How long the process lived |
 
 **`retention`**{ #retention } — written when a [`retain:` policy](manifest.md#retention) deleted
 something, once per (`store`, `reason`) pair that removed anything

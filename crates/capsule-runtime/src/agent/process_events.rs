@@ -377,7 +377,9 @@ impl ProcessEventSink {
                     input_tokens: 0,
                     output_tokens: 0,
                     decision: decision.to_string(),
-                    tool_name: None,
+                    // The same value the trace records, so a hook bound to `on-inference` reads
+                    // the same turn on either transport.
+                    tool_name: open.first_tool.clone(),
                     prompt: None,
                     output: open.text,
                     tools: None,

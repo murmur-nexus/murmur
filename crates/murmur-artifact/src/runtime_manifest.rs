@@ -7826,9 +7826,8 @@ inference:
         assert!(msg.contains("grpc"), "error was: {msg}");
     }
 
-    /// `command:` alone used to select a harness by its binary name. It no longer does: the
-    /// driver is what knows the harness, so a manifest that names only a command is refused and
-    /// told which field to add.
+    /// The driver is what knows a harness, so `command:` alone selects nothing: a manifest that
+    /// names only a command is refused and told which field to add.
     #[test]
     fn process_transport_with_command_and_no_driver_is_refused() {
         let err = RuntimeManifest::from_yaml_str(

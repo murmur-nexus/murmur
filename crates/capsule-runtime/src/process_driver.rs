@@ -270,16 +270,23 @@ impl ProcessDriver {
     }
 }
 
-/// The first `required-env` name that could not be set as an environment variable, if any.
+/// Whether `name` can be set as an environment variable.
 ///
-/// A name carrying `=` would set a second variable when the harness's environment is built, and
-/// one carrying NUL truncates it; an empty name is neither. Rejected where the driver's word is
-/// first taken, rather than wherever it is later spent.
+/// A name carrying `=` would set a second variable when an environment is built, and one carrying
+/// NUL truncates it; an empty name is neither. Both places a driver names a variable — its
+/// `required-env`, checked at load, and its launch plan's `env-set`, checked at spawn — hold to
+/// this one rule.
+pub(crate) fn is_usable_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
+}
+
+/// The first `required-env` name that could not be set as an environment variable, if any.
+/// Rejected where the driver's word is first taken, rather than wherever it is later spent.
 fn unusable_env_name(description: &Description) -> Option<&str> {
     description
         .required_env
         .iter()
-        .find(|var| var.is_empty() || var.contains('=') || var.contains('\0'))
+        .find(|var| !is_usable_env_name(var))
         .map(String::as_str)
 }
 

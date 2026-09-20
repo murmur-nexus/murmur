@@ -439,8 +439,7 @@ struct ToolCallEvent {
     tool_name: String,
     /// The provider's own id for this call, as it appeared on the driver response block that
     /// asked for it. Recorded verbatim and never parsed — the same contract `resource_id` has.
-    /// `null` when the provider named none, which is how the codex dialect's inline tool items
-    /// and every host-synthesized call read.
+    /// `null` when the provider named none, which is how every host-synthesized call reads.
     tool_call_id: Option<String>,
     input: Value,
     input_bytes: u64,
@@ -2266,7 +2265,6 @@ impl TraceWriter {
 
     /// Record the harness about to be spawned: written after the driver planned the run and
     /// before the process exists, so a spawn that goes wrong still has its plan on record.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_harness_start(&mut self, start: HarnessStart) -> std::io::Result<()> {
         let event = HarnessStartEvent {
             event_type: "harness_start",
