@@ -4,8 +4,18 @@ A test-only process driver, and a fake harness for it to drive, for `tests/proce
 `tests/process_runner.rs` and the process driver runner's own tests. The driver exports
 `murmur:driver/process@0.1.0` from the `process-driver` world and imports nothing but WASI.
 
-The committed `tool/process-driver.wasm` is built from `src/process-driver`. `fake-harness` is a
-committed executable bash script; a test copies it and `chmod 755`es its copy.
+Three components are committed under `tool/`, all built from `src/process-driver` and differing
+only in what `describe().interrupt` reports — and, for the `unsupported` build, in naming no
+`interrupt-stdin`:
+
+| Component | `describe().interrupt` | Cargo feature |
+| --- | --- | --- |
+| `tool/process-driver.wasm` | `stdin-message` | none (the default) |
+| `tool/process-driver-signal.wasm` | `signal-int` | `signal-int` |
+| `tool/process-driver-unsupported.wasm` | `unsupported` | `unsupported` |
+
+Every test but the cancel cases uses the default build. `fake-harness` is a committed executable
+bash script; a test copies it and `chmod 755`es its copy.
 
 ## The driver
 
@@ -17,7 +27,7 @@ committed executable bash script; a test copies it and `chmod 755`es its copy.
 | `binary` | `fixture-cli` |
 | `version-args` | `["--version"]` |
 | `tested-versions` | `["1.0.0"]` |
-| `interrupt` | `stdin-message` |
+| `interrupt` | `stdin-message`, `signal-int` or `unsupported` — the build's, per the table above |
 | `required-env` | `["HOME", "FIXTURE_HARNESS_PROFILE"]` |
 | `streams-text` | `true` |
 
@@ -33,7 +43,7 @@ contains `refuse-launch`. Otherwise `ok` with:
 | `files` | one file, `config.json`, holding `config`, or `{}` when `config` is `none` |
 | `stdin` | the task's bytes followed by `\n` |
 | `keep-stdin-open` | `true` |
-| `interrupt-stdin` | `interrupt\n` |
+| `interrupt-stdin` | `interrupt\n`, and `none` in the `unsupported` build |
 
 When `bridge` is set, `env-set` also carries:
 
@@ -100,13 +110,16 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `memory` | Keeps one conversation per session id and answers with everything it holds |
 | `memory-renames` | `memory`, but a new session is reported back under an id of the harness's own |
 | `linger` | `end LINGER`, then ignores stdin closing and sleeps, so the exit grace kills it |
+| `interrupt-honours` | Reads stdin until the driver's `interrupt` line arrives, then `fail canceled interrupted by the runtime` and exit `0` |
+| `interrupt-ignores` | Never reads stdin and sleeps 600 s, so the interrupt grace runs out and the runtime kills it |
+| `interrupt-signal` | Traps `INT`, then `fail canceled interrupted by SIGINT` and exit `0` |
 | `parity` | One `text`, one bridge tool call and its result, then the answer and `end PARITY-ANSWER` |
 | `stream` | Three `delta` fragments, the complete `text`, then `end` with the same words |
 | `think` | Two `tdelta` fragments, the complete `thinking`, then `text done` and `end DONE` |
 | `think-whole` | One complete `thinking` with nothing streaming it, then `text done` and `end DONE` |
 
-`silent`, `turns` and `linger` write their pid to `harness.pid` in their working directory, which
-is how a test proves the harness is dead.
+`silent`, `turns`, `linger` and the three `interrupt-*` profiles write their pid to `harness.pid`
+in their working directory, which is how a test proves the harness is dead.
 
 The bridge request is made with bash's own `/dev/tcp` — no `curl` — and the harness's environment
 is only what the capsule declared plus the driver's `env-set`, so a test that wants `sleep`, `ls`
@@ -131,8 +144,14 @@ said rather than what it asked for; on a resume it reports the id it was handed,
 
 ## Rebuild
 
+One build per component, each copied over the one it produces:
+
 ```bash
 cd src/process-driver
 cargo build --target wasm32-wasip2 --release
 cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver.wasm
+cargo build --target wasm32-wasip2 --release --features signal-int
+cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-signal.wasm
+cargo build --target wasm32-wasip2 --release --features unsupported
+cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-unsupported.wasm
 ```

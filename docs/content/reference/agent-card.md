@@ -56,21 +56,17 @@ This capsule's permissions.
 | `capabilities.shell` | boolean | `true` when `capabilities.shell.allow` lists at least one command |
 | `capabilities.network` | boolean | `true` when `capabilities.network.allow` lists at least one destination |
 | `capabilities.streaming` | boolean | `true` when [`serves.methods`](#serves-methods) contains `message/stream` and the capsule's inference transport streams text |
-| `capabilities.cancellation` | boolean | `true` when [`serves.methods`](#serves-methods) contains `tasks/cancel` and a task on the capsule's inference transport can be stopped |
+| `capabilities.cancellation` | boolean | `true` when [`serves.methods`](#serves-methods) contains `tasks/cancel` |
 
-Each of the two booleans is the door's answer and the transport's together: a method the door
-answers whose effect the transport cannot deliver is listed under
-[`serves.methods`](#serves-methods) and reported `false` here.
+`streaming` is the door's answer and the transport's together: a door that answers
+`message/stream` over a transport that streams nothing lists the method under
+[`serves.methods`](#serves-methods) and reports `false` here. `cancellation` is the served method
+alone, because every transport can be stopped.
 
 | Transport | `streaming` | `cancellation` |
 |---|---|---|
 | `http` | `true` when `message/stream` is served | `true` |
-| `process` | `true` when `message/stream` is served and the [process driver](manifest.md#process-driver) reports `streams-text` | `false` |
-
-A `transport: process` capsule serves `tasks/cancel` — the door answers it and the task is marked
-cancelled — but this runtime does not stop the harness the capsule drives, which keeps working and
-keeps spending. `capabilities.cancellation: false` is where a client reads that before it relies on
-a cancel.
+| `process` | `true` when `message/stream` is served and the [process driver](manifest.md#process-driver) reports `streams-text` | `true` |
 
 ## `serves` { #serves }
 
@@ -101,7 +97,7 @@ in this order:
 See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
 answers `message/send` and `message/stream` with `-32601`, so neither is listed and
 `capabilities.streaming` is `false`. `tasks/cancel` is answered under every acceptance, so
-`capabilities.cancellation` is the transport's answer alone.
+`capabilities.cancellation` is `true` on every card.
 
 ### `serves.planes` { #serves-planes }
 

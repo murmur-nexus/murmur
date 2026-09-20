@@ -32,7 +32,7 @@ impl Guest for Fixture {
             binary: "fixture-cli".to_string(),
             version_args: vec!["--version".to_string()],
             tested_versions: vec!["1.0.0".to_string()],
-            interrupt: InterruptMethod::StdinMessage,
+            interrupt: interrupt_method(),
             required_env: vec!["HOME".to_string(), "FIXTURE_HARNESS_PROFILE".to_string()],
             streams_text: true,
         }
@@ -87,7 +87,7 @@ impl Guest for Fixture {
             }],
             stdin: Some(stdin),
             keep_stdin_open: true,
-            interrupt_stdin: Some(b"interrupt\n".to_vec()),
+            interrupt_stdin: interrupt_stdin(),
         })
     }
 
@@ -109,6 +109,29 @@ impl Guest for Fixture {
                 message: exit.stderr_tail,
             })
         }
+    }
+}
+
+/// What this build declares about interrupting its harness, chosen by cargo feature. The three
+/// components built from this source are otherwise identical, so a test drives each of the
+/// runtime's three interrupt paths against the same driver.
+fn interrupt_method() -> InterruptMethod {
+    if cfg!(feature = "signal-int") {
+        InterruptMethod::SignalInt
+    } else if cfg!(feature = "unsupported") {
+        InterruptMethod::Unsupported
+    } else {
+        InterruptMethod::StdinMessage
+    }
+}
+
+/// The bytes the fake harness treats as an interrupt. A driver that declares `unsupported` names
+/// none: there is nothing the runtime could write that would stop its harness.
+fn interrupt_stdin() -> Option<Vec<u8>> {
+    if cfg!(feature = "unsupported") {
+        None
+    } else {
+        Some(b"interrupt\n".to_vec())
     }
 }
 

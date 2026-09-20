@@ -344,8 +344,9 @@ curl -s -X POST http://localhost:$PORT \
   -d '{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"id":"<your-task-id>"}}'
 ```
 
-The inference call in flight is dropped rather than waited out, and the task reaches the terminal
-state `canceled`:
+The work in flight is stopped rather than waited out — the inference call is dropped, and under
+[`transport: process`](../reference/manifest.md#transport-process) the harness the capsule drives
+is interrupted — and the task reaches the terminal state `canceled`:
 
 ```json
 {
@@ -365,6 +366,20 @@ state `canceled`:
 
 `mur cancel @1 <your-task-id>` does the same thing from a terminal, naming the capsule by
 [session address](../reference/cli.md#session-addresses) rather than by URL.
+
+### What a cancel does on the process transport
+
+The harness is a CLI with an agent loop of its own, so stopping the task means stopping that
+process. The runtime interrupts it the way its [process driver](../reference/manifest.md#process-driver)
+declares — writing the driver's interrupt bytes to the harness's stdin, or sending it `SIGINT` —
+gives it 10 seconds to end on its own, and kills it if it does not. A driver that declares no
+graceful interrupt has its harness killed at once: a person can always stop the task.
+
+The task is `canceled` either way, whatever the harness says on its way out, and the capsule keeps
+its session, its queue and the conversation this context was holding: the next message under the
+same `contextId` resumes the same harness session. When the harness had to be killed, the terminal
+status says so — `task canceled; the harness was killed and its session may not resume cleanly` —
+because a harness cut off mid-turn may not be able to continue that session.
 
 Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` returns
 that state and changes nothing. A task id the capsule never held is the one error: JSON-RPC code
@@ -399,7 +414,9 @@ running" is distinguishable from "these things are" without parsing an empty lis
 The trace tells the same story from the loop's side: a
 [`task_canceled`](../reference/observability-schemas.md#task-canceled) event naming the wait that
 was interrupted and what was still running when the loop stopped, and a `task_end` carrying
-`exit_status: "canceled"`.
+`exit_status: "canceled"`. A process capsule adds a `harness_interrupt` event naming the interrupt
+that went out and a `harness_exit` with `cause: "canceled"`, which `mur trace show` prints under
+`── Harness ──`.
 
 ---
 

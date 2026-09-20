@@ -25,6 +25,14 @@
 //!
 //! A run is bounded by inactivity, not by a wall clock: an agent that is working — writing output
 //! or calling a tool through the bridge — is never interrupted for taking a long time.
+//!
+//! # Stopping one
+//!
+//! A person who cancels the task raises its [`CancelSignal`], and [`deliver_interrupt`] sends the
+//! harness the interrupt its driver's `describe()` declares. A graceful interrupt buys the harness
+//! [`INTERRUPT_GRACE`] to end on its own; anything else kills it at once, because a person can
+//! always stop it. From the moment the interrupt goes out the attempt is
+//! [`AgentLoopExit::Canceled`], whatever terminal event or exit code follows.
 
 use std::{
     collections::BTreeMap,
@@ -44,14 +52,15 @@ use uuid::Uuid;
 
 use crate::{
     agent::{AgentLoopExit, PLAN_TOOL_NOTICE, UNTRUSTED_CONTENT_NOTICE},
+    cancel::{CancelSignal, Residue, PHASE_HARNESS},
     errors::RuntimeError,
     harness_session::{new_harness_session_id, HarnessSessionMap},
     hooks::HookRuntime,
     murmur_md::MURMUR_MD_TRUST_NOTICE,
     otel::OtelEmitter,
     process_driver::{
-        Bridge, ExitStatus, FailureKind, LaunchPlan, LaunchRequest, ProcessDriver, Session,
-        SessionMode,
+        Bridge, ExitStatus, FailureKind, InterruptMethod, LaunchPlan, LaunchRequest, ProcessDriver,
+        Session, SessionMode,
     },
     runtime::CapsuleStoreState,
     shell,
@@ -80,6 +89,11 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a harness that has produced its terminal event is given to exit on its own after its
 /// stdin is closed, before it is killed.
 const TERMINAL_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a harness that was sent a graceful interrupt is given to end on its own before it is
+/// killed. Not a manifest setting: a person asked for the task to stop, and how long the runtime
+/// is polite about it is not the operator's to tune.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
 
 /// The most complete lines handed to one `parse` call. A burst larger than this is split across
 /// calls, in order, so one flood of output cannot make a single driver call unboundedly large.
@@ -542,7 +556,14 @@ pub(crate) async fn run_process_inference_loop(
     _name: &str,
     _version: &str,
     session_policy: HarnessSessionPolicy,
+    // This task's cancel flag, or `None` for a run with no task to stop — `mur run`, a `task.md`
+    // launch. Without one the harness is never interrupted.
+    cancel: Option<CancelSignal>,
 ) -> Result<AgentLoopExit, RuntimeError> {
+    let cancel = cancel.map(|signal| TaskCancel {
+        signal,
+        task_id: task_id.clone().unwrap_or_default(),
+    });
     // Every path below leaves through the one `finish` call at the end, which is what makes the
     // attempt's terminal `status` frame arrive exactly once — including on the paths that return
     // an error, where a client would otherwise wait on a frame no one was going to write.
@@ -562,11 +583,19 @@ pub(crate) async fn run_process_inference_loop(
         otel,
         accessible_workdir,
         session_policy,
+        cancel.as_ref(),
         &mut a2a,
     )
     .await;
     a2a.finish(&outcome).await;
     outcome
+}
+
+/// What one attempt needs to stop when a person asks it to: the task's flag, and the id the
+/// `task_canceled` record names.
+struct TaskCancel {
+    signal: CancelSignal,
+    task_id: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,6 +609,7 @@ async fn run_attempt(
     otel: &mut OtelEmitter,
     accessible_workdir: &Path,
     session_policy: HarnessSessionPolicy,
+    cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let Some(staged) = store_state.process_driver.clone() else {
@@ -602,12 +632,19 @@ async fn run_attempt(
         otel,
         accessible_workdir,
         session_policy,
+        cancel,
         a2a,
     )
     .await;
 
-    otel.emit_session_end(if outcome.is_ok() { "ok" } else { "failed" })
-        .await;
+    // The attempt's own terminal outcome, not a coarse ok/failed: a cancelled attempt closes its
+    // OTel session as `canceled`, as an http one does, and a turn budget or a spend ceiling says
+    // which of the two it was.
+    otel.emit_session_end(match &outcome {
+        Ok(exit) => exit.as_str(),
+        Err(_) => "failed",
+    })
+    .await;
     outcome
 }
 
@@ -623,8 +660,16 @@ async fn run_harness(
     otel: &mut OtelEmitter,
     accessible_workdir: &Path,
     session_policy: HarnessSessionPolicy,
+    cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
 ) -> Result<AgentLoopExit, RuntimeError> {
+    // Nothing is spawned for a task a person already stopped: the probe, the bridge and the
+    // driver's `launch` all happen before a harness exists, and none of them is worth doing for a
+    // run that would be interrupted on its first breath.
+    if let Some(canceled) = stop_before_start(cancel, 0, store_state, trace).await {
+        return Ok(canceled);
+    }
+
     // One driver instance for the whole run, so `parse` may answer from what `launch` was given.
     let mut driver = ProcessDriver::instantiate(
         &store_state.engine,
@@ -711,28 +756,28 @@ async fn run_harness(
     .map_err(launch_error)?;
 
     let stdin_bytes = plan.stdin.as_ref().map(Vec::len).unwrap_or(0);
-    let _ = trace
-        .write_harness_start(HarnessStart {
-            driver: staged.name.clone(),
-            driver_version: staged.version.clone(),
-            harness: description.harness.clone(),
-            binary: staged.binary.to_string_lossy().into_owned(),
-            binary_source: staged.binary_source.clone(),
-            harness_version,
-            version_tested,
-            harness_session_id: session.id().to_string(),
-            session_mode: session_mode_name(session.mode()).to_string(),
-            args_count: args.len(),
-            env_names: env.keys().cloned().collect(),
-            files,
-            bridge_tools: bridge
-                .as_ref()
-                .map(|b| b.tool_names.clone())
-                .unwrap_or_default(),
-            stdin_bytes,
-            keep_stdin_open: plan.keep_stdin_open,
-        })
-        .await;
+    // Written by `drive_harness`, immediately before the spawn: a task stopped while the driver
+    // was still planning leaves no record of a harness that never existed.
+    let start = HarnessStart {
+        driver: staged.name.clone(),
+        driver_version: staged.version.clone(),
+        harness: description.harness.clone(),
+        binary: staged.binary.to_string_lossy().into_owned(),
+        binary_source: staged.binary_source.clone(),
+        harness_version,
+        version_tested,
+        harness_session_id: session.id().to_string(),
+        session_mode: session_mode_name(session.mode()).to_string(),
+        args_count: args.len(),
+        env_names: env.keys().cloned().collect(),
+        files,
+        bridge_tools: bridge
+            .as_ref()
+            .map(|b| b.tool_names.clone())
+            .unwrap_or_default(),
+        stdin_bytes,
+        keep_stdin_open: plan.keep_stdin_open,
+    };
 
     let mut sink = ProcessEventSink::new(workdir, inference.max_turns, session, a2a);
     let outcome = drive_harness(
@@ -743,11 +788,13 @@ async fn run_harness(
         &env,
         accessible_workdir,
         &plan,
+        start,
         &mut driver,
         &mut sink,
         hooks,
         trace,
         otel,
+        cancel,
     )
     .await;
     sink.finish(trace).await;
@@ -764,8 +811,24 @@ enum RunEnd {
     Eof,
     /// Neither stdout nor the bridge said anything for the whole window.
     Inactive,
+    /// An interrupted harness ran out its grace, or had none to run out.
+    Interrupted,
     /// A call into the driver failed, or the bridge stopped serving.
     Failed(RuntimeError),
+}
+
+impl RunEnd {
+    /// Whether the driver already said how the turn ended, which is what decides whether the
+    /// runtime asks it to classify the exit instead.
+    fn saw_terminal(&self) -> bool {
+        matches!(self, RunEnd::Terminal(_) | RunEnd::TurnBudget(_))
+    }
+
+    /// Whether the harness had to be killed rather than ending when it was asked. Only an
+    /// interrupt reaches this: every other ending is an attempt that was never stopped.
+    fn harness_was_killed(&self) -> bool {
+        matches!(self, RunEnd::Interrupted)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,12 +840,22 @@ async fn drive_harness(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     plan: &LaunchPlan,
+    start: HarnessStart,
     driver: &mut ProcessDriver,
     sink: &mut ProcessEventSink<'_>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
+    cancel: Option<&TaskCancel>,
 ) -> Result<AgentLoopExit, RuntimeError> {
+    // The last moment nothing exists yet. A task stopped here leaves neither a `harness_start`
+    // nor a `harness_exit`, which is how the trace says the harness never ran.
+    if let Some(canceled) = stop_before_start(cancel, sink.current_turn(), store_state, trace).await
+    {
+        return Ok(canceled);
+    }
+    let _ = trace.write_harness_start(start).await;
+
     let spawned_at = Instant::now();
     let mut child = Command::new(&staged.binary)
         .args(args)
@@ -869,18 +942,44 @@ async fn drive_harness(
     };
     tokio::pin!(bridge_future);
 
+    // Set once the interrupt has gone out: the harness's remaining time, which harness output no
+    // longer moves. A harness that was asked to stop and keeps talking is still killed on time.
+    let mut grace_deadline: Option<tokio::time::Instant> = None;
+    // Whether the runtime interrupted this attempt, which fixes its outcome at `Canceled`.
+    let mut interrupted = false;
     let end = loop {
-        let deadline = match last_activity.lock() {
-            Ok(at) => *at + inactivity,
-            Err(_) => tokio::time::Instant::now() + inactivity,
+        let deadline = match grace_deadline {
+            Some(deadline) => deadline,
+            None => match last_activity.lock() {
+                Ok(at) => *at + inactivity,
+                Err(_) => tokio::time::Instant::now() + inactivity,
+            },
         };
         let first = tokio::select! {
             biased;
+            // Ahead of the output arm: a person who stopped the task outranks another line of
+            // harness output. Disarmed once the interrupt is out — the signal never clears, so a
+            // live arm would resolve on every iteration from then on.
+            () = wait_for_cancel(cancel, interrupted) => {
+                let delivery = interrupt_harness(
+                    staged, &child, stdin.as_mut(), plan, sink, trace, cancel,
+                ).await;
+                interrupted = true;
+                let grace = delivery.grace();
+                if grace.is_zero() {
+                    break RunEnd::Interrupted;
+                }
+                grace_deadline = Some(tokio::time::Instant::now() + grace);
+                continue;
+            }
             line = line_rx.recv() => line,
             () = &mut bridge_future => break RunEnd::Failed(RuntimeError::AgentLoopFailed(
                 "the tool bridge stopped accepting connections".to_string(),
             )),
             () = tokio::time::sleep_until(deadline) => {
+                if grace_deadline.is_some() {
+                    break RunEnd::Interrupted;
+                }
                 // A bridge request may have moved the clock while this timer was armed.
                 let idle = last_activity
                     .lock()
@@ -919,14 +1018,50 @@ async fn drive_harness(
 
     // Whatever ended the loop, the harness does not outlive this function. A run that produced
     // its terminal event is given the grace period to exit on its own; one that is still mid-turn
-    // is killed outright, because waiting on it is waiting on spend.
+    // is killed outright, because waiting on it is waiting on spend. An interrupted run is killed
+    // outright too: it has already had its grace.
     let grace = match &end {
+        _ if interrupted => None,
         RunEnd::Terminal(_) | RunEnd::Eof => Some(TERMINAL_EXIT_GRACE),
-        RunEnd::TurnBudget(_) | RunEnd::Inactive | RunEnd::Failed(_) => None,
+        RunEnd::TurnBudget(_) | RunEnd::Inactive | RunEnd::Interrupted | RunEnd::Failed(_) => None,
     };
     let exit = finish_child(&mut child, stdin, grace).await;
     if let Some(handle) = stderr_drain {
         let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
+    }
+    let stderr_tail = || stderr_tail.lock().map(|t| t.clone()).unwrap_or_default();
+
+    // A person stopped this attempt, so it is `Canceled` whatever the harness said inside the
+    // grace: a `turn-end` is not a completion and a `turn-failed` is not a failure. What the
+    // harness did say is on record — the sink wrote it as it arrived.
+    if interrupted {
+        write_harness_exit(trace, &exit, "canceled", spawned_at).await;
+        if !end.saw_terminal() {
+            // The driver never got to say how the run ended. Ask it, with the interrupt on the
+            // record, which is what makes its `exit.interrupted` arm reachable.
+            let status = ExitStatus {
+                code: exit.code,
+                signal: exit.signal,
+                stderr_tail: stderr_tail(),
+                interrupted: true,
+                saw_terminal: false,
+            };
+            match driver.classify_exit(status).await {
+                Ok(event) => {
+                    let _ = sink.consume(vec![event], hooks, trace, otel).await;
+                }
+                // A driver that cannot answer does not make a stopped task a failed one.
+                Err(error) => {
+                    let _ = trace.write_harness_note(&error.to_string()).await;
+                }
+            }
+        }
+        if end.harness_was_killed() {
+            sink.mark_harness_killed();
+        }
+        return Ok(
+            finish_canceled_harness_turn(cancel, sink.current_turn(), store_state, trace).await,
+        );
     }
 
     match end {
@@ -944,6 +1079,11 @@ async fn drive_harness(
                 seconds: inactivity.as_secs(),
             })
         }
+        // Only an interrupt ends the loop this way, and an interrupted run has already returned.
+        RunEnd::Interrupted => {
+            write_harness_exit(trace, &exit, "canceled", spawned_at).await;
+            Ok(AgentLoopExit::Canceled)
+        }
         RunEnd::Failed(error) => {
             write_harness_exit(trace, &exit, "driver_error", spawned_at).await;
             Err(error)
@@ -953,9 +1093,8 @@ async fn drive_harness(
             let status = ExitStatus {
                 code: exit.code,
                 signal: exit.signal,
-                stderr_tail: stderr_tail.lock().map(|t| t.clone()).unwrap_or_default(),
-                // Nothing here interrupts a turn on purpose, so a classified exit is never a
-                // cancellation.
+                stderr_tail: stderr_tail(),
+                // An interrupted run never reaches here: it is answered above, as a cancellation.
                 interrupted: false,
                 saw_terminal: false,
             };
@@ -973,6 +1112,228 @@ async fn drive_harness(
             }
         }
     }
+}
+
+/// The cancel arm's future: this task's flag, or one that never resolves — for a run with no task
+/// to cancel, and for a run already interrupted, whose flag would otherwise resolve forever.
+async fn wait_for_cancel(cancel: Option<&TaskCancel>, interrupted: bool) {
+    match cancel.filter(|_| !interrupted) {
+        Some(cancel) => cancel.signal.canceled().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether this attempt must stop before it has started anything, and what it leaves behind if so.
+///
+/// `None` for a run with no task to cancel and for one nobody stopped.
+async fn stop_before_start(
+    cancel: Option<&TaskCancel>,
+    turn: u32,
+    store_state: &CapsuleStoreState,
+    trace: &mut TraceWriter,
+) -> Option<AgentLoopExit> {
+    let cancel = cancel.filter(|cancel| cancel.signal.is_canceled())?;
+    Some(finish_canceled_harness_turn(Some(cancel), turn, store_state, trace).await)
+}
+
+/// What a cancelled attempt leaves behind on this transport: the `task_canceled` record naming
+/// where it stopped and what is still running.
+///
+/// The counterpart to `agent::finish_canceled_turn`, minus the two things this transport does not
+/// have: there is no conversation record to append a cancelled turn to — the harness owns the
+/// conversation — and the terminal `canceled` status frame is `A2aStream::finish`'s, written from
+/// [`run_process_inference_loop`] with this outcome, which is what keeps it to exactly one per
+/// attempt. The OTel session end is written there too, from the same outcome.
+async fn finish_canceled_harness_turn(
+    cancel: Option<&TaskCancel>,
+    turn: u32,
+    store_state: &CapsuleStoreState,
+    trace: &mut TraceWriter,
+) -> AgentLoopExit {
+    if let Some(cancel) = cancel {
+        cancel.signal.note_phase(PHASE_HARNESS);
+        let residue =
+            Residue::snapshot(store_state.detached.as_ref(), &store_state.live_delegations);
+        let _ = trace
+            .write_task_canceled(
+                &cancel.task_id,
+                Some(turn),
+                cancel.signal.phase(),
+                residue.detached_work_ids(),
+                residue.delegation_ids(),
+            )
+            .await;
+    }
+    AgentLoopExit::Canceled
+}
+
+/// How the runtime tried to stop the harness, and whether the attempt went out.
+struct InterruptDelivery {
+    /// The WIT spelling of `describe().interrupt`: `stdin-message`, `signal-int` or `unsupported`.
+    method: &'static str,
+    /// Whether a graceful interrupt actually reached the harness.
+    delivered: bool,
+}
+
+impl InterruptDelivery {
+    /// How long the harness has to end on its own: the grace when a graceful interrupt went out,
+    /// nothing when none did — there is nothing to wait for.
+    fn grace(&self) -> Duration {
+        if self.delivered {
+            interrupt_grace()
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+/// What a graceful interrupt would be, decided from the driver's declaration and its own plan
+/// before anything is written or sent.
+enum InterruptAction {
+    /// Write the plan's `interrupt-stdin` to the harness's still-open stdin.
+    Stdin,
+    /// Send `SIGINT` to the harness process.
+    Signal,
+    /// No graceful interrupt exists. Carries what a `harness_note` says about why, for a driver
+    /// whose declaration contradicts its own plan, and nothing for one that declared
+    /// `unsupported` and has nothing to explain.
+    KillAtOnce(Option<&'static str>),
+}
+
+/// A `stdin-message` driver whose plan closed the stdin it would have to write to.
+const NO_STDIN_TO_INTERRUPT: &str =
+    "the process driver's interrupt-method is stdin-message, but its launch plan did not keep \
+     stdin open, so the harness was killed instead";
+
+/// A `stdin-message` driver whose plan named no bytes to write.
+const NO_INTERRUPT_BYTES: &str =
+    "the process driver's interrupt-method is stdin-message, but its launch plan named no \
+     interrupt-stdin bytes, so the harness was killed instead";
+
+/// Decide how to interrupt, from the driver's `describe().interrupt` and the plan it launched
+/// with. A declaration its own plan contradicts is not an error: a person asked for the task to
+/// stop, and the runtime can always stop it.
+fn plan_interrupt(method: InterruptMethod, plan: &LaunchPlan, stdin_open: bool) -> InterruptAction {
+    match method {
+        InterruptMethod::StdinMessage if !stdin_open => {
+            InterruptAction::KillAtOnce(Some(NO_STDIN_TO_INTERRUPT))
+        }
+        InterruptMethod::StdinMessage if plan.interrupt_stdin.is_none() => {
+            InterruptAction::KillAtOnce(Some(NO_INTERRUPT_BYTES))
+        }
+        InterruptMethod::StdinMessage => InterruptAction::Stdin,
+        InterruptMethod::SignalInt => InterruptAction::Signal,
+        InterruptMethod::Unsupported => InterruptAction::KillAtOnce(None),
+    }
+}
+
+/// How the driver's `interrupt-method` is spelled in the trace.
+fn interrupt_method_name(method: InterruptMethod) -> &'static str {
+    match method {
+        InterruptMethod::StdinMessage => "stdin-message",
+        InterruptMethod::SignalInt => "signal-int",
+        InterruptMethod::Unsupported => "unsupported",
+    }
+}
+
+/// Claim the cancel for this harness, tell the attempt's frames it was stopped, interrupt the
+/// harness, and record what went out. The one place a running harness is interrupted.
+async fn interrupt_harness(
+    staged: &StagedProcessDriver,
+    child: &Child,
+    stdin: Option<&mut ChildStdin>,
+    plan: &LaunchPlan,
+    sink: &mut ProcessEventSink<'_>,
+    trace: &mut TraceWriter,
+    cancel: Option<&TaskCancel>,
+) -> InterruptDelivery {
+    if let Some(cancel) = cancel {
+        cancel.signal.note_phase(PHASE_HARNESS);
+    }
+    sink.mark_interrupted();
+    let delivery = deliver_interrupt(staged.description.interrupt, child, stdin, plan, trace).await;
+    let grace_ms = delivery.grace().as_millis().try_into().unwrap_or(u64::MAX);
+    let _ = trace
+        .write_harness_interrupt(delivery.method, delivery.delivered, grace_ms)
+        .await;
+    delivery
+}
+
+/// Send the harness the interrupt its driver declares.
+///
+/// The bytes a `stdin-message` driver named are written unread: what interrupts a turn is the
+/// driver's knowledge, never this runtime's. Whatever happens here the harness stops — an
+/// undelivered interrupt buys it no grace, and it is killed as soon as this returns.
+async fn deliver_interrupt(
+    method: InterruptMethod,
+    child: &Child,
+    stdin: Option<&mut ChildStdin>,
+    plan: &LaunchPlan,
+    trace: &mut TraceWriter,
+) -> InterruptDelivery {
+    let name = interrupt_method_name(method);
+    let undelivered = |note: Option<&'static str>| (false, note.map(str::to_string));
+    let (delivered, note) = match plan_interrupt(method, plan, stdin.is_some()) {
+        InterruptAction::KillAtOnce(note) => undelivered(note),
+        InterruptAction::Stdin => {
+            let bytes = plan.interrupt_stdin.as_deref().unwrap_or_default();
+            let stdin = stdin.expect("plan_interrupt answers Stdin only for an open stdin");
+            match stdin.write_all(bytes).await {
+                Ok(()) => {
+                    let _ = stdin.flush().await;
+                    (true, None)
+                }
+                Err(error) => (
+                    false,
+                    Some(format!(
+                        "the harness's stdin could not be written to ({error}), so it was killed \
+                         instead"
+                    )),
+                ),
+            }
+        }
+        InterruptAction::Signal => match child.id() {
+            Some(pid) if send_interrupt_signal(pid) => (true, None),
+            _ => (
+                false,
+                Some("the harness could not be sent SIGINT, so it was killed instead".to_string()),
+            ),
+        },
+    };
+    if let Some(note) = note {
+        let _ = trace.write_harness_note(&note).await;
+    }
+    InterruptDelivery {
+        method: name,
+        delivered,
+    }
+}
+
+/// Send `SIGINT` to a live child process, reporting whether the kernel took it.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn send_interrupt_signal(pid: u32) -> bool {
+    // SAFETY: `kill` takes a pid and a signal number by value and dereferences no pointer. The
+    // pid is the child's, which this process has not reaped, so it names that child or nothing.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) == 0 }
+}
+
+#[cfg(not(unix))]
+fn send_interrupt_signal(_pid: u32) -> bool {
+    false
+}
+
+/// How long an interrupted harness has before it is killed. Overridable in debug builds so the
+/// cancel tests do not have to wait out the real grace; release builds read nothing from the
+/// environment.
+fn interrupt_grace() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(ms) = std::env::var("MURMUR_DEBUG_INTERRUPT_GRACE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    INTERRUPT_GRACE
 }
 
 /// How long a run may go silent. Overridable in debug builds so the inactivity tests do not have
@@ -1474,6 +1835,123 @@ mod tests {
             env.is_empty(),
             "a credential-shaped host name reached the harness: {env:?}"
         );
+    }
+
+    fn interruptible_plan(interrupt_stdin: Option<&[u8]>) -> LaunchPlan {
+        LaunchPlan {
+            args: Vec::new(),
+            env_set: Vec::new(),
+            files: Vec::new(),
+            stdin: None,
+            keep_stdin_open: true,
+            interrupt_stdin: interrupt_stdin.map(<[u8]>::to_vec),
+        }
+    }
+
+    fn delivery(method: InterruptMethod, plan: &LaunchPlan, stdin_open: bool) -> InterruptDelivery {
+        InterruptDelivery {
+            method: interrupt_method_name(method),
+            delivered: matches!(
+                plan_interrupt(method, plan, stdin_open),
+                InterruptAction::Stdin | InterruptAction::Signal
+            ),
+        }
+    }
+
+    /// A harness that was asked to stop gets [`INTERRUPT_GRACE`] and no more, and a release build
+    /// reads nothing from the environment to decide it.
+    #[test]
+    fn an_interrupted_harness_has_ten_seconds_to_end_on_its_own() {
+        assert_eq!(INTERRUPT_GRACE, Duration::from_secs(10));
+        if std::env::var_os("MURMUR_DEBUG_INTERRUPT_GRACE_MS").is_none() {
+            assert_eq!(interrupt_grace(), INTERRUPT_GRACE);
+        }
+    }
+
+    #[test]
+    fn interrupt_method_names_match_the_wit_spelling() {
+        assert_eq!(
+            interrupt_method_name(InterruptMethod::StdinMessage),
+            "stdin-message"
+        );
+        assert_eq!(
+            interrupt_method_name(InterruptMethod::SignalInt),
+            "signal-int"
+        );
+        assert_eq!(
+            interrupt_method_name(InterruptMethod::Unsupported),
+            "unsupported"
+        );
+    }
+
+    /// A graceful interrupt buys the harness the grace; anything else kills it at once. A
+    /// `stdin-message` driver whose own plan left nowhere to write is one of the anything elses,
+    /// and says so in a note rather than failing the run.
+    #[test]
+    fn only_a_delivered_interrupt_buys_the_harness_any_grace() {
+        let with_bytes = interruptible_plan(Some(b"interrupt\n"));
+        let no_bytes = interruptible_plan(None);
+
+        let graceful = delivery(InterruptMethod::StdinMessage, &with_bytes, true);
+        assert!(graceful.delivered);
+        assert_eq!(graceful.grace(), interrupt_grace());
+
+        let signal = delivery(InterruptMethod::SignalInt, &no_bytes, false);
+        assert!(
+            signal.delivered,
+            "a signal needs neither stdin nor bytes of its own"
+        );
+        assert_eq!(signal.grace(), interrupt_grace());
+
+        for (method, plan, stdin_open) in [
+            (InterruptMethod::Unsupported, &with_bytes, true),
+            (InterruptMethod::StdinMessage, &no_bytes, true),
+            (InterruptMethod::StdinMessage, &with_bytes, false),
+        ] {
+            let killed = delivery(method, plan, stdin_open);
+            assert!(!killed.delivered, "{:?}", killed.method);
+            assert_eq!(killed.grace(), Duration::ZERO, "{:?}", killed.method);
+        }
+    }
+
+    /// The two contradictions between a driver's declaration and its own plan are named for the
+    /// driver author; a driver that declared it cannot be interrupted has nothing to explain.
+    #[test]
+    fn a_driver_that_contradicts_its_own_plan_is_noted_not_refused() {
+        let with_bytes = interruptible_plan(Some(b"interrupt\n"));
+        let no_bytes = interruptible_plan(None);
+        let note = |method, plan, stdin_open| match plan_interrupt(method, plan, stdin_open) {
+            InterruptAction::KillAtOnce(note) => note,
+            _ => panic!("expected no graceful interrupt"),
+        };
+        assert_eq!(
+            note(InterruptMethod::StdinMessage, &with_bytes, false),
+            Some(NO_STDIN_TO_INTERRUPT)
+        );
+        assert_eq!(
+            note(InterruptMethod::StdinMessage, &no_bytes, true),
+            Some(NO_INTERRUPT_BYTES)
+        );
+        assert_eq!(note(InterruptMethod::Unsupported, &with_bytes, true), None);
+    }
+
+    /// Which endings leave the driver still to be asked how the run went, and which mean the
+    /// harness had to be killed.
+    #[test]
+    fn a_run_end_says_whether_the_driver_spoke_and_whether_the_harness_was_killed() {
+        let error = || RuntimeError::AgentLoopFailed("boom".to_string());
+        for (end, saw_terminal, killed) in [
+            (RunEnd::Terminal(Ok(())), true, false),
+            (RunEnd::Terminal(Err(error())), true, false),
+            (RunEnd::TurnBudget(error()), true, false),
+            (RunEnd::Eof, false, false),
+            (RunEnd::Inactive, false, false),
+            (RunEnd::Failed(error()), false, false),
+            (RunEnd::Interrupted, false, true),
+        ] {
+            assert_eq!(end.saw_terminal(), saw_terminal);
+            assert_eq!(end.harness_was_killed(), killed);
+        }
     }
 
     /// A run is bounded by silence, not by how long it takes: this window is the only limit a

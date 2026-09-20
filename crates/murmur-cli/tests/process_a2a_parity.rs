@@ -755,11 +755,12 @@ fn thinking_reaches_the_client_once() {
     assert_eq!(thinking[0]["final"], false);
 }
 
-/// S6. A process capsule's card says it cannot stop its harness, while still answering
-/// `tasks/cancel`.
+/// S6. A process capsule's card advertises what its transport can do: cancellation, which every
+/// transport supports, and streaming, which is its driver's answer.
 #[test]
-fn a_process_capsule_advertises_no_cancellation() {
-    if common::skip_without_host_support("a_process_capsule_advertises_no_cancellation") {
+fn a_process_capsule_advertises_cancellation_and_streaming() {
+    if common::skip_without_host_support("a_process_capsule_advertises_cancellation_and_streaming")
+    {
         return;
     }
     let capsule = ProcessCapsule::new("card-process", "parity").start();
@@ -767,7 +768,7 @@ fn a_process_capsule_advertises_no_cancellation() {
     println!("process card: {served}");
     let card: Value = serde_json::from_str(&served).expect("the card is JSON");
 
-    assert_eq!(card["capabilities"]["cancellation"], false, "{card}");
+    assert_eq!(card["capabilities"]["cancellation"], true, "{card}");
     assert_eq!(card["capabilities"]["streaming"], true, "{card}");
     assert!(
         card["serves"]["methods"]

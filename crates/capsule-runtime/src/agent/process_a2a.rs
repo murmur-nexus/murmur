@@ -41,6 +41,7 @@ use std::sync::{
 
 use crate::{
     agent::AgentLoopExit,
+    cancel::CANCELED_STATUS_MESSAGE,
     errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035},
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
@@ -92,6 +93,13 @@ pub(super) struct A2aStream {
     segment: Segment,
     /// The result the terminal `completed` status carries, as the harness reported it.
     result: String,
+    /// Whether the runtime interrupted this attempt. Set before the interrupt goes out, so
+    /// everything after it is a stopped task's, not an answer's: the harness's own last words are
+    /// kept in `out/result.txt` and the trace, and are not sent as the client's final text.
+    interrupted: bool,
+    /// Whether the harness had to be killed rather than ending when it was asked, which is the
+    /// one thing the terminal `canceled` status says beyond the fact of the cancel.
+    harness_killed: bool,
 }
 
 impl A2aStream {
@@ -112,7 +120,21 @@ impl A2aStream {
             chunks_emitted,
             segment: Segment::default(),
             result: String::new(),
+            interrupted: false,
+            harness_killed: false,
         }
+    }
+
+    /// The runtime is about to interrupt the harness: this attempt ends `canceled`, whatever the
+    /// harness says next.
+    pub(super) fn mark_interrupted(&mut self) {
+        self.interrupted = true;
+    }
+
+    /// The interrupted harness had to be killed. Adds the clause the client needs to know its
+    /// session may not resume cleanly.
+    pub(super) fn mark_harness_killed(&mut self) {
+        self.harness_killed = true;
     }
 
     /// Open a segment, if none is open, for the turn number a turn opening now would take.
@@ -191,7 +213,9 @@ impl A2aStream {
         self.pay_cursor_removal();
         self.segment.open = false;
         self.result = result.to_string();
-        if self.segment.streamed_text || result.is_empty() {
+        // An interrupted attempt delivers no answer: a person stopped it, and what the harness
+        // produced anyway reaches them through `out/result.txt` rather than as final text.
+        if self.interrupted || self.segment.streamed_text || result.is_empty() {
             return;
         }
         if let Some(wire) = self.wire() {
@@ -210,6 +234,11 @@ impl A2aStream {
     /// what the attempt returned, and never twice: this is the frame a client waits on.
     pub(super) async fn finish(&mut self, outcome: &Result<AgentLoopExit, RuntimeError>) {
         match outcome {
+            Ok(AgentLoopExit::Canceled) => {
+                let message = canceled_message(self.harness_killed).to_string();
+                self.status(AgentLoopExit::Canceled.as_str(), &message, None, true)
+                    .await;
+            }
             Ok(_) => {
                 let response = self.result.clone();
                 self.status("completed", "session ended", Some(response), true)
@@ -265,6 +294,23 @@ impl A2aStream {
         })
     }
 }
+
+/// What the terminal `canceled` status says.
+///
+/// A harness that stopped when it was asked leaves the frame byte-identical to the one the http
+/// path writes, so a client cannot tell the transports apart. One that had to be killed says so:
+/// its own session was cut off mid-turn and the harness may not be able to resume it.
+fn canceled_message(harness_killed: bool) -> &'static str {
+    if harness_killed {
+        CANCELED_KILLED_STATUS_MESSAGE
+    } else {
+        CANCELED_STATUS_MESSAGE
+    }
+}
+
+/// [`canceled_message`] for a harness the runtime had to kill.
+const CANCELED_KILLED_STATUS_MESSAGE: &str =
+    "task canceled; the harness was killed and its session may not resume cleanly";
 
 /// What a failed attempt's terminal status says: the diagnostic the run failed with, under the
 /// code a reader looks it up by.

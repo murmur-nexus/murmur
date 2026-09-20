@@ -848,7 +848,8 @@ struct TaskCanceledEvent {
     /// The turn that was in flight, 0-based. Absent for a task cancelled before it ever ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     turn: Option<u32>,
-    /// Where cancellation landed: `queued`, `turn`, `inference`, `input` or `delegation`.
+    /// Where cancellation landed: `queued`, `turn`, `inference`, `input`, `delegation` or
+    /// `harness`.
     phase: String,
     /// Demoted shell commands still running when the loop stopped. They keep their own
     /// lifecycle — nothing here was killed.
@@ -1012,6 +1013,24 @@ struct HarnessFailedEvent {
     source: String,
 }
 
+/// How the runtime tried to stop a harness a person cancelled the task of.
+#[derive(Serialize)]
+struct HarnessInterruptEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    /// The driver's `interrupt-method`, spelled as the WIT spells it.
+    method: String,
+    /// Whether a graceful interrupt actually reached the harness.
+    delivered: bool,
+    /// How long the harness has to end on its own before it is killed. `0` when it is killed at
+    /// once, which is every ending where `delivered` is false.
+    grace_ms: u64,
+}
+
 /// How one spawned harness ended. Written once per spawn, on every path out of the run.
 #[derive(Serialize)]
 pub(crate) struct HarnessExit {
@@ -1019,7 +1038,8 @@ pub(crate) struct HarnessExit {
     pub code: Option<i32>,
     /// The signal that ended the process, or `null` when it exited on its own.
     pub signal: Option<i32>,
-    /// What ended the run: `terminal`, `eof`, `inactivity`, `max_turns` or `driver_error`.
+    /// What ended the run: `terminal`, `eof`, `inactivity`, `max_turns`, `driver_error` or
+    /// `canceled`.
     pub cause: String,
     /// Whether the runtime had to kill the process rather than wait for it.
     pub killed: bool,
@@ -2258,10 +2278,10 @@ impl TraceWriter {
 
     // ── The harness a `transport: process` session drives ────────────────────────────────
     //
-    // Seven events account for one harness run: what was spawned, what it said about itself,
-    // what it warned or noted, how it failed, and how it ended. None of them ever carries an
-    // argument value, an environment value or a file's contents — the bridge's bearer token
-    // reaches the harness through exactly those three, and `trace.jsonl` is durable.
+    // Eight events account for one harness run: what was spawned, what it said about itself,
+    // what it warned or noted, how it failed, how it was stopped, and how it ended. None of them
+    // ever carries an argument value, an environment value or a file's contents — the bridge's
+    // bearer token reaches the harness through exactly those three, and `trace.jsonl` is durable.
 
     /// Record the harness about to be spawned: written after the driver planned the run and
     /// before the process exists, so a spawn that goes wrong still has its plan on record.
@@ -2370,6 +2390,28 @@ impl TraceWriter {
             kind: kind.to_string(),
             message: message.to_string(),
             source: source.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record the interrupt a cancelled task sent its harness: the method the driver declared,
+    /// whether it went out, and how long the harness has before it is killed.
+    pub(crate) async fn write_harness_interrupt(
+        &mut self,
+        method: &str,
+        delivered: bool,
+        grace_ms: u64,
+    ) -> std::io::Result<()> {
+        let event = HarnessInterruptEvent {
+            event_type: "harness_interrupt",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            method: method.to_string(),
+            delivered,
+            grace_ms,
         };
         self.write_event(&event).await
     }

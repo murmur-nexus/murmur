@@ -430,21 +430,16 @@ fn check_resume_launchable(
     Ok(())
 }
 
-/// What this session's inference transport can do, for the capability booleans on the agent card.
+/// What this session's inference transport can do, for the streaming boolean on the agent card.
 ///
-/// A `transport: process` session can do only what the harness its driver drives can: the driver's
-/// `describe().streams-text` says whether text arrives in fragments, and nothing in this runtime
-/// stops a harness mid-turn, so a task on it cannot be cancelled. Every other transport runs
-/// inside this runtime, which streams and cancels.
+/// A `transport: process` session streams only what the harness its driver drives streams, which
+/// the driver's `describe().streams-text` answers. Every other transport runs inside this runtime,
+/// which streams. Cancellation is not here: a task is stopped the same way on every transport.
 fn transport_capabilities(staged: &StagedSession) -> identity::TransportCapabilities {
-    match staged.process_driver.as_ref() {
-        Some(driver) => identity::TransportCapabilities {
-            streams_text: driver.description.streams_text,
-            cancellable: false,
-        },
-        None => identity::TransportCapabilities {
-            streams_text: true,
-            cancellable: true,
+    identity::TransportCapabilities {
+        streams_text: match staged.process_driver.as_ref() {
+            Some(driver) => driver.description.streams_text,
+            None => true,
         },
     }
 }

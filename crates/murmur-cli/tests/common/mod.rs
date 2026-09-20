@@ -44,6 +44,26 @@ pub fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether a process id is still alive, by `kill(pid, 0)`.
+#[cfg(unix)]
+pub fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 performs the permission and existence check and delivers nothing.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Wait for a process to be gone, failing the test if it outlives `limit`.
+#[cfg(unix)]
+pub fn assert_dead_within(pid: i32, limit: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        if !pid_alive(pid) {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the harness (pid {pid}) was still alive after {limit:?}");
+}
+
 pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())

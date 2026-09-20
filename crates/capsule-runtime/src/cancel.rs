@@ -43,6 +43,13 @@ pub(crate) const PHASE_INFERENCE: &str = "inference";
 pub(crate) const PHASE_INPUT: &str = "input";
 /// Cancelled while a `delegate-task` call was waiting for its child to be up.
 pub(crate) const PHASE_DELEGATION: &str = "delegation";
+/// Cancelled while a `transport: process` harness was running the turn. The runtime interrupts
+/// the harness it spawned, and kills it when the interrupt is refused or unavailable.
+pub(crate) const PHASE_HARNESS: &str = "harness";
+
+/// What the terminal `canceled` status frame says. One constant for every transport: a client
+/// cannot tell from the frame which one ran the task.
+pub(crate) const CANCELED_STATUS_MESSAGE: &str = "task canceled";
 
 // ── CancelSignal ──────────────────────────────────────────────────────────────
 
@@ -385,6 +392,29 @@ mod tests {
             child_workdir: ".murmur/children/child-1".to_string(),
             started: Instant::now(),
         }
+    }
+
+    /// The vocabulary the `task_canceled` record's `phase` is written from. One word per place
+    /// cancellation is checked, and a reader of an old trace matches on these strings.
+    #[test]
+    fn every_phase_has_its_own_word() {
+        let phases = [
+            PHASE_QUEUED,
+            PHASE_TURN,
+            PHASE_INFERENCE,
+            PHASE_INPUT,
+            PHASE_DELEGATION,
+            PHASE_HARNESS,
+        ];
+        assert_eq!(phases[5], "harness");
+        assert_eq!(
+            phases
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            phases.len()
+        );
+        assert_eq!(CANCELED_STATUS_MESSAGE, "task canceled");
     }
 
     #[test]
