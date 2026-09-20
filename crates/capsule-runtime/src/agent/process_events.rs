@@ -2,9 +2,10 @@
 //!
 //! The driver turns harness output into [`Event`]s; this module is the other half — it turns
 //! those events into everything a turn records: the `inference` and `tool_call` trace events, the
-//! `Inference` and `ToolCall` hooks, the OTel spans, the result text, and the harness's own
-//! diagnostics. The runtime never reads the harness's output itself, so nothing here interprets
-//! text; it only counts turns and writes records.
+//! `Inference` and `ToolCall` hooks, the OTel spans, the result text, the harness's own
+//! diagnostics, and, through [`A2aStream`], the task's A2A frames. The runtime never reads the
+//! harness's output itself, so nothing here interprets text; it only counts turns and writes
+//! records.
 //!
 //! # Turns
 //!
@@ -13,6 +14,9 @@
 //! and closes at the next `tool-result` or terminal event. Thinking and the streaming deltas never
 //! open one: a harness that streams its reasoning as its own events would otherwise burn a turn
 //! per thought, and `max_turns` would mean something different on each transport.
+//!
+//! An A2A **segment** is a separate notion, held by [`A2aStream`]: it reads the turn counter to
+//! number itself and never advances it, and a streamed fragment opens one where it opens no turn.
 
 use std::{
     collections::HashMap,
@@ -28,10 +32,12 @@ use crate::{
     hooks::{HookEvent, HookRuntime},
     otel::OtelEmitter,
     process_driver::{Event, FailureKind},
+    streaming::StreamArtifact,
     trace::TraceWriter,
 };
 
 use super::process::RunSession;
+use super::process_a2a::A2aStream;
 
 /// The billing mode the process transport exists for. Compared as a plain string: what any other
 /// value means is the harness's business, and the runtime only reports that it is not this one.
@@ -74,7 +80,7 @@ struct OpenTurn {
 ///
 /// Holds no harness knowledge: names arrive bare and are recorded as given, and the only text it
 /// ever reads is the result it writes out.
-pub(super) struct ProcessEventSink {
+pub(super) struct ProcessEventSink<'a> {
     /// The internal session workdir, where `out/result.txt` goes.
     workdir: PathBuf,
     /// This attempt's remaining turn budget, already net of the turns earlier attempts spent.
@@ -90,10 +96,18 @@ pub(super) struct ProcessEventSink {
     /// The id the harness reported for this run, if it reported one at all. What it says wins
     /// over what the runtime asked for, and its absence is half of the session-gone predicate.
     reported_session: Option<String>,
+    /// The A2A half of the same events. Borrowed rather than owned, because the attempt writes
+    /// its one terminal status through it after this sink is done with the run.
+    a2a: &'a mut A2aStream,
 }
 
-impl ProcessEventSink {
-    pub(super) fn new(workdir: &Path, max_turns: u32, session: RunSession) -> Self {
+impl<'a> ProcessEventSink<'a> {
+    pub(super) fn new(
+        workdir: &Path,
+        max_turns: u32,
+        session: RunSession,
+        a2a: &'a mut A2aStream,
+    ) -> Self {
         Self {
             workdir: workdir.to_path_buf(),
             max_turns,
@@ -103,6 +117,7 @@ impl ProcessEventSink {
             finished: false,
             session,
             reported_session: None,
+            a2a,
         }
     }
 
@@ -187,6 +202,8 @@ impl ProcessEventSink {
                 if let Some(exceeded) = self.open_turn(trace).await {
                     return exceeded;
                 }
+                self.a2a.open_segment(self.segment_turn()).await;
+                self.a2a.complete_text();
                 if let Some(open) = self.open.as_mut() {
                     open.text = Some(text);
                 }
@@ -196,6 +213,8 @@ impl ProcessEventSink {
                 if let Some(exceeded) = self.open_turn(trace).await {
                     return exceeded;
                 }
+                // No frame of its own: the http path emits nothing for a tool request either.
+                self.a2a.open_segment(self.segment_turn()).await;
                 let Some(open) = self.open.as_mut() else {
                     return SinkOutcome::Continue;
                 };
@@ -231,6 +250,8 @@ impl ProcessEventSink {
                 };
                 let status = if result.is_error { "error" } else { "ok" };
                 let output_bytes = result.output.len() as u64;
+                let result_id = result.id.clone();
+                let output = result.output.clone();
                 // Measured by the runtime rather than taken from the harness: the bridge executes
                 // the tool, and this is the only clock that saw both ends of the call.
                 let duration_ms = call
@@ -259,7 +280,7 @@ impl ProcessEventSink {
                         &self.workdir,
                         HookEvent::ToolCall {
                             turn: call.turn,
-                            tool_name: call.name,
+                            tool_name: call.name.clone(),
                             input_bytes: call.input_bytes,
                             input: call.input.to_string(),
                             output_bytes,
@@ -268,11 +289,42 @@ impl ProcessEventSink {
                         },
                     )
                     .await;
+                // Built from the generic events alone: the call's bare name, the result's own
+                // output, id and failure flag, and the runtime's own measurement — the same
+                // number the `tool_call` trace record above carries. The bridge hands tool output
+                // back to the harness unfenced, it ran no subprocess this runtime saw the exit of,
+                // and the event carries no truncation flag, so those three keys say so.
+                self.a2a
+                    .tool_result(StreamArtifact::tool_call(
+                        call.name,
+                        output,
+                        None,
+                        &result_id,
+                        result.is_error,
+                        duration_ms,
+                        None,
+                        false,
+                    ))
+                    .await;
                 SinkOutcome::Continue
             }
-            // Streaming fragments and reasoning. Both are evidence the harness is alive — which
-            // the runner already took from the line arriving — and neither is a model action.
-            Event::TextDelta(_) | Event::ThinkingDelta(_) | Event::Thinking(_) => {
+            // Streaming fragments and reasoning. Each is evidence the harness is alive — which
+            // the runner already took from the line arriving — and none is a model action, so none
+            // opens a turn. Each does open an A2A segment: the http path writes its `working`
+            // status before the driver call, and therefore before any chunk.
+            Event::TextDelta(text) => {
+                self.a2a.open_segment(self.segment_turn()).await;
+                self.a2a.text_delta(&text);
+                SinkOutcome::Continue
+            }
+            Event::ThinkingDelta(text) => {
+                self.a2a.open_segment(self.segment_turn()).await;
+                self.a2a.thinking_delta(&text);
+                SinkOutcome::Continue
+            }
+            Event::Thinking(text) => {
+                self.a2a.open_segment(self.segment_turn()).await;
+                self.a2a.complete_thinking(&text);
                 SinkOutcome::Continue
             }
             Event::Retry(retry) => {
@@ -295,12 +347,16 @@ impl ProcessEventSink {
                     self.session.remember(&id);
                 }
                 match super::record_result(hooks, &self.workdir, &result) {
-                    Ok(()) => SinkOutcome::Ended,
+                    Ok(()) => {
+                        self.a2a.turn_end(&result);
+                        SinkOutcome::Ended
+                    }
                     Err(message) => SinkOutcome::Failed(RuntimeError::AgentLoopFailed(message)),
                 }
             }
             Event::TurnFailed(failure) => {
                 self.close_turn(hooks, trace, otel).await;
+                self.a2a.turn_failed();
                 let kind = failure_kind_name(failure.kind);
                 let _ = trace
                     .write_harness_failed(kind, &failure.message, "harness")
@@ -321,6 +377,16 @@ impl ProcessEventSink {
                     origin: "harness".to_string(),
                 })
             }
+        }
+    }
+
+    /// The number, 1-based, that the turn counter would record a turn opening now under — which
+    /// is the number the A2A segment opening with it carries. Reads the counter; never advances
+    /// it, so `max_turns` counts exactly what it counted before segments existed.
+    fn segment_turn(&self) -> u32 {
+        match self.open.as_ref() {
+            Some(open) => open.index + 1,
+            None => self.turns + 1,
         }
     }
 
@@ -435,12 +501,15 @@ pub(super) fn failure_kind_name(kind: FailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
     use super::*;
-    use crate::agent::process::{plan_session, HarnessSessionPolicy};
+    use crate::agent::process::{plan_session, HarnessSessionPolicy, SessionPlan};
     use crate::harness_session::HarnessSessionMap;
-    use crate::process_driver::{SessionInfo, ToolCallInfo, ToolResultInfo, TurnFailure};
+    use crate::process_driver::{
+        RetryInfo, SessionInfo, ToolCallInfo, ToolResultInfo, TurnFailure,
+    };
+    use crate::streaming::SseEventBuffer;
     use serde_json::Value as Json;
 
     /// The context every sink below runs a task under.
@@ -449,12 +518,64 @@ mod tests {
     /// The harness name every sink below records with the session it remembers.
     const HARNESS: &str = "fixture-harness";
 
-    /// A sink, its sinks, and the workdir they write into. Held together so a test can drop the
-    /// tempdir only after reading `trace.jsonl` back.
+    /// The label a frame reads as: its event type, and for the two types whose shape depends on a
+    /// key, the key. The same labelling the process/http parity tests compare sequences with.
+    fn frame_kind(frame: &str) -> String {
+        let data: Json = serde_json::from_str(frame_data(frame)).expect("frame data is JSON");
+        match event_type(frame) {
+            "status" => match data["status"]["state"].as_str().unwrap_or_default() {
+                "working" => format!(
+                    "status:working:{}",
+                    data["status"]["message"].as_str().unwrap_or_default()
+                ),
+                state => format!("status:{state}"),
+            },
+            "text" => match data["final"] == Json::Bool(true) {
+                true => "text:final".to_string(),
+                false => "text:chunk".to_string(),
+            },
+            other => other.to_string(),
+        }
+    }
+
+    fn event_type(frame: &str) -> &str {
+        frame
+            .lines()
+            .find_map(|line| line.strip_prefix("event: "))
+            .expect("every frame names its event type")
+    }
+
+    fn frame_data(frame: &str) -> &str {
+        frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("every frame carries data")
+    }
+
+    /// The parsed `data` of every frame of `event_type`, in order.
+    fn data_of(frames: &[String], event_type_wanted: &str) -> Vec<Json> {
+        frames
+            .iter()
+            .filter(|frame| event_type(frame) == event_type_wanted)
+            .map(|frame| serde_json::from_str(frame_data(frame)).expect("frame data is JSON"))
+            .collect()
+    }
+
+    /// A sink's sinks and the workdir they write into. Held together so a test can drop the
+    /// tempdir only after reading `trace.jsonl` back, and so one A2A stream spans every batch a
+    /// test feeds.
     struct Harness {
         _dir: tempfile::TempDir,
         workdir: PathBuf,
-        sink: ProcessEventSink,
+        max_turns: u32,
+        /// The session policy and plan this harness runs under. Held rather than the `RunSession`
+        /// itself because [`ProcessEventSink::new`] takes one by value, and the sink is rebuilt
+        /// per batch; planning once keeps `planned_id` the id every batch is handed.
+        policy: HarnessSessionPolicy,
+        plan: SessionPlan,
+        a2a: A2aStream,
+        /// Every frame the A2A stream wrote, in order, as the session buffer recorded them.
+        frames: Arc<Mutex<SseEventBuffer>>,
         hooks: HookRuntime,
         trace: TraceWriter,
         otel: OtelEmitter,
@@ -536,24 +657,67 @@ mod tests {
             };
             let plan = plan_session(&policy);
             let planned_id = plan.session.id.clone();
-            let session =
-                crate::agent::process::RunSession::new(&plan, &policy, HARNESS, "fixture-driver");
+            // A real broadcast and buffer, so the frames these tests read are the bytes a client
+            // would have received. The receiver is held for the same reason: a broadcast with no
+            // receiver still buffers, but keeping one proves the frames were sendable.
+            let (tx, rx) = tokio::sync::broadcast::channel(256);
+            let frames = Arc::new(Mutex::new(SseEventBuffer::new(256)));
             Self {
                 _dir: dir,
                 workdir: workdir.clone(),
-                sink: ProcessEventSink::new(&workdir, max_turns, session),
+                max_turns,
+                policy,
+                plan,
+                a2a: A2aStream::new(
+                    Some((tx, Arc::clone(&frames))),
+                    Some("tsk_test".to_string()),
+                    Some(CONTEXT.to_string()),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+                frames,
                 hooks,
                 trace,
                 otel,
                 map,
                 planned_id,
             }
+            .keeping(rx)
         }
 
+        /// The sink is built per batch because it borrows the stream; its turn state is a
+        /// test-local concern and every test here feeds exactly one batch.
         async fn feed(&mut self, events: Vec<Event>) -> SinkOutcome {
-            self.sink
+            let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
+            let mut sink =
+                ProcessEventSink::new(&self.workdir, self.max_turns, session, &mut self.a2a);
+            let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
-                .await
+                .await;
+            sink.finish(&mut self.trace).await;
+            outcome
+        }
+
+        fn keeping(self, rx: tokio::sync::broadcast::Receiver<Arc<String>>) -> Self {
+            drop(rx);
+            self
+        }
+
+        /// Each frame the A2A stream wrote, labelled by kind, in order.
+        fn frame_kinds(&self) -> Vec<String> {
+            self.frames()
+                .iter()
+                .map(|frame| frame_kind(frame))
+                .collect()
+        }
+
+        /// Each frame's `event: <type>` and parsed `data`, in order.
+        fn frames(&self) -> Vec<String> {
+            match self.frames.lock().unwrap().replay_from(0) {
+                crate::streaming::ReplayResult::Complete(frames)
+                | crate::streaming::ReplayResult::WithGap { events: frames, .. } => {
+                    frames.iter().map(|frame| frame.to_string()).collect()
+                }
+            }
         }
 
         /// Every event written so far, parsed.
@@ -786,7 +950,7 @@ mod tests {
     async fn retries_and_notes_are_traced() {
         let mut h = Harness::new(10).await;
         h.feed(vec![
-            Event::Retry(crate::process_driver::RetryInfo {
+            Event::Retry(RetryInfo {
                 attempt: 2,
                 reason: "overloaded".into(),
             }),
@@ -802,6 +966,323 @@ mod tests {
         );
     }
 
+    // ── The A2A frames one attempt writes ─────────────────────────────────────
+
+    /// A segment that streams fragments and then reports the complete text sends the client one
+    /// cursor removal and never the words twice: on this wire a `text` replaces, and the client
+    /// keeps what it was streamed.
+    #[tokio::test]
+    async fn a_streamed_segment_sends_one_cursor_removal() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::TextDelta("one ".into()),
+            Event::TextDelta("two".into()),
+            text("one two"),
+            Event::TurnEnd("one two".into()),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec![
+                "status:working:inference turn 1",
+                "text:chunk",
+                "text:chunk",
+                "text:final",
+            ],
+            "{:#?}",
+            h.frames()
+        );
+        let texts = data_of(&h.frames(), "text");
+        assert_eq!(texts[0]["text"], "one ");
+        assert_eq!(texts[1]["text"], "two");
+        assert_eq!(texts[2]["text"], "", "the cursor removal carries no text");
+        assert_eq!(texts[2]["final"], true);
+    }
+
+    /// The cursor removal a segment owes is paid before the artifact frame that closes it, so a
+    /// client's streamed item is complete before the tool result lands under it.
+    #[tokio::test]
+    async fn a_cursor_removal_precedes_the_artifact_that_closes_its_segment() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::TextDelta("thinking about it".into()),
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            text("done"),
+            Event::TurnEnd("done".into()),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec![
+                "status:working:inference turn 1",
+                "text:chunk",
+                "text:final",
+                "artifact",
+                "status:working:inference turn 2",
+                "text:final",
+            ],
+            "{:#?}",
+            h.frames()
+        );
+    }
+
+    /// Every key of the artifact frame comes from the contract's own events, or from the
+    /// runtime's own measurement of the call.
+    #[tokio::test]
+    async fn the_artifact_frame_is_built_from_the_generic_events() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", true),
+            Event::TurnEnd(String::new()),
+        ])
+        .await;
+        let frames = h.frames();
+        let artifact = &data_of(&frames, "artifact")[0]["artifact"];
+        assert_eq!(artifact["tool_name"], "echo-tool");
+        assert_eq!(artifact["content"], "done");
+        assert_eq!(artifact["tool_call_id"], "c1");
+        assert_eq!(artifact["is_error"], true);
+        assert!(artifact["duration_ms"].is_number(), "{artifact}");
+        assert_eq!(
+            artifact["fence_source"],
+            Json::Null,
+            "the bridge returns tool output unfenced"
+        );
+        assert_eq!(artifact["exit_code"], Json::Null);
+        assert_eq!(artifact["truncated"], false);
+    }
+
+    /// A tool result nothing called for writes no frame, the same way it writes no `tool_call`
+    /// record.
+    #[tokio::test]
+    async fn an_unmatched_tool_result_writes_no_frame() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![tool_result("ghost", false)]).await;
+        assert!(h.frame_kinds().is_empty(), "{:#?}", h.frames());
+    }
+
+    /// A segment that streamed the client its text does not send it again when the turn ends.
+    #[tokio::test]
+    async fn a_turn_end_after_streamed_text_sends_no_fallback() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::TextDelta("all of it".into()),
+            Event::TurnEnd("all of it".into()),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec![
+                "status:working:inference turn 1",
+                "text:chunk",
+                "text:final"
+            ],
+            "{:#?}",
+            h.frames()
+        );
+        assert_eq!(
+            data_of(&h.frames(), "text")[1]["text"],
+            "",
+            "the one final text frame is the cursor removal, not the result again"
+        );
+    }
+
+    /// A segment that streamed nothing sends the whole result as one final text frame — what the
+    /// http path does for a driver that emits no chunks.
+    #[tokio::test]
+    async fn a_turn_end_after_an_unstreamed_segment_sends_the_result() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            text("the answer"),
+            Event::TurnEnd("the answer".into()),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec!["status:working:inference turn 1", "text:final"],
+            "{:#?}",
+            h.frames()
+        );
+        assert_eq!(data_of(&h.frames(), "text")[0]["text"], "the answer");
+    }
+
+    /// An empty result is no answer to send.
+    #[tokio::test]
+    async fn a_turn_end_with_an_empty_result_sends_no_text() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![text(""), Event::TurnEnd(String::new())]).await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec!["status:working:inference turn 1"],
+            "{:#?}",
+            h.frames()
+        );
+    }
+
+    /// Thinking reaches the client, and a complete `thinking` after fragments is not sent again:
+    /// the client already has every word of it.
+    #[tokio::test]
+    async fn thinking_fragments_are_sent_once() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::ThinkingDelta("step ".into()),
+            Event::ThinkingDelta("one".into()),
+            Event::Thinking("step one".into()),
+            text("done"),
+            Event::TurnEnd("done".into()),
+        ])
+        .await;
+        let frames = h.frames();
+        let thinking = data_of(&frames, "thinking");
+        assert_eq!(thinking.len(), 2, "{frames:#?}");
+        assert_eq!(thinking[0]["text"], "step ");
+        assert_eq!(thinking[1]["text"], "one");
+        for frame in &thinking {
+            assert_eq!(
+                frame["final"], false,
+                "thinking is never final on this wire"
+            );
+        }
+    }
+
+    /// A complete `thinking` with no fragments before it is the client's only copy, and is sent.
+    #[tokio::test]
+    async fn a_whole_thinking_is_sent_when_nothing_streamed_it() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::Thinking("whole thought".into()),
+            text("done"),
+            Event::TurnEnd("done".into()),
+        ])
+        .await;
+        let frames = h.frames();
+        let thinking = data_of(&frames, "thinking");
+        assert_eq!(thinking.len(), 1, "{frames:#?}");
+        assert_eq!(thinking[0]["text"], "whole thought");
+        assert_eq!(thinking[0]["final"], false);
+    }
+
+    /// A provider retry, a note and the session's own start are trace records and nothing else:
+    /// the http stream has no frame for any of them, and a frame here would be one the two
+    /// transports do not share.
+    #[tokio::test]
+    async fn retries_notes_and_session_starts_write_no_frame() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::SessionStarted(SessionInfo {
+                id: "s".into(),
+                auth: SUBSCRIPTION_AUTH.into(),
+                model: None,
+            }),
+            Event::Retry(RetryInfo {
+                attempt: 2,
+                reason: "overloaded".into(),
+            }),
+            Event::Note("a line the driver could not read".into()),
+        ])
+        .await;
+        assert!(h.frame_kinds().is_empty(), "{:#?}", h.frames());
+    }
+
+    /// A segment's number is the number the turn counter would give a turn opening with it, so a
+    /// fragment that opens a segment before the turn it belongs to names the same turn.
+    #[tokio::test]
+    async fn a_segment_carries_the_number_of_the_turn_it_opens_with() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            Event::TextDelta("second".into()),
+            text("second"),
+            Event::TurnEnd("second".into()),
+        ])
+        .await;
+        let working: Vec<String> = h
+            .frame_kinds()
+            .into_iter()
+            .filter(|kind| kind.starts_with("status:working"))
+            .collect();
+        assert_eq!(
+            working,
+            vec![
+                "status:working:inference turn 1",
+                "status:working:inference turn 2"
+            ],
+            "{:#?}",
+            h.frames()
+        );
+        assert_eq!(
+            h.of_type("inference").await.len(),
+            2,
+            "a segment reads the turn counter and never advances it"
+        );
+    }
+
+    /// The attempt's terminal status, on the two paths out of a run the harness itself ends.
+    #[tokio::test]
+    async fn an_attempt_ends_with_one_terminal_status() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            text("the answer"),
+            Event::TurnEnd("the answer".into()),
+        ])
+        .await;
+        h.a2a.finish(&Ok(crate::agent::AgentLoopExit::Ok)).await;
+        assert_eq!(h.frame_kinds().last().unwrap(), "status:completed");
+        let completed = data_of(&h.frames(), "status").pop().unwrap();
+        assert_eq!(completed["status"]["response"], "the answer");
+        assert_eq!(completed["status"]["message"], "session ended");
+        assert_eq!(completed["final"], true);
+        assert_eq!(completed["context_id"], "ctx_test");
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![Event::TurnFailed(TurnFailure {
+            kind: FailureKind::Auth,
+            message: "not signed in".into(),
+        })])
+        .await;
+        h.a2a
+            .finish(&Err(RuntimeError::HarnessTurnFailed {
+                kind: "auth".into(),
+                message: "not signed in".into(),
+                origin: "harness".into(),
+            }))
+            .await;
+        assert_eq!(h.frame_kinds(), vec!["status:failed"], "{:#?}", h.frames());
+        let failed = data_of(&h.frames(), "status").pop().unwrap();
+        let message = failed["status"]["message"].as_str().unwrap();
+        assert!(message.contains("E-RUN-033"), "{message}");
+        assert!(message.contains("auth"), "{message}");
+        assert!(message.contains("not signed in"), "{message}");
+        assert_eq!(failed["final"], true);
+    }
+
+    /// A run with no A2A task — `mur run`, a `task.md` launch — writes no frame at all.
+    #[tokio::test]
+    async fn a_run_with_no_task_writes_no_frames() {
+        let mut h = Harness::new(10).await;
+        let frames = Arc::clone(&h.frames);
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        h.a2a = A2aStream::new(
+            Some((tx, Arc::clone(&frames))),
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        h.feed(vec![
+            Event::TextDelta("streamed".into()),
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            text("done"),
+            Event::TurnEnd("done".into()),
+        ])
+        .await;
+        h.a2a.finish(&Ok(crate::agent::AgentLoopExit::Ok)).await;
+        assert!(h.frame_kinds().is_empty(), "{:#?}", h.frames());
+    }
+
     /// A result nobody called for, and a call nobody answered, are both notes — never a
     /// `tool_call` record for something that did not happen.
     #[tokio::test]
@@ -809,7 +1290,6 @@ mod tests {
         let mut h = Harness::new(10).await;
         h.feed(vec![tool_result("ghost", false), tool_call("c9", "t")])
             .await;
-        h.sink.finish(&mut h.trace).await;
         let notes = h.of_type("harness_note").await;
         assert_eq!(notes.len(), 2, "{notes:#?}");
         assert!(notes[0]["text"].as_str().unwrap().contains("ghost"));

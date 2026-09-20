@@ -550,7 +550,7 @@ fn the_card_keeps_every_existing_key_and_adds_only_serves() {
     let capability_keys: HashSet<&str> = capabilities.keys().map(String::as_str).collect();
     assert_eq!(
         capability_keys,
-        HashSet::from(["tools", "shell", "network", "streaming"])
+        HashSet::from(["tools", "shell", "network", "streaming", "cancellation"])
     );
 
     assert_eq!(card["name"], "door-discovery-agent");
@@ -561,6 +561,10 @@ fn the_card_keeps_every_existing_key_and_adds_only_serves() {
     assert_eq!(capabilities["shell"], false);
     assert_eq!(capabilities["network"], true, "the endpoint is allowlisted");
     assert_eq!(capabilities["streaming"], true);
+    assert_eq!(
+        capabilities["cancellation"], true,
+        "an http capsule can stop a task"
+    );
 
     let serves = card["serves"].as_object().expect("serves is an object");
     let serves_keys: HashSet<&str> = serves.keys().map(String::as_str).collect();

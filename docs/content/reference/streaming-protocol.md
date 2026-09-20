@@ -146,6 +146,38 @@ data: {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b
 
 ---
 
+## Transports { #transports }
+
+A task writes the same frames whatever the capsule's [`inference.transport`](manifest.md#inference-config):
+the same types, the same keys and the same order for the same work. On a `transport: process`
+capsule the frames come from the events its [process driver](manifest.md#process-driver) reads out
+of the harness:
+
+| The harness | Frames |
+|---|---|
+| Starts text, reasoning or a tool call | `status` `working`, message `inference turn <n>` |
+| Streams a fragment of text | [`text`](#event-text), `"final":false` |
+| Reports the complete text of what it streamed | [`text`](#event-text), `"final":true`, empty — the client keeps the fragments it was sent |
+| Streams a fragment of reasoning, or reports reasoning nothing streamed | [`thinking`](#event-thinking) |
+| Answers a tool call | [`artifact`](#event-artifact) |
+| Ends the turn | The whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then `status` `completed` |
+| Fails the turn | `status` `failed` |
+
+Every attempt of a process task ends in exactly one `final:true` `status` frame, on every path out
+of the attempt, including the ones a runtime diagnostic ends: the frame's `status.message` is that
+diagnostic, under the code [`mur` reports it as](diagnostics.md).
+
+The two transports' streams differ in three things, each because the harness, not this runtime,
+ran the turn:
+
+| Difference | Why |
+|---|---|
+| `artifact.fence_source` is `null` on every frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
+| `artifact.exit_code` is `null` and `artifact.truncated` is `false` on every frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
+| A provider retry writes no frame on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
+
+---
+
 ## `status` { #event-status }
 
 A task's state. Written by the agent loop at the start of every inference turn, when a task waits
@@ -166,7 +198,7 @@ for input and resumes, and when a task ends.
 | `working` | `false` | `inference turn <n>`, counted from 1, at the start of each inference turn. `resumed` when an `input-required` wait is answered |
 | `input-required` | `false` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
 | `completed` | `true` | `session ended` |
-| `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out |
+| `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; `error[<code>]: <message>` when a diagnostic ended a [`transport: process`](#transports) attempt |
 | `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one |
 | `rejected` | `true` | `task rejected: capsule is busy`. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered |
 
@@ -243,7 +275,7 @@ A piece of the model's reply.
 | `final` | `text` | Written when |
 |---|---|---|
 | `false` | A chunk | A streaming driver, or a tool, emits a chunk through [`murmur:text/chunks`](wit-interfaces.md#interfaces) |
-| `true` | `""` | A streaming driver's inference call returned. Marks the end of that turn's chunks |
+| `true` | `""` | A streaming driver's inference call returned, or a [`transport: process`](#transports) harness reported the complete text of fragments it streamed. Marks the end of that turn's chunks |
 | `true` | The whole reply | A task completed with a non-empty reply and no chunk was emitted during its last inference turn |
 
 `final` on a `text` frame ends nothing: the task goes on to its `status` frames.

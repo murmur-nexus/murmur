@@ -18,8 +18,10 @@
 //!    one, then [`build_launch_request`], then the driver's `launch`, which returns the plan.
 //! 6. **Spawn** — an environment that starts empty and holds only what `capabilities.env.allow`
 //!    delivers plus the plan's `env-set`, in the accessible workdir the capsule's tools see.
-//! 7. **Read** — complete stdout lines, batched into `parse`, fed to [`ProcessEventSink`].
-//! 8. **End** — the harness is dead whenever this returns, on every path.
+//! 7. **Read** — complete stdout lines, batched into `parse`, fed to [`ProcessEventSink`], whose
+//!    A2A half writes the task's frames through [`A2aStream`].
+//! 8. **End** — the harness is dead whenever this returns, on every path, and the attempt's one
+//!    terminal `status` frame is written from [`run_process_inference_loop`] whatever ended it.
 //!
 //! A run is bounded by inactivity, not by a wall clock: an agent that is working — writing output
 //! or calling a tool through the bridge — is never interrupted for taking a long time.
@@ -59,6 +61,7 @@ use crate::{
     CapabilityPolicy,
 };
 
+use super::process_a2a::A2aStream;
 use super::process_events::SinkOutcome;
 use super::{claude_bridge, inventory::build_tool_inventory, process_events::ProcessEventSink};
 
@@ -532,12 +535,52 @@ pub(crate) async fn run_process_inference_loop(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-    _task_id: Option<String>,
-    _sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    task_id: Option<String>,
+    sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    context_id: Option<String>,
     accessible_workdir: &Path,
     _name: &str,
     _version: &str,
     session_policy: HarnessSessionPolicy,
+) -> Result<AgentLoopExit, RuntimeError> {
+    // Every path below leaves through the one `finish` call at the end, which is what makes the
+    // attempt's terminal `status` frame arrive exactly once — including on the paths that return
+    // an error, where a client would otherwise wait on a frame no one was going to write.
+    let mut a2a = A2aStream::new(
+        sse,
+        task_id,
+        context_id,
+        Arc::clone(&store_state.a2a_chunks_emitted),
+    );
+    let outcome = run_attempt(
+        store_state,
+        workdir,
+        inference,
+        system_prompt,
+        hooks,
+        trace,
+        otel,
+        accessible_workdir,
+        session_policy,
+        &mut a2a,
+    )
+    .await;
+    a2a.finish(&outcome).await;
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_attempt(
+    store_state: &CapsuleStoreState,
+    workdir: &Path,
+    inference: &InferenceConfig,
+    system_prompt: Option<String>,
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    accessible_workdir: &Path,
+    session_policy: HarnessSessionPolicy,
+    a2a: &mut A2aStream,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let Some(staged) = store_state.process_driver.clone() else {
         return Err(RuntimeError::DriverNotConfigured);
@@ -559,6 +602,7 @@ pub(crate) async fn run_process_inference_loop(
         otel,
         accessible_workdir,
         session_policy,
+        a2a,
     )
     .await;
 
@@ -579,6 +623,7 @@ async fn run_harness(
     otel: &mut OtelEmitter,
     accessible_workdir: &Path,
     session_policy: HarnessSessionPolicy,
+    a2a: &mut A2aStream,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // One driver instance for the whole run, so `parse` may answer from what `launch` was given.
     let mut driver = ProcessDriver::instantiate(
@@ -689,7 +734,7 @@ async fn run_harness(
         })
         .await;
 
-    let mut sink = ProcessEventSink::new(workdir, inference.max_turns, session);
+    let mut sink = ProcessEventSink::new(workdir, inference.max_turns, session, a2a);
     let outcome = drive_harness(
         store_state,
         staged,
@@ -733,7 +778,7 @@ async fn drive_harness(
     cwd: &Path,
     plan: &LaunchPlan,
     driver: &mut ProcessDriver,
-    sink: &mut ProcessEventSink,
+    sink: &mut ProcessEventSink<'_>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,

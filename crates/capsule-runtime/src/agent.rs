@@ -1,6 +1,7 @@
 mod claude_bridge;
 pub(crate) mod inventory;
 pub(crate) mod process;
+mod process_a2a;
 mod process_events;
 
 use std::sync::{atomic::Ordering, Arc, Mutex};
@@ -366,6 +367,7 @@ pub(crate) async fn run_agent_loop(
             otel,
             task_id,
             sse,
+            context_id,
             accessible_workdir,
             name,
             version,

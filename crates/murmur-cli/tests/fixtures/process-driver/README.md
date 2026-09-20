@@ -56,6 +56,7 @@ One event per line, read from the first word:
 | `started <id> [<auth>]` | `session-started { id, auth, model: none }`; `auth` defaults to `subscription` |
 | `delta <text>` | `text-delta(<text>)` |
 | `text <text>` | `text(<text>)` |
+| `tdelta <text>` | `thinking-delta(<text>)` |
 | `thinking <text>` | `thinking(<text>)` |
 | `tool <id> <name> <json>` | `tool-call { id, name with the bridge prefix stripped, input: <json> }` |
 | `result <id> ok\|error <output>` | `tool-result { id, output, is-error }` |
@@ -99,6 +100,10 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `memory` | Keeps one conversation per session id and answers with everything it holds |
 | `memory-renames` | `memory`, but a new session is reported back under an id of the harness's own |
 | `linger` | `end LINGER`, then ignores stdin closing and sleeps, so the exit grace kills it |
+| `parity` | One `text`, one bridge tool call and its result, then the answer and `end PARITY-ANSWER` |
+| `stream` | Three `delta` fragments, the complete `text`, then `end` with the same words |
+| `think` | Two `tdelta` fragments, the complete `thinking`, then `text done` and `end DONE` |
+| `think-whole` | One complete `thinking` with nothing streaming it, then `text done` and `end DONE` |
 
 `silent`, `turns` and `linger` write their pid to `harness.pid` in their working directory, which
 is how a test proves the harness is dead.
