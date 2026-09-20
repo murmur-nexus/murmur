@@ -35,7 +35,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
-| `harness_start`, `harness_warning`, `harness_session`, `harness_retry`, `harness_note`, `harness_failed`, `harness_exit` | The task node |
+| `harness_start`, `harness_warning`, `harness_session`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
@@ -458,7 +458,7 @@ called [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running
 |---|---|---|
 | `task_id` | string | The task that was stopped |
 | `turn` | u32 | The turn that was in flight, 0-based. Absent for a task cancelled before it ran |
-| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` — which wait the cancel interrupted |
+| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"harness"` — which wait the cancel interrupted. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted |
 | `detached_work_ids` | array of string | Demoted shell commands still running when the loop stopped |
 | `delegation_ids` | array of string | Delegations still in flight when the loop stopped |
 
@@ -570,7 +570,7 @@ process exists
 | `harness_version` | string \| null | The line the binary printed for its version arguments. `null` when it could not be read |
 | `version_tested` | bool | Whether that line names a version the driver lists as tested. See [`W-RUN-002`](diagnostics.md#w-run-002) |
 | `harness_session_id` | string | The session id handed to the driver. Distinct from `session_id`, the murmur session |
-| `session_mode` | string | `"new"` — every run starts the harness on a fresh session |
+| `session_mode` | string | `"new"` or `"resume"` — whether this run started the harness on a fresh session or continued the one its context already had |
 | `args_count` | u32 | How many arguments the driver asked for. Never the arguments |
 | `env_names` | array of string | Names of the environment variables the harness was given, sorted. Never their values |
 | `files` | array of string | Names of the files the driver asked to be written into the run's private directory. Never their contents |
@@ -611,11 +611,24 @@ The run ends with [`E-RUN-033`](diagnostics.md#e-run-033) naming the same kind.
 | `reason` | string | Why it is retrying |
 
 **`harness_note`** — written for anything else the harness said, for a tool result that matched no
-call, and once per tool call the run ended without a result for
+call, once per tool call the run ended without a result for, for an interrupt that could not be
+delivered, and for a `classify-exit` call the driver never answered
 
 | Field | Type | Notes |
 |---|---|---|
 | `text` | string | The note |
+
+**`harness_interrupt`** — written when a person cancels a task whose harness is running, before
+the harness is given any grace
+
+| Field | Type | Notes |
+|---|---|---|
+| `method` | string | `"stdin-message"`, `"signal-int"` or `"unsupported"` — the interrupt the [process driver](manifest.md#process-driver)'s `describe()` declares |
+| `delivered` | bool | Whether a graceful interrupt reached the harness. `false` for `"unsupported"`, for a `"stdin-message"` driver whose own launch plan left nothing to write to or nothing to write, and for a `SIGINT` the kernel refused — each of which is also a `harness_note` |
+| `grace_ms` | u64 | How long the harness has to end on its own before it is killed: 10000, or `0` whenever `delivered` is `false` |
+
+The attempt ends `canceled` from here on, whatever the harness says next. Its `harness_exit`
+carries `cause: "canceled"`, and `killed` says whether the runtime had to reap it.
 
 **`harness_exit`** — written once per spawned harness, after it is gone
 
@@ -623,7 +636,7 @@ call, and once per tool call the run ended without a result for
 |---|---|---|
 | `code` | i32 \| null | Exit code. `null` when a signal ended it |
 | `signal` | i32 \| null | Signal that ended it. `null` when it exited normally |
-| `cause` | string | `"terminal"` (the harness finished the turn), `"eof"` (its output ended first), `"inactivity"` ([`E-RUN-035`](diagnostics.md#e-run-035)), `"max_turns"` or `"driver_error"` |
+| `cause` | string | `"terminal"` (the harness finished the turn), `"eof"` (its output ended first), `"inactivity"` ([`E-RUN-035`](diagnostics.md#e-run-035)), `"max_turns"`, `"driver_error"` or `"canceled"` (a person stopped the task) |
 | `killed` | bool | Whether the runtime had to kill it rather than wait for it |
 | `duration_ms` | u64 | How long the process lived |
 

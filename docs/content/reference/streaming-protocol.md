@@ -199,7 +199,7 @@ for input and resumes, and when a task ends.
 | `input-required` | `false` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
 | `completed` | `true` | `session ended` |
 | `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; `error[<code>]: <message>` when a diagnostic ended a [`transport: process`](#transports) attempt |
-| `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one |
+| `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed rather than stopping when it was asked |
 | `rejected` | `true` | `task rejected: capsule is busy`. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered |
 
 A `final` status is the last frame a task writes in the ordinary case, with two exceptions that

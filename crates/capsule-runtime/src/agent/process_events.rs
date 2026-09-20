@@ -121,6 +121,25 @@ impl<'a> ProcessEventSink<'a> {
         }
     }
 
+    /// The runtime is about to interrupt the harness. Everything the harness says from here on is
+    /// still recorded — a partial answer is worth keeping — but the attempt ends `canceled`.
+    pub(super) fn mark_interrupted(&mut self) {
+        self.a2a.mark_interrupted();
+    }
+
+    /// The interrupted harness had to be killed rather than ending when it was asked.
+    pub(super) fn mark_harness_killed(&mut self) {
+        self.a2a.mark_harness_killed();
+    }
+
+    /// The turn a record written now belongs to: the open turn, or the last one that closed.
+    pub(super) fn current_turn(&self) -> u32 {
+        match self.open.as_ref() {
+            Some(open) => open.index,
+            None => self.turns.saturating_sub(1),
+        }
+    }
+
     /// Feed one `parse` batch through. Events after a terminal one, in the same batch, are
     /// ignored: the run is over and the harness is already being shut down.
     pub(super) async fn consume(
@@ -1251,6 +1270,67 @@ mod tests {
         assert!(message.contains("auth"), "{message}");
         assert!(message.contains("not signed in"), "{message}");
         assert_eq!(failed["final"], true);
+    }
+
+    /// Once the runtime has interrupted an attempt it ends `canceled`, whatever the harness says
+    /// next: a finished turn is not a completion and a failed one — of any kind, the `canceled`
+    /// kind a harness that honours an interrupt reports included — is not a failure. The answer
+    /// the harness produced anyway is kept, and is not sent as the client's final text.
+    #[tokio::test]
+    async fn an_interrupted_attempt_ends_canceled_whatever_the_harness_said() {
+        let last_words = || {
+            let mut events = vec![Event::TurnEnd("the answer".into())];
+            for kind in [
+                FailureKind::Auth,
+                FailureKind::Quota,
+                FailureKind::MaxTurns,
+                FailureKind::Canceled,
+                FailureKind::HarnessError,
+                FailureKind::Other,
+            ] {
+                events.push(Event::TurnFailed(TurnFailure {
+                    kind,
+                    message: "stopped".into(),
+                }));
+            }
+            // And a run the harness never answered at all.
+            events.push(Event::Note("nothing terminal here".into()));
+            events
+        };
+        for last in last_words() {
+            for killed in [false, true] {
+                let mut h = Harness::new(10).await;
+                h.a2a.mark_interrupted();
+                h.feed(vec![text("the answer"), last.clone()]).await;
+                if killed {
+                    h.a2a.mark_harness_killed();
+                }
+                h.a2a
+                    .finish(&Ok(crate::agent::AgentLoopExit::Canceled))
+                    .await;
+
+                let statuses = data_of(&h.frames(), "status");
+                let terminal: Vec<&Json> = statuses
+                    .iter()
+                    .filter(|status| status["final"] == Json::Bool(true))
+                    .collect();
+                assert_eq!(terminal.len(), 1, "{:#?}", h.frames());
+                assert_eq!(terminal[0]["status"]["state"], "canceled");
+                assert_eq!(terminal[0]["context_id"], "ctx_test");
+                assert!(terminal[0]["status"]["response"].is_null());
+                let message = terminal[0]["status"]["message"].as_str().unwrap();
+                assert_eq!(
+                    message.contains("the harness was killed"),
+                    killed,
+                    "{message}"
+                );
+                assert!(
+                    !h.frame_kinds().contains(&"text:final".to_string()),
+                    "a stopped task is sent no final answer: {:#?}",
+                    h.frames()
+                );
+            }
+        }
     }
 
     /// A run with no A2A task — `mur run`, a `task.md` launch — writes no frame at all.

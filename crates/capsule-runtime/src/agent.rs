@@ -316,8 +316,7 @@ pub(crate) async fn run_agent_loop(
     context_id: Option<String>,
     seed: Option<HookSeed>,
     // This task's cancel flag, or `None` where no task can be cancelled: the `task.md` paths,
-    // which run no A2A task, and the empty-task timeout path. The `process` transport ignores it
-    // — the CLI it drives owns its own turn, and this runtime has no wait of its own to drop.
+    // which run no A2A task, and the empty-task timeout path.
     cancel: Option<CancelSignal>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
@@ -372,6 +371,7 @@ pub(crate) async fn run_agent_loop(
             name,
             version,
             session_policy,
+            cancel,
         )
         .await;
     }
@@ -1553,7 +1553,7 @@ async fn finish_canceled_turn(
                 context_id,
                 status: StreamStatus {
                     state: AgentLoopExit::Canceled.as_str().into(),
-                    message: "task canceled".into(),
+                    message: crate::cancel::CANCELED_STATUS_MESSAGE.into(),
                     response: None,
                 },
                 r#final: true,

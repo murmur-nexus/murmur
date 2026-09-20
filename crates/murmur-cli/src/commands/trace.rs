@@ -475,6 +475,15 @@ struct HarnessFailedEvent {
     message: String,
 }
 
+/// How a cancelled task's harness was stopped. Rendered so that "a kill was needed" — a harness
+/// session that may not resume cleanly — is readable without reading the raw trace.
+#[derive(Debug, Deserialize)]
+struct HarnessInterruptEvent {
+    method: String,
+    delivered: bool,
+    grace_ms: u64,
+}
+
 /// The resource-plane and peer-file records are rendered as counts by outcome, so `outcome`
 /// is the only field five of the nine event types contribute.
 #[derive(Debug, Deserialize)]
@@ -628,6 +637,7 @@ enum TraceEvent {
     SpendCeilingReached(SpendCeilingReachedEvent),
     HarnessWarning(HarnessWarningEvent),
     HarnessFailed(HarnessFailedEvent),
+    HarnessInterrupt(HarnessInterruptEvent),
     #[serde(other)]
     Unknown,
 }
@@ -707,8 +717,8 @@ struct ContextSeedRecord {
     message_ids: Vec<String>,
 }
 
-/// One `harness_warning` or `harness_failed` record, already rendered as the single line
-/// `mur trace show` prints for it.
+/// One `harness_warning`, `harness_failed` or `harness_interrupt` record, already rendered as the
+/// single line `mur trace show` prints for it.
 struct HarnessLine(String);
 
 /// One `hook_dispatch_error` record — a hook that failed without failing the session.
@@ -847,7 +857,8 @@ struct TraceMetrics {
     protected_path_denials: Vec<ProtectedPathDenialRecord>,
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
-    /// The `harness_warning` and `harness_failed` lines of a `transport: process` run, in the
+    /// The `harness_warning`, `harness_failed` and `harness_interrupt` lines of a
+    /// `transport: process` run, in the
     /// order they were written.
     harness_lines: Vec<HarnessLine>,
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
@@ -1454,6 +1465,14 @@ fn compute_metrics(
                     "harness failed ({}): {}",
                     e.kind, e.message
                 )));
+            }
+            TraceEvent::HarnessInterrupt(e) => {
+                let outcome = if e.delivered {
+                    format!("sent, {}ms grace", e.grace_ms)
+                } else {
+                    "not sent; harness killed at once".to_string()
+                };
+                harness_lines.push(HarnessLine(format!("interrupt {}: {outcome}", e.method)));
             }
             TraceEvent::Retention(e) => {
                 retentions.push(RetentionRecord {

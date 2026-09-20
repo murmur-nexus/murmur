@@ -138,14 +138,13 @@ pub(crate) struct DeclaredPlanes {
     pub peer_files: bool,
 }
 
-/// What the capsule's inference transport can actually do, for the two capability booleans that
-/// are otherwise read off the served method list alone.
+/// What the capsule's inference transport can actually do, beyond what the served method list
+/// already says. Every transport can be stopped, so cancellation is not here: it is the served
+/// method alone.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportCapabilities {
     /// Whether the transport emits streaming text frames.
     pub streams_text: bool,
-    /// Whether a task on this transport can be stopped.
-    pub cancellable: bool,
 }
 
 /// Build the Agent Card JSON derived from capsule identity and capability policy.
@@ -160,12 +159,11 @@ pub(crate) struct TransportCapabilities {
 /// dispatcher refuses or omit one it serves. `serves.planes` lists `files` then `peer_files`, each
 /// only when declared.
 ///
-/// The two capability booleans a client reads before it waits on anything are each the door's
-/// answer *and* the transport's: `capabilities.streaming` is `true` when `serves.methods` contains
-/// `message/stream` and `transport.streams_text`, `capabilities.cancellation` when it contains
-/// `tasks/cancel` and `transport.cancellable`. A door that answers a method whose effect its
-/// transport cannot deliver still lists the method — `serves.methods` names what the dispatcher
-/// answers — and says so here.
+/// The two capability booleans a client reads before it waits on anything are read off
+/// `serves.methods`: `capabilities.cancellation` is `true` when it contains `tasks/cancel`, and
+/// `capabilities.streaming` when it contains `message/stream` and the transport streams text. A
+/// door that answers a method whose effect its transport cannot deliver still lists the method —
+/// `serves.methods` names what the dispatcher answers — and says so here.
 pub(crate) fn build_agent_card(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
@@ -183,8 +181,7 @@ pub(crate) fn build_agent_card(
     let methods = served_methods(task_acceptance);
     let streaming =
         methods.contains(&DoorMethod::MessageStream.wire_name()) && transport.streams_text;
-    let cancellation =
-        methods.contains(&DoorMethod::TasksCancel.wire_name()) && transport.cancellable;
+    let cancellation = methods.contains(&DoorMethod::TasksCancel.wire_name());
     let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
         .into_iter()
         .filter_map(|(declared, name)| declared.then_some(name))
@@ -1045,11 +1042,8 @@ mod tests {
         TaskAcceptance::Queue,
     ];
 
-    /// The card an http capsule serves: that transport streams text and stops a task.
-    const HTTP_TRANSPORT: TransportCapabilities = TransportCapabilities {
-        streams_text: true,
-        cancellable: true,
-    };
+    /// The card an http capsule serves: that transport streams text.
+    const HTTP_TRANSPORT: TransportCapabilities = TransportCapabilities { streams_text: true };
 
     fn card_for(acceptance: &TaskAcceptance, planes: DeclaredPlanes) -> Value {
         card_for_transport(acceptance, planes, HTTP_TRANSPORT)
@@ -1076,65 +1070,55 @@ mod tests {
         )
     }
 
-    /// Each capability boolean is the served method AND the transport's answer, so a door that
-    /// answers a method its transport cannot deliver advertises the method and not the capability.
+    /// `streaming` is the served method AND the transport's answer, so a door that answers
+    /// `message/stream` over a transport that streams nothing advertises the method and not the
+    /// capability. `cancellation` is the served method alone: every transport can be stopped.
     #[test]
     fn card_capabilities_are_the_method_and_the_transport() {
-        let cases = [
+        for (transport, streaming) in [
             (
                 TransportCapabilities {
                     streams_text: false,
-                    cancellable: true,
                 },
                 false,
-                true,
             ),
-            (
-                TransportCapabilities {
-                    streams_text: true,
-                    cancellable: false,
-                },
-                true,
-                false,
-            ),
-        ];
-        for (transport, streaming, cancellation) in cases {
+            (TransportCapabilities { streams_text: true }, true),
+        ] {
             let card = card_for_transport(
                 &TaskAcceptance::Single,
                 DeclaredPlanes::default(),
                 transport,
             );
             assert_eq!(card["capabilities"]["streaming"], streaming, "{card}");
-            assert_eq!(card["capabilities"]["cancellation"], cancellation, "{card}");
+            assert_eq!(
+                card["capabilities"]["cancellation"], true,
+                "a door that answers tasks/cancel advertises cancellation: {card}"
+            );
             assert!(
                 card["serves"]["methods"]
                     .as_array()
                     .expect("serves.methods is an array")
                     .contains(&Value::from("tasks/cancel")),
-                "a capsule that cannot stop a task still answers tasks/cancel: {card}"
+                "{card}"
             );
         }
     }
 
     /// A door that starts no task streams nothing, whatever its transport can do: neither
-    /// task-starting method is served under `TaskAcceptance::None`. It still answers
-    /// `tasks/cancel`, so that capability is the transport's answer alone.
+    /// task-starting method is served under `TaskAcceptance::None`. `tasks/cancel` is served
+    /// under every acceptance, so cancellation stays advertised.
     #[test]
     fn a_door_that_starts_no_task_advertises_no_streaming() {
         for transport in [
             HTTP_TRANSPORT,
             TransportCapabilities {
-                streams_text: true,
-                cancellable: false,
+                streams_text: false,
             },
         ] {
             let card =
                 card_for_transport(&TaskAcceptance::None, DeclaredPlanes::default(), transport);
             assert_eq!(card["capabilities"]["streaming"], false, "{card}");
-            assert_eq!(
-                card["capabilities"]["cancellation"], transport.cancellable,
-                "{card}"
-            );
+            assert_eq!(card["capabilities"]["cancellation"], true, "{card}");
         }
     }
 

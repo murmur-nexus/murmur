@@ -227,6 +227,34 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "text done"
     echo "end DONE"
     ;;
+  interrupt-honours)
+    # Honours a stdin interrupt: keeps reading stdin and stops the moment the runtime writes the
+    # driver's interrupt bytes, reporting the turn the way a stopped harness does.
+    record_pid
+    echo "started fixture-session-1"
+    while IFS= read -r line; do
+      if [ "$line" = "interrupt" ]; then
+        echo "fail canceled interrupted by the runtime"
+        exit 0
+      fi
+    done
+    ;;
+  interrupt-ignores)
+    # Never reads its stdin and never stops on its own, so the interrupt grace has to run out and
+    # the runtime has to kill it.
+    record_pid
+    echo "started fixture-session-1"
+    sleep 600
+    ;;
+  interrupt-signal)
+    # Stops on SIGINT, reporting the turn as canceled before it goes.
+    record_pid
+    echo "started fixture-session-1"
+    trap 'echo "fail canceled interrupted by SIGINT"; kill $SLEEP_PID 2>/dev/null; exit 0' INT
+    sleep 600 &
+    SLEEP_PID=$!
+    wait $SLEEP_PID
+    ;;
   linger)
     # Prints its terminal event and then ignores stdin closing, so the exit grace has to kill it.
     record_pid
