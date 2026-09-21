@@ -2,11 +2,14 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
+use assert_cmd::assert::Assert;
 use assert_cmd::Command;
 use murmur_artifact::{
     sha256_hex, write_lockfile_atomic, LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION,
@@ -1590,16 +1593,32 @@ fn doctor_names_the_running_binary_and_what_attaches_to_it() {
     let unusual = project.path().join("mur-at-an-unusual-path");
     fs::copy(assert_cmd::cargo::cargo_bin("mur"), &unusual).unwrap();
 
-    let assertion = Command::new(&unusual)
+    let mut command = Command::new(&unusual);
+    command
         .env("HOME", home.path())
         .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
-        .arg("doctor")
-        // A project whose capabilities declare nothing reaches no `fixes` entry, and the
-        // attachment block adds none whichever profile the kernel reports — the one claim a
-        // regression in this block could break silently.
-        .assert()
-        .success();
+        .arg("doctor");
+
+    // The kernel refuses to exec a file that any process still holds open for writing, and a
+    // sibling test thread that forks while the copy above is mid-write inherits that descriptor
+    // until it reaches its own exec. Retrying the spawn rides out that window; re-copying would
+    // re-open the file and re-arm it.
+    let mut busy_attempts = 0;
+    let output = loop {
+        match command.output() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && busy_attempts < 50 => {
+                busy_attempts += 1;
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => break result.unwrap(),
+        }
+    };
+
+    // A project whose capabilities declare nothing reaches no `fixes` entry, and the attachment
+    // block adds none whichever profile the kernel reports — the one claim a regression in this
+    // block could break silently.
+    let assertion = Assert::new(output).success();
     let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
 
     assert!(
