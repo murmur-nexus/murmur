@@ -100,16 +100,19 @@ extra:
     murmur_driver_anthropic: "1.0.0"
     murmur_driver_openai: "1.0.0"
     murmur_driver_deepseek: "1.0.0"
+    murmur_driver_claude_code: "1.0.0"
     murmur_hook_compact: "1.0.0"
     murmur_hook_eval: "1.0.0"
     murmur_hook_grafana: "1.0.0"
     murmur_hook_debug: "1.0.0"
+    murmur_hook_diff_summary: "1.0.0"
     murmur_hook_memory: "1.0.0"
     murmur_tool_git: "1.0.0"
     murmur_tool_editor: "1.0.0"
     murmur_tool_request_input: "1.0.0"
     murmur_tool_registry_search: "1.0.0"
     murmur_tool_corpus: "1.0.0"
+    murmur_tool_code_graph: "1.0.0"
     murmur_skill_create_manifest: "1.0.0"
 
 markdown_extensions:
@@ -161,6 +164,7 @@ nav:
       - Generate a capsule manifest with mur new: how-to/generate-manifest.md
       - Visualise capsule sessions with mur topology: how-to/topology-view.md
       - Run a capsule from the CLI or from another program: how-to/different-ways-to-run-murmur.md
+      - Run a capsule on your Claude subscription: how-to/run-capsule-on-claude-subscription.md
   - Language Guides:
       - Python Tool Quickstart (WASM): language-guides/python.md
       - Python Tool Quickstart (Native): language-guides/python-native.md

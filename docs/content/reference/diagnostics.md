@@ -639,6 +639,9 @@ error[E-RUN-035]: the harness produced neither a line of output nor a tool call 
 There is no limit on how long a run may take: any output, and any tool call, starts the window
 again. Output on stderr does not. The trace's `harness_exit` event records `cause: "inactivity"`.
 
+The 600 seconds is fixed, as is the 10-second [interrupt grace](manifest.md#transport-process) a
+cancelled harness gets. Neither is a manifest setting.
+
 ### E-RUN-036 — the harness could not find the session { #e-run-036 }
 
 A turn on [`transport: process`](manifest.md#transport-process) was launched to continue the

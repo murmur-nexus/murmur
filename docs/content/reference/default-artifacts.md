@@ -24,6 +24,19 @@ Every driver reads the same [inference environment](#driver-environment) and pas
 [`inference.max_tokens`](manifest.md#inference-max-tokens) through unchanged as the provider's
 output cap.
 
+### Process drivers
+
+A [process driver](manifest.md#process-driver) drives a harness CLI instead of a provider API.
+Declare one with `runtime: driver`, no `gateway:` block, and name it in
+[`inference.driver.artifact`](manifest.md#field-inference) under `transport: process`.
+
+| Artifact | Harness |
+|---|---|
+| `murmur-driver-claude-code` | The Claude CLI (`claude`) |
+
+See [Run a capsule on your Claude subscription](../how-to/run-capsule-on-claude-subscription.md)
+for what that transport costs before you choose it.
+
 ---
 
 ## Hooks
@@ -214,5 +227,8 @@ nor its gateway. A native tool receives no per-artifact environment, so a `confi
 reported as [`W-SEC-015`](diagnostics.md#w-sec-015) and delivers nothing, and a `gateway:` block
 there is refused with [`E-CAP-017`](diagnostics.md#e-cap-017).
 
-`transport: process` loads no driver component: `inference.driver` is rejected in the manifest, and
-the agent loop spawns `inference.command` instead. Tool artifacts still receive the whole table.
+Under `transport: process` the driver named by `inference.driver` is a
+[process driver](manifest.md#process-driver): a `runtime: driver` artifact granted nothing at all —
+no environment, no files, no network — which plans the harness subprocess rather than calling a
+provider itself. None of the variables above reach it. Tool artifacts still receive the whole
+table.

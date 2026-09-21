@@ -71,3 +71,11 @@
 *[capabilities.conversation.read]: bool · grants a hook read access to the conversation record · required, never inferred
 
 *[capabilities.state]: durable directory outside the workdir · keyed by capsule · unreachable by the capsule's own file tools
+
+*[inference.transport]: http: WASM driver calls a provider API · default | process: process driver runs a harness CLI as a subprocess
+
+*[inference.command]: executable run instead of the one the process driver's describe() names · process transport only
+
+*[inference.max_turns]: model steps one task may take · a message or a tool call is one turn
+
+*[capabilities.env.allow]: environment variable names the harness subprocess may see · the whole environment it gets · process transport only

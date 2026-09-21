@@ -163,37 +163,36 @@ Pin every artifact to an exact version and the manifest becomes an execution con
 
 ## Want to use a subscription?
 
-Instead of a driver artifact and an API key, a capsule can drive inference through a provider CLI you are already logged into — the Claude CLI (Anthropic) or the Codex CLI (OpenAI). Set `inference.transport: process` and point `command` at the CLI — no driver artifact, no `capabilities.network`, and no API key.
+A capsule can drive inference through a harness CLI you are already logged into, spending that login instead of an API key. Set `inference.transport: process`, declare a [process driver](../reference/manifest.md#process-driver) artifact — the component that knows how to drive that one CLI — and declare the variables it needs in `capabilities.env.allow`. There is no `capabilities.network` and no `api_key`: the harness reaches its provider with its own credentials.
 
-This is a secondary path for spending a subscription rather than an API key; [`transport: http`](#step-1-declare-the-capsule-in-murmuryaml) remains the primary, fuller-featured way to run a capsule.
+This is a secondary path; [`transport: http`](#step-1-declare-the-capsule-in-murmuryaml) remains the primary, fuller-featured way to run a capsule. Before choosing it, read [Run a capsule on your Claude subscription](../how-to/run-capsule-on-claude-subscription.md), which states what this transport costs you.
 
 ### Create a manifest
 
-Create a `murmur.yaml` in an empty directory, using the CLI for the subscription you are logged into:
+Create a `murmur.yaml` in an empty directory. `murmur-driver-claude-code` drives the Claude CLI:
 
-=== "Anthropic"
+```yaml
+name: my-capsule
+version: "1.0.0"
+artifacts:
+  - name: murmur-driver-claude-code
+    version: "0.1.0"
+    runtime: driver
+capabilities:
+  env:
+    allow: [HOME, PATH]   # every variable the driver's describe() requires
+inference:
+  transport: process
+  driver:
+    artifact: murmur-driver-claude-code
+  max_turns: 10
+```
 
-    ```yaml
-    name: my-capsule
-    version: "1.0.0"
-    inference:
-      transport: process
-      command: claude
-      model: claude-opus-4-8   # optional — omit to use your subscription's default
-      max_turns: 10
-    ```
+Install the driver before the first run:
 
-=== "OpenAI"
-
-    ```yaml
-    name: my-capsule
-    version: "1.0.0"
-    inference:
-      transport: process
-      command: codex
-      model: gpt-5.5   # optional — omit to use your subscription's default
-      max_turns: 10
-    ```
+```bash
+mur install
+```
 
 ### Run the capsule
 
@@ -212,10 +211,10 @@ Pong! 🏓
 
 ### Calling tools
 
-Tool artifacts work under `transport: process` too — declare them exactly as you would for `transport: http`, and `mur trace show` records each tool call. `max_turns` counts one turn per model step here just as it does on `transport: http` — roughly one per tool call plus a final turn — so budget it the same way (a too-low limit fails with `error[E-RUN-007]: max_turns exceeded`).
+Tool artifacts work under `transport: process` too — declare them exactly as you would for `transport: http`, and `mur trace show` records each tool call. Murmur stands up a loopback tool server, the driver points the harness at it, and the harness's own built-in tools are stripped, so the model is offered the capsule's tools and nothing else. `max_turns` counts one turn per model step here just as it does on `transport: http` — roughly one per tool call plus a final turn — so budget it the same way (a too-low limit fails with [`error[E-RUN-033]`](../reference/diagnostics.md#e-run-033) naming the kind `max-turns`).
 
 !!! note "Observability differs from `transport: http`"
 
-    Because the CLI owns the model calls, `mur trace show` records turns, tool calls, declared tools, and exit status — but **not** per-turn token usage. When you need full token accounting, use `transport: http`. System prompts and lifecycle hooks apply on both paths.
+    Because the harness owns the model calls, `mur trace show` records turns, tool calls, declared tools, and exit status — but **not** per-turn token usage, which is reported as zero. When you need token accounting, use `transport: http`. System prompts and lifecycle hooks apply on both paths.
 
 Learn more about the `murmur.yaml` manifest in the [Manifest Schema reference](../reference/manifest.md).
