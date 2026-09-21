@@ -1,4 +1,4 @@
-# How to run a capsule on your Claude subscription
+# How to run a capsule on your subscription
 
 A capsule normally reaches a model over HTTPS with an API key you declare in its manifest. Under `transport: process` it instead drives a harness CLI you are already logged into — the `claude` binary on your machine — so the work is billed to that login rather than to a key. Murmur still owns the task, the tools, the trace and the A2A door; the harness owns the model calls and the conversation.
 

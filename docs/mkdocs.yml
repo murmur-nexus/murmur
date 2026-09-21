@@ -164,7 +164,7 @@ nav:
       - Generate a capsule manifest with mur new: how-to/generate-manifest.md
       - Visualise capsule sessions with mur topology: how-to/topology-view.md
       - Run a capsule from the CLI or from another program: how-to/different-ways-to-run-murmur.md
-      - Run a capsule on your Claude subscription: how-to/run-capsule-on-claude-subscription.md
+      - Run a capsule on your subscription: how-to/run-capsule-on-subscription.md
   - Language Guides:
       - Python Tool Quickstart (WASM): language-guides/python.md
       - Python Tool Quickstart (Native): language-guides/python-native.md

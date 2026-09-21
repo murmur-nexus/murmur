@@ -34,7 +34,7 @@ Declare one with `runtime: driver`, no `gateway:` block, and name it in
 |---|---|
 | `murmur-driver-claude-code` | The Claude CLI (`claude`) |
 
-See [Run a capsule on your Claude subscription](../how-to/run-capsule-on-claude-subscription.md)
+See [Run a capsule on your subscription](../how-to/run-capsule-on-subscription.md)
 for what that transport costs before you choose it.
 
 ---

@@ -165,7 +165,7 @@ Pin every artifact to an exact version and the manifest becomes an execution con
 
 A capsule can drive inference through a harness CLI you are already logged into, spending that login instead of an API key. Set `inference.transport: process`, declare a [process driver](../reference/manifest.md#process-driver) artifact — the component that knows how to drive that one CLI — and declare the variables it needs in `capabilities.env.allow`. There is no `capabilities.network` and no `api_key`: the harness reaches its provider with its own credentials.
 
-This is a secondary path; [`transport: http`](#step-1-declare-the-capsule-in-murmuryaml) remains the primary, fuller-featured way to run a capsule. Before choosing it, read [Run a capsule on your Claude subscription](../how-to/run-capsule-on-claude-subscription.md), which states what this transport costs you.
+This is a secondary path; [`transport: http`](#step-1-declare-the-capsule-in-murmuryaml) remains the primary, fuller-featured way to run a capsule. Before choosing it, read [Run a capsule on your subscription](../how-to/run-capsule-on-subscription.md), which states what this transport costs you.
 
 ### Create a manifest
 
