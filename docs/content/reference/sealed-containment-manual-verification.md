@@ -156,25 +156,32 @@ mkdir -p ~/sealed-check && cd ~/sealed-check
 An **agent** capsule (one that declares `inference:`) is manifest-only — `mur run` never looks for
 a root `*.wasm` for it, so no placeholder component is needed. `capabilities.containment: sealed`
 and a `bash` shell allowlist are what this procedure needs; `inference.transport: process` drives
-the agent loop through a locally installed provider CLI (`command: claude` here) rather than a
-hosted API key, the same pattern as the
-[quickstart](../getting-started/quickstart.md#want-to-use-a-subscription) — swap in whatever CLI
-the host has installed (`command: codex` for OpenAI's Codex CLI, etc.):
+the agent loop through a locally installed harness CLI rather than a hosted API key, the same
+pattern as the [quickstart](../getting-started/quickstart.md#want-to-use-a-subscription). The
+[process driver](manifest.md#process-driver) is what knows how to drive that CLI — swap it for
+whichever driver matches the harness the host has installed:
 
 ```yaml
 name: sealed-check
 version: 0.1.0
 
+artifacts:
+  - name: murmur-driver-claude-code
+    version: "0.1.0"
+    runtime: driver
+
 capabilities:
   containment: sealed
+  env:
+    allow: [HOME, PATH]
   shell:
     allow:
       - bash
 
 inference:
   transport: process
-  command: claude
-  model: claude-sonnet-4-5
+  driver:
+    artifact: murmur-driver-claude-code
   max_turns: 4
 ```
 

@@ -740,7 +740,7 @@ Current runtime constraints:
   - prefers `capsule.wasm`
   - otherwise requires exactly one root `*.wasm`
   - under `--capsule`, the root component of the artifact archive, with no project directory searched
-- Agent capsules require either `transport: http` (with `inference.driver.artifact`) or `transport: process` (with `inference.command`) in `murmur.yaml`; missing driver config exits with `error[E-RUN-005]` or `error[E-RUN-006]` respectively
+- Agent capsules require `inference.driver.artifact` in `murmur.yaml` on both transports: an [http driver](manifest.md#transport-http) under `transport: http`, a [process driver](manifest.md#process-driver) under `transport: process`. A missing driver exits with `error[E-RUN-005]`; a `transport: process` harness binary that cannot be resolved exits with `error[E-RUN-006]`
 
 ### A closed stream { #mur-run-closed-stream }
 

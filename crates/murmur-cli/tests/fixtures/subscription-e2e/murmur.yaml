@@ -1,0 +1,86 @@
+name: nexus-capsule-001
+version: "1.0.0"
+
+mur_version: 0.4.0
+
+artifacts:
+  - name: murmur-driver-claude-code
+    runtime: driver
+    version: "0.1.0"
+  - name: murmur-tool-editor
+    runtime: tool
+    version: "0.5.0"
+  - name: murmur-tool-code-graph
+    runtime: tool
+    version: "0.2.0"
+  - name: murmur-hook-diff-summary
+    runtime: hook
+    version: "0.8.0"
+    capabilities:
+      filesystem:
+        scope: "."
+  - name: murmur-tool-corpus
+    runtime: tool
+    version: "0.2.0"
+    capabilities:
+      state: {}
+    config:
+      config_version: 1
+      read_recent: { default: 10, max: 50 }
+      search: { default_k: 5, max_k: 25 }
+      prefix_map: { session-note: snt }
+      types:
+        note:
+          schema_version: 1
+          schema:
+            type: object
+            required: [text]
+            properties:
+              text: { type: string }
+              tags: { type: array, items: { type: string } }
+            additionalProperties: false
+
+capabilities:
+  env:
+    allow:
+      - HOME
+      - PATH
+  shell:
+    allow:
+      - bash
+      - git
+      - cat
+      - ls
+      - head
+      - tail
+      - wc
+      - grep
+      - find
+      - sed
+      - diff
+      - cp
+      - mv
+      - rm
+      - mkdir
+      - python3
+    interpreter_runtime:
+      - binary: python3
+        dirs:
+          - path: /usr/lib/python3.12
+            list_dir: true
+          - path: /usr/lib/python3.12/lib-dynload
+            list_dir: false
+
+inference:
+  transport: process
+  max_turns: 100
+  system_prompt_file: ./instructions.md
+  driver:
+    artifact: murmur-driver-claude-code
+
+lifecycle:
+  task_acceptance: queue
+  queue_depth: 8
+  after_task: sleep
+  shell_grace_secs: 600
+  conversation: threaded

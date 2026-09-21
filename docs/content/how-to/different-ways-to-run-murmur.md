@@ -139,7 +139,7 @@ skills: 2 installed
 status:  ok
 ```
 
-The `driver:` line names the artifact and model for `transport: http`, or the command and model for `transport: process`. The `skills:` line appears only when the manifest declares at least one `runtime: skill` artifact.
+The `driver:` line names the driver artifact and the model. Under [`transport: process`](../reference/manifest.md#transport-process) it carries the word `process` between the two — `murmur-driver-claude-code process ()`, with the model empty when the manifest leaves it to the harness. The `skills:` line appears only when the manifest declares at least one `runtime: skill` artifact.
 
 ---
 

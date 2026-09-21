@@ -139,7 +139,14 @@ the capsule reaching its `bash` tool.
 name: resource-limit-probe
 version: 0.1.0
 
+artifacts:
+  - name: murmur-driver-claude-code
+    version: "0.1.0"
+    runtime: driver
+
 capabilities:
+  env:
+    allow: [HOME, PATH]
   shell:
     allow: [bash]
   resources:
@@ -156,7 +163,8 @@ capabilities:
 
 inference:
   transport: process
-  model: claude-sonnet-4-5
+  driver:
+    artifact: murmur-driver-claude-code
   max_turns: 4
 ```
 
