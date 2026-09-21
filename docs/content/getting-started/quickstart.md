@@ -176,7 +176,7 @@ name: my-capsule
 version: "1.0.0"
 artifacts:
   - name: murmur-driver-claude-code
-    version: "0.1.0"
+    version: "{{ v.murmur_driver_claude_code }}"
     runtime: driver
 capabilities:
   env:

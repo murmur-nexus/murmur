@@ -50,7 +50,7 @@ claude --version
 
 The version it prints is the version your capsule runs on — the manifest pins neither it nor your login.
 
-The capsule reads that login out of `~/.claude` under the `HOME` it is given, which is why `HOME` is one of the variables the driver requires. An API key cannot reach the harness through the manifest at all: `capabilities.env.allow` refuses every credential-shaped name with [E-CAP-016](../reference/diagnostics.md#e-cap-016), `ANTHROPIC_API_KEY` among them, and the credential backstop strips it besides.
+The capsule reads that login out of `~/.claude` under the `HOME` it is given, which is why `HOME` is one of the variables the driver requires. An API key cannot reach the harness through the manifest at all: `capabilities.env.allow` refuses every credential-shaped name with [E-CAP-016](../reference/diagnostics.md#e-cap-016), `ANTHROPIC_API_KEY` among them.
 
 A run whose harness session reports an API key anyway prints [`warning[W-SEC-031]`](../reference/diagnostics.md#w-sec-031) and keeps going, because that spend is billed to a key Murmur neither counts nor limits. On a subscription login it does not appear.
 
@@ -172,8 +172,6 @@ Two timeouts bound a run, and neither is a manifest setting.
 | Inactivity | 600 seconds | How long a run may go with neither a line of harness output nor a tool call before the harness is killed with [`E-RUN-035`](../reference/diagnostics.md#e-run-035). Any output and any tool call start the window again, so a harness that is working is never interrupted for taking a long time. |
 | Interrupt grace | 10 seconds | How long a harness that was asked to stop has to end on its own before it is killed. |
 
-They are constants because neither belongs to the operator. The inactivity limit measures a harness that has stopped saying anything, which is a property of the harness rather than of the work; the interrupt grace is how long Murmur stays polite after a person has already asked for the task to stop, and a person can always stop it.
-
 ---
 
 ## A full manifest
@@ -181,10 +179,8 @@ They are constants because neither belongs to the operator. The inactivity limit
 A coding capsule with tool artifacts, a hook and a shell allowlist on this transport:
 
 ```yaml
-name: nexus-capsule-001
+name: my-coding-capsule
 version: "1.0.0"
-
-mur_version: 0.4.0
 
 artifacts:
   - name: murmur-driver-claude-code
