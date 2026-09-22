@@ -110,6 +110,7 @@ fn stage_agent_with_port(
             context: runtime_manifest.context.clone(),
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

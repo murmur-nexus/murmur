@@ -51,14 +51,15 @@ pub const E_RUN_030: &str = "E-RUN-030"; // the transport: http inference driver
 pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded with no grants, or described itself unusably
 
 // E-RUN-033 (the harness ended a turn in failure), E-RUN-034 (a call into the process driver
-// refused, trapped or ran out of time) and E-RUN-035 (the harness went silent for the whole
-// inactivity window) are defined beside the errors that raise them, because the A2A terminal
-// status a process attempt writes carries the same code this renders.
-pub use capsule_runtime::errors::{E_RUN_033, E_RUN_034, E_RUN_035};
+// refused, trapped or ran out of time), E-RUN-035 (the harness went silent for the whole
+// inactivity window) and E-RUN-036 (the harness could not find the session a context names) are
+// defined beside the errors that raise them, because the A2A terminal status a process attempt
+// writes carries the same code this renders.
+pub use capsule_runtime::errors::{E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036};
 
-pub const E_RUN_036: &str = "E-RUN-036"; // a resumed harness session could not be found by the harness
 pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inference.transport: process
 pub const E_RUN_038: &str = "E-RUN-038"; // a spend ceiling is set against a process driver that reports no usage
+pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose transport keeps no harness session
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -569,8 +570,18 @@ impl From<RuntimeError> for CliError {
                 error.to_string(),
                 "the harness no longer holds that conversation. murmur left the id where it is, \
                  so the next task in this context fails the same way rather than answering from \
-                 nothing: delete that file to start a new conversation under the same context, or \
-                 use a different --context — see docs/content/reference/workdir.md",
+                 nothing. Ask for it to be dropped and this context starts a new conversation: \
+                 `mur run --context <id> --forget-session`, or the header \
+                 `x-murmur-forget-session: true` on the next message/send or message/stream — see \
+                 docs/content/reference/cli.md",
+            ),
+            error @ RuntimeError::ForgetSessionUnsupportedTransport { .. } => CliError::with_hint(
+                E_RUN_039,
+                error.to_string(),
+                "a harness owns the conversation only under inference.transport: process, so that \
+                 is the only transport with a session to forget; every other one keeps its \
+                 conversation record here, which `mur conversation rm` removes — see \
+                 docs/content/reference/cli.md",
             ),
             error @ RuntimeError::ProcessDriverCallFailed { .. } => CliError::with_hint(
                 E_RUN_034,

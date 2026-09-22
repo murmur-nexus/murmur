@@ -28,6 +28,8 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 const DRIVER: &str = "fixture-process-driver";
+/// The `transport: http` driver the forget-refusal case runs against; it needs no provider.
+const HTTP_DRIVER: &str = "fixture-streaming-driver";
 const DRIVER_VERSION: &str = "0.1.0";
 const CAPSULE: &str = "process-sessions";
 const HARNESS: &str = "fixture-harness";
@@ -51,6 +53,10 @@ struct Capsule {
     _artifacts: TempDir,
     bin_dir: PathBuf,
     manifest: PathBuf,
+    /// The file `fixture-cli` reads its profile from. Rewritten between two tasks of one capsule
+    /// life, which is how a cancelled task and the task that recovers from it run different
+    /// profiles against the same door.
+    profile_file: PathBuf,
 }
 
 struct Built {
@@ -107,14 +113,27 @@ impl Built {
         common::publish_local(&home, &driver).success();
 
         // Only this capsule's `PATH` points here, so `fixture-cli` is the fake harness and
-        // nothing else on the host is.
+        // nothing else on the host is. It is a wrapper that reads the profile out of a file and
+        // execs the fixture script, so the profile belongs to this capsule and can change while
+        // it runs.
         let bin_dir = project.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        let script = bin_dir.join("fixture-cli");
+        let script = project.path().join("fake-harness");
         fs::copy(common::fixture_path("process-driver/fake-harness"), &script).unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        fs::set_permissions(&script, perms).unwrap();
+        make_executable(&script);
+        let profile_file = project.path().join("profile");
+        fs::write(&profile_file, "happy").unwrap();
+        let wrapper = bin_dir.join("fixture-cli");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/bash\nexport FIXTURE_HARNESS_PROFILE=\"$(cat {})\"\nexec {} \"$@\"\n",
+                profile_file.display(),
+                script.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&wrapper);
 
         let acceptance = if self.queue {
             "  task_acceptance: queue\n  after_task: sleep\n"
@@ -151,8 +170,15 @@ impl Built {
             _artifacts: artifacts,
             bin_dir,
             manifest,
+            profile_file,
         }
     }
+}
+
+fn make_executable(path: &Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(path, perms).unwrap();
 }
 
 /// One `mur run` that ran a task and exited.
@@ -173,13 +199,18 @@ impl Capsule {
         )
     }
 
+    /// Which profile the fake harness runs under from here on.
+    fn set_profile(&self, profile: &str) {
+        fs::write(&self.profile_file, profile).unwrap();
+    }
+
     fn mur(&self, profile: &str) -> Command {
+        self.set_profile(profile);
         let mut command = Command::cargo_bin("mur").unwrap();
         command
             .env_clear()
             .env("HOME", self.home.path())
             .env("PATH", self.path_value())
-            .env("FIXTURE_HARNESS_PROFILE", profile)
             .current_dir(self.project.path());
         command
     }
@@ -344,8 +375,14 @@ impl Drop for LiveCapsule {
     }
 }
 
+/// The grace an interrupted harness gets in this binary. Every profile a test cancels honours its
+/// interrupt well inside it; the ceiling is here so a profile that stopped honouring it fails
+/// quickly rather than holding the suite for the real grace.
+const GRACE_MS: &str = "4000";
+
 impl LiveCapsule {
     fn start(capsule: Capsule, profile: &str) -> Self {
+        capsule.set_profile(profile);
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
             .args(["run", "--manifest"])
             .arg(&capsule.manifest)
@@ -354,7 +391,7 @@ impl LiveCapsule {
             .env_clear()
             .env("HOME", capsule.home.path())
             .env("PATH", capsule.path_value())
-            .env("FIXTURE_HARNESS_PROFILE", profile)
+            .env("MURMUR_DEBUG_INTERRUPT_GRACE_MS", GRACE_MS)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -396,27 +433,123 @@ impl LiveCapsule {
 
     /// One A2A `message/send` under `context`, waited out to completion.
     fn send(&self, message_id: &str, context: &str, text: &str, task_number: usize) {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "message/send",
-            "params": {
-                "message": {
-                    "messageId": message_id,
-                    "contextId": context,
-                    "role": "user",
-                    "parts": [{"text": text}]
-                }
-            }
-        })
-        .to_string();
-        let response = post(&self.url, &body);
+        self.send_with(message_id, context, text, task_number, &[]);
+    }
+
+    /// [`Self::send`] with request headers, which is how a forget is asked for over the door.
+    fn send_with(
+        &self,
+        message_id: &str,
+        context: &str,
+        text: &str,
+        task_number: usize,
+        headers: &[(&str, &str)],
+    ) {
+        self.send_only(message_id, context, text, headers);
+        self.wait_for_task_ends(task_number);
+    }
+
+    /// One A2A `message/send` under `context`, returning the id of the task it started without
+    /// waiting for it.
+    fn send_only(
+        &self,
+        message_id: &str,
+        context: &str,
+        text: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
+        let response = post(&self.url, &send_body(message_id, context, text), headers);
         assert_eq!(
             response["result"]["status"]["state"], "submitted",
             "the task should be accepted; got: {response}"
         );
-        assert!(response["result"]["id"].is_string(), "{response}");
-        self.wait_for_task_ends(task_number);
+        response["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the response names the task it started: {response}"))
+            .to_string()
+    }
+
+    /// One A2A `message/stream` under `context`, read to its terminal frame. Returns every
+    /// `(event, data)` pair the connection carried.
+    fn stream(&self, message_id: &str, context: &str, text: &str) -> Vec<(String, Value)> {
+        let stream = TcpStream::connect(&self.url).expect("should connect for SSE");
+        let body = send_body(message_id, context, text).replace("message/send", "message/stream");
+        {
+            let mut writer = &stream;
+            writer
+                .write_all(
+                    format!(
+                        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: \
+                         text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                        self.url,
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                break;
+            }
+        }
+        let mut frames = Vec::new();
+        let mut current = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = line.trim_end_matches(['\n', '\r']).to_string();
+            if let Some(rest) = line.strip_prefix("event: ") {
+                current = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("data: ") {
+                if let Ok(data) = serde_json::from_str::<Value>(rest) {
+                    frames.push((current.clone(), data));
+                }
+            }
+        }
+        frames
+    }
+
+    fn cancel(&self, task_id: &str) -> Value {
+        post(
+            &self.url,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tasks/cancel",
+                "params": {"id": task_id}
+            })
+            .to_string(),
+            &[],
+        )
+    }
+
+    /// Wait until the trace carries at least `count` events of `event_type`.
+    fn wait_for(&self, event_type: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if self
+                .events()
+                .iter()
+                .filter(|event| event["event_type"] == event_type)
+                .count()
+                >= count
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} '{event_type}' event(s)"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// What the last finished task answered.
@@ -460,10 +593,32 @@ impl LiveCapsule {
     }
 }
 
-fn post(addr: &str, body: &str) -> Value {
+/// The JSON-RPC body of one `message/send`.
+fn send_body(message_id: &str, context: &str, text: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": message_id,
+                "contextId": context,
+                "role": "user",
+                "parts": [{"text": text}]
+            }
+        }
+    })
+    .to_string()
+}
+
+fn post(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect to the capsule");
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: \
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{extra}Content-Length: \
          {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -892,5 +1047,397 @@ fn the_conversation_record_stays_inert_under_process() {
     assert!(
         capsule.map_file("ctx_inert").exists(),
         "the one thing this transport records is the session id"
+    );
+}
+
+// ── S10: an interrupted first turn leaves nothing behind ──────────────────────
+
+/// A cancel that lands after the harness named its session and before it produced anything
+/// establishes no conversation, so the next task in that context starts one that works.
+#[test]
+fn a_cancel_before_any_output_leaves_the_context_with_no_session() {
+    let live = LiveCapsule::start(Built::new().queueing().build(), "memory-silent");
+
+    let task = live.send_only("m1", "ctx_silent", SECRET_TASK, &[]);
+    live.wait_for("harness_session", 1);
+    live.cancel(&task);
+    live.wait_for_task_ends(1);
+
+    assert!(
+        !live.capsule.map_file("ctx_silent").exists(),
+        "a turn that produced nothing established no conversation"
+    );
+
+    live.capsule.set_profile("memory");
+    live.send("m2", "ctx_silent", SECRET_TASK, 2);
+    let launches = live.launches();
+    assert_eq!(launches.len(), 2, "{launches:#?}");
+    assert_eq!(
+        launches[1]["session_mode"], "new",
+        "the second task starts a conversation rather than resuming one the harness never opened"
+    );
+    assert_eq!(
+        live.capsule.stored_session("ctx_silent"),
+        launches[1]["harness_session_id"].as_str().unwrap(),
+        "and that one is remembered"
+    );
+}
+
+/// The other side of the same rule: once the harness has produced something, a cancel keeps the
+/// session, and the next task in that context continues it.
+#[test]
+fn a_cancel_after_output_keeps_the_session_and_the_next_task_resumes_it() {
+    resumes_after_a_cancel("memory-slow", "ctx_slow", "text");
+}
+
+/// A thought is output too: nothing here reads what the harness said, only that it said something.
+#[test]
+fn a_cancel_after_thinking_alone_keeps_the_session() {
+    resumes_after_a_cancel("memory-thinking-only", "ctx_thinking", "thinking");
+}
+
+/// So is a tool call, which is a turn the harness opened and a conversation it is holding.
+#[test]
+fn a_cancel_after_a_tool_call_alone_keeps_the_session() {
+    resumes_after_a_cancel("memory-tool-only", "ctx_tool", "tool call");
+}
+
+/// Run `profile` until it has said its one thing, cancel it, and assert the session it opened is
+/// remembered and resumed by the next task in the same context.
+fn resumes_after_a_cancel(profile: &str, context: &str, produced: &str) {
+    let live = LiveCapsule::start(Built::new().queueing().build(), profile);
+
+    let task = live.send_only("m1", context, SECRET_TASK, &[]);
+    // The profile says its one thing and then writes a note, which is not work. The note's trace
+    // record is how this test knows the runtime has already read the work before it.
+    live.wait_for("harness_note", 1);
+    live.cancel(&task);
+    live.wait_for_task_ends(1);
+
+    let established = live.launches()[0]["harness_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        live.capsule.stored_session(context),
+        established,
+        "a cancel after a {produced} keeps the conversation the harness opened"
+    );
+
+    live.capsule.set_profile("memory");
+    live.send("m2", context, RECALL_TASK, 2);
+    let launches = live.launches();
+    assert_eq!(launches[1]["session_mode"], "resume");
+    assert_eq!(launches[1]["harness_session_id"], established.as_str());
+    assert!(
+        live.result().contains(SECRET),
+        "the resumed turn answers from what the cancelled one told the harness; got: {}",
+        live.result()
+    );
+}
+
+/// An auth or quota refusal before any output is that refusal and nothing else: it names its own
+/// kind, and it leaves no session behind for a later task to try to resume.
+#[test]
+fn a_refusal_before_any_output_stays_a_refusal_and_remembers_nothing() {
+    let capsule = Built::new().build();
+    for (profile, kind, context) in [
+        ("fail-auth", "auth", "ctx_auth"),
+        ("fail-quota", "quota", "ctx_quota"),
+    ] {
+        let failed = capsule.task(profile, context, SECRET_TASK).failed();
+        assert!(
+            failed.text.contains("error[E-RUN-033]") && failed.text.contains(kind),
+            "a {kind} failure must say so:\n{}",
+            failed.text
+        );
+        assert!(
+            !failed.text.contains("E-RUN-036"),
+            "a {kind} failure is not a missing conversation:\n{}",
+            failed.text
+        );
+        assert!(
+            !capsule.map_file(context).exists(),
+            "a turn that produced nothing established no conversation"
+        );
+    }
+}
+
+// ── S11: forgetting a harness session ─────────────────────────────────────────
+
+/// Delete the harness's own store, leaving murmur's map naming a session nothing answers to.
+fn brick_the_harness(capsule: &Capsule) {
+    let store = capsule.harness_store();
+    for entry in fs::read_dir(&store).unwrap().filter_map(Result::ok) {
+        fs::remove_file(entry.path()).unwrap();
+    }
+    fs::remove_dir(&store).unwrap();
+}
+
+#[test]
+fn forget_session_recovers_a_bricked_context_from_the_cli() {
+    let capsule = Built::new().build();
+    capsule
+        .task("memory", "ctx_forget", SECRET_TASK)
+        .succeeded();
+    let lost = capsule.stored_session("ctx_forget");
+    brick_the_harness(&capsule);
+
+    // The dead end, and the way out the diagnostic now names.
+    let failed = capsule.task("memory", "ctx_forget", RECALL_TASK).failed();
+    assert!(failed.text.contains("error[E-RUN-036]"), "{}", failed.text);
+    for expected in ["--forget-session", "x-murmur-forget-session"] {
+        assert!(
+            failed.text.contains(expected),
+            "the hint must name {expected}:\n{}",
+            failed.text
+        );
+    }
+    assert!(
+        !failed.text.contains("delete that file"),
+        "the hint must not send the reader to delete a file by hand:\n{}",
+        failed.text
+    );
+
+    let forgotten = capsule
+        .run(
+            "memory",
+            &[
+                "--context",
+                "ctx_forget",
+                "--forget-session",
+                "--task",
+                SECRET_TASK,
+            ],
+        )
+        .succeeded();
+    assert_eq!(forgotten.launch()["session_mode"], "new");
+
+    let records = forgotten.of_type("harness_session_forgotten");
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0]["context_id"], "ctx_forget");
+    assert_eq!(records[0]["harness_session_id"], lost.as_str());
+    assert_eq!(records[0]["requested_by"], "cli");
+
+    let launch = forgotten.launch();
+    let established = launch["harness_session_id"].as_str().unwrap();
+    assert_eq!(capsule.stored_session("ctx_forget"), established);
+    assert_ne!(established, lost);
+
+    // And the context works from here on, with no forget asked for again.
+    let after = capsule
+        .task("memory", "ctx_forget", RECALL_TASK)
+        .succeeded();
+    assert_eq!(after.launch()["session_mode"], "resume");
+    assert!(after.result().contains(SECRET), "{}", after.result());
+    assert!(after.of_type("harness_session_forgotten").is_empty());
+}
+
+#[test]
+fn forget_session_recovers_a_bricked_context_over_the_door() {
+    let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
+
+    live.send("m1", "ctx_door", SECRET_TASK, 1);
+    let lost = live.capsule.stored_session("ctx_door");
+    brick_the_harness(&live.capsule);
+
+    // A message that asks for nothing gets the dead end, code and all.
+    let frames = live.stream("m2", "ctx_door", RECALL_TASK);
+    let terminal = frames
+        .iter()
+        .filter(|(event, data)| event == "status" && data["final"] == serde_json::json!(true))
+        .map(|(_, data)| data.clone())
+        .next()
+        .unwrap_or_else(|| panic!("the stream must end on a terminal status: {frames:#?}"));
+    assert_eq!(terminal["status"]["state"], "failed", "{terminal:#?}");
+    let message = terminal["status"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("error[E-RUN-036]"), "{message}");
+    assert_eq!(live.capsule.stored_session("ctx_door"), lost);
+
+    // The same message, asking for the session to be dropped, answers.
+    live.send_with(
+        "m3",
+        "ctx_door",
+        SECRET_TASK,
+        3,
+        &[("x-murmur-forget-session", "true")],
+    );
+
+    let launches = live.launches();
+    assert_eq!(launches.len(), 3, "{launches:#?}");
+    assert_eq!(launches[2]["session_mode"], "new");
+
+    let forgotten: Vec<Value> = live
+        .events()
+        .into_iter()
+        .filter(|event| event["event_type"] == "harness_session_forgotten")
+        .collect();
+    assert_eq!(forgotten.len(), 1, "{forgotten:#?}");
+    assert_eq!(forgotten[0]["context_id"], "ctx_door");
+    assert_eq!(forgotten[0]["harness_session_id"], lost.as_str());
+    assert_eq!(forgotten[0]["requested_by"], "a2a");
+
+    let established = launches[2]["harness_session_id"].as_str().unwrap();
+    assert_eq!(live.capsule.stored_session("ctx_door"), established);
+    assert_ne!(established, lost);
+}
+
+/// A forget applies to the message that carried it and to no other: the task after it resumes
+/// what the forgetting one established.
+#[test]
+fn a_forget_over_the_door_applies_to_one_task_only() {
+    let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
+
+    live.send_with(
+        "m1",
+        "ctx_once",
+        SECRET_TASK,
+        1,
+        &[("x-murmur-forget-session", "true")],
+    );
+    live.send("m2", "ctx_once", RECALL_TASK, 2);
+
+    let launches = live.launches();
+    assert_eq!(launches[0]["session_mode"], "new");
+    assert_eq!(launches[1]["session_mode"], "resume");
+    assert!(live.result().contains(SECRET), "{}", live.result());
+    // The first context had nothing to drop, so nothing was recorded as dropped.
+    assert!(live
+        .events()
+        .iter()
+        .all(|event| event["event_type"] != "harness_session_forgotten"));
+}
+
+// ── S12: a forget the transport cannot honour ─────────────────────────────────
+
+/// A `transport: http` capsule whose driver needs no provider: it keeps a conversation record,
+/// not a harness session, so there is nothing about it to forget.
+fn http_capsule() -> Capsule {
+    let home = TempDir::new().unwrap();
+    let artifacts = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let driver = common::create_driver_artifact(
+        artifacts.path(),
+        HTTP_DRIVER,
+        DRIVER_VERSION,
+        &common::fixture_path("streaming-driver/tool/streaming-driver.wasm"),
+    );
+    common::publish_local(&home, &driver).success();
+
+    let bin_dir = project.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let profile_file = project.path().join("profile");
+    fs::write(&profile_file, "happy").unwrap();
+
+    let manifest = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest,
+        format!(
+            "name: {CAPSULE}-http\nversion: 0.1.0\nartifacts:\n  - name: {HTTP_DRIVER}\n    \
+             version: {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: \
+             http://127.0.0.1:1\n      api_key: test-key\n\
+             lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  conversation: threaded\n\
+             inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: \
+             {HTTP_DRIVER}\n"
+        ),
+    )
+    .unwrap();
+
+    Capsule {
+        home,
+        project,
+        _artifacts: artifacts,
+        bin_dir,
+        manifest,
+        profile_file,
+    }
+}
+
+#[test]
+fn a_forget_asked_of_a_capsule_with_no_harness_session_is_refused() {
+    let capsule = http_capsule();
+
+    let refused = capsule
+        .run(
+            "happy",
+            &["--context", "ctx_x", "--forget-session", "--task", "hello"],
+        )
+        .failed();
+    assert!(
+        refused.text.contains("error[E-RUN-039]"),
+        "{}",
+        refused.text
+    );
+    for expected in ["--forget-session", "inference.transport: process"] {
+        assert!(
+            refused.text.contains(expected),
+            "the refusal must name {expected}:\n{}",
+            refused.text
+        );
+    }
+    assert!(
+        !refused.workdir.join("trace.jsonl").exists(),
+        "a refusal at staging leaves no session behind"
+    );
+
+    // And the door refuses the header the same way, without starting a task.
+    let live = LiveCapsule::start(capsule, "happy");
+    let response = post(
+        &live.url,
+        &send_body("m1", "ctx_x", "hello"),
+        &[("x-murmur-forget-session", "true")],
+    );
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("x-murmur-forget-session"), "{message}");
+    assert!(
+        message.contains("inference.transport: process"),
+        "{message}"
+    );
+    assert!(
+        live.events()
+            .iter()
+            .all(|event| event["event_type"] != "task_start"),
+        "the refused request must start no task"
+    );
+}
+
+// ── S13: a forget with nothing to act on ──────────────────────────────────────
+
+/// Both refusals come from clap, before `mur run` reads a manifest: `--forget-session` names a
+/// context to forget, and `--resume` asks for the opposite of forgetting.
+#[test]
+fn forget_session_needs_a_context_and_refuses_a_resume() {
+    let capsule = Built::new().build();
+
+    let no_context = capsule.run("memory", &["--forget-session", "--task", SECRET_TASK]);
+    assert!(!no_context.output.status.success(), "{}", no_context.text);
+    assert!(
+        no_context.text.contains("--context"),
+        "clap names the argument it requires:\n{}",
+        no_context.text
+    );
+
+    let with_resume = capsule.run(
+        "memory",
+        &[
+            "--forget-session",
+            "--context",
+            "ctx_conflict",
+            "--resume",
+            "@1",
+        ],
+    );
+    assert!(!with_resume.output.status.success(), "{}", with_resume.text);
+    assert!(
+        with_resume.text.contains("--resume"),
+        "clap names the argument it conflicts with:\n{}",
+        with_resume.text
+    );
+
+    assert!(
+        !capsule.conversations_root().exists(),
+        "neither refusal stages a capsule"
     );
 }

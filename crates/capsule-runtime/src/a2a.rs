@@ -486,6 +486,10 @@ pub(crate) struct IncomingTask {
     /// completion watcher behind it. `None` for every other task, including a locally produced
     /// detached-shell completion, which reports on a work id rather than a delegation.
     pub delegation_id: Option<String>,
+    /// Whether this request asked the capsule to drop the harness session its context names
+    /// before the turn, under [`crate::identity::FORGET_SESSION_HEADER`]. `false` for every task
+    /// that did not carry the header, and for every task the runtime enqueued for itself.
+    pub forget_session: bool,
 }
 
 /// The `source` of a task that arrived over the A2A door.

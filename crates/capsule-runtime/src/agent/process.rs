@@ -160,6 +160,12 @@ pub(crate) struct HarnessSessionPolicy {
     pub(crate) map: Arc<HarnessSessionMap>,
     pub(crate) context_id: Option<String>,
     pub(crate) continue_conversation: bool,
+    /// Who asked for this context's session to be dropped before the turn plans itself, or
+    /// `None` when nobody did — which is every ordinary task. The value is what the trace's
+    /// `harness_session_forgotten` record names as the asker:
+    /// [`crate::harness_session::FORGET_BY_CLI`] or
+    /// [`crate::harness_session::FORGET_BY_A2A`].
+    pub(crate) forget: Option<&'static str>,
 }
 
 /// Which session this turn launches with, and what it may remember afterwards.
@@ -214,6 +220,27 @@ pub(super) fn plan_session(policy: &HarnessSessionPolicy) -> SessionPlan {
         },
         None => new(Some(context_id.to_string())),
     }
+}
+
+/// Drop this context's remembered session, when the request that started the turn asked for it.
+///
+/// Runs immediately before [`plan_session`], so the map is already empty when the plan is made and
+/// the turn launches `mode: new` under the same context id. A forget that actually dropped an id
+/// is recorded; one asked for a context that held none drops nothing and records nothing, and the
+/// turn would have been a new conversation anyway.
+async fn forget_harness_session(policy: &HarnessSessionPolicy, trace: &mut TraceWriter) {
+    let Some(requested_by) = policy.forget else {
+        return;
+    };
+    let Some(context_id) = policy.context_id.as_deref().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let Some(dropped) = policy.map.forget(context_id) else {
+        return;
+    };
+    let _ = trace
+        .write_harness_session_forgotten(context_id, &dropped, requested_by)
+        .await;
 }
 
 /// How a session mode is spelled in the trace, and in the args a driver's `launch` builds from it.
@@ -271,15 +298,17 @@ impl RunSession {
         self.mode
     }
 
-    /// Store `id` as this context's conversation.
+    /// Store this run's session as the context's conversation, once the run is over.
     ///
-    /// Whatever the harness reported wins over whatever the runtime asked for: a harness that
-    /// mints its own session ids says so with `session-started`, and that is the id it will answer
-    /// to next time.
-    pub(super) fn remember(&self, id: &str) {
+    /// `reported` is the id the harness named for itself, when it named one. Whatever the harness
+    /// reported wins over whatever the runtime asked for: a harness that mints its own session ids
+    /// says so with `session-started`, and that is the id it will answer to next time. A run whose
+    /// context resolved to nothing stores nothing.
+    pub(super) fn commit(&self, reported: Option<&str>) {
         let Some(context_key) = self.context_key.as_deref() else {
             return;
         };
+        let id = reported.filter(|id| !id.is_empty()).unwrap_or(&self.id);
         self.map.put(context_key, id, &self.harness, &self.driver);
     }
 
@@ -718,6 +747,7 @@ async fn run_harness(
         read_task_from_workdir(accessible_workdir),
     );
 
+    forget_harness_session(&session_policy, trace).await;
     let session_plan = plan_session(&session_policy);
     let session = RunSession::new(
         &session_plan,
@@ -1634,6 +1664,7 @@ mod tests {
             map: Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
             context_id: context_id.map(str::to_string),
             continue_conversation,
+            forget: None,
         }
     }
 
@@ -1692,7 +1723,7 @@ mod tests {
             assert_eq!(plan.session.mode, SessionMode::New);
             assert_eq!(plan.context_key, None);
 
-            run_session(&plan, &policy).remember("anything");
+            run_session(&plan, &policy).commit(Some("anything"));
             assert_eq!(policy.map.get(""), None);
         }
     }
@@ -1721,14 +1752,27 @@ mod tests {
     }
 
     #[test]
-    fn harness_session_remembers_what_the_harness_reported() {
+    fn harness_session_commits_what_the_harness_reported() {
         let policy = policy(Some("ctx_1"), true);
         let plan = plan_session(&policy);
-        run_session(&plan, &policy).remember("harness-chose-this");
+        run_session(&plan, &policy).commit(Some("harness-chose-this"));
         assert_eq!(
             policy.map.get("ctx_1").as_deref(),
             Some("harness-chose-this")
         );
+    }
+
+    /// A harness that never named its session answers to the id it was handed, and an empty name
+    /// is no name at all.
+    #[test]
+    fn harness_session_commits_the_handed_id_when_the_harness_named_none() {
+        for reported in [None, Some("")] {
+            let policy = policy(Some("ctx_1"), true);
+            let plan = plan_session(&policy);
+            let handed = plan.session.id.clone();
+            run_session(&plan, &policy).commit(reported);
+            assert_eq!(policy.map.get("ctx_1").as_deref(), Some(handed.as_str()));
+        }
     }
 
     /// The one ending that means the harness does not hold the conversation this context names.

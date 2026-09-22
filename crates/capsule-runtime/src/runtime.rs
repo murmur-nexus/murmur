@@ -430,6 +430,38 @@ fn check_resume_launchable(
     Ok(())
 }
 
+/// Spend the launch's `--forget-session` on the task now being activated, leaving nothing for the
+/// tasks after it.
+fn take_forget_session(pending: &mut bool) -> Option<&'static str> {
+    std::mem::take(pending).then_some(crate::harness_session::FORGET_BY_CLI)
+}
+
+/// Whether this capsule has a harness session to forget, which is what decides whether a forget
+/// is honoured or refused.
+///
+/// Only `inference.transport: process` keeps one: there the harness owns the conversation and the
+/// runtime remembers nothing but the id it answers to. Every other transport — and a capsule with
+/// no `inference:` block — keeps a [`conversation record`](crate::conversation) instead, which is
+/// not this.
+fn keeps_a_harness_session(inference: Option<&InferenceConfig>) -> bool {
+    inference.is_some_and(|inference| inference.transport == "process")
+}
+
+/// Refuse a forget asked of a capsule that keeps no harness session, before the launch creates
+/// anything: a flag that could not do what it says is a mistake about which capsule is being
+/// launched, not a no-op.
+fn check_forget_launchable(inference: Option<&InferenceConfig>) -> Result<(), RuntimeError> {
+    if keeps_a_harness_session(inference) {
+        return Ok(());
+    }
+    Err(RuntimeError::ForgetSessionUnsupportedTransport {
+        transport: match inference {
+            Some(inference) => inference.transport.clone(),
+            None => "none".to_string(),
+        },
+    })
+}
+
 /// What this session's inference transport can do, for the streaming boolean on the agent card.
 ///
 /// A `transport: process` session streams only what the harness its driver drives streams, which
@@ -1091,6 +1123,9 @@ pub fn stage_session(
             &hook_components,
         )?;
     }
+    if request.forget_session {
+        check_forget_launchable(request.inference.as_ref())?;
+    }
 
     // For agent capsules (inference configured, empty WASM bytes) skip component compilation.
     // For script capsules, compile the WASM component.
@@ -1254,6 +1289,7 @@ pub fn stage_session(
         context: request.context,
         context_id: request.context_id,
         resume: request.resume,
+        forget_session: request.forget_session,
         engine,
         capsule_component,
         tool_components,
@@ -1582,6 +1618,9 @@ fn launch(
             },
             transport_capabilities(&staged),
         );
+        // Read here, where the staged transport is still in hand, for the door to answer the
+        // forget header with.
+        let forgettable_session = keeps_a_harness_session(staged.inference.as_ref());
         let agent_card_json = agent_card.to_string();
 
         // --- Lifecycle config ---
@@ -1591,6 +1630,10 @@ fn launch(
         // runs given the same one share one conversation record. Validated at staging; `None`
         // mints a fresh id per task, as it always has.
         let supplied_context_id = staged.context_id.clone();
+        // `mur run --forget-session`, and the one task that carries it. The flag names the launch
+        // rather than a message, so it is spent on the launch's first task and no later one:
+        // forgetting once is a recovery, forgetting before every task is a capsule with no memory.
+        let mut pending_forget_session = staged.forget_session;
         // Provenance for `session_start`, taken before `staged.resume` is consumed below: which
         // session this launch continues, and the launch-scoped context it runs under. Both are
         // `None` on an ordinary launch, and `context_id` is `None` whenever each task mints its
@@ -1903,6 +1946,7 @@ fn launch(
                             session_id.clone(),
                             Some(Arc::clone(&detached)),
                             Arc::clone(&live_delegations),
+                            forgettable_session,
                         ));
 
                     // Read before `capability_policy` moves into the store state below. Hooks
@@ -1969,6 +2013,7 @@ fn launch(
                         current_traceparent: None,
                         current_task_provenance: None,
                         current_context_id: None,
+                        current_forget_harness_session: None,
                         live_delegations: Arc::clone(&live_delegations),
                         detached: Some(Arc::clone(&detached)),
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
@@ -2220,6 +2265,8 @@ fn launch(
                                         state.current_traceparent = otel.outgoing_traceparent();
                                         state.current_task_provenance = Some(provenance);
                                         state.current_context_id = Some(context_id.clone());
+                                        state.current_forget_harness_session =
+                                            take_forget_session(&mut pending_forget_session);
                                         // run_task_with_reopens fires on-task-end, honors any
                                         // reopen-task within budget, and writes the terminal
                                         // task_end (with reopen_count) itself.
@@ -2303,6 +2350,8 @@ fn launch(
                                         state.current_traceparent = otel.outgoing_traceparent();
                                         state.current_task_provenance = Some(provenance);
                                         state.current_context_id = Some(context_id.clone());
+                                        state.current_forget_harness_session =
+                                            take_forget_session(&mut pending_forget_session);
                                         let result = run_task_with_reopens(
                                             &mut state,
                                             &workdir,
@@ -2585,6 +2634,9 @@ fn launch(
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.current_task_provenance = Some(incoming.provenance);
                         state.current_context_id = Some(incoming.context_id.clone());
+                        state.current_forget_harness_session = incoming
+                            .forget_session
+                            .then_some(crate::harness_session::FORGET_BY_A2A);
                         state.a2a_task_id = Some(incoming.task_id.clone());
                         let loop_result = run_task_with_reopens(
                             &mut state,
@@ -2906,6 +2958,7 @@ fn launch(
         current_traceparent: None,
         current_task_provenance: None,
         current_context_id: None,
+        current_forget_harness_session: None,
         live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
         // The script-capsule path runs no task loop, so a demoted command's completion would
         // have nowhere to be delivered: every command it dispatches runs to completion in the
@@ -4589,6 +4642,12 @@ pub(crate) struct CapsuleStoreState {
     /// at every task-activation site. A demoted command's completion is enqueued under this id,
     /// so the result joins the conversation the command was started from.
     pub(crate) current_context_id: Option<String>,
+    /// Who asked for the harness session of `current_context_id` to be dropped before this task's
+    /// turn plans itself, or `None` when nobody did — which is every ordinary task. Set beside
+    /// `current_context_id` at every task-activation site, so a forget applies to the one task it
+    /// arrived on and to no other. The value is what the trace's `harness_session_forgotten`
+    /// record names as the asker.
+    pub(crate) current_forget_harness_session: Option<&'static str>,
     /// Every delegation this session started and has not yet closed, by `dlg_` id.
     ///
     /// Filled from the launch notice, read from three places: the completion that arrives as a
@@ -8039,6 +8098,9 @@ async fn enqueue_detached_report(
                 // sub-capsule was launched, so there is no delegation for the trace to join this
                 // task to.
                 delegation_id: None,
+                // Nobody asked for anything to be forgotten: the runtime enqueued this task for
+                // itself.
+                forget_session: false,
             };
             let _ = trace
                 .write_shell_completed(
@@ -8068,6 +8130,7 @@ async fn enqueue_detached_report(
             traceparent: None,
             source: crate::a2a::SOURCE_DETACHED_LOST,
             delegation_id: None,
+            forget_session: false,
         },
     };
 
@@ -9238,6 +9301,7 @@ inference:
             context: None,
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -9334,6 +9398,7 @@ inference:
             context: None,
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -9416,6 +9481,7 @@ inference:
             context: None,
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -9497,6 +9563,7 @@ inference:
             context: None,
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -9631,6 +9698,7 @@ inference:
             context: None,
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -9729,6 +9797,7 @@ inference:
             context: None,
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -9842,6 +9911,7 @@ inference:
             current_traceparent: None,
             current_task_provenance: None,
             current_context_id: None,
+            current_forget_harness_session: None,
             live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
             shell_grace_secs: 0,

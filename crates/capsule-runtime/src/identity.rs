@@ -147,6 +147,18 @@ pub(crate) struct TransportCapabilities {
     pub streams_text: bool,
 }
 
+/// Asks the capsule to drop the harness session the request's context names before the turn it
+/// starts, so that turn opens a new conversation under the same context id.
+///
+/// Carried on the request that starts a turn rather than served as a method of its own, because
+/// that is where the context, the trace and the session plan already are: the door itself writes
+/// no trace and holds no map. Only the value `true` asks for it — every other value, and the
+/// header's absence, are the same request.
+///
+/// Refused with `-32602` by a capsule that keeps no harness session, which is every transport but
+/// `inference.transport: process`.
+pub(crate) const FORGET_SESSION_HEADER: &str = "x-murmur-forget-session";
+
 /// Build the Agent Card JSON derived from capsule identity and capability policy.
 ///
 /// `session_id` is served alongside the rest because the card is how a caller confirms that the
@@ -239,6 +251,9 @@ pub(crate) async fn serve_http(
     // that demotes nothing, which contributes no shell items rather than an empty set.
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
+    // Whether this capsule has a harness session to forget, which is the one thing
+    // `FORGET_SESSION_HEADER` needs to know about the transport behind the door.
+    forgettable_session: bool,
 ) {
     let conversation_mode_str = match conversation_mode {
         ConversationMode::Stateless => "stateless",
@@ -266,7 +281,7 @@ pub(crate) async fn serve_http(
                         let detached_for_conn = detached.clone();
                         let live = Arc::clone(&live_delegations);
                         connections.spawn(async move {
-                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live).await;
+                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live, forgettable_session).await;
                         });
                     }
                     Err(e) => {
@@ -303,6 +318,7 @@ async fn handle_connection(
     session_id: String,
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
+    forgettable_session: bool,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -329,6 +345,7 @@ async fn handle_connection(
     let mut task_trust: Option<String> = None;
     let mut delegation_id: Option<String> = None;
     let mut completion_session: Option<String> = None;
+    let mut forget_session = false;
 
     loop {
         let mut line = String::new();
@@ -364,6 +381,11 @@ async fn handle_connection(
             delegation_id = Some(rest.trim().to_string());
         } else if let Some(rest) = lower.strip_prefix(&format!("{COMPLETION_SESSION_HEADER}:")) {
             completion_session = Some(rest.trim().to_string());
+        } else if let Some(rest) = lower.strip_prefix(&format!("{FORGET_SESSION_HEADER}:")) {
+            // One value asks for a forget. Anything else reads as the header not being there:
+            // dropping a conversation on a value nobody meant as `true` is the failure this
+            // header exists to recover from.
+            forget_session = rest.trim() == "true";
         }
     }
 
@@ -446,6 +468,27 @@ async fn handle_connection(
             }
         };
 
+        // A forget writes to this capsule's harness session map, and only a `transport: process`
+        // capsule has one. Refused here, on the request that carried it, rather than dropped into
+        // a task that would ignore it: a caller that asked for a conversation to be dropped and
+        // was answered `completed` would read that as the drop having happened.
+        let starts_a_turn = req.method == DoorMethod::MessageSend.wire_name()
+            || req.method == DoorMethod::MessageStream.wire_name();
+        if forget_session && starts_a_turn && !forgettable_session {
+            let response = JsonRpcResponse::err(
+                req.id,
+                -32602,
+                &format!(
+                    "{FORGET_SESSION_HEADER} asks this capsule to forget the harness session \
+                     this context names, and only a capsule on inference.transport: process has \
+                     one"
+                ),
+            )
+            .into_http_response();
+            let _ = writer_half.write_all(response.as_bytes()).await;
+            return;
+        }
+
         // The streaming methods own the connection; every other method answers one JSON body.
         let response = match DoorMethod::resolve(&req.method, &task_acceptance) {
             Some(DoorMethod::MessageStream) => {
@@ -457,6 +500,7 @@ async fn handle_connection(
                     traceparent,
                     provenance,
                     delegation_id,
+                    forget_session,
                     last_event_id,
                     sse_tx,
                     sse_buffer,
@@ -483,6 +527,7 @@ async fn handle_connection(
                 traceparent,
                 provenance,
                 delegation_id,
+                forget_session,
                 detached.as_ref(),
                 &live_delegations,
                 &session_id,
@@ -525,6 +570,7 @@ async fn handle_message_stream(
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
+    forget_session: bool,
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
@@ -607,6 +653,7 @@ async fn handle_message_stream(
         provenance,
         source: crate::a2a::SOURCE_A2A,
         delegation_id,
+        forget_session,
     };
     if task_tx.try_send(incoming).is_err() {
         {
@@ -800,6 +847,7 @@ fn handle_jsonrpc(
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
+    forget_session: bool,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
     session_id: &str,
@@ -814,6 +862,7 @@ fn handle_jsonrpc(
             traceparent,
             provenance,
             delegation_id,
+            forget_session,
         ),
         DoorMethod::TasksGet => handle_tasks_get(id, &req.params, task_registry),
         DoorMethod::TasksCancel => {
@@ -828,6 +877,7 @@ fn handle_jsonrpc(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_message_send(
     id: Value,
     params: &Value,
@@ -836,6 +886,7 @@ fn handle_message_send(
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
+    forget_session: bool,
 ) -> String {
     let msg_value = params.get("message").unwrap_or(params);
     let message: A2aMessage = match serde_json::from_value(msg_value.clone()) {
@@ -893,6 +944,7 @@ fn handle_message_send(
         provenance,
         source: crate::a2a::SOURCE_A2A,
         delegation_id,
+        forget_session,
     };
     if task_tx.try_send(incoming).is_err() {
         // Unexpected path — roll back pending count
@@ -1604,6 +1656,7 @@ mod tests {
                 None,
                 TaskProvenance::derive(TaskOrigin::User, None),
                 None,
+                false,
                 None,
                 sse,
                 buffer,

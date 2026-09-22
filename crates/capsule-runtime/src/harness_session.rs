@@ -32,6 +32,14 @@ pub(crate) const HARNESS_SESSION_FILE_NAME: &str = "harness-session.json";
 /// anything else is another tool's, and reads as no entry at all.
 pub(crate) const HARNESS_SESSION_TYPE: &str = "murmur.harness-session";
 
+/// What the trace's `harness_session_forgotten` record names as the asker when the forget came
+/// from `mur run --forget-session`.
+pub(crate) const FORGET_BY_CLI: &str = "cli";
+
+/// What that record names as the asker when the forget arrived on an A2A request, under
+/// [`crate::identity::FORGET_SESSION_HEADER`].
+pub(crate) const FORGET_BY_A2A: &str = "a2a";
+
 /// One context's harness session, as the file holds it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HarnessSessionEntry {
@@ -145,6 +153,33 @@ impl HarnessSessionMap {
         }
     }
 
+    /// Drop whatever session `context_id` has — from this launch's memory and from its file —
+    /// and return the id that was dropped, or `None` when the context had none.
+    ///
+    /// The only thing that removes a map entry. A person has to ask for it, on the request that
+    /// starts a turn, because dropping the id is what makes the next turn a new conversation
+    /// rather than a refusal; nothing in the runtime decides it on its own.
+    ///
+    /// A file that will not delete is reported through the same once-only path a failed write
+    /// takes, and the id still counts as dropped: this launch has forgotten it either way.
+    pub(crate) fn forget(&self, context_id: &str) -> Option<String> {
+        let dropped = self.get(context_id);
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.remove(context_id);
+        }
+        if let Some(path) = self.entry_path(context_id) {
+            if let Err(reason) = remove_entry(&path) {
+                self.report_once(&format!(
+                    "[harness-session] the session id for context '{context_id}' could not be \
+                     removed from {} ({reason}); this context is forgotten only until this \
+                     capsule stops",
+                    path.display()
+                ));
+            }
+        }
+        dropped
+    }
+
     fn report_once(&self, message: &str) {
         if let Ok(mut reported) = self.failure_reported.lock() {
             if *reported {
@@ -222,6 +257,16 @@ fn read_entry(path: &Path) -> Option<HarnessSessionEntry> {
     Some(entry)
 }
 
+/// Remove the map file at `path`. A file that is already gone is the state this asks for, so it
+/// is not a failure; the context directory is left where it is, as the record store's own.
+fn remove_entry(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 /// Write `entry` whole, at `0600` under directories held at `0700`.
 fn write_entry(path: &Path, entry: &HarnessSessionEntry) -> Result<(), String> {
     let dir = path
@@ -287,6 +332,21 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_context_with_no_entry_drops_nothing() {
+        let map = HarnessSessionMap::new(None, Path::new("/tmp"));
+        assert_eq!(map.forget("ctx_1"), None);
+    }
+
+    #[test]
+    fn a_launch_with_no_root_still_forgets_in_memory() {
+        let map = HarnessSessionMap::new(None, Path::new("/tmp"));
+        map.put("ctx_1", "sess-1", HARNESS, DRIVER);
+        assert_eq!(map.forget("ctx_1").as_deref(), Some("sess-1"));
+        assert_eq!(map.get("ctx_1"), None);
+        assert_eq!(map.forget("ctx_1"), None);
+    }
+
+    #[test]
     fn an_empty_session_id_is_not_remembered() {
         let map = HarnessSessionMap::new(None, Path::new("/tmp"));
         map.put("ctx_1", "", HARNESS, DRIVER);
@@ -340,6 +400,13 @@ mod tests {
         assert_eq!(updated.session_id, "sess-2");
         assert_eq!(updated.created_ms, entry.created_ms);
         assert!(updated.updated_ms > entry.created_ms);
+
+        // Forgetting takes the file with it, and a third launch over the same home reads no
+        // session at all — which is what makes the next turn a new conversation.
+        assert_eq!(reread.forget("ctx_1").as_deref(), Some("sess-2"));
+        assert!(!path.exists(), "{}", path.display());
+        assert_eq!(map_in(&home).get("ctx_1"), None);
+        assert_eq!(reread.forget("ctx_1"), None);
     }
 
     #[test]

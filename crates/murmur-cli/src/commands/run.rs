@@ -147,6 +147,7 @@ pub(crate) fn run_run(
     context_id_arg: Option<&str>,
     resume_arg: Option<&str>,
     resume_mode: capsule_runtime::ResumeMode,
+    forget_session: bool,
     lifecycle_task_acceptance: Option<&str>,
     lifecycle_after_task: Option<&str>,
     workdir_arg: Option<PathBuf>,
@@ -669,6 +670,7 @@ pub(crate) fn run_run(
         context: runtime_manifest.context.clone(),
         context_id,
         resume: resume.map(|(request, _)| request),
+        forget_session,
         otel_endpoint: runtime_manifest
             .observability
             .as_ref()

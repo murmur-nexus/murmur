@@ -329,9 +329,37 @@ turn — see [E-RUN-036](diagnostics.md#e-run-036).
 A task whose context id resolved to nothing starts a new conversation and writes no entry.
 
 The id the runtime mints is a bare UUID. A harness that mints its own reports it back, and **that**
-is what the context is keyed on from then on. A turn that ends without the harness ever naming a
-session is keyed on the id it was handed; a turn that fails without ever naming one writes nothing,
-because nothing was established.
+is what the context is keyed on from then on. A turn that never names a session is keyed on the id
+it was handed.
+
+### What writes an entry { #what-writes-an-entry }
+
+The entry is written once, when the run ends, and only when the run produced observable work: a
+piece of text, a thought, a tool call, or a turn that ran to completion. A harness names its
+session before the model has produced anything, so a run that got no further — one interrupted in
+that window, or one refused for `auth` or `quota` — leaves no entry, and the next task in that
+context starts a conversation the harness will answer to.
+
+A cancel is not special. A task stopped after the harness has said something keeps the conversation
+it opened, and the next task in that context continues it.
+
+### What removes an entry { #what-removes-an-entry }
+
+One action, asked for on the request that starts the next turn:
+
+| Surface | How it is asked for |
+|---|---|
+| CLI | [`mur run --forget-session`](cli.md#run-forget-session), with `--context <id>` |
+| A2A door | [`x-murmur-forget-session: true`](agent-card.md#request-headers) on `message/send` or `message/stream` |
+
+The entry is deleted from the file and from the running capsule's memory, the run's trace records a
+[`harness_session_forgotten`](observability-schemas.md#harness-session-forgotten) event naming the
+context, the id that was dropped and who asked, and the turn launches as a new conversation under
+the same context id. Asked for a context that holds no entry, it drops nothing and records nothing.
+
+Nothing else removes one. A failed resume leaves the entry where it is — see
+[E-RUN-036](diagnostics.md#e-run-036) — and [`context.retain`](manifest.md#context-retain) prunes
+nothing here.
 
 ### What it does not keep
 
@@ -344,7 +372,7 @@ because nothing was established.
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | Reads an empty page, however the hook is granted |
 | An `on-task-start` `seed-context` | Rejected, recorded as a [`context_seed`](observability-schemas.md#context-seed) with reason `unsupported_transport` |
 | [`context.retain`](manifest.md#context-retain) | Prunes nothing — it is wired to the conversation record, which this transport keeps none of, and a deleted session id is a person's conversation lost with no way back |
-| [`mur conversation ls`](cli.md#mur-conversation) and `rm` | Neither lists nor removes these contexts: both work on conversation records, and `rm` answers [`E-CNV-001`](diagnostics.md#e-cnv-001). Delete `harness-session.json` to drop a context's session |
+| [`mur conversation ls`](cli.md#mur-conversation) and `rm` | Neither lists nor removes these contexts: both work on conversation records, and `rm` answers [`E-CNV-001`](diagnostics.md#e-cnv-001). [`mur run --forget-session`](cli.md#run-forget-session) is what drops a context's session |
 
 The session id is the whole of what murmur keeps for such a capsule. To read or export the
 conversation itself, use whatever the harness offers for its own sessions.

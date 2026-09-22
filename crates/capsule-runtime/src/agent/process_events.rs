@@ -177,6 +177,9 @@ pub(super) struct ProcessEventSink<'a> {
     session: RunSession,
     /// The id the harness reported for this run, if it reported one at all. What it says wins
     /// over what the runtime asked for, and its absence is half of the session-gone predicate.
+    /// Held rather than stored on arrival: a harness names its session before the model has
+    /// produced anything, and a turn interrupted in that window leaves the harness holding no
+    /// conversation to answer to.
     reported_session: Option<String>,
     /// The latest cumulative counts the driver has reported for this run, member by member.
     usage: UsageCounts,
@@ -186,6 +189,13 @@ pub(super) struct ProcessEventSink<'a> {
     /// This session's spend account, charged with each closed turn's growth and then asked
     /// whether a ceiling has been reached.
     spend: Arc<SpendMeter>,
+    /// Whether this run produced observable work — see [`produces_observable_work`]. The one
+    /// condition on committing the session: a run that produced nothing established no
+    /// conversation, whatever it was told its session was called.
+    produced: bool,
+    /// Whether the run ended because the harness could not find the session it was handed. That
+    /// entry is left exactly as it was, so nothing is written over it here.
+    session_gone: bool,
     /// The A2A half of the same events. Borrowed rather than owned, because the attempt writes
     /// its one terminal status through it after this sink is done with the run.
     a2a: &'a mut A2aStream,
@@ -211,6 +221,8 @@ impl<'a> ProcessEventSink<'a> {
             usage: UsageCounts::default(),
             attributed: UsageCounts::default(),
             spend,
+            produced: false,
+            session_gone: false,
             a2a,
         }
     }
@@ -263,10 +275,21 @@ impl<'a> ProcessEventSink<'a> {
         SinkOutcome::Continue
     }
 
-    /// Record every tool call the harness never answered. A call with no result is not a
-    /// `tool_call` record: nothing is known about how it went, and inventing a status would put a
-    /// tool call in the trace that no tool ever finished.
+    /// Close the run out: commit its session, and record every tool call the harness never
+    /// answered.
+    ///
+    /// The one place a run writes the harness session map, and the reason it is here rather than
+    /// in an event arm: a session is worth remembering once the run it belongs to has produced
+    /// something, and that is only known when the run is over. A run that produced nothing
+    /// commits nothing, so the next turn in that context starts a conversation the harness will
+    /// answer to instead of resuming one it never opened.
+    ///
+    /// A call with no result is not a `tool_call` record: nothing is known about how it went, and
+    /// inventing a status would put a tool call in the trace that no tool ever finished.
     pub(super) async fn finish(&mut self, trace: &mut TraceWriter) {
+        if self.produced && !self.session_gone {
+            self.session.commit(self.reported_session.as_deref());
+        }
         let mut unanswered: Vec<(String, String)> = self
             .pending
             .drain()
@@ -290,16 +313,14 @@ impl<'a> ProcessEventSink<'a> {
         trace: &mut TraceWriter,
         otel: &mut OtelEmitter,
     ) -> SinkOutcome {
+        self.produced |= produces_observable_work(&event);
         match event {
             Event::SessionStarted(info) => {
                 let _ = trace
                     .write_harness_session(&info.id, &info.auth, info.model.as_deref())
                     .await;
-                // Remembered the moment the harness names it, not at the end of the turn: the
-                // conversation exists from here on, whatever the turn goes on to do.
                 if !info.id.is_empty() {
                     self.reported_session = Some(info.id.clone());
-                    self.session.remember(&info.id);
                 }
                 if info.auth != SUBSCRIPTION_AUTH {
                     let message = format!(
@@ -473,13 +494,6 @@ impl<'a> ProcessEventSink<'a> {
                 if let Some(reached) = self.close_turn(hooks, trace, otel).await {
                     return reached;
                 }
-                // A harness that finished a turn without ever naming its session answers to the
-                // id it was handed: that is the conversation, and this is the only chance to say
-                // so.
-                if self.reported_session.is_none() {
-                    let id = self.session.id().to_string();
-                    self.session.remember(&id);
-                }
                 match super::record_result(hooks, &self.workdir, &result) {
                     Ok(()) => {
                         self.a2a.turn_end(&result);
@@ -497,14 +511,16 @@ impl<'a> ProcessEventSink<'a> {
                 let _ = trace
                     .write_harness_failed(kind, &failure.message, "harness")
                     .await;
-                // A turn that failed without ever reporting a session established nothing, so
-                // nothing is remembered. When it was a resume, that is the harness saying it does
-                // not hold the conversation this context names, which is its own failure.
+                // A turn launched `mode: resume` that failed without the harness ever reporting
+                // the session it was handed is the harness saying it does not hold the
+                // conversation this context names, which is its own failure — and leaves the
+                // entry naming it exactly where it was.
                 if let Some(gone) = self.session.session_gone(
                     failure.kind,
                     self.reported_session.is_some(),
                     &failure.message,
                 ) {
+                    self.session_gone = true;
                     return SinkOutcome::Failed(gone);
                 }
                 SinkOutcome::Failed(RuntimeError::HarnessTurnFailed {
@@ -650,6 +666,29 @@ impl<'a> ProcessEventSink<'a> {
         self.a2a.mark_spend_refused(&refusal);
         Some(SinkOutcome::SpendCeilingReached(refusal))
     }
+}
+
+/// Whether an event is work the harness actually produced, which is the whole of what makes a
+/// run's session id worth keeping.
+///
+/// Six events say yes: a complete or streamed piece of text, a complete or streamed thought, a
+/// tool call, and a turn that ended. `turn-end` counts whatever its result text says — a turn that
+/// ran to completion is a conversation the harness holds, however little it had to say.
+///
+/// The rest say no, and `session-started` is why this predicate exists: a harness prints the name
+/// of its session before the model has produced anything and before it has written a transcript,
+/// so a run that got no further leaves the harness with nothing to answer to under that name. A
+/// retry, a note, a tool result and a failed turn each report on work rather than being it.
+fn produces_observable_work(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Text(_)
+            | Event::TextDelta(_)
+            | Event::Thinking(_)
+            | Event::ThinkingDelta(_)
+            | Event::ToolCall(_)
+            | Event::TurnEnd(_)
+    )
 }
 
 /// The WIT spelling of a `failure-kind`, which is what the error and the trace both name.
@@ -828,6 +867,7 @@ mod tests {
                 map: Arc::clone(&map),
                 context_id: Some(CONTEXT.to_string()),
                 continue_conversation: true,
+                forget: None,
             };
             let plan = plan_session(&policy);
             let planned_id = plan.session.id.clone();
@@ -1731,18 +1771,76 @@ mod tests {
         assert!(h.of_type("tool_call").await.is_empty());
     }
 
+    /// The event a run names its session with. Every session test below starts from one.
+    fn session_started(id: &str) -> Event {
+        Event::SessionStarted(SessionInfo {
+            id: id.to_string(),
+            auth: SUBSCRIPTION_AUTH.into(),
+            model: None,
+        })
+    }
+
     /// Whatever the harness calls its session is what the context is keyed on from then on.
     #[tokio::test]
     async fn harness_session_the_reported_id_replaces_the_one_the_runtime_minted() {
         let mut h = Harness::new(10).await;
-        h.feed(vec![Event::SessionStarted(SessionInfo {
-            id: "harness-chose-this".into(),
-            auth: SUBSCRIPTION_AUTH.into(),
-            model: None,
-        })])
+        h.feed(vec![
+            session_started("harness-chose-this"),
+            text("here it is"),
+            Event::TurnEnd("here it is".into()),
+        ])
         .await;
         assert_eq!(h.map.get(CONTEXT).as_deref(), Some("harness-chose-this"));
         assert_ne!(h.planned_id, "harness-chose-this");
+    }
+
+    /// The run this card exists for: the harness named its session and then the turn was
+    /// interrupted before it produced anything. Nothing is remembered, so the next task in this
+    /// context starts a conversation the harness will answer to.
+    #[tokio::test]
+    async fn harness_session_a_run_that_only_named_its_session_remembers_nothing() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![session_started("named-but-empty")]).await;
+        assert_eq!(h.map.get(CONTEXT), None);
+    }
+
+    /// The four events that are not work: a retry, a note, a tool result nobody called for, and a
+    /// failed turn leave the context exactly as they found it.
+    #[tokio::test]
+    async fn harness_session_reports_about_work_are_not_work() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            session_started("named-but-empty"),
+            Event::Retry(RetryInfo {
+                attempt: 2,
+                reason: "overloaded".into(),
+            }),
+            Event::Note("a line the driver could not read".into()),
+            tool_result("ghost", false),
+            Event::TurnFailed(TurnFailure {
+                kind: FailureKind::Canceled,
+                message: "stopped".into(),
+            }),
+        ])
+        .await;
+        assert_eq!(h.map.get(CONTEXT), None);
+    }
+
+    /// Each of the five events that is work, on its own, with no terminal event after it: the run
+    /// was interrupted past the window this card is about, and the session it established is kept.
+    #[tokio::test]
+    async fn harness_session_any_observable_work_commits_the_reported_id() {
+        for work in [
+            text("an answer"),
+            Event::TextDelta("an ".into()),
+            Event::Thinking("pondering".into()),
+            Event::ThinkingDelta("pond".into()),
+            tool_call("c1", "echo-tool"),
+        ] {
+            let mut h = Harness::new(10).await;
+            h.feed(vec![session_started("worked"), work]).await;
+            assert_eq!(h.map.get(CONTEXT).as_deref(), Some("worked"));
+        }
     }
 
     /// A harness that says nothing about its session answers to the id it was handed.
