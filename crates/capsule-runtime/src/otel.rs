@@ -116,8 +116,8 @@ impl OtelEmitter {
     pub(crate) async fn emit_inference(
         &self,
         turn: u32,
-        input_tokens: u64,
-        output_tokens: u64,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
         decision: &str,
         stop_reason: Option<&str>,
         tool_name: Option<&str>,
@@ -131,12 +131,19 @@ impl OtelEmitter {
         let end_ns = now_ns();
         let start_ns = end_ns.saturating_sub(ms_to_ns(duration_ms));
         let span_id = new_span_id();
-        let mut attrs = vec![
-            kv_int("turn", u64::from(turn)),
-            kv_int("input_tokens", input_tokens),
-            kv_int("output_tokens", output_tokens),
-            kv_str("decision", decision),
-        ];
+        let mut attrs = vec![kv_int("turn", u64::from(turn))];
+        // Absent when nothing counted this turn, which only a `transport: process` driver
+        // reporting no usage produces. An attribute that is not there is not the same fact as
+        // one carrying `0`, so neither is written in that case.
+        for (name, value) in [
+            ("input_tokens", input_tokens),
+            ("output_tokens", output_tokens),
+        ] {
+            if let Some(value) = value {
+                attrs.push(kv_int(name, value));
+            }
+        }
+        attrs.push(kv_str("decision", decision));
         // The provider's own stop reason, beside the `decision` the loop derived from it. Absent
         // only where no driver response was parsed — a hook's `run-inference` and the `process`
         // transport.
@@ -146,15 +153,18 @@ impl OtelEmitter {
         if let Some(tn) = tool_name {
             attrs.push(kv_str("tool_name", tn));
         }
-        // The provider's own counts, each present only when the driver reported it. They sit
-        // beside `input_tokens`/`output_tokens` (this runtime's tiktoken estimates) rather
-        // than replacing them, so the drift between the two is a subtraction on one span.
+        // The provider's own counts, each present only when the driver reported it. Under `http`
+        // the two `*_actual` attributes sit beside `input_tokens`/`output_tokens` (this
+        // runtime's tiktoken estimates) rather than replacing them, so the drift between the two
+        // is a subtraction on one span. Under `process` the harness's counts are already the
+        // two above and only the cache and thinking attributes arrive here.
         if let Some(u) = usage {
             for (name, value) in [
                 ("input_tokens_actual", u.input_tokens),
                 ("output_tokens_actual", u.output_tokens),
                 ("cached_tokens", u.cached_tokens),
                 ("cache_write_tokens", u.cache_write_tokens),
+                ("thinking_tokens", u.thinking_tokens),
             ] {
                 if let Some(value) = value {
                     attrs.push(kv_int(name, value));

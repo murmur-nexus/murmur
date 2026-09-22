@@ -18,8 +18,8 @@ use murmur_artifact::{
     MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType,
     TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006,
     W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-    W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026,
-    W_SEC_027, W_SEC_030,
+    W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027,
+    W_SEC_030,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -1051,6 +1051,16 @@ pub fn stage_session(
     // machine ceiling that cannot be kept, or an artifact with a `gateway:` that does not say how
     // its upstream takes the key (it could only be run by handing it the key), refuses the launch
     // here rather than at its first call.
+    if let Some(driver) = staged_process_driver.as_ref() {
+        check_driver_meters_ceilings(
+            driver,
+            request
+                .inference
+                .as_ref()
+                .and_then(|inference| inference.max_session_tokens),
+            request.machine_tokens_per_day,
+        )?;
+    }
     let spend = stage_spend_meter(
         request.inference.as_ref(),
         request.machine_tokens_per_day,
@@ -3750,30 +3760,6 @@ fn gateway_endpoint_host(endpoint: &str) -> String {
     }
 }
 
-/// Print `W-SEC-026` when `spend.machine_tokens_per_day` is in effect and the capsule uses
-/// `transport: process`.
-///
-/// That transport's CLI reaches its provider with its own credentials, so nothing it spends passes
-/// the inference gateway and the machine ceiling does not cover it. Shared between `mur run` and
-/// `mur doctor` on the same terms as [`warn_on_gateway_endpoint_in_network_allow`]: decided
-/// before any session workdir exists, so it goes to stderr only. Never a refusal.
-pub fn warn_on_machine_spend_ceiling_under_process_transport(
-    machine_tokens_per_day: Option<u64>,
-    inference: Option<&InferenceConfig>,
-) {
-    if machine_tokens_per_day.is_none()
-        || !inference.is_some_and(|inference| inference.transport == "process")
-    {
-        return;
-    }
-    let link = security_warning_link(W_SEC_026);
-    crate::runtime_err!(
-        "[capsule-runtime] warning[{W_SEC_026}]: spend.machine_tokens_per_day is set and this \
-         capsule uses transport: process — the CLI reaches its provider with its own credentials, \
-         so murmur neither counts nor limits this capsule's spend ({link})"
-    );
-}
-
 /// The `network_allow` entries whose rule matches some artifact's `gateway.endpoint`, each with
 /// the artifact whose `capabilities:` declares it (`None` for the capsule-wide block) and the
 /// artifacts whose endpoint it matches. Capsule-wide entries first, then each artifact's own, in
@@ -5116,20 +5102,55 @@ fn session_gateways(gateways: &GatewayTable) -> Vec<crate::trace::SessionGateway
         .collect()
 }
 
-/// Builds the session's spend account: `inference.max_session_tokens` as its session ceiling and,
-/// for a `transport: http` session with a driver, the shared daily ledger when
-/// `machine_tokens_per_day` is set.
+/// Refuses a launch that sets a spend ceiling against a process driver reporting no usage.
 ///
-/// Refuses with [`RuntimeError::SpendLedgerUnavailable`] when that ledger cannot be opened. A
-/// `transport: process` session holds no key and makes no call the runtime can meter, so it keeps
-/// no ledger whatever the operator set.
+/// The runtime learns what a `transport: process` turn cost only from the driver's `usage`
+/// events, so a driver whose `describe().reports-usage` is `false` can never move the meter: the
+/// ceiling would stand over a run that goes on for ever beneath it. Asked at staging, before any
+/// session directory exists, so nothing is spawned and nothing is left behind. A driver that
+/// reports no usage under no ceiling runs normally.
+fn check_driver_meters_ceilings(
+    driver: &StagedProcessDriver,
+    max_session_tokens: Option<u64>,
+    machine_tokens_per_day: Option<u64>,
+) -> Result<(), RuntimeError> {
+    if driver.description.reports_usage {
+        return Ok(());
+    }
+    let ceilings: Vec<String> = [
+        max_session_tokens.map(|_| "inference.max_session_tokens"),
+        machine_tokens_per_day.map(|_| "spend.machine_tokens_per_day"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_string)
+    .collect();
+    if ceilings.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeError::ProcessDriverReportsNoUsage {
+        name: driver.name.clone(),
+        version: driver.version.clone(),
+        ceilings,
+    })
+}
+
+/// Builds the session's spend account: `inference.max_session_tokens` as its session ceiling and,
+/// for a session with an inference driver, the shared daily ledger when `machine_tokens_per_day`
+/// is set.
+///
+/// Refuses with [`RuntimeError::SpendLedgerUnavailable`] when that ledger cannot be opened. Both
+/// transports that name a driver are metered: `http` against the runtime's own tiktoken
+/// measurement of each call it makes, `process` against the counts the harness's driver reports
+/// for each turn. A session naming no driver spends nothing the runtime could count and keeps no
+/// ledger whatever the operator set.
 fn stage_spend_meter(
     inference: Option<&InferenceConfig>,
     machine_tokens_per_day: Option<u64>,
     session_id: &str,
 ) -> Result<Arc<SpendMeter>, RuntimeError> {
     let metered = inference.filter(|inference| {
-        inference.transport == "http"
+        matches!(inference.transport.as_str(), "http" | "process")
             && inference
                 .driver
                 .as_ref()
@@ -11784,10 +11805,49 @@ inference:
                 interrupt: crate::process_driver::InterruptMethod::StdinMessage,
                 required_env: Vec::new(),
                 streams_text: true,
+                reports_usage: true,
             },
             binary: binary.to_path_buf(),
             binary_source: "inference.command".to_string(),
         })
+    }
+
+    /// A driver that reports no usage runs under no ceiling, and is refused under either.
+    #[test]
+    fn a_ceiling_against_an_unreporting_driver_is_refused_at_staging() {
+        let engine = build_engine().expect("engine");
+        let mut driver = staged_fixture_driver(&engine, Path::new("/bin/true"));
+        assert!(check_driver_meters_ceilings(&driver, Some(1_000), Some(2_000)).is_ok());
+
+        Arc::get_mut(&mut driver).unwrap().description.reports_usage = false;
+        assert!(check_driver_meters_ceilings(&driver, None, None).is_ok());
+
+        for (session, machine, expected) in [
+            (Some(1_000), None, vec!["inference.max_session_tokens"]),
+            (None, Some(2_000), vec!["spend.machine_tokens_per_day"]),
+            (
+                Some(1_000),
+                Some(2_000),
+                vec![
+                    "inference.max_session_tokens",
+                    "spend.machine_tokens_per_day",
+                ],
+            ),
+        ] {
+            let err = check_driver_meters_ceilings(&driver, session, machine).unwrap_err();
+            match &err {
+                RuntimeError::ProcessDriverReportsNoUsage { name, ceilings, .. } => {
+                    assert_eq!(name, "fixture-process-driver");
+                    assert_eq!(ceilings, &expected);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            let message = err.to_string();
+            assert!(message.contains("reports no usage"), "{message}");
+            for ceiling in expected {
+                assert!(message.contains(ceiling), "{message}");
+            }
+        }
     }
 
     /// Make `script` executable, as a staged harness binary has to be.

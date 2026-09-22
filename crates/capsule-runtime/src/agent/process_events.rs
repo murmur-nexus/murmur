@@ -21,6 +21,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -28,10 +29,12 @@ use murmur_artifact::{security_warning_link, W_SEC_031};
 use serde_json::Value;
 
 use crate::{
+    agent::DriverUsage,
     errors::RuntimeError,
     hooks::{HookEvent, HookRuntime},
     otel::OtelEmitter,
-    process_driver::{Event, FailureKind},
+    process_driver::{Event, FailureKind, Usage},
+    spend::{SpendMeter, SpendRefusal},
     streaming::StreamArtifact,
     trace::TraceWriter,
 };
@@ -54,6 +57,85 @@ pub(super) enum SinkOutcome {
     /// A turn opened past the attempt's remaining budget. The harness is killed at once rather
     /// than given the exit grace: it is mid-turn and would otherwise keep spending.
     TurnBudgetExceeded(RuntimeError),
+    /// A turn closed on or past a spend ceiling. Killed at once for the same reason a turn
+    /// budget is: every further turn is spend the operator said must not happen.
+    SpendCeilingReached(SpendRefusal),
+}
+
+/// One set of token counts, each member independently optional.
+///
+/// Used twice by [`ProcessEventSink`]: as the latest cumulative report the driver made for the
+/// harness run, and as the totals already attributed to turns that have closed. `None` means the
+/// harness does not report that count at all — never that it reported zero, which is `Some(0)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageCounts {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+    thinking: Option<u64>,
+}
+
+impl UsageCounts {
+    /// The members in a fixed order, so growth and replacement walk the same list.
+    fn members(&self) -> [Option<u64>; 5] {
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_creation,
+            self.thinking,
+        ]
+    }
+
+    fn from_members(members: [Option<u64>; 5]) -> Self {
+        let [input, output, cache_read, cache_creation, thinking] = members;
+        Self {
+            input,
+            output,
+            cache_read,
+            cache_creation,
+            thinking,
+        }
+    }
+
+    /// Replace each member `report` names, leaving the rest standing.
+    ///
+    /// A harness that reports output on one line and a full set on the next must not lose the
+    /// earlier members, and a member missing from a later report is the harness declining to
+    /// repeat itself rather than retracting what it said.
+    fn overlay(&mut self, report: &Usage) {
+        let incoming = [
+            report.input,
+            report.output,
+            report.cache_read,
+            report.cache_creation,
+            report.thinking,
+        ];
+        let held = self.members();
+        *self = Self::from_members(std::array::from_fn(|i| incoming[i].or(held[i])));
+    }
+
+    /// What has been reported since `attributed` was last taken, member by member, advancing
+    /// `attributed` by exactly that.
+    ///
+    /// Every reported member is the total for the harness run so far, so only its growth belongs
+    /// to the turn closing now: reporting the same total twice adds nothing, and a member that
+    /// shrank contributes zero and leaves the larger total attributed, so a later report back at
+    /// the earlier figure cannot be counted a second time.
+    fn take_growth(&self, attributed: &mut Self) -> Self {
+        let latest = self.members();
+        let mut counted = attributed.members();
+        let growth = std::array::from_fn(|i| {
+            let latest = latest[i]?;
+            let already = counted[i].unwrap_or(0);
+            let grown = latest.saturating_sub(already);
+            counted[i] = Some(already.saturating_add(grown));
+            Some(grown)
+        });
+        *attributed = Self::from_members(counted);
+        Self::from_members(growth)
+    }
 }
 
 /// A tool call the harness reported, waiting for its result so the pair can be recorded with a
@@ -96,6 +178,14 @@ pub(super) struct ProcessEventSink<'a> {
     /// The id the harness reported for this run, if it reported one at all. What it says wins
     /// over what the runtime asked for, and its absence is half of the session-gone predicate.
     reported_session: Option<String>,
+    /// The latest cumulative counts the driver has reported for this run, member by member.
+    usage: UsageCounts,
+    /// The part of [`Self::usage`] already attributed to turns that have closed. The difference
+    /// between the two is what the next turn to close records.
+    attributed: UsageCounts,
+    /// This session's spend account, charged with each closed turn's growth and then asked
+    /// whether a ceiling has been reached.
+    spend: Arc<SpendMeter>,
     /// The A2A half of the same events. Borrowed rather than owned, because the attempt writes
     /// its one terminal status through it after this sink is done with the run.
     a2a: &'a mut A2aStream,
@@ -106,6 +196,7 @@ impl<'a> ProcessEventSink<'a> {
         workdir: &Path,
         max_turns: u32,
         session: RunSession,
+        spend: Arc<SpendMeter>,
         a2a: &'a mut A2aStream,
     ) -> Self {
         Self {
@@ -117,8 +208,16 @@ impl<'a> ProcessEventSink<'a> {
             finished: false,
             session,
             reported_session: None,
+            usage: UsageCounts::default(),
+            attributed: UsageCounts::default(),
+            spend,
             a2a,
         }
+    }
+
+    /// The internal session workdir this run writes `out/result.txt` into.
+    pub(super) fn workdir(&self) -> &Path {
+        &self.workdir
     }
 
     /// The runtime is about to interrupt the harness. Everything the harness says from here on is
@@ -205,8 +304,8 @@ impl<'a> ProcessEventSink<'a> {
                 if info.auth != SUBSCRIPTION_AUTH {
                     let message = format!(
                         "the harness session reports auth '{}', not '{SUBSCRIPTION_AUTH}' — this \
-                         run's spend may be billed to an API key, which murmur neither counts nor \
-                         limits",
+                         run's spend may be billed to an API key rather than to the subscription \
+                         this transport exists for",
                         info.auth
                     );
                     crate::runtime_err!(
@@ -256,7 +355,11 @@ impl<'a> ProcessEventSink<'a> {
             Event::ToolResult(result) => {
                 // The turn that issued the call closes here, before the call is recorded, so the
                 // trace reads in the order the work happened: the model decided, then the tool ran.
-                self.close_turn(hooks, trace, otel).await;
+                // A ceiling reached by that turn stops the run before the tool call is recorded:
+                // the tool has already run, and its record belongs to a run that is continuing.
+                if let Some(reached) = self.close_turn(hooks, trace, otel).await {
+                    return reached;
+                }
                 let Some(call) = self.pending.remove(&result.id) else {
                     let _ = trace
                         .write_harness_note(&format!(
@@ -352,12 +455,24 @@ impl<'a> ProcessEventSink<'a> {
                     .await;
                 SinkOutcome::Continue
             }
+            // Cumulative for the whole harness run, so it is held rather than added up: what a
+            // turn records is the growth `close_turn` takes off it. Held member by member, so a
+            // report naming only what changed leaves the rest of the last one standing.
+            Event::Usage(report) => {
+                self.usage.overlay(&report);
+                SinkOutcome::Continue
+            }
             Event::Note(text) => {
                 let _ = trace.write_harness_note(&text).await;
                 SinkOutcome::Continue
             }
             Event::TurnEnd(result) => {
-                self.close_turn(hooks, trace, otel).await;
+                // A ceiling the last turn reached outranks the answer: the run stopped at the
+                // operator's limit, and `out/result.txt` says so rather than holding an answer
+                // the next turn would have gone past the ceiling to improve on.
+                if let Some(reached) = self.close_turn(hooks, trace, otel).await {
+                    return reached;
+                }
                 // A harness that finished a turn without ever naming its session answers to the
                 // id it was handed: that is the conversation, and this is the only chance to say
                 // so.
@@ -374,7 +489,9 @@ impl<'a> ProcessEventSink<'a> {
                 }
             }
             Event::TurnFailed(failure) => {
-                self.close_turn(hooks, trace, otel).await;
+                // The failure is the run's own account of itself and outranks a ceiling the same
+                // turn reached: the harness said why it stopped, and that is what is reported.
+                let _ = self.close_turn(hooks, trace, otel).await;
                 self.a2a.turn_failed();
                 let kind = failure_kind_name(failure.kind);
                 let _ = trace
@@ -441,49 +558,67 @@ impl<'a> ProcessEventSink<'a> {
         None
     }
 
-    /// Write the open turn's `inference` record, if one is open. Tokens are zero on this
-    /// transport: the harness holds its own conversation and reports no usage the runtime could
-    /// record.
+    /// Write the open turn's `inference` record, if one is open, charge what it cost, and say
+    /// whether that took the session to a spend ceiling.
+    ///
+    /// The counts are the harness's own, as its driver reported them, and this transport has no
+    /// second measurement: the growth of the cumulative `usage` report goes into the record's
+    /// `input_tokens`/`output_tokens` — which is what the task and session totals accumulate —
+    /// and `input_tokens_actual`/`output_tokens_actual` stay absent. Cache read, cache creation
+    /// and thinking ride along in a [`DriverUsage`] carrying nothing else. A driver that reported
+    /// no usage leaves each count absent, which the trace keeps distinct from a count of zero.
+    ///
+    /// The hook is handed `0` where the trace holds absent: `murmur:hook`'s `inference-event`
+    /// declares both counts as plain `u64` with no optional form, and widening them would break
+    /// every published hook artifact. The absent/zero distinction lives in the trace.
     async fn close_turn(
         &mut self,
         hooks: &mut HookRuntime,
         trace: &mut TraceWriter,
         otel: &mut OtelEmitter,
-    ) {
-        let Some(open) = self.open.take() else {
-            return;
-        };
+    ) -> Option<SinkOutcome> {
+        let open = self.open.take()?;
         let decision = if open.first_tool.is_some() {
             "tool_call"
         } else {
             "end_turn"
         };
+        let spent = self.usage.take_growth(&mut self.attributed);
+        // `None` throughout rather than a record of absences, so an unreporting driver's turn
+        // carries no provider keys at all.
+        let reported = (spent != UsageCounts::default()).then_some(DriverUsage {
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: spent.cache_read,
+            cache_write_tokens: spent.cache_creation,
+            thinking_tokens: spent.thinking,
+        });
         let _ = trace
             .write_inference(
                 open.index,
-                0,
-                0,
+                spent.input,
+                spent.output,
                 decision.to_string(),
                 // The runtime reads no driver response of its own on this transport, so there is
                 // no provider stop reason and no request payload to hash.
                 None,
                 open.first_tool.clone(),
                 None,
-                None,
+                reported.as_ref(),
                 Vec::new(),
                 None,
             )
             .await;
         otel.emit_inference(
             open.index,
-            0,
-            0,
+            spent.input,
+            spent.output,
             decision,
             None,
             open.first_tool.as_deref(),
             0,
             None,
-            None,
+            reported.as_ref(),
         )
         .await;
         hooks
@@ -491,8 +626,8 @@ impl<'a> ProcessEventSink<'a> {
                 &self.workdir,
                 HookEvent::Inference {
                     turn: open.index,
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: spent.input.unwrap_or(0),
+                    output_tokens: spent.output.unwrap_or(0),
                     decision: decision.to_string(),
                     // The same value the trace records, so a hook bound to `on-inference` reads
                     // the same turn on either transport.
@@ -503,6 +638,17 @@ impl<'a> ProcessEventSink<'a> {
                 },
             )
             .await;
+        // Charged after the record is written, so what the meter holds is always a sum of lines
+        // already in the trace. Cache and thinking are not charged: the meter's definition is
+        // `input + output` on both transports.
+        self.spend
+            .charge_spent(spent.input.unwrap_or(0), spent.output.unwrap_or(0));
+        let refusal = self.spend.ceiling_crossed()?;
+        let _ = trace
+            .write_spend_ceiling_reached(open.index, &refusal, None)
+            .await;
+        self.a2a.mark_spend_refused(&refusal);
+        Some(SinkOutcome::SpendCeilingReached(refusal))
     }
 }
 
@@ -592,6 +738,9 @@ mod tests {
         /// per batch; planning once keeps `planned_id` the id every batch is handed.
         policy: HarnessSessionPolicy,
         plan: SessionPlan,
+        /// The spend account every batch's sink shares, so a ceiling test can hold one across
+        /// several batches the way one run does.
+        spend: Arc<SpendMeter>,
         a2a: A2aStream,
         /// Every frame the A2A stream wrote, in order, as the session buffer recorded them.
         frames: Arc<Mutex<SseEventBuffer>>,
@@ -611,6 +760,12 @@ mod tests {
                 Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
             )
             .await
+        }
+
+        /// The same harness, metered by `spend` rather than by an unlimited meter.
+        fn metered(mut self, spend: SpendMeter) -> Self {
+            self.spend = Arc::new(spend);
+            self
         }
 
         /// A sink threading `CONTEXT` through `map`: `mode: resume` when the map already holds an
@@ -687,6 +842,7 @@ mod tests {
                 max_turns,
                 policy,
                 plan,
+                spend: Arc::new(SpendMeter::unlimited()),
                 a2a: A2aStream::new(
                     Some((tx, Arc::clone(&frames))),
                     Some("tsk_test".to_string()),
@@ -706,8 +862,13 @@ mod tests {
         /// test-local concern and every test here feeds exactly one batch.
         async fn feed(&mut self, events: Vec<Event>) -> SinkOutcome {
             let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
-            let mut sink =
-                ProcessEventSink::new(&self.workdir, self.max_turns, session, &mut self.a2a);
+            let mut sink = ProcessEventSink::new(
+                &self.workdir,
+                self.max_turns,
+                session,
+                Arc::clone(&self.spend),
+                &mut self.a2a,
+            );
             let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
                 .await;
@@ -771,6 +932,205 @@ mod tests {
             output: "done".to_string(),
             is_error,
         })
+    }
+
+    /// A `usage` report naming only some members, with the rest of the last one standing.
+    fn usage(members: &[(&str, u64)]) -> Event {
+        let mut report = Usage {
+            input: None,
+            output: None,
+            cache_read: None,
+            cache_creation: None,
+            thinking: None,
+        };
+        for (member, value) in members {
+            let slot = match *member {
+                "in" => &mut report.input,
+                "out" => &mut report.output,
+                "cache-read" => &mut report.cache_read,
+                "cache-creation" => &mut report.cache_creation,
+                "thinking" => &mut report.thinking,
+                other => panic!("no such usage member: {other}"),
+            };
+            *slot = Some(*value);
+        }
+        Event::Usage(report)
+    }
+
+    /// The reported counts land in `input_tokens`/`output_tokens` — which is what the totals
+    /// accumulate — and the cache and thinking counts sit beside them. `*_actual` stays absent:
+    /// there is one measurement on this transport and it is recorded once.
+    #[tokio::test]
+    async fn usage_a_reported_turn_carries_the_harness_counts() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            usage(&[
+                ("in", 120),
+                ("out", 30),
+                ("cache-read", 900),
+                ("cache-creation", 64),
+                ("thinking", 2),
+            ]),
+            text("answer"),
+            Event::TurnEnd("answer".into()),
+        ])
+        .await;
+        let inference = &h.of_type("inference").await[0];
+        assert_eq!(inference["input_tokens"], 120);
+        assert_eq!(inference["output_tokens"], 30);
+        assert_eq!(inference["cached_tokens"], 900);
+        assert_eq!(inference["cache_write_tokens"], 64);
+        assert_eq!(inference["thinking_tokens"], 2);
+        assert!(
+            inference.get("input_tokens_actual").is_none(),
+            "{inference}"
+        );
+        assert!(
+            inference.get("output_tokens_actual").is_none(),
+            "{inference}"
+        );
+    }
+
+    /// A driver that reported nothing leaves both counts off the record entirely, which is a
+    /// different fact from a harness that reported spending none.
+    #[tokio::test]
+    async fn usage_an_unreported_turn_carries_no_counts_at_all() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![text("answer"), Event::TurnEnd("answer".into())])
+            .await;
+        let inference = &h.of_type("inference").await[0];
+        assert!(inference.get("input_tokens").is_none(), "{inference}");
+        assert!(inference.get("output_tokens").is_none(), "{inference}");
+        assert!(inference.get("thinking_tokens").is_none(), "{inference}");
+    }
+
+    #[tokio::test]
+    async fn usage_a_reported_zero_is_written_as_zero() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            usage(&[("in", 0), ("out", 0)]),
+            text("answer"),
+            Event::TurnEnd("answer".into()),
+        ])
+        .await;
+        let inference = &h.of_type("inference").await[0];
+        assert_eq!(inference["input_tokens"], 0);
+        assert_eq!(inference["output_tokens"], 0);
+    }
+
+    /// Every report is the total for the run, so the second turn is charged the growth alone and
+    /// the two turns together add up to the last report rather than to twice it.
+    #[tokio::test]
+    async fn usage_is_cumulative_so_each_turn_records_only_its_growth() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            usage(&[("in", 40), ("out", 20)]),
+            tool_call("c1", "t"),
+            tool_result("c1", false),
+            usage(&[("in", 100), ("out", 50)]),
+            text("two"),
+            Event::TurnEnd("two".into()),
+        ])
+        .await;
+        let inferences = h.of_type("inference").await;
+        assert_eq!(inferences.len(), 2);
+        assert_eq!(inferences[0]["input_tokens"], 40);
+        assert_eq!(inferences[0]["output_tokens"], 20);
+        assert_eq!(inferences[1]["input_tokens"], 60);
+        assert_eq!(inferences[1]["output_tokens"], 30);
+    }
+
+    /// The same total reported twice adds nothing, and a member that shrinks contributes zero
+    /// rather than wrapping or subtracting.
+    #[tokio::test]
+    async fn usage_repeated_and_shrinking_reports_add_nothing() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            usage(&[("in", 100), ("out", 50)]),
+            tool_call("c1", "t"),
+            tool_result("c1", false),
+            usage(&[("in", 100), ("out", 10)]),
+            text("two"),
+            Event::TurnEnd("two".into()),
+        ])
+        .await;
+        let inferences = h.of_type("inference").await;
+        assert_eq!(inferences[1]["input_tokens"], 0);
+        assert_eq!(inferences[1]["output_tokens"], 0);
+    }
+
+    /// A member a later report omits keeps the value the earlier one gave it, rather than being
+    /// retracted and counted again from zero.
+    #[tokio::test]
+    async fn usage_a_member_a_later_report_omits_keeps_standing() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            usage(&[("in", 100), ("cache-read", 7)]),
+            tool_call("c1", "t"),
+            tool_result("c1", false),
+            usage(&[("out", 5)]),
+            text("two"),
+            Event::TurnEnd("two".into()),
+        ])
+        .await;
+        let inferences = h.of_type("inference").await;
+        assert_eq!(inferences[0]["input_tokens"], 100);
+        assert_eq!(inferences[0]["cached_tokens"], 7);
+        assert_eq!(inferences[1]["input_tokens"], 0);
+        assert_eq!(inferences[1]["output_tokens"], 5);
+        // Reported once means reported from then on: the second turn's growth over the same
+        // total is zero, which is a count, not an absence.
+        assert_eq!(inferences[1]["cached_tokens"], 0);
+    }
+
+    /// The meter is charged `input + output` alone, and a turn that reaches the ceiling ends
+    /// the run with the refusal and its `spend_ceiling_reached` record.
+    #[tokio::test]
+    async fn usage_reaches_the_spend_meter_and_crosses_its_ceiling() {
+        let mut h = Harness::new(10)
+            .await
+            .metered(SpendMeter::new(Some(100), None));
+        let outcome = h
+            .feed(vec![
+                usage(&[("in", 80), ("out", 40), ("cache-read", 9_000)]),
+                text("answer"),
+                Event::TurnEnd("answer".into()),
+            ])
+            .await;
+        let refusal = match outcome {
+            SinkOutcome::SpendCeilingReached(refusal) => refusal,
+            _ => panic!("a turn past the ceiling must end the run"),
+        };
+        // Cache reads are never folded into what the meter charges: 80 + 40 crosses 100, and the
+        // 9000 cached prompt tokens are beside it rather than inside it.
+        assert_eq!(refusal.used, 120);
+        assert_eq!(refusal.requested, 0);
+        let reached = h.of_type("spend_ceiling_reached").await;
+        assert_eq!(reached.len(), 1);
+        assert_eq!(reached[0]["limit"], "session");
+        assert!(
+            refusal
+                .to_string()
+                .contains("inference.max_session_tokens is 100"),
+            "{refusal}"
+        );
+    }
+
+    /// A run under the ceiling ends the way it would with no ceiling at all.
+    #[tokio::test]
+    async fn usage_a_run_under_the_ceiling_is_untouched() {
+        let mut h = Harness::new(10)
+            .await
+            .metered(SpendMeter::new(Some(1_000), None));
+        let outcome = h
+            .feed(vec![
+                usage(&[("in", 80), ("out", 40)]),
+                text("answer"),
+                Event::TurnEnd("answer".into()),
+            ])
+            .await;
+        assert!(matches!(outcome, SinkOutcome::Ended));
+        assert!(h.of_type("spend_ceiling_reached").await.is_empty());
     }
 
     #[tokio::test]

@@ -29,10 +29,10 @@ Read this before you choose it. Four things are true here that are not true of `
 |---|---|
 | The harness process is not contained | Unlike a WASM artifact, the `claude` process runs on the host with the host network and your real home directory. Murmur controls the environment it starts with and the tools it is offered, not what the process can reach once running. |
 | The capsule depends on your machine | It runs on your login and on whichever `claude` version is installed. The manifest pins neither, so the same manifest on two machines is not the same capsule. |
-| Spend is invisible to Murmur | The harness reaches its provider with its own credentials, so no request passes through Murmur. [inference.max_session_tokens](../reference/manifest.md#inference-max-session-tokens) is a manifest error here, `spend.machine_tokens_per_day` does not cover this capsule, and every token count in the trace is reported as zero. |
+| Murmur counts what it is told | The harness reaches its provider with its own credentials, so no request passes through Murmur. The token counts in the trace are the harness's own report of what it spent, relayed by the driver — not requests Murmur measured. [inference.max_session_tokens](../reference/manifest.md#inference-max-session-tokens) and `spend.machine_tokens_per_day` are enforced against those reported numbers. |
 | The harness's own configuration does not load | The driver launches the harness with `--setting-sources ""`, so the harness reads none of its own configuration on this machine: its `CLAUDE.md`, its settings and its own hook scripts stay out. The agent's instructions come from the manifest alone, and the capsule's own `runtime: hook` artifacts run exactly as they do on `transport: http`. |
 
-A capsule that ran on a subscription and reported zero tokens spent nothing that Murmur can tell you about. If you need token accounting or a spend ceiling, use [`transport: http`](../reference/manifest.md#transport-http).
+These are the harness's own numbers, not Murmur's. On [`transport: http`](../reference/manifest.md#transport-http) Murmur builds every request and counts it before sending; here it counts what the harness said it spent, and a harness that reports nothing leaves the count absent rather than zero. A manifest that sets either ceiling against a driver that reports no usage is refused at launch with `E-RUN-038`, so a ceiling never stands over a run nothing could measure.
 
 ---
 
@@ -52,7 +52,7 @@ The version it prints is the version your capsule runs on — the manifest pins 
 
 The capsule reads that login out of `~/.claude` under the `HOME` it is given, which is why `HOME` is one of the variables the driver requires. An API key cannot reach the harness through the manifest at all: `capabilities.env.allow` refuses every credential-shaped name with [E-CAP-016](../reference/diagnostics.md#e-cap-016), `ANTHROPIC_API_KEY` among them.
 
-A run whose harness session reports an API key anyway prints [`warning[W-SEC-031]`](../reference/diagnostics.md#w-sec-031) and keeps going, because that spend is billed to a key Murmur neither counts nor limits. On a subscription login it does not appear.
+A run whose harness session reports an API key anyway prints [`warning[W-SEC-031]`](../reference/diagnostics.md#w-sec-031) and keeps going: the harness still reports what it spent and both ceilings still count it, but the bill arrives against that key rather than the subscription. On a subscription login the warning does not appear.
 
 ## Step 2 — create murmur.yaml
 
@@ -287,8 +287,9 @@ It declares no compaction hook and no `context.max_tokens`: both are inert under
 | `capabilities.shell.allow` | Each binary becomes one tool the model may call through Murmur |
 | `capabilities.filesystem.read_only`, an `on-tool-call` policy hook | Both govern every tool call the harness makes, the same way they govern one on `transport: http` |
 | `lifecycle.conversation: threaded` | Each A2A context resumes one harness session; the harness holds the history |
-| `inference.max_session_tokens` | A manifest error — Murmur sees no spend on this transport |
+| `inference.max_session_tokens` | Enforced against the harness's own reported counts; the run stops at the first turn that reaches it |
 | `context.max_tokens`, `inference.compaction` | Parse but do nothing; the harness manages its own context |
 | Inactivity limit, 600 seconds | Fixed; a silent harness is killed with `E-RUN-035` |
 | Interrupt grace, 10 seconds | Fixed; a harness asked to stop is killed after it |
-| Token counts in the trace | Always zero; the subprocess protocol does not carry them |
+| `spend.machine_tokens_per_day` | Counts this capsule's turns too, from the same reported counts |
+| Token counts in the trace | The harness's own report, relayed by the driver; absent for a driver that reports none |

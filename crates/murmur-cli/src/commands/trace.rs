@@ -180,6 +180,8 @@ struct InferenceEvent {
     cached_tokens: Option<u64>,
     #[serde(default)]
     cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    thinking_tokens: Option<u64>,
     /// The four wire hashes. All absent under `trace.capture: none`, and on a record the
     /// runtime did not build the request for.
     #[serde(default)]
@@ -698,12 +700,49 @@ impl InferenceRecord {
 
 /// The provider's own token counts, summed over every turn that reported them. Absent when
 /// no turn did — the runtime writes these keys only when the driver returned a `usage` block.
+///
+/// Each member is summed separately and stays absent until some turn reports it, so a transport
+/// that carries only part of the set does not read as having reported the rest as zero. A
+/// `transport: process` record carries no `*_actual` pair at all: the harness's own counts are
+/// the session totals above, not a second measurement beside them.
 #[derive(Default)]
 struct ProviderTokens {
-    input: u64,
-    output: u64,
-    cached: u64,
-    cache_write: u64,
+    input: Option<u64>,
+    output: Option<u64>,
+    cached: Option<u64>,
+    cache_write: Option<u64>,
+    thinking: Option<u64>,
+}
+
+impl ProviderTokens {
+    /// Add one record's counts, leaving members it did not report untouched.
+    fn add(&mut self, event: &InferenceEvent) {
+        for (total, reported) in [
+            (&mut self.input, event.input_tokens_actual),
+            (&mut self.output, event.output_tokens_actual),
+            (&mut self.cached, event.cached_tokens),
+            (&mut self.cache_write, event.cache_write_tokens),
+            (&mut self.thinking, event.thinking_tokens),
+        ] {
+            if let Some(reported) = reported {
+                *total = Some(total.unwrap_or(0) + reported);
+            }
+        }
+    }
+
+    /// The reported members, each as `<label> <count>`, in a fixed order.
+    fn parts(&self) -> Vec<String> {
+        [
+            ("in", self.input),
+            ("out", self.output),
+            ("cached", self.cached),
+            ("cache write", self.cache_write),
+            ("thinking", self.thinking),
+        ]
+        .into_iter()
+        .filter_map(|(label, total)| total.map(|total| format!("{label} {}", fmt_thousands(total))))
+        .collect()
+    }
 }
 
 /// One `context_seed` record: what a seeding hook proposed, and what survived the budget.
@@ -1283,12 +1322,11 @@ fn compute_metrics(
                     || e.output_tokens_actual.is_some()
                     || e.cached_tokens.is_some()
                     || e.cache_write_tokens.is_some()
+                    || e.thinking_tokens.is_some()
                 {
-                    let totals = provider_tokens.get_or_insert_with(ProviderTokens::default);
-                    totals.input += e.input_tokens_actual.unwrap_or(0);
-                    totals.output += e.output_tokens_actual.unwrap_or(0);
-                    totals.cached += e.cached_tokens.unwrap_or(0);
-                    totals.cache_write += e.cache_write_tokens.unwrap_or(0);
+                    provider_tokens
+                        .get_or_insert_with(ProviderTokens::default)
+                        .add(&e);
                 }
                 inference_records.push(InferenceRecord {
                     turn: e.turn,
@@ -1996,16 +2034,12 @@ fn print_show(m: &TraceMetrics) {
         "total:      {}",
         fmt_thousands(m.total_input_tokens + m.total_output_tokens)
     );
-    // The provider's own counts, beside the runtime's tiktoken estimates above rather than
-    // replacing them: the difference between the two lines is estimator drift.
+    // The provider's or harness's own counts, beside the totals above. Under `transport: http`
+    // those totals are the runtime's tiktoken estimate and the difference between the two lines
+    // is estimator drift; under `process` only the cache and thinking members appear here,
+    // because the harness's input and output counts are already the totals above.
     if let Some(p) = &m.provider_tokens {
-        println!(
-            "provider:   in {}, out {}, cached {}, cache write {}",
-            fmt_thousands(p.input),
-            fmt_thousands(p.output),
-            fmt_thousands(p.cached),
-            fmt_thousands(p.cache_write)
-        );
+        println!("provider:   {}", p.parts().join(", "));
     }
     println!();
 

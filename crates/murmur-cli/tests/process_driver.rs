@@ -31,6 +31,16 @@ fn anthropic_wasm() -> PathBuf {
     common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm")
 }
 
+/// A driver built against the frozen `@0.1.0` WIT beside it, a version the host does not accept.
+fn retired_wasm() -> PathBuf {
+    common::fixture_path("process-driver-v1/tool/process-driver-v1.wasm")
+}
+
+/// The build whose `describe().reports-usage` is `false` and whose `parse` reads no `usage` line.
+fn no_usage_wasm() -> PathBuf {
+    common::fixture_path("process-driver/tool/process-driver-no-usage.wasm")
+}
+
 /// A published driver artifact and a project holding the manifest that names it.
 struct Capsule {
     home: TempDir,
@@ -159,6 +169,14 @@ fn fixture_describes_itself() {
         vec!["HOME".to_string(), "FIXTURE_HARNESS_PROFILE".to_string()]
     );
     assert!(description.streams_text);
+    assert!(description.reports_usage);
+
+    let no_usage = fs::read(no_usage_wasm()).unwrap();
+    assert!(
+        !describe_process_driver_wasm(&no_usage)
+            .unwrap()
+            .reports_usage
+    );
 }
 
 /// Every load-time check passes and the runtime reaches the binary: with no `fixture-cli` on
@@ -195,7 +213,21 @@ fn http_driver_under_process_is_refused() {
     let text = capsule.run_refused();
     assert!(text.contains("E-RUN-029"), "{text}");
     assert!(text.contains("murmur-driver-anthropic@0.1.0"), "{text}");
+    assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
+}
+
+/// The host accepts exactly one version of the interface, so a driver built against the retired
+/// `@0.1.0` is refused by name rather than shimmed. Its component is committed alongside the WIT
+/// it was built from, so this stays testable after every later bump.
+#[test]
+fn a_driver_built_against_the_retired_version_is_refused() {
+    let name = "retired-process-driver";
+    let capsule = Capsule::process(name, &retired_wasm(), &["HOME"]);
+    let text = capsule.run_refused();
+    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
     assert!(text.contains("murmur:driver/process@0.1.0"), "{text}");
+    assert!(text.contains("rebuild"), "{text}");
 }
 
 #[test]

@@ -261,13 +261,9 @@ pub const W_SEC_024: &str = "W-SEC-024";
 /// Fires once per matching entry, before any session workdir exists.
 pub const W_SEC_025: &str = "W-SEC-025";
 
-/// `spend.machine_tokens_per_day` is in effect and the capsule uses `transport: process`.
-///
-/// The CLI that transport drives reaches its provider with its own credentials, so no request
-/// passes the inference gateway and murmur neither counts nor limits the capsule's spend: the
-/// ceiling does not cover it. Never a refusal. Fires once per launch or `mur doctor`, before any
-/// session workdir exists.
-pub const W_SEC_026: &str = "W-SEC-026";
+// W-SEC-026 is retired and its code is not reused. The machine ceiling covers a
+// `transport: process` capsule, and `E-RUN-038` refuses one set against a driver that reports no
+// usage. The diagnostics page keeps the `#w-sec-026` anchor.
 
 /// An artifact's `gateway.api_key` can only be read at launch: it is a literal in the manifest, or
 /// a `${NAME}` the global config's `credentials:` map does not hold and the launching shell's
@@ -338,7 +334,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
-            W_SEC_025, W_SEC_026, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031,
+            W_SEC_025, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

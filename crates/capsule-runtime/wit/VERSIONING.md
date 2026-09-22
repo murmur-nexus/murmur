@@ -24,7 +24,7 @@ Current versions:
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
-| `murmur:driver`          | `0.1.0`  |
+| `murmur:driver`          | `0.2.0`  |
 
 `murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
 already reflected one prior additive evolution — the original 7-function baseline
@@ -191,6 +191,36 @@ nothing existing moves: no published artifact exports or imports anything it
 contains, so no instance name changes and nothing is rebuilt. Its world,
 `process-driver`, imports nothing of Murmur's, because a process driver is
 granted nothing; it lives in its own bindgen tree, `process-driver/`.
+
+`murmur:driver` then went to `0.2.0` when the `process` interface learned to
+carry what a harness spent. A new `usage` record — `input`, `output`,
+`cache-read`, `cache-creation` and `thinking`, each `option<u64>` and each the
+cumulative total for the harness run — arrived with a new `event` case,
+`usage(usage)`, **appended** after `retry` so the existing discriminants `0`–`7`
+keep their indices; and `description` gained `reports-usage: bool`, last, which
+says whether the driver emits that case at all. Adding a case to a variant and a
+field to a record are each independently a breaking change under the rule below.
+Its instance name is now `murmur:driver/process@0.2.0`.
+
+The bump was paid for by rebuilding: every driver built against `@0.1.0`,
+including this repository's own `tests/fixtures/process-driver` components,
+stopped loading and was rebuilt against `@0.2.0`. The host keeps no fallback, so
+a `@0.1.0` driver is refused at staging with `E-RUN-029`, naming both versions.
+One `@0.1.0` component stays committed under
+`crates/murmur-cli/tests/fixtures/process-driver-v1/`, together with a frozen
+copy of the `@0.1.0` `.wit` it is built from, so that refusal stays testable
+after this and every later bump. That copy lives in the fixture tree rather than
+under `wit/`, because the one-version-per-package rule this file's checker
+enforces is a rule about the tree the host is built from.
+
+Nothing else was bundled with it, because nothing else was pending: the `0.6.0`
+entry above records both why a bundle is worth paying for when several shape
+changes are already wanted, and why a bump whose contents are open is a bump
+nobody can finish paying for. `murmur:hook` did not move, and deliberately:
+`inference-event` still carries `input-tokens: u64` / `output-tokens: u64` with
+no optional form, so a `process` turn whose driver reported nothing is handed
+`0`. Making those optional would break every published hook artifact to express
+a distinction the trace already carries, which this bump declined to do.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

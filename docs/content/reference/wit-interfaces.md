@@ -144,7 +144,8 @@ for that call:
     "input_tokens": 12043,
     "output_tokens": 218,
     "cached_tokens": 11780,
-    "cache_write_tokens": 0
+    "cache_write_tokens": 0,
+    "thinking_tokens": 96
   }
 }
 ```
@@ -155,6 +156,7 @@ for that call:
 | `output_tokens` | Tokens the provider billed for the completion |
 | `cached_tokens` | Request tokens served from the provider's prompt cache |
 | `cache_write_tokens` | Request tokens written into the provider's prompt cache |
+| `thinking_tokens` | The part of the completion the provider reports as reasoning — a subset of `output_tokens`, never an addition to it |
 
 Every member is optional and every member is a non-negative integer. A driver reports whichever
 members its provider returned; a provider with no prompt cache reports no cache members. Omit a
@@ -169,6 +171,7 @@ Where the two provider shapes carry each number:
 | `output_tokens` | `usage.output_tokens` | `usage.completion_tokens` |
 | `cached_tokens` | `usage.cache_read_input_tokens` | `usage.prompt_tokens_details.cached_tokens` |
 | `cache_write_tokens` | `usage.cache_creation_input_tokens` | Not reported |
+| `thinking_tokens` | `usage.output_tokens_details.thinking_tokens` | `usage.completion_tokens_details.reasoning_tokens` |
 
 The runtime records the reported numbers on the call's `inference` trace event and its
 `capsule.inference` span, and acts on none of them: the compaction threshold and every budget
@@ -608,7 +611,7 @@ the driver with an empty WASI context and grants it nothing.
 
 | Function | Called | Returns |
 |---|---|---|
-| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, and the variables it requires |
+| `describe` | Once, when the driver is loaded | The harness's name and binary, how to read its version, how to interrupt a turn, the variables it requires, and whether it reports token usage |
 | `launch` | Once per run | The arguments, environment, files and stdin to run the harness with, or an error |
 | `parse` | For each batch of complete stdout lines | The events those lines describe |
 | `classify-exit` | When the harness's output ends without a terminal event | `turn-end` or `turn-failed` |
@@ -620,6 +623,39 @@ check — see [Process driver](manifest.md#process-driver).
 
 Every record, field and event is documented in
 [`process-driver.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver.wit).
+
+### What the harness spent { #process-usage }
+
+A driver reports its harness's token counts through the `usage` event, whose payload is the
+`usage` record:
+
+| Member | Type | Value |
+|---|---|---|
+| `input` | `option<u64>` | Prompt tokens, excluding anything `cache-read` or `cache-creation` covers |
+| `output` | `option<u64>` | Generated tokens, including the `thinking` subset below |
+| `cache-read` | `option<u64>` | Prompt tokens served from the provider's cache |
+| `cache-creation` | `option<u64>` | Prompt tokens written to the provider's cache |
+| `thinking` | `option<u64>` | The part of `output` the harness reports as reasoning |
+
+Three rules govern what a driver sends:
+
+| Rule | What it means |
+|---|---|
+| Cumulative, never delta | Every value is the total for the harness run so far, not the increment since the last report. A harness that streams a running count and then a final total is relayed verbatim, both times; the runtime attributes only each member's growth to the turn closing when it arrives, so reporting the same total twice adds nothing |
+| Absent is not zero | `none` means *this harness does not report this count*. `0` means it reported spending none. The runtime keeps the two apart all the way into the trace |
+| Cache sits beside input | A harness that folds its cache counts into its input count subtracts them before reporting, so `input` is always the uncached prompt alone |
+
+No cost figure and no context-window size is carried. A price a harness computed against its own
+table is a different claim from a token count, and there is no equivalent on `transport: http` to
+make it mean the same thing on both.
+
+`describe().reports-usage` says whether the driver emits the event at all. A driver that does not
+is fully supported, and its turns carry no token counts — but a manifest that sets a spend ceiling
+against one is refused at launch with [`E-RUN-038`](diagnostics.md#e-run-038), because a ceiling
+nothing could ever reach is not a ceiling.
+
+Where the reported numbers land in the trace, and how they differ from the `http` path's, is in
+[the `inference` record](observability-schemas.md#session-trace-tracejsonl).
 
 ---
 
@@ -644,7 +680,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
-| `murmur:driver` | `0.1.0` |
+| `murmur:driver` | `0.2.0` |
 
 | Tier | When |
 |---|---|

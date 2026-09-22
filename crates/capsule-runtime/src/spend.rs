@@ -1,14 +1,24 @@
 //! Inference spend ceilings: how many tokens a session, and every session on this machine, may
 //! spend before a driver call is refused without reaching the provider.
 //!
-//! Every number here is the runtime's own tiktoken measurement — `input_tokens` plus
-//! `output_tokens`, exactly what the trace's `inference` lines carry — so an operator checks a
-//! ceiling by summing the trace. A provider's reported `usage` never enters.
+//! Every number here is `input_tokens` plus `output_tokens`, exactly what the trace's
+//! `inference` lines carry — so an operator checks a ceiling by summing the trace. What those
+//! two carry differs by transport and the meter's definition does not: under `http` they are the
+//! runtime's own tiktoken measurement, and the provider's reported `usage` never enters; under
+//! `process` they are the harness's own reported counts, which are the only measurement of that
+//! transport there is. Cache reads, cache writes and thinking are never folded into either.
 //!
-//! [`SpendMeter`] is the one per-session account. A call is admitted against it before dispatch
-//! and settled once its output is measured; the [`SpendAdmission`] guard releases its reservation
-//! on every other path. The inference gateway sends nothing unless an admission is open, so a
-//! driver invocation that skipped admission cannot reach the provider with the key.
+//! [`SpendMeter`] is the one per-session account. Under `http` a call is admitted against it
+//! before dispatch and settled once its output is measured; the [`SpendAdmission`] guard releases
+//! its reservation on every other path, and the inference gateway sends nothing unless an
+//! admission is open, so a driver invocation that skipped admission cannot reach the provider
+//! with the key.
+//!
+//! Under `process` there is nothing to admit. The harness reached its provider itself and the
+//! runtime learns what a turn cost only once that turn is over, so each closed turn is charged
+//! through [`SpendMeter::charge_spent`] and the ceilings are asked afterwards, through
+//! [`SpendMeter::ceiling_crossed`]. A ceiling therefore stops the *next* turn rather than the one
+//! that crossed it, and the overshoot is bounded by one harness turn.
 //!
 //! [`MachineLedger`] is the shared, append-only daily file every `mur run` on this `~/.murmur`
 //! writes its settled calls to. There is no lock and no daemon: each process reads only the
@@ -71,7 +81,9 @@ pub(crate) struct SpendRefusal {
     /// session refusal, the machine ledger's total plus this session's reservations for a machine
     /// refusal.
     pub(crate) used: u64,
-    /// The refused call's input tokens plus the most output it may request.
+    /// The refused call's input tokens plus the most output it may request, and `0` for a
+    /// refusal [`SpendMeter::ceiling_crossed`] produced — nothing is in flight to request there,
+    /// which is what [`SpendRefusal::fmt`] reads to drop the "could use up to" clause.
     pub(crate) requested: u64,
 }
 
@@ -83,14 +95,26 @@ impl fmt::Display for SpendRefusal {
             used,
             requested,
         } = self;
-        match limit {
-            SpendLimit::Session => write!(
+        match (limit, requested) {
+            (SpendLimit::Session, 0) => write!(
+                f,
+                "spend ceiling reached: inference.max_session_tokens is {ceiling} and this session \
+                 has used {used}, which is at or past it. The operator set this limit; retrying \
+                 will not get past it."
+            ),
+            (SpendLimit::Session, _) => write!(
                 f,
                 "spend ceiling reached: inference.max_session_tokens is {ceiling} and this session \
                  has used {used}; the next call could use up to {requested} more. The operator set \
                  this limit; retrying will not get past it."
             ),
-            SpendLimit::Machine => write!(
+            (SpendLimit::Machine, 0) => write!(
+                f,
+                "spend ceiling reached: spend.machine_tokens_per_day is {ceiling} and capsules on \
+                 this machine have used {used} today (UTC), which is at or past it. The operator \
+                 set this limit; retrying will not get past it before it resets at 00:00 UTC."
+            ),
+            (SpendLimit::Machine, _) => write!(
                 f,
                 "spend ceiling reached: spend.machine_tokens_per_day is {ceiling} and capsules on \
                  this machine have used {used} today (UTC); the next call could use up to \
@@ -235,19 +259,86 @@ impl SpendMeter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Charge tokens already spent, with no admission behind them.
+    ///
+    /// For `transport: process`, where the harness reaches its provider itself: nothing could be
+    /// reserved before the spend happened, so the turn is charged once it is over and the
+    /// ceilings are asked afterwards through [`Self::ceiling_crossed`]. The numbers are the same
+    /// ones the turn's `inference` record carries — the harness's own reported input and output
+    /// growth — so summing the trace still reproduces what this meter holds.
+    pub(crate) fn charge_spent(&self, input_tokens: u64, output_tokens: u64) {
+        self.record(input_tokens, output_tokens);
+    }
+
+    /// Which ceiling, if any, what has already been spent has reached.
+    ///
+    /// Asked after a charge rather than before a call, so its test is `>=` where [`Self::admit`]'s
+    /// is `>`: a session that has reached its ceiling has nothing left to spend, and on the
+    /// transport that asks this there is no reservation that could hold the next turn back. The
+    /// refusal carries `requested: 0`, since nothing is in flight.
+    ///
+    /// A session refusal latches, as [`Self::admit`]'s does, so every later question is answered
+    /// the same way. A machine refusal does not: the ledger is shared and another process may
+    /// have been the one to cross it.
+    pub(crate) fn ceiling_crossed(&self) -> Option<SpendRefusal> {
+        // Read before the meter lock is taken, so no file I/O runs under it.
+        let machine_total = self.machine.as_ref().map(MachineLedger::refresh_total);
+
+        let mut state = self.lock();
+        let committed = state.used.saturating_add(state.reserved);
+        if let Some(latched) = state.session_latched.as_ref() {
+            return Some(SpendRefusal {
+                used: committed,
+                requested: 0,
+                ..latched.clone()
+            });
+        }
+        if let Some(ceiling) = self.session_ceiling {
+            if committed >= ceiling {
+                let refusal = SpendRefusal {
+                    limit: SpendLimit::Session,
+                    ceiling,
+                    used: committed,
+                    requested: 0,
+                };
+                state.session_latched = Some(refusal.clone());
+                return Some(refusal);
+            }
+        }
+        if let (Some(ledger), Some(total)) = (self.machine.as_ref(), machine_total) {
+            let used = total.saturating_add(state.reserved);
+            if used >= ledger.ceiling {
+                return Some(SpendRefusal {
+                    limit: SpendLimit::Machine,
+                    ceiling: ledger.ceiling,
+                    used,
+                    requested: 0,
+                });
+            }
+        }
+        None
+    }
+
     fn finish(&self, reserved: u64, input_tokens: u64, output_tokens: u64) {
-        // Appended before the reservation is released, so an admission that reads the ledger after
-        // the append sees this call, and one that takes the meter lock before the release sees it
-        // reserved; one that does both counts it twice. `admit` reads the ledger before taking the
-        // lock, so an admission whose read ran before the append and whose lock is taken after the
-        // release counts this call zero times. The call was then in flight at that read, which is
-        // what the machine ceiling's overshoot is bounded by.
+        self.record(input_tokens, output_tokens);
+        let mut state = self.lock();
+        state.reserved = state.reserved.saturating_sub(reserved);
+        state.open = state.open.saturating_sub(1);
+    }
+
+    /// Put one settled call on the machine ledger and into this session's total.
+    ///
+    /// Appended before the caller releases any reservation, so an admission that reads the ledger
+    /// after the append sees this call, and one that takes the meter lock before the release sees
+    /// it reserved; one that does both counts it twice. `admit` reads the ledger before taking the
+    /// lock, so an admission whose read ran before the append and whose lock is taken after the
+    /// release counts this call zero times. The call was then in flight at that read, which is
+    /// what the machine ceiling's overshoot is bounded by.
+    fn record(&self, input_tokens: u64, output_tokens: u64) {
         if let Some(ledger) = self.machine.as_ref() {
             ledger.append(input_tokens, output_tokens);
         }
         let mut state = self.lock();
-        state.reserved = state.reserved.saturating_sub(reserved);
-        state.open = state.open.saturating_sub(1);
         state.used = state
             .used
             .saturating_add(input_tokens.saturating_add(output_tokens));
@@ -645,6 +736,85 @@ mod tests {
             serde_json::to_value(&machine).unwrap()["limit"],
             serde_json::json!("machine")
         );
+    }
+
+    /// A refusal with nothing in flight — what `ceiling_crossed` produces — says the session is
+    /// already at or past the ceiling rather than naming a next call that does not exist.
+    #[test]
+    fn crossed_refusal_display_omits_the_requested_clause() {
+        let session = SpendRefusal {
+            limit: SpendLimit::Session,
+            ceiling: 200_000,
+            used: 200_400,
+            requested: 0,
+        };
+        assert_eq!(
+            session.to_string(),
+            "spend ceiling reached: inference.max_session_tokens is 200000 and this session has \
+             used 200400, which is at or past it. The operator set this limit; retrying will not \
+             get past it."
+        );
+        let machine = SpendRefusal {
+            limit: SpendLimit::Machine,
+            ..session
+        };
+        assert_eq!(
+            machine.to_string(),
+            "spend ceiling reached: spend.machine_tokens_per_day is 200000 and capsules on this \
+             machine have used 200400 today (UTC), which is at or past it. The operator set this \
+             limit; retrying will not get past it before it resets at 00:00 UTC."
+        );
+    }
+
+    /// `charge_spent` books tokens the runtime never reserved — the `transport: process` path —
+    /// and leaves no admission behind it.
+    #[test]
+    fn charge_spent_books_tokens_with_no_admission() {
+        let meter = Arc::new(SpendMeter::unlimited());
+        meter.charge_spent(40, 20);
+        meter.charge_spent(0, 0);
+        assert_eq!(meter.used(), 60);
+        assert!(!meter.has_open_admission());
+    }
+
+    /// The post-hoc test is `>=`: a session that has reached its ceiling has nothing left, and
+    /// the refusal latches so every later question is answered the same way.
+    #[test]
+    fn ceiling_crossed_fires_at_the_ceiling_and_latches() {
+        let meter = session_meter(100);
+        meter.charge_spent(40, 20);
+        assert!(meter.ceiling_crossed().is_none());
+        meter.charge_spent(40, 0);
+        let refusal = meter.ceiling_crossed().expect("100 of 100 is reached");
+        assert_eq!(refusal.limit, SpendLimit::Session);
+        assert_eq!(refusal.used, 100);
+        assert_eq!(refusal.requested, 0);
+        // Latched: an admission after the crossing is refused without asking again.
+        assert!(meter.admit(1, 1).is_err());
+    }
+
+    /// A machine refusal does not latch, and the ledger is what it reads: a line another process
+    /// appended crosses it just as this one's own spend does.
+    #[test]
+    fn ceiling_crossed_reads_the_machine_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let meter = Arc::new(SpendMeter::new(
+            None,
+            Some(ledger(dir.path(), "ses_a", 100, fixed_clock)),
+        ));
+        meter.charge_spent(10, 10);
+        assert!(meter.ceiling_crossed().is_none());
+        // Another process's line, appended straight to today's file.
+        let other = Arc::new(SpendMeter::new(
+            None,
+            Some(ledger(dir.path(), "ses_b", 100, fixed_clock)),
+        ));
+        other.charge_spent(50, 50);
+        let refusal = meter
+            .ceiling_crossed()
+            .expect("the ledger is at 120 of 100");
+        assert_eq!(refusal.limit, SpendLimit::Machine);
+        assert_eq!(refusal.requested, 0);
     }
 
     // ── the gateway rule ───────────────────────────────────────────────────────

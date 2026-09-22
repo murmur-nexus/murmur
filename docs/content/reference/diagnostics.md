@@ -91,6 +91,7 @@ section that explains it.
 | `E-RUN-035` | A `transport: process` harness went silent and was killed | [E-RUN-035](#e-run-035) |
 | `E-RUN-036` | The harness could not find the session it was asked to continue | [E-RUN-036](#e-run-036) |
 | `E-RUN-037` | `--resume-mode compact` under `inference.transport: process` | [E-RUN-037](#e-run-037) |
+| `E-RUN-038` | A spend ceiling is set against a process driver that reports no usage | [E-RUN-038](#e-run-038) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -128,7 +129,6 @@ section that explains it.
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
 | `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker | [W-SEC-024](#w-sec-024) |
 | `W-SEC-025` | A `capabilities.network.allow` entry names an artifact's `gateway.endpoint` host — the gateway does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
-| `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
 | `W-SEC-027` | An artifact's `gateway.api_key` is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
 | `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file a `gateway.api_key` was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
 | `W-SEC-029` | A compiler driver could not be run to ask where its helper binaries live, so `W-SEC-012` was not evaluated for it | [W-SEC-029](#w-sec-029) |
@@ -548,11 +548,11 @@ The message ends with the path and the operating system's error.
 ### E-RUN-029 — the process driver lacks the process interface { #e-run-029 }
 
 A `transport: process` manifest names an artifact under `inference.driver` that does not export
-`murmur:driver/process@0.1.0`. `mur run` refuses at staging, before the driver runs.
+`murmur:driver/process@0.2.0`. `mur run` refuses at staging, before the driver runs.
 
 ```text
-error[E-RUN-029]: artifact 'my-http-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.1.0; a process driver must be built against the process-driver world
-  hint: rebuild the driver against murmur:driver/process@0.1.0, or name a process driver
+error[E-RUN-029]: artifact 'my-http-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.2.0; a process driver must be built against the process-driver world
+  hint: rebuild the driver against murmur:driver/process@0.2.0, or name a process driver
 ```
 
 A driver built against another version of the interface is told which one it exports instead:
@@ -564,7 +564,7 @@ A `transport: http` manifest names an artifact under `inference.driver` that exp
 driver interface. `mur run` refuses at staging, before the driver runs.
 
 ```text
-error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.1.0, the process driver interface; name it under transport: process, or name an http driver
+error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.2.0, the process driver interface; name it under transport: process, or name an http driver
   hint: set inference.transport: process to use this driver, or name an http driver
 ```
 
@@ -581,7 +581,7 @@ The message ends with the reason; for an import, it names the interface.
 
 ```text
 error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:text/chunks@0.1.0`, but a matching implementation was not found in the linker
-  hint: the driver must export murmur:driver/process@0.1.0 and import nothing but WASI
+  hint: the driver must export murmur:driver/process@0.2.0 and import nothing but WASI
 ```
 
 ### E-RUN-033 — a harness turn failed { #e-run-033 }
@@ -676,6 +676,24 @@ error[E-RUN-037]: --resume-mode compact is not available under inference.transpo
 
 `--resume-mode full` is what this transport resumes with: the harness is launched on the session id
 the map holds and answers from everything it was told before.
+
+### E-RUN-038 — a spend ceiling against a driver that reports no usage { #e-run-038 }
+
+A [`transport: process`](manifest.md#transport-process) spend ceiling is enforced against the token
+counts the harness reports and its driver relays. A driver whose `describe()` sets
+`reports-usage: false` relays none, so a ceiling set against it could never be reached. `mur run`
+refuses at staging, before anything is spawned and before a session directory exists:
+
+```text
+error[E-RUN-038]: process driver 'my-process-driver@1.0.0' reports no usage — its describe() sets reports-usage: false — so inference.max_session_tokens and spend.machine_tokens_per_day could never be enforced
+  hint: use a driver release that reports its harness's token usage, or remove the ceiling — a ceiling murmur can never measure against would let the run go on for ever
+```
+
+The message names whichever ceilings are in effect:
+[`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) from the manifest,
+[`spend.machine_tokens_per_day`](config.md#spend) from the effective config, or both. The same
+capsule with neither in effect runs normally — a driver that reports no usage is a supported
+driver, and its turns simply carry no token counts.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1419,7 +1437,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
 
@@ -2300,19 +2318,16 @@ The runtime reaches the upstream for the artifact and attaches the key there, so
 with or without the entry. The entry still grants direct access to that host, without the key.
 Remove it unless something other than the gateway needs that host.
 
-### W-SEC-026 — a machine spend ceiling does not cover a `transport: process` capsule { #w-sec-026 }
+### W-SEC-026 — retired { #w-sec-026 }
 
-**Fires when:** [`spend.machine_tokens_per_day`](config.md#spend) is set in the effective config and
-the capsule's [`inference.transport`](manifest.md#field-inference) is `process`. Once, on stderr,
-from `mur run` (including `mur run --explain-scope`) and from `mur doctor`.
+Nothing raises this code and nothing reuses it. [`spend.machine_tokens_per_day`](config.md#spend)
+counts a [`transport: process`](manifest.md#transport-process) capsule's turns from the token
+counts the harness reports and its driver relays. Two codes cover what happens around that:
 
-```text
-[capsule-runtime] warning[W-SEC-026]: spend.machine_tokens_per_day is set and this capsule uses transport: process — the CLI reaches its provider with its own credentials, so murmur neither counts nor limits this capsule's spend (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-026)
-```
-
-The CLI that `transport: process` drives holds its own credentials, so none of its requests pass
-the runtime, and the capsule runs with no ledger lines and no machine refusal. Bound that CLI's
-spend with its provider's own controls.
+| Code | Covers |
+|---|---|
+| [`E-RUN-038`](#e-run-038) | A spend ceiling set against a driver that reports no usage |
+| [`W-SEC-031`](#w-sec-031) | A harness billing against something other than the subscription |
 
 ### W-SEC-027 — a gateway key is read only at launch { #w-sec-027 }
 
@@ -2420,14 +2435,15 @@ own quota.
 ### W-SEC-031 — a harness that is not on a subscription { #w-sec-031 }
 
 ```text
-[capsule-runtime] warning[W-SEC-031]: the harness session reports auth 'api-key', not 'subscription' — this run's spend may be billed to an API key, which murmur neither counts nor limits (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-031)
+[capsule-runtime] warning[W-SEC-031]: the harness session reports auth 'api-key', not 'subscription' — this run's spend may be billed to an API key rather than to the subscription this transport exists for (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-031)
 ```
 
 **Why it matters:** a [`transport: process`](manifest.md#transport-process) capsule runs on a
 harness the operator is already signed in to, and the point of that is spend on that plan. A harness
-billing another way spends money murmur neither holds nor counts:
-[`inference.max_session_tokens`](manifest.md#inference-config) and
-[`spend.machine_tokens_per_day`](config.md#spend) do not cover it.
+billing another way spends money against a key instead. The ceilings still count it —
+[`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) and
+[`spend.machine_tokens_per_day`](config.md#spend) are enforced against whatever the harness
+reports, however it is billing — but the bill arrives somewhere the operator did not choose.
 
 **What the runtime does about it:** nothing is refused. The value is whatever the harness reported
 through its process driver, compared only against `subscription`. The trace carries the same text as
