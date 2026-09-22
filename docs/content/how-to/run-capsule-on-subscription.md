@@ -30,7 +30,7 @@ Read this before you choose it. Four things are true here that are not true of `
 | The harness process is not contained | Unlike a WASM artifact, the `claude` process runs on the host with the host network and your real home directory. Murmur controls the environment it starts with and the tools it is offered, not what the process can reach once running. |
 | The capsule depends on your machine | It runs on your login and on whichever `claude` version is installed. The manifest pins neither, so the same manifest on two machines is not the same capsule. |
 | Spend is invisible to Murmur | The harness reaches its provider with its own credentials, so no request passes through Murmur. [inference.max_session_tokens](../reference/manifest.md#inference-max-session-tokens) is a manifest error here, `spend.machine_tokens_per_day` does not cover this capsule, and every token count in the trace is reported as zero. |
-| Your own configuration does not load | The driver launches the harness with `--setting-sources ""`, so your `CLAUDE.md`, your settings and your hooks are not read. The agent's instructions come from the manifest alone. |
+| The harness's own configuration does not load | The driver launches the harness with `--setting-sources ""`, so the harness reads none of its own configuration on this machine: its `CLAUDE.md`, its settings and its own hook scripts stay out. The agent's instructions come from the manifest alone, and the capsule's own `runtime: hook` artifacts run exactly as they do on `transport: http`. |
 
 A capsule that ran on a subscription and reported zero tokens spent nothing that Murmur can tell you about. If you need token accounting or a spend ceiling, use [`transport: http`](../reference/manifest.md#transport-http).
 
@@ -138,6 +138,13 @@ Two kinds of entry reach the model this way:
 | A binary in [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | One tool per binary, running in the capsule workdir |
 
 `runtime: driver` and `runtime: hook` artifacts are not offered to the model, on this transport as on the other.
+
+Every call the harness makes is checked before it runs, in the same order as on `transport: http`:
+
+1. [capabilities.filesystem.read_only](../reference/manifest.md#field-capabilities) — refused if the call writes a protected path.
+2. An [`on-tool-call`](../concepts/hooks.md) policy hook, where the capsule declares one — refused if the hook denies the call.
+
+A refused call never runs. The model is handed a failed tool result carrying the refusal's reason, and `trace.jsonl` records the refusal.
 
 Watch what the harness actually called:
 
@@ -278,6 +285,7 @@ It declares no compaction hook and no `context.max_tokens`: both are inert under
 | `inference.command` | Overrides the executable the driver's `describe()` names |
 | `capabilities.env.allow` | The whole environment the harness sees; every variable the driver requires must appear, or the launch is refused with `E-CAP-019` |
 | `capabilities.shell.allow` | Each binary becomes one tool the model may call through Murmur |
+| `capabilities.filesystem.read_only`, an `on-tool-call` policy hook | Both govern every tool call the harness makes, the same way they govern one on `transport: http` |
 | `lifecycle.conversation: threaded` | Each A2A context resumes one harness session; the harness holds the history |
 | `inference.max_session_tokens` | A manifest error — Murmur sees no spend on this transport |
 | `context.max_tokens`, `inference.compaction` | Parse but do nothing; the harness manages its own context |

@@ -26,6 +26,10 @@
 //!   token and the bare tool names, and is what writes them into whatever configuration its
 //!   harness reads: the runtime builds no harness configuration and no harness tool name.
 //! - Only the capsule's declared tools are advertised.
+//! - Every call crosses the session's decision point first — the manifest's
+//!   `capabilities.filesystem.read_only` check and then an `on-tool-call` policy hook — over the
+//!   gate channel, because the hook runtime and the trace writer belong to the task driving the
+//!   harness and this bridge holds only the store.
 //! - Request/response is plain JSON, so the transport is a minimal manual HTTP/1.1 handler
 //!   mirroring `identity.rs`, not a full server stack.
 
@@ -33,6 +37,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot},
 };
 use uuid::Uuid;
 
@@ -48,6 +53,60 @@ pub(super) const BRIDGE_SERVER_NAME: &str = "murmur";
 
 /// Path the bridge listens on. Arbitrary; the driver is handed the full URL.
 const BRIDGE_PATH: &str = "/bridge";
+
+/// What a bridged tool call is refused with when the session's decision point cannot be reached
+/// at all.
+///
+/// Fail closed: the alternative is a tool running because the thing that would have refused it
+/// went away.
+const GATE_UNREACHABLE: &str =
+    "Refused: the session stopped answering policy checks, so this tool call was not dispatched.";
+
+/// One bridged tool call, asking the session's decision point whether it may run.
+///
+/// The task driving the harness owns the hook runtime and the trace writer, and answers this
+/// between two batches of harness output; the bridge is parked on `reply` in the meantime.
+pub(super) struct GateRequest {
+    /// The tool's bare name, as the harness asked for it.
+    pub(super) tool_name: String,
+    /// The call's arguments, serialised exactly as dispatch is about to receive them.
+    pub(super) input_json: String,
+    /// The refusal text, or `None` to let the call run.
+    pub(super) reply: oneshot::Sender<Option<String>>,
+}
+
+/// Put one call to the session's decision point and wait for its verdict.
+///
+/// Fail closed on both arms — a send onto a closed channel and a dropped reply alike — so a
+/// session that has stopped answering cannot let a tool through ungated.
+async fn ask_gate(
+    gate: &mpsc::UnboundedSender<GateRequest>,
+    tool_name: &str,
+    input_json: &str,
+) -> Option<String> {
+    let (reply, verdict) = oneshot::channel();
+    if gate
+        .send(GateRequest {
+            tool_name: tool_name.to_string(),
+            input_json: input_json.to_string(),
+            reply,
+        })
+        .is_err()
+    {
+        return Some(GATE_UNREACHABLE.to_string());
+    }
+    verdict
+        .await
+        .unwrap_or_else(|_| Some(GATE_UNREACHABLE.to_string()))
+}
+
+/// A tool-server result carrying `text` as a failure.
+fn error_result(text: String) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true
+    })
+}
 
 /// Everything the process runner needs to hand a freshly-bound bridge to the driver.
 pub(super) struct BridgeHandle {
@@ -127,18 +186,32 @@ impl BridgeHandle {
     /// `on_request` is called once per accepted connection, before it is read. A harness working
     /// through a long tool call writes nothing to stdout, so this is the other half of the
     /// evidence that it is still alive — see the runner's inactivity clock.
-    pub(super) async fn serve(&self, store: &CapsuleStoreState, on_request: &dyn Fn()) {
+    ///
+    /// `gate` is where a `tools/call` asks whether it may run. `None` is a capsule that declared
+    /// neither a policy hook that gates calls nor a `read_only` path, so nothing can refuse one
+    /// and no call is resolved or sent.
+    pub(super) async fn serve(
+        &self,
+        store: &CapsuleStoreState,
+        gate: Option<&mpsc::UnboundedSender<GateRequest>>,
+        on_request: &dyn Fn(),
+    ) {
         // Serve inline (not spawned): keeps the borrow of `store` non-'static and serializes
         // tool execution, which is what a single harness client needs.
         while let Ok((stream, _)) = self.listener.accept().await {
             on_request();
-            self.handle_connection(stream, store).await;
+            self.handle_connection(stream, store, gate).await;
         }
     }
 
     /// Manual HTTP/1.1 request handler (mirrors `identity.rs`), routing the tool-server
     /// protocol: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`.
-    async fn handle_connection(&self, stream: TcpStream, store: &CapsuleStoreState) {
+    async fn handle_connection(
+        &self,
+        stream: TcpStream,
+        store: &CapsuleStoreState,
+        gate: Option<&mpsc::UnboundedSender<GateRequest>>,
+    ) {
         use tokio::io::AsyncBufReadExt;
 
         let (reader_half, mut writer) = stream.into_split();
@@ -225,7 +298,9 @@ impl BridgeHandle {
                 write_json_rpc(&mut writer, &id, json!({ "tools": self.mcp_tools }), None).await;
             }
             "tools/call" => {
-                let result = self.dispatch_tool_call(request.get("params"), store).await;
+                let result = self
+                    .dispatch_tool_call(request.get("params"), store, gate)
+                    .await;
                 write_json_rpc(&mut writer, &id, result, None).await;
             }
             _ => {
@@ -248,7 +323,16 @@ impl BridgeHandle {
     /// HTTP transport uses — and shape the outcome as a tool-server result. Tool execution
     /// stays entirely in murmur's sandbox under the capsule's declared capabilities; the harness
     /// never runs anything itself.
-    async fn dispatch_tool_call(&self, params: Option<&Value>, store: &CapsuleStoreState) -> Value {
+    ///
+    /// The session's decision point comes first, over `gate`. A refusal is returned as the
+    /// failing tool result the harness reports back to its model, carrying the refusal's own text
+    /// unaltered — its no-retry sentence is what stops the model asking again.
+    async fn dispatch_tool_call(
+        &self,
+        params: Option<&Value>,
+        store: &CapsuleStoreState,
+        gate: Option<&mpsc::UnboundedSender<GateRequest>>,
+    ) -> Value {
         let name = params
             .and_then(|p| p.get("name"))
             .and_then(Value::as_str)
@@ -262,10 +346,17 @@ impl BridgeHandle {
             .unwrap_or_else(|| json!({}));
         let input_json = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
 
+        if let Some(gate) = gate {
+            // A refusal means nothing ran, and its trace line is written on the answering side.
+            // The harness still reports the failure as a tool result of its own, which the event
+            // sink records as a `tool_call` with `status: error`: this request carries no id
+            // tying it to that result, so suppressing the pair would mean guessing.
+            if let Some(refusal) = ask_gate(gate, &name, &input_json).await {
+                return error_result(refusal);
+            }
+        }
+
         match store
-            // No decision point on this transport: `on-tool-call` denial and the
-            // `capabilities.filesystem.read_only` check are the agent loop's, and this bridge is
-            // a tool server for an external process that owns neither a hook runtime nor a turn.
             .dispatch_agent_tool_async(
                 &name,
                 ToolInput {
@@ -292,10 +383,7 @@ impl BridgeHandle {
                     "isError": is_error
                 })
             }
-            Err(err) => json!({
-                "content": [{ "type": "text", "text": format!("tool '{name}' failed: {err}") }],
-                "isError": true
-            }),
+            Err(err) => error_result(format!("tool '{name}' failed: {err}")),
         }
     }
 }
