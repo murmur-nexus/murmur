@@ -1794,9 +1794,9 @@ mod tests {
         assert_ne!(h.planned_id, "harness-chose-this");
     }
 
-    /// The run this card exists for: the harness named its session and then the turn was
-    /// interrupted before it produced anything. Nothing is remembered, so the next task in this
-    /// context starts a conversation the harness will answer to.
+    /// The harness named its session and then the turn was interrupted before it produced
+    /// anything. Nothing is remembered, so the next task in this context starts a conversation
+    /// the harness will answer to.
     #[tokio::test]
     async fn harness_session_a_run_that_only_named_its_session_remembers_nothing() {
         let mut h = Harness::new(10).await;
@@ -1827,7 +1827,8 @@ mod tests {
     }
 
     /// Each of the five events that is work, on its own, with no terminal event after it: the run
-    /// was interrupted past the window this card is about, and the session it established is kept.
+    /// was interrupted past the window where the harness has a name and no conversation, and the
+    /// session it established is kept.
     #[tokio::test]
     async fn harness_session_any_observable_work_commits_the_reported_id() {
         for work in [

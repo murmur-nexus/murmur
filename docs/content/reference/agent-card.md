@@ -101,8 +101,8 @@ answers `message/send` and `message/stream` with `-32601`, so neither is listed 
 
 ### Request headers { #request-headers }
 
-Per-request control that is not part of the A2A message schema rides on an `x-murmur-*` request
-header. One is read on the methods that start a turn:
+The door reads `x-murmur-*` request headers alongside the JSON-RPC body. One of them changes what
+the methods that start a turn do:
 
 | Header | Read on | Effect |
 |---|---|---|

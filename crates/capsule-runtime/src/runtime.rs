@@ -1503,7 +1503,7 @@ fn launch(
             resume: staged.resume.as_ref().map(|resume| resume.mode),
             // Built here rather than per task, so every task of one launch reads and writes one
             // map — which is what threads a capsule whose host keeps no file.
-            harness_sessions: (inference.transport == "process").then(|| {
+            harness_sessions: keeps_a_harness_session(Some(inference)).then(|| {
                 Arc::new(crate::harness_session::HarnessSessionMap::new(
                     crate::harness_session::resolve_harness_session_root(
                         staged.context.as_ref(),

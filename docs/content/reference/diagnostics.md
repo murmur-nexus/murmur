@@ -657,17 +657,11 @@ error[E-RUN-036]: the harness 'claude-code' could not continue session 0199c7d4-
 
 The map entry is left exactly as it was. Starting a new conversation instead would be silent memory
 loss: the next message would be answered as if nothing had been said. Dropping the entry is a
-person's decision, asked for on the request that starts the next turn:
-
-| Surface | How it is asked for |
-|---|---|
-| CLI | [`mur run --forget-session`](cli.md#run-forget-session), with `--context <id>` |
-| A2A door | [`x-murmur-forget-session: true`](agent-card.md#request-headers) on `message/send` or `message/stream` |
-
-Either way the entry is deleted, the run's trace records a `harness_session_forgotten` event naming
-the context, the id that was dropped and who asked, and the turn launches as a new conversation
-under the same context id. A forget asked of a capsule on any other transport is
-[`E-RUN-039`](#e-run-039).
+person's decision, asked for on the request that starts the next turn — with
+[`mur run --forget-session`](cli.md#run-forget-session) or the
+[`x-murmur-forget-session`](agent-card.md#request-headers) header, both described under
+[what removes an entry](workdir.md#what-removes-an-entry). A forget asked of a capsule on any other
+transport is [`E-RUN-039`](#e-run-039).
 
 The turn must have been launched to continue a session, the harness must never have reported one,
 and the failure kind must be `harness-error` or `other`. A turn that started a new conversation had
