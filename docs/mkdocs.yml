@@ -58,11 +58,14 @@ theme:
 extra_css:
   - assets/extra.css
   - assets/dracula.css
+  - assets/page-actions.css
+
+extra_javascript:
+  - assets/page-actions.js
 
 plugins:
   - search
   - macros
-  - copy-to-llm
   - badges
   - git-revision-date-localized:
       fallback_to_build_date: true

@@ -1,0 +1,161 @@
+/* "Copy page" split button beside each page's h1 (page-actions.js). */
+
+.page-actions-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.md-typeset .page-actions-header h1 {
+  flex: 1;
+  margin: 0;
+}
+
+.page-actions {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  margin-top: 0.4rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 6px;
+}
+
+.page-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  margin: 0;
+  border: none;
+  background: var(--md-default-bg-color);
+  color: var(--md-default-fg-color);
+  font-family: var(--md-text-font-family);
+  cursor: pointer;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.page-actions__copy,
+.page-actions__toggle {
+  padding: 0.5em 0.8em;
+  font-size: 0.7rem;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.page-actions__copy {
+  border-right: 1px solid var(--md-default-fg-color--lightest) !important;
+  border-radius: 6px 0 0 6px;
+}
+
+.page-actions__toggle {
+  padding-inline: 0.55em;
+  border-radius: 0 6px 6px 0;
+}
+
+.page-actions__copy:hover,
+.page-actions__toggle:hover,
+.page-actions--open .page-actions__toggle {
+  background: var(--md-accent-fg-color);
+  color: var(--md-accent-bg-color);
+}
+
+.page-actions svg {
+  width: 1.1em;
+  height: 1.1em;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+.page-actions__chevron {
+  transition: transform 0.2s;
+}
+
+.page-actions--open .page-actions__chevron {
+  transform: rotate(180deg);
+}
+
+.page-actions__icon--done {
+  fill: #2e7d32 !important;
+}
+
+.page-actions__menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 10;
+  min-width: 11rem;
+  padding: 0.25rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 6px;
+  background: var(--md-default-bg-color);
+  box-shadow: var(--md-shadow-z2);
+}
+
+.page-actions__menu[hidden] {
+  display: none;
+}
+
+.page-actions__menu button {
+  width: 100%;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.page-actions__menu button span {
+  flex: 1;
+}
+
+.page-actions__menu button:hover,
+.page-actions__menu button:focus-visible {
+  background: var(--md-default-fg-color--lightest);
+  outline: none;
+}
+
+.page-actions__menu .page-actions__external {
+  width: 0.8em;
+  height: 0.8em;
+  opacity: 0.6;
+}
+
+.page-actions-toast {
+  position: fixed;
+  bottom: 2rem;
+  left: 50%;
+  z-index: 10000;
+  padding: 0.75rem 1.5rem;
+  border-radius: 6px;
+  background: var(--md-accent-fg-color);
+  color: var(--md-accent-bg-color);
+  font-family: var(--md-text-font-family);
+  font-size: 0.75rem;
+  box-shadow: var(--md-shadow-z2);
+  opacity: 0;
+  transform: translateX(-50%) translateY(100px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.page-actions-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+@media screen and (max-width: 768px) {
+  .page-actions-header {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .page-actions {
+    margin-top: 0;
+  }
+
+  .page-actions__menu {
+    left: 0;
+    right: auto;
+  }
+}
