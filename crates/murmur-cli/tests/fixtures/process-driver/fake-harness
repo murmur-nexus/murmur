@@ -39,13 +39,15 @@ SESSION_STORE="${HOME:-.}/fake-harness-sessions"
 recall() { tr '\n' ' ' < "$SESSION_STORE/$1"; }
 
 # One `tools/call` against the bridge, over bash's own /dev/tcp — no curl in the environment.
+# Takes the tool's bare name and its arguments as JSON, both defaulting to the echo tool's ping.
 # Prints the response body on one line.
 call_bridge() {
-  local host_port path body request line
+  local tool="${1:-echo-tool}" args="${2:-}" host_port path body request line
+  [ -n "$args" ] || args='{"msg":"ping-7"}'
   host_port="${FIXTURE_BRIDGE_URL#http://}"
   path="/${host_port#*/}"
   host_port="${host_port%%/*}"
-  body='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo-tool","arguments":{"msg":"ping-7"}}}'
+  body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
   exec 3<>"/dev/tcp/${host_port%%:*}/${host_port##*:}"
   printf 'POST %s HTTP/1.1\r\n' "$path" >&3
   printf 'Host: %s\r\n' "$host_port" >&3
@@ -110,6 +112,49 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
       sleep 0.5
     done
     echo "end CHATTY-RESULT"
+    ;;
+  bridge-call)
+    # One bridged call per FIXTURE_BRIDGE_CALLS (default one), with whatever tool and arguments
+    # FIXTURE_BRIDGE_CALL_TOOL and FIXTURE_BRIDGE_CALL_ARGS name. An `isError` answer is reported
+    # as a failed tool result, which is what a harness told no does with one.
+    echo "started fixture-session-1"
+    CALL_TOOL="${FIXTURE_BRIDGE_CALL_TOOL:-}"
+    CALL_ARGS="${FIXTURE_BRIDGE_CALL_ARGS:-}"
+    [ -n "$CALL_ARGS" ] || CALL_ARGS='{"msg":"ping-7"}'
+    # The `tool` line carries the qualified <server>__<tool> spelling, the bridge call the bare
+    # one. Match them: taking the first advertised tool would mislabel the call for any capsule
+    # declaring more than one.
+    QUALIFIED="${FIXTURE_BRIDGE_TOOLS%%,*}"
+    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+      case "$candidate" in
+        *"__$CALL_TOOL") QUALIFIED="$candidate"; break ;;
+      esac
+    done
+    i=1
+    while [ "$i" -le "${FIXTURE_BRIDGE_CALLS:-1}" ]; do
+      echo "tool c$i $QUALIFIED $CALL_ARGS"
+      answer="$(call_bridge "$CALL_TOOL" "$CALL_ARGS")"
+      case "$answer" in
+        *'"isError":true'*) status=error ;;
+        *) status=ok ;;
+      esac
+      echo "result c$i $status $answer"
+      i=$((i + 1))
+    done
+    echo "text $answer"
+    echo "end $answer"
+    ;;
+  bridge-bench)
+    # FIXTURE_BRIDGE_CALLS bridged calls back to back and one turn around all of them, so a test
+    # can time the same run with and without a decision point in the way.
+    echo "started fixture-session-1"
+    i=1
+    while [ "$i" -le "${FIXTURE_BRIDGE_CALLS:-20}" ]; do
+      answer="$(call_bridge)"
+      i=$((i + 1))
+    done
+    echo "text $answer"
+    echo "end $answer"
     ;;
   bridge-busy)
     # Says nothing on stdout while it works, and keeps the bridge busy instead.

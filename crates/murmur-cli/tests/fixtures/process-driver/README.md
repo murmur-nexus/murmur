@@ -101,6 +101,8 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `exit-3` | `boom-on-stderr` on stderr, then exit `3` |
 | `silent` | Says nothing and sleeps, so the inactivity window kills it |
 | `chatty` | Six lines half a second apart, then `end CHATTY-RESULT` |
+| `bridge-call` | `FIXTURE_BRIDGE_CALLS` bridged calls to `FIXTURE_BRIDGE_CALL_TOOL` with `FIXTURE_BRIDGE_CALL_ARGS`, each reported as its own tool result, then the last answer and `end` |
+| `bridge-bench` | `FIXTURE_BRIDGE_CALLS` bridged pings back to back inside one turn, then the last answer and `end` |
 | `bridge-busy` | Six bridge requests half a second apart with nothing on stdout, then `end BRIDGE-BUSY-RESULT` |
 | `env` | Notes its environment's variable names and its files directory's mode, then `end ENV-RESULT` |
 | `old-version` | Reports an untested version to `--version`, then `end OLD-VERSION-RESULT` |
@@ -124,6 +126,19 @@ in their working directory, which is how a test proves the harness is dead.
 The bridge request is made with bash's own `/dev/tcp` — no `curl` — and the harness's environment
 is only what the capsule declared plus the driver's `env-set`, so a test that wants `sleep`, `ls`
 or `env` to resolve has to declare `PATH`.
+
+`call_bridge` takes the tool's **bare** name and its arguments as JSON, and prints the response
+body on one line. Both arguments default to a `{"msg": "ping-7"}` call against `echo-tool`, which
+is what every profile that names neither sends.
+
+| Variable | Read by | Default |
+| --- | --- | --- |
+| `FIXTURE_BRIDGE_CALL_TOOL` | `bridge-call` | `echo-tool` |
+| `FIXTURE_BRIDGE_CALL_ARGS` | `bridge-call` | `{"msg":"ping-7"}` |
+| `FIXTURE_BRIDGE_CALLS` | `bridge-call`, `bridge-bench` | `1` for `bridge-call`, `20` for `bridge-bench` |
+
+A capsule whose manifest does not declare these under `capabilities.env.allow` leaves every one of
+them on its default.
 
 ### The `memory` profiles
 

@@ -225,7 +225,10 @@ task's final status or the capsule's exit.
 
 One tool call's result, or one hook artifact. The runtime writes one frame for each tool call it
 dispatches, in dispatch order, and one for each hook artifact before the task's `completed`
-status. A call a policy hook refuses writes no frame.
+status. On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
+no frame. On [`transport: process`](manifest.md#transport-process) the harness reports the
+refusal it was handed as its own failed tool call, and that report writes a frame with
+`artifact.is_error` set to `true`.
 
 Every key is present on every frame, in this order. A key that does not apply to the frame is
 `null`, never absent.

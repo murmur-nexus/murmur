@@ -1493,13 +1493,19 @@ task tsk_11112222…  ctx_11112222…  (a2a)
   turn 2  end_turn
 ```
 
-A call a policy hook refused has no `tool_call` or `shell` row, because nothing ran. It renders
-as a `call_denied` row under its turn instead:
+A call a policy hook refused renders as a `call_denied` row under its turn:
 
 ```text
   turn 0  tool_call  bash
     call_denied on-shell  /usr/bin/bash  denied by branch-policy
 ```
+
+What sits beside that row depends on the transport:
+
+| Transport | Rows for a refused call |
+|---|---|
+| [`transport: http`](manifest.md#transport-http) | The `call_denied` row alone. Nothing ran, so there is no `tool_call` or `shell` row |
+| [`transport: process`](manifest.md#transport-process) | The `call_denied` row, and a `tool_call` row marked `✗`. The tool still did not run; the harness reports the refusal it was handed as its own failed call, and that report is recorded |
 
 A [plan run](observability-schemas.md#plan-events) renders as its own subtree: a `plan_start` row
 naming the plan and its step count, then a `plan_step_start` row as each step is handed to a
