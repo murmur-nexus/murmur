@@ -42,7 +42,7 @@ use std::sync::{
 use crate::{
     agent::AgentLoopExit,
     cancel::CANCELED_STATUS_MESSAGE,
-    errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035},
+    errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036},
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
         SseEventBuffer, StreamArtifact, StreamStatus, TaskArtifactUpdateEvent,
@@ -343,6 +343,7 @@ fn diagnostic_code(error: &RuntimeError) -> Option<&'static str> {
         RuntimeError::HarnessTurnFailed { .. } => Some(E_RUN_033),
         RuntimeError::ProcessDriverCallFailed { .. } => Some(E_RUN_034),
         RuntimeError::ProcessHarnessInactive { .. } => Some(E_RUN_035),
+        RuntimeError::HarnessSessionGone { .. } => Some(E_RUN_036),
         _ => None,
     }
 }

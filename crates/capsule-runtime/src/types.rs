@@ -362,6 +362,11 @@ pub struct StageRequest {
     /// ordinary launch. `stage_session` refuses a resume whose context kept no record on disk,
     /// and a `--resume-mode compact` with no hook bound to `on-compaction`.
     pub resume: Option<ResumeRequest>,
+    /// `mur run --forget-session`: drop the harness session `context_id` names before this
+    /// launch's first task, so that task starts a new conversation under the same context id.
+    /// `false` on every ordinary launch. `stage_session` refuses it for a capsule whose transport
+    /// keeps no harness session.
+    pub forget_session: bool,
     /// OTLP/HTTP endpoint for span export; None = no external OTel emission.
     pub otel_endpoint: Option<String>,
     /// JSON-serialized EvalConfig injected into hook WASI env as MURMUR_EVAL_CONFIG.
@@ -463,6 +468,10 @@ pub struct StagedSession {
     /// Copied from [`StageRequest::resume`] and already checked. Read by `launch_session`, which
     /// turns it into `session_start.resumed_from` and the agent loop's record-load override.
     pub(crate) resume: Option<ResumeRequest>,
+    /// Copied from [`StageRequest::forget_session`] and already checked against the transport.
+    /// Read by `launch_session` as a one-shot: the launch's first task carries the forget, and no
+    /// later task of the same launch does.
+    pub(crate) forget_session: bool,
     pub(crate) engine: Engine,
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,

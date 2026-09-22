@@ -287,6 +287,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
             context: runtime_manifest.context.clone(),
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

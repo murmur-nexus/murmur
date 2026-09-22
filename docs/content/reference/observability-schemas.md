@@ -35,7 +35,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
-| `harness_start`, `harness_warning`, `harness_session`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
+| `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
@@ -593,6 +593,16 @@ process exists
 | `harness_session_id` | string | The session id the harness itself reports, which need not be the one it was given |
 | `auth` | string | How the harness is authenticating. Anything other than `"subscription"` also raises [`W-SEC-031`](diagnostics.md#w-sec-031) |
 | `model` | string \| null | The model the harness chose. `null` when it reported none |
+
+**`harness_session_forgotten`**{ #harness-session-forgotten } — written when a person asked this
+capsule to drop the harness session a context names, and there was one to drop. See
+[what removes an entry](workdir.md#what-removes-an-entry)
+
+| Field | Type | Notes |
+|---|---|---|
+| `context_id` | string | The context whose entry was dropped |
+| `harness_session_id` | string | The id that was dropped, which the harness is no longer asked to continue |
+| `requested_by` | string | `"cli"` for `mur run --forget-session`, `"a2a"` for the door header |
 
 **`harness_warning`** — written beside each warning the run printed to stderr
 

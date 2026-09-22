@@ -352,6 +352,10 @@ pub(crate) async fn run_agent_loop(
             }),
             context_id: context_id.clone(),
             continue_conversation: process::continues_conversation(mode, run_config.resume),
+            // Whoever asked for this context's session to be dropped, on the request that started
+            // this task. A reopened attempt of the same task reads the same flag, and the second
+            // forget drops nothing: the first already emptied the entry.
+            forget: store_state.current_forget_harness_session,
         };
         // `store_state` (shared &) is threaded through so the process path can start the
         // Claude Bridge and execute declared tool artifacts — see agent/claude_bridge.rs.

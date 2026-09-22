@@ -99,6 +99,22 @@ answers `message/send` and `message/stream` with `-32601`, so neither is listed 
 `capabilities.streaming` is `false`. `tasks/cancel` is answered under every acceptance, so
 `capabilities.cancellation` is `true` on every card.
 
+### Request headers { #request-headers }
+
+The door reads `x-murmur-*` request headers alongside the JSON-RPC body. One of them changes what
+the methods that start a turn do:
+
+| Header | Read on | Effect |
+|---|---|---|
+| `x-murmur-forget-session` | `message/send`, `message/stream` | `true` drops the harness session this request's context names before the turn, so the turn starts a new conversation under the same context id |
+
+Only the value `true` asks for it; every other value, and the header's absence, are the same
+request. A capsule on any transport but
+[`inference.transport: process`](manifest.md#transport-process) keeps no harness session, and
+answers the header with `-32602` without starting a task — see
+[`E-RUN-039`](diagnostics.md#e-run-039). What the forget does, and what it records, is
+[what removes an entry](workdir.md#what-removes-an-entry).
+
 ### `serves.planes` { #serves-planes }
 
 A plane is listed only when the manifest declares it. An undeclared plane answers every request

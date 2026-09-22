@@ -33,7 +33,7 @@ impl std::fmt::Display for UnreachableEntrypoint {
     }
 }
 
-// The three codes below live beside the variants that raise them because two callers name them:
+// The four codes below live beside the variants that raise them because two callers name them:
 // murmur-cli renders them on the terminal, and the A2A terminal status a process attempt writes
 // carries the same code. Defining them twice would let a client and an operator be shown
 // different codes for one failure.
@@ -44,6 +44,8 @@ pub const E_RUN_033: &str = "E-RUN-033";
 pub const E_RUN_034: &str = "E-RUN-034";
 /// The code [`RuntimeError::ProcessHarnessInactive`] renders under.
 pub const E_RUN_035: &str = "E-RUN-035";
+/// The code [`RuntimeError::HarnessSessionGone`] renders under.
+pub const E_RUN_036: &str = "E-RUN-036";
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -682,10 +684,12 @@ pub enum RuntimeError {
 
     /// A turn launched `mode: resume` failed without the harness ever reporting the session it
     /// was handed: the conversation this context names is gone from the harness's own store.
+    /// Renders as [`E_RUN_036`].
     ///
     /// `path` is the map file that still holds the id, or `None` on a launch that kept none. The
     /// entry is deliberately left as it is — the next task in this context fails the same way
-    /// rather than quietly starting a new conversation.
+    /// rather than quietly starting a new conversation, until somebody asks for it to be dropped
+    /// with `mur run --forget-session` or the door's forget header.
     #[error(
         "the harness '{harness}' could not continue session {session_id}, which context \
          '{context_id}' names: {detail}{}",
@@ -698,6 +702,18 @@ pub enum RuntimeError {
         path: Option<PathBuf>,
         detail: String,
     },
+
+    /// A forget was asked of a capsule that keeps no harness session: only
+    /// `inference.transport: process` has one, because only there does a harness own the
+    /// conversation. Raised at staging, so the launch leaves nothing behind.
+    ///
+    /// `transport` is the transport the capsule declared, or `none` for a capsule with no
+    /// `inference:` block at all.
+    #[error(
+        "--forget-session forgets the harness session a context names, and only \
+         inference.transport: process has one; this capsule's transport is '{transport}'"
+    )]
+    ForgetSessionUnsupportedTransport { transport: String },
 
     /// A call into the process driver trapped, ran out of time, or refused. Renders as
     /// [`E_RUN_034`]. `call` is the WIT function name; `message` is the driver's own refusal or

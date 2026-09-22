@@ -38,6 +38,36 @@ SESSION_STORE="${HOME:-.}/fake-harness-sessions"
 # Every task line this session has been told, on one line.
 recall() { tr '\n' ' ' < "$SESSION_STORE/$1"; }
 
+# A task that arrived over A2A is fenced, so the payload is several lines rather than one. Read to
+# the closing marker — which is already on stdin, so nothing here waits on the runtime, which keeps
+# the handle open after writing.
+unfence_task() {
+  case "$TASK" in
+    '<untrusted-content'*)
+      local fenced="" line
+      while IFS= read -r line; do
+        [ "$line" = "</untrusted-content>" ] && break
+        fenced="$fenced$line "
+      done
+      TASK="$fenced"
+      ;;
+  esac
+}
+
+# Wait for the runtime's stdin interrupt and report the turn the way a stopped harness does. The
+# profiles that use it produce a fixed amount of output, then a `note` — which is not work, and
+# whose trace record is how a test knows the runtime has already read the work before it — and
+# then hold the turn open, so a test can cancel at a known point.
+await_interrupt() {
+  local line
+  while IFS= read -r line; do
+    if [ "$line" = "interrupt" ]; then
+      echo "fail canceled interrupted by the runtime"
+      exit 0
+    fi
+  done
+}
+
 # One `tools/call` against the bridge, over bash's own /dev/tcp — no curl in the environment.
 # Takes the tool's bare name and its arguments as JSON, both defaulting to the echo tool's ping.
 # Prints the response body on one line.
@@ -239,19 +269,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "end API-KEY-RESULT"
     ;;
   memory|memory-renames)
-    # A task that arrived over A2A is fenced, so the payload is several lines rather than one.
-    # Read to the closing marker — which is already on stdin, so nothing here waits on the runtime,
-    # which keeps the handle open after writing.
-    case "$TASK" in
-      '<untrusted-content'*)
-        FENCED=""
-        while IFS= read -r line; do
-          [ "$line" = "</untrusted-content>" ] && break
-          FENCED="$FENCED$line "
-        done
-        TASK="$FENCED"
-        ;;
-    esac
+    unfence_task
     # On a new session the harness picks the id it will answer to; under `memory` that is the one
     # it was handed, and under `memory-renames` it is one of its own, reported back on `started`.
     if [ "$MODE" = "resume" ]; then
@@ -273,6 +291,50 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
       echo "started $REPORTED"
       echo "end $(recall "$REPORTED")"
     fi
+    ;;
+  memory-silent)
+    # Names the session it was handed and then produces nothing at all: no text, no thinking, no
+    # tool call, and no entry in its own store. A cancel here lands inside the window where the
+    # harness has a name and no conversation.
+    record_pid
+    echo "started $SESSION"
+    await_interrupt
+    ;;
+  memory-slow)
+    # Opens a conversation of its own, says one thing, and then holds the turn open. A cancel here
+    # lands after real output, on a session the harness will answer to again.
+    record_pid
+    unfence_task
+    mkdir -p "$SESSION_STORE"
+    printf '%s\n' "$TASK" > "$SESSION_STORE/$SESSION"
+    echo "started $SESSION"
+    echo "text SLOW-PARTIAL"
+    echo "note the work above is out"
+    await_interrupt
+    ;;
+  memory-thinking-only)
+    # As memory-slow, with a thought in place of the text: thinking alone is work the harness
+    # produced.
+    record_pid
+    unfence_task
+    mkdir -p "$SESSION_STORE"
+    printf '%s\n' "$TASK" > "$SESSION_STORE/$SESSION"
+    echo "started $SESSION"
+    echo "thinking pondering the secret"
+    echo "note the work above is out"
+    await_interrupt
+    ;;
+  memory-tool-only)
+    # As memory-slow, with a tool call in place of the text. The call is never answered and the
+    # tool is never reached: what the runtime saw is the call itself.
+    record_pid
+    unfence_task
+    mkdir -p "$SESSION_STORE"
+    printf '%s\n' "$TASK" > "$SESSION_STORE/$SESSION"
+    echo "started $SESSION"
+    echo "tool c1 probe {}"
+    echo "note the work above is out"
+    await_interrupt
     ;;
   parity)
     # The http capsule's provider script, in harness events: one turn that says something and
@@ -309,16 +371,15 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "end DONE"
     ;;
   interrupt-honours)
-    # Honours a stdin interrupt: keeps reading stdin and stops the moment the runtime writes the
-    # driver's interrupt bytes, reporting the turn the way a stopped harness does.
-    record_pid
+    # Honours a stdin interrupt: says one thing, then keeps reading stdin and stops the moment the
+    # runtime writes the driver's interrupt bytes, reporting the turn the way a stopped harness
+    # does. The text goes out before the pid does, so a test that waits for the pid before
+    # cancelling is cancelling a turn that has already produced something — which is what keeps
+    # the conversation it opened.
     echo "started fixture-session-1"
-    while IFS= read -r line; do
-      if [ "$line" = "interrupt" ]; then
-        echo "fail canceled interrupted by the runtime"
-        exit 0
-      fi
-    done
+    echo "text working on it"
+    record_pid
+    await_interrupt
     ;;
   interrupt-ignores)
     # Never reads its stdin and never stops on its own, so the interrupt grace has to run out and

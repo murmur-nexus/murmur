@@ -992,6 +992,25 @@ struct HarnessSessionEvent {
     model: Option<String>,
 }
 
+/// The harness session a person asked this capsule to drop, recorded because forgetting is not
+/// the same as never having known: the turn that follows starts a new conversation under a context
+/// that had one, and this is what says so.
+#[derive(Serialize)]
+struct HarnessSessionForgottenEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    /// The context whose entry was dropped.
+    context_id: String,
+    /// The id that was dropped, which the harness is no longer asked to continue.
+    harness_session_id: String,
+    /// Which surface carried the request: `cli` or `a2a`.
+    requested_by: String,
+}
+
 #[derive(Serialize)]
 struct HarnessRetryEvent {
     event_type: &'static str,
@@ -2362,6 +2381,27 @@ impl TraceWriter {
             harness_session_id: harness_session_id.to_string(),
             auth: auth.to_string(),
             model: model.map(str::to_string),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record the harness session a person asked this capsule to forget, and who asked.
+    pub(crate) async fn write_harness_session_forgotten(
+        &mut self,
+        context_id: &str,
+        harness_session_id: &str,
+        requested_by: &str,
+    ) -> std::io::Result<()> {
+        let event = HarnessSessionForgottenEvent {
+            event_type: "harness_session_forgotten",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            context_id: context_id.to_string(),
+            harness_session_id: harness_session_id.to_string(),
+            requested_by: requested_by.to_string(),
         };
         self.write_event(&event).await
     }

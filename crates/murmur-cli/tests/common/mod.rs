@@ -369,6 +369,7 @@ fn stage_agent_session_inner(
                     from_session: from_session.clone(),
                     mode: capsule_runtime::ResumeMode::Full,
                 }),
+            forget_session: false,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

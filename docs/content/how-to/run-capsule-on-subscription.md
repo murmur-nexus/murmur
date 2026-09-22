@@ -166,7 +166,26 @@ The session's `harness_start` record names the driver, the harness, the absolute
 
 `lifecycle.conversation: threaded` maps each A2A context to one harness session. The first task in a context starts a session; every later task in that context resumes it, and the harness — not Murmur — carries the history. Murmur writes no `conversation.jsonl` here.
 
-The mapping lives in a `harness-session.json` file under `~/.murmur/conversations/`. [`mur run --resume`](../reference/cli.md#mur-run) continues from it. If the harness has lost that conversation, the next task fails with [`E-RUN-036`](../reference/diagnostics.md#e-run-036) and the file is left exactly as it was, rather than answering from nothing.
+The mapping lives in a `harness-session.json` file under `~/.murmur/conversations/`. [`mur run --resume`](../reference/cli.md#mur-run) continues from it. The entry is written when a turn ends having produced something — text, a thought, a tool call, or a turn that ran to completion — so a turn interrupted before the harness produced anything leaves nothing behind, and the next task in that context starts a conversation the harness will answer to.
+
+If the harness has lost a conversation Murmur is still naming, the next task in that context fails with [`E-RUN-036`](../reference/diagnostics.md#e-run-036), and every task after it fails the same way. The entry is left exactly as it was: answering from nothing would be memory loss the person never sees. Dropping it is something you ask for, and it is recorded:
+
+=== "From the CLI"
+
+    ```bash
+    mur run --context ctx_0193f2 --forget-session --task "carry on"
+    ```
+
+=== "Over the A2A door"
+
+    ```bash
+    curl -s localhost:41234 \
+      -H 'content-type: application/json' \
+      -H 'x-murmur-forget-session: true' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","contextId":"ctx_0193f2","role":"user","parts":[{"text":"carry on"}]}}}'
+    ```
+
+Either way the entry is deleted, the turn runs as a new conversation under the same context id, and the trace records a `harness_session_forgotten` event naming the context, the id that was dropped and who asked. The flag applies to the launch's first task, and the header to the message that carried it. Only this transport has a harness session, so a forget asked of any other capsule is refused with [`E-RUN-039`](../reference/diagnostics.md#e-run-039).
 
 Because the harness holds the history, `--resume-mode compact` has nothing to compact and refuses with [`E-RUN-037`](../reference/diagnostics.md#e-run-037). `context.max_tokens` and `inference.compaction` parse but do nothing: the harness manages its own context.
 

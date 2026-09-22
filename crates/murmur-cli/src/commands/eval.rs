@@ -654,6 +654,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             context: runtime_manifest.context.clone(),
             context_id: None,
             resume: None,
+            forget_session: false,
             otel_endpoint: runtime_manifest
                 .observability
                 .as_ref()

@@ -125,6 +125,7 @@ mod tests {
             provenance: TaskProvenance::derive(origin, None),
             source: crate::a2a::SOURCE_A2A,
             delegation_id: None,
+            forget_session: false,
         }
     }
 

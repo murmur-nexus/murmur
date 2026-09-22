@@ -92,6 +92,7 @@ section that explains it.
 | `E-RUN-036` | The harness could not find the session it was asked to continue | [E-RUN-036](#e-run-036) |
 | `E-RUN-037` | `--resume-mode compact` under `inference.transport: process` | [E-RUN-037](#e-run-037) |
 | `E-RUN-038` | A spend ceiling is set against a process driver that reports no usage | [E-RUN-038](#e-run-038) |
+| `E-RUN-039` | A forget was asked of a capsule that keeps no harness session | [E-RUN-039](#e-run-039) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -651,11 +652,16 @@ store:
 
 ```text
 error[E-RUN-036]: the harness 'claude-code' could not continue session 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55, which context 'ctx_0193f2…' names: no conversation found with session id 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55 (that id is recorded in /home/you/.murmur/conversations/shey/ctx_0193f2…/harness-session.json)
-  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing: delete that file to start a new conversation under the same context, or use a different --context — see docs/content/reference/workdir.md
+  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or the header `x-murmur-forget-session: true` on the next message/send or message/stream — see docs/content/reference/cli.md
 ```
 
 The map entry is left exactly as it was. Starting a new conversation instead would be silent memory
-loss: the next message would be answered as if nothing had been said.
+loss: the next message would be answered as if nothing had been said. Dropping the entry is a
+person's decision, asked for on the request that starts the next turn — with
+[`mur run --forget-session`](cli.md#run-forget-session) or the
+[`x-murmur-forget-session`](agent-card.md#request-headers) header, both described under
+[what removes an entry](workdir.md#what-removes-an-entry). A forget asked of a capsule on any other
+transport is [`E-RUN-039`](#e-run-039).
 
 The turn must have been launched to continue a session, the harness must never have reported one,
 and the failure kind must be `harness-error` or `other`. A turn that started a new conversation had
@@ -694,6 +700,22 @@ The message names whichever ceilings are in effect:
 [`spend.machine_tokens_per_day`](config.md#spend) from the effective config, or both. The same
 capsule with neither in effect runs normally — a driver that reports no usage is a supported
 driver, and its turns simply carry no token counts.
+
+### E-RUN-039 — nothing to forget on this transport { #e-run-039 }
+
+`--forget-session` and the `x-murmur-forget-session` header drop the harness session a context
+names. Only [`transport: process`](manifest.md#transport-process) has one — on every other
+transport the runtime holds the conversation itself, in a
+[conversation record](workdir.md#the-conversation-record). The CLI refuses at staging, before the
+launch creates anything:
+
+```text
+error[E-RUN-039]: --forget-session forgets the harness session a context names, and only inference.transport: process has one; this capsule's transport is 'http'
+  hint: a harness owns the conversation only under inference.transport: process, so that is the only transport with a session to forget; every other one keeps its conversation record here, which `mur conversation rm` removes — see docs/content/reference/cli.md
+```
+
+The door refuses the header on `message/send` and `message/stream` with JSON-RPC `-32602`, and
+starts no task.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

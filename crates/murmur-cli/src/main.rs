@@ -244,6 +244,16 @@ enum Commands {
         #[arg(long, value_name = "MODE", requires = "resume")]
         resume_mode: Option<ResumeModeArg>,
 
+        /// Drop the harness session --context names, then run this launch's first task as a new
+        /// conversation under the same context id.
+        /// The answer to E-RUN-036, where the harness no longer holds the conversation a context
+        /// names and every later task in it fails the same way.
+        /// The run's trace records what was dropped and that a person asked for it.
+        /// Requires --context, and applies only to a capsule on inference.transport: process,
+        /// which is the only transport whose harness owns the conversation.
+        #[arg(long, requires = "context", conflicts_with = "resume")]
+        forget_session: bool,
+
         /// Override manifest lifecycle.task_acceptance (none|single|queue)
         #[arg(long, value_name = "MODE")]
         lifecycle_task_acceptance: Option<String>,
@@ -517,6 +527,7 @@ fn main() {
             context,
             resume,
             resume_mode,
+            forget_session,
             lifecycle_task_acceptance,
             lifecycle_after_task,
             workdir,
@@ -536,6 +547,7 @@ fn main() {
             context.as_deref(),
             resume.as_deref(),
             resume_mode.unwrap_or_default().into(),
+            forget_session,
             lifecycle_task_acceptance.as_deref(),
             lifecycle_after_task.as_deref(),
             workdir,
