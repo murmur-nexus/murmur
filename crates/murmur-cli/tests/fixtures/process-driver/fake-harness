@@ -77,6 +77,42 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "text HAPPY-RESULT"
     echo "end HAPPY-RESULT"
     ;;
+  usage)
+    # Every `usage` line is the cumulative total for the run so far, which is what the interface
+    # asks for: the second names the same input as the first, so only the output grew.
+    echo "started fixture-session-1"
+    echo "usage in=120 out=4 cache-read=900 cache-creation=64 thinking=2"
+    echo "text USAGE-RESULT"
+    echo "usage in=120 out=30"
+    echo "end USAGE-RESULT"
+    ;;
+  usage-zero)
+    # A harness that reports having spent nothing. The trace must say `0`, not say nothing.
+    echo "started fixture-session-1"
+    echo "usage in=0 out=0"
+    echo "text ZERO-RESULT"
+    echo "end ZERO-RESULT"
+    ;;
+  usage-turns)
+    # Two turns, each with its own cumulative report: the second turn is charged the growth
+    # alone. Totals end at in=100 out=50.
+    echo "started fixture-session-1"
+    echo "usage in=40 out=20"
+    echo "tool c1 probe {}"
+    echo "result c1 ok one"
+    echo "usage in=100 out=50"
+    echo "text two"
+    echo "end TURNS-RESULT"
+    ;;
+  usage-spends)
+    # Enough on one turn to cross a small ceiling, so a test can watch the run stop.
+    echo "started fixture-session-1"
+    record_pid
+    echo "usage in=5000 out=5000"
+    echo "text SPENT"
+    echo "end SPENT"
+    sleep 60
+    ;;
   tool)
     echo "started fixture-session-1"
     echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping-7\"}"

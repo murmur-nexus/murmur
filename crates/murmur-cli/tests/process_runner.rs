@@ -34,6 +34,11 @@ fn fixture_wasm() -> PathBuf {
     common::fixture_path("process-driver/tool/process-driver.wasm")
 }
 
+/// The build whose `describe().reports-usage` is `false` and whose `parse` reads no `usage` line.
+fn no_usage_wasm() -> PathBuf {
+    common::fixture_path("process-driver/tool/process-driver-no-usage.wasm")
+}
+
 fn fake_harness_source() -> PathBuf {
     common::fixture_path("process-driver/fake-harness")
 }
@@ -85,6 +90,11 @@ struct Built {
     config: Option<String>,
     max_turns: Option<u32>,
     model: Option<String>,
+    /// A hook artifact to publish and declare, as `(name, binding, wasm)`.
+    hook: Option<(String, String, Vec<u8>)>,
+    /// The driver component published as the capsule's driver. The default build reports usage;
+    /// [`Built::reporting_no_usage`] picks the one that does not.
+    driver_wasm: PathBuf,
 }
 
 impl Built {
@@ -96,7 +106,20 @@ impl Built {
             config: None,
             max_turns: None,
             model: None,
+            hook: None,
+            driver_wasm: fixture_wasm(),
         }
+    }
+
+    fn with_hook(mut self, name: &str, binding: &str, wasm: Vec<u8>) -> Self {
+        self.hook = Some((name.to_string(), binding.to_string(), wasm));
+        self
+    }
+
+    /// Publish the `no-usage` build instead, whose `describe().reports-usage` is `false`.
+    fn reporting_no_usage(mut self) -> Self {
+        self.driver_wasm = no_usage_wasm();
+        self
     }
 
     fn binary(mut self, binary: HarnessBinary) -> Self {
@@ -128,7 +151,7 @@ impl Built {
             artifacts.path(),
             DRIVER,
             DRIVER_VERSION,
-            &fixture_wasm(),
+            &self.driver_wasm,
             "",
         );
         common::publish_local(&home, &driver).success();
@@ -141,6 +164,14 @@ impl Built {
             common::publish_local(&home, &tool).success();
             entries.push_str(&format!(
                 "  - name: {TOOL}\n    version: {DRIVER_VERSION}\n    runtime: tool\n"
+            ));
+        }
+        if let Some((name, binding, wasm)) = self.hook.as_ref() {
+            let hook =
+                common::hook_wat::create_hook_zip(artifacts.path(), name, binding, "none", wasm);
+            common::publish_local(&home, &hook).success();
+            entries.push_str(&format!(
+                "  - name: {name}\n    version: {DRIVER_VERSION}\n    runtime: hook\n"
             ));
         }
 
@@ -773,4 +804,145 @@ fn s12_a_driver_that_refuses_to_launch_fails_the_run_before_anything_is_spawned(
     );
     assert!(run.of_type("harness_start").is_empty());
     assert!(run.of_type("harness_exit").is_empty());
+}
+
+// ── S13: the harness's own token counts ───────────────────────────────────────
+
+#[test]
+fn s13_a_reported_turn_carries_the_harness_counts_everywhere() {
+    println!("S13: the trace, the totals and `mur trace show` all carry the harness's numbers");
+    let capsule = Built::new().build();
+    let run = capsule.run("usage", &[]).succeeded();
+    assert_eq!(run.result(), "USAGE-RESULT");
+
+    // The harness reported `in=120 out=4 …` and then `in=120 out=30`; one turn closed, so the
+    // turn is charged the second report's totals in full.
+    let inference = run.one("inference");
+    assert_eq!(inference["input_tokens"], 120);
+    assert_eq!(inference["output_tokens"], 30);
+    assert_eq!(inference["cached_tokens"], 900);
+    assert_eq!(inference["cache_write_tokens"], 64);
+    assert_eq!(inference["thinking_tokens"], 2);
+    // There is one measurement on this transport and it is recorded once.
+    assert!(
+        inference.get("input_tokens_actual").is_none(),
+        "{inference}"
+    );
+    assert!(
+        inference.get("output_tokens_actual").is_none(),
+        "{inference}"
+    );
+
+    let task_end = run.one("task_end");
+    assert_eq!(task_end["input_tokens"], 120);
+    assert_eq!(task_end["output_tokens"], 30);
+    let session_end = run.one("session_end");
+    assert_eq!(session_end["total_input_tokens"], 120);
+    assert_eq!(session_end["total_output_tokens"], 30);
+
+    // The same numbers in the session summary, and a provider line naming only what the harness
+    // reported: there is no `*_actual` pair on this transport to sum.
+    let shown = capsule.trace_show(&run.workdir);
+    assert!(shown.contains("input:      120"), "{shown}");
+    assert!(shown.contains("output:     30"), "{shown}");
+    assert!(shown.contains("total:      150"), "{shown}");
+    assert!(
+        shown.contains("provider:   cached 900, cache write 64, thinking 2"),
+        "{shown}"
+    );
+}
+
+/// Absent and zero are different facts. A driver that reports nothing writes neither key; a
+/// harness that reports spending none writes both, as `0`.
+#[test]
+fn s13_an_unreporting_driver_writes_no_counts_and_a_reported_zero_writes_zero() {
+    println!("S13: absent is not zero");
+    let silent = Built::new().reporting_no_usage().build();
+    let run = silent.run("usage", &[]).succeeded();
+    let inference = run.one("inference");
+    assert!(inference.get("input_tokens").is_none(), "{inference}");
+    assert!(inference.get("output_tokens").is_none(), "{inference}");
+    assert!(inference.get("thinking_tokens").is_none(), "{inference}");
+    let raw = run.trace_raw();
+    assert!(
+        !raw.lines()
+            .any(|line| line.contains(r#""event_type":"inference""#)
+                && line.contains(r#""input_tokens""#)),
+        "{raw}"
+    );
+
+    let capsule = Built::new().build();
+    let zero = capsule.run("usage-zero", &[]).succeeded();
+    let inference = zero.one("inference");
+    assert_eq!(inference["input_tokens"], 0);
+    assert_eq!(inference["output_tokens"], 0);
+    assert!(
+        zero.trace_raw()
+            .contains(r#""input_tokens":0,"output_tokens":0"#),
+        "{}",
+        zero.trace_raw()
+    );
+}
+
+/// Each report is the run's total, so the second turn is charged the growth alone.
+#[test]
+fn s13_cumulative_reports_are_attributed_turn_by_turn() {
+    println!("S13: two turns, each charged only what grew");
+    let capsule = Built::new().with_tool().build();
+    let run = capsule.run("usage-turns", &[]).succeeded();
+    let inferences = run.of_type("inference");
+    assert_eq!(inferences.len(), 2, "{inferences:#?}");
+    assert_eq!(inferences[0]["input_tokens"], 40);
+    assert_eq!(inferences[0]["output_tokens"], 20);
+    assert_eq!(inferences[1]["input_tokens"], 60);
+    assert_eq!(inferences[1]["output_tokens"], 30);
+    let session_end = run.one("session_end");
+    assert_eq!(session_end["total_input_tokens"], 100);
+    assert_eq!(session_end["total_output_tokens"], 50);
+}
+
+/// A hook bound to `on-inference` is handed what the trace record holds — and `0` where the
+/// trace holds absent, because `murmur:hook`'s `inference-event` has no optional count.
+///
+/// The hook traps exactly when it is handed the numbers named here, and a trap writes
+/// `logs/hook-<name>.log`; that file's presence is the assertion, in both directions.
+#[test]
+fn s13_a_hook_is_handed_the_numbers_the_trace_holds() {
+    println!("S13: on-inference sees the trace's counts, and zero where the trace says nothing");
+    let armed = |run: &Run, hook: &str| run.workdir.join("logs").join(format!("hook-{hook}.log"));
+
+    // Reported: the hook armed at the trace's own numbers fires, and one armed at zero does not.
+    for (hook, tokens, expected) in [
+        ("matches", (120_u64, 30_u64), true),
+        ("zeros", (0, 0), false),
+    ] {
+        let capsule = Built::new()
+            .with_hook(
+                hook,
+                "on-inference",
+                common::hook_wat::inference_tokens_trap_hook_wasm(tokens.0, tokens.1),
+            )
+            .build();
+        let run = capsule.run("usage", &[]).succeeded();
+        assert_eq!(run.one("inference")["input_tokens"], 120);
+        assert_eq!(
+            armed(&run, hook).exists(),
+            expected,
+            "hook armed at {tokens:?}: {}",
+            run.text
+        );
+    }
+
+    // Unreported: the trace holds neither key, and the hook is handed zeros.
+    let capsule = Built::new()
+        .reporting_no_usage()
+        .with_hook(
+            "zeros",
+            "on-inference",
+            common::hook_wat::inference_tokens_trap_hook_wasm(0, 0),
+        )
+        .build();
+    let run = capsule.run("usage", &[]).succeeded();
+    assert!(run.one("inference").get("input_tokens").is_none());
+    assert!(armed(&run, "zeros").exists(), "{}", run.text);
 }

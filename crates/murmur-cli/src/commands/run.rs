@@ -403,15 +403,10 @@ pub(crate) fn run_run(
     let cli_containment = parse_containment_flag(containment_arg, &session_id, &workdir, json)?;
     let effective_config = load_effective_mur_config_if_any_exists()
         .map_err(|error| fail(&session_id, &workdir, error, json))?;
-    // `W-SEC-026` needs this config read, and must still print ahead of `--explain-scope`.
     let machine_tokens_per_day = effective_config
         .as_ref()
         .and_then(|config| config.spend.as_ref())
         .and_then(|spend| spend.machine_tokens_per_day);
-    capsule_runtime::warn_on_machine_spend_ceiling_under_process_transport(
-        machine_tokens_per_day,
-        runtime_manifest.inference.as_ref(),
-    );
     let workspace_containment = effective_config.and_then(|config| config.containment);
     let declared_containment_floor = effective_containment_floor(
         workspace_containment,

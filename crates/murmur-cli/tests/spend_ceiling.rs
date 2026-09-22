@@ -5,6 +5,10 @@
 //! gateway, so every "nothing was sent" assertion is a count of requests that crossed a socket.
 //! Ceilings are derived from a control run's own trace rather than hard-coded, because the
 //! runtime's token counts move with the system prompt and the tool inventory.
+//!
+//! The `transport: process` cases at the end are the exception on both counts: nothing there
+//! crosses a socket the runtime can see, and the numbers are the fake harness's own fixed
+//! reports rather than a measurement, so their ceilings are written down.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -34,8 +38,6 @@ const DRIVER_VERSION: &str = "0.1.0";
 /// `inference.max_tokens` in every manifest here, so each agent turn reserves exactly this much
 /// output.
 const MAX_OUTPUT: u64 = 1_000;
-const W_SEC_026_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-026";
 
 // ── Scripted provider responses ───────────────────────────────────────────────
 
@@ -1086,57 +1088,222 @@ fn resume_compact_refused_by_spend_ceiling() {
     assert_eq!(refusal["turn"], json!(0));
 }
 
-// ── S13: W-SEC-026 ────────────────────────────────────────────────────────────
+// ── S13: the ceilings cover transport: process ────────────────────────────────
 
-#[test]
-fn process_transport_warns_under_machine_ceiling() {
-    println!("S13 process_transport_warns_under_machine_ceiling");
-    let home = home_with_driver();
-    set_machine_ceiling(&home, 1_000_000);
-    // A process capsule names its process driver, so the fixture has to be in this home's store
-    // for `mur doctor` to find it installed.
-    let process_driver_artifacts = TempDir::new().unwrap();
-    let process_driver = common::create_driver_artifact_with_auth(
-        process_driver_artifacts.path(),
+/// A published process driver, the fake harness beside it, and a manifest naming both.
+///
+/// The harness's own reported counts are what these ceilings meter, so the fixture driver and
+/// its `usage` profiles stand in for a real harness reporting its spend.
+struct ProcessCapsule {
+    project: Project,
+    harness: PathBuf,
+}
+
+fn process_capsule(home: &TempDir, driver_wasm: &Path, inference_extra: &str) -> ProcessCapsule {
+    let artifacts = TempDir::new().unwrap();
+    let driver = common::create_driver_artifact_with_auth(
+        artifacts.path(),
         "fixture-process-driver",
         "0.1.0",
-        &common::fixture_path("process-driver/tool/process-driver.wasm"),
+        driver_wasm,
         "",
     );
-    common::publish_local(&home, &process_driver).success();
+    common::publish_local(home, &driver).success();
+    // Kept past this function: `publish_local` copies the artifact into the store, so the temp
+    // directory it was built in is no longer needed, but the harness script below is.
+    drop(artifacts);
 
-    let process = project(
+    let project = project(&format!(
         "name: spend-process\nversion: 0.1.0\nartifacts:\n  - name: fixture-process-driver\n    \
-         version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    \
-         artifact: fixture-process-driver\n  model: test-model\n",
+         version: 0.1.0\n    runtime: driver\ncapabilities:\n  env:\n    allow: [HOME, PATH, \
+         FIXTURE_HARNESS_PROFILE]\ninference:\n  transport: process\n  driver:\n    artifact: \
+         fixture-process-driver\n  model: test-model\n{inference_extra}"
+    ));
+    let harness = project.dir.path().join("fake-harness");
+    fs::copy(
+        common::fixture_path("process-driver/fake-harness"),
+        &harness,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&harness).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&harness, perms).unwrap();
+    fs::write(
+        &project.manifest,
+        format!(
+            "{}  command: {}\n",
+            fs::read_to_string(&project.manifest).unwrap(),
+            harness.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    ProcessCapsule { project, harness }
+}
+
+fn run_process_task(home: &TempDir, capsule: &ProcessCapsule, profile: &str) -> Run {
+    Run::of(
+        mur(home, &capsule.project)
+            .env("FIXTURE_HARNESS_PROFILE", profile)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    capsule.harness.parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
+                ),
+            )
+            .args([
+                "run",
+                "--manifest",
+                capsule.project.manifest.to_str().unwrap(),
+                "--task",
+                "Say hello.",
+                "--verbose",
+            ])
+            .output()
+            .unwrap(),
+    )
+}
+
+fn fixture_driver_wasm() -> PathBuf {
+    common::fixture_path("process-driver/tool/process-driver.wasm")
+}
+
+fn no_usage_driver_wasm() -> PathBuf {
+    common::fixture_path("process-driver/tool/process-driver-no-usage.wasm")
+}
+
+/// The `usage-spends` profile reports 10 000 tokens on its one turn, so a ceiling of 1 000 is
+/// crossed when that turn closes. The run stops with the same sentence, the same
+/// `spend_ceiling_reached` record and the same session exit the http path writes — and the
+/// harness, which sleeps for a minute after its terminal event, is killed rather than waited on.
+#[test]
+fn process_session_ceiling_stops_the_run() {
+    println!("S13 process_session_ceiling_stops_the_run");
+    let home = TempDir::new().unwrap();
+    let capsule = process_capsule(
+        &home,
+        &fixture_driver_wasm(),
+        "  max_session_tokens: 1000\n",
     );
-    let http = project(&http_manifest("spend-http", "http://127.0.0.1:1", ""));
+    let started = std::time::Instant::now();
+    let run = run_process_task(&home, &capsule, "usage-spends");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the run waited out the harness's sleep: {:?}",
+        started.elapsed()
+    );
 
-    for (label, project, expected) in [("process", &process, 1), ("http", &http, 0)] {
-        let explained = Run::of(
-            mur(&home, project)
-                .args([
-                    "run",
-                    "--manifest",
-                    project.manifest.to_str().unwrap(),
-                    "--explain-scope",
-                ])
-                .output()
-                .unwrap(),
-        );
-        let lines = explained.warning_lines("W-SEC-026");
-        println!("{label} --explain-scope: {lines:?}");
-        assert_eq!(lines.len(), expected, "{label}: {}", explained.stderr);
+    // The same place the http path puts it: `mur run` prints only its status line, and the
+    // refusal reaches the operator through the result and the trace.
+    let sentence = "spend ceiling reached: inference.max_session_tokens is 1000";
+    assert!(run.result().starts_with("stopped: "), "{}", run.result());
+    assert!(run.result().contains(sentence), "{}", run.result());
 
-        let doctor = Run::of(mur(&home, project).arg("doctor").output().unwrap());
-        let doctor_lines = doctor.warning_lines("W-SEC-026");
-        println!("{label} doctor: {doctor_lines:?}");
-        assert_eq!(doctor_lines.len(), expected, "{label}: {}", doctor.stderr);
+    let trace = run.trace();
+    let refusals = events(&trace, "spend_ceiling_reached");
+    assert_eq!(refusals.len(), 1, "{trace:#?}");
+    assert_eq!(refusals[0]["limit"], json!("session"));
+    assert_eq!(refusals[0]["ceiling"], json!(1000));
+    assert_eq!(refusals[0]["used"], json!(10_000));
+    assert_eq!(exit_status(&trace, "session_end"), "spend_ceiling_reached");
+    assert_eq!(
+        events(&trace, "harness_exit")[0]["cause"],
+        json!("spend_ceiling")
+    );
 
-        for line in lines.iter().chain(&doctor_lines) {
-            assert!(line.contains(W_SEC_026_LINK), "{line}");
-            assert!(line.contains("spend.machine_tokens_per_day"), "{line}");
-            assert!(line.contains("transport: process"), "{line}");
+    let pid: i32 = fs::read_to_string(
+        common::find_file(&run.workdir(), "harness.pid").expect("the profile wrote a pid"),
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    common::assert_dead_within(pid, std::time::Duration::from_secs(5));
+}
+
+/// The machine ledger counts process turns: a passing run appends the harness's own numbers, and
+/// a run under an already-exhausted ceiling is stopped by them.
+#[test]
+fn process_machine_ceiling_counts_and_stops() {
+    println!("S13 process_machine_ceiling_counts_and_stops");
+    let home = TempDir::new().unwrap();
+    set_machine_ceiling(&home, 1_000_000);
+    let capsule = process_capsule(&home, &fixture_driver_wasm(), "");
+
+    let run = run_process_task(&home, &capsule, "usage");
+    assert_eq!(
+        exit_status(&run.trace(), "session_end"),
+        "ok",
+        "{}",
+        run.stderr
+    );
+    // Nothing raises W-SEC-026: the machine ceiling covers this capsule.
+    assert!(run.warning_lines("W-SEC-026").is_empty(), "{}", run.stderr);
+
+    let today = format!("{}.jsonl", chrono::Utc::now().format("%Y-%m-%d"));
+    let ledger = fs::read_to_string(home.path().join(".murmur/spend").join(&today)).unwrap();
+    println!("ledger {today}:\n{}", ledger.trim_end());
+    let lines: Vec<Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    // The harness's own reported growth, not a runtime estimate and not the cache counts beside
+    // it: the `usage` profile ends at in=120 out=30 with 900 cached.
+    assert_eq!(lines[0]["input_tokens"], json!(120));
+    assert_eq!(lines[0]["output_tokens"], json!(30));
+
+    // A second run under a ceiling the day's ledger has already used up stops at the first turn
+    // that closes.
+    let exhausted = TempDir::new().unwrap();
+    set_machine_ceiling(&exhausted, 50);
+    let capsule = process_capsule(&exhausted, &fixture_driver_wasm(), "");
+    let run = run_process_task(&exhausted, &capsule, "usage");
+    let sentence = "spend ceiling reached: spend.machine_tokens_per_day is 50";
+    assert!(run.result().contains(sentence), "{}", run.result());
+    let trace = run.trace();
+    assert_eq!(
+        events(&trace, "spend_ceiling_reached")[0]["limit"],
+        json!("machine")
+    );
+    assert_eq!(exit_status(&trace, "session_end"), "spend_ceiling_reached");
+}
+
+/// A ceiling against a driver that reports no usage is refused at staging: a ceiling nothing
+/// could ever reach would let the run go on for ever beneath it.
+#[test]
+fn process_ceiling_against_an_unreporting_driver_is_refused() {
+    println!("S13 process_ceiling_against_an_unreporting_driver_is_refused");
+    for (label, config, extra) in [
+        ("session", None, "  max_session_tokens: 1000\n"),
+        ("machine", Some(1_000_000_u64), ""),
+    ] {
+        let home = TempDir::new().unwrap();
+        if let Some(ceiling) = config {
+            set_machine_ceiling(&home, ceiling);
         }
+        let capsule = process_capsule(&home, &no_usage_driver_wasm(), extra);
+        let run = run_process_task(&home, &capsule, "happy");
+        assert!(!run.output.status.success(), "{label}: {}", run.stderr);
+        assert!(run.stderr.contains("E-RUN-038"), "{label}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("reports no usage"),
+            "{label}: {}",
+            run.stderr
+        );
+        // Nothing was spawned and no session workdir was left behind.
+        assert!(!run.stdout.contains("workdir: "), "{label}: {}", run.stdout);
     }
+
+    // The same driver with no ceiling in effect runs normally.
+    let home = TempDir::new().unwrap();
+    let capsule = process_capsule(&home, &no_usage_driver_wasm(), "");
+    let run = run_process_task(&home, &capsule, "happy");
+    assert_eq!(
+        exit_status(&run.trace(), "session_end"),
+        "ok",
+        "{}",
+        run.stderr
+    );
 }

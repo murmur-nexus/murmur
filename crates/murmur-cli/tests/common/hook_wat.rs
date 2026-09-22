@@ -770,6 +770,26 @@ pub fn none_hook_wasm(fn_name: &str) -> Vec<u8> {
     )
 }
 
+/// An `on-inference` hook that traps exactly when it is handed `input` and `output` as the
+/// turn's token counts, and returns `none` otherwise. The trap is what a test observes, so the
+/// numbers the hook was handed are asserted rather than assumed.
+///
+/// `inference-event` arrives indirectly, so the two counts are read out of guest memory at the
+/// canonical-ABI offsets: `turn` is a `u32` at 0, and the two `u64`s follow at 8 and 16.
+pub fn inference_tokens_trap_hook_wasm(input: u64, output: u64) -> Vec<u8> {
+    let body = format!(
+        r#"      (if (i32.and
+            (i64.eq (i64.load (i32.add (local.get $event) (i32.const 8))) (i64.const {input}))
+            (i64.eq (i64.load (i32.add (local.get $event) (i32.const 16))) (i64.const {output})))
+        (then unreachable))
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+      (i32.store (i32.const {disc}) (i32.const 0))
+      (i32.const {RETURN_AREA})"#,
+        disc = RETURN_AREA + 4,
+    );
+    policy_component("on-inference", HOOK_OUTPUT, "", &body)
+}
+
 /// A hook whose `fn_name` traps.
 pub fn trap_hook_wasm(fn_name: &str) -> Vec<u8> {
     policy_component(fn_name, HOOK_OUTPUT, "", "      unreachable")

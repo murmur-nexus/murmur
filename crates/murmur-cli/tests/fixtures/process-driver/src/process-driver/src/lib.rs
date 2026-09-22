@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use exports::murmur::driver::process::{
     Description, DriverFile, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan,
     LaunchRequest, RetryInfo, SessionInfo, SessionMode, ToolCallInfo, ToolResultInfo, TurnFailure,
+    Usage,
 };
 
 thread_local! {
@@ -35,6 +36,7 @@ impl Guest for Fixture {
             interrupt: interrupt_method(),
             required_env: vec!["HOME".to_string(), "FIXTURE_HARNESS_PROFILE".to_string()],
             streams_text: true,
+            reports_usage: reports_usage(),
         }
     }
 
@@ -125,6 +127,13 @@ fn interrupt_method() -> InterruptMethod {
     }
 }
 
+/// Whether this build reads `usage` lines. The `no-usage` build reports `false` and drops every
+/// `usage` line into a `note`, which is what a harness that reports no token counts at all looks
+/// like to the runtime.
+fn reports_usage() -> bool {
+    !cfg!(feature = "no-usage")
+}
+
 /// The bytes the fake harness treats as an interrupt. A driver that declares `unsupported` names
 /// none: there is nothing the runtime could write that would stop its harness.
 fn interrupt_stdin() -> Option<Vec<u8>> {
@@ -167,6 +176,7 @@ fn parse_line(line: String) -> Event {
             },
             None => Event::Note(line),
         },
+        "usage" if reports_usage() => parse_usage(rest, &line),
         "end" => Event::TurnEnd(rest.to_string()),
         "fail" => match rest.split_once(' ') {
             Some((kind, message)) => match failure_kind(kind) {
@@ -179,6 +189,43 @@ fn parse_line(line: String) -> Event {
             None => Event::Note(line),
         },
         _ => Event::Note(line),
+    }
+}
+
+/// `usage <member>=<n> ...`, with `<member>` one of `in`, `out`, `cache-read`, `cache-creation`
+/// or `thinking`. Every value is the cumulative total for the harness run so far, which is what
+/// the interface asks a driver to report; members the line omits are left `none`.
+fn parse_usage(rest: &str, line: &str) -> Event {
+    let mut usage = Usage {
+        input: None,
+        output: None,
+        cache_read: None,
+        cache_creation: None,
+        thinking: None,
+    };
+    let mut named = false;
+    for field in rest.split_whitespace() {
+        let Some((member, value)) = field.split_once('=') else {
+            return Event::Note(line.to_string());
+        };
+        let Ok(value) = value.parse::<u64>() else {
+            return Event::Note(line.to_string());
+        };
+        let slot = match member {
+            "in" => &mut usage.input,
+            "out" => &mut usage.output,
+            "cache-read" => &mut usage.cache_read,
+            "cache-creation" => &mut usage.cache_creation,
+            "thinking" => &mut usage.thinking,
+            _ => return Event::Note(line.to_string()),
+        };
+        *slot = Some(value);
+        named = true;
+    }
+    if named {
+        Event::Usage(usage)
+    } else {
+        Event::Note(line.to_string())
     }
 }
 

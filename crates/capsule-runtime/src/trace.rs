@@ -302,11 +302,24 @@ struct InferenceEvent {
     timestamp: u64,
     turn: u32,
     task_id: Option<String>,
-    /// The runtime's own tiktoken estimate of the request, counted before the request was
-    /// sent — not the provider's count, which arrives afterwards as `input_tokens_actual`.
-    input_tokens: u64,
-    /// The runtime's own tiktoken estimate of the raw driver response.
-    output_tokens: u64,
+    /// The input this turn cost, and the number the task and session totals accumulate.
+    ///
+    /// Under `transport: http` it is the runtime's own tiktoken estimate of the request, counted
+    /// before the request was sent, and the provider's own count sits beside it in
+    /// `input_tokens_actual`. Under `transport: process` the runtime estimates nothing — the
+    /// harness holds the conversation — so this *is* the harness's own reported count and
+    /// `input_tokens_actual` is absent: there is one measurement on that transport and it is
+    /// recorded once.
+    ///
+    /// Absent means no count was made at all, which only a `process` driver reporting no usage
+    /// produces. Never conflate it with `0`, which is a count of none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<u64>,
+    /// The output this turn cost, on the same terms as [`Self::input_tokens`]: the runtime's own
+    /// tiktoken estimate of the raw driver response under `http`, the harness's own reported
+    /// count under `process`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
     decision: String,
     /// The provider's own stop reason for this turn, verbatim as the agent loop dispatched on
     /// it. Present on every agent-loop turn, including one whose driver reported nothing — an
@@ -326,6 +339,10 @@ struct InferenceEvent {
     cached_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_write_tokens: Option<u64>,
+    /// The part of the output the provider or harness reports as reasoning — a subset of
+    /// `output_tokens`, never an addition to it. Absent when nothing reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_tokens: Option<u64>,
     /// Where this inference came from. Absent for an ordinary agent-loop turn,
     /// so every pre-existing consumer sees a byte-identical record; `"hook:<name>"`
     /// for a completion that hook ran through `murmur:runtime/inference`'s
@@ -1540,15 +1557,21 @@ impl TraceWriter {
         Ok(())
     }
 
-    /// `input_tokens`/`output_tokens` are the runtime's tiktoken estimates and are what the
-    /// session and task totals accumulate; `usage` is the provider's own report for the same
-    /// call, written verbatim beside them and accumulated into nothing.
+    /// `input_tokens`/`output_tokens` are what the session and task totals accumulate: the
+    /// runtime's own tiktoken estimates under `transport: http`, and the counts the harness's
+    /// driver reported under `transport: process`, where the runtime measures nothing itself.
+    /// `None` is a turn nothing counted, which only a process driver reporting no usage
+    /// produces, and it adds nothing to the totals.
+    ///
+    /// `usage` is written verbatim beside them and accumulated into nothing. Under `http` it is
+    /// the provider's own report for the same call; under `process` it carries only the cache and
+    /// thinking counts, because the harness's input and output are already the two above.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_inference(
         &mut self,
         turn: u32,
-        input_tokens: u64,
-        output_tokens: u64,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
         decision: String,
         stop_reason: Option<&str>,
         tool_name: Option<String>,
@@ -1590,6 +1613,7 @@ impl TraceWriter {
             output_tokens_actual: usage.and_then(|u| u.output_tokens),
             cached_tokens: usage.and_then(|u| u.cached_tokens),
             cache_write_tokens: usage.and_then(|u| u.cache_write_tokens),
+            thinking_tokens: usage.and_then(|u| u.thinking_tokens),
             origin: origin.map(|o| o.source.clone()),
             model: origin.map(|o| o.model.clone()),
             message_ids,
@@ -1599,6 +1623,10 @@ impl TraceWriter {
             message_shas,
         };
         self.write_event(&event).await?;
+        // A turn nothing counted contributes nothing to the totals. The totals are plain `u64`
+        // because a session's spend is a sum, and the sum of no measurements is zero; the
+        // absent/zero distinction lives on the record itself.
+        let (input_tokens, output_tokens) = (input_tokens.unwrap_or(0), output_tokens.unwrap_or(0));
         self.total_turns = self.total_turns.saturating_add(1);
         self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
@@ -3958,8 +3986,8 @@ mod tests {
         let mut w = make_writer(dir.path()).await;
         w.write_inference(
             0,
-            100,
-            50,
+            Some(100),
+            Some(50),
             "tool_call".to_string(),
             Some("tool_call"),
             Some("bash".to_string()),
@@ -4010,11 +4038,12 @@ mod tests {
             output_tokens: None,
             cached_tokens: Some(0),
             cache_write_tokens: None,
+            thinking_tokens: None,
         };
         w.write_inference(
             0,
-            100,
-            50,
+            Some(100),
+            Some(50),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -4229,8 +4258,8 @@ mod tests {
         let mut w = make_writer(dir.path()).await;
         w.write_inference(
             0,
-            100,
-            50,
+            Some(100),
+            Some(50),
             "tool_call".to_string(),
             Some("tool_call"),
             None,
@@ -4338,8 +4367,8 @@ mod tests {
             .unwrap();
         w.write_inference(
             0,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -4366,8 +4395,8 @@ mod tests {
         w.write_session_start(10, vec![]).await.unwrap();
         w.write_inference(
             0,
-            50,
-            25,
+            Some(50),
+            Some(25),
             "tool_call".to_string(),
             Some("tool_call"),
             Some("bash".to_string()),
@@ -4407,8 +4436,8 @@ mod tests {
         .unwrap();
         w.write_inference(
             1,
-            60,
-            30,
+            Some(60),
+            Some(30),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -4653,8 +4682,8 @@ mod tests {
         assert_eq!(w.task_turns(), 0);
         w.write_inference(
             0,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -4667,8 +4696,8 @@ mod tests {
         .unwrap();
         w.write_inference(
             1,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -4704,8 +4733,8 @@ mod tests {
             .unwrap();
         w.write_inference(
             0,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "tool_call".to_string(),
             Some("tool_call"),
             None,
@@ -4799,8 +4828,8 @@ mod tests {
             .unwrap();
         w.write_inference(
             0,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "tool_call".to_string(),
             Some("tool_call"),
             None,
@@ -4817,8 +4846,8 @@ mod tests {
         };
         w.write_inference(
             0,
-            1,
-            1,
+            Some(1),
+            Some(1),
             "end_turn".to_string(),
             // A hook's `run-inference` saw no provider stop reason, so it records none.
             None,
@@ -4893,8 +4922,8 @@ mod tests {
             .unwrap();
         w.write_inference(
             0,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "tool_call".to_string(),
             Some("tool_call"),
             None,
@@ -4912,8 +4941,8 @@ mod tests {
         w.write_task_end("tsk_1", "ok", 0).await.unwrap();
         w.write_inference(
             1,
-            1,
-            1,
+            Some(1),
+            Some(1),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -4996,8 +5025,8 @@ mod tests {
             .unwrap();
         w.write_inference(
             2,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "tool_call".to_string(),
             Some("tool_call"),
             None,
@@ -5043,8 +5072,8 @@ mod tests {
         for turn in 0..5 {
             w.write_inference(
                 turn,
-                1,
-                1,
+                Some(1),
+                Some(1),
                 "end_turn".to_string(),
                 Some("end_turn"),
                 None,
@@ -5088,8 +5117,8 @@ mod tests {
         let wire = WireCapture::from_driver_payload(payload, response);
         w.write_inference(
             turn,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "end_turn".to_string(),
             Some("end_turn"),
             None,
@@ -5301,8 +5330,8 @@ mod tests {
         let mut w = make_writer(dir.path()).await;
         w.write_inference(
             0,
-            10,
-            5,
+            Some(10),
+            Some(5),
             "end_turn".to_string(),
             None,
             None,
@@ -5334,8 +5363,8 @@ mod tests {
         };
         w.write_inference(
             0,
-            1,
-            1,
+            Some(1),
+            Some(1),
             "end_turn".to_string(),
             // A hook's `run-inference` saw no provider stop reason, so it records none.
             None,

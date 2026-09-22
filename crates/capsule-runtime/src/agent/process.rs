@@ -65,6 +65,7 @@ use crate::{
     },
     runtime::CapsuleStoreState,
     shell,
+    spend::SpendRefusal,
     streaming::{SseBroadcast, SseEventBuffer},
     trace::{HarnessExit, HarnessStart, TraceWriter},
     types::{ResumeMode, StagedProcessDriver},
@@ -780,7 +781,13 @@ async fn run_harness(
         keep_stdin_open: plan.keep_stdin_open,
     };
 
-    let mut sink = ProcessEventSink::new(workdir, inference.max_turns, session, a2a);
+    let mut sink = ProcessEventSink::new(
+        workdir,
+        inference.max_turns,
+        session,
+        Arc::clone(&store_state.spend),
+        a2a,
+    );
     let outcome = drive_harness(
         store_state,
         staged,
@@ -809,6 +816,9 @@ enum RunEnd {
     Terminal(Result<(), RuntimeError>),
     /// A turn opened past the attempt's budget.
     TurnBudget(RuntimeError),
+    /// A turn closed on or past a spend ceiling. Its `spend_ceiling_reached` record is already
+    /// in the trace, written where the ceiling was read.
+    SpendCeiling(SpendRefusal),
     /// The harness closed stdout without a terminal event.
     Eof,
     /// Neither stdout nor the bridge said anything for the whole window.
@@ -823,7 +833,10 @@ impl RunEnd {
     /// Whether the driver already said how the turn ended, which is what decides whether the
     /// runtime asks it to classify the exit instead.
     fn saw_terminal(&self) -> bool {
-        matches!(self, RunEnd::Terminal(_) | RunEnd::TurnBudget(_))
+        matches!(
+            self,
+            RunEnd::Terminal(_) | RunEnd::TurnBudget(_) | RunEnd::SpendCeiling(_)
+        )
     }
 
     /// Whether the harness had to be killed rather than ending when it was asked. Only an
@@ -1054,6 +1067,7 @@ async fn drive_harness(
             SinkOutcome::Ended => break RunEnd::Terminal(Ok(())),
             SinkOutcome::Failed(error) => break RunEnd::Terminal(Err(error)),
             SinkOutcome::TurnBudgetExceeded(error) => break RunEnd::TurnBudget(error),
+            SinkOutcome::SpendCeilingReached(refusal) => break RunEnd::SpendCeiling(refusal),
         }
     };
 
@@ -1064,7 +1078,11 @@ async fn drive_harness(
     let grace = match &end {
         _ if interrupted => None,
         RunEnd::Terminal(_) | RunEnd::Eof => Some(TERMINAL_EXIT_GRACE),
-        RunEnd::TurnBudget(_) | RunEnd::Inactive | RunEnd::Interrupted | RunEnd::Failed(_) => None,
+        RunEnd::TurnBudget(_)
+        | RunEnd::SpendCeiling(_)
+        | RunEnd::Inactive
+        | RunEnd::Interrupted
+        | RunEnd::Failed(_) => None,
     };
     let exit = finish_child(&mut child, stdin, grace).await;
     if let Some(handle) = stderr_drain {
@@ -1114,6 +1132,16 @@ async fn drive_harness(
             write_harness_exit(trace, &exit, "max_turns", spawned_at).await;
             Err(error)
         }
+        RunEnd::SpendCeiling(refusal) => {
+            write_harness_exit(trace, &exit, "spend_ceiling", spawned_at).await;
+            // The counterpart to `agent::finish_spend_refused_turn`, minus the three things this
+            // transport writes elsewhere: the `spend_ceiling_reached` record is the sink's, and
+            // the terminal A2A status and the OTel session end both come from this attempt's
+            // outcome, which is what keeps each to exactly one per attempt.
+            super::record_result(hooks, sink.workdir(), &format!("stopped: {refusal}"))
+                .map_err(RuntimeError::AgentLoopFailed)?;
+            Ok(AgentLoopExit::SpendCeilingReached)
+        }
         RunEnd::Inactive => {
             write_harness_exit(trace, &exit, "inactivity", spawned_at).await;
             Err(RuntimeError::ProcessHarnessInactive {
@@ -1143,6 +1171,13 @@ async fn drive_harness(
             match sink.consume(vec![event], hooks, trace, otel).await {
                 SinkOutcome::Ended => Ok(AgentLoopExit::Ok),
                 SinkOutcome::Failed(error) | SinkOutcome::TurnBudgetExceeded(error) => Err(error),
+                // The classify-exit event closed a turn that reached the ceiling. The run is
+                // over either way; the ceiling is what it is reported as.
+                SinkOutcome::SpendCeilingReached(refusal) => {
+                    super::record_result(hooks, sink.workdir(), &format!("stopped: {refusal}"))
+                        .map_err(RuntimeError::AgentLoopFailed)?;
+                    Ok(AgentLoopExit::SpendCeilingReached)
+                }
                 SinkOutcome::Continue => Err(RuntimeError::ProcessDriverCallFailed {
                     name: staged.name.clone(),
                     version: staged.version.clone(),

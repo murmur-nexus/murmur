@@ -874,8 +874,10 @@ pub(crate) async fn run_agent_loop(
         trace
             .write_inference(
                 turn_u32,
-                u64::from(input_tokens),
-                u64::from(output_tokens),
+                // Always `Some` on this transport: the runtime counted the request itself, so
+                // there is no turn here it did not measure.
+                Some(u64::from(input_tokens)),
+                Some(u64::from(output_tokens)),
                 decision.to_string(),
                 Some(stop_reason),
                 hook_tool_name.clone(),
@@ -888,8 +890,8 @@ pub(crate) async fn run_agent_loop(
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
         otel.emit_inference(
             turn_u32,
-            u64::from(input_tokens),
-            u64::from(output_tokens),
+            Some(u64::from(input_tokens)),
+            Some(u64::from(output_tokens)),
             decision,
             Some(stop_reason),
             hook_tool_name.as_deref(),
@@ -1826,8 +1828,8 @@ async fn flush_hook_inference_records(
         let _ = trace
             .write_inference(
                 turn,
-                record.input_tokens,
-                record.output_tokens,
+                Some(record.input_tokens),
+                Some(record.output_tokens),
                 record.decision.clone(),
                 // A hook names its own `decision` from its own completion and never saw a
                 // provider stop reason, so there is none to record.
@@ -1844,8 +1846,8 @@ async fn flush_hook_inference_records(
             .await;
         otel.emit_inference(
             turn,
-            record.input_tokens,
-            record.output_tokens,
+            Some(record.input_tokens),
+            Some(record.output_tokens),
             &record.decision,
             None,
             None,
@@ -3281,12 +3283,22 @@ impl ContextOccupancy<'_> {
 /// `session_tokens`, the compaction ratio, or any other decision the loop makes. Every member
 /// is independently optional because a driver reports whatever its provider gave it — a
 /// provider with no prompt cache reports no cache members, and that is not an error.
+///
+/// The two transports fill it differently. Under `http` the whole record is the provider's
+/// report, sitting beside the runtime's own tiktoken estimate in the trace's `input_tokens` /
+/// `output_tokens`. Under `process` there is no runtime estimate — the harness holds the
+/// conversation — so the harness's own input and output counts *are* the trace's `input_tokens`
+/// / `output_tokens`, and this record carries only what has no home there: the cache and
+/// thinking counts, with `input_tokens` and `output_tokens` left `None`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DriverUsage {
     pub(crate) input_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
     pub(crate) cached_tokens: Option<u64>,
     pub(crate) cache_write_tokens: Option<u64>,
+    /// The part of the output the provider reports as reasoning — a subset of `output_tokens`,
+    /// never an addition to it.
+    pub(crate) thinking_tokens: Option<u64>,
 }
 
 /// Reserved top-level field on the driver response payload carrying the provider's own token
@@ -3311,6 +3323,7 @@ pub(crate) fn parse_driver_usage(response: &Value) -> Option<DriverUsage> {
         output_tokens: member("output_tokens"),
         cached_tokens: member("cached_tokens"),
         cache_write_tokens: member("cache_write_tokens"),
+        thinking_tokens: member("thinking_tokens"),
     };
     (parsed != DriverUsage::default()).then_some(parsed)
 }
@@ -5064,8 +5077,8 @@ forgery: {prompt}"
         trace
             .write_inference(
                 0,
-                1,
-                1,
+                Some(1),
+                Some(1),
                 "end_turn".to_string(),
                 Some("end_turn"),
                 None,
@@ -5133,8 +5146,8 @@ forgery: {prompt}"
             trace
                 .write_inference(
                     0,
-                    1,
-                    1,
+                    Some(1),
+                    Some(1),
                     "end_turn".to_string(),
                     Some("end_turn"),
                     None,

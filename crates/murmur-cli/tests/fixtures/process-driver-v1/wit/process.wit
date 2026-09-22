@@ -1,4 +1,4 @@
-package murmur:driver@0.2.0;
+package murmur:driver@0.1.0;
 
 /// The contract between the runtime and a process driver: an artifact that knows how to drive
 /// one harness CLI. Pure translation; the runtime grants it nothing.
@@ -33,13 +33,6 @@ interface process {
     required-env: list<string>,
     /// Whether `parse` emits `text-delta` events.
     streams-text: bool,
-    /// Whether `parse` emits `usage` events for the harness it drives.
-    ///
-    /// A driver whose harness reports no token counts sets this `false`, and the runtime then
-    /// records no counts for its turns. A manifest that sets `inference.max_session_tokens`, or
-    /// a machine ceiling in effect, against such a driver is refused at load: a ceiling that can
-    /// never be reached is not a ceiling.
-    reports-usage: bool,
   }
 
   /// The endpoint through which the harness calls the capsule's tools.
@@ -130,40 +123,6 @@ interface process {
     model: option<string>,
   }
 
-  /// What the harness has spent on this run so far.
-  ///
-  /// Every member is **cumulative for the harness run**, never the increment since the last
-  /// report: a harness that sends a running count as it streams and a final total at the end is
-  /// reported verbatim, both times. The runtime attributes, to each turn it closes, only the
-  /// growth of each member over what it has already attributed, so reporting the same total
-  /// twice adds nothing and a member that shrinks contributes zero. A driver that reports
-  /// deltas instead would be counted several times over.
-  ///
-  /// Every member is independently optional. `none` means *this harness does not report this
-  /// count* and is never the same fact as `0`, which means the harness reported spending none:
-  /// the runtime keeps the two apart all the way into the trace.
-  ///
-  /// `cache-read` and `cache-creation` sit **beside** `input`, never inside it. A harness that
-  /// folds its cache counts into its input count must subtract them before reporting, so that
-  /// `input` is always the uncached prompt alone. `thinking` is a **subset** of `output`, not an
-  /// addition to it.
-  ///
-  /// No cost figure and no context-window size is carried. A price a harness computed against
-  /// its own table is a different claim from a token count, and the runtime has no equivalent
-  /// on its other transport to make it mean the same thing on both.
-  record usage {
-    /// Prompt tokens, excluding anything `cache-read` or `cache-creation` covers.
-    input: option<u64>,
-    /// Generated tokens, including the `thinking` subset below.
-    output: option<u64>,
-    /// Prompt tokens served from the provider's cache.
-    cache-read: option<u64>,
-    /// Prompt tokens written to the provider's cache.
-    cache-creation: option<u64>,
-    /// The part of `output` the harness reports as reasoning.
-    thinking: option<u64>,
-  }
-
   /// A tool the agent called.
   record tool-call-info {
     /// The call id, matching the `tool-result-info.id` of its result.
@@ -235,9 +194,6 @@ interface process {
     tool-result(tool-result-info),
     /// The harness is retrying a request to its provider.
     retry(retry-info),
-    /// What the harness has spent on this run so far, cumulative. May arrive any number of
-    /// times; the runtime records each member's growth against the turn open when it arrives.
-    usage(usage),
     /// The turn finished; the payload is the final answer.
     turn-end(string),
     /// The turn failed.

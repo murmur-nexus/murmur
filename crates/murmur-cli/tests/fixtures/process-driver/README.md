@@ -2,20 +2,22 @@
 
 A test-only process driver, and a fake harness for it to drive, for `tests/process_driver.rs`,
 `tests/process_runner.rs` and the process driver runner's own tests. The driver exports
-`murmur:driver/process@0.1.0` from the `process-driver` world and imports nothing but WASI.
+`murmur:driver/process@0.2.0` from the `process-driver` world and imports nothing but WASI.
 
-Three components are committed under `tool/`, all built from `src/process-driver` and differing
-only in what `describe().interrupt` reports — and, for the `unsupported` build, in naming no
-`interrupt-stdin`:
+A driver built against the retired `@0.1.0` lives next door, in
+`../process-driver-v1/`, with the frozen `.wit` it was built from; it exists only to be refused.
 
-| Component | `describe().interrupt` | Cargo feature |
+Four components are committed under `tool/`, all built from `src/process-driver`:
+
+| Component | Cargo feature | Differs in |
 | --- | --- | --- |
-| `tool/process-driver.wasm` | `stdin-message` | none (the default) |
-| `tool/process-driver-signal.wasm` | `signal-int` | `signal-int` |
-| `tool/process-driver-unsupported.wasm` | `unsupported` | `unsupported` |
+| `tool/process-driver.wasm` | none (the default) | — |
+| `tool/process-driver-signal.wasm` | `signal-int` | `describe().interrupt` is `signal-int` |
+| `tool/process-driver-unsupported.wasm` | `unsupported` | `describe().interrupt` is `unsupported`, and the plan names no `interrupt-stdin` |
+| `tool/process-driver-no-usage.wasm` | `no-usage` | `describe().reports-usage` is `false`, and `parse` reads no `usage` line |
 
-Every test but the cancel cases uses the default build. `fake-harness` is a committed executable
-bash script; a test copies it and `chmod 755`es its copy.
+Every test but the cancel cases and the unreported-usage cases uses the default build.
+`fake-harness` is a committed executable bash script; a test copies it and `chmod 755`es its copy.
 
 ## The driver
 
@@ -30,6 +32,7 @@ bash script; a test copies it and `chmod 755`es its copy.
 | `interrupt` | `stdin-message`, `signal-int` or `unsupported` — the build's, per the table above |
 | `required-env` | `["HOME", "FIXTURE_HARNESS_PROFILE"]` |
 | `streams-text` | `true` |
+| `reports-usage` | `true`, and `false` in the `no-usage` build |
 
 ### `launch(request)`
 
@@ -71,12 +74,28 @@ One event per line, read from the first word:
 | `tool <id> <name> <json>` | `tool-call { id, name with the bridge prefix stripped, input: <json> }` |
 | `result <id> ok\|error <output>` | `tool-result { id, output, is-error }` |
 | `retry <n> <reason>` | `retry { attempt: <n>, reason }` |
+| `usage <member>=<n> ...` | `usage { … }` — see below. Read by every build but `no-usage`, where it is "anything else" |
 | `end <result>` | `turn-end(<result>)` |
 | `fail <kind> <message>` | `turn-failed { kind, message }`, `kind` one of `auth`, `quota`, `max-turns`, `canceled`, `harness-error`, `other` |
 | anything else | `note(<line>)` |
 
 A word with nothing after it, an unknown failure kind, a `retry` whose attempt is not a number, and
 a `tool` / `result` line with too few fields are all "anything else".
+
+A `usage` line names one or more `<member>=<n>` fields, space-separated, each `<n>` the cumulative
+total for the harness run so far. Members it omits are left `none`, so a later line naming only
+what changed leaves the rest of the last one standing:
+
+| Field word | `usage` member |
+| --- | --- |
+| `in` | `input` |
+| `out` | `output` |
+| `cache-read` | `cache-read` |
+| `cache-creation` | `cache-creation` |
+| `thinking` | `thinking` |
+
+A field that is not `<member>=<number>`, or an unknown member word, makes the whole line "anything
+else".
 
 ### `classify-exit(exit)`
 
@@ -95,6 +114,10 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | Profile | What it does |
 | --- | --- |
 | `happy` | One `text` and one `end`, result `HAPPY-RESULT` |
+| `usage` | Two cumulative `usage` lines around one `text`, ending at `in=120 out=30` with `cache-read=900 cache-creation=64 thinking=2`, then `end USAGE-RESULT` |
+| `usage-zero` | One `usage in=0 out=0`, then `end ZERO-RESULT`: a harness reporting that it spent nothing |
+| `usage-turns` | Two turns, reporting `in=40 out=20` and then `in=100 out=50` — totals, not increments |
+| `usage-spends` | `usage in=5000 out=5000` on one turn, then `end SPENT` and a 60 s sleep, so a small ceiling is crossed and the harness has to be killed |
 | `tool` | One `tool` call, one bridge request, the response as the `result`, the `text` and the `end` |
 | `fail-auth`, `fail-quota`, `fail-max-turns`, `fail-canceled`, `fail-harness-error`, `fail-other` | One `fail <kind> the harness says so` |
 | `exit-0` | Output with no terminal event, then exit `0` |
@@ -120,7 +143,7 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `think` | Two `tdelta` fragments, the complete `thinking`, then `text done` and `end DONE` |
 | `think-whole` | One complete `thinking` with nothing streaming it, then `text done` and `end DONE` |
 
-`silent`, `turns`, `linger` and the three `interrupt-*` profiles write their pid to `harness.pid`
+`silent`, `turns`, `linger`, `usage-spends` and the three `interrupt-*` profiles write their pid to `harness.pid`
 in their working directory, which is how a test proves the harness is dead.
 
 The bridge request is made with bash's own `/dev/tcp` — no `curl` — and the harness's environment
@@ -169,4 +192,6 @@ cargo build --target wasm32-wasip2 --release --features signal-int
 cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-signal.wasm
 cargo build --target wasm32-wasip2 --release --features unsupported
 cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-unsupported.wasm
+cargo build --target wasm32-wasip2 --release --features no-usage
+cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-no-usage.wasm
 ```

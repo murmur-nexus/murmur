@@ -538,7 +538,7 @@ What the artifact sees and what the runtime does:
 | Request | A request to `127.0.0.1:9` is readdressed at `gateway.endpoint`'s scheme, host and port, keeping its own path and query; `https` upstreams get TLS. Every header named like [`upstream_auth.header`](#upstream-auth) is removed and exactly one is attached, rendered from the key. |
 | Network grant | `gateway.endpoint` is the grant for these requests: they are not checked against `capabilities.network.allow` or the entry's own `capabilities.network`. Every other request from the artifact is checked as usual. An allow-list entry naming the upstream warns [`W-SEC-025`](diagnostics.md#w-sec-025). |
 | Scope | Only the declaring artifact's own calls use its gateway. A request another artifact sends to `127.0.0.1:9` carries no key and is checked against the allow-list. |
-| Spend | Only the configured `transport: http` driver's gateway is metered by [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend). Every other gateway is unmetered and warns [`W-SEC-030`](diagnostics.md#w-sec-030) at launch and from `mur doctor`. |
+| Spend | Only the configured inference driver's gateway is metered by [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend). Every other gateway is unmetered and warns [`W-SEC-030`](diagnostics.md#w-sec-030) at launch and from `mur doctor`. |
 | Rejection | A `401` from the driver's upstream fails the task with [`E-RUN-027`](diagnostics.md#e-run-027). A `401` from any other gateway's upstream goes back to the artifact as the response, and is recorded in the trace. |
 | Trace | Each gateway is listed in [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl). |
 
@@ -844,7 +844,12 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | `inference.model` | string | yes | Model identifier passed to the driver. |
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
-| `inference.max_session_tokens` | integer | no | Most tokens this session's driver calls may use in total, as the runtime measures them. No default: absent sets no session ceiling. Must be > 0. See [Session spend ceiling](#inference-max-session-tokens). |
+
+This field is read under both transports, against a different measurement on each:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `inference.max_session_tokens` | integer | no | Most tokens this session may spend on inference in total. No default: absent sets no session ceiling. Must be > 0. See [Session spend ceiling](#inference-max-session-tokens). |
 
 The driver's upstream and key are `gateway.endpoint` and `gateway.api_key` on its `artifacts:`
 entry. A manifest that writes either under `inference:`, under any transport, fails with
@@ -1129,13 +1134,21 @@ provider names the same condition differently normalizes it to that value.
 
 `inference.max_session_tokens` caps the tokens one session spends on inference. It counts every
 driver call the session makes — each agent turn, and each hook's `run-inference` call, including
-compaction and seed summarization. What it counts is the runtime's own measurement,
-`input_tokens + output_tokens`, the same numbers the trace's
-[`inference`](observability-schemas.md#session-trace-tracejsonl) lines carry, so summing those
-lines checks the ceiling.
+compaction and seed summarization. What it counts is `input_tokens + output_tokens`, the same
+numbers the trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) lines carry,
+so summing those lines checks the ceiling. Cache reads, cache writes and thinking are never folded
+into either number.
 
-Before each driver call the runtime admits the call only if these three fit under the ceiling
-together:
+Those two numbers mean something different on each transport, and the ceiling's definition does
+not change with them:
+
+| Transport | What the ceiling counts |
+|---|---|
+| `transport: http` | The runtime's own measurement of each request it builds and each response it reads |
+| `transport: process` | The counts the harness reports and its driver relays — see [`transport: process`](#transport-process) |
+
+Under `transport: http`, before each driver call the runtime admits the call only if these three
+fit under the ceiling together:
 
 | Part | Value |
 |---|---|
@@ -1177,10 +1190,17 @@ can be larger than the cap the provider applied.
 | [`context.max_tokens`](#field-context) | The conversation's size, which drives compaction |
 | [`spend.machine_tokens_per_day`](config.md#spend) | Tokens across every run on the machine per UTC day |
 
-`transport: http` only: under `transport: process` the harness reaches its provider with its own
-credentials, murmur sees no spend, and the field is a manifest error. A delegated child is bounded
-by its own `inference.max_session_tokens` and by the machine ceiling, not by its parent's session
-ceiling.
+Under `transport: process` there is nothing to admit: the harness reaches its provider itself, and
+the runtime learns what a turn cost only once that turn is over. Each closed turn is charged and
+the ceiling is asked afterwards, so a ceiling stops the *next* turn rather than the one that
+reached it, and the session's total can overshoot by at most one harness turn. The run stops the
+same way it does under `http` — the same sentence, the same `spend_ceiling_reached` line, the same
+`exit_status` — and the harness is killed at once rather than given its exit grace. A ceiling set
+against a process driver whose `describe()` reports no usage is refused at launch with
+[`E-RUN-038`](diagnostics.md#e-run-038).
+
+A delegated child is bounded by its own `inference.max_session_tokens` and by the machine ceiling,
+not by its parent's session ceiling.
 
 ### `transport: process` — harness subprocess { #transport-process }
 
@@ -1215,7 +1235,9 @@ inference:
 | Interrupt grace | A harness sent a graceful interrupt has 10 seconds to end on its own before it is killed. Both this and the inactivity limit are fixed, not manifest settings. |
 | Cancellation | [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) interrupts the harness the way the driver's `describe()` declares: `stdin-message` writes the launch plan's interrupt bytes to its stdin, `signal-int` sends it `SIGINT`, and `unsupported` kills it outright. A graceful interrupt gets the interrupt grace above. The task is `canceled` either way, and the capsule, its queue and its conversation keep going. |
 | Result | The harness's final result text is written to `out/result.txt`. A turn the harness reports as failed is [`E-RUN-033`](diagnostics.md#e-run-033), naming why. |
-| Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. Token counts are reported as 0, which the subprocess protocol does not carry. |
+| Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. |
+| Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
+| Spend ceilings | [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend) are enforced against those reported counts. |
 | Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the harness manages its own context. |
 | Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |
 | Conversation | The harness's. Murmur keeps no message list and writes no `conversation.jsonl`; it maps each context to the harness's own session id in a [harness session map](workdir.md#harness-session-map), which is what [`lifecycle.conversation: threaded`](#lifecycle-conversation) and [`mur run --resume`](cli.md#mur-run) continue. A session the harness cannot find fails the turn with [`E-RUN-036`](diagnostics.md#e-run-036). |
@@ -1248,9 +1270,10 @@ launch:
 
 | Check | Refused with |
 |---|---|
-| The artifact exports `murmur:driver/process@0.1.0` | [`E-RUN-029`](diagnostics.md#e-run-029) |
+| The artifact exports `murmur:driver/process@0.2.0` | [`E-RUN-029`](diagnostics.md#e-run-029) |
 | It instantiates with no grants, and `describe()` returns usable variable names | [`E-RUN-032`](diagnostics.md#e-run-032) |
 | Every variable `describe()` requires is declared in `capabilities.env.allow` | [`E-CAP-019`](diagnostics.md#e-cap-019) |
+| `describe()` reports usage, or no spend ceiling is in effect | [`E-RUN-038`](diagnostics.md#e-run-038) |
 
 A `transport: http` manifest whose driver exports the process interface is refused with
 [`E-RUN-030`](diagnostics.md#e-run-030).

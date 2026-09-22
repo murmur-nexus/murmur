@@ -215,6 +215,6 @@ Tool artifacts work under `transport: process` too — declare them exactly as y
 
 !!! note "Observability differs from `transport: http`"
 
-    Because the harness owns the model calls, `mur trace show` records turns, tool calls, declared tools, and exit status — but **not** per-turn token usage, which is reported as zero. When you need token accounting, use `transport: http`. System prompts and lifecycle hooks apply on both paths.
+    Because the harness owns the model calls, the per-turn token counts `mur trace show` prints are the harness's own report of what it spent, relayed by the driver, rather than requests Murmur measured. A driver that reports no counts leaves them out of the trace entirely. Turns, tool calls, declared tools, exit status, system prompts and lifecycle hooks work the same on both transports.
 
 Learn more about the `murmur.yaml` manifest in the [Manifest Schema reference](../reference/manifest.md).

@@ -929,10 +929,13 @@ pub struct InferenceConfig {
     /// Unrelated to [`ContextConfig::max_tokens`], which is the session-wide token budget that
     /// drives compaction. This one is a per-turn *output* cap.
     pub max_tokens: Option<u32>,
-    /// `inference.max_session_tokens`: the most tokens — the runtime's own measured input plus
-    /// output, over every driver call the session makes — this session may spend. `None` sets no
-    /// session ceiling. `transport: http` only — rejected at parse time under `transport: process`,
-    /// where the CLI reaches its provider with its own credentials and murmur sees no spend.
+    /// `inference.max_session_tokens`: the most input plus output tokens this session may spend.
+    /// `None` sets no session ceiling.
+    ///
+    /// Valid on both transports, measured differently on each: under `transport: http` it counts
+    /// the runtime's own measurement of every driver call, and under `transport: process` the
+    /// counts the harness's driver reports for each turn. Setting it against a process driver
+    /// that reports no usage is refused at load.
     pub max_session_tokens: Option<u64>,
 }
 
@@ -3951,12 +3954,13 @@ fn parse_inference(
                 });
             }
 
-            // murmur holds no key under this transport and sees no spend, so a ceiling here could
-            // never be enforced.
-            if raw.max_session_tokens.is_some() {
+            // Valid here: the harness's own reported token counts are what this transport's
+            // turns are metered against, and a driver that reports none is refused at load
+            // rather than run for ever beneath a ceiling nothing could reach.
+            if raw.max_session_tokens == Some(0) {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.max_session_tokens".to_string(),
-                    message: "is not valid with transport: process".to_string(),
+                    message: "must be greater than 0".to_string(),
                 });
             }
 
@@ -3987,7 +3991,7 @@ fn parse_inference(
                 system_prompt_artifact,
                 max_turns,
                 max_tokens: None,
-                max_session_tokens: None,
+                max_session_tokens: raw.max_session_tokens,
             }))
         }
         other => Err(RuntimeManifestError::InvalidInferenceConfig {
@@ -8075,18 +8079,51 @@ inference:
         );
     }
 
+    /// The harness's own reported counts are what this transport meters, so the ceiling parses
+    /// here as it does under `http`. A driver that reports no counts is refused at load, not
+    /// here: the manifest cannot see which driver it names.
     #[test]
-    fn process_transport_rejects_max_session_tokens() {
+    fn process_transport_carries_max_session_tokens() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur-driver-claude-code
+    version: 0.1.0
+    runtime: driver
+inference:
+  transport: process
+  driver:
+    artifact: murmur-driver-claude-code
+  model: claude-haiku-4-5-20251001
+  max_session_tokens: 200000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.inference.unwrap().max_session_tokens,
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn process_transport_rejects_a_zero_max_session_tokens() {
         let err = RuntimeManifest::from_yaml_str(
             r#"
 name: cap
 version: 0.0.1
-artifacts: []
+artifacts:
+  - name: murmur-driver-claude-code
+    version: 0.1.0
+    runtime: driver
 inference:
   transport: process
-  command: claude
+  driver:
+    artifact: murmur-driver-claude-code
   model: claude-haiku-4-5-20251001
-  max_session_tokens: 200000
+  max_session_tokens: 0
 "#,
         )
         .unwrap_err();
@@ -8096,10 +8133,7 @@ inference:
             msg.contains("inference.max_session_tokens"),
             "error was: {msg}"
         );
-        assert!(
-            msg.contains("not valid with transport: process"),
-            "error was: {msg}"
-        );
+        assert!(msg.contains("must be greater than 0"), "error was: {msg}");
     }
 
     #[test]

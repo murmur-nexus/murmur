@@ -100,6 +100,10 @@ pub(super) struct A2aStream {
     /// Whether the harness had to be killed rather than ending when it was asked, which is the
     /// one thing the terminal `canceled` status says beyond the fact of the cancel.
     harness_killed: bool,
+    /// The refusal a reached spend ceiling stopped this attempt with, as the terminal status
+    /// reports it. A2A has no state for a task stopped by policy, so it is `failed` carrying the
+    /// refusal — the same frame the http path writes for the same fact.
+    spend_refusal: Option<String>,
 }
 
 impl A2aStream {
@@ -122,6 +126,7 @@ impl A2aStream {
             result: String::new(),
             interrupted: false,
             harness_killed: false,
+            spend_refusal: None,
         }
     }
 
@@ -135,6 +140,12 @@ impl A2aStream {
     /// session may not resume cleanly.
     pub(super) fn mark_harness_killed(&mut self) {
         self.harness_killed = true;
+    }
+
+    /// A spend ceiling stopped this attempt, with `refusal` as the reason the terminal status
+    /// carries.
+    pub(super) fn mark_spend_refused(&mut self, refusal: &crate::spend::SpendRefusal) {
+        self.spend_refusal = Some(refusal.to_string());
     }
 
     /// Open a segment, if none is open, for the turn number a turn opening now would take.
@@ -238,6 +249,10 @@ impl A2aStream {
                 let message = canceled_message(self.harness_killed).to_string();
                 self.status(AgentLoopExit::Canceled.as_str(), &message, None, true)
                     .await;
+            }
+            Ok(AgentLoopExit::SpendCeilingReached) => {
+                let message = self.spend_refusal.clone().unwrap_or_default();
+                self.status("failed", &message, None, true).await;
             }
             Ok(_) => {
                 let response = self.result.clone();

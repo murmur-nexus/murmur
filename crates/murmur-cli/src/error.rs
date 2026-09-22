@@ -58,6 +58,7 @@ pub use capsule_runtime::errors::{E_RUN_033, E_RUN_034, E_RUN_035};
 
 pub const E_RUN_036: &str = "E-RUN-036"; // a resumed harness session could not be found by the harness
 pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inference.transport: process
+pub const E_RUN_038: &str = "E-RUN-038"; // a spend ceiling is set against a process driver that reports no usage
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -530,12 +531,19 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ProcessDriverInterfaceMissing { .. } => CliError::with_hint(
                 E_RUN_029,
                 error.to_string(),
-                "rebuild the driver against murmur:driver/process@0.1.0, or name a process driver",
+                "rebuild the driver against murmur:driver/process@0.2.0, or name a process driver",
             ),
             error @ RuntimeError::HttpDriverExportsProcessInterface { .. } => CliError::with_hint(
                 E_RUN_030,
                 error.to_string(),
                 "set inference.transport: process to use this driver, or name an http driver",
+            ),
+            error @ RuntimeError::ProcessDriverReportsNoUsage { .. } => CliError::with_hint(
+                E_RUN_038,
+                error.to_string(),
+                "use a driver release that reports its harness's token usage, or remove the \
+                 ceiling — a ceiling murmur can never measure against would let the run go on \
+                 for ever",
             ),
             error @ RuntimeError::ProcessDriverRequiredEnvNotAllowed { .. } => CliError::with_hint(
                 E_CAP_019,
@@ -579,7 +587,7 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ProcessDriverLoad { .. } => CliError::with_hint(
                 E_RUN_032,
                 error.to_string(),
-                "the driver must export murmur:driver/process@0.1.0 and import nothing but WASI",
+                "the driver must export murmur:driver/process@0.2.0 and import nothing but WASI",
             ),
             error @ RuntimeError::GatewayWithoutCredential { .. } => CliError::with_hint(
                 E_CAP_018,

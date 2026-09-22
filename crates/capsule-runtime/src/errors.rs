@@ -633,6 +633,23 @@ pub enum RuntimeError {
         missing: Vec<String>,
     },
 
+    /// A spend ceiling is in effect against a process driver whose `describe().reports-usage` is
+    /// `false`, so no turn it drives could ever be counted against that ceiling.
+    ///
+    /// `ceilings` names each ceiling in effect, in the order the operator would read them: the
+    /// manifest's `inference.max_session_tokens` first, then the effective config's
+    /// `spend.machine_tokens_per_day`.
+    #[error(
+        "process driver '{name}@{version}' reports no usage — its describe() sets \
+         reports-usage: false — so {} could never be enforced",
+        .ceilings.join(" and ")
+    )]
+    ProcessDriverReportsNoUsage {
+        name: String,
+        version: String,
+        ceilings: Vec<String>,
+    },
+
     /// A process driver could not be instantiated with no grants, trapped in `describe`, or
     /// described itself with an unusable `required-env` name. `message` is wasmtime's error, which
     /// names an unsatisfied import, or names the unusable variable.

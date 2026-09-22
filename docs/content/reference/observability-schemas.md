@@ -83,15 +83,16 @@ before the first task begins
 |---|---|---|
 | `turn` | u32 | Zero-based turn index |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
-| `input_tokens` | u64 | The runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before the request was sent. This is the number the compaction threshold and the session totals run on |
-| `output_tokens` | u64 | The runtime's own tiktoken estimate of the driver response |
+| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn, which only a process driver reporting no usage produces — never the same fact as `0` |
+| `output_tokens` | u64 | What this turn's output cost, on the same terms as `input_tokens` |
 | `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` — what the loop does next. A turn the provider cut off at the output cap reads `"text"`; `stop_reason` beside it is the field that says it was cut off |
 | `stop_reason` | string | The provider's own stop reason, verbatim as the loop dispatched on it — `"max_tokens"` for a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens). Written on every agent-loop turn, and as `""` when the driver reported none. Absent on a record no driver response was parsed for: a hook's `run-inference` and the `process` transport |
 | `tool_name` | string \| null | The tool the response asked for; `null` when it asked for none |
-| `input_tokens_actual` | u64 | The provider's own count of the request, from the driver's [`usage`](wit-interfaces.md#driver-usage) block |
-| `output_tokens_actual` | u64 | The provider's own count of the completion |
-| `cached_tokens` | u64 | Request tokens the provider served from its prompt cache |
-| `cache_write_tokens` | u64 | Request tokens the provider wrote into its prompt cache |
+| `input_tokens_actual` | u64 | The provider's own count of the request, from the driver's [`usage`](wit-interfaces.md#driver-usage) block. `transport: http` only: on `process` the harness's own count is already `input_tokens`, and writing it twice would invent a second measurement |
+| `output_tokens_actual` | u64 | The provider's own count of the completion, on the same terms |
+| `cached_tokens` | u64 | Request tokens the provider served from its prompt cache. Beside `input_tokens`, never inside it |
+| `cache_write_tokens` | u64 | Request tokens the provider wrote into its prompt cache. Beside `input_tokens`, never inside it |
+| `thinking_tokens` | u64 | The part of the output reported as reasoning — a subset of `output_tokens`, never an addition to it |
 | `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
 | `model` | string | The model this call was sent to. Written only alongside `origin` |
 | `message_ids` | array of string | Ids of the messages this request embedded, in the order they sat in it. Under an active [driver continuation](wit-interfaces.md#stateful-driver-continuation) only the tail the driver has not seen is sent, and this names exactly that tail. Absent when the list is empty: a hook's own completion and the `process` transport both send a message list the runtime never minted |
@@ -100,11 +101,17 @@ before the first task begins
 | `response_sha` | string | SHA-256 (lowercase hex) of the raw driver response body, as the runtime read it before parsing |
 | `message_shas` | array of string | SHA-256 (lowercase hex) of each message this request embedded, in send order — one entry per `message_ids` entry, over the same messages once the runtime's own identity keys are stripped |
 
-The four provider-reported fields are written only when the driver reported that member, and are
-absent otherwise — never `0`. They sit beside the runtime's estimates rather than replacing them,
-so estimator drift is a subtraction on one line. See
-[Reported token usage](wit-interfaces.md#driver-usage) for what a driver sends and what the
-runtime does with it.
+The five provider-reported fields are written only when the driver reported that member, and are
+absent otherwise — never `0`. See [Reported token usage](wit-interfaces.md#driver-usage) for what a
+driver sends and what the runtime does with it.
+
+Which of them appear depends on the transport, because the two transports make a different number
+of measurements:
+
+| Transport | `input_tokens` / `output_tokens` | `*_actual` | `cached_tokens`, `cache_write_tokens`, `thinking_tokens` |
+|---|---|---|---|
+| `http` | The runtime's own estimate, always present | The provider's own counts, beside the estimate so drift is a subtraction on one line | Present when the driver reported them |
+| `process` | The harness's own reported counts, absent when its driver reports none | Always absent: there is one count on this transport and it is recorded once | Present when the driver reported them |
 
 ### `inference_credential` { #inference-credential }
 
@@ -530,12 +537,13 @@ driver call before it is sent
 | `limit` | string | `"session"` — [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) \| `"machine"` — [`spend.machine_tokens_per_day`](config.md#spend) |
 | `ceiling` | u64 | The ceiling's value |
 | `used` | u64 | `"session"`: this session's settled tokens plus its calls in flight. `"machine"`: the day's ledger total plus this session's calls in flight |
-| `requested` | u64 | The refused call's `input_tokens` plus the most output it could request |
+| `requested` | u64 | The refused call's `input_tokens` plus the most output it could request, and `0` for a ceiling reached rather than crossed by a call — which is every refusal under `transport: process`, where the spend is already made by the time the runtime learns of it |
 | `origin` | string | `"hook:<hook name>"` for a hook's `run-inference` call. Absent for an agent turn |
 
-No `inference` line accompanies it: nothing was sent. A `"session"` refusal latches, so every later
-driver call in the session writes one of these too; a `"machine"` refusal is checked again on every
-call.
+Under `transport: http` no `inference` line accompanies it: nothing was sent. Under
+`transport: process` it follows the `inference` line of the turn whose spend reached the ceiling,
+which is the turn its `turn` names. A `"session"` refusal latches, so every later driver call in
+the session writes one of these too; a `"machine"` refusal is checked again on every call.
 
 **`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 
@@ -1008,7 +1016,7 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 | Span name | Source event | Attributes |
 |---|---|---|
 | `capsule.session` | One per task | `exit_status` |
-| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `stop_reason` (the provider's own reason, on every agent-loop turn), `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens` and `cache_write_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
+| `capsule.inference` | `inference` | `turn`, `input_tokens` and `output_tokens` (each when the turn was counted at all), `decision`, `stop_reason` (the provider's own reason, on every agent-loop turn), `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens`, `cache_write_tokens` and `thinking_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
 | `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
 | `capsule.compaction` | `compaction` | `tokens_before`, `tokens_after` |

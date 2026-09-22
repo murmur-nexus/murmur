@@ -9,12 +9,15 @@ crate-type = ["cdylib"]
 [dependencies]
 wit-bindgen = "0.46"
 
-# One source, three components. The feature picks what `describe().interrupt` reports, which is
-# what decides the runtime's interrupt path, and `unsupported` also drops the plan's
-# `interrupt-stdin`: a driver that cannot interrupt gracefully has no bytes for it.
+# One source, four components. `signal-int` and `unsupported` pick what `describe().interrupt`
+# reports, which is what decides the runtime's interrupt path, and `unsupported` also drops the
+# plan's `interrupt-stdin`: a driver that cannot interrupt gracefully has no bytes for it.
+# `no-usage` sets `describe().reports-usage` to false and makes `parse` read no `usage` line, so a
+# test can drive the runtime's unreporting-driver paths against the same source.
 [features]
 default = []
 signal-int = []
 unsupported = []
+no-usage = []
 
 [workspace]

@@ -240,11 +240,13 @@ spend:
 |---|---|---|---|
 | `machine_tokens_per_day` | integer | no | Most tokens every run on this `~/.murmur` may spend per UTC day. No default: absent sets no machine ceiling. `0` is refused with `E-IO-003` when the config is loaded |
 
-It counts what [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) counts:
-the runtime's own `input_tokens + output_tokens` for every driver call, agent turns and hooks'
-`run-inference` calls alike. Before each call, a run adds the day's total, its own calls still in
-flight and the call's input plus its most output; a call that would cross the ceiling is refused
-before it is sent, with `limit: "machine"` on its
+It counts what [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) counts,
+against the same per-transport measurement: `input_tokens + output_tokens` for every agent turn and
+every hook's `run-inference` call. Under `transport: http`, before each call a run adds the day's
+total, its own calls still in flight and the call's input plus its most output; a call that would
+cross the ceiling is refused before it is sent. Under [`transport: process`](manifest.md#transport-process)
+there is nothing to admit: each turn is charged the counts the harness reported once it closes, and
+a turn that reaches the ceiling stops the run. Either way the stop carries `limit: "machine"` on its
 [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line. A machine refusal
 does not latch: the next call is checked again, and the total starts from zero at 00:00 UTC.
 
@@ -252,8 +254,9 @@ does not latch: the next call is checked again, and the total starts from zero a
 and checks the ledger before its next call. A call that is admitted and not yet settled is
 invisible to every other run. The machine total can therefore exceed
 `spend.machine_tokens_per_day` by at most the tokens of the calls in flight on the machine
-(admitted and not yet settled) when the last call was admitted. Those tokens are the runtime's own
-`input_tokens + output_tokens` for each call, however much output the call asked for.
+(admitted and not yet settled) when the last call was admitted, however much output each asked for.
+A `transport: process` run adds one more turn's worth: its spend is known only once the turn is
+over, so the turn that crosses the ceiling has already been paid for when the run stops.
 
 Calls that can be in flight at the same time:
 
