@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use murmur_artifact::{ConversationMode, TaskAcceptance};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::a2a::{
     A2aMessage, A2aTask, CancelOutcome, IncomingTask, JsonRpcRequest, JsonRpcResponse,
@@ -227,6 +227,12 @@ pub(crate) fn build_agent_card(
 /// Returns once `shutdown_rx` fires or its sender is dropped, having closed the listener and
 /// ended every connection still open, so the door closes with the session rather than with the
 /// runtime. An accept error closes the listener but leaves open connections served until then.
+///
+/// A streaming connection is not cut off mid-queue: the session's last frames — a task's final
+/// status among them — are broadcast just before the shutdown signal, and a handler not yet
+/// scheduled to write them would otherwise lose them. Each one is told the door is closing, writes
+/// what it has already been sent and returns; [`CONNECTION_DRAIN_GRACE`] bounds a connection that
+/// cannot, such as one whose client stopped reading.
 // Everything after the listener and the shutdown channel is A2A server state that is cloned
 // once per accepted connection and handed to `handle_connection` unchanged. A wrapper struct
 // would name the argument count rather than a concept.
@@ -260,6 +266,7 @@ pub(crate) async fn serve_http(
         ConversationMode::Threaded => "threaded",
     };
     let mut connections = tokio::task::JoinSet::new();
+    let (closing_tx, closing_rx) = watch::channel(false);
     let accept_failed = loop {
         tokio::select! {
             _ = &mut shutdown_rx => break false,
@@ -280,8 +287,9 @@ pub(crate) async fn serve_http(
                         let session = session_id.clone();
                         let detached_for_conn = detached.clone();
                         let live = Arc::clone(&live_delegations);
+                        let closing = closing_rx.clone();
                         connections.spawn(async move {
-                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live, forgettable_session).await;
+                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live, forgettable_session, closing).await;
                         });
                     }
                     Err(e) => {
@@ -298,7 +306,24 @@ pub(crate) async fn serve_http(
     }
     // A `stream/watch` or `message/stream` connection otherwise outlives the session: its
     // handler holds a broadcast sender, so it never sees the channel close.
+    let _ = closing_tx.send(true);
+    let drained = async { while connections.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(CONNECTION_DRAIN_GRACE, drained).await;
     connections.shutdown().await;
+}
+
+/// How long a closing door waits for its open connections to finish before ending them.
+///
+/// A connection that drains normally is gone within one scheduling round, so this is paid only by
+/// a connection that cannot finish: a client that stopped reading, or one that connected and
+/// never sent its request.
+const CONNECTION_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Resolves once the door is closing. The handler's receive loop polls this after the broadcast
+/// receiver, so it fires only when every frame already sent to the connection has been taken.
+async fn door_closing(closing: &mut watch::Receiver<bool>) {
+    // A dropped sender means `serve_http` itself is gone, which closes the door just the same.
+    let _ = closing.wait_for(|&closing| closing).await;
 }
 
 // Receives `serve_http`'s state verbatim and splits it across the three request handlers; see
@@ -319,6 +344,7 @@ async fn handle_connection(
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
     forgettable_session: bool,
+    closing: watch::Receiver<bool>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -504,6 +530,7 @@ async fn handle_connection(
                     last_event_id,
                     sse_tx,
                     sse_buffer,
+                    closing,
                 )
                 .await;
                 return;
@@ -515,6 +542,7 @@ async fn handle_connection(
                     sse_tx,
                     sse_buffer,
                     conversation_mode_str,
+                    closing,
                 )
                 .await;
                 return;
@@ -574,6 +602,7 @@ async fn handle_message_stream(
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
+    mut closing: watch::Receiver<bool>,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -707,6 +736,7 @@ async fn handle_message_stream(
                     }
                 }
             }
+            () = door_closing(&mut closing) => return,
         }
     }
 }
@@ -766,6 +796,7 @@ async fn handle_stream_watch(
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
     conversation_mode_str: String,
+    mut closing: watch::Receiver<bool>,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -833,6 +864,9 @@ async fn handle_stream_watch(
                     }
                 }
             }
+            // An exiting capsule ends an observer's stream without `capsule-closed`: that frame
+            // means the frame stream closed while the capsule still serves the connection.
+            () = door_closing(&mut closing) => return,
         }
     }
 }
@@ -1362,6 +1396,7 @@ mod tests {
         let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
 
+        let (_closing_tx, closing) = watch::channel(false);
         let local = tokio::task::LocalSet::new();
         let (connected_at, blocked_at, watcher) = local
             .run_until(async {
@@ -1373,8 +1408,15 @@ mod tests {
                 let buffer = Arc::clone(&sse_buffer);
                 let watcher = tokio::spawn(async move {
                     let _read_half = read_half;
-                    handle_stream_watch(write_half, Some(0), sse, buffer, "stateless".to_string())
-                        .await;
+                    handle_stream_watch(
+                        write_half,
+                        Some(0),
+                        sse,
+                        buffer,
+                        "stateless".to_string(),
+                        closing,
+                    )
+                    .await;
                 });
 
                 // Let the handler write its preamble and settle into the receive loop before
@@ -1578,9 +1620,18 @@ mod tests {
         let (read_half, write_half) = sock.into_split();
         let sse = sse_tx.clone();
         let buffer = Arc::clone(&sse_buffer);
+        let (_closing_tx, closing) = watch::channel(false);
         let watcher = tokio::spawn(async move {
             let _read_half = read_half;
-            handle_stream_watch(write_half, Some(0), sse, buffer, "stateless".to_string()).await;
+            handle_stream_watch(
+                write_half,
+                Some(0),
+                sse,
+                buffer,
+                "stateless".to_string(),
+                closing,
+            )
+            .await;
         });
         wait_for_subscriber(&sse_tx).await;
 
@@ -1646,6 +1697,7 @@ mod tests {
         let (read_half, write_half) = sock.into_split();
         let sse = sse_tx.clone();
         let buffer = Arc::clone(&sse_buffer);
+        let (_closing_tx, closing) = watch::channel(false);
         let handler = tokio::spawn(async move {
             let _read_half = read_half;
             handle_message_stream(
@@ -1660,6 +1712,7 @@ mod tests {
                 None,
                 sse,
                 buffer,
+                closing,
             )
             .await;
         });
@@ -1690,6 +1743,127 @@ mod tests {
         );
         assert_eq!(body, expected);
         assert_buffer_has_no_lagged_frame(&sse_buffer);
+    }
+
+    /// The session's last frames are broadcast just before the door closes. A `message/stream`
+    /// handler that has not yet been scheduled when the close lands still writes the final status
+    /// it was sent, and then ends the connection.
+    ///
+    /// Current-thread flavour: the frame and the close are sent with no await between them, so
+    /// the handler sees both at once — the shape of a busy host, where it is scheduled late.
+    #[tokio::test]
+    async fn message_stream_writes_queued_frames_before_the_door_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
+
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, _task_rx) = mpsc::channel::<IncomingTask>(4);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: serde_json::json!(1),
+            method: "message/stream".to_string(),
+            params: serde_json::json!({
+                "message": {
+                    "messageId": "msg_closing",
+                    "role": "user",
+                    "parts": [{"text": "hello"}]
+                }
+            }),
+        };
+
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let buffer = Arc::clone(&sse_buffer);
+        let (closing_tx, closing) = watch::channel(false);
+        let handler = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_message_stream(
+                write_half,
+                req,
+                &task_registry,
+                &task_tx,
+                None,
+                TaskProvenance::derive(TaskOrigin::User, None),
+                None,
+                false,
+                None,
+                sse,
+                buffer,
+                closing,
+            )
+            .await;
+        });
+        wait_for_subscriber(&sse_tx).await;
+
+        let final_status = format_sse_event(1, "status", "{\"id\":\"tsk_closing\",\"final\":true}");
+        sse_tx.send(Arc::new(final_status.clone())).unwrap();
+        closing_tx.send(true).unwrap();
+
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, None).await;
+        handler.await.unwrap();
+        client.join().unwrap();
+
+        assert_eq!(sse_body(&received), final_status);
+    }
+
+    /// A `stream/watch` observer is written every frame it was sent before the door closed, rather
+    /// than having its socket dropped mid-queue, and the stream then ends without
+    /// `capsule-closed`, as it does for any capsule that exits.
+    #[tokio::test]
+    async fn stream_watch_writes_queued_frames_before_the_door_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(30),
+        );
+
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let buffer = Arc::clone(&sse_buffer);
+        let (closing_tx, closing) = watch::channel(false);
+        let watcher = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_stream_watch(
+                write_half,
+                Some(0),
+                sse,
+                buffer,
+                "stateless".to_string(),
+                closing,
+            )
+            .await;
+        });
+        wait_for_subscriber(&sse_tx).await;
+
+        let text = format_sse_event(1, "text", "{\"n\":\"last\",\"final\":false}");
+        let final_status = format_sse_event(2, "status", "{\"id\":\"tsk_closing\",\"final\":true}");
+        sse_tx.send(Arc::new(text.clone())).unwrap();
+        sse_tx.send(Arc::new(final_status.clone())).unwrap();
+        closing_tx.send(true).unwrap();
+
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, None).await;
+        watcher.await.unwrap();
+        client.join().unwrap();
+
+        let expected = format!(
+            "event: connection-ack\ndata: {{\"role\":\"observer\",\"conversation_mode\":\"stateless\"}}\n\n\
+             {text}{final_status}"
+        );
+        assert_eq!(sse_body(&received), expected);
     }
 
     const PROTOCOL_PAGE_PATH: &str = concat!(
