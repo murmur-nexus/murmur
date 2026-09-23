@@ -49,7 +49,7 @@ need a [`filesystem` grant](manifest.md#hook-capabilities).
 | Artifact | Fires on | What it does |
 |---|---|---|
 | `murmur-hook-compact` | `on-compaction` | Summarizes conversation history when the session token threshold is reached, and replaces the context with the summary |
-| `murmur-hook-debug` | Every event | Appends one JSON object per lifecycle event to `hook-debug.jsonl` |
+| `murmur-hook-debug` | Every event except `on-stage` | Appends one JSON object per lifecycle event to `hook-debug.jsonl` |
 | `murmur-hook-diff-summary` | Every event | Snapshots files before each editor tool call and emits a unified-diff summary at the end of the turn |
 | `murmur-hook-eval` | Every event | Scores the session against the configured scorers and writes `eval.jsonl` |
 | `murmur-hook-grafana` | Every event | Emits OpenTelemetry spans for each lifecycle event to a Grafana Tempo OTLP/HTTP endpoint |

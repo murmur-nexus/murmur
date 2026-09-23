@@ -277,7 +277,7 @@ A piece of the model's reply.
 
 | `final` | `text` | Written when |
 |---|---|---|
-| `false` | A chunk | A streaming driver, or a tool, emits a chunk through [`murmur:text/chunks`](wit-interfaces.md#interfaces) |
+| `false` | A chunk | A streaming driver, or a tool, emits a chunk through [`murmur:text/chunks`](wit-interfaces.md#text-chunks) |
 | `true` | `""` | A streaming driver's inference call returned, or a [`transport: process`](#transports) harness reported the complete text of fragments it streamed. Marks the end of that turn's chunks |
 | `true` | The whole reply | A task completed with a non-empty reply and no chunk was emitted during its last inference turn |
 
@@ -292,7 +292,7 @@ A piece of the model's reply.
 ## `thinking` { #event-thinking }
 
 A piece of the model's reasoning, emitted by a streaming driver or a tool through
-[`murmur:text/chunks`](wit-interfaces.md#interfaces).
+[`murmur:text/chunks`](wit-interfaces.md#text-chunks).
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|
