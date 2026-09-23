@@ -251,6 +251,19 @@ optional `context-id`, and the `text` — and returns the peer's `task-id`, `con
 
 ---
 
+## `murmur:text/chunks` { #text-chunks }
+
+Streams a reply to the session's SSE stream while a tool or driver is still producing it.
+
+| Function | Emits | Call it with |
+|---|---|---|
+| `emit-chunk: func(chunk: string)` | A [`text`](streaming-protocol.md#event-text) frame | The next piece of reply text |
+| `emit-thinking-chunk: func(chunk: string)` | A [`thinking`](streaming-protocol.md#event-thinking) frame | The next piece of reasoning |
+
+Outside an A2A task there is no SSE stream, and both calls do nothing.
+
+---
+
 ## `murmur:hook/lifecycle`
 
 Hook artifacts (`runtime: hook`) export this interface. The runtime calls each handler

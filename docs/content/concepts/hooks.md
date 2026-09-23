@@ -18,7 +18,7 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 | `on-compaction` | When session tokens reach the [compaction threshold](context.md). |
 | `on-task-end` | Immediately after that task's agent loop returns. Once per task. |
 | `on-session-end` | After the task loop exits (idle timeout, shutdown, or explicit exit). Once per capsule launch. |
-| *(omitted)* | All session events (`on-session-start` through `on-session-end`). Does not include `on-stage`. |
+| *(omitted)* | Every event, `on-stage` included. An `async` hook with no binding receives every event except `on-stage`. |
 
 **Execution mode** — whether the agent loop waits for the hook. **`blocking`** (the default) stops
 the loop until the hook returns; **`async`** enqueues the event and lets the loop continue. If the
