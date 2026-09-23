@@ -286,10 +286,17 @@ impl<'a> ProcessEventSink<'a> {
     ///
     /// A call with no result is not a `tool_call` record: nothing is known about how it went, and
     /// inventing a status would put a tool call in the trace that no tool ever finished.
-    pub(super) async fn finish(&mut self, trace: &mut TraceWriter) {
-        if self.produced && !self.session_gone {
+    ///
+    /// Returns the id the harness will answer to, on exactly the condition the session is
+    /// committed, and `None` otherwise: that is the session a reopened attempt of the same task
+    /// resumes, whether or not the context remembers it.
+    pub(super) async fn finish(&mut self, trace: &mut TraceWriter) -> Option<String> {
+        let continuable = (self.produced && !self.session_gone).then(|| {
             self.session.commit(self.reported_session.as_deref());
-        }
+            self.session
+                .effective_id(self.reported_session.as_deref())
+                .to_string()
+        });
         let mut unanswered: Vec<(String, String)> = self
             .pending
             .drain()
@@ -304,6 +311,7 @@ impl<'a> ProcessEventSink<'a> {
                 ))
                 .await;
         }
+        continuable
     }
 
     async fn handle(
@@ -790,6 +798,8 @@ mod tests {
         map: Arc<HarnessSessionMap>,
         /// The id the runtime handed the harness for this run.
         planned_id: String,
+        /// What the last batch's `finish` handed back for a reopened attempt to resume.
+        carried: Option<String>,
     }
 
     impl Harness {
@@ -868,6 +878,7 @@ mod tests {
                 context_id: Some(CONTEXT.to_string()),
                 continue_conversation: true,
                 forget: None,
+                reopen_session: None,
             };
             let plan = plan_session(&policy);
             let planned_id = plan.session.id.clone();
@@ -895,6 +906,7 @@ mod tests {
                 otel,
                 map,
                 planned_id,
+                carried: None,
             }
         }
 
@@ -912,7 +924,7 @@ mod tests {
             let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
                 .await;
-            sink.finish(&mut self.trace).await;
+            self.carried = sink.finish(&mut self.trace).await;
             outcome
         }
 
@@ -1851,6 +1863,35 @@ mod tests {
         assert_eq!(h.map.get(CONTEXT), None);
         h.feed(vec![Event::TurnEnd("done".into())]).await;
         assert_eq!(h.map.get(CONTEXT).as_deref(), Some(h.planned_id.as_str()));
+    }
+
+    /// The session a run leaves for a reopened attempt of its task is the one it commits, on the
+    /// same condition: the reported id over the handed one, and nothing from a run that produced
+    /// no work or lost its session.
+    #[tokio::test]
+    async fn harness_session_a_run_carries_to_a_reopen_exactly_what_it_commits() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![session_started("worked"), text("an answer")])
+            .await;
+        assert_eq!(h.carried.as_deref(), Some("worked"));
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![Event::TurnEnd("done".into())]).await;
+        assert_eq!(h.carried.as_deref(), Some(h.planned_id.as_str()));
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![session_started("named-but-empty")]).await;
+        assert_eq!(h.carried, None);
+
+        let map = Arc::new(HarnessSessionMap::new(None, Path::new("/tmp")));
+        map.put(CONTEXT, "remembered", HARNESS, "fixture-driver");
+        let mut h = Harness::threading(10, map).await;
+        h.feed(vec![Event::TurnFailed(TurnFailure {
+            kind: FailureKind::HarnessError,
+            message: "no conversation found with session id remembered".into(),
+        })])
+        .await;
+        assert_eq!(h.carried, None);
     }
 
     /// Nothing was established, so nothing is remembered.

@@ -24,7 +24,9 @@ pub(crate) const TASK_IO_IFACE_VERSIONED: &str = "murmur:task-io/read@0.1.0";
 ///
 /// `original` and `as_given` are byte-identical until a hook reopens the task:
 /// the reopen loop rewrites `task.md` as the original plus accumulated feedback,
-/// and `as_given` is what the *next* attempt's agent loop is handed.
+/// and `as_given` is that text. A continued attempt received the same content as
+/// the original task message followed by one feedback message per reopen; a
+/// restarted attempt received it as its task message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaskIoValues {
     pub(crate) original: String,

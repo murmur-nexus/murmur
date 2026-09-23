@@ -398,13 +398,57 @@ pub(crate) mod test_support {
         status: u32,
         response: &str,
     ) -> Component {
+        driver_double_with_metadata(engine, status, response, &[])
+    }
+
+    /// [`driver_double`], answering with `metadata` on every call — a `continuation_id` entry
+    /// makes it a stateful driver holding a continuation.
+    ///
+    /// Each `(string, string)` tuple is 16 bytes (key pointer, key length, value pointer, value
+    /// length) laid out from 192; the strings follow from 256, below the response at 4096. The bump
+    /// allocator starts past the response, so lowering the request overwrites none of them.
+    pub(crate) fn driver_double_with_metadata(
+        engine: &wasmtime::Engine,
+        status: u32,
+        response: &str,
+        metadata: &[(&str, &str)],
+    ) -> Component {
         let len = response.len();
-        let escaped: String = response.bytes().map(|b| format!("\\{b:02x}")).collect();
+        let escape =
+            |text: &str| -> String { text.bytes().map(|b| format!("\\{b:02x}")).collect() };
+        let escaped = escape(response);
+        let mut metadata_stores = String::new();
+        let mut metadata_data = String::new();
+        let mut next_string = 256usize;
+        for (index, (key, value)) in metadata.iter().enumerate() {
+            let tuple = 192 + 16 * index;
+            for (offset, text) in [(0, key), (8, value)] {
+                metadata_stores.push_str(&format!(
+                    "      (i32.store (i32.const {}) (i32.const {next_string}))\n      \
+                     (i32.store (i32.const {}) (i32.const {}))\n",
+                    tuple + offset,
+                    tuple + offset + 4,
+                    text.len()
+                ));
+                metadata_data.push_str(&format!(
+                    "    (data (i32.const {next_string}) \"{}\")\n",
+                    escape(text)
+                ));
+                next_string += text.len();
+            }
+        }
+        assert!(
+            next_string <= 4096,
+            "metadata strings must fit below the response"
+        );
+        let bump_start = 4096 + len + 8;
+        let metadata_ptr = if metadata.is_empty() { 0 } else { 192 };
+        let metadata_len = metadata.len();
         let wat = format!(
             r#"(component
   (core module $m
-    (memory (export "memory") 1)
-    (global $bump (mut i32) (i32.const 1024))
+    (memory (export "memory") 4)
+    (global $bump (mut i32) (i32.const {bump_start}))
     (func (export "realloc") (param i32 i32 i32 i32) (result i32)
       (local $p i32)
       (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
@@ -418,10 +462,11 @@ pub(crate) mod test_support {
       (i32.store  (i32.const 152) (i32.const {len}))
       (i32.store  (i32.const 156) (i32.const 0))
       (i32.store8 (i32.const 168) (i32.const 0))
-      (i32.store  (i32.const 172) (i32.const 0))
-      (i32.store  (i32.const 176) (i32.const 0))
-      (i32.const 128))
+      (i32.store  (i32.const 172) (i32.const {metadata_ptr}))
+      (i32.store  (i32.const 176) (i32.const {metadata_len}))
+{metadata_stores}      (i32.const 128))
     (data (i32.const 4096) "{escaped}")
+{metadata_data}
   )
   (core instance $i (instantiate $m))
   (alias core export $i "memory" (core memory $mem))

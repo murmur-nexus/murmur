@@ -140,12 +140,30 @@ fn resolve_versioned_iface<T>(
 /// Fires `on-task-end` after every attempt (via [`HookRuntime::dispatch_task_end`]). If
 /// a blocking hook returns `reopen-task(reason)` and both budgets still allow it — fewer
 /// than `max_task_reopens` (the manifest's `lifecycle.max_task_reopens`) reopens used AND
-/// cumulative task turns still below `inference.max_turns` — the task's
-/// `accessible_workdir/task.md` is rewritten as the original content plus every reopen's
-/// feedback so far, a `task_reopened` trace record is written, and the loop runs again.
-/// Reopening shares one cumulative turn budget with the original attempt: each attempt is
-/// handed only `max_turns - task_turns()` turns, so the whole task can never exceed the
-/// capsule's turn ceiling.
+/// cumulative task turns still below `inference.max_turns` — a `task_reopened` trace record
+/// is written and the loop runs again.
+///
+/// A reopened attempt continues the task's own conversation, whatever
+/// `lifecycle.conversation` says: that mode decides what a *new* task loads, never whether a
+/// reopened attempt keeps the context its own task built. Every message the rejected attempt
+/// put in context stays there — its tool calls, their results and the rejected answer — and
+/// the hook's feedback arrives as one new user message after them. On `process` that is
+/// `mode: resume` on the harness session the previous attempt ran under, with the feedback as
+/// its prompt. Re-running the task from its text instead would repeat every state-changing tool
+/// call the rejected attempt already made. The seed is applied once, to the task's first fresh
+/// context, and a continued attempt neither consults it nor honours the first attempt's forget
+/// request again.
+///
+/// An attempt that left nothing to continue — an `http` message list still empty, or a harness
+/// run that produced no observable work or could not find its session — is followed by a
+/// restart: a fresh context built from the rewritten `task.md`, seed applied. The `task_reopened` record says which of the two the
+/// next attempt gets (`attempt_context`) and how many turns it is handed (`turns_remaining`).
+///
+/// Either way `accessible_workdir/task.md` is rewritten as the original content plus every
+/// reopen's feedback so far ([`build_reopen_task_md`]): it is `murmur:task-io/read`'s
+/// `as-given` form, and the input to a restart. Reopening shares one cumulative turn budget
+/// with the original attempt: each attempt is handed only `max_turns - task_turns()` turns, so
+/// the whole task can never exceed the capsule's turn ceiling.
 ///
 /// Writes the terminal `task_end` record (carrying the final `reopen_count`) itself, and
 /// the terminal `on-task-end` dispatch is simply the loop's last one. Returns the task's
@@ -155,8 +173,8 @@ fn resolve_versioned_iface<T>(
 /// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
 /// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
 ///
-/// `seed` is whatever the task's single `on-task-start` dispatch proposed, handed to every
-/// attempt so a reopened task starts from the same context as its first run.
+/// `seed` is whatever the task's single `on-task-start` dispatch proposed. The hook is
+/// dispatched once, at task start, and is not asked again.
 ///
 /// `agent_task_id` is what [`agent::run_agent_loop`] receives (governs A2A SSE emission);
 /// `trace_task_id` is the id used for the `task_start`/`task_reopened`/`task_end` records
@@ -194,10 +212,15 @@ async fn run_task_with_reopens(
     // Every reopen's (hook_name, reason) so far — all re-injected on each reopen.
     let mut feedback: Vec<(String, String)> = Vec::new();
     let mut reopens_used: u32 = 0;
-    // Exactly the bytes the next attempt's agent loop will be handed, tracked alongside the
-    // `task.md` writes below so `murmur:task-io/read`'s `as-given` form is what the model saw
-    // rather than a re-read of a file whose path is a convention.
+    // The task plus every reopen's feedback so far, tracked alongside the `task.md` writes below
+    // so `murmur:task-io/read`'s `as-given` form is the text the attempt was handed rather than a
+    // re-read of a file whose path is a convention. A continued attempt received the same content
+    // as the original task message followed by one feedback message per reopen.
     let mut as_given = original_task.clone();
+    // The conversation this task has built, handed from each attempt to the next.
+    let mut thread = agent::TaskThread::default();
+    // This reopen's feedback text, `None` until a hook reopens the task.
+    let mut reopen_feedback: Option<String> = None;
 
     loop {
         // This function owns the task's scope: nothing else puts a task in scope, which is why
@@ -229,11 +252,12 @@ async fn run_task_with_reopens(
             capsule_version,
             mode.clone(),
             context_id.clone(),
-            // Cloned per attempt rather than moved into the first: a reopened task re-runs
-            // the same task, so every attempt must start from the same context the hook
-            // proposed. The hook is dispatched once, at task start, and is not asked again.
+            // Cloned per attempt rather than moved into the first: an attempt that restarts
+            // from a fresh context applies it, and a continued attempt never reads it.
             seed.clone(),
             cancel.clone(),
+            &mut thread,
+            reopen_feedback.take(),
         )
         .await;
 
@@ -276,12 +300,28 @@ async fn run_task_with_reopens(
                 if budget_ok && turns_ok {
                     reopens_used += 1;
                     feedback.push((hook_name.clone(), reason.clone()));
+                    let attempt_context = if thread.can_continue(&inference.transport) {
+                        crate::trace::REOPEN_CONTEXT_CONTINUED
+                    } else {
+                        crate::trace::REOPEN_CONTEXT_RESTARTED
+                    };
                     let _ = trace
-                        .write_task_reopened(trace_task_id, &hook_name, &reason, reopens_used)
+                        .write_task_reopened(
+                            trace_task_id,
+                            &hook_name,
+                            &reason,
+                            reopens_used,
+                            attempt_context,
+                            inference.max_turns.saturating_sub(trace.task_turns()),
+                        )
                         .await;
-                    // Rewrite task.md as original + all feedback so far; the resumed
-                    // attempt picks it up through its normal `read_task`, so neither
-                    // transport's message-building code needs to change.
+                    reopen_feedback = Some(reopen_feedback_message(
+                        reopens_used as usize,
+                        &hook_name,
+                        &reason,
+                    ));
+                    // Original + all feedback so far: what a restarted attempt reads as its task,
+                    // and what `as-given` reports on either kind of attempt.
                     let rewritten = build_reopen_task_md(&original_task, &feedback);
                     if let Err(e) = tokio::fs::write(&task_md_path, rewritten.as_bytes()).await {
                         crate::runtime_err!(
@@ -315,22 +355,41 @@ async fn run_task_with_reopens(
     }
 }
 
+/// The line that opens every reopen's feedback, in `task.md` and in a continued attempt's
+/// feedback message alike.
+const REOPEN_FEEDBACK_PREAMBLE: &str =
+    "The previous attempt was not accepted. Address the following feedback, then continue.";
+
+/// One reopen's section: a heading naming its 1-based ordinal and the hook that produced it,
+/// then the hook's reason.
+fn reopen_feedback_section(reopen_number: usize, hook_name: &str, reason: &str) -> String {
+    format!(
+        "## Reopen {reopen_number} — from hook `{hook_name}`\n\n{}",
+        reason.trim()
+    )
+}
+
+/// The feedback message a continued attempt receives for one reopen: the preamble and that
+/// reopen's section, worded exactly as [`build_reopen_task_md`] words them.
+fn reopen_feedback_message(reopen_number: usize, hook_name: &str, reason: &str) -> String {
+    format!(
+        "{REOPEN_FEEDBACK_PREAMBLE}\n\n{}",
+        reopen_feedback_section(reopen_number, hook_name, reason)
+    )
+}
+
 /// Compose the reopened task's `task.md`: the original task content followed by a clearly
 /// delimited feedback section for every reopen so far, each naming the hook that produced
 /// it. Used by [`run_task_with_reopens`].
 fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String {
     let mut out = original.trim_end().to_string();
-    out.push_str(
-        "\n\n---\n\n# Reopen feedback\n\nThe previous attempt was not accepted. Address the \
-         following feedback, then continue.\n",
-    );
+    out.push_str("\n\n---\n\n# Reopen feedback\n\n");
+    out.push_str(REOPEN_FEEDBACK_PREAMBLE);
+    out.push('\n');
     for (i, (hook_name, reason)) in feedback.iter().enumerate() {
-        out.push_str(&format!(
-            "\n## Reopen {} — from hook `{}`\n\n{}\n",
-            i + 1,
-            hook_name,
-            reason.trim()
-        ));
+        out.push('\n');
+        out.push_str(&reopen_feedback_section(i + 1, hook_name, reason));
+        out.push('\n');
     }
     out
 }
@@ -2533,6 +2592,9 @@ fn launch(
                                                         // Nor is there a task to cancel; only
                                                         // `SIGTERM` ends this attempt early.
                                                         Some(terminating.clone()),
+                                                        // Nor a task to reopen.
+                                                        &mut agent::TaskThread::default(),
+                                                        None,
                                                     )
                                                     .await;
                                                     break 'task_loop;
@@ -12049,38 +12111,52 @@ inference:
         max_task_reopens: u32,
         max_turns: u32,
     ) -> (Result<(), RuntimeError>, Vec<serde_json::Value>) {
-        let dir = tempfile::tempdir().unwrap();
-        let workdir = dir.path().to_path_buf();
-        fs::create_dir_all(workdir.join("tools")).unwrap();
-        fs::write(workdir.join("task.md"), "Original task: build the thing.").unwrap();
-        let harness = write_fake_harness(dir.path());
-
-        let inference = InferenceConfig {
-            transport: "process".into(),
-            model: "test-model".into(),
-            driver: Some(murmur_artifact::InferenceDriver {
-                artifact: "fixture-process-driver".to_string(),
-                config: None,
-            }),
-            command: None,
-            compaction: None,
-            system_prompt: None,
-            system_prompt_file: None,
-            system_prompt_artifact: None,
+        let run = run_process_reopen(ProcessReopen {
+            reopen_limit,
+            max_task_reopens,
             max_turns,
-            max_tokens: None,
-            max_session_tokens: None,
-        };
+            mode: ConversationMode::Stateless,
+            harness_sessions: None,
+            forget: None,
+        })
+        .await;
+        (run.result, run.events)
+    }
 
-        let mut state = build_test_state(
-            Arc::new(FakeSkillRegistry::new(Vec::new())),
-            workdir.clone(),
-            workdir.join("murmur.lock"),
-        );
-        state.process_driver = Some(staged_fixture_driver(&state.engine, &harness));
+    /// One process-transport reopen scenario: task `tsk_1` in context `ctx_1`, the fake harness,
+    /// and the `gatekeeper` reopen double.
+    struct ProcessReopen {
+        reopen_limit: u32,
+        max_task_reopens: u32,
+        max_turns: u32,
+        mode: ConversationMode,
+        harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
+        /// The forget request the task's starting request carried.
+        forget: Option<&'static str>,
+    }
 
-        let mut trace = TraceWriter::open(
-            &workdir,
+    /// What a reopen scenario left behind.
+    struct ReopenRun {
+        result: Result<(), RuntimeError>,
+        /// The parsed `trace.jsonl`.
+        events: Vec<serde_json::Value>,
+        /// Every message line of `ctx_1`'s conversation record, header excluded; empty for a
+        /// scenario that keeps no record.
+        record: Vec<serde_json::Value>,
+        /// `task.md` as the last attempt left it.
+        task_md: String,
+    }
+
+    /// The task text every reopen scenario starts from.
+    const REOPEN_TASK: &str = "Original task: build the thing.";
+
+    /// The reason the `gatekeeper` reopen double gives.
+    const REOPEN_REASON: &str = "tests still fail";
+
+    /// A trace writer over `workdir/trace.jsonl`, as the reopen scenarios open it.
+    async fn reopen_scenario_trace(workdir: &Path) -> TraceWriter {
+        TraceWriter::open(
+            workdir,
             "ses_test".to_string(),
             "cap".to_string(),
             "0.1.0".to_string(),
@@ -12107,14 +12183,20 @@ inference:
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
 
-        let mut otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
-
+    /// The hook runtime every reopen scenario runs: the `gatekeeper` double, reopening
+    /// `reopen_limit` times with [`REOPEN_REASON`].
+    async fn reopen_scenario_hooks(
+        state: &CapsuleStoreState,
+        workdir: &Path,
+        reopen_limit: u32,
+    ) -> HookRuntime {
         let staged_hook = StagedHookArtifact {
             name: "gatekeeper".to_string(),
             version: "0.0.1".to_string(),
-            component: on_task_end_reopen_double(&state.engine, reopen_limit, "tests still fail"),
+            component: on_task_end_reopen_double(&state.engine, reopen_limit, REOPEN_REASON),
             config: murmur_artifact::HookConfig {
                 binding: HookBinding::OnTaskEnd,
                 execution_mode: murmur_artifact::HookExecutionMode::Blocking,
@@ -12124,11 +12206,10 @@ inference:
             on_overflow: Default::default(),
             gateway: None,
         };
-
-        let mut hooks = HookRuntime::new(
+        HookRuntime::new(
             &state.engine,
-            &workdir,
-            &workdir,
+            workdir,
+            workdir,
             vec![staged_hook],
             SessionContextData {
                 capsule_name: "cap".to_string(),
@@ -12143,10 +12224,16 @@ inference:
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
 
-        let run_config = agent::AgentRunConfig {
-            context_window: 0,
+    fn reopen_scenario_run_config(
+        context_window: u32,
+        conversation_root: Option<PathBuf>,
+        harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
+    ) -> agent::AgentRunConfig {
+        agent::AgentRunConfig {
+            context_window,
             compaction_threshold: 0.98,
             compaction_model: None,
             compaction_system_prompt: None,
@@ -12154,11 +12241,28 @@ inference:
             max_output_tokens: 1024,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            conversation_root: None,
+            conversation_root,
             record_owner: None,
-            harness_sessions: None,
+            harness_sessions,
             resume: None,
-        };
+        }
+    }
+
+    /// Start task `tsk_1`, run it through `run_task_with_reopens`, and collect what it left.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_reopen_scenario(
+        state: &mut CapsuleStoreState,
+        workdir: &Path,
+        inference: &InferenceConfig,
+        max_task_reopens: u32,
+        run_config: agent::AgentRunConfig,
+        hooks: &mut HookRuntime,
+        mode: ConversationMode,
+        seed: Option<HookSeed>,
+    ) -> ReopenRun {
+        let conversation_root = run_config.conversation_root.clone();
+        let mut trace = reopen_scenario_trace(workdir).await;
+        let mut otel = OtelEmitter::new(None, workdir, "cap".to_string(), "0.1.0".to_string());
 
         // Caller resets per-task counters via write_task_start before the reopen loop.
         trace
@@ -12174,36 +12278,178 @@ inference:
             .unwrap();
 
         let result = run_task_with_reopens(
-            &mut state,
-            &workdir,
-            &inference,
+            state,
+            workdir,
+            inference,
             max_task_reopens,
             None,
             run_config,
-            &mut hooks,
+            hooks,
             &mut trace,
             &mut otel,
             None,
             None,
-            &workdir,
+            workdir,
             "cap",
             "0.1.0",
-            ConversationMode::Stateless,
+            mode,
             Some("ctx_1".to_string()),
             "tsk_1",
-            None,
+            seed,
             None,
         )
         .await;
 
         trace.flush().await.unwrap();
-        let content = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
-        let events: Vec<serde_json::Value> = content
+        let events = fs::read_to_string(workdir.join("trace.jsonl"))
+            .unwrap()
             .lines()
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        (result.map(|_| ()), events)
+        let record = conversation_root
+            .map(|root| {
+                fs::read_to_string(
+                    root.join("ctx_1")
+                        .join(crate::conversation::RECORD_FILE_NAME),
+                )
+                .unwrap_or_default()
+            })
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|line| line.get("role").is_some())
+            .collect();
+        ReopenRun {
+            result: result.map(|_| ()),
+            events,
+            record,
+            task_md: fs::read_to_string(workdir.join("task.md")).unwrap(),
+        }
+    }
+
+    async fn run_process_reopen(scenario: ProcessReopen) -> ReopenRun {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        fs::create_dir_all(workdir.join("tools")).unwrap();
+        fs::write(workdir.join("task.md"), REOPEN_TASK).unwrap();
+        let harness = write_fake_harness(dir.path());
+
+        let inference = InferenceConfig {
+            transport: "process".into(),
+            model: "test-model".into(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "fixture-process-driver".to_string(),
+                config: None,
+            }),
+            command: None,
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns: scenario.max_turns,
+            max_tokens: None,
+            max_session_tokens: None,
+        };
+
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+        state.process_driver = Some(staged_fixture_driver(&state.engine, &harness));
+        state.current_forget_harness_session = scenario.forget;
+
+        let mut hooks = reopen_scenario_hooks(&state, &workdir, scenario.reopen_limit).await;
+        let run_config = reopen_scenario_run_config(0, None, scenario.harness_sessions);
+        drive_reopen_scenario(
+            &mut state,
+            &workdir,
+            &inference,
+            scenario.max_task_reopens,
+            run_config,
+            &mut hooks,
+            scenario.mode,
+            None,
+        )
+        .await
+    }
+
+    /// One http-transport reopen scenario, keeping a conversation record for `ctx_1`.
+    struct HttpReopen {
+        mode: ConversationMode,
+        seed: Option<HookSeed>,
+        context_window: u32,
+        /// The metadata the driver double answers with on every call, or `None` to leave
+        /// `tools/mock-driver` absent so every attempt fails before a message exists.
+        driver_metadata: Option<Vec<(&'static str, &'static str)>>,
+        reopen_limit: u32,
+        max_turns: u32,
+    }
+
+    impl HttpReopen {
+        /// A driver double answering `end_turn` on every call, reopened once.
+        fn answering(mode: ConversationMode) -> Self {
+            Self {
+                mode,
+                seed: None,
+                context_window: 0,
+                driver_metadata: Some(Vec::new()),
+                reopen_limit: 1,
+                max_turns: 10,
+            }
+        }
+    }
+
+    async fn run_http_reopen(scenario: HttpReopen) -> ReopenRun {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        fs::create_dir_all(workdir.join("tools")).unwrap();
+        fs::write(workdir.join("task.md"), REOPEN_TASK).unwrap();
+        let conversation_root = dir.path().join("conversations");
+
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+        if let Some(metadata) = scenario.driver_metadata.as_deref() {
+            fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
+            state.tool_components.insert(
+                "mock-driver".to_string(),
+                crate::inference_import::test_support::driver_double_with_metadata(
+                    &state.engine,
+                    0,
+                    r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-1"}]}"#,
+                    metadata,
+                ),
+            );
+        }
+        let inference = InferenceConfig {
+            transport: "http".into(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "mock-driver".to_string(),
+                config: None,
+            }),
+            max_turns: scenario.max_turns,
+            ..task_io_inference_config()
+        };
+
+        let mut hooks = reopen_scenario_hooks(&state, &workdir, scenario.reopen_limit).await;
+        let run_config =
+            reopen_scenario_run_config(scenario.context_window, Some(conversation_root), None);
+        drive_reopen_scenario(
+            &mut state,
+            &workdir,
+            &inference,
+            5,
+            run_config,
+            &mut hooks,
+            scenario.mode,
+            scenario.seed,
+        )
+        .await
     }
 
     // ── murmur:task-io/read end to end ────────────────────────────────────────
@@ -12652,5 +12898,310 @@ inference:
             .unwrap();
         assert_eq!(end["reopen_count"], 2);
         assert_eq!(end["exit_status"], "reopen_budget_exhausted");
+    }
+
+    /// Every `event_type` record in `events`, in order.
+    fn of_type<'e>(events: &'e [serde_json::Value], ty: &str) -> Vec<&'e serde_json::Value> {
+        events.iter().filter(|e| e["event_type"] == ty).collect()
+    }
+
+    /// The `message_ids` one `inference` record names, as strings.
+    fn message_ids(inference: &serde_json::Value) -> Vec<String> {
+        inference["message_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The id a conversation-record line carries.
+    fn line_id(line: &serde_json::Value) -> String {
+        line["id"].as_str().unwrap().to_string()
+    }
+
+    /// A record line's text content.
+    fn line_text(line: &serde_json::Value) -> &str {
+        line["content"][0]["text"].as_str().unwrap_or_default()
+    }
+
+    /// `lifecycle.conversation: stateless` over http: the reopened attempt continues the task's
+    /// own conversation. Its first request carries the task, the rejected answer and one new
+    /// feedback message, and the task text is sent once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_stateless_http_attempt_continues_its_conversation() {
+        let run = run_http_reopen(HttpReopen::answering(ConversationMode::Stateless)).await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+
+        let roles: Vec<&str> = run
+            .record
+            .iter()
+            .map(|line| line["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        assert_eq!(line_text(&run.record[0]), REOPEN_TASK);
+        let feedback = line_text(&run.record[2]);
+        assert!(
+            feedback.contains("Reopen 1") && feedback.contains(REOPEN_REASON),
+            "{feedback}"
+        );
+        assert_eq!(
+            run.record
+                .iter()
+                .filter(|line| line_text(line).contains(REOPEN_TASK))
+                .count(),
+            1,
+            "the task text reaches the conversation once"
+        );
+
+        let inferences = of_type(&run.events, "inference");
+        assert_eq!(inferences.len(), 2);
+        let expected: Vec<String> = run.record[..3].iter().map(line_id).collect();
+        assert_eq!(message_ids(inferences[1]), expected);
+
+        let reopened = of_type(&run.events, "task_reopened");
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0]["attempt_context"], "continued");
+        assert_eq!(reopened[0]["turns_remaining"], 10 - 1);
+
+        let end = of_type(&run.events, "task_end");
+        assert_eq!(end[0]["exit_status"], "ok");
+        assert_eq!(end[0]["reopen_count"], 1);
+    }
+
+    /// `lifecycle.conversation: threaded` with a seed: the reopened attempt neither applies the
+    /// seed a second time nor sends the task again. Its first request holds each message once, in
+    /// the order the task built them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_threaded_attempt_neither_reseeds_nor_repeats_the_task() {
+        use crate::bindings::hook::exports::murmur::hook::lifecycle::Message as WitMessage;
+        let seed_message = |content: &str| WitMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+            id: None,
+            source_id: None,
+            inserted_by: None,
+        };
+        let run = run_http_reopen(HttpReopen {
+            seed: Some(HookSeed {
+                hook_name: "memory".to_string(),
+                messages: vec![
+                    seed_message("SEED-ONE remembered"),
+                    seed_message("SEED-TWO remembered"),
+                ],
+            }),
+            context_window: 100_000,
+            ..HttpReopen::answering(ConversationMode::Threaded)
+        })
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(of_type(&run.events, "context_seed").len(), 1);
+
+        let lines_with = |needle: &str| -> Vec<&serde_json::Value> {
+            run.record
+                .iter()
+                .filter(|line| line.to_string().contains(needle))
+                .collect()
+        };
+        let seed_one = lines_with("SEED-ONE");
+        let seed_two = lines_with("SEED-TWO");
+        let task = lines_with(REOPEN_TASK);
+        assert_eq!(
+            (seed_one.len(), seed_two.len(), task.len()),
+            (1, 1, 1),
+            "{:#?}",
+            run.record
+        );
+        let answers: Vec<&serde_json::Value> = run
+            .record
+            .iter()
+            .filter(|line| line["role"] == "assistant")
+            .collect();
+        let feedback = lines_with("Reopen 1");
+        assert_eq!((answers.len(), feedback.len()), (2, 1));
+
+        let inferences = of_type(&run.events, "inference");
+        assert_eq!(inferences.len(), 2);
+        let ids = message_ids(inferences[1]);
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "no id twice in one request: {ids:?}"
+        );
+        assert_eq!(
+            ids,
+            vec![
+                line_id(seed_one[0]),
+                line_id(seed_two[0]),
+                line_id(task[0]),
+                line_id(answers[0]),
+                line_id(feedback[0]),
+            ]
+        );
+    }
+
+    /// Under a driver continuation the reopened attempt wires only what the driver has not seen:
+    /// the answer it generated is acknowledged, so the first request of attempt 2 carries the
+    /// feedback message alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_continued_attempt_wires_only_the_feedback_under_a_held_continuation() {
+        let run = run_http_reopen(HttpReopen {
+            driver_metadata: Some(vec![("continuation_id", "cont-1")]),
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(run.record.len(), 4);
+
+        let inferences = of_type(&run.events, "inference");
+        assert_eq!(inferences.len(), 2);
+        assert_eq!(message_ids(inferences[0]), vec![line_id(&run.record[0])]);
+        assert_eq!(
+            message_ids(inferences[1]),
+            vec![line_id(&run.record[2])],
+            "the answer attempt 1's driver generated is not sent back to it"
+        );
+    }
+
+    /// An attempt that failed before any message existed leaves nothing to continue, so the next
+    /// attempt restarts from the rewritten `task.md`, and the trace says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attempt_that_left_no_context_is_restarted_and_recorded_as_such() {
+        let run = run_http_reopen(HttpReopen {
+            driver_metadata: None,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        assert!(run.result.is_err());
+
+        let reopened = of_type(&run.events, "task_reopened");
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0]["attempt_context"], "restarted");
+        assert!(
+            run.task_md.starts_with(REOPEN_TASK)
+                && run.task_md.contains("# Reopen feedback")
+                && run.task_md.contains(REOPEN_REASON),
+            "{}",
+            run.task_md
+        );
+
+        let end = of_type(&run.events, "task_end");
+        assert_eq!(end[0]["exit_status"], "failed");
+        assert_eq!(end[0]["reopen_count"], 1);
+    }
+
+    /// Over the process transport the reopened attempt resumes the harness session the first
+    /// attempt ran under, and its prompt is the feedback alone rather than the rewritten task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_process_attempt_resumes_the_same_harness_session() {
+        let run = run_process_reopen(ProcessReopen {
+            reopen_limit: 1,
+            max_task_reopens: 5,
+            max_turns: 10,
+            mode: ConversationMode::Stateless,
+            harness_sessions: None,
+            forget: None,
+        })
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+
+        let starts = of_type(&run.events, "harness_start");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["session_mode"], "new");
+        assert_eq!(starts[1]["session_mode"], "resume");
+        assert_eq!(
+            starts[1]["harness_session_id"],
+            starts[0]["harness_session_id"]
+        );
+
+        // No task provenance is in scope in the test state, so the feedback goes unfenced; the
+        // fixture driver writes the prompt and a newline.
+        let feedback = reopen_feedback_message(1, "gatekeeper", REOPEN_REASON);
+        assert_eq!(starts[1]["stdin_bytes"], feedback.len() + 1);
+        assert!(feedback.len() < run.task_md.len());
+        assert_eq!(
+            of_type(&run.events, "task_reopened")[0]["attempt_context"],
+            "continued"
+        );
+    }
+
+    /// Each `task_reopened` names the turns the next attempt is handed, out of one shared budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_reopened_reports_the_turns_left_to_the_next_attempt() {
+        let (_, events) = run_reopen_scenario(99, 5, 3).await;
+        let reopened = of_type(&events, "task_reopened");
+        let turns: Vec<&serde_json::Value> =
+            reopened.iter().map(|e| &e["turns_remaining"]).collect();
+        assert_eq!(turns, [2, 1]);
+        let contexts: Vec<&serde_json::Value> =
+            reopened.iter().map(|e| &e["attempt_context"]).collect();
+        assert_eq!(contexts, ["continued", "continued"]);
+    }
+
+    /// The forget request belongs to the task's first attempt: a continued attempt resumes the
+    /// session that attempt established rather than dropping it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_continued_attempt_does_not_honour_the_forget_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = Arc::new(crate::harness_session::HarnessSessionMap::new(
+            None,
+            dir.path(),
+        ));
+        map.put(
+            "ctx_1",
+            "old-session",
+            "fixture-harness",
+            "fixture-process-driver",
+        );
+        let run = run_process_reopen(ProcessReopen {
+            reopen_limit: 1,
+            max_task_reopens: 5,
+            max_turns: 10,
+            mode: ConversationMode::Threaded,
+            harness_sessions: Some(Arc::clone(&map)),
+            forget: Some(crate::harness_session::FORGET_BY_CLI),
+        })
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+
+        assert_eq!(of_type(&run.events, "harness_session_forgotten").len(), 1);
+        let starts = of_type(&run.events, "harness_start");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["session_mode"], "new");
+        assert_eq!(starts[1]["session_mode"], "resume");
+        assert_eq!(
+            starts[1]["harness_session_id"],
+            starts[0]["harness_session_id"]
+        );
+        assert_eq!(
+            map.get("ctx_1").as_deref(),
+            starts[0]["harness_session_id"].as_str(),
+            "a threaded context keeps the session the task established"
+        );
+    }
+
+    /// The feedback a continued attempt receives is worded as `task.md`'s feedback section is.
+    #[test]
+    fn a_reopen_feedback_message_matches_its_task_md_section() {
+        let message = reopen_feedback_message(2, "gatekeeper", "  fix the date  ");
+        assert_eq!(
+            message,
+            "The previous attempt was not accepted. Address the following feedback, then \
+             continue.\n\n## Reopen 2 — from hook `gatekeeper`\n\nfix the date"
+        );
+        let task_md = build_reopen_task_md(
+            "the task\n",
+            &[
+                ("first".to_string(), "one".to_string()),
+                ("gatekeeper".to_string(), "fix the date".to_string()),
+            ],
+        );
+        assert_eq!(
+            task_md,
+            "the task\n\n---\n\n# Reopen feedback\n\nThe previous attempt was not accepted. \
+             Address the following feedback, then continue.\n\n## Reopen 1 — from hook \
+             `first`\n\none\n\n## Reopen 2 — from hook `gatekeeper`\n\nfix the date\n"
+        );
     }
 }

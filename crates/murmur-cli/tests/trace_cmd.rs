@@ -2811,6 +2811,34 @@ fn show_surfaces_reopen_events_and_count() {
         .stdout(predicate::str::contains("tests still fail"));
 }
 
+/// A `task_reopened` record that says what the next attempt starts from and how many turns it
+/// has gets both on its Reopens line; one that says neither prints the line without them.
+#[test]
+fn show_names_what_a_reopened_attempt_starts_from_and_its_turns_left() {
+    let tmp = TempDir::new().unwrap();
+    let with_context = FIXTURE_REOPEN.replace(
+        "\"reopen_number\":1}",
+        "\"reopen_number\":1,\"attempt_context\":\"continued\",\"turns_remaining\":9}",
+    );
+    let path = write_fixture(tmp.path(), "reopen-context.jsonl", &with_context);
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "reopen 1  by gatekeeper  continued, 9 turns left  “tests still fail”",
+        ));
+
+    let path = write_fixture(tmp.path(), "reopen.jsonl", FIXTURE_REOPEN);
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "reopen 1  by gatekeeper  “tests still fail”",
+        ));
+}
+
 // ── the nine session-level event types ───────────────────────────────────────
 
 const SESSION_ID_NINE: &str = "ses_99999999999949998999000000000009";
