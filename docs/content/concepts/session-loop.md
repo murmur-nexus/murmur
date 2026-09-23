@@ -62,22 +62,72 @@ and is set per-capsule in the manifest. When the limit is reached, the loop exit
 
 A hook bound to `on-task-end` with `commit_policy: reopen-task` can veto a task's outcome
 instead of just observing it. When it returns `reopen-task(reason)`, the runtime does not
-finalize the task: it re-runs the task's agent loop with `reason` injected into the task
-content as feedback, then fires `on-task-end` again so the hook can re-inspect the new result.
+finalize the task. The next attempt continues the task's own conversation, and `on-task-end`
+fires again when it ends so the hook can re-inspect the new result:
+
+1. Every message the rejected attempt put in context stays there: its tool calls, their results,
+   and the answer the hook rejected.
+2. The hook's feedback arrives as one new user message after them, headed `Reopen <n> — from
+   hook <name>`.
+3. The model continues from there. Fixing one wrong field in a final answer costs one turn, and
+   work the rejected attempt already did, including state-changing tool calls, is not repeated.
+
+The attempt continues on both transports and under both `lifecycle.conversation` values,
+`stateless` included. `lifecycle.conversation` decides what carries from one task to the next. A
+reopen happens inside one task, which has not ended yet, so a reopened attempt always keeps the
+context its own task built.
+
+| Transport | What the reopened attempt is handed |
+|---|---|
+| `http` | The previous attempt's message list, plus the feedback message |
+| `process` | `mode: resume` on the harness session the previous attempt ran under, with the feedback message as its prompt |
+
+A seed from an `on-task-start` hook is applied to a fresh context only; a continued attempt
+already holds it and is never seeded again. A [`--forget-session`](../reference/cli.md#run-forget-session) or
+`x-murmur-forget-session` request applies to the task's first attempt only, so a reopened attempt
+resumes the session that attempt established.
+
+The feedback message is fenced as untrusted content on exactly the condition the task message is.
+The task's `task.md` is rewritten on every reopen as the original task plus every reopen's
+feedback so far, under a `# Reopen feedback` heading.
+
+**Restart fallback.** An attempt that left nothing to continue is followed by a restart instead:
+the rewritten `task.md` becomes the task message of a fresh context (or the prompt of a new
+harness session), and the seed is applied. Nothing to continue means:
+
+| Transport | The attempt left nothing to continue when |
+|---|---|
+| `http` | It failed before any message entered its context |
+| `process` | The harness produced no text, thinking, tool call or turn end, or could not find the session it was handed |
 
 This repeats up to the reopen limit set by `lifecycle.max_task_reopens` (default **1**; `0`
 disables reopening entirely — unlike `inference.max_turns`, an explicit `0` is accepted).
 Reopening never grants extra turns: every attempt of a task shares one cumulative turn count
-against the capsule's `inference.max_turns` limit, so a task cannot out-run its turn budget just
-because a hook keeps asking for another try.
+against the capsule's `inference.max_turns` limit, so each attempt is handed only the turns
+earlier attempts left unspent. A task cannot out-run its turn budget just because a hook keeps
+asking for another try.
 
 If the reopen limit or the turn limit is used up while a hook still wants to reopen, the task
 ends with its own exit status — `exit_status: "reopen_budget_exhausted"` rather than an
 ordinary `"ok"`/`"failed"` — and the task registry / A2A task state records it like any other
-failed task.
+failed task. The task's error message names the limit that refused the reopen:
 
-Every reopen is written to `trace.jsonl` as a `task_reopened` event (the hook's name, its
-feedback text, and a 1-based ordinal), and the terminal `task_end` record carries a
+| Limit used up | Error message contains | Raise |
+|---|---|---|
+| Reopen limit | `task reopen budget exhausted` | `lifecycle.max_task_reopens` |
+| Turn limit, with reopens left | `task turn budget exhausted` | `inference.max_turns` |
+
+**What the hook sees.** A hook granted `task_io.read` reads, through `murmur:task-io/read`:
+
+| Form | Value on every attempt |
+|---|---|
+| `original` | The task as it first arrived, byte for byte |
+| `as-given` | The original task plus every reopen's feedback so far — the rewritten `task.md` |
+| Output | This attempt's result. It is cleared at the start of every attempt, so a hook judging attempt N never reads attempt N-1's result |
+
+Every reopen is written to `trace.jsonl` as a `task_reopened` event: the hook's name, its
+feedback text, a 1-based ordinal, `attempt_context` (`continued` or `restarted`) and
+`turns_remaining`, the turns the next attempt is handed. The terminal `task_end` record carries a
 `reopen_count` field — `0` for a task that ran once. See [Session trace
 (`trace.jsonl`) schema](../reference/observability-schemas.md#session-trace-tracejsonl) for the exact shapes.
 

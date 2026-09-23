@@ -297,6 +297,60 @@ impl AgentLoopExit {
     }
 }
 
+/// The conversation one task has built so far, carried from each attempt of the task to the next
+/// when an `on-task-end` hook reopens it.
+///
+/// Owned by `run_task_with_reopens` for exactly one task and handed to every attempt. The `http`
+/// path works on [`Self::messages`] in place for the whole attempt, so every way out of the turn
+/// loop, a `?` included, leaves the list exactly as it stood. The `process` path writes
+/// [`Self::harness_session`] once the harness run is over.
+#[derive(Debug, Default)]
+pub(crate) struct TaskThread {
+    /// Every message the task's `http` attempts put in context, in the order they entered it:
+    /// whatever the fresh context loaded, the seed, the task message, each turn, and one feedback
+    /// message per reopen.
+    pub(crate) messages: Vec<Value>,
+    /// The harness session the last `process` attempt ran under, or `None` when that attempt
+    /// left nothing the harness will answer to. Set on the condition the session map is
+    /// committed on: the harness produced observable work and did not report the session gone.
+    pub(crate) harness_session: Option<String>,
+}
+
+impl TaskThread {
+    /// Whether an attempt on `transport` has a conversation of this task's to continue. `false`
+    /// sends a reopened attempt back to a fresh context built from the rewritten `task.md`.
+    pub(crate) fn can_continue(&self, transport: &str) -> bool {
+        if transport == "process" {
+            self.harness_session.is_some()
+        } else {
+            !self.messages.is_empty()
+        }
+    }
+}
+
+/// A user message carrying task text, fenced on the task's own provenance and labelled with the
+/// fence source when it was wrapped.
+///
+/// Builds both the task message a fresh context starts from and the feedback message a reopened
+/// attempt continues with, so the two are fenced on one condition.
+fn task_user_message(provenance: Option<TaskProvenance>, text: String) -> Value {
+    let (text, fence_source) = fence_task_payload(provenance, text);
+    with_fence_source(
+        with_new_id(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+        })),
+        fence_source,
+    )
+}
+
+/// Run one attempt of one task.
+///
+/// `reopen_feedback` is `None` on a task's first attempt and the plain, unfenced feedback text
+/// for this reopen on every later one. An attempt continues `thread` when it has feedback and
+/// [`TaskThread::can_continue`] holds for its transport; it then consults neither `seed` nor the
+/// store's forget request, loads no history and sends no task message. Every other attempt builds
+/// a fresh context from `task.md`, as `lifecycle.conversation` and `--resume` direct.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
@@ -318,13 +372,24 @@ pub(crate) async fn run_agent_loop(
     // This task's cancel flag, or `None` where no task can be cancelled: the `task.md` paths,
     // which run no A2A task, and the empty-task timeout path.
     cancel: Option<CancelSignal>,
+    thread: &mut TaskThread,
+    reopen_feedback: Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
+    // The feedback this attempt continues the task's conversation with, or `None` for an attempt
+    // that builds a fresh context.
+    let continuation = reopen_feedback.filter(|_| thread.can_continue(&inference.transport));
+
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
     if inference.transport == "process" {
+        // Taken on every attempt, so the thread holds a session only when this attempt's harness
+        // run leaves one behind.
+        let carried_session = thread.harness_session.take();
+        let reopen_session = carried_session.filter(|_| continuation.is_some());
         // The CLI owns its own conversation and this path never builds a message list, so
         // there is nowhere to put a seed. Recorded rather than dropped: a silently discarded
-        // seed is indistinguishable from a capsule with no memory hook.
-        if let Some(seed) = seed {
+        // seed is indistinguishable from a capsule with no memory hook. A continued attempt
+        // does not consult the seed, so a task records one rejection whatever its reopens.
+        if let Some(seed) = seed.filter(|_| continuation.is_none()) {
             let proposed_tokens =
                 reconstruct_hook_messages(seed.messages, ContextInsertion::SeedContext, &[])
                     .iter()
@@ -353,9 +418,12 @@ pub(crate) async fn run_agent_loop(
             context_id: context_id.clone(),
             continue_conversation: process::continues_conversation(mode, run_config.resume),
             // Whoever asked for this context's session to be dropped, on the request that started
-            // this task. A reopened attempt of the same task reads the same flag, and the second
-            // forget drops nothing: the first already emptied the entry.
-            forget: store_state.current_forget_harness_session,
+            // this task. The request belongs to the task's first attempt: a continued attempt
+            // resumes the session that attempt established, and must not drop it.
+            forget: store_state
+                .current_forget_harness_session
+                .filter(|_| continuation.is_none()),
+            reopen_session,
         };
         // `store_state` (shared &) is threaded through so the process path can start the
         // Claude Bridge and execute declared tool artifacts — see agent/claude_bridge.rs.
@@ -376,6 +444,8 @@ pub(crate) async fn run_agent_loop(
             version,
             session_policy,
             cancel,
+            continuation,
+            &mut thread.harness_session,
         )
         .await;
     }
@@ -408,14 +478,6 @@ pub(crate) async fn run_agent_loop(
     })?;
     append_bootstrap_log(workdir, &format!("Installed tools (JSON):\n{tools_json}"));
 
-    // task.md lives in accessible_workdir (where the agent's own tools are preopened),
-    // not workdir (the internal `.murmur/<session_id>` bookkeeping dir) — reading from
-    // workdir here silently yields an empty task, producing an empty user message.
-    let (task, task_fence_source) = fence_task_payload(
-        store_state.current_task_provenance,
-        read_task(accessible_workdir),
-    );
-
     let augmented_system = build_augmented_system_prompt(
         name,
         version,
@@ -446,12 +508,6 @@ pub(crate) async fn run_agent_loop(
         _ => None,
     };
 
-    // In threaded mode the task continues the record's conversation, so the message list starts
-    // from what the record already holds — including messages written by an earlier session,
-    // with the ids those lines carry. `mur run --resume` loads on the same terms whatever the
-    // capsule declared. Loaded messages are never appended again.
-    let mut messages: Vec<Value> = load_recorded_history(record.as_mut(), &mode, resume.is_some());
-
     // The one occupancy counter for this session — used both for the per-turn
     // compaction-trigger input and for the recount after a replace-context commit. Built
     // before the task message so `--resume-mode compact` can be measured and committed through
@@ -469,83 +525,108 @@ pub(crate) async fn run_agent_loop(
     // commit recounts into, and is read by nothing else.
     let mut session_tokens: u32 = 0;
 
-    // `--resume-mode compact`: the same hook, the same commit site and the same record rules the
-    // per-turn threshold trigger uses, reached from a second place — as the seed-overflow path
-    // already does. It runs at turn 0, ahead of the task message, so the summary stands for the
-    // resumed conversation alone and the new task is not folded into it. An explicit operator
-    // act, so `inference.compaction.threshold` gets no vote; a bound hook that declines to
-    // replace the context leaves the ordinary `compaction_declined` record and the launch
-    // continues on the verbatim history. Staging already refused a `compact` resume on a capsule
-    // with no hook bound to `on-compaction`.
-    if resume == Some(ResumeMode::Compact) && !messages.is_empty() {
-        session_tokens = occupancy.count(&messages);
-        let compacted = try_compact_via_hooks(
-            &mut messages,
-            &mut session_tokens,
-            &occupancy,
-            store_state,
-            0,
-            run_config.context_window,
-            workdir,
-            hooks,
-            trace,
-            otel,
-            run_config.compaction_model.clone(),
-            run_config.compaction_system_prompt.clone(),
-            run_config.compaction_dump_summaries,
-            record.as_mut(),
-        )
-        .await;
-        match compacted {
-            Ok(()) => {}
-            Err(CompactionFailure::Hook(text)) => return Err(RuntimeError::AgentLoopFailed(text)),
-            Err(CompactionFailure::SpendRefused(refusal)) => {
-                return finish_spend_refused_turn(
+    // The task's own message list, worked on in place for the whole attempt: every way out of
+    // this function leaves it as it stood, which is what a reopened attempt continues from.
+    let messages = &mut thread.messages;
+
+    match continuation {
+        // A reopened attempt continues the conversation its task already built, rejected answer
+        // included, and the hook's feedback is the one message it adds before the next turn.
+        // Nothing is loaded and no task message is sent: both are already in the list.
+        Some(feedback) => {
+            let feedback_message = task_user_message(store_state.current_task_provenance, feedback);
+            append_to_record(record.as_mut(), std::slice::from_ref(&feedback_message));
+            messages.push(feedback_message);
+        }
+        None => {
+            // In threaded mode the task continues the record's conversation, so the message list
+            // starts from what the record already holds — including messages written by an
+            // earlier session, with the ids those lines carry. `mur run --resume` loads on the
+            // same terms whatever the capsule declared. Loaded messages are never appended again.
+            *messages = load_recorded_history(record.as_mut(), &mode, resume.is_some());
+
+            // `--resume-mode compact`: the same hook, the same commit site and the same record
+            // rules the per-turn threshold trigger uses, reached from a second place — as the
+            // seed-overflow path already does. It runs at turn 0, ahead of the task message, so
+            // the summary stands for the resumed conversation alone and the new task is not
+            // folded into it. An explicit operator act, so `inference.compaction.threshold` gets
+            // no vote; a bound hook that declines to replace the context leaves the ordinary
+            // `compaction_declined` record and the launch continues on the verbatim history.
+            // Staging already refused a `compact` resume on a capsule with no hook bound to
+            // `on-compaction`.
+            if resume == Some(ResumeMode::Compact) && !messages.is_empty() {
+                session_tokens = occupancy.count(messages);
+                let compacted = try_compact_via_hooks(
+                    messages,
+                    &mut session_tokens,
+                    &occupancy,
+                    store_state,
+                    0,
+                    run_config.context_window,
+                    workdir,
                     hooks,
                     trace,
                     otel,
+                    run_config.compaction_model.clone(),
+                    run_config.compaction_system_prompt.clone(),
+                    run_config.compaction_dump_summaries,
+                    record.as_mut(),
+                )
+                .await;
+                match compacted {
+                    Ok(()) => {}
+                    Err(CompactionFailure::Hook(text)) => {
+                        return Err(RuntimeError::AgentLoopFailed(text))
+                    }
+                    Err(CompactionFailure::SpendRefused(refusal)) => {
+                        return finish_spend_refused_turn(
+                            hooks,
+                            trace,
+                            otel,
+                            workdir,
+                            &sse,
+                            task_id.as_deref(),
+                            task_id.as_deref().unwrap_or_default(),
+                            context_id.clone(),
+                            0,
+                            &refusal,
+                            RefusalLine::AlreadyWritten,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            // task.md lives in accessible_workdir (where the agent's own tools are preopened),
+            // not workdir (the internal `.murmur/<session_id>` bookkeeping dir) — reading from
+            // workdir here silently yields an empty task, producing an empty user message.
+            let task_message = task_user_message(
+                store_state.current_task_provenance,
+                read_task(accessible_workdir),
+            );
+            append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
+            messages.push(task_message);
+
+            // Applied after the message list exists and before the first turn, so a committed
+            // seed sits at the head of the very first driver request — ahead of any loaded
+            // history and ahead of the task message.
+            if let Some(seed) = seed {
+                apply_seed_context(
+                    seed,
+                    messages,
+                    &mut session_tokens,
+                    &occupancy,
+                    store_state,
                     workdir,
-                    &sse,
-                    task_id.as_deref(),
-                    task_id.as_deref().unwrap_or_default(),
-                    context_id.clone(),
-                    0,
-                    &refusal,
-                    RefusalLine::AlreadyWritten,
+                    hooks,
+                    trace,
+                    otel,
+                    &run_config,
+                    record.as_mut(),
                 )
                 .await;
             }
         }
-    }
-
-    let task_message = with_fence_source(
-        with_new_id(json!({
-            "role": "user",
-            "content": [{"type": "text", "text": task}],
-        })),
-        task_fence_source,
-    );
-    append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
-    messages.push(task_message);
-
-    // Applied after the message list exists and before the first turn, so a committed seed
-    // sits at the head of the very first driver request — ahead of any loaded history and
-    // ahead of the task message.
-    if let Some(seed) = seed {
-        apply_seed_context(
-            seed,
-            &mut messages,
-            &mut session_tokens,
-            &occupancy,
-            store_state,
-            workdir,
-            hooks,
-            trace,
-            otel,
-            &run_config,
-            record.as_mut(),
-        )
-        .await;
     }
 
     let task_id_str = task_id.clone().unwrap_or_default();
@@ -594,14 +675,14 @@ pub(crate) async fn run_agent_loop(
         let active_continuation = store_state.active_continuation(context_id.as_deref());
         // Exactly the messages this request embeds, so `message_ids` records what went on the
         // wire rather than what the context held.
-        let message_ids: Vec<String> = wire_messages(&messages, active_continuation)
+        let message_ids: Vec<String> = wire_messages(messages, active_continuation)
             .iter()
             .filter_map(|message| message_id(message).map(str::to_string))
             .collect();
         let payload = build_driver_payload(
             &inference.model,
             run_config.max_output_tokens,
-            &messages,
+            messages,
             &tools,
             &augmented_system,
             active_continuation,
@@ -617,7 +698,7 @@ pub(crate) async fn run_agent_loop(
         // check fires at the same point whether or not continuation is active. That is what
         // `ContextOccupancy::count` guarantees; when no continuation is active it recomputes
         // the payload `payload_json` already holds, byte for byte.
-        let input_tokens = occupancy.count(&messages);
+        let input_tokens = occupancy.count(messages);
         // Assign: `input_tokens` already counts the FULL current context,
         // so `session_tokens` tracks live occupancy rather than lifetime throughput — the
         // same notion `try_compact_via_hooks` resets it to after a replace-context commit.
@@ -956,7 +1037,7 @@ pub(crate) async fn run_agent_loop(
             let ratio = session_tokens as f32 / run_config.context_window as f32;
             if ratio >= run_config.compaction_threshold {
                 let compacted = try_compact_via_hooks(
-                    &mut messages,
+                    messages,
                     &mut session_tokens,
                     &occupancy,
                     store_state,
@@ -1396,7 +1477,7 @@ pub(crate) async fn run_agent_loop(
                     otel,
                     hooks,
                     record.as_mut(),
-                    &mut messages,
+                    messages,
                     content,
                     workdir,
                     mode,
@@ -1425,7 +1506,7 @@ pub(crate) async fn run_agent_loop(
                     otel,
                     hooks,
                     record.as_mut(),
-                    &mut messages,
+                    messages,
                     content,
                     workdir,
                     mode,
@@ -1759,9 +1840,10 @@ async fn finish_completed_turn(
     append_to_record(record, std::slice::from_ref(&assistant));
     messages.push(assistant);
     // The assistant just recorded is known to the driver (it generated it), so advance the acked
-    // length past it: the next same-context Task then wires only its new user message, not this
-    // assistant again.
-    if matches!(mode, ConversationMode::Threaded) && context_id.is_some() {
+    // length past it: the next request in this context — a same-context task under `threaded`,
+    // or a reopened attempt continuing this task under either mode — then wires only the user
+    // message that follows it, not this assistant again.
+    if context_id.is_some() {
         store_state.advance_continuation_acked_len(context_id.as_deref(), messages.len());
     }
 
@@ -3786,6 +3868,35 @@ forgery: {prompt}"
                 assert_eq!(payload, "do the thing");
             }
         }
+    }
+
+    /// A continued attempt's feedback message is built by the function that builds the task
+    /// message, so an untrusted task's feedback is fenced and labelled like its task, and a
+    /// trusted task's is handed over verbatim with no label.
+    #[test]
+    fn reopen_feedback_is_fenced_on_the_task_s_own_condition() {
+        use crate::origin::TaskOrigin;
+        let feedback = "The previous attempt was not accepted.";
+
+        let untrusted = task_user_message(
+            Some(TaskProvenance::derive(TaskOrigin::Event, None)),
+            feedback.to_string(),
+        );
+        assert_eq!(untrusted["role"], "user");
+        let text = untrusted["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("<untrusted-content source=task:event>") && text.contains(feedback),
+            "{text}"
+        );
+        assert_eq!(untrusted[MESSAGE_FENCE_KEY], "task:event");
+        assert!(message_id(&untrusted).is_some());
+
+        let trusted = task_user_message(
+            Some(TaskProvenance::derive(TaskOrigin::User, None)),
+            feedback.to_string(),
+        );
+        assert_eq!(trusted["content"][0]["text"], feedback);
+        assert!(trusted.get(MESSAGE_FENCE_KEY).is_none());
     }
 
     // ── prompt_cache_key ────────────────────────────────────────────────────────

@@ -680,6 +680,9 @@ fn policy_component(fn_name: &str, hook_output: &str, reason: &str, body: &str) 
     (global $bump (mut i32) (i32.const 65536))
     ;; Write cursor into the scratch buffer, for a body that assembles its own reason.
     (global $n (mut i32) (i32.const 0))
+    ;; Calls so far, for a body whose answer depends on how often it was asked. The instance
+    ;; outlives one dispatch, so it counts across a session.
+    (global $calls (mut i32) (i32.const 0))
     (data (i32.const {REASON_POOL}) "{reason}")
     (func (export "realloc") (param $old i32) (param $oldsz i32) (param $align i32) (param $newsz i32) (result i32)
       (local $p i32)
@@ -754,6 +757,23 @@ pub fn reopen_task_hook_wasm(reason: &str) -> Vec<u8> {
         reason,
         &return_string_arm(4, reason.len()),
     )
+}
+
+/// An `on-task-end` hook that returns `reopen-task(reason)` on its first call and `none` on every
+/// later one: a validator that rejects a task's first answer and accepts the next. Bind it with
+/// `commit_policy: reopen-task`.
+pub fn reopen_task_once_hook_wasm(reason: &str) -> Vec<u8> {
+    let body = format!(
+        "      (global.set $calls (i32.add (global.get $calls) (i32.const 1)))\n      \
+         (if (i32.gt_u (global.get $calls) (i32.const 1))\n        \
+         (then\n          \
+         (i32.store (i32.const {RETURN_AREA}) (i32.const 0))\n          \
+         (i32.store (i32.const {}) (i32.const 0))\n          \
+         (return (i32.const {RETURN_AREA}))))\n{}",
+        RETURN_AREA + 4,
+        return_string_arm(4, reason.len()),
+    );
+    policy_component("on-task-end", HOOK_OUTPUT, reason, &body)
 }
 
 /// A hook whose `fn_name` returns `none`.

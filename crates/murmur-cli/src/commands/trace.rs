@@ -366,6 +366,13 @@ struct TaskReopenedEvent {
     hook_name: String,
     reason: String,
     reopen_number: u32,
+    /// `"continued"` or `"restarted"`: what the next attempt starts from. Absent from a trace
+    /// whose runtime did not record it.
+    #[serde(default)]
+    attempt_context: Option<String>,
+    /// The turns the next attempt is handed. Absent on the same terms as `attempt_context`.
+    #[serde(default)]
+    turns_remaining: Option<u32>,
 }
 
 /// What an `on-task-start` hook proposed as context and what the runtime did with it. One
@@ -961,6 +968,21 @@ struct ReopenRecord {
     reopen_number: u32,
     hook_name: String,
     reason: String,
+    attempt_context: Option<String>,
+    turns_remaining: Option<u32>,
+}
+
+impl ReopenRecord {
+    /// What the next attempt starts from and how many turns it has, e.g. `continued, 7 turns
+    /// left`, or `None` for a record that carries neither.
+    fn next_attempt(&self) -> Option<String> {
+        let turns = self.turns_remaining.map(|n| match n {
+            1 => "1 turn left".to_string(),
+            n => format!("{n} turns left"),
+        });
+        let parts: Vec<String> = self.attempt_context.iter().cloned().chain(turns).collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
 }
 
 /// One `call_denied` trace record, surfaced in `mur trace show`.
@@ -1455,6 +1477,8 @@ fn compute_metrics(
                     reopen_number: e.reopen_number,
                     hook_name: e.hook_name,
                     reason: e.reason,
+                    attempt_context: e.attempt_context,
+                    turns_remaining: e.turns_remaining,
                 });
             }
             TraceEvent::ContextSeed(e) => {
@@ -2222,8 +2246,12 @@ fn print_show(m: &TraceMetrics) {
         println!("── Reopens ──────────────────────────────────────");
         for r in &m.reopens {
             let reason: String = r.reason.chars().take(80).collect();
+            let next_attempt = r
+                .next_attempt()
+                .map(|next| format!("{next}  "))
+                .unwrap_or_default();
             println!(
-                "reopen {}  by {}  “{}”",
+                "reopen {}  by {}  {next_attempt}“{}”",
                 r.reopen_number, r.hook_name, reason
             );
         }
@@ -2934,10 +2962,14 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_thousands(e.tokens)
         ),
         TraceEvent::TaskReopened(e) => format!(
-            "{}{}  reopen {}",
+            "{}{}  reopen {}{}",
             kind("task_reopened"),
             e.hook_name,
-            e.reopen_number
+            e.reopen_number,
+            e.attempt_context
+                .as_deref()
+                .map(|context| format!("  {context}"))
+                .unwrap_or_default()
         ),
         TraceEvent::TaskCanceled(e) => {
             let still_running = e.detached_work_ids.len() + e.delegation_ids.len();

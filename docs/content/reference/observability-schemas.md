@@ -484,8 +484,10 @@ the reopen is granted
 |---|---|---|
 | `task_id` | string | The task being reopened |
 | `hook_name` | string | Manifest name of the hook that requested the reopen |
-| `reason` | string | Feedback text the hook asked to inject into the reopened task content |
+| `reason` | string | Feedback text the hook returned; the next attempt receives it as one new user message |
 | `reopen_number` | u32 | 1-based ordinal of this reopen within the task (first reopen = `1`) |
+| `attempt_context` | string | `continued` — the next attempt continues the task's conversation with the feedback appended; `restarted` — the previous attempt left nothing to continue, so the next one starts from the rewritten `task.md` |
+| `turns_remaining` | u32 | Turns the next attempt is handed: `inference.max_turns` less every turn the task's attempts have spent |
 
 Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full

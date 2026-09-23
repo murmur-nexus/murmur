@@ -1346,7 +1346,7 @@ Output sections, in the order they are printed:
 | Skill calls | always | Count, ok/error breakdown, success rate, average latency |
 | Shell calls | always | Count, exit code distribution, average latency |
 | Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
-| Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, and the feedback it injected |
+| Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, whether the next attempt `continued` the task's conversation or `restarted` it, the turns it had left, and the hook's feedback — `reopen 1  by gatekeeper  continued, 7 turns left  “…”` |
 | Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
 | Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
 | Delegations | one or more [`delegation_start`](observability-schemas.md#delegation-lineage)/`delegation` records | One row per delegation: its `dlg_` id, `capsule@version`, the child session, and the outcome — `in flight` for a delegation this trace never saw end. The reason follows on any outcome that recorded one, and the path to the child's own trace follows on any delegation that launched one |

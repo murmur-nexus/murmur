@@ -166,6 +166,10 @@ pub(crate) struct HarnessSessionPolicy {
     /// [`crate::harness_session::FORGET_BY_CLI`] or
     /// [`crate::harness_session::FORGET_BY_A2A`].
     pub(crate) forget: Option<&'static str>,
+    /// The session a reopened attempt continues: the one its task's previous attempt ran under.
+    /// `None` on a task's first attempt, and on a reopened attempt whose previous harness run
+    /// left nothing to resume.
+    pub(crate) reopen_session: Option<String>,
 }
 
 /// Which session this turn launches with, and what it may remember afterwards.
@@ -196,6 +200,11 @@ pub(crate) fn continues_conversation(mode: ConversationMode, resume: Option<Resu
 ///
 /// A turn with no context id resolved launches `mode: new` and remembers nothing: there is
 /// nothing to key a conversation on.
+///
+/// A [`HarnessSessionPolicy::reopen_session`] is resumed ahead of every row above: a reopened
+/// attempt continues its own task's session whatever `lifecycle.conversation` says, because that
+/// mode decides what a new task loads. What the run may remember afterwards still follows the
+/// table's rule, so a stateless context stores nothing.
 pub(super) fn plan_session(policy: &HarnessSessionPolicy) -> SessionPlan {
     let new = |context_key: Option<String>| SessionPlan {
         session: Session {
@@ -204,7 +213,20 @@ pub(super) fn plan_session(policy: &HarnessSessionPolicy) -> SessionPlan {
         },
         context_key,
     };
-    let Some(context_id) = policy.context_id.as_deref().filter(|id| !id.is_empty()) else {
+    let context_id = policy.context_id.as_deref().filter(|id| !id.is_empty());
+    let context_key = context_id
+        .filter(|_| policy.continue_conversation)
+        .map(str::to_string);
+    if let Some(id) = policy.reopen_session.clone() {
+        return SessionPlan {
+            session: Session {
+                id,
+                mode: SessionMode::Resume,
+            },
+            context_key,
+        };
+    }
+    let Some(context_id) = context_id else {
         return new(None);
     };
     if !policy.continue_conversation {
@@ -298,6 +320,13 @@ impl RunSession {
         self.mode
     }
 
+    /// The id the harness will answer to after this run: `reported`, the id the harness named
+    /// for itself with `session-started`, when it named a non-empty one, and otherwise the id
+    /// this run was handed.
+    pub(super) fn effective_id<'s>(&'s self, reported: Option<&'s str>) -> &'s str {
+        reported.filter(|id| !id.is_empty()).unwrap_or(&self.id)
+    }
+
     /// Store this run's session as the context's conversation, once the run is over.
     ///
     /// `reported` is the id the harness named for itself, when it named one. Whatever the harness
@@ -308,7 +337,7 @@ impl RunSession {
         let Some(context_key) = self.context_key.as_deref() else {
             return;
         };
-        let id = reported.filter(|id| !id.is_empty()).unwrap_or(&self.id);
+        let id = self.effective_id(reported);
         self.map.put(context_key, id, &self.harness, &self.driver);
     }
 
@@ -590,6 +619,11 @@ pub(crate) async fn run_process_inference_loop(
     // This task's cancel flag, or `None` for a run with no task to stop — `mur run`, a `task.md`
     // launch. Without one the harness is never interrupted.
     cancel: Option<CancelSignal>,
+    // The reopen feedback this attempt continues `session_policy.reopen_session` with, sent as
+    // the harness's prompt in place of `task.md`. `None` on an attempt that starts from the task.
+    reopen_feedback: Option<String>,
+    // Where the session this run leaves behind is written, for the task's next attempt.
+    carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let cancel = cancel.map(|signal| TaskCancel {
         signal,
@@ -616,6 +650,8 @@ pub(crate) async fn run_process_inference_loop(
         session_policy,
         cancel.as_ref(),
         &mut a2a,
+        reopen_feedback,
+        carried_session,
     )
     .await;
     a2a.finish(&outcome).await;
@@ -642,6 +678,8 @@ async fn run_attempt(
     session_policy: HarnessSessionPolicy,
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
+    reopen_feedback: Option<String>,
+    carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let Some(staged) = store_state.process_driver.clone() else {
         return Err(RuntimeError::DriverNotConfigured);
@@ -665,6 +703,8 @@ async fn run_attempt(
         session_policy,
         cancel,
         a2a,
+        reopen_feedback,
+        carried_session,
     )
     .await;
 
@@ -693,6 +733,8 @@ async fn run_harness(
     session_policy: HarnessSessionPolicy,
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
+    reopen_feedback: Option<String>,
+    carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // Nothing is spawned for a task a person already stopped: the probe, the bridge and the
     // driver's `launch` all happen before a harness exists, and none of them is worth doing for a
@@ -738,13 +780,15 @@ async fn run_harness(
     let inventory = build_tool_inventory(workdir, inference.system_prompt_artifact.as_deref());
     let bridge = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory).await;
 
-    // task.md lives in accessible_workdir (where the agent's own tools are preopened), not the
-    // internal session workdir. Fenced on the same condition as the http path, from the same
-    // function, so the transport a capsule runs on does not decide whether an untrusted payload is
-    // marked. The fence source is discarded: this transport keeps no conversation record.
+    // A continued attempt's prompt is its reopen feedback alone: the resumed session already
+    // holds the task. Otherwise it is task.md, which lives in accessible_workdir (where the
+    // agent's own tools are preopened), not the internal session workdir. Either is fenced on the
+    // same condition as the http path, from the same function, so the transport a capsule runs on
+    // does not decide whether an untrusted payload is marked. The fence source is discarded: this
+    // transport keeps no conversation record.
     let (task, _fence_source) = super::fence_task_payload(
         store_state.current_task_provenance,
-        read_task_from_workdir(accessible_workdir),
+        reopen_feedback.unwrap_or_else(|| read_task_from_workdir(accessible_workdir)),
     );
 
     forget_harness_session(&session_policy, trace).await;
@@ -836,7 +880,7 @@ async fn run_harness(
         cancel,
     )
     .await;
-    sink.finish(trace).await;
+    *carried_session = sink.finish(trace).await;
     outcome
 }
 
@@ -1665,6 +1709,7 @@ mod tests {
             context_id: context_id.map(str::to_string),
             continue_conversation,
             forget: None,
+            reopen_session: None,
         }
     }
 
@@ -1686,6 +1731,27 @@ mod tests {
 
         // And the next one gets a different id again.
         assert_ne!(plan_session(&policy).session.id, plan.session.id);
+    }
+
+    /// A reopened attempt resumes its own task's session under either conversation mode, ahead of
+    /// whatever the map holds for the context; the mode still decides whether the context
+    /// remembers the session afterwards.
+    #[test]
+    fn a_reopen_session_is_resumed_whatever_the_conversation_mode() {
+        let mut stateless = policy(Some("ctx_1"), false);
+        stateless.reopen_session = Some("attempt-1".to_string());
+        let plan = plan_session(&stateless);
+        assert_eq!(plan.session.mode, SessionMode::Resume);
+        assert_eq!(plan.session.id, "attempt-1");
+        assert_eq!(plan.context_key, None);
+
+        let mut threaded = policy(Some("ctx_1"), true);
+        threaded.map.put("ctx_1", "remembered", "h", "d");
+        threaded.reopen_session = Some("attempt-1".to_string());
+        let plan = plan_session(&threaded);
+        assert_eq!(plan.session.mode, SessionMode::Resume);
+        assert_eq!(plan.session.id, "attempt-1");
+        assert_eq!(plan.context_key.as_deref(), Some("ctx_1"));
     }
 
     #[test]

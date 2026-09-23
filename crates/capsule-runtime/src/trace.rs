@@ -876,9 +876,18 @@ struct TaskCanceledEvent {
     delegation_ids: Vec<String>,
 }
 
-/// One `on-task-end` hook reopened the task: its agent loop is about to re-run with
-/// the hook's feedback injected. Written between two agent-loop attempts for the same
-/// task, so `mur trace show` can show which hook drove each reopen and why.
+/// `task_reopened.attempt_context` for a next attempt that continues the task's own
+/// conversation, with the hook's feedback as the one message it adds.
+pub(crate) const REOPEN_CONTEXT_CONTINUED: &str = "continued";
+
+/// `task_reopened.attempt_context` for a next attempt that starts from a fresh context built
+/// from the rewritten `task.md`, because the previous attempt left no conversation to continue.
+pub(crate) const REOPEN_CONTEXT_RESTARTED: &str = "restarted";
+
+/// One `on-task-end` hook reopened the task: its agent loop is about to run again with
+/// the hook's feedback. Written between two agent-loop attempts for the same task, so
+/// `mur trace show` can show which hook drove each reopen, why, and what the next attempt
+/// starts from.
 #[derive(Serialize)]
 struct TaskReopenedEvent {
     event_type: &'static str,
@@ -893,6 +902,11 @@ struct TaskReopenedEvent {
     reason: String,
     /// 1-based ordinal of this reopen within the task (first reopen = 1).
     reopen_number: u32,
+    /// [`REOPEN_CONTEXT_CONTINUED`] or [`REOPEN_CONTEXT_RESTARTED`].
+    attempt_context: &'static str,
+    /// The turns the next attempt is handed: `inference.max_turns` less every turn the task's
+    /// attempts have spent so far.
+    turns_remaining: u32,
 }
 
 /// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
@@ -2091,6 +2105,8 @@ impl TraceWriter {
         hook_name: &str,
         reason: &str,
         reopen_number: u32,
+        attempt_context: &'static str,
+        turns_remaining: u32,
     ) -> std::io::Result<()> {
         let event = TaskReopenedEvent {
             event_type: "task_reopened",
@@ -2102,6 +2118,8 @@ impl TraceWriter {
             hook_name: hook_name.to_string(),
             reason: reason.to_string(),
             reopen_number,
+            attempt_context,
+            turns_remaining,
         };
         self.write_event(&event).await
     }
@@ -4692,9 +4710,16 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
-        w.write_task_reopened("tsk_1", "gatekeeper", "tests still fail", 1)
-            .await
-            .unwrap();
+        w.write_task_reopened(
+            "tsk_1",
+            "gatekeeper",
+            "tests still fail",
+            1,
+            REOPEN_CONTEXT_CONTINUED,
+            7,
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -4706,6 +4731,8 @@ mod tests {
         assert_eq!(re["hook_name"], "gatekeeper");
         assert_eq!(re["reason"], "tests still fail");
         assert_eq!(re["reopen_number"], 1);
+        assert_eq!(re["attempt_context"], "continued");
+        assert_eq!(re["turns_remaining"], 7);
         assert!(re["timestamp"].as_u64().unwrap() > 0);
     }
 
