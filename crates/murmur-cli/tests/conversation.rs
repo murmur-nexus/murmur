@@ -22,7 +22,8 @@ use tempfile::TempDir;
 
 use common::hook_wat::{
     compaction_hook_wasm, compaction_hook_wasm_as, conversation_reading_task_end_hook_wasm,
-    create_hook_zip, mark_reporting_compaction_hook_wasm, MARK_REPORT_SEP, SEED_CONTEXT,
+    create_hook_zip, mark_reporting_compaction_hook_wasm, reopen_task_once_hook_wasm,
+    MARK_REPORT_SEP, SEED_CONTEXT,
 };
 
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
@@ -201,7 +202,15 @@ struct Fixture {
 }
 
 fn fixture(responses: Vec<String>, blocks: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Fixture {
-    let server = common::ScriptedServer::start(responses);
+    fixture_on(common::ScriptedServer::start(responses), blocks, hooks)
+}
+
+/// [`fixture`] over a provider the case built itself.
+fn fixture_on(
+    server: common::ScriptedServer,
+    blocks: &str,
+    hooks: &[(&str, &str, &str, Vec<u8>)],
+) -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -999,4 +1008,95 @@ fn the_record_labels_a_fenced_tool_message() {
         }
     }
     drop(f.project);
+}
+
+/// A validator that rejects a task's final answer gets it fixed in one more turn, under either
+/// `lifecycle.conversation` mode, with the real driver and a real `on-task-end` hook. The reopened
+/// attempt's only request carries the task once, the rejected attempt's tool call, its result and
+/// its answer, then the hook's feedback as the one new message; the tool the first attempt called
+/// is not called again.
+#[test]
+fn a_rejected_answer_is_fixed_in_one_more_turn_without_rerunning_a_tool() {
+    const REASON: &str = "the date is wrong";
+    for mode in ["stateless", "threaded"] {
+        // A model double: it looks the answer up with a tool until it has seen that tool's
+        // result, answers wrongly until it has been told why, then answers rightly. Handed a
+        // blank page on the reopen, it would call the tool a second time.
+        let server = common::ScriptedServer::start_answering(4, |request| {
+            let sent = request["messages"].to_string();
+            if !sent.contains("tool_result") {
+                tool_call()
+            } else if !sent.contains(REASON) {
+                end_turn("REJECTED")
+            } else {
+                end_turn("ACCEPTED")
+            }
+        });
+        let f = fixture_on(
+            server,
+            &format!("lifecycle:\n  conversation: {mode}\n"),
+            &[(
+                "validator",
+                "on-task-end",
+                "reopen-task",
+                reopen_task_once_hook_wasm(REASON),
+            )],
+        );
+
+        let workdir = workdir_of(run(&f.home, &f.manifest, &["--context", CONTEXT_ID]).success());
+
+        assert_eq!(
+            trace_events(&workdir, "tool_call").len(),
+            1,
+            "{mode}: the first attempt's tool call is not re-run"
+        );
+
+        let requests = f.server.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "{mode}: one extra request: {requests:#?}"
+        );
+        let continued = request_messages(&requests[2]);
+        let text = |message: &Value| message.to_string();
+        assert_eq!(continued.len(), 5, "{mode}: {continued:#?}");
+        assert!(
+            text(&continued[0]).contains(TASK_TEXT),
+            "{mode}: {continued:#?}"
+        );
+        assert!(
+            text(&continued[1]).contains("tool_use"),
+            "{mode}: {continued:#?}"
+        );
+        assert!(
+            text(&continued[2]).contains("tool_result"),
+            "{mode}: {continued:#?}"
+        );
+        assert!(
+            text(&continued[3]).contains("REJECTED"),
+            "{mode}: {continued:#?}"
+        );
+        assert_eq!(continued[4]["role"], "user");
+        assert!(
+            text(&continued[4]).contains("Reopen 1") && text(&continued[4]).contains(REASON),
+            "{mode}: {continued:#?}"
+        );
+        assert_eq!(
+            continued
+                .iter()
+                .filter(|message| text(message).contains(TASK_TEXT))
+                .count(),
+            1,
+            "{mode}: the task is sent once"
+        );
+
+        assert_eq!(trace_events(&workdir, "inference").len(), 3, "{mode}");
+        let reopened = trace_events(&workdir, "task_reopened");
+        assert_eq!(reopened.len(), 1, "{mode}: {reopened:#?}");
+        assert_eq!(reopened[0]["attempt_context"], "continued");
+        let end = trace_events(&workdir, "task_end");
+        assert_eq!(end[0]["exit_status"], "ok", "{mode}: {end:#?}");
+        assert_eq!(end[0]["reopen_count"], 1);
+        drop(f.project);
+    }
 }

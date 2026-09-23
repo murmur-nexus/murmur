@@ -628,8 +628,33 @@ impl ScriptedServer {
         Self::start_inner(responses, std::time::Duration::ZERO, Some(gate))
     }
 
+    /// A server answering up to `limit` requests, each with `answer(request)`: a provider whose
+    /// reply depends on what it was sent, as a model's does.
+    pub fn start_answering(
+        limit: usize,
+        answer: impl FnMut(&Value) -> String + Send + 'static,
+    ) -> Self {
+        Self::serve(limit, answer, std::time::Duration::ZERO, None)
+    }
+
     fn start_inner(
         responses: Vec<String>,
+        delay: std::time::Duration,
+        gate: Option<Arc<RequestGate>>,
+    ) -> Self {
+        let limit = responses.len();
+        let mut responses = responses.into_iter();
+        Self::serve(
+            limit,
+            move |_| responses.next().expect("one response per request"),
+            delay,
+            gate,
+        )
+    }
+
+    fn serve(
+        limit: usize,
+        mut answer: impl FnMut(&Value) -> String + Send + 'static,
         delay: std::time::Duration,
         gate: Option<Arc<RequestGate>>,
     ) -> Self {
@@ -641,11 +666,12 @@ impl ScriptedServer {
         let requests_for_thread = Arc::clone(&requests);
 
         let join = thread::spawn(move || {
-            for body in responses {
+            for _ in 0..limit {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request_body = read_http_request_body(&mut stream).unwrap_or_default();
                 let parsed = serde_json::from_str::<Value>(&request_body)
                     .unwrap_or_else(|_| json!({"_raw": request_body}));
+                let body = answer(&parsed);
                 requests_for_thread.lock().unwrap().push(parsed);
 
                 if let Some(gate) = gate.as_ref() {

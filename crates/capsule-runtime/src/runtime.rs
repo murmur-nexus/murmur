@@ -149,15 +149,19 @@ fn resolve_versioned_iface<T>(
 /// put in context stays there — its tool calls, their results and the rejected answer — and
 /// the hook's feedback arrives as one new user message after them. On `process` that is
 /// `mode: resume` on the harness session the previous attempt ran under, with the feedback as
-/// its prompt. Re-running the task from its text instead would repeat every state-changing tool
-/// call the rejected attempt already made. The seed is applied once, to the task's first fresh
-/// context, and a continued attempt neither consults it nor honours the first attempt's forget
-/// request again.
+/// its prompt. The seed is applied to a fresh context only, and a continued attempt neither
+/// consults it nor honours the first attempt's forget request again.
+///
+/// There is deliberately no setting to restart instead. A restart re-runs every state-changing
+/// tool call the rejected attempt already made, and pays for them again out of the same shared
+/// turn budget; a knob would make every operator choose between that and this, and double the
+/// reopen test matrix for good.
 ///
 /// An attempt that left nothing to continue — an `http` message list still empty, or a harness
 /// run that produced no observable work or could not find its session — is followed by a
-/// restart: a fresh context built from the rewritten `task.md`, seed applied. The `task_reopened` record says which of the two the
-/// next attempt gets (`attempt_context`) and how many turns it is handed (`turns_remaining`).
+/// restart: a fresh context built from the rewritten `task.md`, seed applied. The
+/// `task_reopened` record says which of the two the next attempt gets (`attempt_context`) and
+/// how many turns it is handed (`turns_remaining`).
 ///
 /// Either way `accessible_workdir/task.md` is rewritten as the original content plus every
 /// reopen's feedback so far ([`build_reopen_task_md`]): it is `murmur:task-io/read`'s
@@ -338,9 +342,12 @@ async fn run_task_with_reopens(
                     .write_task_end(trace_task_id, "reopen_budget_exhausted", reopens_used)
                     .await;
                 hooks.end_task();
-                return Err(RuntimeError::AgentLoopFailed(format!(
-                    "task reopen budget exhausted after {reopens_used} reopen(s): hook \
-                     '{hook_name}' still requested another reopen"
+                return Err(RuntimeError::AgentLoopFailed(reopen_refusal_message(
+                    &hook_name,
+                    reopens_used,
+                    max_task_reopens,
+                    inference.max_turns,
+                    budget_ok,
                 )));
             }
             None => {
@@ -352,6 +359,32 @@ async fn run_task_with_reopens(
                 return result;
             }
         }
+    }
+}
+
+/// Why a reopen a hook asked for was refused, naming the limit that refused it. The two limits
+/// share one `task_end` exit status, so this message is the only place an operator learns
+/// whether to raise `lifecycle.max_task_reopens` or `inference.max_turns`; when both are spent,
+/// the reopen limit is named.
+fn reopen_refusal_message(
+    hook_name: &str,
+    reopens_used: u32,
+    max_task_reopens: u32,
+    max_turns: u32,
+    reopens_left: bool,
+) -> String {
+    if reopens_left {
+        format!(
+            "task turn budget exhausted after {reopens_used} reopen(s): hook '{hook_name}' \
+             still requested another reopen, but the task's attempts have spent all \
+             {max_turns} turns of inference.max_turns"
+        )
+    } else {
+        format!(
+            "task reopen budget exhausted after {reopens_used} reopen(s): hook '{hook_name}' \
+             still requested another reopen, but lifecycle.max_task_reopens allows \
+             {max_task_reopens}"
+        )
     }
 }
 
@@ -13137,6 +13170,35 @@ inference:
         let contexts: Vec<&serde_json::Value> =
             reopened.iter().map(|e| &e["attempt_context"]).collect();
         assert_eq!(contexts, ["continued", "continued"]);
+    }
+
+    /// A reopen refused because the reopen limit is spent says so, and names the setting that
+    /// sets it rather than the turn limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopen_refused_by_the_reopen_limit_names_that_limit() {
+        let (result, _) = run_reopen_scenario(99, 1, 10).await;
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("reopen budget exhausted")
+                && message.contains("lifecycle.max_task_reopens allows 1"),
+            "{message}"
+        );
+        assert!(!message.contains("inference.max_turns"), "{message}");
+    }
+
+    /// A reopen refused because the task's attempts spent every turn, with reopens still left,
+    /// names the turn limit rather than claiming the reopen limit ran out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopen_refused_for_want_of_turns_names_the_turn_limit() {
+        let (result, _) = run_reopen_scenario(99, 5, 3).await;
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("turn budget exhausted")
+                && message.contains("all 3 turns of inference.max_turns"),
+            "{message}"
+        );
+        assert!(!message.contains("max_task_reopens"), "{message}");
+        assert!(!message.contains("reopen budget"), "{message}");
     }
 
     /// The forget request belongs to the task's first attempt: a continued attempt resumes the

@@ -72,8 +72,9 @@ fires again when it ends so the hook can re-inspect the new result:
 3. The model continues from there. Fixing one wrong field in a final answer costs one turn, and
    work the rejected attempt already did, including state-changing tool calls, is not repeated.
 
-The attempt continues under both `lifecycle.conversation` values and on both transports.
-`lifecycle.conversation` decides what a *new* task loads; a reopened attempt always keeps the
+The attempt continues on both transports and under both `lifecycle.conversation` values,
+`stateless` included. `lifecycle.conversation` decides what carries from one task to the next. A
+reopen happens inside one task, which has not ended yet, so a reopened attempt always keeps the
 context its own task built.
 
 | Transport | What the reopened attempt is handed |
@@ -81,8 +82,8 @@ context its own task built.
 | `http` | The previous attempt's message list, plus the feedback message |
 | `process` | `mode: resume` on the harness session the previous attempt ran under, with the feedback message as its prompt |
 
-A seed from an `on-task-start` hook is applied once, to the task's first context, and never
-again on a reopened attempt. A [`--forget-session`](../reference/cli.md#run-forget-session) or
+A seed from an `on-task-start` hook is applied to a fresh context only; a continued attempt
+already holds it and is never seeded again. A [`--forget-session`](../reference/cli.md#run-forget-session) or
 `x-murmur-forget-session` request applies to the task's first attempt only, so a reopened attempt
 resumes the session that attempt established.
 
@@ -109,7 +110,12 @@ asking for another try.
 If the reopen limit or the turn limit is used up while a hook still wants to reopen, the task
 ends with its own exit status — `exit_status: "reopen_budget_exhausted"` rather than an
 ordinary `"ok"`/`"failed"` — and the task registry / A2A task state records it like any other
-failed task.
+failed task. The task's error message names the limit that refused the reopen:
+
+| Limit used up | Error message contains | Raise |
+|---|---|---|
+| Reopen limit | `task reopen budget exhausted` | `lifecycle.max_task_reopens` |
+| Turn limit, with reopens left | `task turn budget exhausted` | `inference.max_turns` |
 
 **What the hook sees.** A hook granted `task_io.read` reads, through `murmur:task-io/read`:
 
