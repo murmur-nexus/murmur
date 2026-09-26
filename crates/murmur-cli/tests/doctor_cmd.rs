@@ -1759,3 +1759,85 @@ fn doctor_reports_murmur_home_permissions_and_warns_on_wide_private_entries() {
     assert!(!streams(&output).contains("secret-doctor-value"));
     assert_eq!(modes(), before, "mur doctor changes no mode");
 }
+
+/// `mur doctor` lists `~/.murmur/compiled` as an owner-only entry of its own, absent until the
+/// first `mur run` compiles a component, and flags a form wider than owner-only.
+#[test]
+fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run/components");
+    create_project(project.path(), "  - name: echo-tool\n    version: 0.1.0\n");
+    fs::copy(
+        components.join("capsule-allowlisted.wasm"),
+        project.path().join("capsule.wasm"),
+    )
+    .unwrap();
+    let artifact = project.path().join("echo-tool-0.1.0.mur.zip");
+    {
+        let mut zip = zip::ZipWriter::new(fs::File::create(&artifact).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("murmur.yaml", options).unwrap();
+        zip.write_all(b"name: echo-tool\nversion: 0.1.0\nruntime: wasm\n")
+            .unwrap();
+        zip.start_file("tool.wasm", options).unwrap();
+        zip.write_all(&fs::read(components.join("echo-tool.wasm")).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    common::install_artifact_to_project(project.path(), &artifact).success();
+
+    let doctor = || {
+        let output = mur_doctor(&home, project.path())
+            .success()
+            .get_output()
+            .clone();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    let (stdout, _) = doctor();
+    assert!(
+        stdout.contains(
+            "  artifacts: absent  installed artifacts\n  compiled: absent  compiled WASM artifacts, \
+             expected owner-only\n"
+        ),
+        "{stdout}"
+    );
+
+    common::run_capsule(&home, &project.path().join("murmur.yaml"))
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
+    let (stdout, _) = doctor();
+    for line in [
+        "  artifacts: absent  installed artifacts\n",
+        "  compiled: 0700  compiled WASM artifacts, expected owner-only\n",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in:\n{stdout}");
+    }
+
+    let compiled = home.path().join(".murmur").join("compiled");
+    let form = fs::read_dir(&compiled)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "cwasm"))
+        .expect("a compiled form");
+    fs::set_permissions(&form, fs::Permissions::from_mode(0o644)).unwrap();
+    let (stdout, stderr) = doctor();
+    let name = form.file_name().unwrap().to_string_lossy();
+    let line = format!("    wider than 0600: compiled/{name} is 0644");
+    assert!(stdout.contains(&line), "missing {line:?} in:\n{stdout}");
+    let path = form.display().to_string();
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("warning[W-SEC-028]") && line.contains(&path)),
+        "no W-SEC-028 for {path}:\n{stderr}"
+    );
+}

@@ -192,7 +192,15 @@ chmod 600 ~/.murmur/config.yaml
 | `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
 | `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
+| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a warm launch skips compiling. An entry not read in 30 days is deleted; deleting the directory is safe | `mur run` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
+
+`mur run` loads a compiled artifact into itself only from an owner-only file of the running user,
+in the owner-only `compiled/` directory reached without a symlink, whose bytes match the checksum
+stored beside it, and never when `~/.murmur` lies inside the capsule's workdir. Any other file
+there is compiled again and replaced. A capsule whose shell runs without filesystem mediation
+([`advisory`](containment.md#field-containment)), or whose workdir contains `~/.murmur`, can write
+here as it can anywhere else the operator can.
 
 Every mode marked `0700` or `0600` is set again on each write, not only when the path is created.
 A `mur run` that writes under an existing `~/.murmur` removes its group and other permissions and

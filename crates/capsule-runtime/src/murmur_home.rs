@@ -90,6 +90,7 @@ pub enum HomeEntryKind {
     Running,
     State,
     Artifacts,
+    CompiledForms,
     BinaryCache,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
@@ -97,7 +98,7 @@ pub enum HomeEntryKind {
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 10] = [
+    const KNOWN: [HomeEntryKind; 11] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -107,6 +108,7 @@ impl HomeEntryKind {
         Self::Running,
         Self::State,
         Self::Artifacts,
+        Self::CompiledForms,
         Self::BinaryCache,
     ];
 
@@ -123,6 +125,7 @@ impl HomeEntryKind {
             Self::Running => "running",
             Self::State => "state",
             Self::Artifacts => "artifacts",
+            Self::CompiledForms => "compiled",
             Self::BinaryCache => "bin",
             Self::Unrecognised(name) => name,
         })
@@ -141,6 +144,7 @@ impl HomeEntryKind {
             Self::Running => "running-capsule records",
             Self::State => "capsule state stores",
             Self::Artifacts => "installed artifacts",
+            Self::CompiledForms => "compiled WASM artifacts",
             Self::BinaryCache => "cached mur binaries",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
@@ -525,10 +529,11 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 11);
+        assert_eq!(reports.len(), 12);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
-        assert_eq!(reports[10].kind, HomeEntryKind::BinaryCache);
+        assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
+        assert_eq!(reports[11].kind, HomeEntryKind::BinaryCache);
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));

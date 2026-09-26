@@ -13,6 +13,7 @@ pub mod bindings;
 pub(crate) mod cancel;
 pub(crate) mod cgroup;
 pub mod child_launch;
+pub(crate) mod compiled_forms;
 pub mod containment;
 pub(crate) mod conversation;
 pub(crate) mod conversation_import;
