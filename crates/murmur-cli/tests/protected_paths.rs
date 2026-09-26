@@ -854,7 +854,7 @@ fn an_absolute_path_resolves_to_the_same_rule() {
         &accessible,
     );
     let session_dir = staged.workdir.clone();
-    fs::write(session_dir.join("task.md"), "Do the thing.").unwrap();
+    fs::write(staged.accessible_workdir.join("task.md"), "Do the thing.").unwrap();
 
     launch_session(staged, |_| {}).expect("the session must launch");
 

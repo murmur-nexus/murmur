@@ -1731,7 +1731,7 @@ lifecycle:
 
 | Value | Behaviour |
 |---|---|
-| `exit` (default) | The capsule exits immediately after the task finishes, or after the idle timeout fires. |
+| `exit` (default) | The session ends as soon as the task finishes, whether the task came from `--task` or over A2A. A launch that receives no task ends when the [idle timeout](#idle-timeout) fires. |
 | `sleep` | The capsule loops back to wait for the next task. Only useful with `task_acceptance: queue`; with `single` it behaves like `exit`. |
 
 ### `lifecycle.input_timeout_secs` { #lifecycle-input-timeout-secs }
@@ -1936,10 +1936,9 @@ How long a capsule waits for the next A2A message depends on the lifecycle it de
 | Lifecycle | Behaviour when no message arrives |
 |---|---|
 | `task_acceptance: queue` with `after_task: sleep` | Waits indefinitely. Shutdown is the host's responsibility. |
-| Every other combination | Waits 30 seconds, then runs the agent loop once with an empty task and exits. |
+| Every other combination | Waits 30 seconds for a task. If none arrives, the capsule runs the task in `input.txt` when the accessible workdir holds one, and otherwise ends the session without calling the model. |
 
-The 30-second window is set by the `MURMUR_A2A_TIMEOUT_SECS` environment variable, which tests use
-to keep wait times short.
+Set the `MURMUR_A2A_TIMEOUT_SECS` environment variable to change the 30-second window.
 
 ### CLI overrides
 

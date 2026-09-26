@@ -33,8 +33,8 @@ The agent reads its task from the accessible workdir at the start of every task,
 of:
 
 1. `task.md`
-2. `input.txt`
-3. Neither, in which case the agent starts with an empty task.
+2. `input.txt`, except under `inference.transport: process`, which reads `task.md` only
+3. Neither, in which case the task is empty
 
 `task.md` has three writers:
 
@@ -44,8 +44,12 @@ of:
 | The runtime | On each incoming A2A message, and again when an `on-task-end` hook returns `reopen-task` — rewritten as the original task plus every reopen's feedback so far |
 | The capsule | Through its own file tools, like any other file in the accessible workdir |
 
-Under `lifecycle.task_acceptance: queue` the runtime deletes `task.md` after each task, so the next
-task comes from the queue rather than from a stale file.
+A task whose text is empty or only whitespace fails without a request to the model, with a message
+saying the task is empty. A launch that receives no task at all ends after its
+[idle timeout](manifest.md#idle-timeout) without a model call.
+
+Under `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep` the runtime deletes
+`task.md` after each task, so the next task comes from the queue rather than from a stale file.
 
 ---
 

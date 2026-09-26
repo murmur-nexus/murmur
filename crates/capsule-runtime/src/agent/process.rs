@@ -112,11 +112,6 @@ pub(crate) const FILES_DIR_NAME: &str = ".process-driver";
 /// absolute path of the run's private files directory.
 const FILES_DIR_TOKEN: &str = "{files_dir}";
 
-/// Read `task.md` from the workdir, returning empty string if absent.
-fn read_task_from_workdir(workdir: &Path) -> String {
-    std::fs::read_to_string(workdir.join("task.md")).unwrap_or_default()
-}
-
 /// Builds the system prompt the driver is handed. Always carries `MURMUR_MD_TRUST_NOTICE` and
 /// `UNTRUSTED_CONTENT_NOTICE`, even when no `inference.system_prompt` is configured, so the
 /// harness never receives MURMUR.md-adjacent context or runs tools without the
@@ -788,7 +783,7 @@ async fn run_harness(
     // transport keeps no conversation record.
     let (task, _fence_source) = super::fence_task_payload(
         store_state.current_task_provenance,
-        reopen_feedback.unwrap_or_else(|| read_task_from_workdir(accessible_workdir)),
+        reopen_feedback.unwrap_or_else(|| super::fresh_task_text(inference, accessible_workdir)),
     );
 
     forget_harness_session(&session_policy, trace).await;

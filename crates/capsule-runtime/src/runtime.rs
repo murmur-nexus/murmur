@@ -2289,8 +2289,8 @@ fn launch(
                     }
 
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
-                    // Each iteration processes one task. Single/none modes break after
-                    // the first iteration; queue+sleep iterates until channel closes.
+                    // Each iteration processes one task. Every lifecycle but queue+sleep ends
+                    // after its first task; queue+sleep iterates until the channel closes.
                     'task_loop: loop {
                         if terminating.is_canceled() {
                             close_lanes_on_termination(
@@ -2400,7 +2400,7 @@ fn launch(
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
                                     if workdir_task_md.exists() {
-                                        // Backward compat: existing task.md → single run, no A2A
+                                        // A `task.md` runs before any A2A message is waited for.
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
                                         let bytes = tokio::fs::metadata(&workdir_task_md)
@@ -2468,11 +2468,13 @@ fn launch(
                                         .await;
                                         let _ = trace.flush().await;
                                         let failed = result.is_err();
-                                        let single = matches!(
-                                            effective_lifecycle.task_acceptance,
-                                            TaskAcceptance::Single
-                                        );
-                                        if single || failed {
+                                        // Only queue+sleep outlives its task. Every other
+                                        // lifecycle, `queue` + `exit` included, ends here: it
+                                        // closes out what is already in a lane, such as a
+                                        // reconciled loss report, and never waits for more.
+                                        if !effective_lifecycle.can_receive_background_tasks()
+                                            || failed
+                                        {
                                             final_loop_result = result;
                                             if failed {
                                                 break 'task_loop;
@@ -2480,15 +2482,18 @@ fn launch(
                                             closing_out = true;
                                             continue 'task_loop;
                                         }
-                                        // Queue mode: remove task.md so the next iteration
-                                        // falls through to task_rx.recv() for queued subtasks.
+                                        // Queue+sleep: remove task.md so the next iteration
+                                        // falls through to the wait for queued tasks.
                                         let _ = tokio::fs::remove_file(&workdir_task_md).await;
                                         continue 'task_loop;
                                     }
-                                    // Wait for the next task from the mpsc channel.
+                                    // Wait for the next task from the mpsc channel. Reached with
+                                    // no `task.md`: on a launch given no task, or by queue+sleep
+                                    // between tasks.
                                     // queue+sleep mode waits indefinitely — no self-terminating
                                     // timeout. The host (mur-roost) is responsible for shutdown.
-                                    // All other modes apply MURMUR_A2A_TIMEOUT_SECS (default 30 s).
+                                    // All other modes wait MURMUR_A2A_TIMEOUT_SECS (default 30 s)
+                                    // for a first task and end the session if none arrives.
                                     let is_queue_sleep =
                                         effective_lifecycle.can_receive_background_tasks();
 
@@ -2598,8 +2603,27 @@ fn launch(
                                                     final_loop_result = Ok(AgentLoopExit::Ok);
                                                     break 'task_loop;
                                                 }
+                                                // A `task.md` would have run above, so what can
+                                                // still give this launch a task is a file already
+                                                // in the accessible workdir, in practice
+                                                // `input.txt`. Without one there is nothing to
+                                                // send, so the model is never called.
+                                                Err(_elapsed)
+                                                    if agent::fresh_task_text(
+                                                        inference,
+                                                        &accessible_workdir,
+                                                    )
+                                                    .trim()
+                                                    .is_empty() =>
+                                                {
+                                                    crate::runtime_err!(
+                                                        "[capsule-runtime] no A2A message received within {idle_timeout_secs}s and there is no task to run; ending the session without calling the model"
+                                                    );
+                                                    final_loop_result = Ok(AgentLoopExit::Ok);
+                                                    break 'task_loop;
+                                                }
                                                 Err(_elapsed) => {
-                                                    crate::runtime_err!("[capsule-runtime] no A2A message received within timeout; running with empty task");
+                                                    crate::runtime_err!("[capsule-runtime] no A2A message received within {idle_timeout_secs}s; running the task in input.txt");
                                                     otel.begin_session(None);
                                                     state.current_traceparent = otel.outgoing_traceparent();
                                                     final_loop_result = agent::run_agent_loop(
