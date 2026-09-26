@@ -33,8 +33,8 @@ The agent reads its task from the accessible workdir at the start of every task,
 of:
 
 1. `task.md`
-2. `input.txt`
-3. Neither, in which case the task is empty and is not sent to the model.
+2. `input.txt`, except under `inference.transport: process`, which reads `task.md` only
+3. Neither, in which case the task is empty
 
 `task.md` has three writers:
 

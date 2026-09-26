@@ -613,7 +613,7 @@ pub(crate) async fn run_agent_loop(
 
             // task.md lives in accessible_workdir (where the agent's own tools are preopened),
             // not workdir (the internal `.murmur/<session_id>` bookkeeping dir) — reading from
-            // workdir here silently yields an empty task, producing an empty user message.
+            // workdir here finds no task, so the attempt is refused as empty.
             let task_message = task_user_message(
                 store_state.current_task_provenance,
                 fresh_task_text(inference, accessible_workdir),
@@ -5795,9 +5795,15 @@ forgery: {prompt}"
         }
     }
 
+    /// A `task.md` that exists is the task, blank or not: `input.txt` is a fallback for a missing
+    /// `task.md`, not for an empty one, so a blank `--task` is refused rather than replaced.
     #[test]
-    fn empty_task_refusal_says_the_task_is_empty_and_nothing_was_sent() {
-        assert!(EMPTY_TASK_REFUSAL.contains("the task is empty"));
-        assert!(EMPTY_TASK_REFUSAL.contains("nothing was sent to the model"));
+    fn fresh_task_text_on_http_does_not_fall_back_past_a_blank_task_md() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("task.md"), "   ").unwrap();
+        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
+        assert!(fresh_task_text(&inference_on("http"), dir.path())
+            .trim()
+            .is_empty());
     }
 }

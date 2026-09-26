@@ -2400,7 +2400,7 @@ fn launch(
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
                                     if workdir_task_md.exists() {
-                                        // Backward compat: existing task.md → single run, no A2A
+                                        // A `task.md` runs before any A2A message is waited for.
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
                                         let bytes = tokio::fs::metadata(&workdir_task_md)

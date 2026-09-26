@@ -1936,10 +1936,9 @@ How long a capsule waits for the next A2A message depends on the lifecycle it de
 | Lifecycle | Behaviour when no message arrives |
 |---|---|
 | `task_acceptance: queue` with `after_task: sleep` | Waits indefinitely. Shutdown is the host's responsibility. |
-| Every other combination | Waits 30 seconds for a task. If none arrives, the session ends without calling the model. |
+| Every other combination | Waits 30 seconds for a task. If none arrives, the capsule runs the task in `input.txt` when the accessible workdir holds one, and otherwise ends the session without calling the model. |
 
-The 30-second window is set by the `MURMUR_A2A_TIMEOUT_SECS` environment variable, which tests use
-to keep wait times short.
+Set the `MURMUR_A2A_TIMEOUT_SECS` environment variable to change the 30-second window.
 
 ### CLI overrides
 
