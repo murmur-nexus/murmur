@@ -503,21 +503,27 @@ fn resolve_beneath(
     Ok(canonical)
 }
 
-/// Opens `path` without following a symlink on its final component and without blocking on a
-/// FIFO, then confirms from the open descriptor that it is a regular file.
+/// Opens `path` for reading without following a symlink on its final component and without
+/// blocking on a FIFO, and returns the descriptor with the metadata `fstat` reports for it.
 ///
-/// `O_NONBLOCK` is what keeps a FIFO under the export root from parking the request until a
-/// writer appears; the `fstat` behind [`std::fs::File::metadata`] is what turns it, and a socket
-/// or device node, into `not_a_regular_file`.
-fn open_regular_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), ResourceError> {
+/// `O_NONBLOCK` is what keeps a FIFO from parking the caller until a writer appears. Check the
+/// file type and owner on the returned metadata, never on a second lookup of `path`, which may by
+/// then name something else.
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|e| io_to_resource_error(&e))?;
-    let metadata = file.metadata().map_err(|e| io_to_resource_error(&e))?;
+        .open(path)?;
+    let metadata = file.metadata()?;
+    Ok((file, metadata))
+}
+
+/// [`open_no_follow`], then confirms from the open descriptor that it is a regular file, so a
+/// FIFO, socket or device node under the export root is `not_a_regular_file`.
+fn open_regular_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), ResourceError> {
+    let (file, metadata) = open_no_follow(path).map_err(|e| io_to_resource_error(&e))?;
     if !metadata.is_file() {
         return Err(ResourceError::NotARegularFile);
     }

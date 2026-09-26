@@ -174,14 +174,7 @@ fn current_euid() -> u32 {
 ///
 /// [`PRIVATE_FILE_MODE`]: crate::murmur_home::PRIVATE_FILE_MODE
 fn open_private(path: &Path) -> Option<(std::fs::File, Metadata)> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
+    let (file, metadata) = crate::resource_plane::open_no_follow(path).ok()?;
     (metadata.is_file()
         && owned_within(
             &metadata,
