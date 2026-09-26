@@ -350,7 +350,8 @@ fn task_user_message(provenance: Option<TaskProvenance>, text: String) -> Value 
 /// for this reopen on every later one. An attempt continues `thread` when it has feedback and
 /// [`TaskThread::can_continue`] holds for its transport; it then consults neither `seed` nor the
 /// store's forget request, loads no history and sends no task message. Every other attempt builds
-/// a fresh context from `task.md`, as `lifecycle.conversation` and `--resume` direct.
+/// a fresh context from `task.md`, as `lifecycle.conversation` and `--resume` direct, and fails
+/// with [`EMPTY_TASK_REFUSAL`] before touching either transport when [`fresh_task_text`] is blank.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
@@ -370,7 +371,7 @@ pub(crate) async fn run_agent_loop(
     context_id: Option<String>,
     seed: Option<HookSeed>,
     // This task's cancel flag, or `None` where no task can be cancelled: the `task.md` paths,
-    // which run no A2A task, and the empty-task timeout path.
+    // which run no A2A task, and the idle-timeout path that runs an `input.txt` task.
     cancel: Option<CancelSignal>,
     thread: &mut TaskThread,
     reopen_feedback: Option<String>,
@@ -378,6 +379,19 @@ pub(crate) async fn run_agent_loop(
     // The feedback this attempt continues the task's conversation with, or `None` for an attempt
     // that builds a fresh context.
     let continuation = reopen_feedback.filter(|_| thread.can_continue(&inference.transport));
+
+    // A fresh attempt with nothing to say fails before either transport starts: the http path
+    // would otherwise load history, which may compact through the driver, and then send an empty
+    // user message. The raw text is checked, because an untrusted task's fence is never empty.
+    if continuation.is_none()
+        && fresh_task_text(inference, accessible_workdir)
+            .trim()
+            .is_empty()
+    {
+        return Err(RuntimeError::AgentLoopFailed(
+            EMPTY_TASK_REFUSAL.to_string(),
+        ));
+    }
 
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
     if inference.transport == "process" {
@@ -602,7 +616,7 @@ pub(crate) async fn run_agent_loop(
             // workdir here silently yields an empty task, producing an empty user message.
             let task_message = task_user_message(
                 store_state.current_task_provenance,
-                read_task(accessible_workdir),
+                fresh_task_text(inference, accessible_workdir),
             );
             append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
             messages.push(task_message);
@@ -3541,11 +3555,26 @@ pub(crate) fn fence_task_payload(
     }
 }
 
-fn read_task(workdir: &Path) -> String {
-    fs::read_to_string(workdir.join("task.md"))
-        .or_else(|_| fs::read_to_string(workdir.join("input.txt")))
+/// The task text a fresh attempt on `inference`'s transport would send, read from
+/// `accessible_workdir` and unfenced.
+///
+/// The `process` transport reads `task.md` alone. Every other transport reads `task.md`, falls
+/// back to `input.txt`, and yields `""` when neither exists. This is the one reader of task text
+/// for both transports, so the check that refuses a blank task and the message a transport sends
+/// can never read different files.
+pub(crate) fn fresh_task_text(inference: &InferenceConfig, accessible_workdir: &Path) -> String {
+    let task_md = fs::read_to_string(accessible_workdir.join("task.md"));
+    if inference.transport == "process" {
+        return task_md.unwrap_or_default();
+    }
+    task_md
+        .or_else(|_| fs::read_to_string(accessible_workdir.join("input.txt")))
         .unwrap_or_default()
 }
+
+/// Why a fresh attempt whose task text is blank fails without a request.
+pub(crate) const EMPTY_TASK_REFUSAL: &str =
+    "the task is empty; nothing was sent to the model (write the task to task.md, pass --task, or send a non-empty message)";
 
 /// A credential rejection the gateway recorded for the request a driver just failed, reported as
 /// `E-RUN-027` with its hint, or `None` when there is none.
@@ -5696,5 +5725,79 @@ forgery: {prompt}"
             AgentLoopExit::SpendCeilingReached.as_str(),
             "spend_ceiling_reached"
         );
+    }
+
+    fn inference_on(transport: &str) -> InferenceConfig {
+        InferenceConfig {
+            transport: transport.to_string(),
+            model: "test-model".to_string(),
+            driver: None,
+            command: None,
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns: 10,
+            max_tokens: None,
+            max_session_tokens: None,
+        }
+    }
+
+    #[test]
+    fn fresh_task_text_on_http_prefers_task_md() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("task.md"), "from task.md").unwrap();
+        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
+        assert_eq!(
+            fresh_task_text(&inference_on("http"), dir.path()),
+            "from task.md"
+        );
+    }
+
+    #[test]
+    fn fresh_task_text_on_http_falls_back_to_input_txt() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
+        assert_eq!(
+            fresh_task_text(&inference_on("http"), dir.path()),
+            "from input.txt"
+        );
+    }
+
+    #[test]
+    fn fresh_task_text_on_http_is_empty_when_neither_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(fresh_task_text(&inference_on("http"), dir.path()), "");
+    }
+
+    /// The process transport sends `task.md` alone, so `input.txt` must not make its task look
+    /// non-blank to the check that guards it.
+    #[test]
+    fn fresh_task_text_on_process_ignores_input_txt() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("input.txt"), "from input.txt").unwrap();
+        assert_eq!(fresh_task_text(&inference_on("process"), dir.path()), "");
+        fs::write(dir.path().join("task.md"), "from task.md").unwrap();
+        assert_eq!(
+            fresh_task_text(&inference_on("process"), dir.path()),
+            "from task.md"
+        );
+    }
+
+    #[test]
+    fn fresh_task_text_that_is_only_whitespace_trims_to_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("task.md"), "  \n\t \n").unwrap();
+        for transport in ["http", "process"] {
+            assert!(fresh_task_text(&inference_on(transport), dir.path())
+                .trim()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_task_refusal_says_the_task_is_empty_and_nothing_was_sent() {
+        assert!(EMPTY_TASK_REFUSAL.contains("the task is empty"));
+        assert!(EMPTY_TASK_REFUSAL.contains("nothing was sent to the model"));
     }
 }

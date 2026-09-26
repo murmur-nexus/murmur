@@ -616,9 +616,6 @@ fn spawn_mur_run(
     command
         .env("HOME", home.path())
         .env_remove("NEXUS_API_KEY")
-        // The idle wait after a queue capsule's `task.md` task, kept short so a resume with
-        // nothing left to report ends in seconds rather than the 30-second default.
-        .env("MURMUR_A2A_TIMEOUT_SECS", "2")
         .arg("run")
         .arg("--manifest")
         .arg(manifest_path)

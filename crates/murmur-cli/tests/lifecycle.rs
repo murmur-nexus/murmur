@@ -1188,3 +1188,328 @@ fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result
         "no task carried the result, so nothing wrote shell_completed"
     );
 }
+
+// ── Ending without an empty prompt ────────────────────────────────────────────
+
+/// `mur run --manifest <manifest> --verbose <args>` as a child process, with only `env` in its
+/// idle-timeout environment: an inherited `MURMUR_A2A_TIMEOUT_SECS` is removed first, so a test
+/// that sets none runs against the 30-second default.
+fn mur_run(
+    home: &TempDir,
+    manifest_path: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = assert_cmd::Command::cargo_bin("mur").unwrap();
+    command
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .env_remove("MURMUR_A2A_TIMEOUT_SECS");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
+        .args([
+            "run",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--verbose",
+        ])
+        .args(args)
+        .output()
+        .expect("mur run should execute")
+}
+
+/// The text of the last `user` message in a recorded driver request.
+fn last_user_text(request: &Value) -> String {
+    let last_user = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "user"))
+        .unwrap_or_else(|| panic!("the request carries a user message: {request}"));
+    match &last_user["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("unexpected user content: {other}"),
+    }
+}
+
+/// Milliseconds from `task_end` to `session_end`, which is how long the session held on after its
+/// task. Read off the trace rather than a clock around the process, so the time spent compiling
+/// the capsule before the task can neither hide nor fake a wait.
+fn millis_from_task_end_to_session_end(events: &[Value]) -> u64 {
+    let task_end = events_named(events, "task_end")[0]["timestamp"]
+        .as_u64()
+        .unwrap();
+    let session_end = events_named(events, "session_end")[0]["timestamp"]
+        .as_u64()
+        .unwrap();
+    session_end - task_end
+}
+
+/// `queue` + `exit` given its task with `--task` ends as soon as that task does: no idle wait, no
+/// second request, and no turn or token beyond the task's own.
+#[test]
+fn lifecycle_queue_exit_ends_as_soon_as_its_task_md_task_does() {
+    // A second response is scripted so that a second request would be recorded rather than
+    // refused.
+    let server = multi_turn_server(&["done", "an answer to nothing"]);
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let output = mur_run(
+        &home,
+        &manifest_path,
+        &[
+            "--task",
+            "Say done.",
+            "--lifecycle-task-acceptance",
+            "queue",
+            "--lifecycle-after-task",
+            "exit",
+        ],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "mur run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let workdir = common::parse_workdir_from_stdout(&stdout);
+    let events = read_trace(&workdir.join("trace.jsonl"));
+    let held = millis_from_task_end_to_session_end(&events);
+    assert!(
+        held < 5_000,
+        "the session held on {held}ms after its task ended, so it waited out the idle timeout"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "one task, one request: {requests:?}");
+    assert!(
+        !last_user_text(&requests[0]).trim().is_empty(),
+        "the request carries the task: {}",
+        requests[0]
+    );
+    assert!(
+        !stderr.contains("no A2A message received"),
+        "the session never waited for a message:\n{stderr}"
+    );
+
+    assert_eq!(events_named(&events, "task_start").len(), 1);
+    let task_ends = events_named(&events, "task_end");
+    assert_eq!(task_ends.len(), 1);
+    assert_eq!(events_named(&events, "inference").len(), 1);
+    let session_end = events_named(&events, "session_end")[0];
+    assert_eq!(session_end["exit_status"], "ok");
+    assert_eq!(session_end["total_turns"], 1);
+    assert_eq!(
+        session_end["total_input_tokens"], task_ends[0]["input_tokens"],
+        "the session spent nothing beyond its task"
+    );
+}
+
+/// Ending straight after a `task.md` task still runs the teardown sweep: a demoted command is
+/// discarded and reported to the operator, not handed to a task nobody waits for.
+#[test]
+fn lifecycle_queue_exit_task_md_still_reports_discarded_shell_work() {
+    if capsule_runtime::skip_without_host_support(
+        "lifecycle_queue_exit_task_md_still_reports_discarded_shell_work",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        bash_call_response("msg_1", "toolu_build", "sleep 45; echo done"),
+        end_turn_response("msg_2", "build started"),
+        end_turn_response("msg_3", "an answer to nothing"),
+    ]);
+    let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Exit,
+            queue_depth: 4,
+            shell_grace_secs: 1,
+            ..Default::default()
+        }),
+        None,
+    );
+    fs::write(staged.accessible_workdir.join("task.md"), "Run the build.").unwrap();
+    let workdir = staged.workdir.clone();
+    let trace_path = workdir.join("trace.jsonl");
+
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, |_| {});
+    });
+
+    let events = wait_for_trace(&trace_path, 180, "the session to end", |events| {
+        !events_named(events, "session_end").is_empty()
+    });
+    let work_id = events_named(&events, "shell_detached")[0]["work_id"]
+        .as_str()
+        .expect("a demoted command carries its work id")
+        .to_string();
+
+    let report = wait_for_abandonment_report(&workdir, 60);
+    assert!(report.contains(&work_id), "report was: {report}");
+    assert!(report.contains("bash"), "report was: {report}");
+    assert!(
+        report.contains("command: sleep 45; echo done"),
+        "report was: {report}"
+    );
+    assert!(
+        report.contains("state: still running after"),
+        "report was: {report}"
+    );
+    assert!(
+        events_named(&events, "shell_abandoned")
+            .iter()
+            .any(|event| event["work_id"] == work_id.as_str()),
+        "the discarded command has its shell_abandoned record"
+    );
+
+    let held = millis_from_task_end_to_session_end(&events);
+    assert!(
+        held < 5_000,
+        "the session held on {held}ms after its task ended"
+    );
+    assert_eq!(
+        server.requests().len(),
+        2,
+        "the task's two turns, and nothing for the completion"
+    );
+}
+
+/// A launch that is never given a task waits the idle window for one and then ends without
+/// calling the model, on the default lifecycle and on `queue` + `exit` alike.
+#[test]
+fn lifecycle_a_launch_that_receives_no_task_ends_without_calling_the_model() {
+    for lifecycle_args in [
+        &[][..],
+        &[
+            "--lifecycle-task-acceptance",
+            "queue",
+            "--lifecycle-after-task",
+            "exit",
+        ][..],
+    ] {
+        // One response is scripted so that a request would be recorded rather than refused.
+        let server = end_turn_server("an answer to nothing");
+        let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+        let output = mur_run(
+            &home,
+            &manifest_path,
+            lifecycle_args,
+            &[("MURMUR_A2A_TIMEOUT_SECS", "2")],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{lifecycle_args:?}: mur run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("ending the session without calling the model"),
+            "{lifecycle_args:?}: stderr was:\n{stderr}"
+        );
+        assert_eq!(
+            server.requests().len(),
+            0,
+            "{lifecycle_args:?}: nothing was sent to the model"
+        );
+
+        let workdir = common::parse_workdir_from_stdout(&stdout);
+        let events = read_trace(&workdir.join("trace.jsonl"));
+        assert!(events_named(&events, "inference").is_empty());
+        assert!(events_named(&events, "task_start").is_empty());
+        let session_end = events_named(&events, "session_end");
+        assert_eq!(session_end.len(), 1);
+        assert_eq!(session_end[0]["exit_status"], "ok");
+    }
+}
+
+/// A `--task` of nothing but whitespace fails its task before any request is made.
+#[test]
+fn lifecycle_a_blank_task_is_never_sent_to_the_model() {
+    // One response is scripted so that a request would be recorded rather than refused.
+    let server = end_turn_server("an answer to nothing");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let output = mur_run(&home, &manifest_path, &["--task", "   "], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a blank task must fail the run:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the task is empty"),
+        "stderr was:\n{stderr}"
+    );
+    assert_eq!(server.requests().len(), 0, "nothing was sent to the model");
+
+    let workdir = common::parse_workdir_from_stdout(&stdout);
+    let events = read_trace(&workdir.join("trace.jsonl"));
+    assert_eq!(events_named(&events, "task_start").len(), 1);
+    let task_ends = events_named(&events, "task_end");
+    assert_eq!(task_ends.len(), 1);
+    assert_eq!(task_ends[0]["exit_status"], "failed");
+    assert!(events_named(&events, "inference").is_empty());
+}
+
+/// An empty message from an untrusted peer fails its task before any request is made. The fence
+/// an untrusted payload is wrapped in is never empty, so this holds only because the check reads
+/// the task text before fencing.
+#[test]
+fn lifecycle_a_blank_untrusted_message_is_never_sent_to_the_model() {
+    // One response is scripted so that a request would be recorded rather than refused.
+    let server = end_turn_server("an answer to nothing");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let staged = stage_agent(&home, &manifest_path, None, None);
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+
+    http_post_json_with_headers(
+        &capsule_url,
+        "/",
+        &message_send_body("m-blank", ""),
+        &[
+            ("x-murmur-task-origin", "peer"),
+            ("x-murmur-task-trust", "untrusted"),
+        ],
+    );
+
+    let result = handle.join().expect("launch thread should not panic");
+    let error = result.expect_err("a failed task fails the launch");
+    assert!(
+        error.to_string().contains("the task is empty"),
+        "error was: {error}"
+    );
+
+    let events = read_trace(&trace_path);
+    let task_starts = events_named(&events, "task_start");
+    assert_eq!(task_starts.len(), 1);
+    assert_eq!(task_starts[0]["trust"], "untrusted");
+    let task_ends = events_named(&events, "task_end");
+    assert_eq!(task_ends.len(), 1);
+    assert_eq!(task_ends[0]["exit_status"], "failed");
+    assert!(events_named(&events, "inference").is_empty());
+    assert_eq!(server.requests().len(), 0, "nothing was sent to the model");
+}
