@@ -10289,15 +10289,30 @@ inference:
         );
     }
 
+    /// An in-test registry serving `bytes` for every name and version: a skill, or a WASM tool
+    /// when built with [`Self::wasm_tool`]. `sha256` is what the registry reports, which need not
+    /// be the hash of `bytes`.
     struct FakeSkillRegistry {
         bytes: Vec<u8>,
         sha256: String,
+        runtime: RuntimeType,
     }
 
     impl FakeSkillRegistry {
         fn new(bytes: Vec<u8>) -> Self {
             let sha256 = murmur_artifact::sha256_hex(&bytes);
-            Self { bytes, sha256 }
+            Self {
+                bytes,
+                sha256,
+                runtime: RuntimeType::Static,
+            }
+        }
+
+        fn wasm_tool(bytes: Vec<u8>) -> Self {
+            Self {
+                runtime: RuntimeType::Wasm,
+                ..Self::new(bytes)
+            }
         }
     }
 
@@ -10307,8 +10322,12 @@ inference:
                 meta: ArtifactMeta {
                     name: name.to_string(),
                     version: version.to_string(),
-                    runtime: RuntimeType::Static,
-                    artifact_runtime: "skill".to_string(),
+                    runtime: self.runtime,
+                    artifact_runtime: match self.runtime {
+                        RuntimeType::Wasm => "tool",
+                        _ => "skill",
+                    }
+                    .to_string(),
                     platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
@@ -10584,62 +10603,16 @@ inference:
         ])
     }
 
-    /// Like [`FakeSkillRegistry`], but for a WASM tool. `sha256` is what the registry reports,
-    /// which need not be the hash of `bytes`.
-    struct FakeWasmRegistry {
-        bytes: Vec<u8>,
-        sha256: String,
-    }
-
-    impl FakeWasmRegistry {
-        fn new(bytes: Vec<u8>) -> Self {
-            let sha256 = murmur_artifact::sha256_hex(&bytes);
-            Self { bytes, sha256 }
-        }
-    }
-
-    impl Registry for FakeWasmRegistry {
-        fn resolve(&self, name: &str, version: &str) -> Result<ResolvedArtifact, RegistryError> {
-            Ok(ResolvedArtifact {
-                meta: ArtifactMeta {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                    runtime: RuntimeType::Wasm,
-                    artifact_runtime: "tool".to_string(),
-                    platforms: Vec::new(),
-                    description: None,
-                    tags: Vec::new(),
-                    wit_contracts: None,
-                },
-                bytes: self.bytes.clone().into(),
-                sha256: self.sha256.clone(),
-                platform_match: murmur_artifact::PlatformMatch::NotApplicable,
-            })
-        }
-
-        fn publish(
-            &self,
-            _meta: ArtifactMeta,
-            _bytes: &[u8],
-        ) -> Result<murmur_artifact::PublishResult, RegistryError> {
-            unreachable!()
-        }
-
-        fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
-            unreachable!()
-        }
-    }
-
     /// One project directory whose sessions pull from one registry.
     struct WasmPullProject {
         _dir: TempDir,
         workdir: PathBuf,
         lock_path: PathBuf,
-        registry: Arc<FakeWasmRegistry>,
+        registry: Arc<FakeSkillRegistry>,
     }
 
     impl WasmPullProject {
-        fn new(registry: FakeWasmRegistry) -> Self {
+        fn new(registry: FakeSkillRegistry) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let workdir = dir.path().join("workdir");
             fs::create_dir_all(&workdir).unwrap();
@@ -10654,7 +10627,7 @@ inference:
 
         /// A project whose registry serves `wasm-tool` exporting `murmur-test:pull/first`.
         fn exporting_first() -> Self {
-            Self::new(FakeWasmRegistry::new(wasm_tool_zip(
+            Self::new(FakeSkillRegistry::wasm_tool(wasm_tool_zip(
                 PULLED_WASM_TOOL,
                 &iface_component_bytes("murmur-test:pull/first"),
             )))
@@ -10752,6 +10725,18 @@ inference:
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// A valid compiled form, for `build_engine()`, of a component exporting
+    /// `murmur-test:pull/planted`, which the pulled payload does not export.
+    fn planted_form_bytes() -> Vec<u8> {
+        Component::new(
+            &build_engine().unwrap(),
+            iface_component_bytes("murmur-test:pull/planted"),
+        )
+        .unwrap()
+        .serialize()
+        .unwrap()
+    }
+
     /// Pulls `wasm-tool` in a first session, so its form is stored, and returns that form.
     fn first_session_stores_the_form(project: &WasmPullProject) -> PathBuf {
         let mut state = project.session();
@@ -10782,13 +10767,7 @@ inference:
         let project = WasmPullProject::exporting_first();
         let form = first_session_stores_the_form(&project);
 
-        let planted = Component::new(
-            &build_engine().unwrap(),
-            iface_component_bytes("murmur-test:pull/planted"),
-        )
-        .unwrap()
-        .serialize()
-        .unwrap();
+        let planted = planted_form_bytes();
         crate::murmur_home::write_private_file(&form, &planted).unwrap();
         crate::murmur_home::write_private_file(
             &form_sidecar(&form),
@@ -10936,6 +10915,66 @@ inference:
     }
 
     #[test]
+    fn a_pulled_form_whose_sidecar_is_wider_than_owner_only_is_rewritten() {
+        pull_under_scratch_home("inner_a_pulled_form_whose_sidecar_is_wider_than_owner_only");
+    }
+
+    #[test]
+    #[ignore = "run by a_pulled_form_whose_sidecar_is_wider_than_owner_only_is_rewritten"]
+    fn inner_a_pulled_form_whose_sidecar_is_wider_than_owner_only() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        let (old_inode, _held) = held_inode(&form);
+        set_mode(&form_sidecar(&form), 0o644);
+
+        second_session_pulls_first(&project);
+        assert_ne!(inode(&the_form()), old_inode);
+        assert_eq!(
+            crate::murmur_home::mode_of(&form_sidecar(&the_form())),
+            0o600
+        );
+        assert_sidecar_matches(&the_form());
+    }
+
+    #[test]
+    fn a_pulled_form_reached_through_a_symlink_is_not_loaded() {
+        pull_under_scratch_home("inner_a_pulled_form_reached_through_a_symlink_is_not_loaded");
+    }
+
+    #[test]
+    #[ignore = "run by a_pulled_form_reached_through_a_symlink_is_not_loaded"]
+    fn inner_a_pulled_form_reached_through_a_symlink_is_not_loaded() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        // An owner-only form that would load if the link were followed, with the sidecar at the
+        // link's name matching it.
+        let planted = planted_form_bytes();
+        let target = scratch_compiled_dir()
+            .parent()
+            .unwrap()
+            .join("planted.cwasm");
+        crate::murmur_home::write_private_file(&target, &planted).unwrap();
+        fs::remove_file(&form).unwrap();
+        std::os::unix::fs::symlink(&target, &form).unwrap();
+        crate::murmur_home::write_private_file(
+            &form_sidecar(&form),
+            murmur_artifact::sha256_hex(&planted).as_bytes(),
+        )
+        .unwrap();
+
+        second_session_pulls_first(&project);
+        assert!(!fs::symlink_metadata(&form).unwrap().is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), planted);
+        assert_sidecar_matches(&form);
+    }
+
+    #[test]
     fn a_pull_neither_reads_nor_writes_a_symlinked_compiled_dir() {
         pull_under_scratch_home("inner_a_pull_neither_reads_nor_writes_a_symlinked_compiled_dir");
     }
@@ -11025,7 +11064,7 @@ inference:
         // `<root>/home` is beside `<root>/<session_id>`.
         let session_dir = capsule_root.join("ses_test");
         fs::create_dir_all(&session_dir).unwrap();
-        let registry = Arc::new(FakeWasmRegistry::new(wasm_tool_zip(
+        let registry = Arc::new(FakeSkillRegistry::wasm_tool(wasm_tool_zip(
             PULLED_WASM_TOOL,
             &iface_component_bytes("murmur-test:pull/first"),
         )));
@@ -11079,8 +11118,9 @@ inference:
             return;
         }
         let bad_wasm: &[u8] = b"\0asm\x01\0\0\0";
-        let project =
-            WasmPullProject::new(FakeWasmRegistry::new(wasm_tool_zip("bad-tool", bad_wasm)));
+        let project = WasmPullProject::new(FakeSkillRegistry::wasm_tool(wasm_tool_zip(
+            "bad-tool", bad_wasm,
+        )));
 
         let mut state = project.session();
         let err = pull(&mut state, "bad-tool").expect_err("the pull fails to compile");
@@ -11115,9 +11155,9 @@ inference:
         );
 
         // A well-formed key, so a pull that reached the compile would use the cache.
-        let tampered = WasmPullProject::new(FakeWasmRegistry {
-            bytes: payload.clone(),
+        let tampered = WasmPullProject::new(FakeSkillRegistry {
             sha256: murmur_artifact::sha256_hex(b"some other payload"),
+            ..FakeSkillRegistry::wasm_tool(payload.clone())
         });
         let lock_before = fs::read(&tampered.lock_path).ok();
         let err = pull(&mut tampered.session(), PULLED_WASM_TOOL).expect_err("integrity refusal");
@@ -11125,7 +11165,7 @@ inference:
         assert!(cwasm_entries(&scratch_compiled_dir()).is_empty());
         assert_eq!(fs::read(&tampered.lock_path).ok(), lock_before);
 
-        let pinned = WasmPullProject::new(FakeWasmRegistry::new(payload));
+        let pinned = WasmPullProject::new(FakeSkillRegistry::wasm_tool(payload));
         write_lockfile_atomic(
             &pinned.lock_path,
             &MurmurLock {

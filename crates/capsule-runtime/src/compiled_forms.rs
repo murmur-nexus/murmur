@@ -9,15 +9,14 @@
 //! mismatched form is compiled again through `Component::new` and rewritten, so the cache never
 //! fails a launch and never changes a compile error.
 //!
-//! The cache has two callers, `runtime::stage_session` and `manage::Host::pull`, and both compile
-//! through the one [`CompiledForms`] handle staging built for the session. Each passes as the key
-//! of an artifact the `resolved.sha256` that `verify_sha256` has just recomputed over the payload
-//! bytes in hand, and extracts the component with `extract_root_wasm`. The lock pin on staging and
-//! the registry's self-reported hash on a pull decide only whether a payload is accepted, never
-//! what the key names: a form named `H` is the compiled root component of the payload whose bytes
-//! hash to `H`, for this engine. A form either caller writes is therefore the right form for any
-//! later caller that has accepted payload `H`, and loading it grants that payload nothing its
-//! caller had not.
+//! An artifact's key must be a sha256 that `verify_sha256` has just recomputed over the payload
+//! bytes in hand, so a form named `H` is always the `extract_root_wasm` component of the payload
+//! whose bytes hash to `H`, for this engine. `runtime::stage_session` and `manage::Host::pull`
+//! both key this way and share the one [`CompiledForms`] handle staging built for the session.
+//! What accepts a payload differs, the `murmur.lock` pin on staging and the registry's reported
+//! hash on a pull, but never what the key names. A form either caller writes is therefore correct
+//! for any later caller that has accepted payload `H`, and loading it grants that payload nothing
+//! its caller had not.
 //!
 //! The directory sits beside `~/.murmur/artifacts`, not in it, so nothing that walks the artifact
 //! store sees it. Two `mur` builds with different engines keep separate forms, since the engine
