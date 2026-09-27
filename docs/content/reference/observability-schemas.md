@@ -401,7 +401,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first run that ended anything but `"ok"` decides it, and no later run replaces it |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -490,7 +490,7 @@ terminal `task_end`
 |---|---|
 | `driver_error` | The driver returned an error, or a response whose `stop_reason` is `"error"`: a body it could not parse, a body cut off in transit, an HTTP error, provider error text, a provider request that timed out |
 | `credential_rejected` | As `driver_error`, while the provider keeps rejecting the inference credential. The reason is the [`E-RUN-027`](diagnostics.md#e-run-027) message |
-| `malformed_response` | The response asked for a tool call and carried none, or its `stop_reason` is missing or unsupported |
+| `malformed_response` | The response the driver handed back asked for a tool call and carried none, or its `stop_reason` is missing or one the runtime does not handle |
 | `compaction_hook` | A hook bound to `on-compaction` returned an error |
 | `input_timeout` | A `request-input` wait passed [`lifecycle.input_timeout_secs`](manifest.md#lifecycle-input-timeout-secs) with no answer. The attempt makes no further inference call |
 | `reopen_budget_exhausted` | An `on-task-end` hook still asked to reopen the task after `lifecycle.max_task_reopens` or `inference.max_turns` was spent. The reason names the limit |

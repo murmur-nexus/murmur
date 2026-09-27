@@ -3236,9 +3236,9 @@ pub(crate) fn build_prompt_cache_key(
 }
 
 /// Longest prefix of `text` that is at most `max_bytes` long and ends on a character boundary.
-/// `version` is manifest text that no validation restricts to ASCII, so a raw byte slice of a
-/// key built from it can land mid-character and panic.
-fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+/// A raw byte slice of text nothing restricts to ASCII — a manifest `version`, a provider's error
+/// text — can land mid-character and panic.
+pub(crate) fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }

@@ -307,7 +307,7 @@ fn assert_failed_with<'t>(run: &Run, trace: &'t [Value], cause: &str) -> &'t Val
     failed
 }
 
-// ── S1: a task that completes ─────────────────────────────────────────────────
+// ── A task that completes ─────────────────────────────────────────────────────
 
 #[test]
 fn s1_a_completed_task_is_ok_and_exits_zero() {
@@ -327,7 +327,7 @@ fn s1_a_completed_task_is_ok_and_exits_zero() {
     assert_eq!(session_end_status(&trace), "ok");
 }
 
-// ── S2, S3: a driver call that failed ─────────────────────────────────────────
+// ── A driver call that failed ─────────────────────────────────────────────────
 
 #[test]
 #[ignore = "the anthropic driver reads a chat-completions body as an empty end_turn, so the \
@@ -357,7 +357,7 @@ fn s3_a_body_cut_off_in_transit_fails_the_task() {
     println!("task_failed: {failed}");
 }
 
-// ── S7: a response the loop cannot act on ─────────────────────────────────────
+// ── A response the loop cannot act on ─────────────────────────────────────────
 
 /// The `truncation-driver` fixture in `NOSTOP` mode answers with a `stop_reason` the loop has no
 /// branch for, without making an HTTP call.
@@ -394,7 +394,7 @@ fn s7_an_unsupported_stop_reason_fails_the_task() {
     );
 }
 
-// ── S8: a spent turn budget ───────────────────────────────────────────────────
+// ── A spent turn budget ───────────────────────────────────────────────────────
 
 #[test]
 fn s8_a_spent_turn_budget_is_max_turns_reached_and_exits_non_zero() {
@@ -430,7 +430,7 @@ fn s8_a_spent_turn_budget_is_max_turns_reached_and_exits_non_zero() {
     assert_eq!(session_end_status(&trace), "max_turns_reached");
 }
 
-// ── S13: the launch outcome is never replaced ─────────────────────────────────
+// ── The launch outcome is never replaced ──────────────────────────────────────
 
 /// The provider would answer a second call cleanly. Whatever the launch runs after the failed
 /// task, the launch still reports the failure.
@@ -736,7 +736,7 @@ fn assert_did_not_complete(result: Result<(), RuntimeError>, expected: &str) -> 
     }
 }
 
-// ── S4, S5: a failed driver call on an A2A task ───────────────────────────────
+// ── A failed driver call on an A2A task ───────────────────────────────────────
 
 #[test]
 fn s4_a_failed_a2a_task_fails_the_launch_and_its_stream() {
@@ -781,7 +781,7 @@ fn s5_a_failed_a2a_task_reads_failed_on_tasks_get() {
     assert_eq!(task.task_end_status(), "failed");
 }
 
-/// S8 on the door: a spent turn budget leaves the task `failed`, the state its stream already
+/// On the door: a spent turn budget leaves the task `failed`, the state its stream already
 /// closed with.
 #[test]
 fn s8_a_spent_turn_budget_reads_failed_on_tasks_get() {
@@ -802,7 +802,7 @@ fn s8_a_spent_turn_budget_reads_failed_on_tasks_get() {
     assert!(task.named("task_failed").is_empty());
 }
 
-// ── S10: a cancelled task ─────────────────────────────────────────────────────
+// ── A cancelled task ──────────────────────────────────────────────────────────
 
 #[test]
 fn s10_a_cancelled_task_ends_the_launch_canceled() {
@@ -840,7 +840,7 @@ fn s10_a_cancelled_task_ends_the_launch_canceled() {
     assert_eq!(session_end_status(&trace), "canceled");
 }
 
-// ── The ratchet reproduction: `mur trace show` renders the failure ────────────
+// ── `mur trace show` and `mur trace steps` render the failure ─────────────────
 
 #[test]
 fn trace_show_and_steps_render_task_failed() {

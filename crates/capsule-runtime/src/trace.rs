@@ -2171,7 +2171,8 @@ impl TraceWriter {
         cause: &str,
         reason: &str,
     ) -> std::io::Result<()> {
-        let reason = cap_task_failure_reason(reason);
+        let reason = crate::agent::truncate_on_char_boundary(reason, MAX_TASK_FAILURE_REASON_BYTES)
+            .to_string();
         let event = TaskFailedEvent {
             event_type: "task_failed",
             event_id: new_event_id(),
@@ -2674,18 +2675,6 @@ impl TraceWriter {
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await
     }
-}
-
-/// `reason` cut to [`MAX_TASK_FAILURE_REASON_BYTES`] at a character boundary.
-fn cap_task_failure_reason(reason: &str) -> String {
-    if reason.len() <= MAX_TASK_FAILURE_REASON_BYTES {
-        return reason.to_string();
-    }
-    let mut end = MAX_TASK_FAILURE_REASON_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    reason[..end].to_string()
 }
 
 /// One element of `session_start.gateways`: an artifact's credential gateway. Never the key.
