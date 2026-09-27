@@ -1165,6 +1165,7 @@ A call that does not fit is never sent. The refusal appears as:
 | A2A terminal status | `failed`, with the same `spend ceiling reached: …` text as its message |
 | A hook's `run-inference` | `err` with the same text |
 | `task_end`, `session_end` | `exit_status: "spend_ceiling_reached"` |
+| [`mur run`](cli.md#mur-run-status) | `status:  spend_ceiling_reached`, [`E-RUN-040`](diagnostics.md#e-run-040), exit code `1` |
 
 The first refusal latches. That task ends, and every later call and task in the session is refused
 without reaching the provider; the session itself stays up.

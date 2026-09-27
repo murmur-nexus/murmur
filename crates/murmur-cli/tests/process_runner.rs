@@ -715,6 +715,28 @@ fn s9_a_turn_past_max_turns_kills_the_harness() {
     assert_eq!(run.of_type("inference").len(), 2);
     assert_eq!(run.one("harness_exit")["cause"], "max_turns");
     common::assert_dead_within(run.harness_pid(), Duration::from_secs(5));
+
+    // The attempt's `Err` is named in the trace, before the task it ended.
+    let task_failed = run.one("task_failed");
+    assert_eq!(task_failed["cause"], "runtime_error");
+    assert!(
+        task_failed["reason"]
+            .as_str()
+            .unwrap()
+            .contains("max-turns"),
+        "{task_failed}"
+    );
+    let task_end = run.one("task_end");
+    assert_eq!(task_end["exit_status"], "failed");
+    assert_eq!(task_failed["task_id"], task_end["task_id"]);
+    let events = run.events();
+    let position = |event_type: &str| {
+        events
+            .iter()
+            .position(|event| event["event_type"] == event_type)
+            .unwrap()
+    };
+    assert!(position("task_failed") < position("task_end"));
 }
 
 #[test]

@@ -671,6 +671,68 @@ fn persistent_rejection_names_the_credential_source() {
     }
 }
 
+/// A rejection that persists fails a queue capsule that exits after its task: `mur run` exits
+/// non-zero with `status:  failed`, prints `E-RUN-027` once and `E-RUN-040` once, and the trace
+/// names the cause.
+#[test]
+fn persistent_rejection_fails_a_queue_capsule_that_exits_after_its_task() {
+    let upstream = Upstream::start(&[], |_, _| (401, UNAUTHORIZED));
+    let capsule = Capsule::new(
+        &upstream,
+        ApiKey::Reference,
+        "lifecycle:\n  task_acceptance: queue\n  after_task: exit\n",
+    );
+    capsule.set_credential(OLD);
+    let run = Run::of(
+        capsule
+            .mur(None)
+            .env("MURMUR_A2A_TIMEOUT_SECS", "1")
+            .args([
+                "run",
+                "--manifest",
+                capsule.manifest.to_str().unwrap(),
+                "--task",
+                "Say hello.",
+                "--lifecycle-after-task",
+                "exit",
+                "--verbose",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert_eq!(run.output.status.code(), Some(1), "{}", run.context());
+    assert!(run.stdout.contains("status:  failed"), "{}", run.context());
+    assert_eq!(run.lines("error[E-RUN-027]").len(), 1, "{}", run.context());
+    let task_ended = run.lines("error[E-RUN-040]");
+    assert_eq!(task_ended.len(), 1, "{}", run.context());
+    assert!(
+        task_ended[0]
+            .contains("the task ended failed: the provider rejected the inference credential"),
+        "{}",
+        task_ended[0]
+    );
+
+    let trace = run.trace();
+    let task_id = trace
+        .iter()
+        .find(|event| event["event_type"] == "task_start")
+        .expect("task_start")["task_id"]
+        .clone();
+    let failed: Vec<_> = trace
+        .iter()
+        .filter(|event| event["event_type"] == "task_failed" && event["task_id"] == task_id)
+        .collect();
+    assert_eq!(failed.len(), 1, "{trace:?}");
+    assert_eq!(failed[0]["cause"], "credential_rejected");
+    let rejected: Vec<_> = run
+        .credential_events()
+        .into_iter()
+        .filter(|event| event["change"] == "rejected")
+        .collect();
+    assert_eq!(rejected.len(), 1, "the rejection is still recorded");
+}
+
 /// S4: a key only readable at launch warns once on every surface that describes a launch, and a
 /// key from the config neither warns nor loses to the environment.
 #[test]

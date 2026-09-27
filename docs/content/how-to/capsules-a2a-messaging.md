@@ -309,6 +309,12 @@ curl -s -X POST http://localhost:$PORT \
 
 `state` progresses through: `submitted` → `working` → `completed` | `failed` | `canceled`.
 
+| Final `state` | The task |
+|---|---|
+| `completed` | Finished its work. A reply cut off at `inference.max_tokens` still counts |
+| `failed` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
+| `canceled` | Was stopped with `tasks/cancel`, `session/stop` or `mur stop` |
+
 ```json
 {
     "jsonrpc": "2.0",

@@ -744,6 +744,30 @@ Current runtime constraints:
   - under `--capsule`, the root component of the artifact archive, with no project directory searched
 - Agent capsules require `inference.driver.artifact` in `murmur.yaml` on both transports: an [http driver](manifest.md#transport-http) under `transport: http`, a [process driver](manifest.md#process-driver) under `transport: process`. A missing driver exits with `error[E-RUN-005]`; a `transport: process` harness binary that cannot be resolved exits with `error[E-RUN-006]`
 
+### Status and exit code { #mur-run-status }
+
+When the session ends, `mur run` prints one `status:` line and exits:
+
+| `status:` | Exit code | The launch |
+|---|---:|---|
+| `ok` | 0 | Ran, and every task that decides its outcome completed. A turn cut off at `inference.max_tokens` still completes its task: it is marked, and warned about with [`W-RUN-001`](diagnostics.md#w-run-001) |
+| `failed` | 1 | Ran a task that failed — a failed driver call, a response it could not act on, a compaction hook error, a `request-input` wait past `lifecycle.input_timeout_secs` — and prints [`E-RUN-040`](diagnostics.md#e-run-040) with the reason. Also the status of a launch that could not run at all, with that error's own code |
+| `max_turns_reached` | 1 | Ran a task that used every turn `inference.max_turns` allows, and prints `E-RUN-040` |
+| `spend_ceiling_reached` | 1 | Ran a task a [spend ceiling](manifest.md#inference-max-session-tokens) stopped, and prints `E-RUN-040` |
+| `canceled` | 1 | Ran a task that was canceled — by `tasks/cancel`, `session/stop`, [`mur stop`](#mur-stop) or `SIGTERM` — and prints `E-RUN-040` |
+| `trapped` | 1 | Ran a script capsule that stopped with an error |
+
+The tasks that decide the outcome:
+
+- the task `--task` or `task.md` gives the launch, under every lifecycle;
+- an A2A task, when the capsule ends after it (`lifecycle.after_task: exit`, or `task_acceptance: single`), or while the session is closing out.
+
+A peer's task on a capsule that sleeps between tasks reports through `tasks/get` and its stream,
+and leaves the launch's status alone. The first deciding task that did not complete sets the
+status, and no later run replaces it. The trace's `session_end.exit_status` carries the same value.
+
+`--json` prints no `status:` line; the exit code and error are the same.
+
 ### A closed stream { #mur-run-closed-stream }
 
 Under `--json`, standard output carries one line: the readiness line, written the moment the
@@ -775,6 +799,10 @@ An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur s
 |---|---|
 | A second `SIGTERM` | The process exits at once, with status 143 |
 | 20 seconds after the first `SIGTERM` | The process exits with status 143, wherever the teardown is |
+
+A session that was running a task when the first `SIGTERM` arrived, and whose teardown finishes,
+ends `status:  canceled` and exits `1`; one that was waiting for a task ends `status:  ok`. See
+[Status and exit code](#mur-run-status).
 
 A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule,
 and every session that `mur eval run` or `mur new` runs, has no `SIGTERM` handling: the process
@@ -1347,6 +1375,8 @@ Output sections, in the order they are printed:
 | Skill calls | always | Count, ok/error breakdown, success rate, average latency |
 | Shell calls | always | Count, exit code distribution, average latency |
 | Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
+| Cancelled | one or more [`task_canceled`](observability-schemas.md#task-canceled) records | One `task_canceled  at <phase>` row per cancel, naming what was still running |
+| Failed | one or more [`task_failed`](observability-schemas.md#task-failed) records | One `task_failed  <cause>  <task id>  at turn <n>` row per failed attempt, followed by its `reason:` |
 | Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, whether the next attempt `continued` the task's conversation or `restarted` it, the turns it had left, and the hook's feedback — `reopen 1  by gatekeeper  continued, 7 turns left  “…”` |
 | Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
 | Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
@@ -1508,6 +1538,14 @@ What sits beside that row depends on the transport:
 |---|---|
 | [`transport: http`](manifest.md#transport-http) | The `call_denied` row alone. Nothing ran, so there is no `tool_call` or `shell` row |
 | [`transport: process`](manifest.md#transport-process) | The `call_denied` row, and a `tool_call` row marked `✗`. The tool still did not run; the harness reports the refusal it was handed as its own failed call, and that report is recorded |
+
+A failed attempt renders as a `task_failed` row under its task, naming the
+[cause](observability-schemas.md#task-failed) and the first 120 characters of the reason:
+
+```text
+task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
+  task_failed driver_error  {"error":"driver: failed to parse Anthropic response JSON: EOF while parsing a string at line 1 column 38","stop_reason"
+```
 
 A [plan run](observability-schemas.md#plan-events) renders as its own subtree: a `plan_start` row
 naming the plan and its step count, then a `plan_step_start` row as each step is handed to a

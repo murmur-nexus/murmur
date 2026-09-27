@@ -62,6 +62,9 @@ struct Suite {
     /// Held for the life of the process: every agent capsule here addresses it as its inference
     /// endpoint.
     _inference: ScriptedServer,
+    /// The inference endpoint of `failing-worker`: it answers a body cut off mid-JSON, which the
+    /// anthropic driver cannot parse.
+    _failing_inference: ScriptedServer,
 }
 
 fn suite() -> &'static Suite {
@@ -72,6 +75,8 @@ fn suite() -> &'static Suite {
         std::env::set_var(MARKER_VAR, MARKER);
 
         let inference = ScriptedServer::always_replying("parent turn done");
+        let failing_inference =
+            ScriptedServer::always_answering(r#"{"content":[{"type":"text","text":"hel"#);
         let registry_path = home.path().join(".murmur").join("artifacts");
         std::fs::create_dir_all(&registry_path).unwrap();
 
@@ -94,15 +99,35 @@ fn suite() -> &'static Suite {
                 "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    \
                  runtime: driver\n    gateway:\n      endpoint: {url}\n      \
                  api_key: test-key\ncapabilities:\n  \
-                 network:\n    allow: [{endpoint}]\n  \
+                 network:\n    allow: [{endpoint}, {failing}]\n  \
                  env:\n    allow: [{MARKER_VAR}]\n  \
-                 spawn:\n    allow: [worker, waiting-worker, slow-worker]\n\
+                 spawn:\n    allow: [worker, waiting-worker, slow-worker, failing-worker]\n\
                  lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
                  trace:\n  capture: content\n\
                  inference:\n  transport: http\n  model: test-model\n  \
                  driver:\n    artifact: {DRIVER}\n",
                 endpoint = inference.authority(),
+                failing = failing_inference.authority(),
                 url = inference.endpoint,
+            ),
+            None,
+        );
+
+        // An agent child whose every inference call fails, and which exits after its one task:
+        // the session runs and shuts down cleanly, and its task did not complete.
+        common::publish_capsule(
+            &registry_path,
+            "failing-worker",
+            "0.1.0",
+            &format!(
+                "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: \
+                 driver\n    gateway:\n      endpoint: {url}\n      api_key: test-key\n\
+                 capabilities:\n  network:\n    allow: [{endpoint}]\n\
+                 lifecycle:\n  task_acceptance: queue\n  after_task: exit\n\
+                 inference:\n  transport: http\n  model: test-model\n  \
+                 driver:\n    artifact: {DRIVER}\n",
+                endpoint = failing_inference.authority(),
+                url = failing_inference.endpoint,
             ),
             None,
         );
@@ -156,6 +181,7 @@ fn suite() -> &'static Suite {
             credential,
             home,
             _inference: inference,
+            _failing_inference: failing_inference,
         }
     })
 }
@@ -706,6 +732,61 @@ fn parent_sent(parent: &RunningParent, needle: &str) -> bool {
         needle,
     )
     .is_some()
+}
+
+// ── 4b. A child whose task failed ─────────────────────────────────────────────
+
+/// An agent child whose inference fails ends its session cleanly, and reports the delegation as
+/// `error` itself: a task that did not complete is not a delegation that succeeded.
+#[test]
+fn an_agent_child_whose_task_failed_reports_error() {
+    if capsule_runtime::skip_without_host_support("an_agent_child_whose_task_failed_reports_error")
+    {
+        return;
+    }
+    let parent = RunningParent::start();
+    let parent_dir = TempDir::new().unwrap();
+
+    let child = {
+        let _slot = agent_child_slot();
+        launch(
+            parent_dir.path(),
+            "failing-worker",
+            &[],
+            Some(parent.spawner(TrustClass::Trusted)),
+        )
+    };
+    let sent = common::request(
+        "POST",
+        &child.capsule_url,
+        Some(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "message/send",
+                "params": {"message": {
+                    "messageId": "msg-1",
+                    "role": "user",
+                    "parts": [{"text": "Say hello."}]
+                }}
+            })
+            .to_string(),
+        ),
+        &[],
+    );
+    assert!(
+        sent.as_ref()
+            .is_some_and(|sent| sent["result"]["id"].is_string()),
+        "the child took the task: {sent:?}"
+    );
+
+    let completion = wait_for_completion(&child);
+    assert_eq!(
+        completion["status"],
+        DelegationStatus::Error.as_str(),
+        "{completion}"
+    );
+    assert_eq!(completion["reported_by"], Reporter::Child.as_str());
 }
 
 // ── 5. A child that crashes without reporting ─────────────────────────────────

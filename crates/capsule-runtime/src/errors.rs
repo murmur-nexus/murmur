@@ -539,6 +539,19 @@ pub enum RuntimeError {
     #[error("agent loop failed: {0}")]
     AgentLoopFailed(String),
 
+    /// The launch ran, and the task it was run for did not complete. The session itself shut down
+    /// cleanly: everything it records — `out/result.txt`, the trace, a delegated child's
+    /// completion — was written before this was returned.
+    ///
+    /// `exit_status` is the `task_end`/`session_end` vocabulary, never `"ok"`: `"failed"`,
+    /// `"max_turns_reached"`, `"spend_ceiling_reached"` or `"canceled"`. `reason` is never empty;
+    /// for `"failed"` it is the reason the run's `task_failed` trace line carries.
+    #[error("the task ended {exit_status}: {reason}")]
+    TaskDidNotComplete {
+        exit_status: &'static str,
+        reason: String,
+    },
+
     #[error("internal_port {port} is already bound; choose another port or omit internal_port to use an OS-assigned port")]
     PortInUse { port: u16 },
 

@@ -105,8 +105,21 @@ fn result_txt_written_on_error_response() {
         common::stage_agent_session(&home, manifest_path.parent().unwrap(), &manifest_path);
     fs::write(staged.workdir.join("task.md"), "Trigger an error").unwrap();
 
-    let launched = launch_session(staged, |_| {}).expect("agent error response should not trap");
-    assert!(launched.workdir.join("out/result.txt").exists());
+    let workdir = staged.workdir.clone();
+    match launch_session(staged, |_| {}) {
+        Err(capsule_runtime::RuntimeError::TaskDidNotComplete {
+            exit_status,
+            reason,
+        }) => {
+            assert_eq!(exit_status, "failed");
+            assert!(reason.contains("stop_reason 'error'"), "{reason}");
+            assert_eq!(
+                fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
+                format!("error: {reason}")
+            );
+        }
+        other => panic!("an error response fails the task, got {other:?}"),
+    }
 }
 
 fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {

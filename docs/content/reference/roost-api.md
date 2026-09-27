@@ -511,7 +511,7 @@ other path.
 
 | Situation | Reporter | `status` |
 |---|---|---|
-| The child's session ended | The child, at the end of its own session | `ok` or `error` |
+| The child's session ended | The child, at the end of its own session | `ok` when its task completed; `error` when the task failed, spent `inference.max_turns`, hit a spend ceiling or was canceled, or the session itself failed. The child's own `task_end` holds the precise status |
 | The child's process ended without recording a completion | The parent's launcher | `crashed` |
 | The parent ended the delegation itself | The parent's launcher, recorded and posted to nobody | `terminated` |
 | The child was still running at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) | The parent's launcher | `terminated` |

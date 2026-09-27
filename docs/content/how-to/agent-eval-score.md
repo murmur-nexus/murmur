@@ -172,7 +172,7 @@ The relevant manifest options are:
 
 | Scorer type | Passes when |
 |---|---|
-| `exit_ok` | The session exited with `status: ok` (not `failed` or `max_turns_reached`) |
+| `exit_ok` | The session ended with `status: ok`: its task completed, rather than failing, spending `inference.max_turns`, hitting a spend ceiling or being canceled. See [Status and exit code](../reference/cli.md#mur-run-status) |
 | `max_turns` | The session used at most `max` inference turns |
 | `max_tokens` | Total input + output tokens did not exceed `max` |
 | `tool_sequence` | The `expected` list is a subsequence of the observed tool calls (same order, gaps allowed) |

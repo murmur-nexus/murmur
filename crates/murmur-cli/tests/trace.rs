@@ -520,8 +520,11 @@ fn trace_session_end_written_on_failed_exit() {
     let workdir = staged.workdir.clone();
     fs::write(workdir.join("task.md"), "Echo something.").unwrap();
 
-    // Session may Ok or Err depending on how the driver reports the network failure.
-    let _ = launch_session(staged, |_| {});
+    let launched = launch_session(staged, |_| {});
+    assert!(
+        launched.is_err(),
+        "a session whose task failed does not launch successfully"
+    );
 
     assert!(
         workdir.join("trace.jsonl").exists(),
