@@ -856,10 +856,11 @@ pub fn is_reserved_version(version: &str) -> bool {
 
 /// SHA-256 of `bytes` as 64 lowercase hex characters.
 ///
-/// This is the exact form `murmur.lock` pins and the store's `.sha256` sidecars hold, so any change
-/// to the output invalidates every existing lock and store; the FIPS 180-2 known-answer tests in
+/// This is the exact form `murmur.lock` pins and the store's `.sha256` sidecars hold: any change to
+/// the output invalidates every existing lock and store, and the FIPS 180-2 known-answer tests in
 /// this file pin it. The engine is `ring`, whose SHA-256 selects SIMD or SHA-extension code at run
-/// time: staging hashes every artifact payload and compiled form on each launch, several MB in all.
+/// time. Staging hashes every artifact payload and compiled form on each launch, and a pure-Rust
+/// SHA-256 built at the release profile's `opt-level = "z"` hashes several times slower.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     lowercase_hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
@@ -867,11 +868,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// SHA-256 of everything `reader` yields, returned with the number of bytes read.
 ///
-/// The streaming companion to [`sha256_hex`], with the same engine and the same 64-lowercase-hex
-/// output, pinned by the same known-answer tests: a caller that must hash a file it cannot afford
-/// to hold in memory — a resource-plane listing walking a subtree it does not bound — gets the
-/// digest `murmur.lock` and the `.sha256` sidecars use without a second hasher entering the
-/// workspace.
+/// The streaming companion to [`sha256_hex`]: same engine, same output, pinned by the same
+/// known-answer tests. A caller hashing a file too large to hold in memory uses this rather than a
+/// second hasher, so its digest matches the ones `murmur.lock` and the `.sha256` sidecars hold.
 pub fn sha256_hex_of_reader(reader: &mut impl std::io::Read) -> std::io::Result<(u64, String)> {
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = [0u8; 64 * 1024];
