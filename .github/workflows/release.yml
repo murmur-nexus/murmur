@@ -171,19 +171,6 @@ jobs:
           sha256sum "mur-${VERSION}-"* "mur-roost-${VERSION}-"* > checksums.txt
           cat checksums.txt
 
-          # SHA256 for release notes
-          NOTES="## Checksums\n\`\`\`"
-          for f in "mur-${VERSION}-"* "mur-roost-${VERSION}-"*; do
-            HASH=$(sha256sum "$f" | awk '{print $1}')
-            NOTES="${NOTES}\nsha256  ${f}  ${HASH}"
-          done
-          NOTES="${NOTES}\n\`\`\`"
-          {
-            echo "notes<<EOF"
-            printf "%b\n" "$NOTES"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
           # SHA512 for changelog (space-separated to work with shell expansion)
           BINARIES_ARGS=""
           for f in "mur-${VERSION}-"* "mur-roost-${VERSION}-"*; do
@@ -241,15 +228,11 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION_NO_V="${VERSION#v}"
 
-          # The release body is the generated changelog with the SHA256 block
-          # appended. Publishing only the checksums left the release page and
-          # the committed CHANGELOG/ file saying different things, and the
-          # changelog readable only by whoever downloaded the workflow artifact.
-          cat "CHANGELOG/v${VERSION_NO_V}.md" > release-body.md
-          printf '\n\n' >> release-body.md
-          cat >> release-body.md <<'CHECKSUMS'
-          ${{ steps.checksums.outputs.notes }}
-          CHECKSUMS
+          # The release body is only the checksums heading; the hashes are in
+          # the checksums.txt asset. Release notes are curated from the
+          # generated changelog artifact and committed to CHANGELOG/, which is
+          # the published source, so the release page does not carry them.
+          printf '## Checksums\n' > release-body.md
 
           gh release create "${{ github.ref_name }}" \
             "mur-${VERSION_NO_V}-darwin-aarch64" \
