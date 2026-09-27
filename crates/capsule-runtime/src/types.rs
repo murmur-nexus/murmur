@@ -473,6 +473,10 @@ pub struct StagedSession {
     /// later task of the same launch does.
     pub(crate) forget_session: bool,
     pub(crate) engine: Engine,
+    /// The compiled-form cache handle built for [`Self::engine`] and the capsule's writable root.
+    /// A mid-session `manage.pull()` compiles through it, so a pulled component is stored and
+    /// looked up under the same name a staged one is.
+    pub(crate) compiled_forms: crate::compiled_forms::CompiledForms,
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,
     pub(crate) tool_components: HashMap<String, Component>,

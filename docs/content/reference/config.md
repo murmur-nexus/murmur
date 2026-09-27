@@ -192,7 +192,7 @@ chmod 600 ~/.murmur/config.yaml
 | `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
 | `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
-| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so later launches skip compiling. An entry not read in 30 days is deleted; deleting the directory is safe | `mur run` |
+| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so later launches skip compiling. An entry not read in 30 days is deleted; deleting the directory is safe | `mur run`, at staging and on a capsule's `manage.pull()` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
 
 `mur run` uses a file in `compiled/` only when all of these hold, and otherwise compiles the
