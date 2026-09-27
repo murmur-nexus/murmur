@@ -46,6 +46,7 @@ use crate::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
     cgroup,
+    compiled_forms::CompiledForms,
     containment::{achieved_containment_class, check_containment_floor},
     credential_gateway::{CredentialGateway, GatewayMetering, GatewayTable},
     delegation::SpawnerHandle,
@@ -818,6 +819,13 @@ pub fn stage_session(
     );
 
     let engine = build_engine()?;
+    let compiled_forms = CompiledForms::new(
+        &engine,
+        request
+            .workdir
+            .as_deref()
+            .unwrap_or(&request.manifest_dir.join("workdir")),
+    );
     // Start ticking before the first guest runs: `dispatch_stage` below invokes on-stage
     // hooks, which are already subject to the epoch deadline.
     let epoch_ticker = EpochTicker::spawn(&engine);
@@ -974,13 +982,13 @@ pub fn stage_session(
                         )?;
                         let tool_wasm =
                             extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
-                        let tool_component = Component::new(&engine, tool_wasm).map_err(|err| {
-                            RuntimeError::ToolComponentCompile {
+                        let tool_component = compiled_forms
+                            .compile(&engine, &resolved.sha256, &tool_wasm)
+                            .map_err(|err| RuntimeError::ToolComponentCompile {
                                 name: artifact.name.clone(),
                                 version: resolved_version.clone(),
                                 message: err.to_string(),
-                            }
-                        })?;
+                            })?;
                         tool_components.insert(artifact.name.clone(), tool_component);
                     }
                 }
@@ -1005,13 +1013,13 @@ pub fn stage_session(
                 )?;
                 // A process driver is granted nothing: no `stage_artifact_grant`, and it never
                 // enters `tool_components`, so nothing can dispatch it as a tool.
-                let driver_component = Component::new(&engine, driver_wasm).map_err(|err| {
-                    RuntimeError::ToolComponentCompile {
+                let driver_component = compiled_forms
+                    .compile(&engine, &resolved.sha256, &driver_wasm)
+                    .map_err(|err| RuntimeError::ToolComponentCompile {
                         name: artifact.name.clone(),
                         version: resolved_version.clone(),
                         message: err.to_string(),
-                    }
-                })?;
+                    })?;
                 process_driver = Some((
                     artifact.name.clone(),
                     resolved_version.clone(),
@@ -1044,13 +1052,13 @@ pub fn stage_session(
                         contracts.as_ref(),
                     )?;
                 }
-                let tool_component = Component::new(&engine, tool_wasm).map_err(|err| {
-                    RuntimeError::ToolComponentCompile {
+                let tool_component = compiled_forms
+                    .compile(&engine, &resolved.sha256, &tool_wasm)
+                    .map_err(|err| RuntimeError::ToolComponentCompile {
                         name: artifact.name.clone(),
                         version: resolved_version.clone(),
                         message: err.to_string(),
-                    }
-                })?;
+                    })?;
                 tool_components.insert(artifact.name.clone(), tool_component);
             }
             ArtifactRuntime::Hook => {
@@ -1062,13 +1070,13 @@ pub fn stage_session(
                 })?;
                 let hook_wasm =
                     extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
-                let hook_component = Component::new(&engine, hook_wasm).map_err(|err| {
-                    RuntimeError::ToolComponentCompile {
+                let hook_component = compiled_forms
+                    .compile(&engine, &resolved.sha256, &hook_wasm)
+                    .map_err(|err| RuntimeError::ToolComponentCompile {
                         name: artifact.name.clone(),
                         version: resolved_version.clone(),
                         message: err.to_string(),
-                    }
-                })?;
+                    })?;
                 // The grant comes from `artifact` — the operator's own manifest entry for
                 // this hook — and never from `manifest_yaml`, the hook's bundled manifest
                 // parsed just above for its behavioral contract. A hook pulled from a
@@ -1230,7 +1238,12 @@ pub fn stage_session(
             ));
         } else {
             Some(
-                Component::new(&engine, &request.capsule_component_bytes)
+                compiled_forms
+                    .compile(
+                        &engine,
+                        &murmur_artifact::sha256_hex(&request.capsule_component_bytes),
+                        &request.capsule_component_bytes,
+                    )
                     .map_err(|err| RuntimeError::CapsuleCompile(err.to_string()))?,
             )
         };
