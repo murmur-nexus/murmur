@@ -201,7 +201,12 @@ new artifact. `search` and `remove` are unimplemented: calling either returns an
 hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/` and
 updates `murmur.lock`. A hash mismatch, or a version or hash that conflicts with an existing
 `murmur.lock` pin, returns an error before anything is written. A pulled artifact is immediately
-visible to `list()` and `describe()` and, for WASM tools, callable via `invoke()`.
+visible to `list()` and `describe()`. A pulled WASM tool is callable via `invoke()` only when the
+manifest's `artifacts` list declares it.
+
+A pulled WASM artifact is compiled once per version and kept in
+[`~/.murmur/compiled`](config.md#murmur-home-permissions), shared with `mur run`, so a later pull
+or launch of that version, in any session, skips compiling it.
 
 ---
 

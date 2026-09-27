@@ -9,6 +9,15 @@
 //! mismatched form is compiled again through `Component::new` and rewritten, so the cache never
 //! fails a launch and never changes a compile error.
 //!
+//! An artifact's key must be a sha256 that `verify_sha256` has just recomputed over the payload
+//! bytes in hand, so a form named `H` is always the `extract_root_wasm` component of the payload
+//! whose bytes hash to `H`, for this engine. `runtime::stage_session` and `manage::Host::pull`
+//! both key this way and share the one [`CompiledForms`] handle staging built for the session.
+//! What accepts a payload differs, the `murmur.lock` pin on staging and the registry's reported
+//! hash on a pull, but never what the key names. A form either caller writes is therefore correct
+//! for any later caller that has accepted payload `H`, and loading it grants that payload nothing
+//! its caller had not.
+//!
 //! The directory sits beside `~/.murmur/artifacts`, not in it, so nothing that walks the artifact
 //! store sees it. Two `mur` builds with different engines keep separate forms, since the engine
 //! key is part of every file name; [`prune_stale`] bounds what accumulates.
@@ -32,6 +41,7 @@ const COMPILED_DIR: &str = "compiled";
 /// How long an entry of [`COMPILED_DIR`] survives without being read or written.
 const FORM_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+#[derive(Clone)]
 pub(crate) struct CompiledForms {
     /// The directory the staged capsule's writable root is created in. A murmur home or
     /// compiled-forms directory at or beneath it is neither read nor written.
@@ -52,7 +62,7 @@ impl CompiledForms {
     /// The component for `wasm`. Errors exactly as `Component::new(engine, wasm)` does.
     ///
     /// `key_sha256` is the lowercase hex sha256 of bytes that uniquely determine `wasm`: an
-    /// artifact payload staging has verified, or `wasm` itself. A key that is not 64 lowercase hex
+    /// artifact payload the caller has verified, or `wasm` itself. A key that is not 64 lowercase hex
     /// characters compiles without touching the cache.
     pub(crate) fn compile(
         &self,

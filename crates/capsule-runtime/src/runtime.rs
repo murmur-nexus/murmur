@@ -1515,6 +1515,7 @@ pub fn stage_session(
         resume: request.resume,
         forget_session: request.forget_session,
         engine,
+        compiled_forms,
         capsule_component,
         tool_components,
         process_driver: staged_process_driver,
@@ -2000,6 +2001,7 @@ fn launch(
         let trace_system_prompt = system_prompt.clone();
         let system_prompt_overridden = staged.system_prompt_overridden;
         let registry_for_pull = Arc::clone(&staged.registry);
+        let compiled_forms_for_pull = staged.compiled_forms.clone();
         let lock_path_for_pull = staged.manifest_dir.join("murmur.lock");
 
         // task.md must live where the agent's own tools are preopened (accessible_workdir),
@@ -2247,6 +2249,7 @@ fn launch(
                         input_timeout_secs: effective_lifecycle.input_timeout_secs,
                         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
                         registry: registry_for_pull,
+                        compiled_forms: compiled_forms_for_pull,
                         lock_path: lock_path_for_pull,
                         driver_continuation_id: None,
                         driver_continuation_context_id: None,
@@ -3201,6 +3204,7 @@ fn launch(
         gateways: staged.gateways.clone(),
         spend: Arc::clone(&staged.spend),
         engine: staged.engine.clone(),
+        compiled_forms: staged.compiled_forms.clone(),
         workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
         tool_components: staged.tool_components,
@@ -4859,6 +4863,10 @@ pub(crate) struct CapsuleStoreState {
     /// it; hooks' `run-inference` and the gateway hold clones of the same account.
     pub(crate) spend: Arc<SpendMeter>,
     pub(crate) engine: Engine,
+    /// Shared from [`StagedSession::compiled_forms`]. `manage.pull()` compiles through it rather
+    /// than a handle built from [`Self::workdir`]: it carries the capsule writable root every
+    /// session directory is created in, which the per-session `workdir` does not.
+    pub(crate) compiled_forms: CompiledForms,
     pub(crate) workdir: PathBuf,
     pub(crate) accessible_workdir: PathBuf,
     pub(crate) tool_components: HashMap<String, Component>,
@@ -5238,7 +5246,9 @@ impl manage::Host for CapsuleStoreState {
             RuntimeType::Wasm => {
                 let wasm_bytes = extract_root_wasm(&name, &version, &resolved.bytes)
                     .map_err(|err| err.to_string())?;
-                let component = Component::new(&self.engine, &wasm_bytes)
+                let component = self
+                    .compiled_forms
+                    .compile(&self.engine, &resolved.sha256, &wasm_bytes)
                     .map_err(|err| format!("failed to compile pulled component '{name}': {err}"))?;
                 (
                     ArtifactRuntime::Tool,
@@ -10163,6 +10173,7 @@ inference:
             inference_env: Vec::new(),
             gateways: GatewayTable::default(),
             spend: Arc::new(SpendMeter::unlimited()),
+            compiled_forms: CompiledForms::new(&engine, &workdir),
             engine,
             workdir: workdir.clone(),
             accessible_workdir: workdir,
@@ -10278,15 +10289,30 @@ inference:
         );
     }
 
+    /// An in-test registry serving `bytes` for every name and version: a skill, or a WASM tool
+    /// when built with [`Self::wasm_tool`]. `sha256` is what the registry reports, which need not
+    /// be the hash of `bytes`.
     struct FakeSkillRegistry {
         bytes: Vec<u8>,
         sha256: String,
+        runtime: RuntimeType,
     }
 
     impl FakeSkillRegistry {
         fn new(bytes: Vec<u8>) -> Self {
             let sha256 = murmur_artifact::sha256_hex(&bytes);
-            Self { bytes, sha256 }
+            Self {
+                bytes,
+                sha256,
+                runtime: RuntimeType::Static,
+            }
+        }
+
+        fn wasm_tool(bytes: Vec<u8>) -> Self {
+            Self {
+                runtime: RuntimeType::Wasm,
+                ..Self::new(bytes)
+            }
         }
     }
 
@@ -10296,8 +10322,12 @@ inference:
                 meta: ArtifactMeta {
                     name: name.to_string(),
                     version: version.to_string(),
-                    runtime: RuntimeType::Static,
-                    artifact_runtime: "skill".to_string(),
+                    runtime: self.runtime,
+                    artifact_runtime: match self.runtime {
+                        RuntimeType::Wasm => "tool",
+                        _ => "skill",
+                    }
+                    .to_string(),
                     platforms: Vec::new(),
                     description: None,
                     tags: Vec::new(),
@@ -10539,6 +10569,620 @@ inference:
             entry.sha256.any.as_deref().unwrap(),
             "pinned-hash-from-earlier-pull"
         );
+    }
+
+    // ── manage.pull() through the compiled-form cache ─────────────────────────
+    //
+    // Every test here pulls a WASM artifact, so each runs its inner half under a scratch `HOME`:
+    // the cache lives in `$HOME/.murmur/compiled`, and no test may touch the real one.
+
+    const PULLED_WASM_TOOL: &str = "wasm-tool";
+
+    /// Runs `runtime::tests::<inner>` in a child process whose `HOME` is a fresh tempdir.
+    fn pull_under_scratch_home(inner: &str) {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(&format!("runtime::tests::{inner}"), home.path());
+    }
+
+    /// A component exporting one empty instance under `iface`, in the binary format.
+    fn iface_component_bytes(iface: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            "(component (instance $i) (export \"{iface}\" (instance $i)))"
+        ))
+        .expect("component WAT parses")
+    }
+
+    /// A `.mur.zip` for tool `name` whose root component is `root_wasm`.
+    fn wasm_tool_zip(name: &str, root_wasm: &[u8]) -> Vec<u8> {
+        zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                format!("name: {name}\nversion: 1.0.0\nruntime: tool\n").as_bytes(),
+            ),
+            ("tool.wasm", root_wasm),
+        ])
+    }
+
+    /// One project directory whose sessions pull from one registry.
+    struct WasmPullProject {
+        _dir: TempDir,
+        workdir: PathBuf,
+        lock_path: PathBuf,
+        registry: Arc<FakeSkillRegistry>,
+    }
+
+    impl WasmPullProject {
+        fn new(registry: FakeSkillRegistry) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let workdir = dir.path().join("workdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let lock_path = dir.path().join("murmur.lock");
+            Self {
+                _dir: dir,
+                workdir,
+                lock_path,
+                registry: Arc::new(registry),
+            }
+        }
+
+        /// A project whose registry serves `wasm-tool` exporting `murmur-test:pull/first`.
+        fn exporting_first() -> Self {
+            Self::new(FakeSkillRegistry::wasm_tool(wasm_tool_zip(
+                PULLED_WASM_TOOL,
+                &iface_component_bytes("murmur-test:pull/first"),
+            )))
+        }
+
+        /// A new session on this project: its own engine, the project's workdir and lock.
+        fn session(&self) -> CapsuleStoreState {
+            build_test_state(
+                self.registry.clone(),
+                self.workdir.clone(),
+                self.lock_path.clone(),
+            )
+        }
+
+        /// The sha256 `murmur.lock` pins for `name`.
+        fn locked_sha256(&self, name: &str) -> String {
+            read_lockfile(&self.lock_path)
+                .unwrap()
+                .artifact_for(name)
+                .unwrap()
+                .sha256
+                .any
+                .clone()
+                .unwrap()
+        }
+    }
+
+    fn pull(state: &mut CapsuleStoreState, name: &str) -> Result<manage::ArtifactSummary, String> {
+        manage::Host::pull(state, name.to_string(), "1.0.0".to_string())
+    }
+
+    fn export_names(engine: &Engine, component: &Component) -> Vec<String> {
+        component
+            .component_type()
+            .exports(engine)
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// What `state` registered for `wasm-tool` exports.
+    fn pulled_exports(state: &CapsuleStoreState) -> Vec<String> {
+        export_names(&state.engine, &state.tool_components[PULLED_WASM_TOOL])
+    }
+
+    fn scratch_compiled_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+            .join(".murmur")
+            .join("compiled")
+    }
+
+    /// Every `.cwasm` entry directly in `dir`; none when `dir` cannot be read.
+    fn cwasm_entries(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "cwasm"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The single form in the scratch home's compiled directory.
+    fn the_form() -> PathBuf {
+        let mut forms = cwasm_entries(&scratch_compiled_dir());
+        assert_eq!(forms.len(), 1, "expected exactly one form: {forms:?}");
+        forms.remove(0)
+    }
+
+    fn form_sidecar(form: &Path) -> PathBuf {
+        form.with_extension("cwasm.sha256")
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// `path`'s inode, with the file held open so its inode cannot be freed and handed to the
+    /// file that replaces it.
+    fn held_inode(path: &Path) -> (u64, fs::File) {
+        (inode(path), fs::File::open(path).unwrap())
+    }
+
+    fn assert_sidecar_matches(form: &Path) {
+        assert_eq!(
+            fs::read_to_string(form_sidecar(form)).unwrap(),
+            murmur_artifact::sha256_hex(&fs::read(form).unwrap())
+        );
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A valid compiled form, for `build_engine()`, of a component exporting
+    /// `murmur-test:pull/planted`, which the pulled payload does not export.
+    fn planted_form_bytes() -> Vec<u8> {
+        Component::new(
+            &build_engine().unwrap(),
+            iface_component_bytes("murmur-test:pull/planted"),
+        )
+        .unwrap()
+        .serialize()
+        .unwrap()
+    }
+
+    /// Pulls `wasm-tool` in a first session, so its form is stored, and returns that form.
+    fn first_session_stores_the_form(project: &WasmPullProject) -> PathBuf {
+        let mut state = project.session();
+        pull(&mut state, PULLED_WASM_TOOL).expect("session 1 pull");
+        assert_eq!(pulled_exports(&state), ["murmur-test:pull/first"]);
+        the_form()
+    }
+
+    /// Pulls `wasm-tool` in a second session and checks it registered the payload's own
+    /// component.
+    fn second_session_pulls_first(project: &WasmPullProject) {
+        let mut state = project.session();
+        pull(&mut state, PULLED_WASM_TOOL).expect("session 2 pull");
+        assert_eq!(pulled_exports(&state), ["murmur-test:pull/first"]);
+    }
+
+    #[test]
+    fn a_pull_whose_form_is_stored_loads_it_instead_of_compiling() {
+        pull_under_scratch_home("inner_a_pull_whose_form_is_stored_loads_it");
+    }
+
+    #[test]
+    #[ignore = "run by a_pull_whose_form_is_stored_loads_it_instead_of_compiling"]
+    fn inner_a_pull_whose_form_is_stored_loads_it() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+
+        let planted = planted_form_bytes();
+        crate::murmur_home::write_private_file(&form, &planted).unwrap();
+        crate::murmur_home::write_private_file(
+            &form_sidecar(&form),
+            murmur_artifact::sha256_hex(&planted).as_bytes(),
+        )
+        .unwrap();
+        let planted_inode = inode(&form);
+
+        let mut state = project.session();
+        pull(&mut state, PULLED_WASM_TOOL).expect("session 2 pull");
+        assert_eq!(pulled_exports(&state), ["murmur-test:pull/planted"]);
+        assert_eq!(inode(&form), planted_inode);
+    }
+
+    #[test]
+    fn a_pull_stores_its_form_and_the_next_session_loads_it() {
+        pull_under_scratch_home("inner_a_pull_stores_its_form_and_the_next_session_loads_it");
+    }
+
+    #[test]
+    #[ignore = "run by a_pull_stores_its_form_and_the_next_session_loads_it"]
+    fn inner_a_pull_stores_its_form_and_the_next_session_loads_it() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+
+        assert_eq!(crate::murmur_home::mode_of(&scratch_compiled_dir()), 0o700);
+        let key = project.locked_sha256(PULLED_WASM_TOOL);
+        let file_name = form.file_name().unwrap().to_str().unwrap();
+        let engine_key = file_name
+            .strip_prefix(&format!("{key}-"))
+            .and_then(|rest| rest.strip_suffix(".cwasm"))
+            .unwrap_or_else(|| panic!("{file_name} is not named for {key}"));
+        assert_eq!(engine_key.len(), 16, "{file_name}");
+        assert!(
+            engine_key
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+            "{file_name}"
+        );
+        assert_eq!(crate::murmur_home::mode_of(&form), 0o600);
+        assert_eq!(crate::murmur_home::mode_of(&form_sidecar(&form)), 0o600);
+        assert_sidecar_matches(&form);
+        let stored_inode = inode(&form);
+
+        second_session_pulls_first(&project);
+        assert_eq!(inode(&form), stored_inode);
+    }
+
+    #[test]
+    fn a_form_written_by_a_pull_is_loaded_by_the_staging_entry_point() {
+        pull_under_scratch_home("inner_a_form_written_by_a_pull_is_loaded_by_staging");
+    }
+
+    #[test]
+    #[ignore = "run by a_form_written_by_a_pull_is_loaded_by_the_staging_entry_point"]
+    fn inner_a_form_written_by_a_pull_is_loaded_by_staging() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        first_session_stores_the_form(&project);
+
+        // Bytes that do not compile: only a stored form can make this call succeed.
+        let engine = build_engine().unwrap();
+        let component = CompiledForms::new(&engine, &project.workdir)
+            .compile(
+                &engine,
+                &project.locked_sha256(PULLED_WASM_TOOL),
+                b"\0asm\x01\0\0\0",
+            )
+            .expect("the pulled form loads");
+        assert_eq!(
+            export_names(&engine, &component),
+            ["murmur-test:pull/first"]
+        );
+    }
+
+    #[test]
+    fn a_corrupted_pulled_form_is_recompiled_and_rewritten() {
+        pull_under_scratch_home("inner_a_corrupted_pulled_form_is_recompiled_and_rewritten");
+    }
+
+    #[test]
+    #[ignore = "run by a_corrupted_pulled_form_is_recompiled_and_rewritten"]
+    fn inner_a_corrupted_pulled_form_is_recompiled_and_rewritten() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        let (old_inode, _held) = held_inode(&form);
+        let mut bytes = fs::read(&form).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(&form, &bytes).unwrap();
+
+        second_session_pulls_first(&project);
+        assert_ne!(inode(&the_form()), old_inode);
+        assert_sidecar_matches(&the_form());
+    }
+
+    #[test]
+    fn a_pulled_form_without_its_sidecar_is_recompiled() {
+        pull_under_scratch_home("inner_a_pulled_form_without_its_sidecar_is_recompiled");
+    }
+
+    #[test]
+    #[ignore = "run by a_pulled_form_without_its_sidecar_is_recompiled"]
+    fn inner_a_pulled_form_without_its_sidecar_is_recompiled() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        let (old_inode, _held) = held_inode(&form);
+        fs::remove_file(form_sidecar(&form)).unwrap();
+
+        second_session_pulls_first(&project);
+        assert_ne!(inode(&the_form()), old_inode);
+        assert_sidecar_matches(&the_form());
+    }
+
+    #[test]
+    fn a_pulled_form_wider_than_owner_only_is_rewritten_owner_only() {
+        pull_under_scratch_home("inner_a_pulled_form_wider_than_owner_only_is_rewritten");
+    }
+
+    #[test]
+    #[ignore = "run by a_pulled_form_wider_than_owner_only_is_rewritten_owner_only"]
+    fn inner_a_pulled_form_wider_than_owner_only_is_rewritten() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        let (old_inode, _held) = held_inode(&form);
+        set_mode(&form, 0o644);
+
+        second_session_pulls_first(&project);
+        assert_eq!(crate::murmur_home::mode_of(&the_form()), 0o600);
+        assert_ne!(inode(&the_form()), old_inode);
+    }
+
+    #[test]
+    fn a_pulled_form_whose_sidecar_is_wider_than_owner_only_is_rewritten() {
+        pull_under_scratch_home("inner_a_pulled_form_whose_sidecar_is_wider_than_owner_only");
+    }
+
+    #[test]
+    #[ignore = "run by a_pulled_form_whose_sidecar_is_wider_than_owner_only_is_rewritten"]
+    fn inner_a_pulled_form_whose_sidecar_is_wider_than_owner_only() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        let (old_inode, _held) = held_inode(&form);
+        set_mode(&form_sidecar(&form), 0o644);
+
+        second_session_pulls_first(&project);
+        assert_ne!(inode(&the_form()), old_inode);
+        assert_eq!(
+            crate::murmur_home::mode_of(&form_sidecar(&the_form())),
+            0o600
+        );
+        assert_sidecar_matches(&the_form());
+    }
+
+    #[test]
+    fn a_pulled_form_reached_through_a_symlink_is_not_loaded() {
+        pull_under_scratch_home("inner_a_pulled_form_reached_through_a_symlink_is_not_loaded");
+    }
+
+    #[test]
+    #[ignore = "run by a_pulled_form_reached_through_a_symlink_is_not_loaded"]
+    fn inner_a_pulled_form_reached_through_a_symlink_is_not_loaded() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        // An owner-only form that would load if the link were followed, with the sidecar at the
+        // link's name matching it.
+        let planted = planted_form_bytes();
+        let target = scratch_compiled_dir()
+            .parent()
+            .unwrap()
+            .join("planted.cwasm");
+        crate::murmur_home::write_private_file(&target, &planted).unwrap();
+        fs::remove_file(&form).unwrap();
+        std::os::unix::fs::symlink(&target, &form).unwrap();
+        crate::murmur_home::write_private_file(
+            &form_sidecar(&form),
+            murmur_artifact::sha256_hex(&planted).as_bytes(),
+        )
+        .unwrap();
+
+        second_session_pulls_first(&project);
+        assert!(!fs::symlink_metadata(&form).unwrap().is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), planted);
+        assert_sidecar_matches(&form);
+    }
+
+    #[test]
+    fn a_pull_neither_reads_nor_writes_a_symlinked_compiled_dir() {
+        pull_under_scratch_home("inner_a_pull_neither_reads_nor_writes_a_symlinked_compiled_dir");
+    }
+
+    #[test]
+    #[ignore = "run by a_pull_neither_reads_nor_writes_a_symlinked_compiled_dir"]
+    fn inner_a_pull_neither_reads_nor_writes_a_symlinked_compiled_dir() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        first_session_stores_the_form(&project);
+        let compiled = scratch_compiled_dir();
+        let elsewhere = compiled
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("elsewhere");
+        fs::rename(&compiled, &elsewhere).unwrap();
+        set_mode(&elsewhere, 0o755);
+        std::os::unix::fs::symlink(&elsewhere, &compiled).unwrap();
+        let entries = || {
+            let mut entries: Vec<(std::ffi::OsString, u64, Vec<u8>)> = fs::read_dir(&elsewhere)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    (
+                        path.file_name().unwrap().to_owned(),
+                        inode(&path),
+                        fs::read(&path).unwrap(),
+                    )
+                })
+                .collect();
+            entries.sort();
+            entries
+        };
+        let before = entries();
+
+        second_session_pulls_first(&project);
+        assert!(fs::symlink_metadata(&compiled).unwrap().is_symlink());
+        assert_eq!(crate::murmur_home::mode_of(&elsewhere), 0o755);
+        assert_eq!(entries(), before);
+    }
+
+    #[test]
+    fn a_pull_narrows_a_widened_compiled_dir_and_rewrites_its_form() {
+        pull_under_scratch_home("inner_a_pull_narrows_a_widened_compiled_dir");
+    }
+
+    #[test]
+    #[ignore = "run by a_pull_narrows_a_widened_compiled_dir_and_rewrites_its_form"]
+    fn inner_a_pull_narrows_a_widened_compiled_dir() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let project = WasmPullProject::exporting_first();
+        let form = first_session_stores_the_form(&project);
+        let (old_inode, _held) = held_inode(&form);
+        set_mode(&scratch_compiled_dir(), 0o755);
+
+        second_session_pulls_first(&project);
+        assert_eq!(crate::murmur_home::mode_of(&scratch_compiled_dir()), 0o700);
+        assert_ne!(inode(&the_form()), old_inode);
+    }
+
+    #[test]
+    fn a_pull_writes_no_form_under_a_home_inside_the_capsule_root() {
+        let project = tempfile::tempdir().unwrap();
+        let home = project.path().join("workdir").join("home");
+        fs::create_dir_all(&home).unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::inner_a_pull_writes_no_form_under_a_home_inside_the_capsule_root",
+            &home,
+        );
+    }
+
+    #[test]
+    #[ignore = "run by a_pull_writes_no_form_under_a_home_inside_the_capsule_root"]
+    fn inner_a_pull_writes_no_form_under_a_home_inside_the_capsule_root() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let capsule_root = home.parent().unwrap().to_path_buf();
+        // The home is beneath the capsule root but beside this session's own directory, as
+        // `<root>/home` is beside `<root>/<session_id>`.
+        let session_dir = capsule_root.join("ses_test");
+        fs::create_dir_all(&session_dir).unwrap();
+        let registry = Arc::new(FakeSkillRegistry::wasm_tool(wasm_tool_zip(
+            PULLED_WASM_TOOL,
+            &iface_component_bytes("murmur-test:pull/first"),
+        )));
+        let mut state = build_test_state(
+            registry,
+            session_dir,
+            capsule_root.parent().unwrap().join("murmur.lock"),
+        );
+        state.compiled_forms = CompiledForms::new(&state.engine, &capsule_root);
+
+        pull(&mut state, PULLED_WASM_TOOL).expect("pull");
+        assert_eq!(pulled_exports(&state), ["murmur-test:pull/first"]);
+        assert!(!scratch_compiled_dir().exists());
+    }
+
+    #[test]
+    fn an_unusable_compiled_path_never_fails_a_pull() {
+        pull_under_scratch_home("inner_an_unusable_compiled_path_never_fails_a_pull");
+    }
+
+    #[test]
+    #[ignore = "run by an_unusable_compiled_path_never_fails_a_pull"]
+    fn inner_an_unusable_compiled_path_never_fails_a_pull() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let compiled = scratch_compiled_dir();
+        crate::murmur_home::wide_dir(compiled.parent().unwrap(), 0o700);
+        fs::write(&compiled, b"not a directory").unwrap();
+        let project = WasmPullProject::exporting_first();
+
+        let mut state = project.session();
+        pull(&mut state, PULLED_WASM_TOOL).expect("pull");
+        assert_eq!(pulled_exports(&state), ["murmur-test:pull/first"]);
+        assert_eq!(
+            project.locked_sha256(PULLED_WASM_TOOL),
+            project.registry.sha256
+        );
+        assert_eq!(fs::read(&compiled).unwrap(), b"not a directory");
+    }
+
+    #[test]
+    fn a_pull_that_fails_to_compile_errors_as_before_and_stores_nothing() {
+        pull_under_scratch_home("inner_a_pull_that_fails_to_compile_errors_as_before");
+    }
+
+    #[test]
+    #[ignore = "run by a_pull_that_fails_to_compile_errors_as_before_and_stores_nothing"]
+    fn inner_a_pull_that_fails_to_compile_errors_as_before() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let bad_wasm: &[u8] = b"\0asm\x01\0\0\0";
+        let project = WasmPullProject::new(FakeSkillRegistry::wasm_tool(wasm_tool_zip(
+            "bad-tool", bad_wasm,
+        )));
+
+        let mut state = project.session();
+        let err = pull(&mut state, "bad-tool").expect_err("the pull fails to compile");
+        assert_eq!(
+            err,
+            format!(
+                "failed to compile pulled component 'bad-tool': {}",
+                Component::new(&build_engine().unwrap(), bad_wasm)
+                    .err()
+                    .expect("Component::new fails")
+            )
+        );
+        assert!(cwasm_entries(&scratch_compiled_dir()).is_empty());
+        assert!(!project.lock_path.exists());
+        assert!(!state.tool_components.contains_key("bad-tool"));
+    }
+
+    #[test]
+    fn a_refused_wasm_pull_reads_and_writes_no_form() {
+        pull_under_scratch_home("inner_a_refused_wasm_pull_reads_and_writes_no_form");
+    }
+
+    #[test]
+    #[ignore = "run by a_refused_wasm_pull_reads_and_writes_no_form"]
+    fn inner_a_refused_wasm_pull_reads_and_writes_no_form() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let payload = wasm_tool_zip(
+            PULLED_WASM_TOOL,
+            &iface_component_bytes("murmur-test:pull/first"),
+        );
+
+        // A well-formed key, so a pull that reached the compile would use the cache.
+        let tampered = WasmPullProject::new(FakeSkillRegistry {
+            sha256: murmur_artifact::sha256_hex(b"some other payload"),
+            ..FakeSkillRegistry::wasm_tool(payload.clone())
+        });
+        let lock_before = fs::read(&tampered.lock_path).ok();
+        let err = pull(&mut tampered.session(), PULLED_WASM_TOOL).expect_err("integrity refusal");
+        assert!(err.contains("artifact integrity check failed"), "{err}");
+        assert!(cwasm_entries(&scratch_compiled_dir()).is_empty());
+        assert_eq!(fs::read(&tampered.lock_path).ok(), lock_before);
+
+        let pinned = WasmPullProject::new(FakeSkillRegistry::wasm_tool(payload));
+        write_lockfile_atomic(
+            &pinned.lock_path,
+            &MurmurLock {
+                lock_version: LOCK_VERSION,
+                artifacts: vec![LockedArtifact {
+                    name: PULLED_WASM_TOOL.to_string(),
+                    resolved_version: "0.9.0".to_string(),
+                    sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
+                }],
+            },
+        )
+        .unwrap();
+        let lock_before = fs::read(&pinned.lock_path).unwrap();
+        let err = pull(&mut pinned.session(), PULLED_WASM_TOOL).expect_err("lock refusal");
+        assert!(err.contains("murmur.lock conflict"), "{err}");
+        assert!(cwasm_entries(&scratch_compiled_dir()).is_empty());
+        assert_eq!(fs::read(&pinned.lock_path).unwrap(), lock_before);
     }
 
     /// Writes an executable shell script native-tool fixture that echoes the given env

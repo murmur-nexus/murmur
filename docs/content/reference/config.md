@@ -192,7 +192,7 @@ chmod 600 ~/.murmur/config.yaml
 | `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
 | `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
-| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so later launches skip compiling. An entry not read in 30 days is deleted; deleting the directory is safe | `mur run` |
+| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted; deleting the directory is safe | `mur run` at staging, and when a capsule calls `manage.pull()` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
 
 `mur run` uses a file in `compiled/` only when all of these hold, and otherwise compiles the
@@ -201,11 +201,11 @@ artifact again and replaces the file:
 - `compiled/` is a real directory, not a symlink, and it and the file are yours and owner-only.
 - The file matches the checksum stored beside it.
 - `~/.murmur` is outside the capsule's workdir. When it is inside, `mur run` neither reads nor
-  writes `compiled/`, and every launch compiles.
+  writes `compiled/`, and every launch and pull compiles.
 
 A capsule under [`advisory`](containment.md#field-containment) containment, or one whose workdir
 contains `~/.murmur`, can write to `compiled/` as it can write anywhere else you can, and a later
-launch loads what it wrote.
+launch or pull loads what it wrote.
 
 Every mode marked `0700` or `0600` is set again on each write, not only when the path is created.
 A `mur run` that writes under an existing `~/.murmur` removes its group and other permissions and
