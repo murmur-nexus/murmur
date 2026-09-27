@@ -4,10 +4,11 @@
 //! validating it, so it is only ever read from where mur wrote it: an owner-only file of this uid,
 //! in the owner-only directory `~/.murmur/compiled` reached without a symlink, and never from a
 //! directory the capsule being staged can write. A form is keyed on the sha256 of the bytes that
-//! determine its compile input and on the engine's precompile compatibility hash. Its own sha256
-//! sits beside it and is checked before wasmtime sees the bytes. A missing, stale, unreadable or
-//! mismatched form is compiled again through `Component::new` and rewritten, so the cache never
-//! fails a launch and never changes a compile error.
+//! determine its compile input, the engine's precompile compatibility hash and the artifact
+//! decompression ceiling ([`max_artifact_decompressed_bytes`]). Its own sha256 sits beside it and
+//! is checked before wasmtime sees the bytes. A missing, stale, unreadable or mismatched form is
+//! compiled again through `Component::new` and rewritten, so the cache never fails a launch and
+//! never changes a compile error.
 //!
 //! An artifact's key must be a sha256 that `verify_sha256` has just recomputed over the payload
 //! bytes in hand, so a form named `H` is always the `extract_root_wasm` component of the payload
@@ -21,6 +22,15 @@
 //! The directory sits beside `~/.murmur/artifacts`, not in it, so nothing that walks the artifact
 //! store sees it. Two `mur` builds with different engines keep separate forms, since the engine
 //! key is part of every file name; [`prune_stale`] bounds what accumulates.
+//!
+//! A form keyed on an artifact payload's sha256 must be compiled only from the root wasm
+//! [`extract_root_wasm`] returned for that payload in the same process, so under the same ceiling.
+//! Whether that extraction succeeds is fixed by the payload bytes and the ceiling, so a form found
+//! under a payload key stands for the payload's successful extraction under that ceiling. That is
+//! what lets a caller of [`CompiledForms::load`] skip the inflate.
+//!
+//! [`max_artifact_decompressed_bytes`]: murmur_artifact::zip_guard::max_artifact_decompressed_bytes
+//! [`extract_root_wasm`]: crate::artifact::extract_root_wasm
 //!
 //! A process that can write as this uid outside the capsule writable root, such as an `advisory`
 //! capsule's shell, can plant a form that is loaded on a later launch. That gives it code
@@ -51,15 +61,39 @@ pub(crate) struct CompiledForms {
 
 impl CompiledForms {
     pub(crate) fn new(engine: &Engine, capsule_writable: &Path) -> Self {
+        Self::with_ceiling(
+            engine,
+            capsule_writable,
+            murmur_artifact::zip_guard::max_artifact_decompressed_bytes(),
+        )
+    }
+
+    /// Forms for an engine staging under the artifact decompression ceiling `ceiling`. Each
+    /// ceiling keys its own forms, so a lowered ceiling never finds a form whose payload only
+    /// extracts under a higher one.
+    fn with_ceiling(engine: &Engine, capsule_writable: &Path, ceiling: u64) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         engine.precompile_compatibility_hash().hash(&mut hasher);
+        ceiling.hash(&mut hasher);
         Self {
             capsule_writable: capsule_writable.to_path_buf(),
             engine_key: hasher.finish(),
         }
     }
 
-    /// The component for `wasm`. Errors exactly as `Component::new(engine, wasm)` does.
+    /// The stored form for `key_sha256`, or `None` when the key is not 64 lowercase hex
+    /// characters or no usable form is stored under it. Creates nothing on disk.
+    pub(crate) fn load(&self, engine: &Engine, key_sha256: &str) -> Option<Component> {
+        if !is_key(key_sha256) {
+            return None;
+        }
+        let dir = self.dir(false)?;
+        load(engine, &dir.join(self.file_name(key_sha256)))
+    }
+
+    /// The component for `wasm`: the form stored under `key_sha256` when [`Self::load`] finds
+    /// one, and otherwise `wasm` compiled and stored. Errors exactly as
+    /// `Component::new(engine, wasm)` does.
     ///
     /// `key_sha256` is the lowercase hex sha256 of bytes that uniquely determine `wasm`: an
     /// artifact payload the caller has verified, or `wasm` itself. A key that is not 64 lowercase hex
@@ -70,22 +104,15 @@ impl CompiledForms {
         key_sha256: &str,
         wasm: &[u8],
     ) -> wasmtime::Result<Component> {
-        let is_key = key_sha256.len() == 64
-            && key_sha256
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
-        if !is_key {
+        if !is_key(key_sha256) {
             return Component::new(engine, wasm);
         }
-        let file_name = format!("{key_sha256}-{:016x}.cwasm", self.engine_key);
-        if let Some(dir) = self.dir(false) {
-            if let Some(component) = load(engine, &dir.join(&file_name)) {
-                return Ok(component);
-            }
+        if let Some(component) = self.load(engine, key_sha256) {
+            return Ok(component);
         }
         let component = Component::new(engine, wasm)?;
         if let (Some(dir), Ok(bytes)) = (self.dir(true), component.serialize()) {
-            let path = dir.join(&file_name);
+            let path = dir.join(self.file_name(key_sha256));
             let _ = crate::murmur_home::write_private_file(&path, &bytes).and_then(|()| {
                 crate::murmur_home::write_private_file(
                     &sidecar(&path),
@@ -95,6 +122,12 @@ impl CompiledForms {
             prune_stale(&dir, SystemTime::now());
         }
         Ok(component)
+    }
+
+    /// The name of the form stored under `key_sha256`: `<key>-<engine key>.cwasm`, the engine key
+    /// as 16 lowercase hex digits.
+    fn file_name(&self, key_sha256: &str) -> String {
+        format!("{key_sha256}-{:016x}.cwasm", self.engine_key)
     }
 
     /// `~/.murmur/compiled`, or `None` when it cannot be used. Only `create` touches the disk: it
@@ -134,6 +167,14 @@ impl CompiledForms {
         }
         Some(dir)
     }
+}
+
+/// Whether `key_sha256` is 64 lowercase hex characters, the only shape a form is stored under.
+fn is_key(key_sha256: &str) -> bool {
+    key_sha256.len() == 64
+        && key_sha256
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The file beside a form that records the form's sha256.
@@ -261,14 +302,15 @@ fn remove_files(dir: &Path, remove: impl Fn(&Metadata) -> bool) {
     }
 }
 
+/// The empty component in the binary format: the component preamble alone.
+#[cfg(test)]
+pub(crate) const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\x00\x01\x00";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::{FileTimes, Permissions};
     use std::os::unix::fs::PermissionsExt;
-
-    /// The empty component in the binary format: the component preamble alone.
-    const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\x00\x01\x00";
 
     fn engine() -> Engine {
         let mut config = wasmtime::Config::new();
@@ -437,6 +479,70 @@ mod tests {
         assert!(read_recently.exists());
         assert!(fresh.exists());
         assert!(subdir.is_dir());
+    }
+
+    #[test]
+    fn the_form_key_carries_the_decompression_ceiling() {
+        let engine = engine();
+        let workdir = Path::new("/nonexistent-workdir");
+        let sha = murmur_artifact::sha256_hex(EMPTY_COMPONENT);
+        let name = |ceiling| CompiledForms::with_ceiling(&engine, workdir, ceiling).file_name(&sha);
+
+        assert_ne!(name(1_000_000), name(2_000_000));
+        assert_eq!(name(1_000_000), name(1_000_000));
+        let engine_key = name(1_000_000)
+            .strip_prefix(&format!("{sha}-"))
+            .and_then(|rest| rest.strip_suffix(".cwasm"))
+            .map(str::to_owned)
+            .expect("<sha>-<engine key>.cwasm");
+        assert_eq!(engine_key.len(), 16);
+        assert!(engine_key
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(
+            CompiledForms::new(&engine, workdir).file_name(&sha),
+            name(murmur_artifact::zip_guard::max_artifact_decompressed_bytes()),
+        );
+    }
+
+    #[test]
+    fn load_returns_only_a_form_stored_under_the_same_key_and_ceiling() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "compiled_forms::tests::inner_load_returns_only_a_form_stored_under_the_same_key_and_ceiling",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by load_returns_only_a_form_stored_under_the_same_key_and_ceiling"]
+    fn inner_load_returns_only_a_form_stored_under_the_same_key_and_ceiling() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let engine = engine();
+        let workdir = tempfile::tempdir().unwrap();
+        let ceiling = 1_000_000;
+        let forms = CompiledForms::with_ceiling(&engine, workdir.path(), ceiling);
+        let sha = murmur_artifact::sha256_hex(b"a payload");
+        let compiled = crate::state_store::murmur_home_dir()
+            .unwrap()
+            .join(COMPILED_DIR);
+
+        assert!(forms.load(&engine, &sha).is_none());
+        assert!(!compiled.exists(), "{} was created", compiled.display());
+
+        forms.compile(&engine, &sha, EMPTY_COMPONENT).unwrap();
+        assert!(forms.load(&engine, &sha).is_some());
+        assert!(
+            CompiledForms::with_ceiling(&engine, workdir.path(), ceiling + 1)
+                .load(&engine, &sha)
+                .is_none()
+        );
+        assert!(forms.load(&engine, &sha.to_uppercase()).is_none());
+        assert!(forms.load(&engine, "not-a-key").is_none());
+        // This wasm fails `Component::new`, so `Ok` is the stored form, found by `compile` itself.
+        assert!(forms.compile(&engine, &sha, b"\0asm\x01\0\0\0").is_ok());
     }
 
     #[test]

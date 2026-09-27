@@ -203,6 +203,10 @@ artifact again and replaces the file:
 - `~/.murmur` is outside the capsule's workdir. When it is inside, `mur run` neither reads nor
   writes `compiled/`, and every launch and pull compiles.
 
+Each value of the [`MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`](../concepts/registry.md#artifact-integrity)
+ceiling keeps its own compiled artifacts, so the first launch after you change it compiles every
+artifact again.
+
 A capsule under [`advisory`](containment.md#field-containment) containment, or one whose workdir
 contains `~/.murmur`, can write to `compiled/` as it can write anywhere else you can, and a later
 launch or pull loads what it wrote.

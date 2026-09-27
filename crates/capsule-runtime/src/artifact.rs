@@ -1,3 +1,5 @@
+use std::io::Cursor;
+
 use murmur_artifact::payload_shape::{
     native_binary_entry, select_root_wasm_in_archive, SKILL_MD_ENTRY,
 };
@@ -7,6 +9,14 @@ use zip::ZipArchive;
 
 use crate::errors::RuntimeError;
 
+/// The root wasm of a `.mur.zip`: `capsule.wasm`, or its one root `*.wasm`, inflated under the
+/// artifact decompression ceiling.
+///
+/// A refusal added here must also go into [`check_root_wasm`] or into the compiled-form key built
+/// by `CompiledForms`. Staging skips this inflate when a form is stored for the payload and runs
+/// only [`check_root_wasm`], which is exact only while every other input deciding whether this
+/// succeeds is in the key: the payload sha256 and the ceiling. A check on the entry's contents, a
+/// new setting, or a `zip` upgrade that changes what inflates is such an input.
 pub fn extract_root_wasm(
     artifact_name: &str,
     artifact_version: &str,
@@ -20,17 +30,30 @@ pub fn extract_root_wasm(
     )
 }
 
-fn extract_root_wasm_capped(
+/// The refusals [`extract_root_wasm`] makes before it inflates anything, with the same errors:
+/// the archive opens, and its entries name exactly one root wasm.
+pub fn check_root_wasm(
     artifact_name: &str,
     artifact_version: &str,
     artifact_bytes: &[u8],
-    max_bytes: u64,
-) -> Result<Vec<u8>, RuntimeError> {
-    let cursor = std::io::Cursor::new(artifact_bytes);
-    let mut archive = ZipArchive::new(cursor).map_err(|err| RuntimeError::ArtifactArchive {
-        name: artifact_name.to_string(),
-        version: artifact_version.to_string(),
-        message: err.to_string(),
+) -> Result<(), RuntimeError> {
+    locate_root_wasm(artifact_name, artifact_version, artifact_bytes).map(|_| ())
+}
+
+type BorrowedArchive<'a> = ZipArchive<Cursor<&'a [u8]>>;
+
+/// The opened archive and the name of its root wasm entry.
+fn locate_root_wasm<'a>(
+    artifact_name: &str,
+    artifact_version: &str,
+    artifact_bytes: &'a [u8],
+) -> Result<(BorrowedArchive<'a>, String), RuntimeError> {
+    let mut archive = ZipArchive::new(Cursor::new(artifact_bytes)).map_err(|err| {
+        RuntimeError::ArtifactArchive {
+            name: artifact_name.to_string(),
+            version: artifact_version.to_string(),
+            message: err.to_string(),
+        }
     })?;
 
     // Which root entry counts as the wasm payload is the shared payload-shape contract; the
@@ -41,6 +64,18 @@ fn extract_root_wasm_capped(
             version: artifact_version.to_string(),
             message: err.to_string(),
         })?;
+
+    Ok((archive, selected_name))
+}
+
+fn extract_root_wasm_capped(
+    artifact_name: &str,
+    artifact_version: &str,
+    artifact_bytes: &[u8],
+    max_bytes: u64,
+) -> Result<Vec<u8>, RuntimeError> {
+    let (mut archive, selected_name) =
+        locate_root_wasm(artifact_name, artifact_version, artifact_bytes)?;
 
     zip_guard::read_zip_entry_capped(&mut archive, &selected_name, max_bytes).map_err(|err| {
         RuntimeError::ArtifactArchive {
@@ -505,6 +540,42 @@ mod tests {
             }
             other => panic!("expected ArtifactArchive error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_root_wasm_refuses_exactly_as_extract_root_wasm() {
+        let no_root_wasm = archive_with_files(&[(PACKED_MANIFEST_ENTRY, b"name: demo")]);
+        let two_root_wasms = archive_with_files(&[
+            ("alpha.wasm", b"a"),
+            ("zeta.wasm", b"z"),
+            (PACKED_MANIFEST_ENTRY, b"name: demo"),
+        ]);
+        for payload in [b"not a zip".to_vec(), no_root_wasm, two_root_wasms] {
+            let checked = check_root_wasm("demo", "0.0.1", &payload).unwrap_err();
+            let extracted = extract_root_wasm("demo", "0.0.1", &payload).unwrap_err();
+            assert_eq!(checked.to_string(), extracted.to_string());
+        }
+
+        let valid = archive_with_files(&[
+            (PACKED_MANIFEST_ENTRY, b"name: demo"),
+            ("tool.wasm", b"tool"),
+        ]);
+        check_root_wasm("demo", "0.0.1", &valid).unwrap();
+        extract_root_wasm("demo", "0.0.1", &valid).unwrap();
+    }
+
+    #[test]
+    fn check_root_wasm_does_not_inflate() {
+        let big = vec![b'a'; 1024];
+        let archive = archive_with_files(&[("tool.wasm", &big)]);
+
+        let err = extract_root_wasm_capped("demo", "0.0.1", &archive, 16).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exceeds the 16-byte decompression ceiling"),
+            "{err}"
+        );
+        check_root_wasm("demo", "0.0.1", &archive).unwrap();
     }
 
     #[test]
