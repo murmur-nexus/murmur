@@ -40,7 +40,10 @@ use wasmtime_wasi_http::{
 use crate::{
     a2a::{IncomingTask, TaskRegistry, TaskState},
     agent::{self, AgentLoopExit},
-    artifact::{extract_manifest_yaml, extract_native_binary, extract_root_wasm, extract_skill_md},
+    artifact::{
+        check_root_wasm, extract_manifest_yaml, extract_native_binary, extract_root_wasm,
+        extract_skill_md,
+    },
     artifact_config::ARTIFACT_CONFIG_ENV,
     bindings::host::murmur::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
@@ -1099,15 +1102,13 @@ pub fn stage_session(
                             &capsule_name,
                             &mut artifact_grants,
                         )?;
-                        let tool_wasm =
-                            extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
-                        let tool_component = compiled_forms
-                            .compile(&engine, &resolved.sha256, &tool_wasm)
-                            .map_err(|err| RuntimeError::ToolComponentCompile {
-                                name: artifact.name.clone(),
-                                version: resolved_version.clone(),
-                                message: err.to_string(),
-                            })?;
+                        let tool_component = stage_root_component(
+                            &engine,
+                            &compiled_forms,
+                            &artifact.name,
+                            &resolved_version,
+                            &resolved,
+                        )?;
                         tool_components.insert(artifact.name.clone(), tool_component);
                     }
                 }
@@ -1187,15 +1188,13 @@ pub fn stage_session(
                         artifact.name, resolved_version
                     ))
                 })?;
-                let hook_wasm =
-                    extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
-                let hook_component = compiled_forms
-                    .compile(&engine, &resolved.sha256, &hook_wasm)
-                    .map_err(|err| RuntimeError::ToolComponentCompile {
-                        name: artifact.name.clone(),
-                        version: resolved_version.clone(),
-                        message: err.to_string(),
-                    })?;
+                let hook_component = stage_root_component(
+                    &engine,
+                    &compiled_forms,
+                    &artifact.name,
+                    &resolved_version,
+                    &resolved,
+                )?;
                 // The grant comes from `artifact` — the operator's own manifest entry for
                 // this hook — and never from `manifest_yaml`, the hook's bundled manifest
                 // parsed just above for its behavioral contract. A hook pulled from a
@@ -4354,6 +4353,32 @@ fn inert_capability_sub_blocks(
     .into_iter()
     .filter_map(|(name, present)| present.then_some(name))
     .collect()
+}
+
+/// The component for a WASM tool's or hook's verified payload `resolved`. Refuses and errors
+/// exactly as [`extract_root_wasm`] followed by [`CompiledForms::compile`] does.
+///
+/// A form stored under the payload's sha256 stands for that payload's successful extraction under
+/// the current decompression ceiling, so on a hit the root wasm is located but never inflated.
+fn stage_root_component(
+    engine: &Engine,
+    compiled_forms: &CompiledForms,
+    name: &str,
+    version: &str,
+    resolved: &murmur_artifact::ResolvedArtifact,
+) -> Result<Component, RuntimeError> {
+    check_root_wasm(name, version, &resolved.bytes)?;
+    if let Some(component) = compiled_forms.load(engine, &resolved.sha256) {
+        return Ok(component);
+    }
+    let wasm = extract_root_wasm(name, version, &resolved.bytes)?;
+    compiled_forms
+        .compile(engine, &resolved.sha256, &wasm)
+        .map_err(|err| RuntimeError::ToolComponentCompile {
+            name: name.to_string(),
+            version: version.to_string(),
+            message: err.to_string(),
+        })
 }
 
 /// Lower one tool's or driver's per-artifact grant and record it, warning about anything the
@@ -10119,6 +10144,144 @@ inference:
             murmur_md.contains("call by name to load guidance"),
             "MURMUR.md missing callable skill hint:\n{murmur_md}"
         );
+    }
+
+    // ── stage_root_component ───────────────────────────────────────────────────
+
+    /// The empty component in the binary format: the component preamble alone.
+    const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\x00\x01\x00";
+
+    /// A `.mur.zip` of `files`, each entry stored uncompressed so its data sits verbatim in the
+    /// archive.
+    fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in files {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// A tool payload whose root `tool.wasm` opens and is selected, but fails its CRC when
+    /// inflated.
+    fn crc_broken_payload() -> Vec<u8> {
+        let mut payload = stored_zip(&[
+            ("murmur.yaml", b"name: demo-tool\nversion: 0.1.0\n"),
+            ("tool.wasm", EMPTY_COMPONENT),
+        ]);
+        let at = payload
+            .windows(EMPTY_COMPONENT.len())
+            .position(|window| window == EMPTY_COMPONENT)
+            .expect("stored tool.wasm data");
+        payload[at + EMPTY_COMPONENT.len() - 1] ^= 0xff;
+        payload
+    }
+
+    fn resolved_payload(bytes: Vec<u8>) -> ResolvedArtifact {
+        ResolvedArtifact {
+            meta: ArtifactMeta {
+                name: "demo-tool".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: RuntimeType::Wasm,
+                artifact_runtime: "wasm".to_string(),
+                platforms: vec![],
+                description: None,
+                tags: vec![],
+                wit_contracts: None,
+            },
+            sha256: murmur_artifact::sha256_hex(&bytes),
+            bytes: bytes.into(),
+            platform_match: murmur_artifact::PlatformMatch::NotApplicable,
+        }
+    }
+
+    fn stage_error(engine: &Engine, forms: &CompiledForms, resolved: &ResolvedArtifact) -> String {
+        match stage_root_component(engine, forms, "demo-tool", "0.1.0", resolved) {
+            Ok(_) => panic!("stage_root_component staged the payload"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// A stored form stands in for the inflate, so a payload whose root wasm fails its CRC stages
+    /// once a form is stored under its sha256. This pins the trust model: what vouches for the
+    /// skipped inflate is who can write a form, and only a writer of this uid outside the capsule's
+    /// writable root can.
+    #[test]
+    fn stage_root_component_loads_a_stored_form_without_inflating_the_root_wasm() {
+        let home = TempDir::new().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::inner_stage_root_component_loads_a_stored_form_without_inflating_the_root_wasm",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by stage_root_component_loads_a_stored_form_without_inflating_the_root_wasm"]
+    fn inner_stage_root_component_loads_a_stored_form_without_inflating_the_root_wasm() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let engine = build_engine().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let forms = CompiledForms::new(&engine, workdir.path());
+        let resolved = resolved_payload(crc_broken_payload());
+
+        let inflated = extract_root_wasm("demo-tool", "0.1.0", &resolved.bytes).unwrap_err();
+        assert_eq!(
+            stage_error(&engine, &forms, &resolved),
+            inflated.to_string()
+        );
+
+        forms
+            .compile(&engine, &resolved.sha256, EMPTY_COMPONENT)
+            .unwrap();
+        assert!(stage_root_component(&engine, &forms, "demo-tool", "0.1.0", &resolved).is_ok());
+    }
+
+    #[test]
+    fn stage_root_component_refuses_an_archive_with_no_root_wasm_even_with_a_stored_form() {
+        let home = TempDir::new().unwrap();
+        crate::murmur_home::run_with_home(
+            "runtime::tests::inner_stage_root_component_refuses_an_archive_with_no_root_wasm_even_with_a_stored_form",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by stage_root_component_refuses_an_archive_with_no_root_wasm_even_with_a_stored_form"]
+    fn inner_stage_root_component_refuses_an_archive_with_no_root_wasm_even_with_a_stored_form() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let engine = build_engine().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let forms = CompiledForms::new(&engine, workdir.path());
+        let no_root_wasm = stored_zip(&[("murmur.yaml", b"name: demo-tool\nversion: 0.1.0\n")]);
+
+        for (index, payload) in [no_root_wasm, b"not a zip".to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            let resolved = resolved_payload(payload);
+            forms
+                .compile(&engine, &resolved.sha256, EMPTY_COMPONENT)
+                .unwrap();
+            assert!(forms.load(&engine, &resolved.sha256).is_some());
+
+            let staged = stage_error(&engine, &forms, &resolved);
+            let extracted = extract_root_wasm("demo-tool", "0.1.0", &resolved.bytes).unwrap_err();
+            assert_eq!(staged, extracted.to_string());
+            if index == 0 {
+                assert!(staged.contains("missing root .wasm file"), "{staged}");
+            }
+        }
     }
 
     // ── manage.pull() ──────────────────────────────────────────────────────────

@@ -72,17 +72,50 @@ impl Project {
         self.home.path().join(".murmur").join("compiled")
     }
 
-    /// The form of `echo-tool`, named by the payload sha256 the lock pins.
-    fn tool_form(&self) -> PathBuf {
+    /// The payload sha256 the lock pins for `echo-tool`.
+    fn tool_sha256(&self) -> String {
         let lock = read_lockfile(&self.project.path().join("murmur.lock")).unwrap();
-        let sha256 = lock
-            .artifact_for(TOOL_NAME)
+        lock.artifact_for(TOOL_NAME)
             .expect("lock entry for echo-tool")
             .sha256
             .any
             .clone()
-            .expect("lock pins echo-tool's sha256");
-        form_named(&self.compiled(), &sha256)
+            .expect("lock pins echo-tool's sha256")
+    }
+
+    /// The form of `echo-tool`, named by the payload sha256 the lock pins.
+    fn tool_form(&self) -> PathBuf {
+        form_named(&self.compiled(), &self.tool_sha256())
+    }
+
+    /// Every form in [`Self::compiled`] keyed on `echo-tool`'s payload, under any engine key.
+    fn tool_forms(&self) -> Vec<PathBuf> {
+        let prefix = format!("{}-", self.tool_sha256());
+        if !self.compiled().exists() {
+            return Vec::new();
+        }
+        forms(&self.compiled())
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    /// Runs the capsule under `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES=ceiling`, requires it to
+    /// fail, and returns stderr.
+    fn run_failing_under_ceiling(&self, ceiling: &str) -> String {
+        let output = common::run_capsule_with_env(
+            &self.home,
+            &self.manifest,
+            &[("MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES", ceiling)],
+        )
+        .failure()
+        .get_output()
+        .clone();
+        String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
     /// The form of the capsule component, named by the sha256 of its bytes.
@@ -302,6 +335,39 @@ fn an_unusable_compiled_path_never_fails_a_launch() {
         blocked_stderr.lines().collect::<Vec<_>>(),
         empty_stderr.lines().collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_lowered_decompression_ceiling_is_enforced_on_a_warm_launch() {
+    let project = Project::new();
+    let (first, _) = project.run();
+    let tool_form = project.tool_form();
+    let stored = inode(&tool_form);
+
+    let warm = project.run_failing_under_ceiling("60000");
+    assert!(warm.contains("E-IO-003"), "{warm}");
+    assert!(
+        warm.contains("zip entry 'tool.wasm' exceeds the 60000-byte decompression ceiling"),
+        "{warm}"
+    );
+    assert_eq!(project.tool_forms(), vec![tool_form.clone()]);
+
+    let aside = project.home.path().join("compiled-aside");
+    fs::rename(project.compiled(), &aside).unwrap();
+    let cold = project.run_failing_under_ceiling("60000");
+    assert_eq!(
+        cold.lines().collect::<Vec<_>>(),
+        warm.lines().collect::<Vec<_>>()
+    );
+    assert_eq!(project.tool_forms(), Vec::<PathBuf>::new());
+
+    if project.compiled().exists() {
+        fs::remove_dir_all(project.compiled()).unwrap();
+    }
+    fs::rename(&aside, project.compiled()).unwrap();
+    let (restored, _) = project.run();
+    assert_eq!(restored, first);
+    assert_eq!(inode(&tool_form), stored);
 }
 
 #[test]
