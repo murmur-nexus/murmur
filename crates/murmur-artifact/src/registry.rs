@@ -8,7 +8,6 @@ use std::{
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -855,20 +854,26 @@ pub fn is_reserved_version(version: &str) -> bool {
         .any(|reserved| version.eq_ignore_ascii_case(reserved))
 }
 
+/// SHA-256 of `bytes` as 64 lowercase hex characters.
+///
+/// This is the exact form `murmur.lock` pins and the store's `.sha256` sidecars hold, so any change
+/// to the output invalidates every existing lock and store; the FIPS 180-2 known-answer tests in
+/// this file pin it. The engine is `ring`, whose SHA-256 selects SIMD or SHA-extension code at run
+/// time: staging hashes every artifact payload and compiled form on each launch, several MB in all.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    lowercase_hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
-/// SHA-256 of everything `reader` yields, with the byte count hashed alongside it.
+/// SHA-256 of everything `reader` yields, returned with the number of bytes read.
 ///
-/// The streaming companion to [`sha256_hex`], sharing its one `Sha256`: a caller that must hash a
-/// file it cannot afford to hold in memory — a resource-plane listing walking a subtree it does
-/// not bound — gets the same digest without a second hasher entering the workspace.
+/// The streaming companion to [`sha256_hex`], with the same engine and the same 64-lowercase-hex
+/// output, pinned by the same known-answer tests: a caller that must hash a file it cannot afford
+/// to hold in memory — a resource-plane listing walking a subtree it does not bound — gets the
+/// digest `murmur.lock` and the `.sha256` sidecars use without a second hasher entering the
+/// workspace.
 pub fn sha256_hex_of_reader(reader: &mut impl std::io::Read) -> std::io::Result<(u64, String)> {
-    let mut hasher = Sha256::new();
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = [0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
@@ -876,10 +881,21 @@ pub fn sha256_hex_of_reader(reader: &mut impl std::io::Read) -> std::io::Result<
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        context.update(&buffer[..read]);
         total = total.saturating_add(read as u64);
     }
-    Ok((total, format!("{:x}", hasher.finalize())))
+    Ok((total, lowercase_hex(context.finish().as_ref())))
+}
+
+fn lowercase_hex(digest: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut hex = String::with_capacity(2 * digest.len());
+    for byte in digest {
+        // Writing into a `String` cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 pub fn verify_sha256(
@@ -1566,5 +1582,100 @@ mod tests {
 
         assert_eq!(resolved.meta.runtime, RuntimeType::Native);
         assert_eq!(resolved.meta.artifact_runtime, "tool");
+    }
+
+    /// The FIPS 180-2 SHA-256 vectors short enough to write as literals, as `(name, input, digest)`.
+    const FIPS_180_2_VECTORS: [(&str, &[u8], &str); 4] = [
+        (
+            "empty",
+            b"",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            "abc",
+            b"abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            "448-bit message",
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+        (
+            "896-bit message",
+            b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+        ),
+    ];
+
+    const MILLION_A_LEN: usize = 1_000_000;
+    const MILLION_A_SHA256: &str =
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+
+    /// Yields at most `chunk` bytes per `read`, so a digest spans many partial reads and never
+    /// lines up with the 64-byte SHA-256 block or the reader function's own buffer.
+    struct TrickleReader<R> {
+        inner: R,
+        chunk: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for TrickleReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(self.chunk);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    #[test]
+    fn sha256_hex_matches_the_fips_180_2_vectors() {
+        for (name, input, expected) in FIPS_180_2_VECTORS {
+            assert_eq!(sha256_hex(input), expected, "FIPS 180-2 vector {name:?}");
+        }
+
+        let million_a = vec![b'a'; MILLION_A_LEN];
+        assert_eq!(
+            sha256_hex(&million_a),
+            MILLION_A_SHA256,
+            "FIPS 180-2 vector \"one million 'a'\""
+        );
+    }
+
+    #[test]
+    fn sha256_hex_of_reader_matches_the_fips_180_2_vectors_across_partial_reads() {
+        use std::io::Read;
+
+        for (name, input, expected) in FIPS_180_2_VECTORS {
+            let want = (input.len() as u64, expected.to_string());
+            assert_eq!(
+                sha256_hex_of_reader(&mut std::io::Cursor::new(input)).unwrap(),
+                want,
+                "FIPS 180-2 vector {name:?} through a Cursor"
+            );
+            let mut trickle = TrickleReader {
+                inner: input,
+                chunk: 7,
+            };
+            assert_eq!(
+                sha256_hex_of_reader(&mut trickle).unwrap(),
+                want,
+                "FIPS 180-2 vector {name:?} through 7-byte partial reads"
+            );
+        }
+
+        let want = (MILLION_A_LEN as u64, MILLION_A_SHA256.to_string());
+        assert_eq!(
+            sha256_hex_of_reader(&mut std::io::repeat(b'a').take(MILLION_A_LEN as u64)).unwrap(),
+            want,
+            "FIPS 180-2 vector \"one million 'a'\" through io::repeat"
+        );
+        let mut trickle = TrickleReader {
+            inner: std::io::repeat(b'a').take(MILLION_A_LEN as u64),
+            chunk: 7,
+        };
+        assert_eq!(
+            sha256_hex_of_reader(&mut trickle).unwrap(),
+            want,
+            "FIPS 180-2 vector \"one million 'a'\" through 7-byte partial reads"
+        );
     }
 }
