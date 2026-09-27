@@ -1924,10 +1924,10 @@ version = "0.4.0"
 dependencies = [
  "bytes",
  "http",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
  "tempfile",
  "thiserror",
  "url",
