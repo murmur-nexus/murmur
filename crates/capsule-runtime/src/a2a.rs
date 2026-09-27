@@ -384,6 +384,14 @@ impl TaskRegistry {
         matches!(self.history.get(task_id), Some((TaskState::Canceled, _)))
     }
 
+    /// Whether this task's recorded state is `Failed`.
+    ///
+    /// Read by the agent loop at each turn boundary: a `request-input` timeout records `Failed`
+    /// while the attempt is still running, and this is how the attempt learns of it.
+    pub(crate) fn has_failed(&self, task_id: &str) -> bool {
+        matches!(self.history.get(task_id), Some((TaskState::Failed, _)))
+    }
+
     /// Stop one task: record `Canceled` and raise its signal.
     ///
     /// Called on the door's connection task and never waits for the agent loop to acknowledge —

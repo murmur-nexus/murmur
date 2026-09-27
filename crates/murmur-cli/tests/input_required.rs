@@ -13,10 +13,11 @@ use std::{
 
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
-    LifecycleConfig, StageRequest,
+    LifecycleConfig, RuntimeError, StageRequest,
 };
 use murmur_artifact::{
-    load_runtime_manifest, ArtifactRuntime, ContainmentClass, LocalRegistry, TaskAcceptance,
+    load_runtime_manifest, AfterTask, ArtifactRuntime, ContainmentClass, LocalRegistry,
+    TaskAcceptance,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -580,30 +581,76 @@ fn input_required_working_state_rejects_message() {
     handle.join().expect("launch thread should not panic");
 }
 
-/// Test 4: When input_timeout_secs elapses with no response, the task transitions
-/// to failed state.
+/// Test 4: When input_timeout_secs elapses with no response, the task is `failed` on
+/// `tasks/get`, the attempt ends without asking the provider for another turn, and the trace
+/// says why. A queue capsule that sleeps between tasks keeps the door up to read.
 #[test]
 fn input_required_timeout_transitions_to_failed() {
     let server = tool_then_end_turn_server("Quick question", "would have completed");
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
 
-    // Override lifecycle to set a 2-second input timeout
     let lifecycle = LifecycleConfig {
-        task_acceptance: TaskAcceptance::Single,
+        task_acceptance: TaskAcceptance::Queue,
+        after_task: AfterTask::Sleep,
         input_timeout_secs: Some(2),
         ..Default::default()
     };
     let staged = stage_agent(&home, &manifest_path, Some(lifecycle));
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("timed out waiting for capsule URL");
+
+    let resp = send_message(&capsule_url, "msg-1", "start timed task");
+    let task_id = resp["result"]["id"].as_str().unwrap().to_string();
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "input-required",
+        Duration::from_secs(30),
+    );
+    poll_until_state(&capsule_url, &task_id, "failed", Duration::from_secs(30));
+
+    let trace = wait_for_task_end(&trace_path, &task_id);
+    assert_input_timeout_recorded(&trace, &task_id);
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the timed-out attempt asked the provider for no further turn"
+    );
+}
+
+/// The same timeout on a queue capsule that exits after its task: the launch reports the task
+/// `failed`, naming the timeout, and the provider was asked once.
+#[test]
+fn input_timeout_fails_the_launch() {
+    let server = tool_then_end_turn_server("Quick question", "would have completed");
+    let home = tempfile::tempdir().unwrap();
+    let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
+
+    let lifecycle = LifecycleConfig {
+        task_acceptance: TaskAcceptance::Queue,
+        after_task: AfterTask::Exit,
+        input_timeout_secs: Some(2),
+        ..Default::default()
+    };
+    let staged = stage_agent(&home, &manifest_path, Some(lifecycle));
+    let trace_path = staged.workdir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
         launch_session(staged, move |url| {
             let _ = url_tx.send(url.to_string());
         })
-        .expect("launch should succeed")
     });
-
     let capsule_url = url_rx
         .recv_timeout(Duration::from_secs(15))
         .expect("timed out waiting for capsule URL");
@@ -611,85 +658,65 @@ fn input_required_timeout_transitions_to_failed() {
     let resp = send_message(&capsule_url, "msg-1", "start timed task");
     let task_id = resp["result"]["id"].as_str().unwrap().to_string();
 
-    // Wait for input-required
-    poll_until_state(
-        &capsule_url,
-        &task_id,
-        "input-required",
-        Duration::from_secs(30),
-    );
-
-    // Do NOT send a response — poll until the task reaches "failed" state.
-    // The 2-second timeout will fire, finish_task(Failed) is called, then the
-    // capsule exits. We poll during that window before the server shuts down.
-    // If polling races with the server shutdown, the capsule exiting is also
-    // evidence that the timeout fired correctly — so we catch that too.
-    let mut saw_failed = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while std::time::Instant::now() < deadline {
-        match tasks_get_opt(&capsule_url, &task_id) {
-            None => {
-                // Server is gone — capsule exited after timeout, which is correct.
-                saw_failed = true;
-                break;
-            }
-            Some(resp) => {
-                let state = resp["result"]["status"]["state"].as_str().unwrap_or("");
-                if state == "failed" {
-                    saw_failed = true;
-                    break;
-                }
-            }
+    match handle.join().expect("launch thread should not panic") {
+        Err(RuntimeError::TaskDidNotComplete {
+            exit_status,
+            reason,
+        }) => {
+            assert_eq!(exit_status, "failed", "{reason}");
+            assert!(reason.contains("lifecycle.input_timeout_secs"), "{reason}");
         }
-        std::thread::sleep(Duration::from_millis(200));
+        other => panic!("expected TaskDidNotComplete(failed), got {other:?}"),
     }
-    assert!(
-        saw_failed,
-        "timed-out input-required task should reach failed state or server should shut down"
-    );
-
-    handle.join().expect("launch thread should not panic");
+    let trace = read_trace(&trace_path);
+    assert_input_timeout_recorded(&trace, &task_id);
+    assert_eq!(server.requests().len(), 1);
 }
 
-/// Like tasks_get but returns None if the server has shut down.
-fn tasks_get_opt(addr: &str, task_id: &str) -> Option<Value> {
-    let stream = TcpStream::connect(addr).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tasks/get",
-        "params": {"id": task_id}
-    })
-    .to_string();
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let mut w = &stream;
-    w.write_all(request.as_bytes()).ok()?;
-    w.flush().ok()?;
+fn read_trace(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("every trace line is valid JSON"))
+        .collect()
+}
 
-    let mut reader = BufReader::new(&stream);
+/// The trace once it holds `task_id`'s `task_end`.
+fn wait_for_task_end(path: &Path, task_id: &str) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return None,
-            Ok(_) => {}
+        let trace = read_trace(path);
+        if trace
+            .iter()
+            .any(|event| event["event_type"] == "task_end" && event["task_id"] == task_id)
+        {
+            return trace;
         }
-        if line.trim().is_empty() {
-            break;
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no task_end for {task_id}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
-    let mut body_str = String::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        body_str.push_str(&line);
-    }
-    serde_json::from_str(&body_str).ok()
+}
+
+/// One `task_failed{cause: input_timeout}` for `task_id`, before its `task_end failed`.
+fn assert_input_timeout_recorded(trace: &[Value], task_id: &str) {
+    let position = |event_type: &str| {
+        trace
+            .iter()
+            .position(|event| event["event_type"] == event_type && event["task_id"] == task_id)
+            .unwrap_or_else(|| panic!("no {event_type} for {task_id}: {trace:?}"))
+    };
+    let failed: Vec<_> = trace
+        .iter()
+        .filter(|event| event["event_type"] == "task_failed" && event["task_id"] == task_id)
+        .collect();
+    assert_eq!(failed.len(), 1, "{trace:?}");
+    assert_eq!(failed[0]["cause"], "input_timeout");
+    assert!(position("task_failed") < position("task_end"));
+    assert_eq!(trace[position("task_end")]["exit_status"], "failed");
 }
 
 /// Test 5: message/stream SSE stream receives an input-required status event

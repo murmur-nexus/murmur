@@ -56,7 +56,8 @@ checkpoints.
 
 The turn limit caps how many inference calls a single task may make. It defaults to **10**
 and is set per-capsule in the manifest. When the limit is reached, the loop exits with
-`exit_status: "max_turns_reached"`.
+`exit_status: "max_turns_reached"`. The task did not complete: `tasks/get` reads `failed`, and
+[`mur run`](../reference/cli.md#mur-run-status) exits `1`.
 
 ## Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }
 

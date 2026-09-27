@@ -193,6 +193,62 @@ fn run_task_with(home: &TempDir, project: &Project, task: &str, extra: &[&str]) 
     )
 }
 
+/// [`run_task`] on a queue capsule that exits after its task: the lifecycle `mur run --task`
+/// launches when a caller wants the task's own outcome to be the launch's.
+fn run_task_queue_exit(home: &TempDir, project: &Project) -> Run {
+    Run::of(
+        mur(home, project)
+            .env("MURMUR_A2A_TIMEOUT_SECS", "1")
+            .args([
+                "run",
+                "--manifest",
+                project.manifest.to_str().unwrap(),
+                "--task",
+                "Say hello.",
+                "--lifecycle-task-acceptance",
+                "queue",
+                "--lifecycle-after-task",
+                "exit",
+                "--verbose",
+            ])
+            .output()
+            .unwrap(),
+    )
+}
+
+/// `run` exited non-zero, printing `status:  <exit_status>` and one `E-RUN-040` naming it.
+fn assert_task_ended(run: &Run, exit_status: &str) {
+    assert_eq!(
+        run.output.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let status: Vec<_> = run
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("status:"))
+        .collect();
+    assert_eq!(
+        status,
+        [format!("status:  {exit_status}")],
+        "{}",
+        run.stdout
+    );
+    let errors: Vec<_> = run
+        .stderr
+        .lines()
+        .filter(|line| line.contains("error[E-RUN-040]"))
+        .collect();
+    assert_eq!(errors.len(), 1, "{}", run.stderr);
+    assert!(
+        errors[0].contains(&format!("the task ended {exit_status}: ")),
+        "{}",
+        errors[0]
+    );
+}
+
 fn read_trace(path: &Path) -> Vec<Value> {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -306,7 +362,7 @@ fn session_ceiling_stops_the_task() {
         &server.endpoint,
         &session_ceiling(ceiling),
     ));
-    let run = run_task(&home, &stopped_project);
+    let run = run_task_queue_exit(&home, &stopped_project);
     let trace = run.trace();
     let requests = server.requests().len();
     println!("upstream requests: {requests}");
@@ -348,10 +404,10 @@ fn session_ceiling_stops_the_task() {
         assert!(!run.stderr.contains(provider_error), "{}", run.stderr);
     }
     assert!(trace_token_sum(&trace) <= ceiling);
-    println!(
-        "mur run exit: {:?}; stdout status: {:?}",
-        run.output.status.code(),
-        run.stdout.lines().find(|line| line.starts_with("status:"))
+    assert_task_ended(&run, "spend_ceiling_reached");
+    assert!(
+        events(&trace, "task_failed").is_empty(),
+        "a spend stop has its own record"
     );
 }
 
@@ -1021,11 +1077,19 @@ fn compaction_hook_error_without_refusal_stays_failed() {
     let home = home_with_compactor();
     let server = common::ScriptedServer::start(compaction_responses());
     let control = project(&compaction_manifest(&server.endpoint, "", true));
-    let run = run_task(&home, &control);
+    let run = run_task_queue_exit(&home, &control);
     let trace = run.trace();
     let requests = server.requests().len();
     println!("upstream requests: {requests}");
     assert_eq!(requests, 2, "{}", run.stderr);
+    assert_task_ended(&run, "failed");
+    let failed = events(&trace, "task_failed");
+    assert_eq!(failed.len(), 1, "{trace:?}");
+    assert_eq!(failed[0]["cause"], "compaction_hook");
+    assert_eq!(
+        failed[0]["task_id"],
+        events(&trace, "task_end")[0]["task_id"]
+    );
 
     assert!(events(&trace, "spend_ceiling_reached").is_empty());
     let hook_calls: Vec<_> = events(&trace, "inference")

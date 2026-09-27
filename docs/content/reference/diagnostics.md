@@ -93,6 +93,7 @@ section that explains it.
 | `E-RUN-037` | `--resume-mode compact` under `inference.transport: process` | [E-RUN-037](#e-run-037) |
 | `E-RUN-038` | A spend ceiling is set against a process driver that reports no usage | [E-RUN-038](#e-run-038) |
 | `E-RUN-039` | A forget was asked of a capsule that keeps no harness session | [E-RUN-039](#e-run-039) |
+| `E-RUN-040` | The session ran and its task did not complete: it failed, spent `inference.max_turns`, hit a spend ceiling, or was canceled | [E-RUN-040](#e-run-040) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -505,7 +506,9 @@ credential did not cure it. When a request is rejected, the runtime re-reads
 [`credentials.<NAME>`](config.md#credentials) at once. If the value there has changed, the request
 is sent once more with it. The task ends with this error when the value is unchanged, or when that
 single resend is rejected too. It replaces the driver's own error text. The same message, without
-the code, is written to `out/result.txt`, and the session fails.
+the code, is written to `out/result.txt` and to a [`task_failed`](observability-schemas.md#task-failed)
+line with `cause: "credential_rejected"`, and the task fails: `mur run` then also prints
+[`E-RUN-040`](#e-run-040) carrying the same message, and exits `1`.
 
 ```text
 error[E-RUN-027]: the provider rejected the inference credential credentials.ANTHROPIC_API_KEY in /home/me/.murmur/config.yaml (HTTP 401)
@@ -716,6 +719,28 @@ error[E-RUN-039]: --forget-session forgets the harness session a context names, 
 
 The door refuses the header on `message/send` and `message/stream` with JSON-RPC `-32602`, and
 starts no task.
+
+### E-RUN-040 — the task did not complete { #e-run-040 }
+
+The session ran, shut down cleanly, and the task it ran for ended without completing. `mur run`
+prints the task's exit status on its `status:` line, prints this error and exits `1`:
+
+```text
+status:  failed
+error[E-RUN-040]: the task ended failed: {"error":"driver: failed to parse Anthropic response JSON: EOF while parsing a string at line 1 column 38","stop_reason":"error"}
+  hint: the task's result text is in out/result.txt under the workdir, and `mur trace show <session>` shows the turn it ended on and why
+```
+
+| Exit status | Reason printed |
+|---|---|
+| `failed` | The `reason` of the run's [`task_failed`](observability-schemas.md#task-failed) line, whose `cause` names the kind of failure |
+| `max_turns_reached` | That the task used every turn `inference.max_turns` allows |
+| `spend_ceiling_reached` | That a spend ceiling refused the next inference call. The [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line names which ceiling and the numbers |
+| `canceled` | That the task was canceled, by `tasks/cancel`, `session/stop`, `mur stop` or `SIGTERM` |
+
+A launch reports the first task that did not complete; a later run that completed does not replace
+it. See [Status and exit code](cli.md#mur-run-status). Under `--json` no `status:` line is printed,
+and the error and exit code are the same.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

@@ -355,6 +355,18 @@ struct TaskCanceledEvent {
     delegation_ids: Vec<String>,
 }
 
+/// A task attempt failed, and why.
+#[derive(Debug, Deserialize)]
+struct TaskFailedEvent {
+    /// Absent for a run no task was started for.
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    turn: Option<u32>,
+    cause: String,
+    reason: String,
+}
+
 /// One `on-task-end` hook reopened the task. New event type; older `mur` binaries
 /// route it through the `Unknown` catch-all, this one surfaces it.
 ///
@@ -624,6 +636,7 @@ enum TraceEvent {
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
     TaskCanceled(TaskCanceledEvent),
+    TaskFailed(TaskFailedEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
     HookDispatchError(HookDispatchErrorEvent),
@@ -892,6 +905,8 @@ struct TraceMetrics {
     compactions_declined: Vec<CompactionDeclinedRecord>,
     /// Every `task_canceled` record, in file order — one per task a person stopped.
     cancels: Vec<CancelRecord>,
+    /// Every `task_failed` record, in file order — one per failing attempt.
+    failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
     reopens: Vec<ReopenRecord>,
     /// Every `context_seed` record, in file order — one per seeded task.
@@ -1317,6 +1332,7 @@ fn compute_metrics(
     let mut task_starts: HashSet<String> = HashSet::new();
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut cancels: Vec<CancelRecord> = Vec::new();
+    let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut denials: Vec<DenialRecord> = Vec::new();
@@ -1472,6 +1488,7 @@ fn compute_metrics(
                         .collect(),
                 });
             }
+            TraceEvent::TaskFailed(e) => failures.push(e),
             TraceEvent::TaskReopened(e) => {
                 reopens.push(ReopenRecord {
                     reopen_number: e.reopen_number,
@@ -1711,6 +1728,7 @@ fn compute_metrics(
             compaction,
             compactions_declined,
             cancels,
+            failures,
             reopens,
             context_seeds,
             denials,
@@ -2238,6 +2256,24 @@ fn print_show(m: &TraceMetrics) {
                 format!("still running: {}", c.still_running.join(", "))
             };
             println!("task_canceled  at {}  {still_running}", c.phase);
+        }
+    }
+
+    if !m.failures.is_empty() {
+        println!();
+        println!("── Failed ───────────────────────────────────────");
+        for f in &m.failures {
+            let task = f
+                .task_id
+                .as_deref()
+                .map(|task_id| format!("  {task_id}"))
+                .unwrap_or_default();
+            let turn = f
+                .turn
+                .map(|turn| format!("  at turn {turn}"))
+                .unwrap_or_default();
+            println!("task_failed  {}{task}{turn}", f.cause);
+            println!("  reason: {}", f.reason);
         }
     }
 
@@ -2987,6 +3023,10 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                 )
             };
             format!("{}{}  {residue}", kind("task_canceled"), e.phase)
+        }
+        TraceEvent::TaskFailed(e) => {
+            let reason: String = e.reason.chars().take(120).collect();
+            format!("{}{}  {reason}", kind("task_failed"), e.cause)
         }
         TraceEvent::CallDenied(e) => format!(
             "{}{}  {}  denied by {}",

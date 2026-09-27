@@ -326,10 +326,19 @@ impl ScriptedServer {
         }))
     }
 
+    /// Answers every request with `body` verbatim, whether or not it parses — a body cut off
+    /// mid-JSON, for a capsule whose driver must fail to read it.
+    pub fn always_answering(body: &str) -> Self {
+        Self::serving_body(body.to_string())
+    }
+
     fn serving(response: serde_json::Value) -> Self {
+        Self::serving_body(response.to_string())
+    }
+
+    fn serving_body(body: String) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let body = response.to_string();
 
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {

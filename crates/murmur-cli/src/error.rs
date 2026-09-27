@@ -60,6 +60,7 @@ pub use capsule_runtime::errors::{E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036};
 pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inference.transport: process
 pub const E_RUN_038: &str = "E-RUN-038"; // a spend ceiling is set against a process driver that reports no usage
 pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose transport keeps no harness session
+pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not complete
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -632,6 +633,12 @@ impl From<RuntimeError> for CliError {
             RuntimeError::AgentLoopFailed(message) => CliError::new(
                 E_RUN_007,
                 format!("agent loop failed: {message}"),
+            ),
+            error @ RuntimeError::TaskDidNotComplete { .. } => CliError::with_hint(
+                E_RUN_040,
+                error.to_string(),
+                "the task's result text is in out/result.txt under the workdir, and `mur trace \
+                 show <session>` shows the turn it ended on and why",
             ),
             error @ RuntimeError::SpawnRegistrationFailed { .. } => CliError::with_hint(
                 E_RUN_019,

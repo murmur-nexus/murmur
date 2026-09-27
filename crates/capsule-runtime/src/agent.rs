@@ -18,6 +18,7 @@ use murmur_artifact::{runtime_warning_link, ConversationMode, InferenceConfig, W
 use serde_json::{json, Value};
 
 use crate::{
+    a2a::TaskState,
     bindings::host::murmur::tool::run::{Status, ToolInput},
     cancel::{CancelSignal, Residue, PHASE_INFERENCE},
     detached::DetachedDispatchInfo,
@@ -36,7 +37,10 @@ use crate::{
         emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamStatus,
         TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
     },
-    trace::{TraceWriter, WireCapture},
+    trace::{
+        TraceWriter, WireCapture, TASK_FAILED_COMPACTION_HOOK, TASK_FAILED_CREDENTIAL_REJECTED,
+        TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT, TASK_FAILED_MALFORMED_RESPONSE,
+    },
     types::ResumeMode,
 };
 
@@ -268,10 +272,11 @@ fn with_fence_source(mut message: Value, source: Option<String>) -> Value {
 /// "did it error". The strings are the `exit_status` vocabulary `session_end` and `task_end`
 /// share, so the same value reads the same wherever it lands in a trace.
 ///
-/// `Ok(Failed)` and `Err(_)` are both failures and differ only in whether the loop could keep
-/// the session alive: the loop returns `Ok(Failed)` for an outcome it already recorded and
-/// reported to the model's caller (a driver error, an unsupported stop reason), and `Err` for
-/// one that ends the launch.
+/// Only `Ok` is a completed task. `Ok(Failed)` and `Err(_)` are both failures and differ only in
+/// whether the loop could keep the session alive: the loop returns `Ok(Failed)` for an outcome it
+/// already recorded — a `task_failed` trace line, `out/result.txt`, the terminal status frame —
+/// and `Err` for one that ends the launch. [`task_state_for`] is the one reading of an outcome as
+/// an A2A task state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLoopExit {
     Ok,
@@ -294,6 +299,23 @@ impl AgentLoopExit {
             Self::SpendCeilingReached => "spend_ceiling_reached",
             Self::Canceled => "canceled",
         }
+    }
+}
+
+/// The A2A state a task is left in by an attempt that ended with `outcome`.
+///
+/// The one classification every surface reads — the registry slot `tasks/get` answers from, and
+/// the process transport's terminal status frame — so they cannot disagree about a task. Only a
+/// completed attempt is `Completed`, and only a cancelled one is `Canceled`; a spent turn budget
+/// and a spend-ceiling stop are failures of the task, whatever the session does next.
+pub(crate) fn task_state_for(outcome: &Result<AgentLoopExit, RuntimeError>) -> TaskState {
+    match outcome {
+        Ok(AgentLoopExit::Ok) => TaskState::Completed,
+        Ok(AgentLoopExit::Canceled) => TaskState::Canceled,
+        Ok(AgentLoopExit::Failed)
+        | Ok(AgentLoopExit::MaxTurnsReached)
+        | Ok(AgentLoopExit::SpendCeilingReached)
+        | Err(_) => TaskState::Failed,
     }
 }
 
@@ -673,6 +695,34 @@ pub(crate) async fn run_agent_loop(
             .await);
         }
 
+        // A `request-input` wait that passed `lifecycle.input_timeout_secs` has already left this
+        // task `failed` in the registry and closed its stream. The trapped tool call is all the
+        // model saw of it, so the loop ends the attempt here rather than asking the provider for
+        // a turn the failed task cannot use.
+        if let Some(timed_out) = task_id
+            .as_deref()
+            .filter(|task_id| store_state.task_input_timed_out(task_id))
+        {
+            let reason = format!(
+                "task {timed_out} asked for input and none arrived within \
+                 lifecycle.input_timeout_secs"
+            );
+            return finish_failed_turn(
+                hooks,
+                trace,
+                otel,
+                workdir,
+                // The wait's own timeout wrote the task's final status frame.
+                &None,
+                None,
+                context_id.clone(),
+                turn_u32,
+                TASK_FAILED_INPUT_TIMEOUT,
+                &reason,
+            )
+            .await;
+        }
+
         // Session-level half of the workdir bound. The subprocess spawn paths already refuse to
         // start another writer once the periodic check latches a breach; this is what actually
         // ends the session rather than letting it grind on against a full disk.
@@ -862,35 +912,29 @@ pub(crate) async fn run_agent_loop(
         }
 
         if !matches!(driver_result.status, Status::Passed) {
-            let error_text = match credential_failure(store_state) {
-                Some(message) => message,
-                None => driver_result
-                    .data
-                    .or(driver_result.summary)
-                    .unwrap_or_else(|| "driver returned error".to_string()),
+            let (cause, error_text) = match credential_failure(store_state) {
+                Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
+                None => (
+                    TASK_FAILED_DRIVER_ERROR,
+                    driver_result
+                        .data
+                        .or(driver_result.summary)
+                        .unwrap_or_else(|| "driver returned error".to_string()),
+                ),
             };
-            record_result(hooks, workdir, &format!("error: {error_text}"))
-                .map_err(RuntimeError::AgentLoopFailed)?;
-            flush_hook_dispatch_faults(hooks, trace).await;
-            otel.emit_session_end("failed").await;
-            if task_id.is_some() {
-                emit_sse(
-                    &sse,
-                    "status",
-                    &TaskStatusUpdateEvent {
-                        id: task_id_str.clone(),
-                        context_id: context_id.clone(),
-                        status: StreamStatus {
-                            state: "failed".into(),
-                            message: "session ended".into(),
-                            response: None,
-                        },
-                        r#final: true,
-                    },
-                )
-                .await;
-            }
-            return Ok(AgentLoopExit::Failed);
+            return finish_failed_turn(
+                hooks,
+                trace,
+                otel,
+                workdir,
+                &sse,
+                task_id.as_deref(),
+                context_id.clone(),
+                turn_u32,
+                cause,
+                &error_text,
+            )
+            .await;
         }
 
         let raw = driver_result
@@ -1000,8 +1044,8 @@ pub(crate) async fn run_agent_loop(
         )
         .await;
         if stop_reason == "error" {
-            let error = match credential_failure(store_state) {
-                Some(message) => message,
+            let (cause, error) = match credential_failure(store_state) {
+                Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
                 None => {
                     let error = response
                         .get("error")
@@ -1009,31 +1053,22 @@ pub(crate) async fn run_agent_loop(
                         .unwrap_or("driver returned error")
                         .to_string();
                     crate::runtime_err!("inference error from driver: {error}");
-                    error
+                    (TASK_FAILED_DRIVER_ERROR, error)
                 }
             };
-            record_result(hooks, workdir, &format!("error: {error}"))
-                .map_err(RuntimeError::AgentLoopFailed)?;
-            flush_hook_dispatch_faults(hooks, trace).await;
-            otel.emit_session_end("failed").await;
-            if task_id.is_some() {
-                emit_sse(
-                    &sse,
-                    "status",
-                    &TaskStatusUpdateEvent {
-                        id: task_id_str.clone(),
-                        context_id: context_id.clone(),
-                        status: StreamStatus {
-                            state: "failed".into(),
-                            message: "session ended".into(),
-                            response: None,
-                        },
-                        r#final: true,
-                    },
-                )
-                .await;
-            }
-            return Ok(AgentLoopExit::Failed);
+            return finish_failed_turn(
+                hooks,
+                trace,
+                otel,
+                workdir,
+                &sse,
+                task_id.as_deref(),
+                context_id.clone(),
+                turn_u32,
+                cause,
+                &error,
+            )
+            .await;
         }
 
         // Persist (or drop) the driver's continuation state for this Turn BEFORE the compaction
@@ -1090,28 +1125,19 @@ pub(crate) async fn run_agent_loop(
                 }
                 if let Err(CompactionFailure::Hook(error)) = compacted {
                     crate::runtime_err!("compaction failed: {error}");
-                    record_result(hooks, workdir, &format!("error: {error}"))
-                        .map_err(RuntimeError::AgentLoopFailed)?;
-                    flush_hook_dispatch_faults(hooks, trace).await;
-                    otel.emit_session_end("failed").await;
-                    if task_id.is_some() {
-                        emit_sse(
-                            &sse,
-                            "status",
-                            &TaskStatusUpdateEvent {
-                                id: task_id_str.clone(),
-                                context_id: context_id.clone(),
-                                status: StreamStatus {
-                                    state: "failed".into(),
-                                    message: "session ended".into(),
-                                    response: None,
-                                },
-                                r#final: true,
-                            },
-                        )
-                        .await;
-                    }
-                    return Ok(AgentLoopExit::Failed);
+                    return finish_failed_turn(
+                        hooks,
+                        trace,
+                        otel,
+                        workdir,
+                        &sse,
+                        task_id.as_deref(),
+                        context_id.clone(),
+                        turn_u32,
+                        TASK_FAILED_COMPACTION_HOOK,
+                        &error,
+                    )
+                    .await;
                 }
             }
         }
@@ -1130,32 +1156,19 @@ pub(crate) async fn run_agent_loop(
                     .collect();
 
                 if tool_blocks.is_empty() {
-                    record_result(
+                    return finish_failed_turn(
                         hooks,
+                        trace,
+                        otel,
                         workdir,
-                        "error: response stop_reason=tool_call but no tool_call blocks were present",
+                        &sse,
+                        task_id.as_deref(),
+                        context_id.clone(),
+                        turn_u32,
+                        TASK_FAILED_MALFORMED_RESPONSE,
+                        "response stop_reason=tool_call but no tool_call blocks were present",
                     )
-                    .map_err(RuntimeError::AgentLoopFailed)?;
-                    flush_hook_dispatch_faults(hooks, trace).await;
-                    otel.emit_session_end("failed").await;
-                    if task_id.is_some() {
-                        emit_sse(
-                            &sse,
-                            "status",
-                            &TaskStatusUpdateEvent {
-                                id: task_id_str.clone(),
-                                context_id: context_id.clone(),
-                                status: StreamStatus {
-                                    state: "failed".into(),
-                                    message: "session ended".into(),
-                                    response: None,
-                                },
-                                r#final: true,
-                            },
-                        )
-                        .await;
-                    }
-                    return Ok(AgentLoopExit::Failed);
+                    .await;
                 }
 
                 let mut tool_messages = Vec::new();
@@ -1534,29 +1547,21 @@ pub(crate) async fn run_agent_loop(
                 .await;
             }
             other => {
-                let error = format!("error: unsupported stop_reason '{other}'");
-                crate::runtime_err!("{error}");
-                record_result(hooks, workdir, &error).map_err(RuntimeError::AgentLoopFailed)?;
-                flush_hook_dispatch_faults(hooks, trace).await;
-                otel.emit_session_end("failed").await;
-                if task_id.is_some() {
-                    emit_sse(
-                        &sse,
-                        "status",
-                        &TaskStatusUpdateEvent {
-                            id: task_id_str.clone(),
-                            context_id: context_id.clone(),
-                            status: StreamStatus {
-                                state: "failed".into(),
-                                message: "session ended".into(),
-                                response: None,
-                            },
-                            r#final: true,
-                        },
-                    )
-                    .await;
-                }
-                return Ok(AgentLoopExit::Failed);
+                let error = format!("unsupported stop_reason '{other}'");
+                crate::runtime_err!("error: {error}");
+                return finish_failed_turn(
+                    hooks,
+                    trace,
+                    otel,
+                    workdir,
+                    &sse,
+                    task_id.as_deref(),
+                    context_id.clone(),
+                    turn_u32,
+                    TASK_FAILED_MALFORMED_RESPONSE,
+                    &error,
+                )
+                .await;
             }
         }
     }
@@ -1592,6 +1597,57 @@ pub(crate) async fn run_agent_loop(
         .await;
     }
     Ok(AgentLoopExit::MaxTurnsReached)
+}
+
+/// End one attempt because it failed: the driver call, the response, the compaction hook or the
+/// task's input wait.
+///
+/// Everything a failed turn leaves behind, in one place so no failure site can record less than
+/// another:
+///
+/// * a `task_failed` trace line with `cause` from the `TASK_FAILED_*` vocabulary and `reason`,
+///   which is also what a launch that ends on this outcome reports;
+/// * `error: <reason>` as the attempt's result text, in `out/result.txt`;
+/// * a final `failed` status event on the task's stream, when `sse` carries one.
+///
+/// `Err` only when the result text cannot be written; the `task_failed` line is already in the
+/// trace by then.
+#[allow(clippy::too_many_arguments)]
+async fn finish_failed_turn(
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    workdir: &Path,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    task_id: Option<&str>,
+    context_id: Option<String>,
+    turn: u32,
+    cause: &str,
+    reason: &str,
+) -> Result<AgentLoopExit, RuntimeError> {
+    let _ = trace.write_task_failed(Some(turn), cause, reason).await;
+    record_result(hooks, workdir, &format!("error: {reason}"))
+        .map_err(RuntimeError::AgentLoopFailed)?;
+    flush_hook_dispatch_faults(hooks, trace).await;
+    otel.emit_session_end(AgentLoopExit::Failed.as_str()).await;
+    if let Some(task_id) = task_id {
+        emit_sse(
+            sse,
+            "status",
+            &TaskStatusUpdateEvent {
+                id: task_id.to_string(),
+                context_id,
+                status: StreamStatus {
+                    state: "failed".into(),
+                    message: "session ended".into(),
+                    response: None,
+                },
+                r#final: true,
+            },
+        )
+        .await;
+    }
+    Ok(AgentLoopExit::Failed)
 }
 
 /// End one attempt because a person stopped the task.
@@ -5725,6 +5781,26 @@ forgery: {prompt}"
             AgentLoopExit::SpendCeilingReached.as_str(),
             "spend_ceiling_reached"
         );
+    }
+
+    /// Every outcome an attempt can end with, read as the A2A state its task is left in: only a
+    /// completed attempt is `completed`, only a cancelled one `canceled`.
+    #[test]
+    fn task_state_for_reads_every_outcome() {
+        let cases = [
+            (Ok(AgentLoopExit::Ok), TaskState::Completed),
+            (Ok(AgentLoopExit::Failed), TaskState::Failed),
+            (Ok(AgentLoopExit::MaxTurnsReached), TaskState::Failed),
+            (Ok(AgentLoopExit::SpendCeilingReached), TaskState::Failed),
+            (Ok(AgentLoopExit::Canceled), TaskState::Canceled),
+            (
+                Err(RuntimeError::AgentLoopFailed("boom".into())),
+                TaskState::Failed,
+            ),
+        ];
+        for (outcome, state) in cases {
+            assert_eq!(task_state_for(&outcome), state, "{outcome:?}");
+        }
     }
 
     fn inference_on(transport: &str) -> InferenceConfig {

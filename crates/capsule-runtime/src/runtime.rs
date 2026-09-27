@@ -240,6 +240,7 @@ async fn run_task_with_reopens(
         let remaining_turns = inference.max_turns.saturating_sub(trace.task_turns());
         let mut attempt_inference = inference.clone();
         attempt_inference.max_turns = remaining_turns;
+        let failures_before = trace.task_failures_written();
 
         let result = agent::run_agent_loop(
             state,
@@ -275,6 +276,20 @@ async fn run_task_with_reopens(
                 .and_then(|value| value.parse::<u64>().ok())
             {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
+
+        // Every failing attempt leaves one `task_failed`. The agent loop writes its own at the
+        // failure site; an `Err` it returned without one is named here, by its own text.
+        if let Err(error) = &result {
+            if trace.task_failures_written() == failures_before {
+                let _ = trace
+                    .write_task_failed(
+                        None,
+                        crate::trace::TASK_FAILED_RUNTIME_ERROR,
+                        &error.to_string(),
+                    )
+                    .await;
             }
         }
 
@@ -339,17 +354,25 @@ async fn run_task_with_reopens(
                 // Budget or turn ceiling reached while a hook still wanted to reopen: end
                 // the task as a distinct, non-silent failure rather than an ordinary
                 // completion. `Err` keeps every existing `.is_err()` downstream branch.
-                let _ = trace
-                    .write_task_end(trace_task_id, "reopen_budget_exhausted", reopens_used)
-                    .await;
-                hooks.end_task();
-                return Err(RuntimeError::AgentLoopFailed(reopen_refusal_message(
+                let refusal = reopen_refusal_message(
                     &hook_name,
                     reopens_used,
                     max_task_reopens,
                     inference.max_turns,
                     budget_ok,
-                )));
+                );
+                let _ = trace
+                    .write_task_failed(
+                        None,
+                        crate::trace::TASK_FAILED_REOPEN_BUDGET_EXHAUSTED,
+                        &refusal,
+                    )
+                    .await;
+                let _ = trace
+                    .write_task_end(trace_task_id, "reopen_budget_exhausted", reopens_used)
+                    .await;
+                hooks.end_task();
+                return Err(RuntimeError::AgentLoopFailed(refusal));
             }
             None => {
                 // No hook asked to reopen — this attempt is terminal.
@@ -426,6 +449,102 @@ fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String
         out.push('\n');
     }
     out
+}
+
+/// The launch-outcome combine rule: a run that did not complete — anything but
+/// `Ok(AgentLoopExit::Ok)` — is never replaced by a later one; a completed one always is.
+///
+/// A launch that ran a failing task therefore cannot end `ok` because something ran cleanly after
+/// it, and the outcome the launch reports is the first run that did not complete.
+pub(crate) fn combine_outcomes(
+    earlier: Result<AgentLoopExit, RuntimeError>,
+    later: Result<AgentLoopExit, RuntimeError>,
+) -> Result<AgentLoopExit, RuntimeError> {
+    if matches!(earlier, Ok(AgentLoopExit::Ok)) {
+        later
+    } else {
+        earlier
+    }
+}
+
+/// What `reason` a launch ending on `max_turns_reached` reports.
+const MAX_TURNS_REACHED_REASON: &str =
+    "the task used every inference turn inference.max_turns allows without finishing";
+
+/// What `reason` a launch ending on `spend_ceiling_reached` reports. The ceiling's own numbers are
+/// in the `spend_ceiling_reached` trace line and `out/result.txt`.
+const SPEND_CEILING_REACHED_REASON: &str = "a spend ceiling (inference.max_session_tokens or \
+     spend.machine_tokens_per_day) refused the next inference call";
+
+/// What `reason` a launch ending on `canceled` reports.
+const CANCELED_REASON: &str = "the task was canceled";
+
+/// What `reason` a `failed` launch reports when the run behind it wrote no `task_failed` line.
+const FAILED_WITHOUT_RECORD_REASON: &str = "see out/result.txt";
+
+/// A launch's outcome, folded over every run its task loop makes by [`combine_outcomes`].
+///
+/// The one value `session_end.exit_status`, `on-session-end` and the launch's own result read, so
+/// the three cannot disagree.
+struct LaunchOutcome {
+    result: Result<AgentLoopExit, RuntimeError>,
+    /// The `task_failed` reason the run behind `result` wrote, or `None` when it wrote none.
+    failure_reason: Option<String>,
+}
+
+impl LaunchOutcome {
+    /// A launch that has run nothing yet, which ends `ok` if it never runs anything.
+    fn new() -> Self {
+        Self {
+            result: Ok(AgentLoopExit::Ok),
+            failure_reason: None,
+        }
+    }
+
+    /// Fold in one run's result. `failures_before` is [`TraceWriter::task_failures_written`] as it
+    /// stood just before that run, so a reason is taken only from a `task_failed` line the run
+    /// wrote itself.
+    fn record(
+        &mut self,
+        result: Result<AgentLoopExit, RuntimeError>,
+        trace: &TraceWriter,
+        failures_before: u64,
+    ) {
+        if matches!(self.result, Ok(AgentLoopExit::Ok)) {
+            self.failure_reason = (trace.task_failures_written() > failures_before)
+                .then(|| trace.last_task_failure().map(str::to_string))
+                .flatten();
+        }
+        let earlier = std::mem::replace(&mut self.result, Ok(AgentLoopExit::Ok));
+        self.result = combine_outcomes(earlier, result);
+    }
+
+    /// The `exit_status` vocabulary `session_end` and `on-session-end` carry.
+    fn exit_status(&self) -> &'static str {
+        match &self.result {
+            Ok(exit) => exit.as_str(),
+            Err(_) => AgentLoopExit::Failed.as_str(),
+        }
+    }
+
+    /// `Ok(())` only for a launch whose every run completed.
+    fn into_launch_result(self) -> Result<(), RuntimeError> {
+        let exit = self.result?;
+        let reason = match exit {
+            AgentLoopExit::Ok => return Ok(()),
+            AgentLoopExit::Failed => self
+                .failure_reason
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| FAILED_WITHOUT_RECORD_REASON.to_string()),
+            AgentLoopExit::MaxTurnsReached => MAX_TURNS_REACHED_REASON.to_string(),
+            AgentLoopExit::SpendCeilingReached => SPEND_CEILING_REACHED_REASON.to_string(),
+            AgentLoopExit::Canceled => CANCELED_REASON.to_string(),
+        };
+        Err(RuntimeError::TaskDidNotComplete {
+            exit_status: exit.as_str(),
+            reason,
+        })
+    }
 }
 
 /// Live-delivery buffer: only needs to cover the lag between fastest and slowest
@@ -2221,11 +2340,9 @@ fn launch(
                     let _running_record = write_running_record(&running_record, &workdir);
                     on_url(&capsule_url);
 
-                    // Seeded rather than assigned on every exit path: an iteration that only
-                    // closes out work already in a lane can end without a result of its own, and
-                    // then the last real task's outcome is the launch's outcome.
-                    let mut final_loop_result: Result<AgentLoopExit, RuntimeError> =
-                        Ok(AgentLoopExit::Ok);
+                    // Every run this loop makes on the launch's behalf is folded in; an
+                    // iteration that only closes out work already in a lane adds nothing.
+                    let mut outcome = LaunchOutcome::new();
 
                     // Set once the loop has stopped taking new work and is running only what is
                     // already in a lane. A task the runtime generated for itself never crossed
@@ -2375,6 +2492,7 @@ fn launch(
                                         // run_task_with_reopens fires on-task-end, honors any
                                         // reopen-task within budget, and writes the terminal
                                         // task_end (with reopen_count) itself.
+                                        let failures_before = trace.task_failures_written();
                                         let result = run_task_with_reopens(
                                             &mut state,
                                             &workdir,
@@ -2400,7 +2518,7 @@ fn launch(
                                         )
                                         .await;
                                         let failed = result.is_err();
-                                        final_loop_result = result;
+                                        outcome.record(result, &trace, failures_before);
                                         if failed {
                                             break 'task_loop;
                                         }
@@ -2457,6 +2575,7 @@ fn launch(
                                         state.current_context_id = Some(context_id.clone());
                                         state.current_forget_harness_session =
                                             take_forget_session(&mut pending_forget_session);
+                                        let failures_before = trace.task_failures_written();
                                         let result = run_task_with_reopens(
                                             &mut state,
                                             &workdir,
@@ -2481,6 +2600,9 @@ fn launch(
                                         .await;
                                         let _ = trace.flush().await;
                                         let failed = result.is_err();
+                                        // The launch's own task decides its outcome under every
+                                        // lifecycle, queue+sleep included, whatever runs next.
+                                        outcome.record(result, &trace, failures_before);
                                         // Only queue+sleep outlives its task. Every other
                                         // lifecycle, `queue` + `exit` included, ends here: it
                                         // closes out what is already in a lane, such as a
@@ -2488,7 +2610,6 @@ fn launch(
                                         if !effective_lifecycle.can_receive_background_tasks()
                                             || failed
                                         {
-                                            final_loop_result = result;
                                             if failed {
                                                 break 'task_loop;
                                             }
@@ -2558,10 +2679,7 @@ fn launch(
                                                 () = terminating.canceled() => break 'task_loop,
                                                 arrived = task_rx.recv() => match arrived {
                                                     Some(task) => task,
-                                                    None => {
-                                                        final_loop_result = Ok(AgentLoopExit::Ok);
-                                                        break 'task_loop;
-                                                    }
+                                                    None => break 'task_loop,
                                                 },
                                                 Some(report) = completion_rx.recv() => {
                                                     enqueue_detached_report(
@@ -2612,10 +2730,7 @@ fn launch(
                                                 }
                                                 Ok(Woke::Terminating) => break 'task_loop,
                                                 Ok(Woke::Task(Some(task))) => task,
-                                                Ok(Woke::Task(None)) => {
-                                                    final_loop_result = Ok(AgentLoopExit::Ok);
-                                                    break 'task_loop;
-                                                }
+                                                Ok(Woke::Task(None)) => break 'task_loop,
                                                 // A `task.md` would have run above, so what can
                                                 // still give this launch a task is a file already
                                                 // in the accessible workdir, in practice
@@ -2632,14 +2747,15 @@ fn launch(
                                                     crate::runtime_err!(
                                                         "[capsule-runtime] no A2A message received within {idle_timeout_secs}s and there is no task to run; ending the session without calling the model"
                                                     );
-                                                    final_loop_result = Ok(AgentLoopExit::Ok);
                                                     break 'task_loop;
                                                 }
                                                 Err(_elapsed) => {
                                                     crate::runtime_err!("[capsule-runtime] no A2A message received within {idle_timeout_secs}s; running the task in input.txt");
                                                     otel.begin_session(None);
                                                     state.current_traceparent = otel.outgoing_traceparent();
-                                                    final_loop_result = agent::run_agent_loop(
+                                                    let failures_before =
+                                                        trace.task_failures_written();
+                                                    let result = agent::run_agent_loop(
                                                         &mut state,
                                                         &workdir,
                                                         inference,
@@ -2667,6 +2783,22 @@ fn launch(
                                                         None,
                                                     )
                                                     .await;
+                                                    // No `run_task_with_reopens` wraps this run,
+                                                    // so its `runtime_error` is written here.
+                                                    if let Err(error) = &result {
+                                                        if trace.task_failures_written()
+                                                            == failures_before
+                                                        {
+                                                            let _ = trace
+                                                                .write_task_failed(
+                                                                    None,
+                                                                    crate::trace::TASK_FAILED_RUNTIME_ERROR,
+                                                                    &error.to_string(),
+                                                                )
+                                                                .await;
+                                                        }
+                                                    }
+                                                    outcome.record(result, &trace, failures_before);
                                                     break 'task_loop;
                                                 }
                                             }
@@ -2770,6 +2902,7 @@ fn launch(
                             .forget_session
                             .then_some(crate::harness_session::FORGET_BY_A2A);
                         state.a2a_task_id = Some(incoming.task_id.clone());
+                        let failures_before = trace.task_failures_written();
                         let loop_result = run_task_with_reopens(
                             &mut state,
                             &workdir,
@@ -2800,11 +2933,7 @@ fn launch(
                         // `finish_task` refuses to overwrite an accepted cancel whatever is
                         // passed, so this is the loop's own reading rather than the authority:
                         // an attempt that reported `canceled` says so here too.
-                        let exit_state = match &loop_result {
-                            Ok(AgentLoopExit::Canceled) => TaskState::Canceled,
-                            Ok(_) => TaskState::Completed,
-                            Err(_) => TaskState::Failed,
-                        };
+                        let exit_state = agent::task_state_for(&loop_result);
                         let _ = trace.flush().await;
                         {
                             let mut reg = task_registry.lock().unwrap();
@@ -2817,7 +2946,7 @@ fn launch(
                         // A terminating session starts nothing after the task it was running:
                         // what is still in a lane gets its cancel recorded, and the loop ends.
                         if terminating.is_canceled() {
-                            final_loop_result = loop_result;
+                            outcome.record(loop_result, &trace, failures_before);
                             close_lanes_on_termination(
                                 &mut lanes,
                                 &task_registry,
@@ -2834,12 +2963,12 @@ fn launch(
                         // Closing out runs down whatever is already in a lane and then ends the
                         // loop, whatever `after_task` says: nothing can arrive to extend it.
                         if closing_out {
-                            final_loop_result = loop_result;
+                            outcome.record(loop_result, &trace, failures_before);
                             continue 'task_loop;
                         }
                         match effective_lifecycle.after_task {
                             AfterTask::Exit => {
-                                final_loop_result = loop_result;
+                                outcome.record(loop_result, &trace, failures_before);
                                 break 'task_loop;
                             }
                             AfterTask::Sleep => {
@@ -2848,10 +2977,12 @@ fn launch(
                                     TaskAcceptance::Single
                                 ) {
                                     // single mode always exits after one task
-                                    final_loop_result = loop_result;
+                                    outcome.record(loop_result, &trace, failures_before);
                                     break 'task_loop;
                                 }
-                                // Queue+sleep: clear task.md and wait for next task
+                                // Queue+sleep: clear task.md and wait for next task. A peer's
+                                // task reports its own outcome through `tasks/get` and its
+                                // stream; it does not decide how a long-lived session ends.
                                 let _ = tokio::fs::remove_file(&workdir_task_md).await;
                                 continue 'task_loop;
                             }
@@ -2861,14 +2992,11 @@ fn launch(
 
                     // on-session-end fires ONCE per launch, after the task loop exits.
                     // total_turns is the whole-launch aggregate accumulated by HookRuntime
-                    // (one per Inference event across every task). exit_status is the last
-                    // agent loop's own terminal outcome, so a launch that ended on a driver
-                    // error or a spent turn budget says so rather than reading `"ok"` because
-                    // the runtime kept the session alive to report it.
-                    let session_exit_status = match &final_loop_result {
-                        Ok(exit) => exit.as_str(),
-                        Err(_) => "failed",
-                    };
+                    // (one per Inference event across every task). exit_status is the launch's
+                    // combined outcome, so a launch that ran a task ending on a driver error or a
+                    // spent turn budget says so rather than reading `"ok"` because the runtime
+                    // kept the session alive to report it.
+                    let session_exit_status = outcome.exit_status();
                     let session_total_turns = hooks.total_turns();
                     hooks
                         .emit(
@@ -2977,7 +3105,7 @@ fn launch(
                     let _ = shutdown_tx.send(());
                     let _ = server_handle.await;
 
-                    final_loop_result.map(|_| ())
+                    outcome.into_launch_result()
                 })
                 .await
         });
@@ -3351,9 +3479,10 @@ impl Drop for RoostSession {
 /// [`DelegationStatus::Error`] and is promoted by [`Self::complete`] at each success return, so
 /// every path that is not a success reports as one that failed.
 ///
-/// `max_turns_reached` is not distinguishable from here: the agent path collapses it into `Ok`
-/// before the value leaves its async block, so a session that spent its turn budget reports `ok`.
-/// The child's own trace holds the precise exit status, at a path the completion names.
+/// Success is a launch whose task completed: a task that ended `failed`, `max_turns_reached`,
+/// `spend_ceiling_reached` or `canceled` reaches here as [`RuntimeError::TaskDidNotComplete`] and
+/// reports `error`. The report carries no finer status; the child's own trace holds the precise
+/// `exit_status`, at a path the completion names.
 struct DelegationReport {
     /// `None` for every capsule nobody delegated, which reports to nobody.
     handle: Option<SpawnerHandle>,
@@ -4837,6 +4966,14 @@ impl CapsuleStoreState {
         let registry = self.a2a_task_registry.as_ref()?;
         let task_id = self.a2a_task_id.as_deref()?;
         Some(registry.lock().unwrap().cancel_watch(task_id))
+    }
+
+    /// Whether `task_id`'s `request-input` wait timed out: the one path that fails a task in the
+    /// registry while its attempt is still running. `false` outside an A2A session.
+    pub(crate) fn task_input_timed_out(&self, task_id: &str) -> bool {
+        self.a2a_task_registry
+            .as_ref()
+            .is_some_and(|registry| registry.lock().unwrap().has_failed(task_id))
     }
 
     /// Returns the held continuation `(id, acked_len)` iff a continuation is currently held
@@ -12942,6 +13079,110 @@ inference:
             .unwrap();
         assert_eq!(end["reopen_count"], 1);
         assert_eq!(end["exit_status"], "reopen_budget_exhausted");
+
+        let failed = of_type(&events, "task_failed");
+        assert_eq!(failed.len(), 1, "one task_failed for the exhausted task");
+        assert_eq!(failed[0]["cause"], "reopen_budget_exhausted");
+        assert_eq!(failed[0]["task_id"], end["task_id"]);
+        let reason = failed[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("lifecycle.max_task_reopens"),
+            "the reason names the limit that refused the reopen: {reason}"
+        );
+        let position = |ty: &str| events.iter().position(|e| e["event_type"] == ty).unwrap();
+        assert!(position("task_failed") < position("task_end"));
+    }
+
+    /// The launch-outcome combine rule over every pair of outcomes: the earlier outcome survives
+    /// exactly when it did not complete.
+    #[test]
+    fn combine_outcomes_never_replaces_an_outcome_that_did_not_complete() {
+        fn outcomes() -> Vec<Result<AgentLoopExit, RuntimeError>> {
+            vec![
+                Ok(AgentLoopExit::Ok),
+                Ok(AgentLoopExit::Failed),
+                Ok(AgentLoopExit::MaxTurnsReached),
+                Ok(AgentLoopExit::SpendCeilingReached),
+                Ok(AgentLoopExit::Canceled),
+                Err(RuntimeError::AgentLoopFailed("earlier-or-later".into())),
+            ]
+        }
+        fn label(outcome: &Result<AgentLoopExit, RuntimeError>) -> &'static str {
+            match outcome {
+                Ok(exit) => exit.as_str(),
+                Err(_) => "err",
+            }
+        }
+        let count = outcomes().len();
+        for i in 0..count {
+            for j in 0..count {
+                let earlier = outcomes().swap_remove(i);
+                let later = outcomes().swap_remove(j);
+                let (earlier_label, later_label) = (label(&earlier), label(&later));
+                let expected = if i == 0 { later_label } else { earlier_label };
+                let combined = combine_outcomes(earlier, later);
+                assert_eq!(
+                    label(&combined),
+                    expected,
+                    "{earlier_label} then {later_label}"
+                );
+            }
+        }
+    }
+
+    /// The launch result an outcome maps to: `Ok(())` only for a completed task, and a
+    /// `TaskDidNotComplete` naming the exit status and a non-empty reason for every other one.
+    #[test]
+    fn launch_outcome_maps_to_the_launch_result() {
+        let outcome = |result, failure_reason: Option<&str>| LaunchOutcome {
+            result,
+            failure_reason: failure_reason.map(str::to_string),
+        };
+        assert!(outcome(Ok(AgentLoopExit::Ok), None)
+            .into_launch_result()
+            .is_ok());
+        let cases = [
+            (
+                AgentLoopExit::Failed,
+                Some("the provider said no"),
+                "the provider said no",
+            ),
+            (AgentLoopExit::Failed, None, FAILED_WITHOUT_RECORD_REASON),
+            (
+                AgentLoopExit::Failed,
+                Some(""),
+                FAILED_WITHOUT_RECORD_REASON,
+            ),
+            (
+                AgentLoopExit::MaxTurnsReached,
+                None,
+                MAX_TURNS_REACHED_REASON,
+            ),
+            (
+                AgentLoopExit::SpendCeilingReached,
+                None,
+                SPEND_CEILING_REACHED_REASON,
+            ),
+            (AgentLoopExit::Canceled, None, CANCELED_REASON),
+        ];
+        for (exit, recorded, expected) in cases {
+            match outcome(Ok(exit), recorded).into_launch_result() {
+                Err(RuntimeError::TaskDidNotComplete {
+                    exit_status,
+                    reason,
+                }) => {
+                    assert_eq!(exit_status, exit.as_str());
+                    assert_eq!(reason, expected);
+                }
+                other => panic!("{exit:?}: expected TaskDidNotComplete, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            outcome(Err(RuntimeError::AgentLoopFailed("boom".into())), None).into_launch_result(),
+            Err(RuntimeError::AgentLoopFailed(message)) if message == "boom"
+        ));
+        assert!(MAX_TURNS_REACHED_REASON.contains("inference.max_turns"));
+        assert!(SPEND_CEILING_REACHED_REASON.contains("spend ceiling"));
     }
 
     /// Turn ceiling respected: `inference.max_turns: 3`, `lifecycle.max_task_reopens: 5`, a

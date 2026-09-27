@@ -96,6 +96,11 @@ pub(crate) struct TraceWriter {
     task_shell_calls: u32,
     task_start_instant: Option<Instant>,
     pub(crate) active_task_id: Option<String>,
+    /// How many `task_failed` lines this writer has written, so a caller can tell whether one run
+    /// wrote its own without comparing reasons.
+    task_failures_written: u64,
+    /// The `reason` of the last `task_failed` line, as written (already capped).
+    last_task_failure: Option<String>,
     /// The spend ceilings `session_start` records. Set by [`Self::set_spend_ceilings`].
     max_session_tokens: Option<u64>,
     machine_tokens_per_day: Option<u64>,
@@ -876,6 +881,63 @@ struct TaskCanceledEvent {
     delegation_ids: Vec<String>,
 }
 
+/// `task_failed.cause` when the driver returned an error status or a response whose
+/// `stop_reason` is `"error"`, and no credential rejection is pending.
+pub(crate) const TASK_FAILED_DRIVER_ERROR: &str = "driver_error";
+
+/// `task_failed.cause` for a driver error while the gateway holds a credential rejection: the
+/// provider keeps refusing the key, and the reason is the `E-RUN-027` message.
+pub(crate) const TASK_FAILED_CREDENTIAL_REJECTED: &str = "credential_rejected";
+
+/// `task_failed.cause` for a response the loop cannot act on: `stop_reason: "tool_call"` with no
+/// `tool_call` block, or a `stop_reason` that is missing or unsupported.
+pub(crate) const TASK_FAILED_MALFORMED_RESPONSE: &str = "malformed_response";
+
+/// `task_failed.cause` when a bound compaction hook returned `Err`.
+pub(crate) const TASK_FAILED_COMPACTION_HOOK: &str = "compaction_hook";
+
+/// `task_failed.cause` when a `request-input` wait passed `lifecycle.input_timeout_secs`.
+pub(crate) const TASK_FAILED_INPUT_TIMEOUT: &str = "input_timeout";
+
+/// `task_failed.cause` when an `on-task-end` hook still asked to reopen and
+/// `lifecycle.max_task_reopens` or `inference.max_turns` refused it.
+pub(crate) const TASK_FAILED_REOPEN_BUDGET_EXHAUSTED: &str = "reopen_budget_exhausted";
+
+/// `task_failed.cause` for an attempt that ended in a runtime error no other cause names. The
+/// reason is the error's own text.
+pub(crate) const TASK_FAILED_RUNTIME_ERROR: &str = "runtime_error";
+
+/// The most `task_failed.reason` carries, in bytes. A driver's error text is provider-supplied
+/// and unbounded; the whole of it stays in `out/result.txt`.
+pub(crate) const MAX_TASK_FAILURE_REASON_BYTES: usize = 2_000;
+
+/// A task attempt failed, and why. Written once per failing attempt, before its task's
+/// `task_end`, by whichever part of the runtime saw the failure.
+///
+/// `task_end.exit_status` says `failed`; this names the cause from a closed vocabulary (the
+/// `TASK_FAILED_*` constants) and carries the reason in words. Never written for a task that
+/// ended `ok`, `max_turns_reached`, `spend_ceiling_reached` or `canceled`: those have their own
+/// records.
+#[derive(Serialize)]
+struct TaskFailedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The task in progress. Absent for the run a launch makes from `input.txt` when no task
+    /// arrived, which has no `task_start`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    /// The turn that failed, 0-based. Absent when the failure is the task's rather than one
+    /// turn's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn: Option<u32>,
+    cause: String,
+    /// Capped at [`MAX_TASK_FAILURE_REASON_BYTES`] on a character boundary.
+    reason: String,
+}
+
 /// `task_reopened.attempt_context` for a next attempt that continues the task's own
 /// conversation, with the hook's feedback as the one message it adds.
 pub(crate) const REOPEN_CONTEXT_CONTINUED: &str = "continued";
@@ -1491,6 +1553,8 @@ impl TraceWriter {
             task_shell_calls: 0,
             task_start_instant: None,
             active_task_id: None,
+            task_failures_written: 0,
+            last_task_failure: None,
             max_session_tokens: None,
             machine_tokens_per_day: None,
         })
@@ -2096,6 +2160,45 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Record that the task attempt in progress failed, with `cause` from the `TASK_FAILED_*`
+    /// vocabulary. Written whatever `trace.capture` is.
+    ///
+    /// Leaves the task frame open, as [`Self::write_task_canceled`] does: the `task_end` that
+    /// follows closes it. The reason, capped, is kept for [`Self::last_task_failure`].
+    pub(crate) async fn write_task_failed(
+        &mut self,
+        turn: Option<u32>,
+        cause: &str,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let reason = cap_task_failure_reason(reason);
+        let event = TaskFailedEvent {
+            event_type: "task_failed",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            turn,
+            cause: cause.to_string(),
+            reason: reason.clone(),
+        };
+        self.task_failures_written += 1;
+        self.last_task_failure = Some(reason);
+        self.write_event(&event).await
+    }
+
+    /// The `reason` of the last `task_failed` line this writer wrote, or `None` before the first.
+    pub(crate) fn last_task_failure(&self) -> Option<&str> {
+        self.last_task_failure.as_deref()
+    }
+
+    /// How many `task_failed` lines this writer has written. Compared across one run to tell
+    /// whether that run wrote its own.
+    pub(crate) fn task_failures_written(&self) -> u64 {
+        self.task_failures_written
+    }
+
     /// Record that an `on-task-end` hook reopened the task. Written by the runtime's
     /// per-task reopen loop between two agent-loop attempts, once per reopen, before
     /// the terminal `task_end` record. `reopen_number` is 1-based.
@@ -2571,6 +2674,18 @@ impl TraceWriter {
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await
     }
+}
+
+/// `reason` cut to [`MAX_TASK_FAILURE_REASON_BYTES`] at a character boundary.
+fn cap_task_failure_reason(reason: &str) -> String {
+    if reason.len() <= MAX_TASK_FAILURE_REASON_BYTES {
+        return reason.to_string();
+    }
+    let mut end = MAX_TASK_FAILURE_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
 }
 
 /// One element of `session_start.gateways`: an artifact's credential gateway. Never the key.
@@ -4975,6 +5090,57 @@ mod tests {
         w.flush().await.unwrap();
         let events = read_events(framed.path());
         assert_eq!(events[1]["parent_id"], events[0]["event_id"]);
+    }
+
+    /// `task_failed` hangs off the task it failed, and a reason past the cap is cut on a character
+    /// boundary. Both optional fields are absent, not null, when there is nothing to say.
+    #[tokio::test]
+    async fn task_failed_names_the_task_turn_cause_and_capped_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        assert_eq!(w.last_task_failure(), None);
+        w.write_task_failed(None, TASK_FAILED_RUNTIME_ERROR, "before any task")
+            .await
+            .unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
+            .await
+            .unwrap();
+        let long = "é".repeat(MAX_TASK_FAILURE_REASON_BYTES);
+        w.write_task_failed(Some(2), TASK_FAILED_DRIVER_ERROR, &long)
+            .await
+            .unwrap();
+        w.write_task_end("tsk_1", "failed", 0).await.unwrap();
+        w.flush().await.unwrap();
+
+        assert_eq!(w.task_failures_written(), 2);
+        let events = read_events(dir.path());
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "task_failed")
+            .collect();
+        assert_eq!(failed.len(), 2);
+
+        assert!(failed[0].get("task_id").is_none(), "{}", failed[0]);
+        assert!(failed[0].get("turn").is_none(), "{}", failed[0]);
+        assert_eq!(failed[0]["cause"], "runtime_error");
+        assert_eq!(failed[0]["reason"], "before any task");
+
+        let start = events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .unwrap();
+        assert_eq!(failed[1]["task_id"], "tsk_1");
+        assert_eq!(failed[1]["turn"], 2);
+        assert_eq!(failed[1]["cause"], "driver_error");
+        assert_eq!(failed[1]["parent_id"], start["event_id"]);
+        assert_eq!(failed[1]["session_id"], start["session_id"]);
+        assert!(failed[1]["event_id"].is_string());
+        assert!(failed[1]["timestamp"].is_u64());
+        let reason = failed[1]["reason"].as_str().unwrap();
+        assert!(reason.len() <= MAX_TASK_FAILURE_REASON_BYTES);
+        assert!(reason.len() > MAX_TASK_FAILURE_REASON_BYTES - 2);
+        assert_eq!(w.last_task_failure(), Some(reason));
     }
 
     /// Turn-level events carry the enclosing task's id, and `null` once the task has ended —

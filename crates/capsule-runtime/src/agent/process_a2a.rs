@@ -40,7 +40,8 @@ use std::sync::{
 };
 
 use crate::{
-    agent::AgentLoopExit,
+    a2a::TaskState,
+    agent::{task_state_for, AgentLoopExit},
     cancel::CANCELED_STATUS_MESSAGE,
     errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036},
     streaming::{
@@ -244,24 +245,26 @@ impl A2aStream {
     /// Write the attempt's one terminal status. Called on every path out of the attempt, with
     /// what the attempt returned, and never twice: this is the frame a client waits on.
     pub(super) async fn finish(&mut self, outcome: &Result<AgentLoopExit, RuntimeError>) {
-        match outcome {
-            Ok(AgentLoopExit::Canceled) => {
-                let message = canceled_message(self.harness_killed).to_string();
-                self.status(AgentLoopExit::Canceled.as_str(), &message, None, true)
-                    .await;
-            }
-            Ok(AgentLoopExit::SpendCeilingReached) => {
-                let message = self.spend_refusal.clone().unwrap_or_default();
-                self.status("failed", &message, None, true).await;
-            }
-            Ok(_) => {
+        match task_state_for(outcome) {
+            TaskState::Completed => {
                 let response = self.result.clone();
                 self.status("completed", "session ended", Some(response), true)
                     .await;
             }
-            Err(error) => {
-                self.status("failed", &failure_message(error), None, true)
+            TaskState::Canceled => {
+                let message = canceled_message(self.harness_killed).to_string();
+                self.status(AgentLoopExit::Canceled.as_str(), &message, None, true)
                     .await;
+            }
+            _ => {
+                let message = match outcome {
+                    Ok(AgentLoopExit::SpendCeilingReached) => {
+                        self.spend_refusal.clone().unwrap_or_default()
+                    }
+                    Ok(exit) => exit.as_str().to_string(),
+                    Err(error) => failure_message(error),
+                };
+                self.status("failed", &message, None, true).await;
             }
         }
     }

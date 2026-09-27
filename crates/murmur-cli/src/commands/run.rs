@@ -820,13 +820,20 @@ pub(crate) fn run_run(
                 print_run_output(&launched.session_id, &launched.workdir, RunStatus::Success);
                 Ok(())
             }
-            Err(RuntimeError::CapsuleTrap(message)) => {
-                let error = CliError::from(RuntimeError::CapsuleTrap(message));
-                print_run_output(&session_id, &workdir, RunStatus::Trapped);
-                Err(error)
+            Err(error) => {
+                print_run_output(&session_id, &workdir, run_status_for(&error));
+                Err(CliError::from(error))
             }
-            Err(error) => Err(fail_run(&session_id, &workdir, CliError::from(error))),
         }
+    }
+}
+
+/// The `status:` line `mur run` prints for a launch that returned `error`.
+fn run_status_for(error: &RuntimeError) -> RunStatus {
+    match error {
+        RuntimeError::CapsuleTrap(_) => RunStatus::Trapped,
+        RuntimeError::TaskDidNotComplete { exit_status, .. } => RunStatus::TaskEnded(exit_status),
+        _ => RunStatus::Failed,
     }
 }
 
@@ -1204,5 +1211,49 @@ mod tests {
         write_input_to_workdir("", &dst).unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "");
+    }
+
+    #[test]
+    fn a_task_that_did_not_complete_prints_its_exit_status() {
+        for exit_status in [
+            "failed",
+            "max_turns_reached",
+            "spend_ceiling_reached",
+            "canceled",
+        ] {
+            let error = RuntimeError::TaskDidNotComplete {
+                exit_status,
+                reason: "why".to_string(),
+            };
+            assert_eq!(run_status_for(&error).as_str(), exit_status);
+        }
+    }
+
+    #[test]
+    fn a_canceled_task_is_error_e_run_040_naming_canceled() {
+        let error = CliError::from(RuntimeError::TaskDidNotComplete {
+            exit_status: "canceled",
+            reason: "the task was canceled".to_string(),
+        });
+        let rendered = error.to_string();
+        assert!(
+            rendered
+                .starts_with("error[E-RUN-040]: the task ended canceled: the task was canceled"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("out/result.txt"), "{rendered}");
+        assert!(rendered.contains("mur trace show"), "{rendered}");
+    }
+
+    #[test]
+    fn other_launch_errors_keep_their_status() {
+        assert_eq!(
+            run_status_for(&RuntimeError::CapsuleTrap("x".into())).as_str(),
+            "trapped"
+        );
+        assert_eq!(
+            run_status_for(&RuntimeError::AgentLoopFailed("x".into())).as_str(),
+            "failed"
+        );
     }
 }

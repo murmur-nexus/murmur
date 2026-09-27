@@ -31,7 +31,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 |---|---|
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
-| `task_end`, `task_reopened`, `task_canceled`, `context_seed` | The task node |
+| `task_end`, `task_reopened`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
@@ -401,7 +401,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` — the last task's own terminal outcome |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first run that ended anything but `"ok"` decides it, and no later run replaces it |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -475,6 +475,31 @@ Nothing named in `detached_work_ids` or `delegation_ids` was stopped: both are r
 operator knows what is still running, and both keep the lifecycle they already had. The arrays are
 a snapshot taken where the loop stopped, so they may differ from the `residue` artifact the
 `tasks/cancel` response carried, which was taken when that response was sent.
+
+**`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's
+terminal `task_end`
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task in progress. Absent for the run a launch makes from `input.txt` when no task arrived, which has no `task_start` |
+| `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted` and `runtime_error` |
+| `cause` | string | Why the attempt failed, from the table below |
+| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. At most 2,000 bytes; the whole text is in `out/result.txt`. For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
+
+| `cause` | Written when |
+|---|---|
+| `driver_error` | The driver returned an error, or a response whose `stop_reason` is `"error"`: a body it could not parse, a body cut off in transit, an HTTP error, provider error text, a provider request that timed out |
+| `credential_rejected` | As `driver_error`, while the provider keeps rejecting the inference credential. The reason is the [`E-RUN-027`](diagnostics.md#e-run-027) message |
+| `malformed_response` | The response asked for a tool call and carried none, or its `stop_reason` is missing or unsupported |
+| `compaction_hook` | A hook bound to `on-compaction` returned an error |
+| `input_timeout` | A `request-input` wait passed [`lifecycle.input_timeout_secs`](manifest.md#lifecycle-input-timeout-secs) with no answer. The attempt makes no further inference call |
+| `reopen_budget_exhausted` | An `on-task-end` hook still asked to reopen the task after `lifecycle.max_task_reopens` or `inference.max_turns` was spent. The reason names the limit |
+| `runtime_error` | The attempt ended in any other error, for example a [`transport: process`](manifest.md#transport-process) failure (`E-RUN-033`–`E-RUN-036`). The reason is the error's text |
+
+Written whatever [`trace.capture`](manifest.md#field-trace) is. A task that ended `ok`,
+`max_turns_reached`, `spend_ceiling_reached` or `canceled` has no `task_failed` line: its
+`task_end` status, a [`spend_ceiling_reached`](#spend-ceiling-reached) line or a
+[`task_canceled`](#task-canceled) line already says what happened.
 
 **`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task,
 when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and
@@ -946,8 +971,9 @@ stopped early.
   started.
 - A `task_end` carries the attempt's own terminal outcome, so it reads `"failed"`,
   `"max_turns_reached"` or `"spend_ceiling_reached"` on a task the runtime survived and reported
-  on. The launch's own
-  `session_end` carries the last task's outcome the same way.
+  on. The launch's own `session_end` carries the first of those outcomes among the tasks that
+  decide the launch, and a later task that completed does not replace it.
+- Every failed attempt writes one `task_failed` line before its task's `task_end`.
 
 ---
 

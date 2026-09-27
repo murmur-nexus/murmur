@@ -37,22 +37,33 @@ use crate::error::{
     GATEWAY_WITHOUT_CREDENTIAL_HINT,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunStatus {
     Success,
     Failed,
     Trapped,
+    /// The session ran and its task did not complete. Carries the task's `exit_status`, never
+    /// `"ok"`: `failed`, `max_turns_reached`, `spend_ceiling_reached` or `canceled`.
+    TaskEnded(&'static str),
+}
+
+impl RunStatus {
+    /// What `mur run` prints after `status:`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "ok",
+            Self::Failed => "failed",
+            Self::Trapped => "trapped",
+            Self::TaskEnded(exit_status) => exit_status,
+        }
+    }
 }
 
 /// Print the post-completion status line. Session and workdir are shown at startup now,
 /// so only `status:` is emitted here to avoid duplication.
 #[deny(clippy::print_stdout, clippy::print_stderr)]
 pub(crate) fn print_run_output(_session_id: &str, _workdir: &Path, status: RunStatus) {
-    let status_str = match status {
-        RunStatus::Success => "ok",
-        RunStatus::Failed => "failed",
-        RunStatus::Trapped => "trapped",
-    };
-    capsule_runtime::runtime_out!("status:  {status_str}");
+    capsule_runtime::runtime_out!("status:  {}", status.as_str());
 }
 
 /// Prints `status: failed` and returns the error, eliminating the
