@@ -631,7 +631,7 @@ Murmur home (/home/alice/.murmur)
   running: absent  running-capsule records, expected owner-only
   state: 0700  capsule state stores, expected owner-only
   artifacts: 0755  installed artifacts
-  compiled: 0700  compiled WASM artifacts, expected owner-only
+  compiled: 0700  compiled WASM cache, safe to delete, expected owner-only
   bin: absent  cached mur binaries
   nexus-config.json: 0644  something not recognised by this build
 ```

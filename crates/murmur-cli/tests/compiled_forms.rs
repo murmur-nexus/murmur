@@ -6,10 +6,11 @@
 mod common;
 
 use std::{
-    fs,
+    fs::{self, FileTimes},
     io::Write,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use assert_cmd::Command;
@@ -72,20 +73,30 @@ impl Project {
         self.home.path().join(".murmur").join("compiled")
     }
 
-    /// The payload sha256 the lock pins for `echo-tool`.
-    fn tool_sha256(&self) -> String {
+    /// The payload sha256 the lock pins for the installed artifact `name`.
+    fn artifact_sha256(&self, name: &str) -> String {
         let lock = read_lockfile(&self.project.path().join("murmur.lock")).unwrap();
-        lock.artifact_for(TOOL_NAME)
-            .expect("lock entry for echo-tool")
+        lock.artifact_for(name)
+            .unwrap_or_else(|| panic!("lock entry for {name}"))
             .sha256
             .any
             .clone()
-            .expect("lock pins echo-tool's sha256")
+            .unwrap_or_else(|| panic!("lock pins {name}'s sha256"))
+    }
+
+    /// The payload sha256 the lock pins for `echo-tool`.
+    fn tool_sha256(&self) -> String {
+        self.artifact_sha256(TOOL_NAME)
     }
 
     /// The form of `echo-tool`, named by the payload sha256 the lock pins.
     fn tool_form(&self) -> PathBuf {
-        form_named(&self.compiled(), &self.tool_sha256())
+        self.artifact_form(TOOL_NAME)
+    }
+
+    /// The form of the installed artifact `name`, named by the payload sha256 the lock pins.
+    fn artifact_form(&self, name: &str) -> PathBuf {
+        form_named(&self.compiled(), &self.artifact_sha256(name))
     }
 
     /// Every form in [`Self::compiled`] keyed on `echo-tool`'s payload, under any engine key.
@@ -116,6 +127,21 @@ impl Project {
         .get_output()
         .clone();
         String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Declares the WASM tool `name`, built from the `fixture` component, and installs it
+    /// project-locally.
+    fn add_tool(&self, name: &str, fixture: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact =
+            create_tool_artifact(dir.path(), name, TOOL_VERSION, &fixture_component(fixture));
+        let mut manifest = fs::read_to_string(&self.manifest).unwrap();
+        manifest.push_str(&format!("  - name: {name}\n    version: {TOOL_VERSION}\n"));
+        fs::write(&self.manifest, manifest).unwrap();
+        common::install_artifact_to_project(self.project.path(), &artifact).success();
+        // A local-file install pins nothing, and a lock that lacks a declared artifact refuses
+        // the run. With no lock, the next `mur run` pins every declared artifact after staging.
+        fs::remove_file(self.project.path().join("murmur.lock")).unwrap();
     }
 
     /// The form of the capsule component, named by the sha256 of its bytes.
@@ -179,6 +205,56 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+const HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// Writes `name` into `dir` at `0600`, with its atime and mtime `age` ago.
+fn plant(dir: &Path, name: &str, age: Duration) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, name).unwrap();
+    set_mode(&path, 0o600);
+    let time = SystemTime::now() - age;
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_accessed(time).set_modified(time))
+        .unwrap();
+    path
+}
+
+/// Plants a form of a 64-hex key under `engine` and its sidecar, both `age` old.
+fn plant_set(dir: &Path, key: char, engine: &str, age: Duration) -> [PathBuf; 2] {
+    let form = format!("{}-{engine}.cwasm", key.to_string().repeat(64));
+    [
+        plant(dir, &format!("{form}.sha256"), age),
+        plant(dir, &form, age),
+    ]
+}
+
+/// The engine key a form name carries.
+fn engine_key(form: &Path) -> String {
+    let name = form.file_name().unwrap().to_str().unwrap();
+    name.strip_suffix(".cwasm").unwrap()[65..].to_string()
+}
+
+/// Every entry directly in `dir` as (name, inode, size, mtime), sorted.
+fn snapshot(dir: &Path) -> Vec<(String, u64, u64, SystemTime)> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.modified().unwrap(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
 #[test]
 fn a_second_run_loads_the_forms_the_first_run_wrote() {
     let project = Project::new();
@@ -203,6 +279,94 @@ fn a_second_run_loads_the_forms_the_first_run_wrote() {
     let (second, _) = project.run();
     assert_eq!(second, first);
     assert_eq!((inode(&tool_form), inode(&capsule_form)), inodes);
+}
+
+#[test]
+fn a_launch_that_stores_a_form_prunes_a_stale_set_and_keeps_the_current_one() {
+    let project = Project::new();
+    project.run();
+    let compiled = project.compiled();
+    let (tool_form, capsule_form) = (project.tool_form(), project.capsule_form());
+    let current = [
+        sidecar(&tool_form),
+        tool_form.clone(),
+        sidecar(&capsule_form),
+        capsule_form.clone(),
+    ];
+    let inodes: Vec<u64> = current.iter().map(|path| inode(path)).collect();
+    let engine = engine_key(&tool_form);
+    let (stale_engine, fresh_engine) = ("0000000000000000", "1111111111111111");
+    assert!(engine != stale_engine && engine != fresh_engine);
+
+    let stale_set = plant_set(&compiled, 'a', stale_engine, 31 * DAY);
+    let fresh_set = plant_set(&compiled, 'b', fresh_engine, DAY);
+    let temp_name = |pid: u32| {
+        format!(
+            ".{}.{pid}.0192d3f4a5b67c8d9e0f1a2b3c4d5e6f.tmp",
+            tool_form.file_name().unwrap().to_string_lossy()
+        )
+    };
+    let crashed_temp = plant(&compiled, &temp_name(4242), 2 * HOUR);
+    let live_temp = plant(&compiled, &temp_name(4243), Duration::ZERO);
+
+    project.add_tool("config-echo", "config-echo.wasm");
+    project.run();
+
+    for path in stale_set.iter().chain([&crashed_temp]) {
+        assert!(!path.exists(), "{} survived", path.display());
+    }
+    for path in fresh_set.iter().chain([&live_temp]) {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+    assert_eq!(
+        current.iter().map(|path| inode(path)).collect::<Vec<_>>(),
+        inodes
+    );
+    let new_form = project.artifact_form("config-echo");
+    assert_matches_sidecar(&new_form);
+    assert_eq!(forms(&compiled), {
+        let mut expected = vec![tool_form, capsule_form, new_form, fresh_set[1].clone()];
+        expected.sort();
+        expected
+    });
+}
+
+#[test]
+fn a_warm_launch_prunes_nothing() {
+    let project = Project::new();
+    project.run();
+    let compiled = project.compiled();
+    plant_set(&compiled, 'a', "0000000000000000", 31 * DAY);
+    plant(
+        &compiled,
+        ".a.cwasm.4242.0192d3f4a5b67c8d9e0f1a2b3c4d5e6f.tmp",
+        2 * HOUR,
+    );
+    let before = snapshot(&compiled);
+
+    project.run();
+    assert_eq!(snapshot(&compiled), before);
+}
+
+#[test]
+fn deleting_the_compiled_dir_between_runs_is_safe() {
+    let project = Project::new();
+    let (first, first_stderr) = project.run();
+    let compiled = project.compiled();
+    fs::remove_dir_all(&compiled).unwrap();
+
+    let (second, second_stderr) = project.run();
+    assert_eq!(second, first);
+    assert_eq!(
+        second_stderr.lines().collect::<Vec<_>>(),
+        first_stderr.lines().collect::<Vec<_>>()
+    );
+    assert_eq!(mode(&compiled), 0o700);
+    let written = forms(&compiled);
+    assert_eq!(written.len(), 2);
+    for form in &written {
+        assert_matches_sidecar(form);
+    }
 }
 
 #[test]
@@ -261,8 +425,22 @@ fn a_symlinked_compiled_dir_is_neither_read_nor_written() {
         entries.sort();
         entries
     };
+    let tool_form_name = project.tool_form().file_name().unwrap().to_owned();
+    plant(&target, "stale.cwasm", 31 * DAY);
+    plant(
+        &target,
+        &format!(
+            ".{}.4242.0192d3f4a5b67c8d9e0f1a2b3c4d5e6f.tmp",
+            tool_form_name.to_string_lossy()
+        ),
+        2 * HOUR,
+    );
     let before = entries(&target);
-    assert_eq!(before.len(), 4, "two forms and their sidecars");
+    assert_eq!(
+        before.len(),
+        6,
+        "two forms, their sidecars, a stale entry and a temp file"
+    );
 
     let (second, _) = project.run();
     assert_eq!(second, first);

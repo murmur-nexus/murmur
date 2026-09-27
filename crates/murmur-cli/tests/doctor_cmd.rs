@@ -1805,8 +1805,8 @@ fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
     let (stdout, _) = doctor();
     assert!(
         stdout.contains(
-            "  artifacts: absent  installed artifacts\n  compiled: absent  compiled WASM artifacts, \
-             expected owner-only\n"
+            "  artifacts: absent  installed artifacts\n  compiled: absent  compiled WASM cache, safe \
+             to delete, expected owner-only\n"
         ),
         "{stdout}"
     );
@@ -1817,7 +1817,7 @@ fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
     let (stdout, _) = doctor();
     for line in [
         "  artifacts: absent  installed artifacts\n",
-        "  compiled: 0700  compiled WASM artifacts, expected owner-only\n",
+        "  compiled: 0700  compiled WASM cache, safe to delete, expected owner-only\n",
     ] {
         assert!(stdout.contains(line), "missing {line:?} in:\n{stdout}");
     }

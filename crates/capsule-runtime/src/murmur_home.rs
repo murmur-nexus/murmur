@@ -144,7 +144,7 @@ impl HomeEntryKind {
             Self::Running => "running-capsule records",
             Self::State => "capsule state stores",
             Self::Artifacts => "installed artifacts",
-            Self::CompiledForms => "compiled WASM artifacts",
+            Self::CompiledForms => "compiled WASM cache, safe to delete",
             Self::BinaryCache => "cached mur binaries",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
