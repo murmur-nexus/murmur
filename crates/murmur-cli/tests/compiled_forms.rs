@@ -245,6 +245,13 @@ fn a_widened_compiled_dir_is_narrowed_and_its_forms_rewritten() {
     let compiled = project.compiled();
     let (tool_form, capsule_form) = (project.tool_form(), project.capsule_form());
     let inodes = (inode(&tool_form), inode(&capsule_form));
+    // The narrowing deletes each form before writing its replacement, and a filesystem may hand
+    // the freed inode number straight to the new file. A link held outside the directory keeps
+    // the old inode allocated, so a replacement cannot carry its number.
+    let held = project.home.path().join("held");
+    fs::create_dir(&held).unwrap();
+    fs::hard_link(&tool_form, held.join("tool")).unwrap();
+    fs::hard_link(&capsule_form, held.join("capsule")).unwrap();
     set_mode(&compiled, 0o755);
 
     let (second, _) = project.run();
