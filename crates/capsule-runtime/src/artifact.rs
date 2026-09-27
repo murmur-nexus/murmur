@@ -12,12 +12,11 @@ use crate::errors::RuntimeError;
 /// The root wasm of a `.mur.zip`: `capsule.wasm`, or its one root `*.wasm`, inflated under the
 /// artifact decompression ceiling.
 ///
-/// Staging skips this inflate for a payload whose compiled form is stored, running only
-/// [`check_root_wasm`]. That is exact only while every input deciding whether this function
-/// succeeds is either checked by [`check_root_wasm`] as well or part of the compiled-form key,
-/// which holds the payload sha256 and the ceiling. A check here that depends on anything else, such as
-/// the entry's contents, a new setting, or a zip dependency upgrade that changes what inflates,
-/// belongs in [`check_root_wasm`] or in the key built by `CompiledForms`.
+/// A refusal added here must also go into [`check_root_wasm`] or into the compiled-form key built
+/// by `CompiledForms`. Staging skips this inflate when a form is stored for the payload and runs
+/// only [`check_root_wasm`], which is exact only while every other input deciding whether this
+/// succeeds is in the key: the payload sha256 and the ceiling. A check on the entry's contents, a
+/// new setting, or a `zip` upgrade that changes what inflates is such an input.
 pub fn extract_root_wasm(
     artifact_name: &str,
     artifact_version: &str,

@@ -23,12 +23,11 @@
 //! store sees it. Two `mur` builds with different engines keep separate forms, since the engine
 //! key is part of every file name; [`prune_stale`] bounds what accumulates.
 //!
-//! For an artifact, the key's sha256 is the payload's, which staging has already checked against
-//! `murmur.lock`. Every [`CompiledForms::compile`] keyed on a payload sha256
-//! is passed the root wasm [`extract_root_wasm`] returned for that payload in the same process, and
-//! whether that extraction succeeds is fixed by the payload bytes and the ceiling. A form found
-//! under a payload key therefore stands for that payload's successful extraction under that
-//! ceiling, and [`CompiledForms::load`] lets a caller skip the inflate.
+//! A form keyed on an artifact payload's sha256 must be compiled only from the root wasm
+//! [`extract_root_wasm`] returned for that payload in the same process, so under the same ceiling.
+//! Whether that extraction succeeds is fixed by the payload bytes and the ceiling, so a form found
+//! under a payload key stands for the payload's successful extraction under that ceiling. That is
+//! what lets a caller of [`CompiledForms::load`] skip the inflate.
 //!
 //! [`max_artifact_decompressed_bytes`]: murmur_artifact::zip_guard::max_artifact_decompressed_bytes
 //! [`extract_root_wasm`]: crate::artifact::extract_root_wasm
@@ -303,14 +302,15 @@ fn remove_files(dir: &Path, remove: impl Fn(&Metadata) -> bool) {
     }
 }
 
+/// The empty component in the binary format: the component preamble alone.
+#[cfg(test)]
+pub(crate) const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\x00\x01\x00";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::{FileTimes, Permissions};
     use std::os::unix::fs::PermissionsExt;
-
-    /// The empty component in the binary format: the component preamble alone.
-    const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\x00\x01\x00";
 
     fn engine() -> Engine {
         let mut config = wasmtime::Config::new();

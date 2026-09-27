@@ -10148,25 +10148,16 @@ inference:
 
     // ── stage_root_component ───────────────────────────────────────────────────
 
-    /// The empty component in the binary format: the component preamble alone.
-    const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\x00\x01\x00";
+    use crate::compiled_forms::EMPTY_COMPONENT;
 
     /// A `.mur.zip` of `files`, each entry stored uncompressed so its data sits verbatim in the
     /// archive.
     fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-        use std::io::Write as _;
-        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-        {
-            let mut zip = zip::ZipWriter::new(&mut cursor);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            for (name, bytes) in files {
-                zip.start_file(*name, options).unwrap();
-                zip.write_all(bytes).unwrap();
-            }
-            zip.finish().unwrap();
-        }
-        cursor.into_inner()
+        zip_with_options(
+            files,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
     }
 
     /// A tool payload whose root `tool.wasm` opens and is selected, but fails its CRC when
@@ -10287,11 +10278,17 @@ inference:
     // ── manage.pull() ──────────────────────────────────────────────────────────
 
     fn zip_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        zip_with_options(files, zip::write::SimpleFileOptions::default())
+    }
+
+    fn zip_with_options(
+        files: &[(&str, &[u8])],
+        options: zip::write::SimpleFileOptions,
+    ) -> Vec<u8> {
         use std::io::Write as _;
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         {
             let mut zip = zip::ZipWriter::new(&mut cursor);
-            let options = zip::write::SimpleFileOptions::default();
             for (name, bytes) in files {
                 zip.start_file(*name, options).unwrap();
                 zip.write_all(bytes).unwrap();
