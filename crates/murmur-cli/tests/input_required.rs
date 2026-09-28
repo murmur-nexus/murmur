@@ -628,6 +628,76 @@ fn input_required_timeout_transitions_to_failed() {
     );
 }
 
+/// A streaming client of a task whose `request-input` wait times out is told once that the task
+/// failed: after `input-required`, one final `failed` status with message `input-timeout`, the
+/// last frame the connection carries, with no earlier `failed` frame.
+#[test]
+fn input_timeout_streams_one_failed_final_status() {
+    let server = tool_then_end_turn_server("Quick question", "would have completed");
+    let home = tempfile::tempdir().unwrap();
+    let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
+
+    let lifecycle = LifecycleConfig {
+        task_acceptance: TaskAcceptance::Queue,
+        after_task: AfterTask::Sleep,
+        input_timeout_secs: Some(2),
+        ..Default::default()
+    };
+    let staged = stage_agent(&home, &manifest_path, Some(lifecycle));
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("timed out waiting for capsule URL");
+
+    let events = collect_sse_events_for_message(
+        &capsule_url,
+        "msg-stream-timeout",
+        "start timed task",
+        Duration::from_secs(60),
+    );
+    let statuses: Vec<Value> = events
+        .iter()
+        .filter(|e| e.event_type == "status")
+        .map(|e| serde_json::from_str(&e.data).expect("status data is JSON"))
+        .collect();
+    assert!(
+        statuses
+            .iter()
+            .any(|s| s["status"]["state"] == "input-required"),
+        "{events:?}"
+    );
+    let failed: Vec<&Value> = statuses
+        .iter()
+        .filter(|s| s["status"]["state"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "one failed status: {events:?}");
+    assert_eq!(failed[0]["final"], true);
+    assert_eq!(failed[0]["status"]["message"], "input-timeout");
+    assert!(failed[0]["context_id"].is_string(), "{}", failed[0]);
+    assert_eq!(
+        statuses.last(),
+        Some(failed[0]),
+        "the final status is the last status: {events:?}"
+    );
+    assert_eq!(
+        events.last().map(|e| e.event_type.as_str()),
+        Some("status"),
+        "{events:?}"
+    );
+
+    let task_id = failed[0]["id"].as_str().unwrap();
+    assert_eq!(
+        tasks_get(&capsule_url, task_id)["result"]["status"]["state"],
+        "failed"
+    );
+}
+
 /// The same timeout on a queue capsule that exits after its task: the launch reports the task
 /// `failed`, naming the timeout, and the provider was asked once.
 #[test]

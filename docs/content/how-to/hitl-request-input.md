@@ -270,7 +270,7 @@ lifecycle:
   input_timeout_secs: 300
 ```
 
-When the deadline passes, the task transitions to `state: "failed"` with message `"input-timeout"`. Omit the field to wait indefinitely.
+When the deadline passes, the tool call fails and the attempt ends. The task then ends `failed` with message `"input-timeout"`, unless an `on-task-end` hook [reopens it](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). Omit the field to wait indefinitely.
 
 ---
 

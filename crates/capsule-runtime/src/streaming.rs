@@ -35,6 +35,11 @@ pub(crate) struct StreamStatus {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
+    /// The 1-based ordinal of the reopen this frame announces, on the `working` frame the reopen
+    /// loop writes between two attempts of one task; `None`, and absent from the wire, on every
+    /// other status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reopen: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,11 +293,29 @@ pub(crate) async fn emit_sse(
     emit_frame(sse_tx, sse_buffer, event_type, &data_str);
 }
 
-/// Check whether a pre-formatted SSE event string is a terminal status event.
-/// Only `event: status` events with `"final":true` close the stream; text events
-/// with `"final":true` (cursor-removal or non-streaming fallback) do not.
-pub(crate) fn is_final_sse_event(event: &str) -> bool {
-    event.contains("event: status\n") && event.contains("\"final\":true")
+/// Whether a pre-formatted SSE event string is `task_id`'s final status: an `event: status`
+/// frame whose data carries `"final": true` and `"id"` equal to `task_id`. A `text` frame with
+/// `"final":true` (a cursor removal or the non-streaming fallback) is not, and neither is
+/// another task's final status.
+pub(crate) fn is_final_status_for(event: &str, task_id: &str) -> bool {
+    let mut is_status = false;
+    let mut data = None;
+    for line in event.lines() {
+        if line == "event: status" {
+            is_status = true;
+        } else if let Some(rest) = line.strip_prefix("data: ") {
+            data = Some(rest);
+        }
+    }
+    if !is_status {
+        return false;
+    }
+    let Some(parsed) = data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+    else {
+        return false;
+    };
+    parsed.get("final") == Some(&serde_json::Value::Bool(true))
+        && parsed.get("id").and_then(serde_json::Value::as_str) == Some(task_id)
 }
 
 /// Emit one text chunk SSE event (synchronous, for use in `func_wrap` callbacks).
@@ -637,23 +660,32 @@ mod tests {
     }
 
     #[test]
-    fn is_final_detects_status_final_only() {
+    fn is_final_status_for_matches_only_this_tasks_final_status() {
         let status_final = "id: 5\nevent: status\ndata: {\"id\":\"x\",\"final\":true}\n\n";
+        let other_final = "id: 6\nevent: status\ndata: {\"id\":\"xy\",\"final\":true}\n\n";
         let text_final =
             "id: 3\nevent: text\ndata: {\"id\":\"x\",\"text\":\"\",\"final\":true}\n\n";
         let status_nonfinal = "id: 1\nevent: status\ndata: {\"id\":\"x\",\"final\":false}\n\n";
 
         assert!(
-            is_final_sse_event(status_final),
-            "status:final:true should be terminal"
+            is_final_status_for(status_final, "x"),
+            "this task's final status is terminal"
         );
         assert!(
-            !is_final_sse_event(text_final),
-            "text:final:true should NOT be terminal"
+            !is_final_status_for(other_final, "x"),
+            "another task's final status is not this task's end, even when its id contains this one"
         );
         assert!(
-            !is_final_sse_event(status_nonfinal),
-            "status:final:false should NOT be terminal"
+            !is_final_status_for(status_final, "xy"),
+            "an id that only contains the frame's id does not match it"
+        );
+        assert!(
+            !is_final_status_for(text_final, "x"),
+            "text:final:true is not terminal"
+        );
+        assert!(
+            !is_final_status_for(status_nonfinal, "x"),
+            "status:final:false is not terminal"
         );
     }
 }

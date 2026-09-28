@@ -237,7 +237,8 @@ Called anywhere else, it returns an error immediately.
 
 **Timeout:** `lifecycle.input_timeout_secs` in the manifest (see
 [lifecycle.input_timeout_secs](manifest.md#lifecycle-input-timeout-secs)). When it fires,
-the component is aborted and the task transitions to `failed`.
+the component is aborted and the attempt ends; the task ends `failed` with message
+`input-timeout` unless an `on-task-end` hook reopens it.
 
 ---
 
@@ -635,7 +636,7 @@ the driver with an empty WASI context and grants it nothing.
 | `classify-exit` | When the harness's output ends without a terminal event | `turn-end` or `turn-failed` |
 
 One driver instance serves a whole run, so `parse` may answer from what `launch` was given. A call
-that refuses, traps or runs out of time ends the run with
+that refuses, crashes or runs out of time ends the run with
 [`E-RUN-034`](diagnostics.md#e-run-034). `mur run` refuses a capsule whose driver fails a load-time
 check — see [Process driver](manifest.md#process-driver).
 

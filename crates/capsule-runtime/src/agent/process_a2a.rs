@@ -17,13 +17,15 @@
 //! the driver call and therefore before any chunk. Segments are an A2A notion only: opening one
 //! reads the runner's turn counter and never advances it.
 //!
-//! # The one terminal status
+//! # The attempt's ending
 //!
-//! Every way an attempt can end writes exactly one `final:true` `status` frame, and [`finish`] is
-//! the only place that writes one. It is called on every path out of the attempt with the
-//! attempt's own result, so a client waiting on a terminal status cannot be left waiting.
+//! Every frame this module writes is non-final. Every way an attempt can end records one
+//! [`AttemptEnding`] — [`ending`] reads it off the attempt's own result on every path out of the
+//! attempt — and the task's one `final:true` `status` frame is `run_task_with_reopens`'s, written
+//! from the last attempt's ending once the `on-task-end` hooks have decided not to reopen the
+//! task.
 //!
-//! [`finish`]: A2aStream::finish
+//! [`ending`]: A2aStream::ending
 //!
 //! # Text replaces, it never appends
 //!
@@ -31,7 +33,7 @@
 //! arrives with `"final":true`. So a segment that streamed fragments closes with an empty
 //! `final:true` frame — the cursor removal — and the client keeps what it was streamed, rather
 //! than being sent the same words twice. The authoritative answer reaches it anyway, as the
-//! `response` of the `completed` status and as `out/result.txt`. The same rule governs
+//! `response` of the task's final `completed` status and as `out/result.txt`. The same rule governs
 //! `thinking`, whose frames are always `"final":false`.
 
 use std::sync::{
@@ -41,9 +43,11 @@ use std::sync::{
 
 use crate::{
     a2a::TaskState,
-    agent::{task_state_for, AgentLoopExit},
+    agent::{
+        failure_message, task_state_for, AgentLoopExit, AttemptEnding, SESSION_ENDED_STATUS_MESSAGE,
+    },
     cancel::CANCELED_STATUS_MESSAGE,
-    errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036},
+    errors::RuntimeError,
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
         SseEventBuffer, StreamArtifact, StreamStatus, TaskArtifactUpdateEvent,
@@ -92,18 +96,18 @@ pub(super) struct A2aStream {
     /// a segment opens, set by every fragment streamed inside one.
     chunks_emitted: Arc<AtomicBool>,
     segment: Segment,
-    /// The result the terminal `completed` status carries, as the harness reported it.
+    /// The result a `completed` ending carries, as the harness reported it.
     result: String,
     /// Whether the runtime interrupted this attempt. Set before the interrupt goes out, so
     /// everything after it is a stopped task's, not an answer's: the harness's own last words are
     /// kept in `out/result.txt` and the trace, and are not sent as the client's final text.
     interrupted: bool,
     /// Whether the harness had to be killed rather than ending when it was asked, which is the
-    /// one thing the terminal `canceled` status says beyond the fact of the cancel.
+    /// one thing a `canceled` ending says beyond the fact of the cancel.
     harness_killed: bool,
-    /// The refusal a reached spend ceiling stopped this attempt with, as the terminal status
-    /// reports it. A2A has no state for a task stopped by policy, so it is `failed` carrying the
-    /// refusal — the same frame the http path writes for the same fact.
+    /// The refusal a reached spend ceiling stopped this attempt with, as its ending reports it.
+    /// A2A has no state for a task stopped by policy, so it is `failed` carrying the refusal —
+    /// the same ending the http path records for the same fact.
     spend_refusal: Option<String>,
 }
 
@@ -143,8 +147,7 @@ impl A2aStream {
         self.harness_killed = true;
     }
 
-    /// A spend ceiling stopped this attempt, with `refusal` as the reason the terminal status
-    /// carries.
+    /// A spend ceiling stopped this attempt, with `refusal` as the reason its ending carries.
     pub(super) fn mark_spend_refused(&mut self, refusal: &crate::spend::SpendRefusal) {
         self.spend_refusal = Some(refusal.to_string());
     }
@@ -162,7 +165,7 @@ impl A2aStream {
             ..Segment::default()
         };
         self.chunks_emitted.store(false, Ordering::Relaxed);
-        self.status("working", &format!("inference turn {turn}"), None, false)
+        self.status("working", &format!("inference turn {turn}"))
             .await;
     }
 
@@ -219,7 +222,7 @@ impl A2aStream {
         .await;
     }
 
-    /// The harness ended the turn. Holds the result for the terminal status, and sends it as the
+    /// The harness ended the turn. Holds the result for the attempt's ending, and sends it as the
     /// whole of the answer when the last segment streamed the client nothing.
     pub(super) fn turn_end(&mut self, result: &str) {
         self.pay_cursor_removal();
@@ -235,37 +238,38 @@ impl A2aStream {
         }
     }
 
-    /// The harness failed the turn. The terminal status itself is [`Self::finish`]'s, which the
-    /// attempt reaches by returning the failure as an error.
+    /// The harness failed the turn. The attempt's ending is [`Self::ending`]'s, which the attempt
+    /// reaches by returning the failure as an error.
     pub(super) fn turn_failed(&mut self) {
         self.pay_cursor_removal();
         self.segment.open = false;
     }
 
-    /// Write the attempt's one terminal status. Called on every path out of the attempt, with
-    /// what the attempt returned, and never twice: this is the frame a client waits on.
-    pub(super) async fn finish(&mut self, outcome: &Result<AgentLoopExit, RuntimeError>) {
+    /// How the attempt that returned `outcome` ended. Read once, on every path out of the
+    /// attempt, whether or not it serves an A2A task.
+    pub(super) fn ending(&self, outcome: &Result<AgentLoopExit, RuntimeError>) -> AttemptEnding {
         match task_state_for(outcome) {
-            TaskState::Completed => {
-                let response = self.result.clone();
-                self.status("completed", "session ended", Some(response), true)
-                    .await;
-            }
-            TaskState::Canceled => {
-                let message = canceled_message(self.harness_killed).to_string();
-                self.status(AgentLoopExit::Canceled.as_str(), &message, None, true)
-                    .await;
-            }
-            _ => {
-                let message = match outcome {
+            TaskState::Completed => AttemptEnding {
+                state: TaskState::Completed,
+                message: SESSION_ENDED_STATUS_MESSAGE.to_string(),
+                response: Some(self.result.clone()),
+            },
+            TaskState::Canceled => AttemptEnding {
+                state: TaskState::Canceled,
+                message: canceled_message(self.harness_killed).to_string(),
+                response: None,
+            },
+            _ => AttemptEnding {
+                state: TaskState::Failed,
+                message: match outcome {
                     Ok(AgentLoopExit::SpendCeilingReached) => {
                         self.spend_refusal.clone().unwrap_or_default()
                     }
                     Ok(exit) => exit.as_str().to_string(),
                     Err(error) => failure_message(error),
-                };
-                self.status("failed", &message, None, true).await;
-            }
+                },
+                response: None,
+            },
         }
     }
 
@@ -280,7 +284,7 @@ impl A2aStream {
         }
     }
 
-    async fn status(&self, state: &str, message: &str, response: Option<String>, last: bool) {
+    async fn status(&self, state: &str, message: &str) {
         let Some(target) = self.target.as_ref() else {
             return;
         };
@@ -293,9 +297,10 @@ impl A2aStream {
                 status: StreamStatus {
                     state: state.to_string(),
                     message: message.to_string(),
-                    response,
+                    response: None,
+                    reopen: None,
                 },
-                r#final: last,
+                r#final: false,
             },
         )
         .await;
@@ -313,7 +318,7 @@ impl A2aStream {
     }
 }
 
-/// What the terminal `canceled` status says.
+/// What a `canceled` ending says.
 ///
 /// A harness that stopped when it was asked leaves the frame byte-identical to the one the http
 /// path writes, so a client cannot tell the transports apart. One that had to be killed says so:
@@ -329,24 +334,3 @@ fn canceled_message(harness_killed: bool) -> &'static str {
 /// [`canceled_message`] for a harness the runtime had to kill.
 const CANCELED_KILLED_STATUS_MESSAGE: &str =
     "task canceled; the harness was killed and its session may not resume cleanly";
-
-/// What a failed attempt's terminal status says: the diagnostic the run failed with, under the
-/// code a reader looks it up by.
-fn failure_message(error: &RuntimeError) -> String {
-    match diagnostic_code(error) {
-        Some(code) => format!("error[{code}]: {error}"),
-        None => error.to_string(),
-    }
-}
-
-/// The code `error` renders under, for the failures this transport raises once an attempt is
-/// under way. Every other error reaches the client as its message alone.
-fn diagnostic_code(error: &RuntimeError) -> Option<&'static str> {
-    match error {
-        RuntimeError::HarnessTurnFailed { .. } => Some(E_RUN_033),
-        RuntimeError::ProcessDriverCallFailed { .. } => Some(E_RUN_034),
-        RuntimeError::ProcessHarnessInactive { .. } => Some(E_RUN_035),
-        RuntimeError::HarnessSessionGone { .. } => Some(E_RUN_036),
-        _ => None,
-    }
-}

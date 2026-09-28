@@ -20,7 +20,7 @@ use crate::resource_plane::{
 };
 use crate::streaming::{
     admit_live_frame, format_gap_event, format_lagged_event, format_unnumbered_sse_event, frame_id,
-    is_final_sse_event, ReplayResult, SseBroadcast, SseEventBuffer, StreamStatus,
+    is_final_status_for, ReplayResult, SseBroadcast, SseEventBuffer, StreamStatus,
     TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT, SSE_HEARTBEAT_INTERVAL,
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
@@ -663,6 +663,7 @@ async fn handle_message_stream(
                 state: "rejected".into(),
                 message: "task rejected: capsule is busy".into(),
                 response: None,
+                reopen: None,
             },
             r#final: true,
         };
@@ -714,7 +715,9 @@ async fn handle_message_stream(
                         if !admit_live_frame(&mut last_written, &event_arc) {
                             continue;
                         }
-                        let is_final = is_final_sse_event(&event_arc);
+                        // Other tasks' frames are forwarded too; only this task's own final
+                        // status ends the connection.
+                        let is_final = is_final_status_for(&event_arc, &task_id);
                         if writer.write_all(event_arc.as_bytes()).await.is_err() {
                             return;
                         }
@@ -843,7 +846,7 @@ async fn handle_stream_watch(
                         if writer.write_all(event_arc.as_bytes()).await.is_err() {
                             return;
                         }
-                        // Do NOT exit on is_final_sse_event — final ends one task turn, not the capsule.
+                        // Do NOT exit on a final status — it ends one task, not the capsule.
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let _ = writer
@@ -1217,6 +1220,7 @@ mod tests {
                 state: "rejected".into(),
                 message: "task rejected: capsule is busy".into(),
                 response: None,
+                reopen: None,
             },
             r#final: true,
         });
@@ -1664,7 +1668,8 @@ mod tests {
     }
 
     /// A `message/stream` connection that falls behind is told how many live frames it lost, keeps
-    /// receiving, and still closes on the first live `final` status it is delivered.
+    /// receiving — another task's final status included — and closes on its own task's first live
+    /// `final` status.
     ///
     /// Current-thread flavour for the same reason as `stream_watch_writes_lagged_frame`.
     #[tokio::test]
@@ -1726,19 +1731,28 @@ mod tests {
         let mut received = String::new();
         collect_sse_lines(&lines, &mut received, Some(retained.last().unwrap())).await;
 
-        let final_status =
-            format_sse_event(100, "status", "{\"id\":\"tsk_lagged\",\"final\":true}");
+        let task_id = task_rx
+            .recv()
+            .await
+            .expect("the task was submitted")
+            .task_id;
+        let other_final = format_sse_event(100, "status", "{\"id\":\"tsk_other\",\"final\":true}");
+        sse_tx.send(Arc::new(other_final.clone())).unwrap();
+        let final_status = format_sse_event(
+            101,
+            "status",
+            &format!("{{\"id\":\"{task_id}\",\"final\":true}}"),
+        );
         sse_tx.send(Arc::new(final_status.clone())).unwrap();
         collect_sse_lines(&lines, &mut received, None).await;
 
         handler.await.unwrap();
         client.join().unwrap();
-        assert!(task_rx.try_recv().is_ok(), "the task was not submitted");
 
         let body = sse_body(&received);
         assert_single_lagged_frame(body);
         let expected = format!(
-            "event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n{}{final_status}",
+            "event: lagged\ndata: {{\"missed\":{LAG_MISSED}}}\n\n{}{other_final}{final_status}",
             retained.concat()
         );
         assert_eq!(body, expected);
@@ -1763,7 +1777,7 @@ mod tests {
         drop(sse_rx);
         let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
-        let (task_tx, _task_rx) = mpsc::channel::<IncomingTask>(4);
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: serde_json::json!(1),
@@ -1801,8 +1815,17 @@ mod tests {
             .await;
         });
         wait_for_subscriber(&sse_tx).await;
+        let task_id = task_rx
+            .recv()
+            .await
+            .expect("the task was submitted")
+            .task_id;
 
-        let final_status = format_sse_event(1, "status", "{\"id\":\"tsk_closing\",\"final\":true}");
+        let final_status = format_sse_event(
+            1,
+            "status",
+            &format!("{{\"id\":\"{task_id}\",\"final\":true}}"),
+        );
         sse_tx.send(Arc::new(final_status.clone())).unwrap();
         closing_tx.send(true).unwrap();
 

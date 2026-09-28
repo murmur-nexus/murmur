@@ -731,8 +731,9 @@ fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
 }
 
 /// A `message/stream` client that stops reading while a capsule writes more than 128 frames is sent
-/// a `lagged` frame carrying the count the runtime reported, then closes on the first `final`
-/// status it is delivered — here another task's, because its own was among the frames lost.
+/// a `lagged` frame carrying the count the runtime reported. Its own task's final status was among
+/// the frames lost, and the connection closes on no other task's: it stays open past the last
+/// task's final status, and `tasks/get` answers how its own task ended.
 #[test]
 fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
     let server = blocking_reply_then_flood();
@@ -753,8 +754,21 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
     let mut slow = SseReader::open(connect_slow_reader(&addr), &addr, &body);
     let last_task = flood(&server, &addr);
 
-    let (blocks, end) = slow.read_until(Duration::from_secs(120), |_| false);
-    assert_eq!(end, ReadEnd::Closed, "the connection did not close");
+    let (mut blocks, end) = slow.read_until(Duration::from_secs(120), |block| {
+        is_final_status_of(block, &last_task)
+    });
+    assert_eq!(
+        end,
+        ReadEnd::Accepted,
+        "the connection did not stay open to the last task's final status"
+    );
+    let (more, end) = slow.read_until(Duration::from_secs(1), |_| false);
+    assert_eq!(
+        end,
+        ReadEnd::TimedOut,
+        "the connection closed on another task's final status"
+    );
+    blocks.extend(more);
 
     let sent = lagged_counts(&blocks);
     assert!(!sent.is_empty(), "no lagged frame reached the connection");
@@ -775,18 +789,16 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
             data["id"].as_str().map(str::to_string)
         })
         .expect("the connection delivered a frame of its own task before blocking");
-    let last = blocks.last().unwrap();
-    assert_eq!(last.field("event"), Some("status"), "{last:?}");
-    let last_data: Value = serde_json::from_str(last.field("data").unwrap()).unwrap();
-    assert_eq!(
-        last_data["final"],
-        json!(true),
-        "the connection closed on {last:?}"
-    );
-    assert_ne!(
-        last_data["id"],
-        json!(own_task),
+    assert!(
+        !blocks
+            .iter()
+            .any(|block| is_final_status_of(block, &own_task)),
         "the connection's own final status was delivered, so nothing was lost before it"
+    );
+    assert_eq!(
+        rpc(&addr, "tasks/get", json!({"id": own_task}))["result"]["status"]["state"],
+        "completed",
+        "tasks/get answers how the connection's own task ended"
     );
 
     assert_replay_has_no_lagged_frame(&addr, &last_task);

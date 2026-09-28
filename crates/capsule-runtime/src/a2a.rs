@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -141,6 +141,20 @@ pub(crate) enum TaskState {
 }
 
 impl TaskState {
+    /// The state's wire spelling, the one `tasks/get` serializes and a stream frame's
+    /// `status.state` carries.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Working => "working",
+            Self::InputRequired => "input-required",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::Canceled => "canceled",
+        }
+    }
+
     /// Whether no further work will be done on a task in this state.
     ///
     /// The one rule a cancel reads: a terminal task is left exactly as it is, and only a live one
@@ -198,6 +212,8 @@ pub(crate) struct TaskRegistry {
     pub(crate) task_acceptance: TaskAcceptance,
     /// Pending input waiters: task_id → (prompt, oneshot sender)
     input_waiters: HashMap<String, (String, oneshot::Sender<String>)>,
+    /// Tasks whose `request-input` wait timed out, until the agent loop takes the mark.
+    input_timeouts: HashSet<String>,
     /// One signal per task anybody has asked about, whether or not it has been cancelled.
     ///
     /// Minted on demand rather than at enqueue, because both ends need one before the task is
@@ -219,6 +235,7 @@ impl TaskRegistry {
             queue_depth,
             task_acceptance,
             input_waiters: HashMap::new(),
+            input_timeouts: HashSet::new(),
             cancels: HashMap::new(),
             resource_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -286,26 +303,52 @@ impl TaskRegistry {
         }
     }
 
-    pub(crate) fn finish_task(&mut self, final_state: TaskState) {
-        if let TaskSlotState::Running {
+    /// End the running task in `final_state`, and return the state actually recorded: an
+    /// accepted cancel already in the history wins over whatever is passed. `None` when no task
+    /// is running, which records nothing.
+    pub(crate) fn finish_task(&mut self, final_state: TaskState) -> Option<TaskState> {
+        let TaskSlotState::Running {
             ref task_id,
             ref context_id,
             ..
         } = self.active_slot
-        {
-            let (tid, cid) = (task_id.clone(), context_id.clone());
-            self.input_waiters.remove(&tid);
-            self.cancels.remove(&tid);
-            // An accepted cancel is final. A turn a person stopped must never later read as one
-            // that ran to completion, so the outcome the loop reports loses to the one already
-            // recorded.
-            let final_state = match self.history.get(&tid) {
-                Some((TaskState::Canceled, _)) => TaskState::Canceled,
-                _ => final_state,
-            };
-            self.history.insert(tid.clone(), (final_state, cid));
-            self.active_slot = TaskSlotState::Done { task_id: tid };
+        else {
+            return None;
+        };
+        let (tid, cid) = (task_id.clone(), context_id.clone());
+        self.input_waiters.remove(&tid);
+        self.input_timeouts.remove(&tid);
+        self.cancels.remove(&tid);
+        // An accepted cancel is final. A turn a person stopped must never later read as one
+        // that ran to completion, so the outcome the loop reports loses to the one already
+        // recorded.
+        let final_state = match self.history.get(&tid) {
+            Some((TaskState::Canceled, _)) => TaskState::Canceled,
+            _ => final_state,
+        };
+        self.history.insert(tid.clone(), (final_state.clone(), cid));
+        self.active_slot = TaskSlotState::Done { task_id: tid };
+        Some(final_state)
+    }
+
+    /// Record that `task_id`'s `request-input` wait passed `lifecycle.input_timeout_secs`
+    /// without ending the task: the waiter is dropped, an `input-required` task goes back to
+    /// `working`, and the timeout is marked for [`Self::take_input_timeout`]. The task's
+    /// terminal state is the reopen loop's to record, once its `on-task-end` hooks have run.
+    pub(crate) fn record_input_timeout(&mut self, task_id: &str) {
+        self.input_waiters.remove(task_id);
+        if let Some((TaskState::InputRequired, ctx)) = self.history.get(task_id).cloned() {
+            self.history
+                .insert(task_id.to_string(), (TaskState::Working, ctx));
         }
+        self.input_timeouts.insert(task_id.to_string());
+    }
+
+    /// Whether `task_id` has an unread input-wait timeout, clearing the mark. Read by the agent
+    /// loop at each turn boundary, so the attempt that timed out ends and a reopened attempt of
+    /// the same task does not end on the same mark.
+    pub(crate) fn take_input_timeout(&mut self, task_id: &str) -> bool {
+        self.input_timeouts.remove(task_id)
     }
 
     /// Transition the active task to InputRequired, storing the prompt and the
@@ -382,14 +425,6 @@ impl TaskRegistry {
     /// still `submitted` from ever starting.
     pub(crate) fn is_canceled(&self, task_id: &str) -> bool {
         matches!(self.history.get(task_id), Some((TaskState::Canceled, _)))
-    }
-
-    /// Whether this task's recorded state is `Failed`.
-    ///
-    /// Read by the agent loop at each turn boundary: a `request-input` timeout records `Failed`
-    /// while the attempt is still running, and this is how the attempt learns of it.
-    pub(crate) fn has_failed(&self, task_id: &str) -> bool {
-        matches!(self.history.get(task_id), Some((TaskState::Failed, _)))
     }
 
     /// Stop one task: record `Canceled` and raise its signal.
@@ -662,16 +697,59 @@ mod tests {
     fn finish_task_does_not_overwrite_an_accepted_cancel() {
         let mut r = running_registry("tsk_001");
         assert_eq!(r.request_cancel("tsk_001"), CancelOutcome::Accepted);
-        r.finish_task(TaskState::Completed);
+        assert_eq!(
+            r.finish_task(TaskState::Completed),
+            Some(TaskState::Canceled),
+            "the state recorded is the accepted cancel, and the caller is told so"
+        );
         assert_eq!(
             r.get_task("tsk_001").unwrap().status.state,
             TaskState::Canceled
         );
-        r.finish_task(TaskState::Failed);
+        assert_eq!(
+            r.finish_task(TaskState::Failed),
+            None,
+            "a slot that is no longer running records nothing"
+        );
         assert_eq!(
             r.get_task("tsk_001").unwrap().status.state,
             TaskState::Canceled
         );
+    }
+
+    #[test]
+    fn finish_task_returns_the_state_it_recorded() {
+        let mut r = running_registry("tsk_001");
+        assert_eq!(
+            r.finish_task(TaskState::Completed),
+            Some(TaskState::Completed)
+        );
+        assert_eq!(make_registry().finish_task(TaskState::Failed), None);
+    }
+
+    #[test]
+    fn an_input_timeout_leaves_the_task_working_and_is_read_once() {
+        let mut r = running_registry("tsk_001");
+        let (tx, _rx) = oneshot::channel();
+        r.set_input_required("tsk_001", "prompt".into(), tx)
+            .unwrap();
+        r.record_input_timeout("tsk_001");
+        assert_eq!(
+            r.get_task("tsk_001").unwrap().status.state,
+            TaskState::Working,
+            "the task's terminal state is not the wait's to record"
+        );
+        assert!(
+            r.get_input_prompt("tsk_001").is_none(),
+            "the waiter is gone"
+        );
+        assert_eq!(r.active_input_required_task_id(), None);
+        assert!(r.take_input_timeout("tsk_001"));
+        assert!(
+            !r.take_input_timeout("tsk_001"),
+            "a reopened attempt does not end on the same timeout"
+        );
+        assert!(!r.take_input_timeout("tsk_other"));
     }
 
     #[test]
@@ -682,6 +760,24 @@ mod tests {
         assert!(!r.can_accept(), "the queue is full");
         assert_eq!(r.request_cancel("tsk_b"), CancelOutcome::Accepted);
         assert!(r.can_accept(), "a cancelled task holds no slot");
+    }
+
+    #[test]
+    fn as_str_is_the_serialized_spelling() {
+        for state in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::InputRequired,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Rejected,
+            TaskState::Canceled,
+        ] {
+            assert_eq!(
+                serde_json::to_value(&state).unwrap(),
+                serde_json::json!(state.as_str())
+            );
+        }
     }
 
     #[test]
