@@ -192,7 +192,7 @@ chmod 600 ~/.murmur/config.yaml
 | `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
 | `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
-| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted; deleting the directory is safe | `mur run` at staging, and when a capsule calls `manage.pull()` |
+| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted by the next `mur run` that compiles a component; deleting the directory is safe | `mur run` at staging, and when a capsule calls `manage.pull()` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
 
 `mur run` uses a file in `compiled/` only when all of these hold, and otherwise compiles the
@@ -207,9 +207,8 @@ Each value of the [`MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`](../concepts/registr
 ceiling keeps its own compiled artifacts, so the first launch after you change it compiles every
 artifact again.
 
-A capsule under [`advisory`](containment.md#field-containment) containment, or one whose workdir
-contains `~/.murmur`, can write to `compiled/` as it can write anywhere else you can, and a later
-launch or pull loads what it wrote.
+Which capsules can write to `compiled/`, and so choose what a later launch or pull loads, is set out
+under [Containment class](containment.md#field-containment).
 
 Every mode marked `0700` or `0600` is set again on each write, not only when the path is created.
 A `mur run` that writes under an existing `~/.murmur` removes its group and other permissions and

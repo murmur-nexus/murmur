@@ -20,8 +20,17 @@
 //! its caller had not.
 //!
 //! The directory sits beside `~/.murmur/artifacts`, not in it, so nothing that walks the artifact
-//! store sees it. Two `mur` builds with different engines keep separate forms, since the engine
-//! key is part of every file name; [`prune_stale`] bounds what accumulates.
+//! store sees it. Two `mur` builds with different engines, or two decompression ceilings, keep
+//! separate forms, since the engine key is part of every file name.
+//!
+//! Only a store prunes. The store branch of [`CompiledForms::compile`] is the one caller of
+//! [`prune_stale`], so after a store the directory holds only forms read or written in the
+//! [`FORM_RETENTION`] before it, and a launch whose every form loads writes, renames and deletes
+//! nothing here. A change of engine key, from a new wasmtime or a changed decompression ceiling,
+//! finds none of its forms, so its first launch stores and always prunes; the previous key's forms
+//! are removed by the first store after they have gone unused for [`FORM_RETENTION`]. Pruning goes
+//! by age alone, never by key, so two builds or ceilings used alternately never delete each
+//! other's forms and each keeps loading its own.
 //!
 //! A form keyed on an artifact payload's sha256 must be compiled only from the root wasm
 //! [`extract_root_wasm`] returned for that payload in the same process, so under the same ceiling.
@@ -50,6 +59,11 @@ const COMPILED_DIR: &str = "compiled";
 
 /// How long an entry of [`COMPILED_DIR`] survives without being read or written.
 const FORM_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How long a staged write's temp file survives. `write_private_file` writes, fsyncs and renames
+/// its `.<name>.<pid>.<uuid>.tmp` file within the one call, so a temp file an hour old was left by
+/// a write that crashed or failed before the rename.
+const TEMP_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub(crate) struct CompiledForms {
@@ -163,7 +177,9 @@ impl CompiledForms {
             return None;
         }
         if widened {
-            remove_files(&dir, |_| true);
+            for (path, _) in files(&dir) {
+                let _ = std::fs::remove_file(path);
+            }
         }
         Some(dir)
     }
@@ -267,39 +283,89 @@ fn load(engine: &Engine, path: &Path) -> Option<Component> {
     component.ok()
 }
 
-/// Removes every direct entry of `dir` that is not a directory and has been neither read nor
-/// written in [`FORM_RETENTION`] before `now`, going by the later of its atime and mtime.
+/// Removes each direct entry of `dir` that has gone unused for its retention period, going by the
+/// later of its atime and mtime:
 ///
-/// A form in use is read on every launch, which keeps its atime fresh under `relatime`; under
-/// `noatime` only the mtime counts, so a form in use is compiled again at most once per retention
-/// period. Never recurses, never follows a symlink, and ignores every error.
+/// - a directory is never removed;
+/// - a form, named `*.cwasm`, is removed when neither it nor its sidecar has been used in
+///   [`FORM_RETENTION`], and its sidecar is removed after it. A sidecar whose form exists goes only
+///   with that form, so a form in use never loses its sidecar to the sidecar's own age;
+/// - a staged-write temp file, named `.*.tmp`, is removed after [`TEMP_RETENTION`];
+/// - anything else, a sidecar whose form is gone included, is removed after [`FORM_RETENTION`].
+///
+/// The only caller is the store branch of [`CompiledForms::compile`], on the directory it has just
+/// written a form to. A form in use is read on every launch, which keeps its atime fresh under
+/// `relatime`; under `noatime` only the mtime counts, so a form in use is compiled again at most
+/// once per retention period. Never recurses, never follows a symlink, and ignores every error.
 fn prune_stale(dir: &Path, now: SystemTime) {
-    remove_files(dir, |metadata| {
-        let last_used = match (metadata.accessed(), metadata.modified()) {
-            (Ok(accessed), Ok(modified)) => accessed.max(modified),
-            (Ok(used), Err(_)) | (Err(_), Ok(used)) => used,
-            (Err(_), Err(_)) => return false,
-        };
-        now.duration_since(last_used)
-            .is_ok_and(|unused| unused > FORM_RETENTION)
-    });
-}
+    use std::os::unix::ffi::OsStrExt;
 
-/// Removes every direct entry of `dir` that is not a directory and whose `lstat` metadata
-/// satisfies `remove`. Never recurses, never follows a symlink, and ignores every error.
-fn remove_files(dir: &Path, remove: impl Fn(&Metadata) -> bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let unused = |used: Option<SystemTime>, retention: Duration| {
+        used.is_some_and(|used| {
+            now.duration_since(used)
+                .is_ok_and(|unused| unused > retention)
+        })
     };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    for (path, metadata) in files(dir) {
+        let Some(name) = path.file_name().map(OsStrExt::as_bytes) else {
             continue;
         };
-        if !metadata.is_dir() && remove(&metadata) {
+        if name.ends_with(b".cwasm") {
+            let sidecar = sidecar(&path);
+            let sidecar_metadata = std::fs::symlink_metadata(&sidecar)
+                .ok()
+                .filter(|metadata| !metadata.is_dir());
+            let used = last_used(&metadata).max(sidecar_metadata.as_ref().and_then(last_used));
+            if unused(used, FORM_RETENTION)
+                && std::fs::remove_file(&path).is_ok()
+                && sidecar_metadata.is_some()
+            {
+                let _ = std::fs::remove_file(&sidecar);
+            }
+            continue;
+        }
+        if is_sidecar_of_a_form(&path) {
+            continue;
+        }
+        let retention = if name.starts_with(b".") && name.ends_with(b".tmp") {
+            TEMP_RETENTION
+        } else {
+            FORM_RETENTION
+        };
+        if unused(last_used(&metadata), retention) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// Whether `path` is the [`sidecar`] of a form that exists and is not a directory.
+fn is_sidecar_of_a_form(path: &Path) -> bool {
+    let form = path.with_extension("");
+    sidecar(&form) == path
+        && std::fs::symlink_metadata(&form).is_ok_and(|metadata| !metadata.is_dir())
+}
+
+/// The later of `metadata`'s atime and mtime, or `None` when neither can be read.
+fn last_used(metadata: &Metadata) -> Option<SystemTime> {
+    match (metadata.accessed(), metadata.modified()) {
+        (Ok(accessed), Ok(modified)) => Some(accessed.max(modified)),
+        (Ok(used), Err(_)) | (Err(_), Ok(used)) => Some(used),
+        (Err(_), Err(_)) => None,
+    }
+}
+
+/// Every direct entry of `dir` that is not a directory, with its `lstat` metadata. Never recurses,
+/// never follows a symlink, and skips an entry it cannot read.
+fn files(dir: &Path) -> impl Iterator<Item = (PathBuf, Metadata)> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            (!metadata.is_dir()).then_some((path, metadata))
+        })
 }
 
 /// The empty component in the binary format: the component preamble alone.
@@ -326,6 +392,24 @@ mod tests {
         std::fs::write(sidecar(&path), murmur_artifact::sha256_hex(bytes)).unwrap();
         std::fs::set_permissions(sidecar(&path), Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    fn set_times(path: &Path, accessed: SystemTime, modified: SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_accessed(accessed)
+                    .set_modified(modified),
+            )
+            .unwrap();
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+            .ino()
     }
 
     fn serialized_empty_component(engine: &Engine) -> Vec<u8> {
@@ -543,6 +627,165 @@ mod tests {
         assert!(forms.load(&engine, "not-a-key").is_none());
         // This wasm fails `Component::new`, so `Ok` is the stored form, found by `compile` itself.
         assert!(forms.compile(&engine, &sha, b"\0asm\x01\0\0\0").is_ok());
+    }
+
+    #[test]
+    fn prune_treats_a_form_and_its_sidecar_as_one_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let (stale, recent) = (now - 31 * day, now - day);
+        let entry = |name: &str, accessed: SystemTime, modified: SystemTime| {
+            let path = dir.join(name);
+            std::fs::write(&path, name).unwrap();
+            set_times(&path, accessed, modified);
+            path
+        };
+
+        let unused = [
+            entry("1.cwasm", stale, stale),
+            entry("1.cwasm.sha256", stale, stale),
+        ];
+        let sidecar_read = [
+            entry("2.cwasm", stale, stale),
+            entry("2.cwasm.sha256", recent, stale),
+        ];
+        let form_read = [
+            entry("3.cwasm", recent, stale),
+            entry("3.cwasm.sha256", stale, stale),
+        ];
+        let stale_orphan = entry("4.cwasm.sha256", stale, stale);
+        let recent_orphan = entry("5.cwasm.sha256", recent, recent);
+
+        prune_stale(dir, now);
+
+        for path in unused.iter().chain([&stale_orphan]) {
+            assert!(!path.exists(), "{} survived", path.display());
+        }
+        for path in sidecar_read
+            .iter()
+            .chain(&form_read)
+            .chain([&recent_orphan])
+        {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
+    }
+
+    #[test]
+    fn prune_removes_temp_files_left_by_a_crashed_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let now = SystemTime::now();
+        let entry = |name: &str, age: Duration| {
+            let path = dir.join(name);
+            std::fs::write(&path, name).unwrap();
+            set_times(&path, now - age, now - age);
+            path
+        };
+
+        let crashed = entry(
+            ".a.cwasm.1.0192d3f4a5b67c8d9e0f1a2b3c4d5e6f.tmp",
+            Duration::from_secs(2 * 60 * 60),
+        );
+        let in_flight = entry(
+            ".b.cwasm.2.0192d3f4a5b67c8d9e0f1a2b3c4d5e70.tmp",
+            Duration::from_secs(60),
+        );
+        let form = entry("c.cwasm", Duration::from_secs(2 * 60 * 60));
+
+        prune_stale(dir, now);
+
+        assert!(!crashed.exists());
+        assert!(in_flight.exists());
+        assert!(form.exists());
+    }
+
+    #[test]
+    fn two_engine_keys_used_alternately_keep_and_load_their_own_forms() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "compiled_forms::tests::inner_two_engine_keys_used_alternately_keep_and_load_their_own_forms",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by two_engine_keys_used_alternately_keep_and_load_their_own_forms"]
+    fn inner_two_engine_keys_used_alternately_keep_and_load_their_own_forms() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        // Y and Z are the empty component plus a custom section named `y` or `z`, so each of the
+        // three has its own sha256.
+        const X: &[u8] = EMPTY_COMPONENT;
+        const Y: &[u8] = b"\0asm\x0d\x00\x01\x00\x00\x02\x01y";
+        const Z: &[u8] = b"\0asm\x0d\x00\x01\x00\x00\x02\x01z";
+
+        let a_engine = engine();
+        let b_engine = {
+            let mut config = wasmtime::Config::new();
+            config.wasm_component_model(true);
+            config.cranelift_opt_level(wasmtime::OptLevel::None);
+            Engine::new(&config).unwrap()
+        };
+        let workdir = tempfile::tempdir().unwrap();
+        let a = (CompiledForms::new(&a_engine, workdir.path()), &a_engine);
+        let b = (CompiledForms::new(&b_engine, workdir.path()), &b_engine);
+        let compile = |(forms, engine): &(CompiledForms, &Engine), wasm: &[u8]| {
+            forms
+                .compile(engine, &murmur_artifact::sha256_hex(wasm), wasm)
+                .unwrap();
+        };
+        let dir = PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".murmur")
+            .join(COMPILED_DIR);
+        let set = |(forms, _): &(CompiledForms, &Engine), wasm: &[u8]| {
+            let form = dir.join(format!(
+                "{}-{:016x}.cwasm",
+                murmur_artifact::sha256_hex(wasm),
+                forms.engine_key
+            ));
+            [sidecar(&form), form]
+        };
+        let inodes = |sets: &[[PathBuf; 2]]| -> Vec<u64> {
+            sets.iter().flatten().map(|path| inode(path)).collect()
+        };
+        assert_ne!(set(&a, X), set(&b, X));
+
+        compile(&a, X);
+        compile(&b, X);
+        for path in set(&a, X).iter().chain(&set(&b, X)) {
+            assert!(path.is_file(), "{} missing", path.display());
+        }
+        let x_inodes = inodes(&[set(&a, X), set(&b, X)]);
+
+        for forms in [&a, &b, &a, &b] {
+            compile(forms, X);
+        }
+        assert_eq!(inodes(&[set(&a, X), set(&b, X)]), x_inodes);
+
+        compile(&a, Y);
+        assert_eq!(inodes(&[set(&b, X)]), x_inodes[2..]);
+        let a_xy_inodes = inodes(&[set(&a, X), set(&a, Y)]);
+
+        let stale = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        for path in set(&b, X) {
+            set_times(&path, stale, stale);
+        }
+        compile(&a, Z);
+        for path in set(&b, X) {
+            assert!(!path.exists(), "{} survived", path.display());
+        }
+        for path in set(&a, Z) {
+            assert!(path.is_file(), "{} missing", path.display());
+        }
+        assert_eq!(inodes(&[set(&a, X), set(&a, Y)]), a_xy_inodes);
+
+        compile(&b, X);
+        for path in set(&b, X) {
+            assert!(path.is_file(), "{} missing", path.display());
+        }
     }
 
     #[test]
