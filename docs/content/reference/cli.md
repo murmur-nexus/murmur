@@ -423,6 +423,7 @@ Behavior:
 2. On a registry hit, verify the bytes against the SHA-256 the registry reports; on a miss, fall through to the configured source chain and download from there
 3. Store into the project-local store (or global store with `-g`)
 4. Pin the name, resolved version and SHA-256 in `murmur.lock` — project installs only, since `-g` has no project to pin
+5. Compile each WASM tool, driver and hook for this machine into `~/.murmur/compiled/`, unless `--no-precompile` is given (see the table above)
 
 ---
 

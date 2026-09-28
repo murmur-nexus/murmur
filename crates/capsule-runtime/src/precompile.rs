@@ -94,7 +94,7 @@ impl Precompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use crate::artifact::test_support::archive_with_files as payload;
     use std::path::PathBuf;
 
     fn fixture(relative: &str) -> Vec<u8> {
@@ -102,19 +102,6 @@ mod tests {
             .join("../murmur-cli/tests/fixtures")
             .join(relative);
         std::fs::read(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
-    }
-
-    fn payload(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut cursor = std::io::Cursor::new(Vec::new());
-        let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (name, bytes) in files {
-            zip.start_file(*name, options).unwrap();
-            zip.write_all(bytes).unwrap();
-        }
-        zip.finish().unwrap();
-        cursor.into_inner()
     }
 
     fn tool() -> Vec<u8> {

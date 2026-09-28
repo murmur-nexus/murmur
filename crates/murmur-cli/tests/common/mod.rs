@@ -91,7 +91,6 @@ pub fn install_artifact_to_project(project_dir: &Path, artifact_path: &Path) -> 
 
 /// [`install_artifact_to_project`] under the scratch `home`, with `extra_args` after the path, so
 /// install precompiles into `home` unless `extra_args` says otherwise.
-#[allow(dead_code)]
 pub fn install_artifact_to_project_with_home(
     project_dir: &Path,
     home: &TempDir,
