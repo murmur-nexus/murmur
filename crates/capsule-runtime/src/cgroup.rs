@@ -1071,10 +1071,12 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
 /// where this process actually lives — so migration is confirmed from `/proc/self/cgroup`, the
 /// same source the rest of this module reads, rather than inferred from a job object path.
 ///
-/// The 2s deadline in 20ms steps mirrors [`enable_controllers`]: both wait on systemd/kernel
-/// bookkeeping that normally completes in a millisecond or two, and a wait that long means
-/// something structural is wrong. A timeout here is cheap — the caller ignores it and falls back
-/// to probing the inherited cgroup.
+/// The 2s deadline mirrors [`enable_controllers`]: both wait on systemd/kernel bookkeeping that
+/// normally completes in a millisecond or two, and a wait that long means something structural is
+/// wrong. A timeout here is cheap — the caller ignores it and falls back to probing the inherited
+/// cgroup. The step is 1ms because this wait sits on the launch path of every capsule that needs a
+/// scope, and the move lands a millisecond or two after `StartTransientUnit` returns, so every
+/// step the loop oversleeps is added to the launch.
 #[cfg(target_os = "linux")]
 fn await_scope_membership(unit: &str) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1090,7 +1092,7 @@ fn await_scope_membership(unit: &str) -> Result<(), String> {
                 "systemd accepted the request for {unit} but this process is not in it"
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
