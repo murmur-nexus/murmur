@@ -10904,10 +10904,15 @@ inference:
         (inode(path), fs::File::open(path).unwrap())
     }
 
+    /// Asserts line 1 of `form`'s sidecar, the sha256 recorded when it was written, is the
+    /// sha256 of its bytes.
     fn assert_sidecar_matches(form: &Path) {
         assert_eq!(
-            fs::read_to_string(form_sidecar(form)).unwrap(),
-            murmur_artifact::sha256_hex(&fs::read(form).unwrap())
+            fs::read_to_string(form_sidecar(form))
+                .unwrap()
+                .lines()
+                .next(),
+            Some(murmur_artifact::sha256_hex(&fs::read(form).unwrap()).as_str())
         );
     }
 

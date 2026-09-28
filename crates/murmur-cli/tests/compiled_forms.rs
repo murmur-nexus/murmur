@@ -186,11 +186,75 @@ fn sidecar(form: &Path) -> PathBuf {
 
 fn assert_matches_sidecar(form: &Path) {
     assert_eq!(
-        fs::read_to_string(sidecar(form)).unwrap().trim(),
+        sidecar_line(form, 0),
         sha256_hex(&fs::read(form).unwrap()),
         "{} does not match its sidecar",
         form.display()
     );
+}
+
+/// Line `index` of `form`'s sidecar, trimmed, or `""` when it has no such line.
+fn sidecar_line(form: &Path, index: usize) -> String {
+    fs::read_to_string(sidecar(form))
+        .unwrap()
+        .lines()
+        .nth(index)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// The stamp mur records on sidecar line 2: device, inode, size, owner, mode, mtime and ctime.
+fn stamp(path: &Path) -> String {
+    let metadata = fs::metadata(path).unwrap();
+    format!(
+        "{} {} {} {} {:o} {}.{:09} {}.{:09}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+/// Overwrites line 1 of `form`'s sidecar with 64 zeros in place, keeping line 2 and the file's
+/// inode and mode.
+fn break_recorded_sha256(form: &Path) {
+    let stamp = sidecar_line(form, 1);
+    assert!(
+        !stamp.is_empty(),
+        "no stamp recorded for {}",
+        form.display()
+    );
+    fs::write(sidecar(form), format!("{}\n{stamp}\n", "0".repeat(64))).unwrap();
+}
+
+/// Inverts the middle byte of `form` with a positioned write, then sets its atime and mtime back
+/// to what they were, so only its ctime shows the change.
+fn flip_middle_byte_keeping_times(form: &Path) {
+    use std::os::unix::fs::FileExt;
+
+    let earlier = fs::metadata(form).unwrap();
+    let bytes = fs::read(form).unwrap();
+    let middle = bytes.len() / 2;
+    let file = fs::OpenOptions::new().write(true).open(form).unwrap();
+    file.write_all_at(&[!bytes[middle]], middle as u64).unwrap();
+    file.set_times(
+        FileTimes::new()
+            .set_accessed(earlier.accessed().unwrap())
+            .set_modified(earlier.modified().unwrap()),
+    )
+    .unwrap();
+    drop(file);
+    let later = fs::metadata(form).unwrap();
+    assert_eq!(later.ino(), earlier.ino());
+    assert_eq!(later.len(), earlier.len());
+    assert_eq!(later.modified().unwrap(), earlier.modified().unwrap());
+    assert_ne!(fs::read(form).unwrap(), bytes);
 }
 
 fn inode(path: &Path) -> u64 {
@@ -585,6 +649,117 @@ fn concurrent_first_runs_both_succeed() {
     assert!(!written.is_empty());
     for form in &written {
         assert_matches_sidecar(form);
+    }
+}
+
+#[test]
+fn a_stored_form_records_its_digest_and_stamp() {
+    let project = Project::new();
+    project.run();
+    for form in [project.tool_form(), project.capsule_form()] {
+        let recorded = fs::read_to_string(sidecar(&form)).unwrap();
+        assert_eq!(
+            recorded,
+            format!(
+                "{}\n{}\n",
+                sha256_hex(&fs::read(&form).unwrap()),
+                stamp(&form)
+            ),
+            "{}",
+            form.display()
+        );
+    }
+}
+
+#[test]
+fn a_warm_run_trusts_an_unchanged_stamp_without_hashing() {
+    let project = Project::new();
+    let (first, _) = project.run();
+    let forms = [project.tool_form(), project.capsule_form()];
+    for form in &forms {
+        break_recorded_sha256(form);
+        assert_eq!(mode(&sidecar(form)), 0o600);
+    }
+    let inodes: Vec<u64> = forms.iter().map(|form| inode(form)).collect();
+
+    let (second, _) = project.run();
+    assert_eq!(second, first);
+    assert_eq!(
+        forms.iter().map(|form| inode(form)).collect::<Vec<_>>(),
+        inodes
+    );
+}
+
+#[test]
+fn a_flipped_byte_with_its_times_restored_is_rebuilt() {
+    let project = Project::new();
+    let (first, _) = project.run();
+    let tool_form = project.tool_form();
+    flip_middle_byte_keeping_times(&tool_form);
+    let flipped = inode(&tool_form);
+
+    let (second, _) = project.run();
+    assert_eq!(second, first);
+    assert_ne!(inode(&tool_form), flipped);
+    assert_matches_sidecar(&tool_form);
+    assert_eq!(sidecar_line(&tool_form, 1), stamp(&tool_form));
+}
+
+#[test]
+fn a_touch_or_narrowing_chmod_is_rehashed_once_and_not_rebuilt() {
+    let project = Project::new();
+    let (first, _) = project.run();
+    let (tool_form, capsule_form) = (project.tool_form(), project.capsule_form());
+    let forms = [&tool_form, &capsule_form];
+    fs::File::open(&tool_form)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::now()))
+        .unwrap();
+    set_mode(&capsule_form, 0o400);
+    let form_inodes: Vec<u64> = forms.iter().map(|form| inode(form)).collect();
+    let sidecar_inodes = |forms: &[&PathBuf]| -> Vec<u64> {
+        forms.iter().map(|form| inode(&sidecar(form))).collect()
+    };
+    let stamped = sidecar_inodes(&forms);
+
+    let (second, _) = project.run();
+    assert_eq!(second, first);
+    assert_eq!(
+        forms.iter().map(|form| inode(form)).collect::<Vec<_>>(),
+        form_inodes
+    );
+    assert_eq!(mode(&capsule_form), 0o400);
+    let restamped = sidecar_inodes(&forms);
+    for (form, (before, after)) in forms.iter().zip(stamped.iter().zip(&restamped)) {
+        assert_ne!(before, after, "{} was not restamped", form.display());
+        assert_eq!(sidecar_line(form, 1), stamp(form));
+    }
+
+    let (third, _) = project.run();
+    assert_eq!(third, first);
+    assert_eq!(sidecar_inodes(&forms), restamped);
+}
+
+#[test]
+fn a_digest_only_sidecar_is_stamped_on_the_next_run() {
+    let project = Project::new();
+    let (first, _) = project.run();
+    let forms = [project.tool_form(), project.capsule_form()];
+    for form in &forms {
+        fs::write(sidecar(form), sidecar_line(form, 0)).unwrap();
+        assert_eq!(sidecar_line(form, 1), "");
+    }
+    let inodes: Vec<u64> = forms.iter().map(|form| inode(form)).collect();
+
+    let (second, _) = project.run();
+    assert_eq!(second, first);
+    assert_eq!(
+        forms.iter().map(|form| inode(form)).collect::<Vec<_>>(),
+        inodes
+    );
+    for form in &forms {
+        assert_matches_sidecar(form);
+        assert_eq!(sidecar_line(form, 1), stamp(form));
     }
 }
 
