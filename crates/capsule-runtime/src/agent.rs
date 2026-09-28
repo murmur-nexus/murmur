@@ -275,8 +275,8 @@ fn with_fence_source(mut message: Value, source: Option<String>) -> Value {
 /// Only `Ok` is a completed task. `Ok(Failed)` and `Err(_)` are both failures and differ only in
 /// whether the loop could keep the session alive: the loop returns `Ok(Failed)` for an outcome it
 /// already recorded — a `task_failed` trace line, `out/result.txt`, the attempt's
-/// [`AttemptEnding`] — and `Err` for one that ends the launch. [`task_state_for`] is the one reading of an outcome as
-/// an A2A task state.
+/// [`AttemptEnding`] — and `Err` for one that ends the launch. [`task_state_for`] is the one
+/// reading of an outcome as an A2A task state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentLoopExit {
     Ok,

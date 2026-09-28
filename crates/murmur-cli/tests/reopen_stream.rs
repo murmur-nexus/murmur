@@ -22,7 +22,7 @@ use std::{
 
 use common::idle_capsule::{
     end_turn, end_turns, http_post_json, launch_idle_capsule,
-    launch_idle_capsule_with_input_timeout, IdleCapsule,
+    launch_idle_capsule_with_input_timeout, open_watch, IdleCapsule,
 };
 use serde_json::Value;
 
@@ -118,7 +118,7 @@ fn request_input_call(n: usize) -> String {
 // ── the stream ─────────────────────────────────────────────────────────────────
 
 /// One SSE frame as written: its `id:` (if any), its event type and its parsed data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Frame {
     id: Option<u64>,
     event: String,
@@ -302,6 +302,41 @@ fn stream_task(capsule: &IdleCapsule, message_id: &str, text: &str) -> Stream {
     read_until_closed(open_message_stream(&capsule.url, message_id, text))
 }
 
+/// Every frame a `stream/watch` connection replays from `Last-Event-ID: 0`, read until `task_id`'s
+/// final status arrives or [`STREAM_DEADLINE`] passes. The observer's `connection-ack` is dropped.
+fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Frame> {
+    let conn = open_watch(&capsule.url, 0);
+    let deadline = Instant::now() + STREAM_DEADLINE;
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut source = &conn;
+    loop {
+        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        let body = text.split_once("\n\n").map(|(_, body)| body).unwrap_or("");
+        let frames: Vec<Frame> = parse_frames(body)
+            .into_iter()
+            .filter(|f| f.event != "connection-ack")
+            .collect();
+        if Instant::now() >= deadline
+            || frames
+                .iter()
+                .any(|f| f.is_final_status() && f.task_id() == task_id)
+        {
+            return frames;
+        }
+        match source.read(&mut buf) {
+            Ok(0) => return frames,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return frames,
+        }
+    }
+}
+
 // ── tasks and trace ────────────────────────────────────────────────────────────
 
 fn task_state(addr: &str, task_id: &str) -> String {
@@ -345,9 +380,9 @@ fn assert_first_boundary(stream: &Stream, task_id: &str, hook: &str) {
 
 // ── tests ──────────────────────────────────────────────────────────────────────
 
-/// S1: a task a hook reopens once and then accepts ends in one final `completed` status carrying
-/// the second attempt's answer. The first attempt's text still went out, followed by one boundary
-/// frame before the second attempt's first turn.
+/// A task a hook reopens once and then accepts ends in one final `completed` status carrying the
+/// second attempt's answer. The first attempt's text still went out, followed by one boundary
+/// frame before the second attempt's first turn, and a `stream/watch` replay shows the same frames.
 #[test]
 fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
     let capsule = launch_with_hook(
@@ -386,6 +421,11 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
         stream.frames
     );
     stream.assert_ids_ascend();
+    assert_eq!(
+        replay(&capsule, &task_id),
+        stream.frames,
+        "a stream/watch replay shows the live stream's frames, boundary and final status included"
+    );
 
     assert_eq!(task_state(&capsule.url, &task_id), "completed");
     assert_eq!(
@@ -398,7 +438,7 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
     assert_eq!(end[0]["reopen_count"], 1);
 }
 
-/// S2: a hook that still wants a reopen when `lifecycle.max_task_reopens` is spent leaves the task
+/// A hook that still wants a reopen when `lifecycle.max_task_reopens` is spent leaves the task
 /// one final `failed` status naming that limit, and it is never reported `completed`.
 #[test]
 fn a_task_refused_a_reopen_is_told_it_failed_once() {
@@ -433,7 +473,7 @@ fn a_task_refused_a_reopen_is_told_it_failed_once() {
     assert_eq!(end[0]["exit_status"], "reopen_budget_exhausted");
 }
 
-/// S3: an attempt that failed and was reopened writes no `failed` status; the task's one final
+/// An attempt that failed and was reopened writes no `failed` status; the task's one final
 /// status is the reopened attempt's `completed`.
 #[test]
 fn a_failed_attempt_that_is_reopened_is_not_reported_failed() {
@@ -473,7 +513,7 @@ fn a_failed_attempt_that_is_reopened_is_not_reported_failed() {
     );
 }
 
-/// S5a: a `request-input` wait that times out with no hook bound ends the task in one final
+/// A `request-input` wait that times out with no hook bound ends the task in one final
 /// `failed` status with message `input-timeout`, and nothing reports it failed earlier.
 #[test]
 fn an_input_timeout_ends_the_task_with_one_failed_status() {
@@ -502,7 +542,7 @@ fn an_input_timeout_ends_the_task_with_one_failed_status() {
     assert_eq!(task_state(&capsule.url, &stream.own_task_id()), "failed");
 }
 
-/// S5b: the same timeout on a task a hook reopens is not the task's end: `tasks/get` never reads
+/// The same timeout on a task a hook reopens is not the task's end: `tasks/get` never reads
 /// `failed`, no `failed` frame is written, and the reopened attempt's answer is the one final
 /// `completed` status.
 #[test]
@@ -562,7 +602,7 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     );
 }
 
-/// S6: `message/stream` forwards other tasks' frames but closes on its own task's final status.
+/// `message/stream` forwards other tasks' frames but closes on its own task's final status.
 /// B, opened while A runs, receives A's final status and stays open until its own.
 #[test]
 fn message_stream_closes_on_its_own_tasks_final_status() {
