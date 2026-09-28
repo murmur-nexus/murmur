@@ -1743,7 +1743,7 @@ Controls how long the capsule waits for a `message/send` reply after a WASM tool
 | Value | Behaviour |
 |---|---|
 | absent (default) | Wait indefinitely — the task stays in `input-required` state until a reply arrives or the process is killed. |
-| `N` (positive integer) | If no `message/send` arrives within `N` seconds, the task transitions to `failed` with status message `"input-timeout"`. SSE clients receive a final `TaskStatusUpdateEvent` with `"final":true`. |
+| `N` (positive integer) | If no `message/send` arrives within `N` seconds, the tool call fails and the attempt ends. The task ends `failed`, and its [final status](streaming-protocol.md#one-final-status) carries message `input-timeout`, unless an `on-task-end` hook reopens it. |
 
 Example — require a reply within 5 minutes:
 

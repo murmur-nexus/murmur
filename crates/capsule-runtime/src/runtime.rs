@@ -181,6 +181,14 @@ fn resolve_versioned_iface<T>(
 /// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
 /// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
 ///
+/// When `agent_task_id` is `Some`, this function is the one writer of the task's `final:true`
+/// `status` frame, and writes exactly one, after the last `on-task-end` dispatch, after
+/// `task_end` is in the trace and after the registry slot records the terminal state — so the
+/// frame, `tasks/get` and `task_end` agree. Its state, message and response are the last
+/// attempt's [`agent::AttemptEnding`], or the reopen refusal when the budget ran out. An attempt
+/// writes no final frame of its own; between two attempts the stream gets one non-final
+/// `working` frame naming the hook and carrying `status.reopen`, the reopen's 1-based ordinal.
+///
 /// `seed` is whatever the task's single `on-task-start` dispatch proposed. The hook is
 /// dispatched once, at task start, and is not asked again.
 ///
@@ -244,6 +252,7 @@ async fn run_task_with_reopens(
         let mut attempt_inference = inference.clone();
         attempt_inference.max_turns = remaining_turns;
         let failures_before = trace.task_failures_written();
+        thread.ending = None;
 
         let result = agent::run_agent_loop(
             state,
@@ -303,6 +312,20 @@ async fn run_task_with_reopens(
             Ok(exit) => exit.as_str(),
             Err(_) => "failed",
         };
+        // What the task's final status says if this attempt is the last. A `?`-propagated error
+        // records nothing, and is reported by its own text.
+        let ending = thread.ending.take().unwrap_or_else(|| match &result {
+            Err(error) => agent::AttemptEnding {
+                state: TaskState::Failed,
+                message: agent::failure_message(error),
+                response: None,
+            },
+            Ok(exit) => agent::AttemptEnding {
+                state: agent::task_state_for(&result),
+                message: exit.as_str().to_string(),
+                response: None,
+            },
+        });
 
         // Let the `on-task-end` hooks inspect this attempt and decide whether to reopen.
         let reopen = hooks
@@ -338,6 +361,26 @@ async fn run_task_with_reopens(
                             inference.max_turns.saturating_sub(trace.task_turns()),
                         )
                         .await;
+                    // The attempt boundary, so a client watching the task does not read the
+                    // rejected attempt's frames as its end.
+                    if let Some(task_id) = &agent_task_id {
+                        emit_sse(
+                            &sse,
+                            "status",
+                            &TaskStatusUpdateEvent {
+                                id: task_id.clone(),
+                                context_id: context_id.clone(),
+                                status: StreamStatus {
+                                    state: "working".into(),
+                                    message: format!("reopened by hook {hook_name}"),
+                                    response: None,
+                                    reopen: Some(reopens_used),
+                                },
+                                r#final: false,
+                            },
+                        )
+                        .await;
+                    }
                     reopen_feedback = Some(reopen_feedback_message(
                         reopens_used as usize,
                         &hook_name,
@@ -371,22 +414,107 @@ async fn run_task_with_reopens(
                         &refusal,
                     )
                     .await;
-                let _ = trace
-                    .write_task_end(trace_task_id, "reopen_budget_exhausted", reopens_used)
-                    .await;
-                hooks.end_task();
+                end_task(
+                    state,
+                    hooks,
+                    trace,
+                    trace_task_id,
+                    "reopen_budget_exhausted",
+                    reopens_used,
+                    agent_task_id.as_deref(),
+                    context_id,
+                    &sse,
+                    agent::AttemptEnding {
+                        state: TaskState::Failed,
+                        message: refusal.clone(),
+                        response: None,
+                    },
+                )
+                .await;
                 return Err(RuntimeError::AgentLoopFailed(refusal));
             }
             None => {
                 // No hook asked to reopen — this attempt is terminal.
-                let _ = trace
-                    .write_task_end(trace_task_id, exit_str, reopens_used)
-                    .await;
-                hooks.end_task();
+                end_task(
+                    state,
+                    hooks,
+                    trace,
+                    trace_task_id,
+                    exit_str,
+                    reopens_used,
+                    agent_task_id.as_deref(),
+                    context_id,
+                    &sse,
+                    ending,
+                )
+                .await;
                 return result;
             }
         }
     }
+}
+
+/// End a task [`run_task_with_reopens`] ran, in the order its readers rely on: `task_end` with
+/// `exit_status`, the hooks' task scope closed, the trace flushed, then — for an A2A task, when
+/// `agent_task_id` is `Some` — the registry slot finished and the task's one `final:true` status
+/// written from `ending`.
+///
+/// An accepted `tasks/cancel` the loop did not observe has already recorded `canceled`, which
+/// [`TaskRegistry::finish_task`] keeps; the frame then says `canceled` too, so it never disagrees
+/// with `tasks/get`.
+#[allow(clippy::too_many_arguments)]
+async fn end_task(
+    state: &CapsuleStoreState,
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    trace_task_id: &str,
+    exit_status: &str,
+    reopens_used: u32,
+    agent_task_id: Option<&str>,
+    context_id: Option<String>,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    ending: agent::AttemptEnding,
+) {
+    let _ = trace
+        .write_task_end(trace_task_id, exit_status, reopens_used)
+        .await;
+    hooks.end_task();
+    let _ = trace.flush().await;
+    let Some(task_id) = agent_task_id else {
+        return;
+    };
+    let recorded = state.a2a_task_registry.as_ref().and_then(|registry| {
+        let mut reg = registry.lock().unwrap();
+        let recorded = reg.finish_task(ending.state.clone());
+        // Immediately after the terminal state, so a resource-plane read that lands next
+        // reports the turn these bytes belong to.
+        reg.advance_resource_generation();
+        recorded
+    });
+    let ending = match recorded {
+        Some(TaskState::Canceled) if ending.state != TaskState::Canceled => agent::AttemptEnding {
+            state: TaskState::Canceled,
+            message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
+            response: None,
+        },
+        _ => ending,
+    };
+    emit_sse(
+        sse,
+        "status",
+        &TaskStatusUpdateEvent {
+            id: task_id.to_string(),
+            context_id,
+            status: StreamStatus {
+                state: ending.state.as_str().to_string(),
+                message: ending.message,
+                response: ending.response,
+                reopen: None,
+            },
+            r#final: true,
+        },
+    )
+    .await;
 }
 
 /// Why a reopen a hook asked for was refused, naming the limit that refused it. The two limits
@@ -2936,22 +3064,10 @@ fn launch(
                         )
                         .await;
 
-                        // ── POST-LOOP SLOT UPDATE ──
-                        // task_end (with reopen_count) and the terminal on-task-end dispatch
-                        // already happened inside run_task_with_reopens; an exhausted reopen
-                        // budget surfaces here as loop_result.is_err(), i.e. a failed task.
-                        // `finish_task` refuses to overwrite an accepted cancel whatever is
-                        // passed, so this is the loop's own reading rather than the authority:
-                        // an attempt that reported `canceled` says so here too.
-                        let exit_state = agent::task_state_for(&loop_result);
-                        let _ = trace.flush().await;
-                        {
-                            let mut reg = task_registry.lock().unwrap();
-                            reg.finish_task(exit_state);
-                            // Immediately after the terminal state, so a resource-plane read that
-                            // lands next reports the turn these bytes belong to.
-                            reg.advance_resource_generation();
-                        }
+                        // task_end (with reopen_count), the terminal on-task-end dispatch, the
+                        // registry slot's terminal state and the task's final status frame all
+                        // happened inside run_task_with_reopens; an exhausted reopen budget
+                        // surfaces here as loop_result.is_err(), i.e. a failed task.
 
                         // A terminating session starts nothing after the task it was running:
                         // what is still in a lane gets its cancel recorded, and the loop ends.
@@ -4707,6 +4823,7 @@ pub(crate) async fn request_input_impl(
                 state: "input-required".into(),
                 message: prompt.clone(),
                 response: None,
+                reopen: None,
             },
             r#final: false,
         },
@@ -4746,6 +4863,7 @@ pub(crate) async fn request_input_impl(
                         state: "working".into(),
                         message: "resumed".into(),
                         response: None,
+                        reopen: None,
                     },
                     r#final: false,
                 },
@@ -4753,31 +4871,15 @@ pub(crate) async fn request_input_impl(
             .await;
             Ok(text)
         }
-        // The state and the final status event are the agent loop's to write on this path: it
-        // takes the cancel at its next boundary and ends the attempt there, with the record, the
-        // trace and the residue that go with it.
+        // The agent loop takes the cancel at its next boundary and ends the attempt there, with
+        // the record, the trace and the residue that go with it; the final status event is the
+        // reopen loop's.
         Err(InputWaitEnd::Canceled) => Err(wasmtime::Error::msg("task-canceled")),
+        // The task is not ended here: the agent loop takes the timeout at its next boundary and
+        // ends the attempt, and the reopen loop writes the task's one final status — or reopens
+        // it — once the `on-task-end` hooks have run.
         Err(InputWaitEnd::TimedOut) => {
-            {
-                let mut reg = task_registry.lock().unwrap();
-                reg.finish_task(TaskState::Failed);
-                reg.advance_resource_generation();
-            }
-            emit_sse(
-                &sse,
-                "status",
-                &TaskStatusUpdateEvent {
-                    id: task_id.clone(),
-                    context_id: None,
-                    status: StreamStatus {
-                        state: "failed".into(),
-                        message: "input-timeout".into(),
-                        response: None,
-                    },
-                    r#final: true,
-                },
-            )
-            .await;
+            task_registry.lock().unwrap().record_input_timeout(&task_id);
             Err(wasmtime::Error::msg("input-timeout"))
         }
     }
@@ -4785,8 +4887,8 @@ pub(crate) async fn request_input_impl(
 
 /// Why a `request-input` wait ended without an answer.
 ///
-/// The two are not interchangeable: a timeout is this task failing, and a cancel is a person
-/// stopping it — so only one of them writes a terminal state here.
+/// The two are not interchangeable: a timeout is this attempt failing, and a cancel is a person
+/// stopping the task. Neither writes a terminal state here.
 enum InputWaitEnd {
     Canceled,
     TimedOut,
@@ -5011,12 +5113,13 @@ impl CapsuleStoreState {
         Some(registry.lock().unwrap().cancel_watch(task_id))
     }
 
-    /// Whether `task_id`'s `request-input` wait timed out: the one path that fails a task in the
-    /// registry while its attempt is still running. `false` outside an A2A session.
+    /// Whether `task_id`'s `request-input` wait timed out since this was last asked. Taking the
+    /// mark means the attempt that timed out ends on it and a reopened attempt of the same task
+    /// starts clear. `false` outside an A2A session.
     pub(crate) fn task_input_timed_out(&self, task_id: &str) -> bool {
         self.a2a_task_registry
             .as_ref()
-            .is_some_and(|registry| registry.lock().unwrap().has_failed(task_id))
+            .is_some_and(|registry| registry.lock().unwrap().take_input_timeout(task_id))
     }
 
     /// Returns the held continuation `(id, acked_len)` iff a continuation is currently held
@@ -5151,15 +5254,7 @@ impl send::Host for CapsuleStoreState {
         Ok(send::TaskResult {
             task_id: task.id,
             context_id: task.context_id,
-            state: match task.status.state {
-                crate::a2a::TaskState::Submitted => "submitted".to_string(),
-                crate::a2a::TaskState::Working => "working".to_string(),
-                crate::a2a::TaskState::InputRequired => "input-required".to_string(),
-                crate::a2a::TaskState::Completed => "completed".to_string(),
-                crate::a2a::TaskState::Failed => "failed".to_string(),
-                crate::a2a::TaskState::Rejected => "rejected".to_string(),
-                crate::a2a::TaskState::Canceled => "canceled".to_string(),
-            },
+            state: task.status.state.as_str().to_string(),
         })
     }
 }
@@ -8344,6 +8439,7 @@ async fn record_canceled_before_start(
                 state: "canceled".into(),
                 message: "task canceled before it started".into(),
                 response: None,
+                reopen: None,
             },
             r#final: true,
         },
@@ -13184,6 +13280,8 @@ inference:
             mode: ConversationMode::Stateless,
             harness_sessions: None,
             forget: None,
+            streamed: false,
+            counting_harness: false,
         })
         .await;
         (run.result, run.events)
@@ -13199,6 +13297,11 @@ inference:
         harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
         /// The forget request the task's starting request carried.
         forget: Option<&'static str>,
+        /// Whether `tsk_1` runs as an A2A task whose frames are collected in [`ReopenRun::frames`].
+        streamed: bool,
+        /// Whether the harness answers `RESULT-<n>` on its n-th spawn rather than `done` on every
+        /// one.
+        counting_harness: bool,
     }
 
     /// What a reopen scenario left behind.
@@ -13211,6 +13314,55 @@ inference:
         record: Vec<serde_json::Value>,
         /// `task.md` as the last attempt left it.
         task_md: String,
+        /// Every frame the task's stream carried, in order, as `{"event": <type>, "data": <data>}`;
+        /// empty for a scenario that is not streamed.
+        frames: Vec<serde_json::Value>,
+    }
+
+    impl ReopenRun {
+        /// The data of every `status` frame with `"final":true`.
+        fn final_statuses(&self) -> Vec<&serde_json::Value> {
+            self.frames
+                .iter()
+                .filter(|frame| frame["event"] == "status" && frame["data"]["final"] == true)
+                .map(|frame| &frame["data"])
+                .collect()
+        }
+
+        /// The data of every `status` frame that marks a reopen boundary.
+        fn boundary_statuses(&self) -> Vec<&serde_json::Value> {
+            self.frames
+                .iter()
+                .filter(|frame| {
+                    frame["event"] == "status" && frame["data"]["status"].get("reopen").is_some()
+                })
+                .map(|frame| &frame["data"])
+                .collect()
+        }
+    }
+
+    /// Every frame in `buffer`, in order, as `{"event": <type>, "data": <data>}`.
+    fn buffered_frames(buffer: &Mutex<SseEventBuffer>) -> Vec<serde_json::Value> {
+        let frames = match buffer.lock().unwrap().replay_from(0) {
+            crate::streaming::ReplayResult::Complete(frames)
+            | crate::streaming::ReplayResult::WithGap { events: frames, .. } => frames,
+        };
+        frames
+            .iter()
+            .map(|frame| {
+                let field = |name: &str| {
+                    frame
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .expect("every frame names its type and carries data")
+                        .to_string()
+                };
+                serde_json::json!({
+                    "event": field("event: "),
+                    "data": serde_json::from_str::<serde_json::Value>(&field("data: ")).unwrap(),
+                })
+            })
+            .collect()
     }
 
     /// The task text every reopen scenario starts from.
@@ -13325,8 +13477,13 @@ inference:
         hooks: &mut HookRuntime,
         mode: ConversationMode,
         seed: Option<HookSeed>,
+        streamed: bool,
     ) -> ReopenRun {
         let conversation_root = run_config.conversation_root.clone();
+        // A real broadcast and buffer: the buffer records every frame whether or not a receiver
+        // is attached, which is what `frames` reads back.
+        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel(1024);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(1024)));
         let mut trace = reopen_scenario_trace(workdir).await;
         let mut otel = OtelEmitter::new(None, workdir, "cap".to_string(), "0.1.0".to_string());
 
@@ -13353,8 +13510,8 @@ inference:
             hooks,
             &mut trace,
             &mut otel,
-            None,
-            None,
+            streamed.then(|| "tsk_1".to_string()),
+            streamed.then(|| (sse_tx.clone(), Arc::clone(&sse_buffer))),
             workdir,
             "cap",
             "0.1.0",
@@ -13392,6 +13549,7 @@ inference:
             events,
             record,
             task_md: fs::read_to_string(workdir.join("task.md")).unwrap(),
+            frames: buffered_frames(&sse_buffer),
         }
     }
 
@@ -13400,7 +13558,11 @@ inference:
         let workdir = dir.path().to_path_buf();
         fs::create_dir_all(workdir.join("tools")).unwrap();
         fs::write(workdir.join("task.md"), REOPEN_TASK).unwrap();
-        let harness = write_fake_harness(dir.path());
+        let harness = if scenario.counting_harness {
+            write_counting_fake_harness(dir.path())
+        } else {
+            write_fake_harness(dir.path())
+        };
 
         let inference = InferenceConfig {
             transport: "process".into(),
@@ -13438,6 +13600,7 @@ inference:
             &mut hooks,
             scenario.mode,
             None,
+            scenario.streamed,
         )
         .await
     }
@@ -13452,7 +13615,16 @@ inference:
         driver_metadata: Option<Vec<(&'static str, &'static str)>>,
         reopen_limit: u32,
         max_turns: u32,
+        max_task_reopens: u32,
+        /// The body the driver double answers every call with.
+        driver_response: &'static str,
+        /// Whether `tsk_1` runs as an A2A task whose frames are collected in [`ReopenRun::frames`].
+        streamed: bool,
     }
+
+    /// The `end_turn` answer the http reopen scenarios' driver double gives by default.
+    const HTTP_REOPEN_RESPONSE: &str =
+        r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-1"}]}"#;
 
     impl HttpReopen {
         /// A driver double answering `end_turn` on every call, reopened once.
@@ -13464,6 +13636,9 @@ inference:
                 driver_metadata: Some(Vec::new()),
                 reopen_limit: 1,
                 max_turns: 10,
+                max_task_reopens: 5,
+                driver_response: HTTP_REOPEN_RESPONSE,
+                streamed: false,
             }
         }
     }
@@ -13487,7 +13662,7 @@ inference:
                 crate::inference_import::test_support::driver_double_with_metadata(
                     &state.engine,
                     0,
-                    r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-1"}]}"#,
+                    scenario.driver_response,
                     metadata,
                 ),
             );
@@ -13509,11 +13684,12 @@ inference:
             &mut state,
             &workdir,
             &inference,
-            5,
+            scenario.max_task_reopens,
             run_config,
             &mut hooks,
             scenario.mode,
             scenario.seed,
+            scenario.streamed,
         )
         .await
     }
@@ -14272,6 +14448,8 @@ inference:
             mode: ConversationMode::Stateless,
             harness_sessions: None,
             forget: None,
+            streamed: false,
+            counting_harness: false,
         })
         .await;
         assert!(run.result.is_ok(), "{:?}", run.result);
@@ -14338,6 +14516,203 @@ inference:
         assert!(!message.contains("reopen budget"), "{message}");
     }
 
+    /// The task's one final status: exactly one `final:true` `status` frame, the last frame on
+    /// the stream, naming the task and its context.
+    fn the_one_final_status(run: &ReopenRun) -> &serde_json::Value {
+        let finals = run.final_statuses();
+        assert_eq!(finals.len(), 1, "{:#?}", run.frames);
+        assert_eq!(
+            run.frames.last().map(|frame| &frame["data"]),
+            Some(finals[0]),
+            "the final status is the task's last frame: {:#?}",
+            run.frames
+        );
+        assert_eq!(finals[0]["id"], "tsk_1");
+        assert_eq!(finals[0]["context_id"], "ctx_1");
+        finals[0]
+    }
+
+    /// Index of the first frame at or after `from` that `matches`.
+    fn frame_index(
+        run: &ReopenRun,
+        from: usize,
+        matches: impl Fn(&serde_json::Value) -> bool,
+    ) -> usize {
+        from + run.frames[from..]
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("no matching frame after {from}: {:#?}", run.frames))
+    }
+
+    /// The reopen boundary frame, checked for its exact shape.
+    fn assert_boundary_frame(frame: &serde_json::Value, reopen: u32) {
+        assert_eq!(
+            frame,
+            &serde_json::json!({
+                "id": "tsk_1",
+                "context_id": "ctx_1",
+                "status": {
+                    "state": "working",
+                    "message": "reopened by hook gatekeeper",
+                    "reopen": reopen,
+                },
+                "final": false,
+            })
+        );
+    }
+
+    /// An error `run_agent_loop` propagates with `?` records no ending, and still ends the task's
+    /// stream with one final `failed` status carrying the error's text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_propagated_error_ends_the_stream_with_one_failed_status() {
+        let run = run_http_reopen(HttpReopen {
+            reopen_limit: 0,
+            driver_response: "not json",
+            streamed: true,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        assert!(run.result.is_err(), "{:?}", run.result);
+        let last = the_one_final_status(&run);
+        assert_eq!(last["status"]["state"], "failed");
+        let message = last["status"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("failed to parse driver response"),
+            "{message}"
+        );
+        assert!(last["status"].get("response").is_none(), "{last}");
+
+        // A driver named in the manifest but absent from `tools/`.
+        let run = run_http_reopen(HttpReopen {
+            reopen_limit: 0,
+            driver_metadata: None,
+            streamed: true,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        let error = run.result.as_ref().unwrap_err().to_string();
+        assert!(error.contains("is not installed"), "{error}");
+        let last = the_one_final_status(&run);
+        assert_eq!(last["status"]["state"], "failed");
+        assert_eq!(last["status"]["message"], error.as_str());
+    }
+
+    /// A process task a hook reopens once streams one boundary frame between its two attempts
+    /// and one final status, after the hook accepted the second: the second attempt's result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_process_task_streams_one_final_status_after_its_hooks() {
+        let run = run_process_reopen(ProcessReopen {
+            reopen_limit: 1,
+            max_task_reopens: 5,
+            max_turns: 10,
+            mode: ConversationMode::Stateless,
+            harness_sessions: None,
+            forget: None,
+            streamed: true,
+            counting_harness: true,
+        })
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+
+        let last = the_one_final_status(&run);
+        assert_eq!(last["status"]["state"], "completed");
+        assert_eq!(last["status"]["response"], "RESULT-2");
+
+        let boundaries = run.boundary_statuses();
+        assert_eq!(boundaries.len(), 1, "{:#?}", run.frames);
+        assert_boundary_frame(boundaries[0], 1);
+
+        // The boundary sits after the first attempt's answer and before the second's first turn.
+        let first_answer = frame_index(&run, 0, |frame| {
+            frame["event"] == "text" && frame["data"]["text"] == "RESULT-1"
+        });
+        let boundary = frame_index(&run, 0, |frame| {
+            frame["data"]["status"].get("reopen").is_some()
+        });
+        let second_turn = frame_index(&run, boundary, |frame| {
+            frame["data"]["status"]["message"] == "inference turn 1"
+        });
+        assert!(first_answer < boundary && boundary < second_turn);
+    }
+
+    /// A process task whose hook still wants a reopen when `lifecycle.max_task_reopens` is spent
+    /// ends in one final `failed` status naming that limit, and is never reported `completed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_task_refused_a_reopen_streams_one_failed_status() {
+        let run = run_process_reopen(ProcessReopen {
+            reopen_limit: 99,
+            max_task_reopens: 1,
+            max_turns: 10,
+            mode: ConversationMode::Stateless,
+            harness_sessions: None,
+            forget: None,
+            streamed: true,
+            counting_harness: true,
+        })
+        .await;
+        assert!(run.result.is_err(), "{:?}", run.result);
+
+        let last = the_one_final_status(&run);
+        assert_eq!(last["status"]["state"], "failed");
+        let message = last["status"]["message"].as_str().unwrap();
+        assert!(message.contains("lifecycle.max_task_reopens"), "{message}");
+        assert!(
+            !run.frames
+                .iter()
+                .any(|frame| frame["data"]["status"]["state"] == "completed"),
+            "{:#?}",
+            run.frames
+        );
+        let boundaries = run.boundary_statuses();
+        assert_eq!(boundaries.len(), 1, "{:#?}", run.frames);
+        assert_boundary_frame(boundaries[0], 1);
+    }
+
+    /// The http transport reaches the same frames through the same reopen loop: one boundary per
+    /// reopen, and one final status, `completed` when the hook is satisfied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reopened_http_task_streams_one_final_status_after_its_hooks() {
+        let run = run_http_reopen(HttpReopen {
+            streamed: true,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        assert!(run.result.is_ok(), "{:?}", run.result);
+
+        let last = the_one_final_status(&run);
+        assert_eq!(last["status"]["state"], "completed");
+        assert_eq!(last["status"]["response"], "RESULT-1");
+        let boundaries = run.boundary_statuses();
+        assert_eq!(boundaries.len(), 1, "{:#?}", run.frames);
+        assert_boundary_frame(boundaries[0], 1);
+    }
+
+    /// And `failed`, naming `lifecycle.max_task_reopens`, when the reopen budget is spent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_http_task_refused_a_reopen_streams_one_failed_status() {
+        let run = run_http_reopen(HttpReopen {
+            reopen_limit: 99,
+            max_task_reopens: 1,
+            streamed: true,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        assert!(run.result.is_err(), "{:?}", run.result);
+
+        let last = the_one_final_status(&run);
+        assert_eq!(last["status"]["state"], "failed");
+        let message = last["status"]["message"].as_str().unwrap();
+        assert!(message.contains("lifecycle.max_task_reopens"), "{message}");
+        assert!(
+            !run.frames
+                .iter()
+                .any(|frame| frame["data"]["status"]["state"] == "completed"),
+            "{:#?}",
+            run.frames
+        );
+        assert_eq!(run.boundary_statuses().len(), 1, "{:#?}", run.frames);
+    }
+
     /// The forget request belongs to the task's first attempt: a continued attempt resumes the
     /// session that attempt established rather than dropping it again.
     #[tokio::test(flavor = "multi_thread")]
@@ -14360,6 +14735,8 @@ inference:
             mode: ConversationMode::Threaded,
             harness_sessions: Some(Arc::clone(&map)),
             forget: Some(crate::harness_session::FORGET_BY_CLI),
+            streamed: false,
+            counting_harness: false,
         })
         .await;
         assert!(run.result.is_ok(), "{:?}", run.result);

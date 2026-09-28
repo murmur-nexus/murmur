@@ -77,6 +77,15 @@ pub fn launch_idle_capsule_with(
     server: ScriptedServer,
     extra_artifacts: impl FnOnce(&TempDir, &Path) -> String,
 ) -> IdleCapsule {
+    launch_idle_capsule_with_input_timeout(server, None, extra_artifacts)
+}
+
+/// [`launch_idle_capsule_with`], with `lifecycle.input_timeout_secs` set to `input_timeout_secs`.
+pub fn launch_idle_capsule_with_input_timeout(
+    server: ScriptedServer,
+    input_timeout_secs: Option<u64>,
+    extra_artifacts: impl FnOnce(&TempDir, &Path) -> String,
+) -> IdleCapsule {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -100,7 +109,7 @@ pub fn launch_idle_capsule_with(
     )
     .unwrap();
 
-    let staged = stage_agent(&home, &manifest_path);
+    let staged = stage_agent(&home, &manifest_path, input_timeout_secs);
     let workdir = staged.workdir.clone();
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
@@ -123,7 +132,11 @@ pub fn launch_idle_capsule_with(
     }
 }
 
-fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedSession {
+fn stage_agent(
+    home: &TempDir,
+    manifest_path: &Path,
+    input_timeout_secs: Option<u64>,
+) -> capsule_runtime::StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::new();
@@ -172,7 +185,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
                 task_acceptance: TaskAcceptance::Queue,
                 after_task: AfterTask::Sleep,
                 queue_depth: 2,
-                input_timeout_secs: None,
+                input_timeout_secs,
                 ..Default::default()
             }),
             lifecycle_override: None,

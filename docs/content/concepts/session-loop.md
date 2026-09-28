@@ -88,6 +88,12 @@ already holds it and is never seeded again. A [`--forget-session`](../reference/
 `x-murmur-forget-session` request applies to the task's first attempt only, so a reopened attempt
 resumes the session that attempt established.
 
+A client streaming the task sees a `working` frame marking each reopen and one final status,
+written after the hooks accept the task or the reopen limit runs out. The final status's
+`response` is the accepted answer; frames from a rejected attempt stay on the stream. The frames
+are described under [`status`](../reference/streaming-protocol.md#reopened-tasks) in the streaming
+protocol.
+
 The feedback message is fenced as untrusted content on exactly the condition the task message is.
 The task's `task.md` is rewritten on every reopen as the original task plus every reopen's
 feedback so far, under a `# Reopen feedback` heading.

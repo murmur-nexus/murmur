@@ -16,7 +16,7 @@ without a body is answered `404 Not Found`.
 
 | Method | Purpose | Params | Closes when |
 |---|---|---|---|
-| `message/stream` | Submit a task and stream the capsule's frames while it runs | An A2A message, under `params.message` or as `params` itself: `messageId` (string, required), `role` (string, required), `parts` (array of `{"text": …}`, required), `contextId` (string, optional) | The first live `status` frame with `"final":true` is written, whatever task it belongs to. Also after an `error` frame and after a `rejected` status |
+| `message/stream` | Submit a task and stream the capsule's frames while it runs | An A2A message, under `params.message` or as `params` itself: `messageId` (string, required), `role` (string, required), `parts` (array of `{"text": …}`, required), `contextId` (string, optional) | The first live `status` frame with `"final":true` whose `id` is the task this connection submitted is written. Also after an `error` frame and after a `rejected` status |
 | `stream/watch` | Observe every frame the capsule writes, without submitting anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A `final` status does not close it |
 
 Request a `stream/watch`:
@@ -70,15 +70,15 @@ Which frames each endpoint can deliver:
 
 Neither endpoint filters by task. Every `status`, `artifact`, `text` and `thinking` frame the
 capsule writes reaches every open connection on either endpoint, so a `message/stream` connection
-carries the frames of other tasks running or queued on the same capsule, and closes on the first
-`final` status of any of them. Read the `id` key in each frame's `data` to tell tasks apart.
+carries the frames of other tasks running or queued on the same capsule, their final statuses
+included. Read the `id` key in each frame's `data` to tell tasks apart. A `message/stream`
+connection closes on the final status of its own task only.
 
-A client that sends a message and waits for its own reply cannot match on that task id: the id is
-minted when the task is accepted and appears only in the frames, so it is not known when the request
-is made. Send a `contextId` of your own in the message instead — the capsule uses it verbatim and
-mints one only when it is absent — then match each frame on `context_id` in its `data` and ignore
-the rest. Without this, two senders that overlap both return on whichever task finishes first, and
-one of them reads a reply to a message it never sent.
+The task id is minted when the task is accepted and appears only in the frames, so a client does
+not know it when the request is made, and cannot tell its own task's frames from another's until
+its final status arrives. To pick out its own frames while the task runs, a client sends a
+`contextId` of its own in the message — the capsule uses it verbatim and mints one only when it is
+absent — and matches each frame on `context_id` in its `data`.
 
 ### What `message/stream` writes, in order
 
@@ -92,7 +92,7 @@ one of them reads a reply to a message it never sent.
 5. When the task cannot be handed to the capsule's queue, an [`error`](#event-error) frame, and
    the connection closes.
 6. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the first delivered
-   `status` frame with `"final":true`.
+   `status` frame with `"final":true` for the task this connection submitted.
 
 The task id and context id minted for the task appear only in the frames' `data`: `tsk_` and a
 UUIDv7 for the task, and the message's `contextId` or `ctx_` and a UUIDv7 for the context.
@@ -115,8 +115,13 @@ written before the next frame the connection receives. The connection stays open
 writes the count to its own stderr, as `SSE broadcast lagged by <n> events`; nothing about a lag is
 written to `trace.jsonl`.
 
-On `message/stream`, a lost frame may be the `final` status the client is waiting for. The
-connection then stays open until the next `final` status it is delivered, from any task.
+On `message/stream`, a lost frame may be the `final` status of the connection's own task, and the
+connection then stays open until the capsule's stream ends. A client that receives a `lagged` frame
+can learn how its task ended by either of these:
+
+- Call `tasks/get` with the task id, read from one of its own frames.
+- Open a `stream/watch` with `Last-Event-ID` set to the last id it received, and read the replay
+  for the task's final status.
 
 A client that needs every frame reconnects with the id of the last frame it received and
 [replays](#replay) the rest, which recovers them while they are still in the replay buffer.
@@ -160,12 +165,12 @@ of the harness:
 | Reports the complete text of what it streamed | [`text`](#event-text), `"final":true`, empty — the client keeps the fragments it was sent |
 | Streams a fragment of reasoning, or reports reasoning nothing streamed | [`thinking`](#event-thinking) |
 | Answers a tool call | [`artifact`](#event-artifact) |
-| Ends the turn | The whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then `status` `completed` |
-| Fails the turn | `status` `failed` |
+| Ends the turn | The whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the task's final `status` `completed` |
+| Fails the turn | The task's final `status` `failed` |
 
-Every attempt of a process task ends in exactly one `final:true` `status` frame, on every path out
-of the attempt, including the ones a runtime diagnostic ends: the frame's `status.message` is that
-diagnostic, under the code [`mur` reports it as](diagnostics.md).
+A process task ends in the same [one final status](#one-final-status) as an http task, on every
+path out of its last attempt, including the ones a runtime diagnostic ends: the frame's
+`status.message` is that diagnostic, under the code [`mur` reports it as](diagnostics.md).
 
 The two transports' streams differ in three things, each because the harness, not this runtime,
 ran the turn:
@@ -180,52 +185,76 @@ ran the turn:
 
 ## `status` { #event-status }
 
-A task's state. Written by the agent loop at the start of every inference turn, when a task waits
-for input and resumes, and when a task ends.
+A task's state. Written at the start of every inference turn, when a task waits for input and
+resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|
 | `id` | string | Never | The task id, `tsk_…` |
-| `context_id` | string | On the `input-required` frame, the `working` frame with message `resumed`, and the `failed` frame with message `input-timeout` | The task's context id |
+| `context_id` | string | On the `input-required` frame and the `working` frame with message `resumed` | The task's context id. Present on every final frame |
 | `status` | object | Never | |
 | `status.state` | string | Never | One of the states below |
 | `status.message` | string | Never | See the states below |
 | `status.response` | string | On every state except `completed` | The task's result text, as written to `out/result.txt` |
+| `status.reopen` | integer | On every frame except the [reopen boundary](#reopened-tasks) | The reopen's ordinal, counted from 1 |
 | `final` | bool | Never | `true` on the states that end a task |
 
 | `status.state` | `final` | `status.message` |
 |---|---|---|
-| `working` | `false` | `inference turn <n>`, counted from 1, at the start of each inference turn. `resumed` when an `input-required` wait is answered |
+| `working` | `false` | `inference turn <n>`, counted from 1, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task |
 | `input-required` | `false` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
 | `completed` | `true` | `session ended` |
-| `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; `error[<code>]: <message>` when a diagnostic ended a [`transport: process`](#transports) attempt |
+| `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
 | `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed rather than stopping when it was asked |
 | `rejected` | `true` | `task rejected: capsule is busy`. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered |
 
-A `final` status is the last frame a task writes in the ordinary case, with two exceptions that
-keep writing frames for the same task id afterwards:
+### One final status { #one-final-status }
 
-| After | What follows |
-|---|---|
-| `completed` or `failed`, when an `on-task-end` hook reopens the task ([`lifecycle.max_task_reopens`](manifest.md#field-lifecycle)) | A new attempt: `working` from `inference turn 1`. Its frames continue the session's [id sequence](#event-ids) |
-| `failed` with message `input-timeout` | The tool that asked for input fails, the model receives that failure as an `artifact`, and the task goes on to its own final status |
+Every task the capsule runs ends in exactly one `status` frame with `"final":true`. It is the
+task's last frame, and it is written after every `on-task-end` hook has run, after `task_end` is
+in the trace and after [`tasks/get`](agent-card.md#serves-methods) answers the same state.
 
-A task that ends in an error the agent loop does not report — a driver response that is not JSON,
-a trace write failure, a workdir size breach — writes no final status for that attempt. Unless an
-`on-task-end` hook reopens the task, a `message/stream` connection on it stays open until another
-task's final status or the capsule's exit.
+| How the task ended | `status.state` | `status.message` | `status.response` |
+|---|---|---|---|
+| An attempt completed and no hook reopened it | `completed` | `session ended` | That attempt's result |
+| A hook still wanted a reopen that `lifecycle.max_task_reopens` or `inference.max_turns` did not allow | `failed` | The refusal, naming the limit | Absent |
+| The last attempt failed | `failed` | The reason, from the `failed` row above | Absent |
+| The task was cancelled | `canceled` | From the `canceled` row above | Absent |
+
+A `request-input` wait that times out ends the attempt, not the task: the tool that asked fails,
+and the task's final status — `failed` with message `input-timeout` — follows once the hooks have
+run, unless a hook reopens the task.
 
 ```json
 {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"completed","message":"session ended","response":"README.md describes the build."},"final":true}
 ```
+
+### Reopened tasks { #reopened-tasks }
+
+An `on-task-end` hook that [reopens a task](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
+starts a new attempt of the same task id. Between the two attempts the stream carries one
+boundary frame:
+
+```json
+{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"working","message":"reopened by hook review-gate","reopen":1},"final":false}
+```
+
+| What a client sees | Reading |
+|---|---|
+| `text`, `thinking` and `artifact` frames of a rejected attempt | Written live and never withdrawn |
+| The boundary frame | The rejected attempt is over; the next attempt starts with `working` `inference turn 1` |
+| The final status's `status.response` | The task's answer |
+
+Never join `text` frames across a boundary frame: the joined text mixes a rejected answer with the
+accepted one. The answer is the final status's `response`.
 
 ---
 
 ## `artifact` { #event-artifact }
 
 One tool call's result, or one hook artifact. The runtime writes one frame for each tool call it
-dispatches, in dispatch order, and one for each hook artifact before the task's `completed`
-status. On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
+dispatches, in dispatch order, and one for each hook artifact when an attempt completes, ahead of
+the task's final status or the [reopen boundary](#reopened-tasks). On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
 no frame. On [`transport: process`](manifest.md#transport-process) the harness reports the
 refusal it was handed as its own failed tool call, and that report writes a frame with
 `artifact.is_error` set to `true`.
@@ -279,7 +308,7 @@ A piece of the model's reply.
 |---|---|---|
 | `false` | A chunk | A streaming driver, or a tool, emits a chunk through [`murmur:text/chunks`](wit-interfaces.md#text-chunks) |
 | `true` | `""` | A streaming driver's inference call returned, or a [`transport: process`](#transports) harness reported the complete text of fragments it streamed. Marks the end of that turn's chunks |
-| `true` | The whole reply | A task completed with a non-empty reply and no chunk was emitted during its last inference turn |
+| `true` | The whole reply | An attempt completed with a non-empty reply and no chunk was emitted during its last inference turn |
 
 `final` on a `text` frame ends nothing: the task goes on to its `status` frames.
 
@@ -425,10 +454,10 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 
 | Frame | Carries `id:` | Id source |
 |---|---|---|
-| `status` from the agent loop (`working` per turn, `completed`, `failed`, `canceled`) | yes | The session's sequence |
+| `status` `working` per turn, the reopen boundary, and each task's final status (`completed`, `failed`, `canceled`) | yes | The session's sequence |
 | `artifact` | yes | The session's sequence |
 | `text`, `thinking` | yes | The session's sequence |
-| `status` `input-required`, `working` `resumed`, `failed` `input-timeout` | yes | The session's sequence |
+| `status` `input-required`, `working` `resumed` | yes | The session's sequence |
 | `status` `canceled` with message `task canceled before it started` | yes | The session's sequence |
 | `status` `rejected` | no | — |
 | `gap` | no | — |

@@ -196,8 +196,8 @@ pub(super) struct ProcessEventSink<'a> {
     /// Whether the run ended because the harness could not find the session it was handed. That
     /// entry is left exactly as it was, so nothing is written over it here.
     session_gone: bool,
-    /// The A2A half of the same events. Borrowed rather than owned, because the attempt writes
-    /// its one terminal status through it after this sink is done with the run.
+    /// The A2A half of the same events. Borrowed rather than owned, because the attempt reads its
+    /// ending from it after this sink is done with the run.
     a2a: &'a mut A2aStream,
 }
 
@@ -1645,22 +1645,27 @@ mod tests {
         );
     }
 
-    /// The attempt's terminal status, on the two paths out of a run the harness itself ends.
+    /// The attempt's ending, on the two paths out of a run the harness itself ends. The stream
+    /// writes no final status of its own: the task's one final frame is the reopen loop's.
     #[tokio::test]
-    async fn an_attempt_ends_with_one_terminal_status() {
+    async fn an_attempt_records_its_ending_and_writes_no_final_status() {
         let mut h = Harness::new(10).await;
         h.feed(vec![
             text("the answer"),
             Event::TurnEnd("the answer".into()),
         ])
         .await;
-        h.a2a.finish(&Ok(crate::agent::AgentLoopExit::Ok)).await;
-        assert_eq!(h.frame_kinds().last().unwrap(), "status:completed");
-        let completed = data_of(&h.frames(), "status").pop().unwrap();
-        assert_eq!(completed["status"]["response"], "the answer");
-        assert_eq!(completed["status"]["message"], "session ended");
-        assert_eq!(completed["final"], true);
-        assert_eq!(completed["context_id"], "ctx_test");
+        let ending = h.a2a.ending(&Ok(crate::agent::AgentLoopExit::Ok));
+        assert_eq!(ending.state, crate::a2a::TaskState::Completed);
+        assert_eq!(ending.response.as_deref(), Some("the answer"));
+        assert_eq!(ending.message, "session ended");
+        assert!(
+            data_of(&h.frames(), "status")
+                .iter()
+                .all(|status| status["final"] == Json::Bool(false)),
+            "{:#?}",
+            h.frames()
+        );
 
         let mut h = Harness::new(10).await;
         h.feed(vec![Event::TurnFailed(TurnFailure {
@@ -1668,20 +1673,21 @@ mod tests {
             message: "not signed in".into(),
         })])
         .await;
-        h.a2a
-            .finish(&Err(RuntimeError::HarnessTurnFailed {
-                kind: "auth".into(),
-                message: "not signed in".into(),
-                origin: "harness".into(),
-            }))
-            .await;
-        assert_eq!(h.frame_kinds(), vec!["status:failed"], "{:#?}", h.frames());
-        let failed = data_of(&h.frames(), "status").pop().unwrap();
-        let message = failed["status"]["message"].as_str().unwrap();
-        assert!(message.contains("E-RUN-033"), "{message}");
-        assert!(message.contains("auth"), "{message}");
-        assert!(message.contains("not signed in"), "{message}");
-        assert_eq!(failed["final"], true);
+        let ending = h.a2a.ending(&Err(RuntimeError::HarnessTurnFailed {
+            kind: "auth".into(),
+            message: "not signed in".into(),
+            origin: "harness".into(),
+        }));
+        assert!(h.frame_kinds().is_empty(), "{:#?}", h.frames());
+        assert_eq!(ending.state, crate::a2a::TaskState::Failed);
+        assert!(ending.response.is_none());
+        assert!(ending.message.contains("E-RUN-033"), "{}", ending.message);
+        assert!(ending.message.contains("auth"), "{}", ending.message);
+        assert!(
+            ending.message.contains("not signed in"),
+            "{}",
+            ending.message
+        );
     }
 
     /// Once the runtime has interrupted an attempt it ends `canceled`, whatever the harness says
@@ -1717,24 +1723,22 @@ mod tests {
                 if killed {
                     h.a2a.mark_harness_killed();
                 }
-                h.a2a
-                    .finish(&Ok(crate::agent::AgentLoopExit::Canceled))
-                    .await;
+                let ending = h.a2a.ending(&Ok(crate::agent::AgentLoopExit::Canceled));
 
-                let statuses = data_of(&h.frames(), "status");
-                let terminal: Vec<&Json> = statuses
-                    .iter()
-                    .filter(|status| status["final"] == Json::Bool(true))
-                    .collect();
-                assert_eq!(terminal.len(), 1, "{:#?}", h.frames());
-                assert_eq!(terminal[0]["status"]["state"], "canceled");
-                assert_eq!(terminal[0]["context_id"], "ctx_test");
-                assert!(terminal[0]["status"]["response"].is_null());
-                let message = terminal[0]["status"]["message"].as_str().unwrap();
+                assert!(
+                    data_of(&h.frames(), "status")
+                        .iter()
+                        .all(|status| status["final"] == Json::Bool(false)),
+                    "{:#?}",
+                    h.frames()
+                );
+                assert_eq!(ending.state, crate::a2a::TaskState::Canceled);
+                assert!(ending.response.is_none());
                 assert_eq!(
-                    message.contains("the harness was killed"),
+                    ending.message.contains("the harness was killed"),
                     killed,
-                    "{message}"
+                    "{}",
+                    ending.message
                 );
                 assert!(
                     !h.frame_kinds().contains(&"text:final".to_string()),
@@ -1765,7 +1769,12 @@ mod tests {
             Event::TurnEnd("done".into()),
         ])
         .await;
-        h.a2a.finish(&Ok(crate::agent::AgentLoopExit::Ok)).await;
+        let ending = h.a2a.ending(&Ok(crate::agent::AgentLoopExit::Ok));
+        assert_eq!(
+            ending.state,
+            crate::a2a::TaskState::Completed,
+            "a run with no task still records how it ended"
+        );
         assert!(h.frame_kinds().is_empty(), "{:#?}", h.frames());
     }
 

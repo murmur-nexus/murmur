@@ -20,8 +20,8 @@
 //!    delivers plus the plan's `env-set`, in the accessible workdir the capsule's tools see.
 //! 7. **Read** — complete stdout lines, batched into `parse`, fed to [`ProcessEventSink`], whose
 //!    A2A half writes the task's frames through [`A2aStream`].
-//! 8. **End** — the harness is dead whenever this returns, on every path, and the attempt's one
-//!    terminal `status` frame is written from [`run_process_inference_loop`] whatever ended it.
+//! 8. **End** — the harness is dead whenever this returns, on every path, and the attempt's
+//!    ending is recorded from [`run_process_inference_loop`] whatever ended it.
 //!
 //! A run is bounded by inactivity, not by a wall clock: an agent that is working — writing output
 //! or calling a tool through the bridge — is never interrupted for taking a long time.
@@ -51,7 +51,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    agent::{AgentLoopExit, CallGate, PLAN_TOOL_NOTICE, UNTRUSTED_CONTENT_NOTICE},
+    agent::{AgentLoopExit, AttemptEnding, CallGate, PLAN_TOOL_NOTICE, UNTRUSTED_CONTENT_NOTICE},
     bindings::host::murmur::tool::run::ToolInput,
     cancel::{CancelSignal, Residue, PHASE_HARNESS},
     errors::RuntimeError,
@@ -619,14 +619,15 @@ pub(crate) async fn run_process_inference_loop(
     reopen_feedback: Option<String>,
     // Where the session this run leaves behind is written, for the task's next attempt.
     carried_session: &mut Option<String>,
+    // Where this attempt's ending is recorded, for the reopen loop's final status.
+    ending: &mut Option<AttemptEnding>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let cancel = cancel.map(|signal| TaskCancel {
         signal,
         task_id: task_id.clone().unwrap_or_default(),
     });
-    // Every path below leaves through the one `finish` call at the end, which is what makes the
-    // attempt's terminal `status` frame arrive exactly once — including on the paths that return
-    // an error, where a client would otherwise wait on a frame no one was going to write.
+    // Every path below leaves through the one `ending` read at the end, so the attempt records
+    // how it ended on every path, the ones that return an error included.
     let mut a2a = A2aStream::new(
         sse,
         task_id,
@@ -649,7 +650,7 @@ pub(crate) async fn run_process_inference_loop(
         carried_session,
     )
     .await;
-    a2a.finish(&outcome).await;
+    *ending = Some(a2a.ending(&outcome));
     outcome
 }
 
@@ -1205,7 +1206,7 @@ async fn drive_harness(
             write_harness_exit(trace, &exit, "spend_ceiling", spawned_at).await;
             // The counterpart to `agent::finish_spend_refused_turn`, minus the three things this
             // transport writes elsewhere: the `spend_ceiling_reached` record is the sink's, and
-            // the terminal A2A status and the OTel session end both come from this attempt's
+            // the attempt's ending and the OTel session end both come from this attempt's
             // outcome, which is what keeps each to exactly one per attempt.
             super::record_result(hooks, sink.workdir(), &format!("stopped: {refusal}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
@@ -1303,9 +1304,9 @@ async fn stop_before_start(
 ///
 /// The counterpart to `agent::finish_canceled_turn`, minus the two things this transport does not
 /// have: there is no conversation record to append a cancelled turn to — the harness owns the
-/// conversation — and the terminal `canceled` status frame is `A2aStream::finish`'s, written from
-/// [`run_process_inference_loop`] with this outcome, which is what keeps it to exactly one per
-/// attempt. The OTel session end is written there too, from the same outcome.
+/// conversation — and the `canceled` ending is `A2aStream::ending`'s, recorded from
+/// [`run_process_inference_loop`] with this outcome. The OTel session end is written there too,
+/// from the same outcome.
 async fn finish_canceled_harness_turn(
     cancel: Option<&TaskCancel>,
     turn: u32,
