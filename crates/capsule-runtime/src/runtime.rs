@@ -1113,7 +1113,8 @@ pub fn stage_session(
                             &compiled_forms,
                             &artifact.name,
                             &resolved_version,
-                            &resolved,
+                            &resolved.bytes,
+                            &resolved.sha256,
                         )?;
                         tool_components.insert(artifact.name.clone(), tool_component);
                     }
@@ -1199,7 +1200,8 @@ pub fn stage_session(
                     &compiled_forms,
                     &artifact.name,
                     &resolved_version,
-                    &resolved,
+                    &resolved.bytes,
+                    &resolved.sha256,
                 )?;
                 // The grant comes from `artifact` — the operator's own manifest entry for
                 // this hook — and never from `manifest_yaml`, the hook's bundled manifest
@@ -4361,25 +4363,27 @@ fn inert_capability_sub_blocks(
     .collect()
 }
 
-/// The component for a WASM tool's or hook's verified payload `resolved`. Refuses and errors
-/// exactly as [`extract_root_wasm`] followed by [`CompiledForms::compile`] does.
+/// The component for a WASM artifact's verified `payload`, whose sha256 `payload_sha256` the
+/// caller has recomputed over those bytes. Refuses and errors exactly as
+/// [`extract_root_wasm`] followed by [`CompiledForms::compile`] does.
 ///
 /// A form stored under the payload's sha256 stands for that payload's successful extraction under
 /// the current decompression ceiling, so on a hit the root wasm is located but never inflated.
-fn stage_root_component(
+pub(crate) fn stage_root_component(
     engine: &Engine,
     compiled_forms: &CompiledForms,
     name: &str,
     version: &str,
-    resolved: &murmur_artifact::ResolvedArtifact,
+    payload: &[u8],
+    payload_sha256: &str,
 ) -> Result<Component, RuntimeError> {
-    check_root_wasm(name, version, &resolved.bytes)?;
-    if let Some(component) = compiled_forms.load(engine, &resolved.sha256) {
+    check_root_wasm(name, version, payload)?;
+    if let Some(component) = compiled_forms.load(engine, payload_sha256) {
         return Ok(component);
     }
-    let wasm = extract_root_wasm(name, version, &resolved.bytes)?;
+    let wasm = extract_root_wasm(name, version, payload)?;
     compiled_forms
-        .compile(engine, &resolved.sha256, &wasm)
+        .compile(engine, payload_sha256, &wasm)
         .map_err(|err| RuntimeError::ToolComponentCompile {
             name: name.to_string(),
             version: version.to_string(),
@@ -10225,7 +10229,14 @@ inference:
     }
 
     fn stage_error(engine: &Engine, forms: &CompiledForms, resolved: &ResolvedArtifact) -> String {
-        match stage_root_component(engine, forms, "demo-tool", "0.1.0", resolved) {
+        match stage_root_component(
+            engine,
+            forms,
+            "demo-tool",
+            "0.1.0",
+            &resolved.bytes,
+            &resolved.sha256,
+        ) {
             Ok(_) => panic!("stage_root_component staged the payload"),
             Err(err) => err.to_string(),
         }
@@ -10264,7 +10275,15 @@ inference:
         forms
             .compile(&engine, &resolved.sha256, EMPTY_COMPONENT)
             .unwrap();
-        assert!(stage_root_component(&engine, &forms, "demo-tool", "0.1.0", &resolved).is_ok());
+        assert!(stage_root_component(
+            &engine,
+            &forms,
+            "demo-tool",
+            "0.1.0",
+            &resolved.bytes,
+            &resolved.sha256,
+        )
+        .is_ok());
     }
 
     #[test]

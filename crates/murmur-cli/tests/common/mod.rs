@@ -75,10 +75,35 @@ pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
 /// Install an artifact into the project store of `project_dir` via `mur install <path>`.
 /// The project directory must already contain murmur.yaml so that
 /// `find_project_root()` can locate it.
+///
+/// Sets no `HOME`, so it passes `--no-precompile`: a compiled form would otherwise be written into
+/// the operator's own `~/.murmur`.
 pub fn install_artifact_to_project(project_dir: &Path, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.current_dir(project_dir)
+        .args([
+            "install",
+            "--no-precompile",
+            artifact_path.to_str().unwrap(),
+        ])
+        .assert()
+}
+
+/// [`install_artifact_to_project`] under the scratch `home`, with `extra_args` after the path, so
+/// install precompiles into `home` unless `extra_args` says otherwise.
+#[allow(dead_code)]
+pub fn install_artifact_to_project_with_home(
+    project_dir: &Path,
+    home: &TempDir,
+    artifact_path: &Path,
+    extra_args: &[&str],
+) -> Assert {
+    let mut cmd = Command::cargo_bin("mur").unwrap();
+    cmd.env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .current_dir(project_dir)
         .args(["install", artifact_path.to_str().unwrap()])
+        .args(extra_args)
         .assert()
 }
 

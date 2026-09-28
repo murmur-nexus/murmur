@@ -80,8 +80,9 @@ const TEMP_RETENTION: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone)]
 pub(crate) struct CompiledForms {
     /// The directory the staged capsule's writable root is created in. A murmur home or
-    /// compiled-forms directory at or beneath it is neither read nor written.
-    capsule_writable: PathBuf,
+    /// compiled-forms directory at or beneath it is neither read nor written. `None` for a writer
+    /// that stages no capsule.
+    capsule_writable: Option<PathBuf>,
     engine_key: u64,
 }
 
@@ -94,16 +95,30 @@ impl CompiledForms {
         )
     }
 
+    /// Forms for a writer that stages no capsule, such as `mur install` into the global store,
+    /// keyed exactly as [`Self::new`] keys them for `engine`.
+    ///
+    /// Skipping the capsule reachability check here is no weaker than launch: a form is only ever
+    /// loaded by a [`CompiledForms`] built for the capsule being staged, and that reader's own
+    /// [`Self::dir`] refuses a murmur home or compiled-forms directory its capsule can reach
+    /// before it opens a single form.
+    pub(crate) fn without_capsule(engine: &Engine) -> Self {
+        Self {
+            capsule_writable: None,
+            engine_key: engine_key(
+                engine,
+                murmur_artifact::zip_guard::max_artifact_decompressed_bytes(),
+            ),
+        }
+    }
+
     /// Forms for an engine staging under the artifact decompression ceiling `ceiling`. Each
     /// ceiling keys its own forms, so a lowered ceiling never finds a form whose payload only
     /// extracts under a higher one.
     fn with_ceiling(engine: &Engine, capsule_writable: &Path, ceiling: u64) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        engine.precompile_compatibility_hash().hash(&mut hasher);
-        ceiling.hash(&mut hasher);
         Self {
-            capsule_writable: capsule_writable.to_path_buf(),
-            engine_key: hasher.finish(),
+            capsule_writable: Some(capsule_writable.to_path_buf()),
+            engine_key: engine_key(engine, ceiling),
         }
     }
 
@@ -164,7 +179,7 @@ impl CompiledForms {
         } else {
             crate::state_store::murmur_home_dir().ok()?
         };
-        if reachable_from(&home, &self.capsule_writable) {
+        if self.reachable_from_capsule(&home) {
             return None;
         }
         let dir = home.join(COMPILED_DIR);
@@ -179,7 +194,7 @@ impl CompiledForms {
             }
             crate::murmur_home::hold_private_dir(&dir).ok()?;
         }
-        if !held_private(&dir) || reachable_from(&dir, &self.capsule_writable) {
+        if !held_private(&dir) || self.reachable_from_capsule(&dir) {
             return None;
         }
         if widened {
@@ -189,6 +204,23 @@ impl CompiledForms {
         }
         Some(dir)
     }
+
+    /// Whether `dir` is reachable from the staged capsule's writable root; never, when no capsule
+    /// is staged.
+    fn reachable_from_capsule(&self, dir: &Path) -> bool {
+        self.capsule_writable
+            .as_deref()
+            .is_some_and(|root| reachable_from(dir, root))
+    }
+}
+
+/// The part of every form's name that `engine`'s precompile compatibility hash and the
+/// decompression ceiling `ceiling` determine.
+fn engine_key(engine: &Engine, ceiling: u64) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    ceiling.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Whether `key_sha256` is 64 lowercase hex characters, the only shape a form is stored under.

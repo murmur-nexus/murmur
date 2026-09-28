@@ -1,6 +1,7 @@
 //! `mur run` keeps the compiled form of every staged WASM component in `~/.murmur/compiled` and
 //! loads it on the next launch, and a form it cannot trust is compiled again and rewritten without
-//! changing the launch.
+//! changing the launch. `mur install` writes the same forms for the artifacts it installs, so the
+//! first launch loads them.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -761,6 +762,342 @@ fn a_digest_only_sidecar_is_stamped_on_the_next_run() {
         assert_matches_sidecar(form);
         assert_eq!(sidecar_line(form, 1), stamp(form));
     }
+}
+
+/// A [`Project`] whose `echo-tool` is installed from a local `.mur.zip` under the project's own
+/// scratch `HOME`, so install precompiles unless told not to.
+struct Installed {
+    project: Project,
+    /// The `.mur.zip` installed, kept so a repeat install reads the same path.
+    artifact: PathBuf,
+    /// Stdout and stderr of the first install.
+    first_output: (String, String),
+    _fixture: TempDir,
+}
+
+impl Installed {
+    /// Installs `echo-tool` with `extra_args` after the path, and requires a clean exit.
+    fn new(extra_args: &[&str]) -> Self {
+        let fixture = tempfile::tempdir().unwrap();
+        let artifact = create_tool_artifact(
+            fixture.path(),
+            TOOL_NAME,
+            TOOL_VERSION,
+            &fixture_component("echo-tool.wasm"),
+        );
+        Self::from_artifact(fixture, artifact, extra_args)
+    }
+
+    /// Installs `artifact` as `echo-tool` into a fresh project and `HOME`.
+    fn from_artifact(fixture: TempDir, artifact: PathBuf, extra_args: &[&str]) -> Self {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = create_project(
+            project.path(),
+            "capsule-allowlisted.wasm",
+            &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+        );
+        let mut installed = Self {
+            project: Project {
+                home: tempfile::tempdir().unwrap(),
+                project,
+                manifest,
+            },
+            artifact,
+            first_output: Default::default(),
+            _fixture: fixture,
+        };
+        installed.first_output = installed.install(extra_args);
+        installed
+    }
+
+    /// Runs `mur install <artifact>` again with `extra_args`, requires a clean exit, and returns
+    /// stdout and stderr.
+    fn install(&self, extra_args: &[&str]) -> (String, String) {
+        output(
+            common::install_artifact_to_project_with_home(
+                self.project.project.path(),
+                &self.project.home,
+                &self.artifact,
+                extra_args,
+            )
+            .success(),
+        )
+    }
+
+    /// The payload sha256 of the installed `.mur.zip`, which names its form before any run has
+    /// pinned it in `murmur.lock`.
+    fn payload_sha256(&self) -> String {
+        sha256_hex(&fs::read(&self.artifact).unwrap())
+    }
+
+    /// The form install wrote for `echo-tool`.
+    fn tool_form(&self) -> PathBuf {
+        form_named(&self.project.compiled(), &self.payload_sha256())
+    }
+}
+
+/// Stdout and stderr of a finished command.
+fn output(assert: assert_cmd::assert::Assert) -> (String, String) {
+    let output = assert.get_output();
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// What `mur install --no-precompile <artifact>` prints into a fresh project and `HOME`.
+fn no_precompile_output(artifact: &Path) -> (String, String) {
+    fresh_install_output(artifact, &["--no-precompile"])
+}
+
+/// What `mur install <artifact>` with `extra_args` prints into a fresh project and `HOME`.
+fn fresh_install_output(artifact: &Path, extra_args: &[&str]) -> (String, String) {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(
+        project.path(),
+        "capsule-allowlisted.wasm",
+        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+    );
+    output(
+        common::install_artifact_to_project_with_home(project.path(), &home, artifact, extra_args)
+            .success(),
+    )
+}
+
+/// The inode and mtime of `path`.
+fn identity(path: &Path) -> (u64, SystemTime) {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    (metadata.ino(), metadata.modified().unwrap())
+}
+
+#[test]
+fn install_precompiles_so_the_first_run_compiles_no_installed_artifact() {
+    let installed = Installed::new(&[]);
+    assert_eq!(
+        installed.first_output,
+        no_precompile_output(&installed.artifact),
+        "install printed something --no-precompile does not"
+    );
+
+    let compiled = installed.project.compiled();
+    assert_eq!(mode(&compiled), 0o700);
+    let tool_form = installed.tool_form();
+    assert_eq!(forms(&compiled), vec![tool_form.clone()]);
+    assert_eq!(mode(&tool_form), 0o600);
+    assert_eq!(mode(&sidecar(&tool_form)), 0o600);
+    assert_eq!(
+        sidecar_line(&tool_form, 0),
+        sha256_hex(&fs::read(&tool_form).unwrap())
+    );
+    let before = (identity(&tool_form), identity(&sidecar(&tool_form)));
+
+    let (result, _) = installed.project.run();
+    assert!(!result.is_empty());
+    assert_eq!(
+        (identity(&tool_form), identity(&sidecar(&tool_form))),
+        before,
+        "the first run rewrote the form install wrote"
+    );
+    let mut expected = vec![tool_form, installed.project.capsule_form()];
+    expected.sort();
+    assert_eq!(forms(&compiled), expected);
+    assert_eq!(installed.project.tool_sha256(), installed.payload_sha256());
+}
+
+#[test]
+fn no_precompile_writes_no_form_and_the_first_run_compiles() {
+    let installed = Installed::new(&["--no-precompile"]);
+    let compiled = installed.project.compiled();
+    assert!(!compiled.exists(), "{} was created", compiled.display());
+
+    let (stdout, stderr) = installed.first_output.clone();
+    assert_eq!(
+        stdout,
+        format!(
+            "Installed {TOOL_NAME}@{TOOL_VERSION} from {}\n",
+            installed.artifact.display()
+        )
+    );
+    assert_eq!(
+        fresh_install_output(&installed.artifact, &[]),
+        (stdout, stderr)
+    );
+    assert!(!compiled.exists(), "{} was created", compiled.display());
+
+    installed.project.run();
+    assert_matches_sidecar(&installed.tool_form());
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", installed.project.home.path())
+        .args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-precompile"));
+}
+
+#[test]
+fn a_repeat_install_with_every_form_present_compiles_nothing() {
+    let installed = Installed::new(&[]);
+    let compiled = installed.project.compiled();
+    let before = snapshot(&compiled);
+
+    assert_eq!(installed.install(&[]), installed.first_output);
+    assert_eq!(snapshot(&compiled), before);
+}
+
+#[test]
+fn a_manifest_install_fills_in_missing_forms_for_cached_artifacts() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let artifact = create_tool_artifact(
+        fixture.path(),
+        TOOL_NAME,
+        TOOL_VERSION,
+        &fixture_component("echo-tool.wasm"),
+    );
+    let sha256 = sha256_hex(&fs::read(&artifact).unwrap());
+    common::publish_local(&home, &artifact).success();
+    create_project(
+        project.path(),
+        "capsule-allowlisted.wasm",
+        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+    );
+    let install = |extra_args: &[&str]| {
+        output(
+            Command::cargo_bin("mur")
+                .unwrap()
+                .env("HOME", home.path())
+                .env_remove("NEXUS_API_KEY")
+                .current_dir(project.path())
+                .arg("install")
+                .args(extra_args)
+                .assert()
+                .success(),
+        )
+    };
+    let compiled = home.path().join(".murmur").join("compiled");
+
+    install(&["--no-precompile"]);
+    let lock = read_lockfile(&project.path().join("murmur.lock")).unwrap();
+    assert_eq!(
+        lock.artifact_for(TOOL_NAME).unwrap().sha256.any.as_deref(),
+        Some(sha256.as_str())
+    );
+    assert!(project
+        .path()
+        .join(format!(
+            ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
+        ))
+        .is_file());
+    assert!(!compiled.exists(), "{} was created", compiled.display());
+
+    let warmed = install(&[]);
+    let form = form_named(&compiled, &sha256);
+    assert_matches_sidecar(&form);
+    assert_eq!(install(&["--no-precompile"]), warmed);
+
+    // A form under another engine key is not this build's: it stays, and the current one is
+    // written beside it.
+    let stale = compiled.join(format!("{sha256}-0000000000000000.cwasm"));
+    fs::rename(&form, &stale).unwrap();
+    fs::rename(sidecar(&form), sidecar(&stale)).unwrap();
+    assert_eq!(install(&[]), warmed);
+    assert_matches_sidecar(&form);
+    assert!(stale.is_file());
+}
+
+#[test]
+fn a_failed_precompile_never_fails_the_install() {
+    // An unusable compiled-forms path.
+    let blocked = Installed::new(&["--no-precompile"]);
+    let murmur_home = blocked.project.home.path().join(".murmur");
+    let compiled = blocked.project.compiled();
+    fs::create_dir_all(&murmur_home).unwrap();
+    set_mode(&murmur_home, 0o700);
+    fs::write(&compiled, b"not a directory").unwrap();
+    assert_eq!(
+        blocked.install(&[]),
+        no_precompile_output(&blocked.artifact)
+    );
+    assert_eq!(fs::read(&compiled).unwrap(), b"not a directory");
+    blocked.project.run();
+    assert_eq!(fs::read(&compiled).unwrap(), b"not a directory");
+
+    // A root wasm that does not compile.
+    let fixture = tempfile::tempdir().unwrap();
+    let artifact = fixture
+        .path()
+        .join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
+    let mut zip = ZipWriter::new(fs::File::create(&artifact).unwrap());
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("murmur.yaml", options).unwrap();
+    write!(
+        zip,
+        "name: {TOOL_NAME}\nversion: {TOOL_VERSION}\nruntime: tool\n"
+    )
+    .unwrap();
+    zip.start_file("tool.wasm", options).unwrap();
+    zip.write_all(b"not wasm").unwrap();
+    zip.finish().unwrap();
+    let expected = no_precompile_output(&artifact);
+
+    let broken = Installed::from_artifact(fixture, artifact, &[]);
+    assert_eq!(broken.first_output, expected);
+    let compiled = broken.project.compiled();
+    assert!(
+        !compiled.exists() || forms(&compiled).is_empty(),
+        "a form was stored for a root wasm that does not compile"
+    );
+}
+
+#[test]
+fn install_written_forms_are_checked_like_launch_written_ones() {
+    // A byte flipped in place, with its times restored, is rebuilt by the first run.
+    let flipped = Installed::new(&[]);
+    let form = flipped.tool_form();
+    let written = inode(&form);
+    flip_middle_byte_keeping_times(&form);
+    flipped.project.run();
+    assert_ne!(inode(&form), written, "the flipped form was not rebuilt");
+    assert_matches_sidecar(&form);
+
+    // A form readable beyond its owner is rewritten owner-only.
+    let widened = Installed::new(&[]);
+    let form = widened.tool_form();
+    set_mode(&form, 0o644);
+    widened.project.run();
+    assert_eq!(mode(&form), 0o600);
+    assert_matches_sidecar(&form);
+
+    // Install stamped the form as launch does: with the digest line broken and the stamp line
+    // kept, the unchanged stamp is trusted and the form is not rebuilt.
+    let stamped = Installed::new(&[]);
+    let form = stamped.tool_form();
+    assert_eq!(sidecar_line(&form, 1), stamp(&form));
+    let written = inode(&form);
+    break_recorded_sha256(&form);
+    stamped.project.run();
+    assert_eq!(inode(&form), written, "the stamped form was rebuilt");
+}
+
+#[test]
+fn a_tampered_payload_fails_even_with_an_install_written_form() {
+    let installed = Installed::new(&[]);
+    let form = installed.tool_form();
+    installed.project.run();
+    let installed_zip = installed.project.project.path().join(format!(
+        ".murmur/artifacts/{TOOL_NAME}/{TOOL_VERSION}/{TOOL_NAME}-{TOOL_VERSION}.mur.zip"
+    ));
+    fs::write(installed_zip, b"tampered").unwrap();
+
+    common::run_capsule(&installed.project.home, &installed.project.manifest)
+        .failure()
+        .stderr(predicate::str::contains("E-REG-002"));
+    assert!(form.is_file());
 }
 
 fn fixture_component(name: &str) -> PathBuf {

@@ -448,8 +448,12 @@ mod tests {
 
         let local_dir = tempdir().unwrap();
         let local_store = murmur_artifact::LocalRegistry::new(local_dir.path());
-        crate::commands::install::install_from_local_file(file.to_str().unwrap(), &local_store)
-            .unwrap();
+        crate::commands::install::install_from_local_file(
+            file.to_str().unwrap(),
+            &local_store,
+            None,
+        )
+        .unwrap();
 
         let from_remote = recorded_meta(&remote_store.metadata_path_for("my-tool", "1.0.0", None));
         let from_local =

@@ -400,6 +400,7 @@ mur install --all-platforms <name@version>
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
 | `mur install --all-platforms <name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
 | `mur install --registry <url\|local> <ref>` | Resolves `name@version` against that registry for this invocation — a URL forces remote mode, `local` forces the local store. See [Registry selection rules](config.md#registry-selection-rules) |
+| `mur install --no-precompile` | Installs without compiling. Without the flag, `mur install` compiles each WASM tool, driver and hook it installs into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), for this machine and this `mur` build, so the first `mur run` loads it instead of compiling it. With no arguments that includes each manifest artifact already in the store, and one whose compiled form is already there is not compiled again. A compile that fails does not fail the install or change its output; that artifact compiles on its first launch |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not found in the local registry it falls back to the configured source chain automatically.
 
