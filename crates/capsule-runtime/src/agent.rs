@@ -3575,6 +3575,36 @@ pub(crate) fn append_bootstrap_log(workdir: &Path, message: &str) {
 static CL100K: LazyLock<Option<tiktoken_rs::CoreBPE>> =
     LazyLock::new(|| tiktoken_rs::cl100k_base().ok());
 
+static TOKEN_TABLE_BUILD: std::sync::Once = std::sync::Once::new();
+
+#[cfg(test)]
+static TOKEN_TABLE_BUILD_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Builds the `cl100k_base` tables behind [`count_tokens`] on a `cl100k-build` thread of their
+/// own, at most once per process. An agent session counts tokens before its first inference
+/// request and the build costs tens of milliseconds; started at staging, it overlaps artifact
+/// loading instead of delaying that request. A [`count_tokens`] call that arrives mid-build
+/// blocks on the `LazyLock` until the build completes, and a failed spawn leaves the build to
+/// the first [`count_tokens`] call. The tables are process-wide and carry no session's data, so
+/// a process that stages many sessions builds them once.
+pub(crate) fn build_token_tables_in_background() {
+    TOKEN_TABLE_BUILD.call_once(|| {
+        #[cfg(test)]
+        TOKEN_TABLE_BUILD_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::thread::Builder::new()
+            .name("cl100k-build".to_string())
+            .spawn(|| {
+                LazyLock::force(&CL100K);
+            });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn token_tables_built() -> bool {
+    matches!(LazyLock::get(&CL100K), Some(Some(_)))
+}
+
 pub(crate) fn count_tokens(text: &str) -> u32 {
     CL100K
         .as_ref()
@@ -3694,6 +3724,26 @@ mod tests {
             used: 10,
             requested: 9_000,
         }
+    }
+
+    #[test]
+    fn token_table_build_is_started_at_most_once_per_process() {
+        use std::sync::atomic::Ordering;
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..16 {
+                        build_token_tables_in_background();
+                    }
+                });
+            }
+        });
+        for _ in 0..16 {
+            build_token_tables_in_background();
+        }
+
+        assert_eq!(TOKEN_TABLE_BUILD_SPAWNS.load(Ordering::SeqCst), 1);
     }
 
     #[test]

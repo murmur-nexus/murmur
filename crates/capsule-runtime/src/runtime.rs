@@ -940,6 +940,12 @@ pub fn stage_session(
         request.declared_containment_floor,
     );
 
+    // Past every pre-staging refusal, so a refused launch builds nothing, and past the host
+    // probes' forks: a thread growing the heap across `fork()` makes each fork copy more page
+    // tables and each later write take a copy-on-write fault.
+    if request.inference.is_some() {
+        agent::build_token_tables_in_background();
+    }
     let engine = build_engine()?;
     let compiled_forms = CompiledForms::new(
         &engine,
@@ -10033,30 +10039,30 @@ inference:
         }
     }
 
-    #[test]
-    fn stage_session_installs_local_source_skill_without_registry() {
+    /// Panics on every call: a local-source skill is staged without consulting the registry.
+    struct LocalSourceOnlyRegistry;
+    impl Registry for LocalSourceOnlyRegistry {
+        fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
+            panic!("registry must not be called for a local-source skill");
+        }
+        fn publish(
+            &self,
+            _: ArtifactMeta,
+            _: &[u8],
+        ) -> Result<murmur_artifact::PublishResult, RegistryError> {
+            unreachable!()
+        }
+        fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
+            unreachable!()
+        }
+    }
+
+    /// An agent session (`inference` declared) whose one artifact is the local-source skill
+    /// `skills/my-skill`, which this writes under `project`.
+    fn local_source_skill_agent_request(project: &Path) -> StageRequest {
         use murmur_artifact::{InferenceConfig, InferenceDriver};
 
-        // Registry must never be consulted for a local-source skill.
-        struct PanicRegistry;
-        impl Registry for PanicRegistry {
-            fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
-                panic!("registry must not be called for a local-source skill");
-            }
-            fn publish(
-                &self,
-                _: ArtifactMeta,
-                _: &[u8],
-            ) -> Result<murmur_artifact::PublishResult, RegistryError> {
-                unreachable!()
-            }
-            fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
-                unreachable!()
-            }
-        }
-
-        let project = tempfile::tempdir().unwrap();
-        let skill_dir = project.path().join("skills").join("my-skill");
+        let skill_dir = project.join("skills").join("my-skill");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("skill.md"), b"# my local skill").unwrap();
 
@@ -10077,9 +10083,9 @@ inference:
             max_session_tokens: None,
         };
 
-        let request = StageRequest {
+        StageRequest {
             credentials_file: None,
-            manifest_dir: project.path().to_path_buf(),
+            manifest_dir: project.to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: "0.0.1".to_string(),
             capsule_component_bytes: Vec::new(),
@@ -10116,9 +10122,15 @@ inference:
             exports: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
-        };
+        }
+    }
 
-        let staged = stage_session(Arc::new(PanicRegistry), request).unwrap();
+    #[test]
+    fn stage_session_installs_local_source_skill_without_registry() {
+        let project = tempfile::tempdir().unwrap();
+        let request = local_source_skill_agent_request(project.path());
+
+        let staged = stage_session(Arc::new(LocalSourceOnlyRegistry), request).unwrap();
         let installed = staged
             .workdir
             .join("tools")
@@ -10144,6 +10156,25 @@ inference:
             murmur_md.contains("call by name to load guidance"),
             "MURMUR.md missing callable skill hint:\n{murmur_md}"
         );
+    }
+
+    #[test]
+    fn staging_an_agent_session_builds_the_token_tables() {
+        let project = tempfile::tempdir().unwrap();
+        let request = local_source_skill_agent_request(project.path());
+
+        assert!(stage_session(Arc::new(LocalSourceOnlyRegistry), request).is_ok());
+
+        // Nothing here calls `count_tokens`, so run alone the tables fill only if staging started
+        // their build.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !agent::token_tables_built() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cl100k tables were not built within 30 s of staging an agent session"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // ── stage_root_component ───────────────────────────────────────────────────
