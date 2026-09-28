@@ -199,7 +199,8 @@ chmod 600 ~/.murmur/config.yaml
 artifact again and replaces the file:
 
 - `compiled/` is a real directory, not a symlink, and it and the file are yours and owner-only.
-- The file matches the checksum stored beside it.
+- The file matches the checksum stored beside it. `mur` checks this when it writes the file, and
+  again whenever the file has been changed, replaced or had its permissions changed since.
 - `~/.murmur` is outside the capsule's workdir. When it is inside, `mur run` neither reads nor
   writes `compiled/`, and every launch and pull compiles.
 

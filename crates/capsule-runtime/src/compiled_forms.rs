@@ -5,10 +5,19 @@
 //! in the owner-only directory `~/.murmur/compiled` reached without a symlink, and never from a
 //! directory the capsule being staged can write. A form is keyed on the sha256 of the bytes that
 //! determine its compile input, the engine's precompile compatibility hash and the artifact
-//! decompression ceiling ([`max_artifact_decompressed_bytes`]). Its own sha256 sits beside it and
-//! is checked before wasmtime sees the bytes. A missing, stale, unreadable or mismatched form is
-//! compiled again through `Component::new` and rewritten, so the cache never fails a launch and
-//! never changes a compile error.
+//! decompression ceiling ([`max_artifact_decompressed_bytes`]). Its own sha256 sits beside it, and
+//! its bytes are hashed against that sha256 when the form is written and again whenever the file's
+//! [`FileStamp`] has moved since they last matched; [`read_verified`] states the rule. A missing,
+//! stale, unreadable or mismatched form is compiled again through `Component::new` and rewritten,
+//! so the cache never fails a launch and never changes a compile error.
+//!
+//! The sidecar and the stamp it records sit in the same directory as the form, so they detect
+//! damage, not a rewrite by code running as this uid, which can rewrite all three together. A
+//! `sealed` or `scoped` capsule cannot write under the murmur home, and an `advisory` capsule
+//! already runs with the operator's trust. An unchanged stamp does not catch corruption below the
+//! filesystem that leaves the inode's metadata alone, such as bit rot on a filesystem without data
+//! checksums like ext4, until the stamp next moves. mur's own writes always rename a new inode into
+//! place, so the tick-resolution ctime caveat on [`FileStamp`] applies only to another writer.
 //!
 //! An artifact's key must be a sha256 that `verify_sha256` has just recomputed over the payload
 //! bytes in hand, so a form named `H` is always the `extract_root_wasm` component of the payload
@@ -25,12 +34,13 @@
 //!
 //! Only a store prunes. The store branch of [`CompiledForms::compile`] is the one caller of
 //! [`prune_stale`], so after a store the directory holds only forms read or written in the
-//! [`FORM_RETENTION`] before it, and a launch whose every form loads writes, renames and deletes
-//! nothing here. A change of engine key, from a new wasmtime or a changed decompression ceiling,
-//! finds none of its forms, so its first launch stores and always prunes; the previous key's forms
-//! are removed by the first store after they have gone unused for [`FORM_RETENTION`]. Pruning goes
-//! by age alone, never by key, so two builds or ceilings used alternately never delete each
-//! other's forms and each keeps loading its own.
+//! [`FORM_RETENTION`] before it, and a launch whose every form loads with an unchanged stamp
+//! writes, renames and deletes nothing here; a form that loads after being hashed has only its
+//! sidecar rewritten. A change of engine key, from a new wasmtime or a changed decompression
+//! ceiling, finds none of its forms, so its first launch stores and always prunes; the previous
+//! key's forms are removed by the first store after they have gone unused for [`FORM_RETENTION`].
+//! Pruning goes by age alone, never by key, so two builds or ceilings used alternately never
+//! delete each other's forms and each keeps loading its own.
 //!
 //! A form keyed on an artifact payload's sha256 must be compiled only from the root wasm
 //! [`extract_root_wasm`] returned for that payload in the same process, so under the same ceiling.
@@ -53,6 +63,8 @@ use std::time::{Duration, SystemTime};
 
 use wasmtime::component::Component;
 use wasmtime::Engine;
+
+use crate::murmur_home::FileStamp;
 
 /// The directory under the murmur home that holds compiled forms.
 const COMPILED_DIR: &str = "compiled";
@@ -126,13 +138,7 @@ impl CompiledForms {
         }
         let component = Component::new(engine, wasm)?;
         if let (Some(dir), Ok(bytes)) = (self.dir(true), component.serialize()) {
-            let path = dir.join(self.file_name(key_sha256));
-            let _ = crate::murmur_home::write_private_file(&path, &bytes).and_then(|()| {
-                crate::murmur_home::write_private_file(
-                    &sidecar(&path),
-                    murmur_artifact::sha256_hex(&bytes).as_bytes(),
-                )
-            });
+            store(&dir, &self.file_name(key_sha256), &bytes);
             prune_stale(&dir, SystemTime::now());
         }
         Ok(component)
@@ -251,33 +257,90 @@ fn open_private(path: &Path) -> Option<(std::fs::File, Metadata)> {
     .then_some((file, metadata))
 }
 
-/// The form at `path`, when it and its sidecar are owner-only regular files of this uid and the
-/// form's bytes match the sidecar.
+/// Writes the form `bytes` as `file_name` in `dir` and a sidecar holding their sha256, then reads
+/// the form back through [`read_verified`], which hashes it once more and records its
+/// [`FileStamp`].
+/// `dir` is one [`CompiledForms::dir`] returned. Every error is ignored: a form or sidecar that
+/// was not written is compiled again on the next launch, and a stamp that was not recorded means
+/// only that the next launch hashes the form.
+fn store(dir: &Path, file_name: &str, bytes: &[u8]) {
+    let path = dir.join(file_name);
+    let written = crate::murmur_home::write_private_file(&path, bytes).and_then(|()| {
+        crate::murmur_home::write_private_file(
+            &sidecar(&path),
+            murmur_artifact::sha256_hex(bytes).as_bytes(),
+        )
+    });
+    if written.is_ok() {
+        let _ = read_verified(&path);
+    }
+}
+
+/// The bytes of the form at `path`, when it and its sidecar are owner-only regular files of this
+/// uid and the bytes are the ones whose sha256 was recorded when the form was written.
+///
+/// Sidecar line 1 is that write-time sha256. Line 2, when present, is the form's [`FileStamp`] at
+/// the last read whose bytes hashed to it. A form whose stamp is the same before and after this
+/// read, and equal to line 2, is taken without hashing. Any other form is hashed in full: a
+/// mismatch is `None`, and a match whose stamp held still during the read has the sidecar
+/// rewritten as `<sha256>\n<stamp>\n`. Lines after the second are ignored. This is the only write
+/// here, and it goes into the directory `path` is in, through `write_private_file`; a failed write
+/// is ignored and leaves the next read to hash again.
 ///
 /// Each file's own owner and mode are checked on its open handle, not only the directory's: a
 /// directory that was ever wider than owner-only can hold an entry another uid created, and
 /// narrowing the directory afterwards does not change that entry's owner.
-fn load(engine: &Engine, path: &Path) -> Option<Component> {
+fn read_verified(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let (mut file, metadata) = open_private(path)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    let (mut file, before) = open_private(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).ok()?);
     file.read_to_end(&mut bytes).ok()?;
     let mut recorded = String::new();
     open_private(&sidecar(path))?
         .0
         .read_to_string(&mut recorded)
         .ok()?;
-    if recorded.trim() != murmur_artifact::sha256_hex(&bytes) {
+    let mut lines = recorded.lines();
+    let sha256 = lines.next()?.trim();
+    // A write that lands while the bytes are read moves the stamp between the two fstat calls.
+    let unchanged = Some(FileStamp::of(&before))
+        .filter(|before| {
+            file.metadata()
+                .is_ok_and(|after| FileStamp::of(&after) == *before)
+        })
+        .map(|stamp| stamp.to_string());
+    if unchanged.is_some() && lines.next() == unchanged.as_deref() {
+        return Some(bytes);
+    }
+    if murmur_artifact::sha256_hex(&bytes) != sha256 {
         return None;
     }
+    if let Some(unchanged) = unchanged {
+        // Pairs a sha256 only with the stamp of an inode whose bytes, read while that stamp held
+        // still, hashed to it. A concurrent `store` that renames a new form into place moves the
+        // form's stamp away from this one, so this write landing over its sidecar costs at most
+        // one more hash or one recompile, never unhashed bytes.
+        let _ = crate::murmur_home::write_private_file(
+            &sidecar(path),
+            format!("{sha256}\n{unchanged}\n").as_bytes(),
+        );
+    }
+    Some(bytes)
+}
+
+/// The form at `path`, read through [`read_verified`].
+fn load(engine: &Engine, path: &Path) -> Option<Component> {
+    let bytes = read_verified(path)?;
     // SAFETY: `bytes` is an image `Component::serialize` produced for an engine whose
     // precompile compatibility hash keys the file name, and `deserialize` itself refuses an
     // image built by another wasmtime version or an incompatible engine configuration. It was read
     // from an owner-only regular file of this uid, in the owner-only `compiled` directory of this
-    // uid that `CompiledForms::dir` only returns when the staged capsule cannot reach it. Its
-    // sha256 matched the one recorded beside it when it was written, and `deserialize` copies
-    // `bytes`, so a later change to the file cannot reach the loaded code.
+    // uid that `CompiledForms::dir` only returns when the staged capsule cannot reach it. The
+    // bytes hashed to the sha256 recorded beside the file when it was written, either in this read
+    // or in an earlier one since which the file's stamp (device, inode, size, owner, mode, mtime
+    // and ctime) has not moved. `deserialize` copies `bytes`, so a later change to the file cannot
+    // reach the loaded code.
     #[allow(unsafe_code)]
     let component = unsafe { Component::deserialize(engine, &bytes) };
     component.ok()
@@ -475,6 +538,159 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         std::fs::copy(sidecar(&path), sidecar(&link)).unwrap();
         assert!(load(&engine, &link).is_none());
+    }
+
+    /// Replaces the sha256 in `path`'s sidecar with one no bytes hash to and keeps the stamp line,
+    /// so only an unchanged stamp can still admit the form.
+    fn break_recorded_sha256(path: &Path) {
+        let recorded = std::fs::read_to_string(sidecar(path)).unwrap();
+        let stamp = recorded.lines().nth(1).unwrap_or_default();
+        assert!(!stamp.is_empty(), "no stamp recorded: {recorded:?}");
+        std::fs::write(sidecar(path), format!("{}\n{stamp}\n", "0".repeat(64))).unwrap();
+    }
+
+    /// Line 2 of `path`'s sidecar.
+    fn recorded_stamp(path: &Path) -> String {
+        let recorded = std::fs::read_to_string(sidecar(path)).unwrap();
+        recorded.lines().nth(1).unwrap_or_default().to_owned()
+    }
+
+    fn current_stamp(path: &Path) -> String {
+        FileStamp::of(&std::fs::metadata(path).unwrap()).to_string()
+    }
+
+    #[test]
+    fn store_records_the_stamp_of_the_bytes_it_wrote() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), Permissions::from_mode(0o700)).unwrap();
+        let bytes = serialized_empty_component(&engine);
+        store(temp.path(), "form.cwasm", &bytes);
+
+        let path = temp.path().join("form.cwasm");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read_to_string(sidecar(&path)).unwrap(),
+            format!(
+                "{}\n{}\n",
+                murmur_artifact::sha256_hex(&bytes),
+                current_stamp(&path)
+            ),
+        );
+    }
+
+    #[test]
+    fn a_file_whose_stamp_is_unchanged_is_taken_without_hashing() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_form(temp.path(), &serialized_empty_component(&engine));
+        assert!(read_verified(&path).is_some());
+        break_recorded_sha256(&path);
+        assert!(load(&engine, &path).is_some());
+    }
+
+    #[test]
+    fn a_file_rewritten_since_its_stamp_is_hashed_again() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = serialized_empty_component(&engine);
+        let path = write_form(temp.path(), &bytes);
+        assert!(read_verified(&path).is_some());
+        break_recorded_sha256(&path);
+        std::fs::write(&path, [bytes.as_slice(), b"\0"].concat()).unwrap();
+        assert!(read_verified(&path).is_none());
+    }
+
+    #[test]
+    fn a_file_rewritten_in_place_with_its_times_restored_is_hashed_again() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = serialized_empty_component(&engine);
+        let path = write_form(temp.path(), &bytes);
+        assert!(read_verified(&path).is_some());
+        break_recorded_sha256(&path);
+        let earlier = std::fs::metadata(&path).unwrap();
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let middle = bytes.len() / 2;
+        file.write_all_at(&[!bytes[middle]], middle as u64).unwrap();
+        file.set_times(
+            FileTimes::new()
+                .set_accessed(earlier.accessed().unwrap())
+                .set_modified(earlier.modified().unwrap()),
+        )
+        .unwrap();
+        drop(file);
+
+        let later = std::fs::metadata(&path).unwrap();
+        assert_eq!(later.ino(), earlier.ino());
+        assert_eq!(later.len(), earlier.len());
+        assert_eq!(later.modified().unwrap(), earlier.modified().unwrap());
+        assert!(read_verified(&path).is_none());
+    }
+
+    #[test]
+    fn a_file_replaced_since_its_stamp_is_hashed_again() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = serialized_empty_component(&engine);
+        let path = write_form(temp.path(), &bytes);
+        assert!(read_verified(&path).is_some());
+        break_recorded_sha256(&path);
+        let replacement = temp.path().join("replacement");
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::set_permissions(&replacement, Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(read_verified(&path).is_none());
+    }
+
+    #[test]
+    fn a_file_chmodded_since_its_stamp_is_hashed_again() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_form(temp.path(), &serialized_empty_component(&engine));
+        assert!(read_verified(&path).is_some());
+        break_recorded_sha256(&path);
+        std::fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
+        assert!(read_verified(&path).is_none());
+    }
+
+    #[test]
+    fn a_touched_file_whose_bytes_still_match_is_restamped() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_form(temp.path(), &serialized_empty_component(&engine));
+        assert!(read_verified(&path).is_some());
+        let stamped = recorded_stamp(&path);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(SystemTime::now()))
+            .unwrap();
+        assert_ne!(current_stamp(&path), stamped);
+
+        assert!(read_verified(&path).is_some());
+        assert_eq!(recorded_stamp(&path), current_stamp(&path));
+    }
+
+    #[test]
+    fn a_digest_only_sidecar_is_hashed_and_stamped() {
+        let engine = engine();
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = serialized_empty_component(&engine);
+        let path = write_form(temp.path(), &bytes);
+        assert_eq!(recorded_stamp(&path), "");
+
+        assert!(read_verified(&path).is_some());
+        assert_eq!(recorded_stamp(&path), current_stamp(&path));
+        assert_eq!(
+            std::fs::read_to_string(sidecar(&path))
+                .unwrap()
+                .lines()
+                .next(),
+            Some(murmur_artifact::sha256_hex(&bytes).as_str()),
+        );
     }
 
     #[test]

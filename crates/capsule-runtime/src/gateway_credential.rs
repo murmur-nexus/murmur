@@ -18,7 +18,6 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Read,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -26,7 +25,7 @@ use std::{
 use murmur_artifact::ApiKeyReference;
 use serde::Deserialize;
 
-use crate::{errors::RuntimeError, trace::ResourceTraceAppender};
+use crate::{errors::RuntimeError, murmur_home::FileStamp, trace::ResourceTraceAppender};
 
 /// The diagnostic code a session fails with when the provider keeps rejecting its credential.
 pub(crate) const E_RUN_027: &str = "E-RUN-027";
@@ -97,37 +96,6 @@ pub(crate) enum CredentialChange {
     Unreadable { reason: &'static str },
 }
 
-/// The identity and last change of an opened config file, as `fstat(2)` reports them. Identifies a
-/// state of the file for reporting `unreadable` once; it never decides whether to read.
-/// `Unavailable` is a file that could not be opened or stat'd.
-///
-/// `mode` is compared with the rest, which changes nothing: `chmod(2)` also updates `ctime`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileStamp {
-    Unavailable,
-    Present {
-        dev: u64,
-        ino: u64,
-        len: u64,
-        mtime: (i64, i64),
-        ctime: (i64, i64),
-        mode: u32,
-    },
-}
-
-impl FileStamp {
-    fn of(metadata: &fs::Metadata) -> Self {
-        Self::Present {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            len: metadata.len(),
-            mtime: (metadata.mtime(), metadata.mtime_nsec()),
-            ctime: (metadata.ctime(), metadata.ctime_nsec()),
-            mode: metadata.mode(),
-        }
-    }
-}
-
 /// The only part of the config file this module reads.
 #[derive(Deserialize)]
 struct CredentialsFile {
@@ -142,19 +110,20 @@ enum EntryRead {
 }
 
 /// Opens `path`, stamps the open handle and reads `credentials.<name>` from it, so the stamp and
-/// the value describe the same file even when it is replaced mid-read.
-fn read_entry(path: &Path, name: &str) -> (FileStamp, EntryRead) {
+/// the value describe the same file even when it is replaced mid-read. The stamp is `None` for a
+/// file that could not be opened or stat'd.
+fn read_entry(path: &Path, name: &str) -> (Option<FileStamp>, EntryRead) {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return (FileStamp::Unavailable, EntryRead::Unreadable("missing"))
+            return (None, EntryRead::Unreadable("missing"))
         }
-        Err(_) => return (FileStamp::Unavailable, EntryRead::Unreadable("unreadable")),
+        Err(_) => return (None, EntryRead::Unreadable("unreadable")),
     };
     let stamp = file
         .metadata()
-        .map(|metadata| FileStamp::of(&metadata))
-        .unwrap_or(FileStamp::Unavailable);
+        .ok()
+        .map(|metadata| FileStamp::of(&metadata));
     let mut text = String::new();
     if file.read_to_string(&mut text).is_err() {
         return (stamp, EntryRead::Unreadable("unreadable"));
@@ -180,8 +149,9 @@ struct CredentialState {
     /// The last good value. Never cleared: an unreadable source keeps it.
     value: String,
     /// The file state and reason an `unreadable` event was last written for, so a broken file read
-    /// on every request is reported once. `None` after a read that yielded a value.
-    unreadable_reported_for: Option<(FileStamp, &'static str)>,
+    /// on every request is reported once. `None` after a read that yielded a value. The stamp
+    /// identifies a state of the file for this and never decides whether to read.
+    unreadable_reported_for: Option<(Option<FileStamp>, &'static str)>,
     pending_rejection: Option<CredentialRejection>,
 }
 
@@ -245,8 +215,8 @@ impl GatewayCredential {
         if let Some(path) = credentials_file {
             let (stamp, read) = read_entry(path, name);
             if let EntryRead::Value(value) = read {
-                if let FileStamp::Present { mode, .. } = stamp {
-                    crate::murmur_home::warn_on_wide_credential_file(path, name, mode);
+                if let Some(stamp) = stamp {
+                    crate::murmur_home::warn_on_wide_credential_file(path, name, stamp.mode);
                 }
                 let credential = Self::new(
                     artifact,
@@ -469,7 +439,7 @@ impl GatewayCredential {
 #[cfg(test)]
 #[allow(clippy::print_stdout, clippy::print_stderr)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::{os::unix::fs::MetadataExt, sync::atomic::Ordering};
 
     use super::*;
 

@@ -72,6 +72,62 @@ pub fn write_private_file(target: &Path, contents: &[u8]) -> Result<(), String> 
         .commit()
 }
 
+/// The identity and last change of a file, as `fstat(2)` reports them on an open handle: device,
+/// inode, size, owner, mode, mtime and ctime.
+///
+/// The kernel sets ctime to the current time on every write, truncate, chmod, chown and rename of
+/// the inode, and nothing without `CAP_SYS_TIME` can set it back, so a file changed or replaced
+/// since its stamp was taken has a different stamp even when its mtime was restored. Where ctime
+/// has timer-tick resolution, as on Linux before 6.13, a same-size write within one tick of the
+/// stamp can keep it.
+///
+/// Its `Display` form is recorded on disk beside each compiled form, so changing the format makes
+/// every recorded stamp miss once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    uid: u32,
+    pub(crate) mode: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+impl std::fmt::Display for FileStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {:o} {}.{:09} {}.{:09}",
+            self.dev,
+            self.ino,
+            self.len,
+            self.uid,
+            self.mode,
+            self.mtime.0,
+            self.mtime.1,
+            self.ctime.0,
+            self.ctime.1,
+        )
+    }
+}
+
 /// Whether `mode` grants any permission bit `allowed` does not.
 pub fn is_wider_than(mode: u32, allowed: u32) -> bool {
     (mode & 0o777) & !allowed != 0
