@@ -9,6 +9,9 @@ cd ~/default-artifacts
 cargo build --workspace --target wasm32-wasip2 --release
 ```
 
+The anthropic driver wasm is built from default-artifacts `e0f2f62696fb9124a6002e0f6f69807e88f2b224` with
+`cargo build --target wasm32-wasip2 --release -p murmur-driver-anthropic`.
+
 ## Copy outputs into this fixture
 
 ```bash
