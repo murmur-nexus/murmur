@@ -332,11 +332,16 @@ fn report_murmur_home() {
         } else {
             ""
         };
+        let deletable = if report.kind.safe_to_delete() {
+            ", safe to delete"
+        } else {
+            ""
+        };
         let holds = report.kind.holds();
         match &report.state {
-            HomeEntryState::Absent => println!("  {name}: absent  {holds}{expected}"),
+            HomeEntryState::Absent => println!("  {name}: absent  {holds}{deletable}{expected}"),
             HomeEntryState::Unreadable { error } => {
-                println!("  {name}: unreadable ({error})  {holds}{expected}")
+                println!("  {name}: unreadable ({error})  {holds}{deletable}{expected}")
             }
             HomeEntryState::Present {
                 mode,
@@ -344,7 +349,7 @@ fn report_murmur_home() {
                 wide_descendants,
                 wide_descendants_omitted,
             } => {
-                println!("  {name}: {mode:04o}  {holds}{expected}");
+                println!("  {name}: {mode:04o}  {holds}{deletable}{expected}");
                 if *wide {
                     warnings.push(wide_entry_warning(
                         &report.path,

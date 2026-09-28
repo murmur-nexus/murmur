@@ -1833,11 +1833,14 @@ fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
     let name = form.file_name().unwrap().to_string_lossy();
     let line = format!("    wider than 0600: compiled/{name} is 0644");
     assert!(stdout.contains(&line), "missing {line:?} in:\n{stdout}");
-    let path = form.display().to_string();
+    let warning = format!(
+        "{} holds compiled WASM cache and is mode 0644",
+        form.display()
+    );
     assert!(
         stderr
             .lines()
-            .any(|line| line.contains("warning[W-SEC-028]") && line.contains(&path)),
-        "no W-SEC-028 for {path}:\n{stderr}"
+            .any(|line| line.contains("warning[W-SEC-028]") && line.contains(&warning)),
+        "no W-SEC-028 reading {warning:?}:\n{stderr}"
     );
 }

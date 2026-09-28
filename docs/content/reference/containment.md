@@ -140,14 +140,14 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
 | `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires Linux 5.13+ with a usable Landlock ABI and unprivileged user namespaces the process can mount inside: inside a container that needs `--cap-add SYS_ADMIN`, and on a host where AppArmor's `restrict_unprivileged_userns` is active the `mur-sealed` profile shipped with `mur` must be loaded. |
 
-`advisory` is user-level trust. On a host that achieves only `advisory`, the Seccomp-only and
-Environment-only [tiers](#subprocess-enforcement-tiers), a capsule's shell runs as you without
-filesystem mediation and can write anything you can, including the compiled forms in
-[`~/.murmur/compiled/`](config.md#murmur-home-permissions) that later `scoped` and `sealed` launches
-load; the checksum stored beside each form detects damage and is no defence against code running as
-you. On the Full and Sealed tiers the shell writes no file outside its workdir, so it reaches
-`~/.murmur` only when that lies inside the workdir: `mur` then keeps no forms for that launch, but a
-later launch from another workdir loads any form the shell wrote there.
+`advisory` is user-level trust. What a capsule's shell can write, including the compiled WASM
+artifacts in [`~/.murmur/compiled/`](config.md#murmur-home-permissions) that every later launch
+loads, depends on the [tier](#subprocess-enforcement-tiers) the host achieves:
+
+| Tier | The shell can write | `~/.murmur/compiled/` |
+|---|---|---|
+| Seccomp-only, Environment-only | Anything you can | Writable. A later `scoped` or `sealed` launch loads what the shell wrote there. The checksum stored beside each compiled artifact detects damage and is no defence against code running as you |
+| Full, Sealed | Its workdir only | Writable only when `~/.murmur` lies inside the workdir. `mur` then keeps no compiled artifacts for that launch, but a later launch from another workdir loads what the shell wrote there |
 
 !!! note "`sealed`'s one documented exception: `/proc`"
 

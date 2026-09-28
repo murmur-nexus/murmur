@@ -60,9 +60,9 @@ const COMPILED_DIR: &str = "compiled";
 /// How long an entry of [`COMPILED_DIR`] survives without being read or written.
 const FORM_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// How long a staged write's temp file survives. `write_private_file` fsyncs its
-/// `.<name>.<pid>.<uuid>.tmp` file and renames it over the target within the one call, and removes
-/// it on any error, so a temp file an hour old belongs to a writer that crashed.
+/// How long a staged write's temp file survives. `write_private_file` writes, fsyncs and renames
+/// its `.<name>.<pid>.<uuid>.tmp` file within the one call, so a temp file an hour old was left by
+/// a write that crashed or failed before the rename.
 const TEMP_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]

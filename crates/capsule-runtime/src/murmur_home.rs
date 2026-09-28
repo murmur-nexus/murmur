@@ -144,10 +144,15 @@ impl HomeEntryKind {
             Self::Running => "running-capsule records",
             Self::State => "capsule state stores",
             Self::Artifacts => "installed artifacts",
-            Self::CompiledForms => "compiled WASM cache, safe to delete",
+            Self::CompiledForms => "compiled WASM cache",
             Self::BinaryCache => "cached mur binaries",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
+    }
+
+    /// Whether deleting the entry loses nothing, because `mur` writes it again when it needs it.
+    pub fn safe_to_delete(&self) -> bool {
+        matches!(self, Self::CompiledForms)
     }
 
     /// Whether the entry, and everything beneath it, is expected to be owner-only.
