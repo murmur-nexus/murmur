@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use capsule_runtime::precompile::Precompiler;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use murmur_artifact::{
@@ -131,6 +132,7 @@ pub(crate) fn install_resolved(
     local_registry: &LocalRegistry,
     resolved: crate::source::ResolvedSource,
     lock_path: Option<&Path>,
+    precompiler: Option<&Precompiler>,
 ) -> Result<(), CliError> {
     use murmur_artifact::load_manifest_from_artifact_bytes;
     let resolved_version_hint = resolved.resolved_version.clone();
@@ -182,7 +184,35 @@ pub(crate) fn install_resolved(
         "Installed {}@{} from {}",
         manifest.name, installed_version, resolved.source
     );
+    precompile(
+        precompiler,
+        &manifest.name,
+        &installed_version,
+        &resolved.bytes,
+    );
     Ok(())
+}
+
+/// The one [`Precompiler`] an install command stores forms with, or `None` under
+/// `--no-precompile` or when no engine can be built. `project_root` is the project whose store is
+/// being installed into: its capsules' writable roots default to `<project_root>/workdir`, the
+/// directory `stage_session` checks a form against, so forms are withheld from a murmur home that
+/// directory could reach. `None` for the global store, which no one capsule stages from.
+fn build_precompiler(no_precompile: bool, project_root: Option<&Path>) -> Option<Precompiler> {
+    if no_precompile {
+        return None;
+    }
+    let capsule_writable = project_root.map(|root| root.join("workdir"));
+    Precompiler::new(capsule_writable.as_deref())
+}
+
+/// Stores the compiled form of the payload `bytes` just stored as `name@version`, when a
+/// precompiler is given. The outcome is deliberately dropped: a form that is not stored only means
+/// the first launch compiles, so it never changes what install prints or how it exits.
+fn precompile(precompiler: Option<&Precompiler>, name: &str, version: &str, bytes: &[u8]) {
+    if let Some(precompiler) = precompiler {
+        let _ = precompiler.precompile(name, version, bytes);
+    }
 }
 
 /// The `CliError` for a failed source-chain lookup; code, message and hint all come from
@@ -248,18 +278,23 @@ pub(crate) fn run_install(
     registry_override: Option<&str>,
     global: bool,
     all_platforms: bool,
+    no_precompile: bool,
 ) -> Result<(), CliError> {
     if all_platforms {
-        return run_install_all_platforms(artifact_ref);
+        return run_install_all_platforms(artifact_ref, no_precompile);
     }
 
     let (store, project_root) = determine_store(global)?;
 
     match artifact_ref {
-        None => install_manifest_deps(&store, &project_root, registry_override),
-        Some(ref_str) => {
-            install_single(ref_str, registry_override, &store, project_root.as_deref())
-        }
+        None => install_manifest_deps(&store, &project_root, registry_override, no_precompile),
+        Some(ref_str) => install_single(
+            ref_str,
+            registry_override,
+            &store,
+            project_root.as_deref(),
+            no_precompile,
+        ),
     }
 }
 
@@ -317,9 +352,11 @@ fn install_single(
     registry_override: Option<&str>,
     store: &LocalRegistry,
     project_root: Option<&Path>,
+    no_precompile: bool,
 ) -> Result<(), CliError> {
     if is_local_path(artifact_ref) {
-        return install_from_local_file(artifact_ref, store);
+        let precompiler = build_precompiler(no_precompile, project_root);
+        return install_from_local_file(artifact_ref, store, precompiler.as_ref());
     }
 
     if is_source_chain_ref(artifact_ref) {
@@ -336,8 +373,9 @@ fn install_single(
                 .map_err(source_chain_error_to_cli)?,
         };
         let lock_path = project_root.map(|r| r.join("murmur.lock"));
+        let precompiler = build_precompiler(no_precompile, project_root);
         for resolved in resolved_list {
-            install_resolved(store, resolved, lock_path.as_deref())?;
+            install_resolved(store, resolved, lock_path.as_deref(), precompiler.as_ref())?;
         }
         return Ok(());
     }
@@ -347,7 +385,7 @@ fn install_single(
     let registry = resolve_registry(registry_override)?;
     // The name the payload is filed under, which for a native artifact carries its platform tag.
     let mut file_stem = format!("{name}-{version}");
-    match registry.resolve_with_platform(name, version, Some(current_platform())) {
+    let payload = match registry.resolve_with_platform(name, version, Some(current_platform())) {
         Ok(resolved) => {
             verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
@@ -364,6 +402,7 @@ fn install_single(
             if let Some(root) = project_root {
                 upsert_lock_entry(&root.join("murmur.lock"), name, version, pin)?;
             }
+            resolved.bytes
         }
         Err(RegistryError::NotFound { .. }) => {
             let source_chain = match load_effective_mur_config_if_any_exists()? {
@@ -383,7 +422,8 @@ fn install_single(
                         .resolve_bare(name, Some(version))
                         .map_err(source_chain_error_to_cli)?;
                     let lock_path = project_root.map(|r| r.join("murmur.lock"));
-                    install_resolved(store, resolved, lock_path.as_deref())?;
+                    let precompiler = build_precompiler(no_precompile, project_root);
+                    install_resolved(store, resolved, lock_path.as_deref(), precompiler.as_ref())?;
                     return Ok(());
                 }
                 None => {
@@ -396,10 +436,16 @@ fn install_single(
             }
         }
         Err(e) => return Err(CliError::from(e)),
-    }
+    };
 
     let display = store_display(store);
     println!("Installed {name}@{version} → {display}/{name}/{version}/{file_stem}.mur.zip");
+    precompile(
+        build_precompiler(no_precompile, project_root).as_ref(),
+        name,
+        version,
+        &payload,
+    );
     Ok(())
 }
 
@@ -407,6 +453,7 @@ fn install_manifest_deps(
     store: &LocalRegistry,
     project_root: &Option<PathBuf>,
     registry_override: Option<&str>,
+    no_precompile: bool,
 ) -> Result<(), CliError> {
     let root = match project_root {
         Some(r) => r.clone(),
@@ -610,6 +657,21 @@ fn install_manifest_deps(
         }
     }
 
+    // After the lock is written, so an interrupted compile never costs a pin, and for the cached
+    // artifacts too, so forms a new `mur` build keys differently are filled in. The header
+    // spinner keeps ticking meanwhile.
+    if let Some(precompiler) = build_precompiler(no_precompile, Some(&root)) {
+        successes.par_iter().for_each(|(i, outcome)| {
+            let artifact = artifacts[*i];
+            precompile(
+                Some(&precompiler),
+                &artifact.name,
+                &artifact.version,
+                &outcome.payload,
+            );
+        });
+    }
+
     // Byte/cache accounting covers the successes only — a failed artifact contributed no
     // bytes and is neither "fetched" nor "cached".
     let fetched_bytes: u64 = successes
@@ -689,6 +751,8 @@ fn install_summary_tail(count: usize, cached_n: usize, fetched_bytes: u64) -> St
 struct FetchOutcome {
     bytes_len: u64,
     lock_upsert: Option<(String, String, LockedSha256)>,
+    /// The payload bytes written to the store, which are the bytes precompiled.
+    payload: bytes::Bytes,
 }
 
 /// Fetch one artifact from the registry (or source chain fallback) and write it
@@ -714,6 +778,7 @@ fn fetch_and_store(
             Ok(FetchOutcome {
                 bytes_len: len,
                 lock_upsert: Some((name.to_string(), version.to_string(), pin)),
+                payload: resolved.bytes,
             })
         }
         Err(RegistryError::NotFound { .. }) => match source_chain {
@@ -762,6 +827,7 @@ fn fetch_and_store(
                 Ok(FetchOutcome {
                     bytes_len: len,
                     lock_upsert: Some((name.to_string(), version.to_string(), pin)),
+                    payload: resolved.bytes,
                 })
             }
             None => Err(CliError::with_hint(
@@ -778,6 +844,7 @@ fn fetch_and_store(
 pub(crate) fn install_from_local_file(
     path_str: &str,
     store: &LocalRegistry,
+    precompiler: Option<&Precompiler>,
 ) -> Result<(), CliError> {
     let bytes = std::fs::read(path_str)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to read {path_str}: {e}")))?;
@@ -816,6 +883,7 @@ pub(crate) fn install_from_local_file(
         "Installed {}@{} from {}",
         manifest.name, manifest.version, path_str
     );
+    precompile(precompiler, &manifest.name, &manifest.version, &bytes);
     Ok(())
 }
 
@@ -853,7 +921,10 @@ fn local_file_platform(path_str: &str) -> Result<String, CliError> {
     Ok(current_platform().to_string())
 }
 
-fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError> {
+fn run_install_all_platforms(
+    artifact_ref: Option<&str>,
+    no_precompile: bool,
+) -> Result<(), CliError> {
     let Some(ref_str) = artifact_ref else {
         return Err(CliError::new(
             E_IO_003,
@@ -908,6 +979,16 @@ fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError>
                 println!(
                     "Installed {name}@{version} ({platform}) → ~/.murmur/artifacts/{name}/{version}/{name}-{version}-{platform}.mur.zip"
                 );
+                // Only this host's payload: a form is native code for the machine that compiled
+                // it, so another platform's payload has nothing to gain from one here.
+                if *platform == current_platform() {
+                    precompile(
+                        build_precompiler(no_precompile, None).as_ref(),
+                        name,
+                        version,
+                        &resolved.bytes,
+                    );
+                }
             }
             Err(e) => {
                 eprintln!(

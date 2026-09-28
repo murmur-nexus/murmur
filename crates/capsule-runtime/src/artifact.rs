@@ -293,14 +293,13 @@ struct DeclaredAllowList {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::io::Write;
 
     use zip::write::SimpleFileOptions;
 
-    use super::*;
-
-    fn archive_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+    /// A `.mur.zip` payload holding `files`, each `(path in the archive, bytes)`.
+    pub(crate) fn archive_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         {
             let mut zip = zip::ZipWriter::new(&mut cursor);
@@ -313,6 +312,12 @@ mod tests {
         }
         cursor.into_inner()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::archive_with_files;
+    use super::*;
 
     #[test]
     fn prefers_capsule_wasm_when_present() {

@@ -171,6 +171,10 @@ enum Commands {
         /// Requires a name@version artifact reference and a configured source chain.
         #[arg(long)]
         all_platforms: bool,
+
+        /// Skip compiling installed WASM artifacts for this machine; they compile on first launch instead.
+        #[arg(long)]
+        no_precompile: bool,
     },
     /// Run a capsule component with local lockfile-aware tool resolution
     Run {
@@ -511,11 +515,13 @@ fn main() {
             registry,
             global,
             all_platforms,
+            no_precompile,
         } => run_install(
             artifact.as_deref(),
             registry.as_deref(),
             global,
             all_platforms,
+            no_precompile,
         ),
         Commands::Run {
             manifest,
