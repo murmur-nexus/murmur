@@ -7,19 +7,17 @@
 //! determine its compile input, the engine's precompile compatibility hash and the artifact
 //! decompression ceiling ([`max_artifact_decompressed_bytes`]). Its own sha256 sits beside it, and
 //! its bytes are hashed against that sha256 when the form is written and again whenever the file's
-//! [`stamp`] has moved since they last matched; [`read_verified`] states the rule. A missing,
+//! [`FileStamp`] has moved since they last matched; [`read_verified`] states the rule. A missing,
 //! stale, unreadable or mismatched form is compiled again through `Component::new` and rewritten,
 //! so the cache never fails a launch and never changes a compile error.
 //!
 //! The sidecar and the stamp it records sit in the same directory as the form, so they detect
 //! damage, not a rewrite by code running as this uid, which can rewrite all three together. A
 //! `sealed` or `scoped` capsule cannot write under the murmur home, and an `advisory` capsule
-//! already runs with the operator's trust. Trusting an unchanged stamp gives up one thing:
-//! corruption below the filesystem that leaves the inode's metadata alone, such as bit rot on a
-//! filesystem without data checksums like ext4, goes unnoticed until the stamp next moves. On Linux
-//! before 6.13, ctime has jiffy resolution, so a same-size rewrite by another writer within one
-//! tick of the stamp being taken could keep it; mur's own writes always rename a new inode into
-//! place.
+//! already runs with the operator's trust. An unchanged stamp does not catch corruption below the
+//! filesystem that leaves the inode's metadata alone, such as bit rot on a filesystem without data
+//! checksums like ext4, until the stamp next moves. mur's own writes always rename a new inode into
+//! place, so the tick-resolution ctime caveat on [`FileStamp`] applies only to another writer.
 //!
 //! An artifact's key must be a sha256 that `verify_sha256` has just recomputed over the payload
 //! bytes in hand, so a form named `H` is always the `extract_root_wasm` component of the payload
@@ -36,12 +34,13 @@
 //!
 //! Only a store prunes. The store branch of [`CompiledForms::compile`] is the one caller of
 //! [`prune_stale`], so after a store the directory holds only forms read or written in the
-//! [`FORM_RETENTION`] before it, and a launch whose every form loads writes, renames and deletes
-//! nothing here. A change of engine key, from a new wasmtime or a changed decompression ceiling,
-//! finds none of its forms, so its first launch stores and always prunes; the previous key's forms
-//! are removed by the first store after they have gone unused for [`FORM_RETENTION`]. Pruning goes
-//! by age alone, never by key, so two builds or ceilings used alternately never delete each
-//! other's forms and each keeps loading its own.
+//! [`FORM_RETENTION`] before it, and a launch whose every form loads with an unchanged stamp
+//! writes, renames and deletes nothing here; a form that loads after being hashed has only its
+//! sidecar rewritten. A change of engine key, from a new wasmtime or a changed decompression
+//! ceiling, finds none of its forms, so its first launch stores and always prunes; the previous
+//! key's forms are removed by the first store after they have gone unused for [`FORM_RETENTION`].
+//! Pruning goes by age alone, never by key, so two builds or ceilings used alternately never
+//! delete each other's forms and each keeps loading its own.
 //!
 //! A form keyed on an artifact payload's sha256 must be compiled only from the root wasm
 //! [`extract_root_wasm`] returned for that payload in the same process, so under the same ceiling.
@@ -64,6 +63,8 @@ use std::time::{Duration, SystemTime};
 
 use wasmtime::component::Component;
 use wasmtime::Engine;
+
+use crate::murmur_home::FileStamp;
 
 /// The directory under the murmur home that holds compiled forms.
 const COMPILED_DIR: &str = "compiled";
@@ -257,7 +258,8 @@ fn open_private(path: &Path) -> Option<(std::fs::File, Metadata)> {
 }
 
 /// Writes the form `bytes` as `file_name` in `dir` and a sidecar holding their sha256, then reads
-/// the form back through [`read_verified`], which hashes it once more and records its [`stamp`].
+/// the form back through [`read_verified`], which hashes it once more and records its
+/// [`FileStamp`].
 /// `dir` is one [`CompiledForms::dir`] returned. Every error is ignored: a form or sidecar that
 /// was not written is compiled again on the next launch, and a stamp that was not recorded means
 /// only that the next launch hashes the form.
@@ -277,13 +279,13 @@ fn store(dir: &Path, file_name: &str, bytes: &[u8]) {
 /// The bytes of the form at `path`, when it and its sidecar are owner-only regular files of this
 /// uid and the bytes are the ones whose sha256 was recorded when the form was written.
 ///
-/// Sidecar line 1 is that write-time sha256. Line 2, when present, is the form's [`stamp`] at the
-/// last read whose bytes hashed to it. A form whose stamp is the same before and after this read,
-/// and equal to line 2, is taken without hashing. Any other form is hashed in full: a mismatch is
-/// `None`, and a match whose stamp held still during the read has the sidecar rewritten as
-/// `<sha256>\n<stamp>\n`. Lines after the second are ignored. This is the only write here, and it
-/// goes into the directory `path` is in, through `write_private_file`; a failed write is ignored
-/// and leaves the next read to hash again.
+/// Sidecar line 1 is that write-time sha256. Line 2, when present, is the form's [`FileStamp`] at
+/// the last read whose bytes hashed to it. A form whose stamp is the same before and after this
+/// read, and equal to line 2, is taken without hashing. Any other form is hashed in full: a
+/// mismatch is `None`, and a match whose stamp held still during the read has the sidecar
+/// rewritten as `<sha256>\n<stamp>\n`. Lines after the second are ignored. This is the only write
+/// here, and it goes into the directory `path` is in, through `write_private_file`; a failed write
+/// is ignored and leaves the next read to hash again.
 ///
 /// Each file's own owner and mode are checked on its open handle, not only the directory's: a
 /// directory that was ever wider than owner-only can hold an entry another uid created, and
@@ -302,8 +304,12 @@ fn read_verified(path: &Path) -> Option<Vec<u8>> {
     let mut lines = recorded.lines();
     let sha256 = lines.next()?.trim();
     // A write that lands while the bytes are read moves the stamp between the two fstat calls.
-    let unchanged = Some(stamp(&before))
-        .filter(|before| file.metadata().is_ok_and(|after| stamp(&after) == *before));
+    let unchanged = Some(FileStamp::of(&before))
+        .filter(|before| {
+            file.metadata()
+                .is_ok_and(|after| FileStamp::of(&after) == *before)
+        })
+        .map(|stamp| stamp.to_string());
     if unchanged.is_some() && lines.next() == unchanged.as_deref() {
         return Some(bytes);
     }
@@ -321,28 +327,6 @@ fn read_verified(path: &Path) -> Option<Vec<u8>> {
         );
     }
     Some(bytes)
-}
-
-/// The identity and change state of the file `metadata` describes: device, inode, size, owner,
-/// mode, mtime and ctime. The kernel sets ctime to the current time on every write, truncate,
-/// chmod, chown and rename of the inode, and no call made without `CAP_SYS_TIME` sets it back, so
-/// the stamp of a file changed or replaced since it was taken differs from it, even when the
-/// mtime has been restored.
-fn stamp(metadata: &Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
-
-    format!(
-        "{} {} {} {} {:o} {}.{:09} {}.{:09}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.uid(),
-        metadata.mode(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    )
 }
 
 /// The form at `path`, read through [`read_verified`].
@@ -572,7 +556,7 @@ mod tests {
     }
 
     fn current_stamp(path: &Path) -> String {
-        stamp(&std::fs::metadata(path).unwrap())
+        FileStamp::of(&std::fs::metadata(path).unwrap()).to_string()
     }
 
     #[test]
