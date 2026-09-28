@@ -37,8 +37,7 @@ const DRIVER_VERSION: &str = "0.1.0";
 const TASK: &str = "Say hello.";
 
 /// A chat-completions body: well-formed JSON in another provider's shape. The anthropic driver
-/// fixture reads a missing `stop_reason` as `end_turn` and missing `content` as empty, so it hands
-/// the loop an empty, successful turn rather than an error.
+/// refuses it because it has no `stop_reason`, so the task fails with `driver_error`.
 const CHAT_COMPLETIONS_BODY: &str = r#"{"id":"x","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
 
 /// A body cut off in transit, mid-JSON.
@@ -330,9 +329,6 @@ fn s1_a_completed_task_is_ok_and_exits_zero() {
 // ── A driver call that failed ─────────────────────────────────────────────────
 
 #[test]
-#[ignore = "the anthropic driver reads a chat-completions body as an empty end_turn, so the \
-            runtime is handed a successful turn; fails until the driver refuses a body with no \
-            stop_reason"]
 fn s2_a_body_in_another_providers_shape_fails_the_task() {
     let home = home_with_driver();
     let server = common::ScriptedServer::start(vec![CHAT_COMPLETIONS_BODY.to_string()]);
