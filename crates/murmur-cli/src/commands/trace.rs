@@ -628,6 +628,42 @@ struct PlanEndEvent {
     reason: Option<String>,
 }
 
+/// A controller changed a setting or a secret over the control surface. A secret's line carries
+/// no value.
+#[derive(Debug, Deserialize)]
+struct ControlChangeEvent {
+    event_id: String,
+    /// `"setting"` or `"secret"`.
+    kind: String,
+    name: String,
+    /// `"set"` or `"forget"`.
+    action: String,
+    #[serde(default)]
+    previous: Option<serde_json::Value>,
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+    #[serde(default)]
+    replaced: Option<bool>,
+}
+
+/// The control surface refused a request. `name` is absent when the caller did not authenticate.
+#[derive(Debug, Deserialize)]
+struct ControlRefusedEvent {
+    status: u16,
+    reason: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// The first inference call to use a setting value a controller set.
+#[derive(Debug, Deserialize)]
+struct ControlAppliedEvent {
+    turn: u32,
+    name: String,
+    value: serde_json::Value,
+    change_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -673,6 +709,9 @@ enum TraceEvent {
     HarnessWarning(HarnessWarningEvent),
     HarnessFailed(HarnessFailedEvent),
     HarnessInterrupt(HarnessInterruptEvent),
+    ControlChange(ControlChangeEvent),
+    ControlRefused(ControlRefusedEvent),
+    ControlApplied(ControlAppliedEvent),
     #[serde(other)]
     Unknown,
 }
@@ -955,6 +994,50 @@ struct TraceMetrics {
     delegations: Vec<DelegationRecord>,
     /// Every plan run this trace records, in the order they started.
     plan_runs: Vec<PlanRunRecord>,
+    /// Every `control_change`, in file order, joined to the `control_applied` that names it.
+    control_changes: Vec<ControlChangeRecord>,
+    /// `control_refused` records, counted by status.
+    control_refusals: OutcomeCounts,
+}
+
+/// One accepted control change, and the turn that first used it when a `control_applied` says so.
+struct ControlChangeRecord {
+    change: ControlChangeEvent,
+    applied_turn: Option<u32>,
+}
+
+/// One line for a control change: what changed and, for a setting whose `applied` turn is known,
+/// the turn that first used it.
+fn control_change_line(c: &ControlChangeEvent, applied: Option<Option<u32>>) -> String {
+    let value = |value: &Option<serde_json::Value>| {
+        value
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_else(|| "?".to_string())
+    };
+    match (c.kind.as_str(), c.action.as_str()) {
+        ("setting", _) => format!(
+            "setting {}  {} \u{2192} {}{}",
+            c.name,
+            value(&c.previous),
+            value(&c.value),
+            match applied {
+                Some(Some(turn)) => format!("  applied from turn {turn}"),
+                Some(None) => "  not yet used by an inference call".to_string(),
+                None => String::new(),
+            }
+        ),
+        (_, "forget") => format!("secret {}  forgotten", c.name),
+        _ => format!(
+            "secret {}  set ({})",
+            c.name,
+            if c.replaced == Some(true) {
+                "replaced"
+            } else {
+                "new"
+            }
+        ),
+    }
 }
 
 /// One delegation this session made, as the two lines that record it join up.
@@ -1376,6 +1459,8 @@ fn compute_metrics(
     let mut a2a_sends: Vec<String> = Vec::new();
     let mut delegations: Vec<DelegationRecord> = Vec::new();
     let mut plan_runs: Vec<PlanRunRecord> = Vec::new();
+    let mut control_changes: Vec<ControlChangeRecord> = Vec::new();
+    let mut control_refusals = OutcomeCounts::new();
 
     for event in events {
         match event {
@@ -1701,6 +1786,23 @@ fn compute_metrics(
             }
             // Rendered in the step list; the summary has no spend section.
             TraceEvent::SpendCeilingReached(_) => {}
+            TraceEvent::ControlChange(change) => control_changes.push(ControlChangeRecord {
+                change,
+                applied_turn: None,
+            }),
+            TraceEvent::ControlApplied(applied) => {
+                if let Some(record) = control_changes
+                    .iter_mut()
+                    .find(|record| record.change.event_id == applied.change_id)
+                {
+                    record.applied_turn = Some(applied.turn);
+                }
+            }
+            TraceEvent::ControlRefused(refused) => {
+                *control_refusals
+                    .entry(format!("HTTP {}", refused.status))
+                    .or_insert(0) += 1;
+            }
             TraceEvent::Unknown => {}
         }
     }
@@ -1776,6 +1878,8 @@ fn compute_metrics(
             spawned_by_delegation: ss.delegation_id,
             delegations,
             plan_runs,
+            control_changes,
+            control_refusals,
         },
         task_metrics,
     ))
@@ -2369,6 +2473,20 @@ fn print_show(m: &TraceMetrics) {
         }
         if !m.resource_reads.is_empty() {
             println!("read:       {}", fmt_outcomes(&m.resource_reads));
+        }
+    }
+
+    if !m.control_changes.is_empty() || !m.control_refusals.is_empty() {
+        println!();
+        println!("── Control ──────────────────────────────────────");
+        for record in &m.control_changes {
+            println!(
+                "{}",
+                control_change_line(&record.change, Some(record.applied_turn))
+            );
+        }
+        if !m.control_refusals.is_empty() {
+            println!("refused:    {}", fmt_outcomes(&m.control_refusals));
         }
     }
 
@@ -3118,6 +3236,27 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.kind,
             e.status,
             fmt_dur(e.duration_ms)
+        ),
+        TraceEvent::ControlChange(e) => {
+            format!("{}{}", kind("control_change"), control_change_line(e, None))
+        }
+        TraceEvent::ControlRefused(e) => format!(
+            "{}{} {}{}",
+            kind("control_refused"),
+            e.status,
+            e.reason,
+            e.name
+                .as_deref()
+                .map(|name| format!("  {name}"))
+                .unwrap_or_default()
+        ),
+        TraceEvent::ControlApplied(e) => format!(
+            "{}{} = {}  turn {}  from {}",
+            kind("control_applied"),
+            e.name,
+            e.value,
+            e.turn,
+            fmt_id_short(&e.change_id, 12)
         ),
         TraceEvent::PlanEnd(e) => format!(
             "{}{}{}",

@@ -27,6 +27,7 @@ pub mod detached;
 pub(crate) mod detached_reconcile;
 // Public so the `runtime_out!` / `runtime_err!` macros resolve `$crate::diagnostic` from outside
 // this crate, and so `mur run`'s launch path writes its lines the same way the runtime does.
+pub(crate) mod control_plane;
 pub(crate) mod credential_gateway;
 pub mod diagnostic;
 pub(crate) mod dns_resolver;

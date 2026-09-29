@@ -30,6 +30,7 @@ use commands::{
     build::run_build,
     cancel::run_cancel,
     config_cmd::{run_config, ConfigCommand},
+    control::{run_control, ControlCommand},
     conversation::{
         run_conversation_ls, run_conversation_rm, run_conversation_truncate, ConversationCommand,
     },
@@ -366,6 +367,11 @@ enum Commands {
         #[arg(long, value_name = "HOST:PORT")]
         url: Option<String>,
     },
+    /// Change what a running capsule's control: block lets a controller change
+    Control {
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
     /// List the capsules running on this machine
     Ps,
     /// Stop one running capsule, ending its session and everything it still holds
@@ -656,6 +662,7 @@ fn main() {
             url,
         } => cancel_arguments(session, task_id, url)
             .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
+        Commands::Control { command } => run_control(command),
         Commands::Ps => run_ps(),
         Commands::Stop { session, timeout } => run_stop(&session, timeout),
         #[cfg(feature = "beta-mur-deploy")]

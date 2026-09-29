@@ -144,7 +144,7 @@ pub(crate) fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
 ///
 /// `TcpStream::connect_timeout` takes a resolved `SocketAddr`, so the host is resolved first and
 /// every address it yields is tried in turn, which is what the plain `connect` does for free.
-fn connect_with_timeout(addr: &str) -> Result<TcpStream, CliError> {
+pub(crate) fn connect_with_timeout(addr: &str) -> Result<TcpStream, CliError> {
     let resolved: Vec<_> = addr
         .to_socket_addrs()
         .map_err(|e| CliError::new(E_IO_003, format!("failed to resolve {addr}: {e}")))?

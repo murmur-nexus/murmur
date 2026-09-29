@@ -226,8 +226,16 @@ pub(crate) fn formation_env_report(
 ) -> Option<FormationEnvReport> {
     // A set reference is already satisfied, so it contributes no line and no finding — which is
     // what keeps a fully-provisioned capsule's report to what the walk alone found.
+    // A `control.secrets` name is supplied by a controller at run time and is never read from the
+    // environment, so this workspace not holding it is not a gap.
     let unset_references: Vec<ReferencedEnvVariable> = referenced_env_variables(root_manifest_yaml)
         .into_iter()
+        .filter(|reference| {
+            !root
+                .control
+                .as_ref()
+                .is_some_and(|control| control.declares_secret(&reference.variable))
+        })
         .filter(|reference| {
             !environment.answers_from_credentials(reference)
                 && !environment.contains(&reference.variable)
@@ -923,6 +931,23 @@ mod tests {
             source_refs(variable),
             ["infer-root@0.0.1", "infer-worker@0.1.0"]
         );
+    }
+
+    /// A `control.secrets` name is supplied by a controller at run time, so it is never reported
+    /// as a variable this workspace is missing.
+    #[test]
+    fn a_control_secret_is_not_reported_as_unset() {
+        let project = TempDir::new().unwrap();
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n  - name: card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\ncontrol:\n  secrets: [CARD_TOKEN]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
+        assert!(formation_env_report(
+            &root,
+            yaml,
+            project.path(),
+            None,
+            &EnvironmentNames::from_names(Vec::<String>::new()),
+        )
+        .is_none());
     }
 
     /// A capsule that delegates to nobody has no formation to walk, so the only thing this

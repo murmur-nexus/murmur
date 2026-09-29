@@ -229,6 +229,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },

@@ -536,6 +536,13 @@ pub enum RuntimeError {
     #[error("spend ledger at {path} is unavailable: {message}")]
     SpendLedgerUnavailable { path: String, message: String },
 
+    /// A capsule declaring `control:` could not mint its control token or write it beside its
+    /// running record. Raised before the door is announced: a capsule whose declared
+    /// controllability no controller could reach does not run. `reason` names the path and the
+    /// failure, never the token.
+    #[error("this capsule declares control: and its control token could not be written: {reason}")]
+    ControlTokenUnwritable { reason: String },
+
     #[error("agent loop failed: {0}")]
     AgentLoopFailed(String),
 

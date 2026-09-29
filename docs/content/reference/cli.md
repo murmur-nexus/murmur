@@ -18,6 +18,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur watch` | Stream live events from a running capsule's output to stdout |
 | `mur cancel` | Stop one running task on a capsule, leaving the session running |
 | `mur stop` | End one running capsule, and report what it left behind |
+| `mur control` | Show or change what a running capsule's `control:` block lets a controller change |
 | `mur deploy run` | Upload a capsule to an existing VM and return its public URL |
 | `mur deploy ls` | List all deployed capsules |
 | `mur destroy` | Remove a deployment record from the local tracking list |
@@ -99,6 +100,10 @@ removes it when the session ends.
 | File mode | `0600` |
 | Written by | The runtime, once the capsule is serving its door and just before `mur run` prints its URL |
 | Removed by | The runtime, when the session ends |
+
+A session whose manifest declares `control:` also holds its control token beside its record, at
+`~/.murmur/running/<session_id>.control`, mode `0600`, removed with the record — see
+[Control surface](control-surface.md#token).
 
 Each record carries the session id, the capsule address, the process id and its start time, the
 capsule name and version, the session workdir, whether the session outlives its launcher, and the
@@ -1143,6 +1148,79 @@ Exit codes:
 
 - `0` — the capsule holds this task; the line printed says what state it is in
 - `1` — the capsule does not hold this task id, the session address named nothing running
+  (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
+
+---
+
+## `mur control`
+
+Show or change what a running capsule's [`control:`](manifest.md#field-control) block lets a
+controller change, over its [control surface](control-surface.md).
+
+```bash
+mur control show [SESSION] [--json]
+mur control set <SETTING> <VALUE> [SESSION]
+mur control secret <NAME> [SESSION]
+mur control forget <NAME> [SESSION]
+```
+
+| Subcommand | Does |
+|---|---|
+| `show` | Lists the declared settings with their current values, and the declared secrets with whether each is set |
+| `set` | Changes a declared setting from the capsule's next inference call |
+| `secret` | Supplies a declared secret's value, read from standard input |
+| `forget` | Drops a declared secret's value, so its gateway's keyed requests are refused again |
+
+| Argument | Default | Description |
+|---|---|---|
+| `SESSION` | `@1` | A [session address](#session-addresses) naming a running capsule |
+| `SETTING` | — | A setting `control.settings` declares, e.g. `inference.max_tokens` |
+| `VALUE` | — | The new value. Sent as JSON when it parses as JSON, as a string otherwise; the capsule decides what the setting takes |
+| `NAME` | — | A secret `control.secrets` declares |
+| `--json` | off | `show` only: print the control surface's JSON as it answered |
+
+Each subcommand resolves `SESSION` through its running record, reads the control token beside it,
+and makes one request to the capsule. There is no `--url`: the token is found only through the
+record.
+
+`mur control secret` reads the value from standard input and strips exactly one trailing `\n` or
+`\r\n`. On a terminal it prompts `value for NAME: ` on stderr and turns echo off for the read,
+restoring it on return, `SIGINT`, `SIGTERM` or `SIGHUP`. The value is sent only when the capsule is
+reached over loopback; the control surface refuses it otherwise.
+
+Output:
+
+```text
+$ mur control show
+session:  ses_0199c4e2f1b7712a9d3e4f5061728394
+settings:
+  inference.max_tokens   4096
+secrets:
+  CARD_TOKEN             not set
+
+$ mur control set inference.max_tokens 2048
+setting:  inference.max_tokens
+previous: 4096
+value:    2048
+applies:  next inference call
+
+$ printf '%s\n' "$CARD_TOKEN_VALUE" | mur control secret CARD_TOKEN
+secret: CARD_TOKEN
+set:    yes (new)
+
+$ mur control forget CARD_TOKEN
+secret: CARD_TOKEN
+set:    no
+```
+
+`set:` reads `yes (replaced)` when a value was already held. Neither the token nor a secret value
+appears in any output or error.
+
+Exit codes:
+
+- `0` — the control surface accepted the request
+- `1` — the session has no control surface or the surface refused the request (`E-RUN-042`, which
+  states the HTTP status and the surface's reason), the session address named nothing running
   (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
 
 ---

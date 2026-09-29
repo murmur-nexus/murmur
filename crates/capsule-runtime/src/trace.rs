@@ -55,6 +55,9 @@ pub(crate) struct TraceWriter {
     /// Every credential gateway the session holds. Set by [`Self::set_gateways`] before
     /// `session_start` is written; empty until then.
     gateways: Vec<SessionGateway>,
+    /// What a controller may change on this session. Set by [`Self::set_control`] before
+    /// `session_start` is written; `None` for a capsule with no `control:` block.
+    control: Option<SessionControl>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -179,7 +182,7 @@ pub(crate) const RETENTION_REASON_MAX_MESSAGES: &str = "max_messages";
 ///
 /// Called once per line at the moment of the write. An id is never reused, never derived from
 /// the event's content, and never reconstructed from anything else in the file.
-fn new_event_id() -> String {
+pub(crate) fn new_event_id() -> String {
     format!("evt_{}", uuid::Uuid::now_v7().simple())
 }
 
@@ -274,6 +277,10 @@ struct SessionStartEvent {
     /// and empty for a session with none, so an auditor can tell an unmetered third-party
     /// upstream from spend the ceilings cover.
     gateways: Vec<SessionGateway>,
+    /// What a controller holding this session's control token may change: the setting names and
+    /// secret names `control:` declares. Omitted entirely for a capsule with no `control:` block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control: Option<SessionControl>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -1562,6 +1569,7 @@ impl TraceWriter {
             system_prompt_sha256,
             credential_source: "none",
             gateways: Vec::new(),
+            control: None,
             resumed_from,
             context_id,
             spawned_by,
@@ -1647,6 +1655,39 @@ impl TraceWriter {
         self.gateways = gateways;
     }
 
+    /// Records what `control:` declares for `session_start.control`.
+    pub(crate) fn set_control(&mut self, control: Option<SessionControl>) {
+        self.control = control;
+    }
+
+    /// Records that this inference call is the first to use a setting value a controller set:
+    /// `turn` is the call's zero-based turn, the same number its `inference` line carries, and
+    /// `change_id` the `event_id` of the `control_change` that set `value`.
+    ///
+    /// Written before the call is sent, so it precedes the turn's `inference` line and hangs off
+    /// the task.
+    pub(crate) async fn write_control_applied(
+        &mut self,
+        turn: u32,
+        name: &str,
+        value: Value,
+        change_id: &str,
+    ) -> std::io::Result<()> {
+        let event = ControlAppliedEvent {
+            event_type: "control_applied",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            name,
+            value,
+            change_id,
+        };
+        self.write_event(&event).await
+    }
+
     pub(crate) async fn write_session_start(
         &mut self,
         max_turns: u32,
@@ -1675,6 +1716,7 @@ impl TraceWriter {
             system_prompt_sha256: self.system_prompt_sha256.clone(),
             credential_source: self.credential_source,
             gateways: self.gateways.clone(),
+            control: self.control.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -2750,6 +2792,93 @@ pub(crate) struct SessionGateway {
     pub(crate) metered: bool,
 }
 
+/// `session_start.control`: the names a capsule's `control:` block declares, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionControl {
+    /// Controllable setting names, as `control.settings` lists them.
+    pub(crate) settings: Vec<&'static str>,
+    /// Controller-supplied secret names, as `control.secrets` lists them.
+    pub(crate) secrets: Vec<String>,
+}
+
+/// One accepted control-plane change, as [`ResourceTraceAppender::write_control_change`] records
+/// it. `event_id` is minted by the caller, because the setting it changed carries it forward to
+/// the `control_applied` that names it.
+pub(crate) struct ControlChange<'a> {
+    pub(crate) event_id: String,
+    pub(crate) token_id: &'a str,
+    /// `"setting"` or `"secret"`.
+    pub(crate) kind: &'static str,
+    pub(crate) name: &'a str,
+    /// `"set"` or `"forget"`.
+    pub(crate) action: &'static str,
+    /// A setting's value before and after. Always `None` for a secret.
+    pub(crate) previous: Option<Value>,
+    pub(crate) value: Option<Value>,
+    /// When a setting change takes effect. `None` for a secret.
+    pub(crate) applies_from: Option<&'static str>,
+    /// For a secret `set`: whether it replaced a held value.
+    pub(crate) replaced: Option<bool>,
+}
+
+/// `control_change`: a controller changed a setting or a secret. A secret's line names it and
+/// carries nothing of its value.
+#[derive(Serialize)]
+struct ControlChangeEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    principal: &'static str,
+    token_id: &'a str,
+    kind: &'static str,
+    name: &'a str,
+    action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applies_from: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replaced: Option<bool>,
+}
+
+/// `control_refused`: the control plane refused a request. `kind`, `name` and `token_id` are
+/// written only once the request authenticated, so a `401` names nothing.
+#[derive(Serialize)]
+struct ControlRefusedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    status: u16,
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<&'a str>,
+}
+
+/// `control_applied`: the first inference call to use a setting value a controller set.
+#[derive(Serialize)]
+struct ControlAppliedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    name: &'a str,
+    value: Value,
+    change_id: &'a str,
+}
+
 /// `gateway_credential`: the `inference_credential` event for the credential of any artifact other
 /// than the configured inference driver, with the artifact's name.
 #[derive(Serialize)]
@@ -3114,6 +3243,52 @@ impl ResourceTraceAppender {
             status,
             retried,
             reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one accepted control-plane change, under the `event_id` the caller minted.
+    pub(crate) async fn write_control_change(&self, change: ControlChange<'_>) {
+        let event = ControlChangeEvent {
+            event_type: "control_change",
+            event_id: change.event_id,
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            principal: "controller",
+            token_id: change.token_id,
+            kind: change.kind,
+            name: change.name,
+            action: change.action,
+            previous: change.previous,
+            value: change.value,
+            applies_from: change.applies_from,
+            replaced: change.replaced,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one refused control-plane request. `kind`, `name` and `token_id` are `None` for a
+    /// request that did not authenticate.
+    pub(crate) async fn write_control_refused(
+        &self,
+        status: u16,
+        reason: &'static str,
+        kind: Option<&'static str>,
+        name: Option<&str>,
+        token_id: Option<&str>,
+    ) {
+        let event = ControlRefusedEvent {
+            event_type: "control_refused",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            status,
+            reason,
+            kind,
+            name,
+            token_id,
         };
         self.append(&event).await;
     }

@@ -23,6 +23,11 @@
 //! The record names the process and stores nothing from the environment. The directory is `0700`
 //! and each record `0600`, because the set of records is a map of reachable capsules to anything
 //! on the machine that can read it.
+//!
+//! A session whose manifest declares `control:` also holds `<session_id>.control` beside its
+//! record: the control token, at the same mode, written before the record and removed with it.
+//! It is the only place the token exists outside the process, and it is useless once the process
+//! is gone, because the key that verifies it was never written anywhere.
 
 use std::{
     path::{Path, PathBuf},
@@ -37,8 +42,11 @@ const RUNNING_DIR: &str = "running";
 /// Mode held on the running directory, and on `~/.murmur` on the way to it.
 const RUNNING_DIR_MODE: u32 = 0o700;
 
-/// Mode held on each record file.
+/// Mode held on each record file, and on each control token file.
 const RECORD_FILE_MODE: u32 = 0o600;
+
+/// Extension of a session's control token file, beside its `.json` record.
+const CONTROL_TOKEN_EXTENSION: &str = "control";
 
 /// How long the door probe waits for a TCP connection: long enough for a loopback accept, short
 /// enough that an address nothing holds is reported rather than waited on.
@@ -268,10 +276,52 @@ fn refusal_before_signal(state: &ProcessState) -> Option<SignalOutcome> {
     }
 }
 
-/// Unlink one record. For a [`Liveness::Gone`] reading only.
+/// Unlink one record, and its control token file if it has one. For a [`Liveness::Gone`] reading
+/// only.
 pub fn prune(record: &RunningRecord) {
     if let Ok(dir) = running_dir() {
         let _ = std::fs::remove_file(record_path(&dir, &record.session_id));
+        let _ = std::fs::remove_file(token_path(&dir, &record.session_id));
+    }
+}
+
+/// `~/.murmur/running/<session_id>.control`: where a session declaring `control:` keeps its
+/// control token for as long as it runs.
+///
+/// The `Err` is the running directory being unusable, as [`running_dir`] reports it.
+pub fn control_token_path(session_id: &str) -> Result<PathBuf, String> {
+    Ok(token_path(&running_dir()?, session_id))
+}
+
+/// One session's control token file, written for exactly as long as the session runs.
+///
+/// A guard of its own rather than part of [`RunningGuard`]: the token is written before the
+/// record, and a session whose record could not be written still runs and still holds a token.
+pub struct ControlTokenGuard {
+    path: PathBuf,
+}
+
+impl ControlTokenGuard {
+    /// Writes `token` to [`control_token_path`] at owner-only mode and holds it until this guard
+    /// drops.
+    ///
+    /// The `Err` names the path and why; it never carries the token.
+    pub fn write(session_id: &str, token: &str) -> Result<Self, String> {
+        let path = control_token_path(session_id)?;
+        crate::retention::StagedRewrite::stage_with_mode(
+            &path,
+            token.as_bytes(),
+            Some(RECORD_FILE_MODE),
+        )
+        .and_then(crate::retention::StagedRewrite::commit)
+        .map_err(|reason| format!("failed to write {}: {reason}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ControlTokenGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -309,6 +359,8 @@ impl RunningGuard {
 impl Drop for RunningGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        // The record's control token goes with it, whichever guard drops first.
+        let _ = std::fs::remove_file(self.path.with_extension(CONTROL_TOKEN_EXTENSION));
     }
 }
 
@@ -323,6 +375,10 @@ pub fn has_controlling_terminal() -> bool {
 
 fn record_path(dir: &Path, session_id: &str) -> PathBuf {
     dir.join(format!("{session_id}.json"))
+}
+
+fn token_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.{CONTROL_TOKEN_EXTENSION}"))
 }
 
 fn read_record(path: &Path) -> Option<RunningRecord> {
@@ -495,6 +551,58 @@ fn probe_session_id(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_removes_the_record_and_its_control_token() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "running::tests::inner_prune_removes_the_record_and_its_control_token",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by prune_removes_the_record_and_its_control_token"]
+    fn inner_prune_removes_the_record_and_its_control_token() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let record = RunningRecord {
+            session_id: "ses_0199prunecontroltoken000000000000".to_string(),
+            url: "localhost:1".to_string(),
+            pid: std::process::id(),
+            process_start: String::new(),
+            capsule_name: "c".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            workdir: PathBuf::from("/tmp"),
+            outlives_launcher: false,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let token = ControlTokenGuard::write(&record.session_id, "ctl1.token.mac").unwrap();
+        let record_guard = RunningGuard::write(&record).unwrap();
+        let dir = running_dir().unwrap();
+        let token_file = control_token_path(&record.session_id).unwrap();
+        assert_eq!(
+            token_file,
+            dir.join(format!("{}.control", record.session_id))
+        );
+        assert_eq!(crate::murmur_home::mode_of(&token_file), RECORD_FILE_MODE);
+        assert_eq!(
+            std::fs::read_to_string(&token_file).unwrap(),
+            "ctl1.token.mac"
+        );
+
+        prune(&record);
+        assert!(!record_path(&dir, &record.session_id).exists());
+        assert!(!token_file.exists());
+
+        // Either guard dropping takes both files.
+        std::mem::forget(token);
+        std::mem::forget(record_guard);
+        let _token = ControlTokenGuard::write(&record.session_id, "ctl1.token.mac").unwrap();
+        drop(RunningGuard::write(&record).unwrap());
+        assert!(!token_file.exists());
+    }
 
     fn record(pid: u32, process_start: &str) -> RunningRecord {
         RunningRecord {

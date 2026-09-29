@@ -123,6 +123,7 @@ fn stage_agent_with_port(
             internal_port,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },

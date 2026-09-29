@@ -18,7 +18,7 @@ use capsule_runtime::{running, Liveness, ProcessState, RunningRecord};
 use crate::error::{CliError, E_RUN_022, E_RUN_023, E_RUN_028};
 
 /// The address an omitted argument means: the most recent running session.
-const LATEST: &str = "@1";
+pub(crate) const LATEST: &str = "@1";
 
 /// Length of a full session id: `ses_` and 32 hex characters.
 const SESSION_ID_LEN: usize = 36;

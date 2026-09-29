@@ -976,11 +976,14 @@ pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         410 => "Gone",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
         _ => "Internal Server Error",
     }
 }

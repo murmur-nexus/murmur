@@ -25,6 +25,8 @@ capsule-runtime.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.18"
+# Terminal echo control for `mur control secret`.
+libc = "0.2"
 murmur-artifact.workspace = true
 dialoguer = "0.12"
 rayon = "1"
@@ -76,9 +78,6 @@ alloc-bench = ["capsule-runtime/alloc-bench"]
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
 assert_cmd = "2"
-# Only to ask whether a pid is still alive (`kill(pid, 0)`), which the process runner tests do
-# to prove a killed harness is really gone.
-libc = "0.2"
 predicates = "3"
 sha2 = "0.10"
 tempfile = "3"

@@ -94,6 +94,8 @@ section that explains it.
 | `E-RUN-038` | A spend ceiling is set against a process driver that reports no usage | [E-RUN-038](#e-run-038) |
 | `E-RUN-039` | A forget was asked of a capsule that keeps no harness session | [E-RUN-039](#e-run-039) |
 | `E-RUN-040` | The session ran and its task did not complete: it failed, spent `inference.max_turns`, hit a spend ceiling, or was canceled | [E-RUN-040](#e-run-040) |
+| `E-RUN-041` | A capsule declaring `control:` could not write its control token beside its running record, and did not launch | [E-RUN-041](#e-run-041) |
+| `E-RUN-042` | `mur control` named a session with no control surface, or the control surface refused the request | [E-RUN-042](#e-run-042) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -744,6 +746,31 @@ error[E-RUN-040]: the task ended failed: {"error":"driver: failed to parse Anthr
 A launch reports the first task that did not complete; a later run that completed does not replace
 it. See [Status and exit code](cli.md#mur-run-status). Under `--json` no `status:` line is printed,
 and the error and exit code are the same.
+
+### E-RUN-041 — the control token could not be written { #e-run-041 }
+
+A capsule whose manifest declares [`control:`](manifest.md#field-control) writes its control token
+to `~/.murmur/running/<session_id>.control` before its door is announced. When that file cannot be
+written, the capsule does not run:
+
+```text
+error[E-RUN-041]: this capsule declares control: and its control token could not be written: <path>: <reason>
+  hint: make ~/.murmur/running a directory this user can write, or remove control: from murmur.yaml — a capsule whose declared controllability no controller could reach does not run
+```
+
+No inference call is made. The message names the path and the failure, never the token.
+
+### E-RUN-042 — no control surface, or a refused control request { #e-run-042 }
+
+`mur control` prints this in two cases:
+
+| Case | Message |
+|---|---|
+| The session holds no control token, because its manifest declares no `control:` block | `<session_id> has no control surface: it holds no control token, because its murmur.yaml declares no control: block` |
+| The [control surface](control-surface.md#refusals) answered anything but `200` | `the control surface of <session_id> refused <METHOD> <path>: HTTP <status>: <reason>` |
+
+What is controllable is fixed at launch, so the first case is answered by declaring `control:` and
+restarting the capsule. Neither message carries the token or a secret value.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

@@ -552,6 +552,10 @@ pub struct RuntimeManifest {
     /// Read-only views onto the workdir that the operator opens to processes outside the capsule.
     /// `None` means nothing is exported and every request to the resource plane is denied.
     pub exports: Option<Exports>,
+    /// What a controller holding this session's control token may change while it runs. `None`
+    /// — the block absent, `control: {}`, or both lists empty — means the capsule has no control
+    /// surface and mints no token.
+    pub control: Option<ControlConfig>,
     /// Pins the mur runtime version required by this capsule.
     /// Used by `mur deploy` to select the binary version to install on the VM,
     /// and by `mur run` to warn on version mismatch.
@@ -572,6 +576,65 @@ pub struct RuntimeManifest {
 impl RuntimeManifest {
     pub fn effective_lifecycle(&self) -> LifecycleConfig {
         self.lifecycle.clone().unwrap_or_default()
+    }
+}
+
+/// A setting of a running session that a controller may change over the control surface, when
+/// `control.settings` names it.
+///
+/// Each variant is one manifest key, spelled by [`Self::wire_name`] in `control.settings`, in the
+/// control surface's paths and bodies, and in the trace. What a value must be, and where the agent
+/// loop reads it, is the runtime's to decide per variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControllableSetting {
+    /// `inference.max_tokens`: the per-turn output cap the agent loop sends as `max_tokens`.
+    /// `transport: http` only, on the same terms as the manifest key.
+    InferenceMaxTokens,
+}
+
+impl ControllableSetting {
+    /// Every setting a manifest may list, in the order refusals name them.
+    pub const ALL: &'static [ControllableSetting] = &[Self::InferenceMaxTokens];
+
+    /// The manifest key this setting is, as written in `control.settings`.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::InferenceMaxTokens => "inference.max_tokens",
+        }
+    }
+
+    /// The setting `name` spells, or `None` for anything outside [`Self::ALL`].
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|setting| setting.wire_name() == name)
+    }
+}
+
+/// The top-level `control:` block: what a controller may change on a running session.
+///
+/// Parsed only to a non-empty declaration; `control: {}` and two empty lists parse as no block.
+/// Nothing a controller sets is persisted, so this is also everything a restart starts from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ControlConfig {
+    /// Settings a controller may change, in manifest order, each listed once.
+    pub settings: Vec<ControllableSetting>,
+    /// Credential names a controller supplies at run time, in manifest order, each listed once.
+    /// Every name backs some artifact's `gateway.api_key: ${NAME}`, and none backs the configured
+    /// inference driver's. Such a name is never looked up in the config or the environment.
+    pub secrets: Vec<String>,
+}
+
+impl ControlConfig {
+    /// Whether `name` is a credential a controller supplies.
+    pub fn declares_secret(&self, name: &str) -> bool {
+        self.secrets.iter().any(|secret| secret == name)
+    }
+
+    /// Whether `setting` is one a controller may change.
+    pub fn declares_setting(&self, setting: ControllableSetting) -> bool {
+        self.settings.contains(&setting)
     }
 }
 
@@ -1476,6 +1539,11 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidExports { field: String, message: String },
+    #[error(
+        "{}: invalid control config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
+    InvalidControl { field: String, message: String },
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
@@ -1522,6 +1590,8 @@ struct RawRuntimeManifest {
     #[serde(default)]
     exports: Option<RawExports>,
     #[serde(default)]
+    control: Option<RawControl>,
+    #[serde(default)]
     mur_version: Option<String>,
     /// Captured only to refuse it. `config:` is delivered to one artifact through that artifact's
     /// own grant, so a capsule-wide block reaches nothing; without this field it would be one of
@@ -1552,6 +1622,19 @@ struct RawRuntimeManifest {
     #[serde(default)]
     #[allow(dead_code)]
     requires_files: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawControl {
+    /// Untyped, so a value that is not a list of strings is refused as an
+    /// [`RuntimeManifestError::InvalidControl`] naming the field rather than as a serde type error
+    /// naming a line number.
+    #[serde(default)]
+    settings: Option<serde_yaml::Value>,
+    #[serde(default)]
+    secrets: Option<serde_yaml::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2078,6 +2161,7 @@ impl RawBlock for RawRuntimeManifest {
         "network",
         "lifecycle",
         "exports",
+        "control",
         "mur_version",
         "config",
         "runtime",
@@ -2118,6 +2202,16 @@ impl RawBlock for RawRuntimeManifest {
         if let Some(exports) = &self.exports {
             collect_block(exports, &child_path(path, "exports"), out);
         }
+        if let Some(control) = &self.control {
+            collect_block(control, &child_path(path, "control"), out);
+        }
+    }
+}
+
+impl RawBlock for RawControl {
+    const KNOWN_KEYS: &'static [&'static str] = &["settings", "secrets"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -2731,6 +2825,10 @@ impl RuntimeManifest {
                 field: "version".to_string(),
             })?;
 
+        // Read off the raw entries because a parse that skips secrets keeps no `ApiKeyReference`,
+        // and `control.secrets` is checked against what the manifest wrote either way.
+        let gateway_references = raw_gateway_references(&raw.artifacts);
+
         let artifacts = raw
             .artifacts
             .into_iter()
@@ -3049,6 +3147,7 @@ impl RuntimeManifest {
         });
 
         let exports = parse_exports(raw.exports)?;
+        let control = parse_control(raw.control, &gateway_references, inference.as_ref())?;
 
         Ok(Self {
             name,
@@ -3062,10 +3161,177 @@ impl RuntimeManifest {
             network,
             lifecycle,
             exports,
+            control,
             mur_version: raw.mur_version.filter(|s| !s.trim().is_empty()),
             unknown_keys,
         })
     }
+}
+
+/// Every artifact entry whose `gateway.api_key` is written as `${NAME}`, as `(artifact, NAME)`.
+fn raw_gateway_references(artifacts: &[RawArtifact]) -> Vec<(String, String)> {
+    artifacts
+        .iter()
+        .filter_map(|artifact| {
+            let name = artifact.name.as_deref()?.trim();
+            let written = artifact
+                .gateway
+                .as_ref()?
+                .as_ref()?
+                .api_key
+                .as_ref()?
+                .as_ref()?;
+            let variable = parse_env_reference(written.trim())?;
+            Some((name.to_string(), variable.to_string()))
+        })
+        .collect()
+}
+
+/// Lowers the top-level `control:` block. A block that declares nothing is no block.
+///
+/// `gateway_references` is every `(artifact, NAME)` pair an entry's `gateway.api_key: ${NAME}`
+/// wrote. A secret must back one of them, and must not back the configured `transport: http`
+/// driver's: that credential is resolved at staging and keys every turn, so a session launched
+/// without it could make no inference call at all.
+fn parse_control(
+    raw: Option<RawControl>,
+    gateway_references: &[(String, String)],
+    inference: Option<&InferenceConfig>,
+) -> Result<Option<ControlConfig>, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let refuse = |field: &str, message: String| RuntimeManifestError::InvalidControl {
+        field: field.to_string(),
+        message,
+    };
+    let settings_written = control_string_list("control.settings", raw.settings)?;
+    let secrets_written = control_string_list("control.secrets", raw.secrets)?;
+    if settings_written.is_empty() && secrets_written.is_empty() {
+        return Ok(None);
+    }
+    let Some(inference) = inference else {
+        return Err(refuse(
+            "control",
+            "is declared on a capsule with no inference: block; the control surface is served on \
+             an agent capsule's A2A listener, and a script capsule opens none"
+                .to_string(),
+        ));
+    };
+
+    let mut settings = Vec::new();
+    for entry in settings_written {
+        let Some(setting) = ControllableSetting::from_wire_name(&entry) else {
+            let controllable: Vec<&str> = ControllableSetting::ALL
+                .iter()
+                .map(|setting| setting.wire_name())
+                .collect();
+            return Err(refuse(
+                "control.settings",
+                format!(
+                    "'{entry}' is not a controllable setting; the controllable settings are: {}",
+                    controllable.join(", ")
+                ),
+            ));
+        };
+        if settings.contains(&setting) {
+            return Err(refuse(
+                "control.settings",
+                format!("'{entry}' is listed more than once"),
+            ));
+        }
+        match setting {
+            ControllableSetting::InferenceMaxTokens if inference.transport != "http" => {
+                return Err(refuse(
+                    "control.settings",
+                    format!(
+                        "'{entry}' is controllable only under inference.transport: http; a \
+                         transport: {} harness sets its own output cap",
+                        inference.transport
+                    ),
+                ));
+            }
+            ControllableSetting::InferenceMaxTokens => {}
+        }
+        settings.push(setting);
+    }
+
+    let inference_driver = (inference.transport == "http")
+        .then(|| {
+            inference
+                .driver
+                .as_ref()
+                .map(|driver| driver.artifact.as_str())
+        })
+        .flatten();
+    let mut secrets: Vec<String> = Vec::new();
+    for entry in secrets_written {
+        if !is_valid_env_variable(&entry) {
+            return Err(refuse(
+                "control.secrets",
+                format!(
+                    "'{entry}' is not a credential name; a name is uppercase letters, digits and \
+                     underscores, and does not start with a digit"
+                ),
+            ));
+        }
+        if secrets.contains(&entry) {
+            return Err(refuse(
+                "control.secrets",
+                format!("'{entry}' is listed more than once"),
+            ));
+        }
+        let backing: Vec<&str> = gateway_references
+            .iter()
+            .filter(|(_, variable)| *variable == entry)
+            .map(|(artifact, _)| artifact.as_str())
+            .collect();
+        if backing.is_empty() {
+            return Err(refuse(
+                "control.secrets",
+                format!(
+                    "'{entry}' is not referenced by any artifact's gateway.api_key as \
+                     ${{{entry}}}; a controller-supplied secret must key some artifact's gateway"
+                ),
+            ));
+        }
+        if let Some(driver) = inference_driver.filter(|driver| backing.contains(driver)) {
+            return Err(refuse(
+                "control.secrets",
+                format!(
+                    "'{entry}' keys the configured inference driver's gateway \
+                     (artifacts.{driver}.gateway.api_key); the inference credential is resolved \
+                     at launch and cannot be supplied by a controller"
+                ),
+            ));
+        }
+        secrets.push(entry);
+    }
+
+    Ok(Some(ControlConfig { settings, secrets }))
+}
+
+/// `value` as a list of strings, trimmed, for `field`. Absent and YAML null are the empty list.
+fn control_string_list(
+    field: &str,
+    value: Option<serde_yaml::Value>,
+) -> Result<Vec<String>, RuntimeManifestError> {
+    let refuse = || RuntimeManifestError::InvalidControl {
+        field: field.to_string(),
+        message: "must be a list of names".to_string(),
+    };
+    let items = match value {
+        None | Some(serde_yaml::Value::Null) => return Ok(Vec::new()),
+        Some(serde_yaml::Value::Sequence(items)) => items,
+        Some(_) => return Err(refuse()),
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            serde_yaml::Value::String(name) => Ok(name.trim().to_string()),
+            _ => Err(refuse()),
+        })
+        .collect()
 }
 
 /// Lowers the top-level `exports:` block, rejecting anything the runtime would otherwise have to
@@ -10852,6 +11118,8 @@ exports:
     probe_files: 1
   peer_files:
     probe_peer_files: 1
+control:
+  probe_control: 1
 "#,
         );
 
@@ -10898,6 +11166,7 @@ exports:
             ("probe_exports", "exports"),
             ("probe_files", "exports.files"),
             ("probe_peer_files", "exports.peer_files"),
+            ("probe_control", "control"),
         ]
         .into_iter()
         .map(|(key, path)| (key.to_string(), path.to_string()))
@@ -10969,5 +11238,185 @@ exports:
             .step_by(2)
             .map(str::to_string)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    const TOOL_ENTRY: &str = "  - name: card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\n";
+
+    /// An `http` agent capsule whose driver is keyed by `${DRIVER_KEY}` and whose `card-api` tool
+    /// is keyed by `${CARD_TOKEN}`, with `control` spliced in at the top level.
+    fn agent(transport: &str, control: &str) -> String {
+        let driver = if transport == "http" {
+            "  - name: drv\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      api_key: ${DRIVER_KEY}\n"
+        } else {
+            "  - name: drv\n    version: 0.1.0\n    runtime: driver\n"
+        };
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n{driver}{TOOL_ENTRY}inference:\n  transport: {transport}\n  model: m\n  driver:\n    artifact: drv\n{control}"
+        )
+    }
+
+    fn refusal(yaml: &str) -> (String, String) {
+        match RuntimeManifest::from_yaml_str(yaml) {
+            Err(RuntimeManifestError::InvalidControl { field, message }) => (field, message),
+            other => panic!("expected InvalidControl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_absent_empty_and_empty_lists_load_as_none() {
+        for control in [
+            "",
+            "control: {}\n",
+            "control:\n",
+            "control:\n  settings: []\n  secrets: []\n",
+        ] {
+            let manifest = RuntimeManifest::from_yaml_str(&agent("http", control))
+                .unwrap_or_else(|err| panic!("{control:?}: {err}"));
+            assert_eq!(manifest.control, None, "{control:?}");
+        }
+    }
+
+    #[test]
+    fn control_parses_settings_and_secrets_in_manifest_order() {
+        let yaml = agent(
+            "http",
+            "control:\n  settings: [inference.max_tokens]\n  secrets: [CARD_TOKEN]\n",
+        );
+        for manifest in [
+            RuntimeManifest::from_yaml_str(&yaml).unwrap(),
+            RuntimeManifest::from_yaml_str_without_secrets(&yaml).unwrap(),
+        ] {
+            let control = manifest.control.unwrap();
+            assert_eq!(
+                control.settings,
+                vec![ControllableSetting::InferenceMaxTokens]
+            );
+            assert_eq!(control.secrets, vec!["CARD_TOKEN".to_string()]);
+            assert!(control.declares_secret("CARD_TOKEN"));
+            assert!(!control.declares_secret("DRIVER_KEY"));
+            assert!(control.declares_setting(ControllableSetting::InferenceMaxTokens));
+        }
+    }
+
+    #[test]
+    fn control_setting_wire_names_round_trip() {
+        for setting in ControllableSetting::ALL {
+            assert_eq!(
+                ControllableSetting::from_wire_name(setting.wire_name()),
+                Some(*setting)
+            );
+        }
+        assert_eq!(ControllableSetting::from_wire_name("inference.model"), None);
+    }
+
+    /// Every refusal names `control.settings` or `control.secrets` as its field and quotes the
+    /// entry it refused.
+    #[test]
+    fn control_manifest_refusals_name_the_field() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            (
+                "http",
+                "control:\n  settings: [inference.model]\n",
+                "control.settings",
+                "'inference.model' is not a controllable setting; the controllable settings are: inference.max_tokens",
+            ),
+            (
+                "process",
+                "control:\n  settings: [inference.max_tokens]\n",
+                "control.settings",
+                "'inference.max_tokens' is controllable only under inference.transport: http",
+            ),
+            (
+                "http",
+                "control:\n  settings: [inference.max_tokens, inference.max_tokens]\n",
+                "control.settings",
+                "'inference.max_tokens' is listed more than once",
+            ),
+            (
+                "http",
+                "control:\n  secrets: [CARD_TOKEN, CARD_TOKEN]\n",
+                "control.secrets",
+                "'CARD_TOKEN' is listed more than once",
+            ),
+            (
+                "http",
+                "control:\n  secrets: [card-token]\n",
+                "control.secrets",
+                "'card-token' is not a credential name",
+            ),
+            (
+                "http",
+                "control:\n  secrets: [OTHER_TOKEN]\n",
+                "control.secrets",
+                "'OTHER_TOKEN' is not referenced by any artifact's gateway.api_key as ${OTHER_TOKEN}",
+            ),
+            (
+                "http",
+                "control:\n  secrets: [DRIVER_KEY]\n",
+                "control.secrets",
+                "'DRIVER_KEY' keys the configured inference driver's gateway (artifacts.drv.gateway.api_key)",
+            ),
+            (
+                "http",
+                "control:\n  settings: inference.max_tokens\n",
+                "control.settings",
+                "must be a list of names",
+            ),
+            (
+                "http",
+                "control:\n  secrets: [1]\n",
+                "control.secrets",
+                "must be a list of names",
+            ),
+        ];
+        for (transport, control, field, message) in cases {
+            let (got_field, got_message) = refusal(&agent(transport, control));
+            assert_eq!(&got_field, field, "{control:?}");
+            assert!(
+                got_message.starts_with(message),
+                "{control:?}: {got_message}"
+            );
+            let rendered = RuntimeManifest::from_yaml_str(&agent(transport, control))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                rendered.contains(&format!("invalid control config for '{field}'")),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_on_a_capsule_with_no_inference_is_refused() {
+        let yaml = format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n{TOOL_ENTRY}control:\n  secrets: [CARD_TOKEN]\n"
+        );
+        let (field, message) = refusal(&yaml);
+        assert_eq!(field, "control");
+        assert!(message.contains("no inference: block"), "{message}");
+    }
+
+    #[test]
+    fn control_unknown_key_is_reported_once_at_its_block() {
+        let manifest = RuntimeManifest::from_yaml_str(&agent(
+            "http",
+            "control:\n  settings: [inference.max_tokens]\n  agent_may_call: true\n",
+        ))
+        .unwrap();
+        let keys: Vec<(&str, &str)> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.key.as_str(), key.block_path.as_str()))
+            .collect();
+        assert_eq!(keys, vec![("agent_may_call", "control")]);
+        assert_eq!(
+            manifest.control.unwrap().settings,
+            vec![ControllableSetting::InferenceMaxTokens]
+        );
     }
 }

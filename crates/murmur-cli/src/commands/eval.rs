@@ -679,6 +679,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                 .and_then(|capabilities| capabilities.containment)
                 .unwrap_or_default(),
             exports: runtime_manifest.exports.clone(),
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
