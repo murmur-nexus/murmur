@@ -118,10 +118,11 @@ impl RawHttpResponse {
 
 /// Fetches a peer's agent card.
 ///
-/// The minting side needs the peer's own `name` and `url` to derive the audience a handle is
-/// scoped to; both come from the card the peer already publishes, so neither side has to be told
-/// the audience string by the other. The caller enforces `capabilities.network.allow` *before*
-/// this is reached — **minting grants no new outbound authority**.
+/// The minting side needs the peer's own `name` and `JSONRPC` interface `url` to derive the
+/// audience a handle is scoped to; both come from the card the peer already publishes, so neither
+/// side has to be told the audience string by the other. The caller enforces
+/// `capabilities.network.allow` *before* this is reached — **minting grants no new outbound
+/// authority**.
 pub(crate) async fn fetch_agent_card(peer_url: &str) -> Result<serde_json::Value, String> {
     let response = raw_get(peer_url, "/.well-known/agent-card.json", &[]).await?;
     if response.status != 200 {

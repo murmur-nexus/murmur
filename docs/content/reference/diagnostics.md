@@ -432,6 +432,7 @@ has on it. Try again, or read what the session is doing with
 |---|---|
 | `failed to connect to …`, or a read timeout | The door did not answer in time — the process may be suspended, or the host too loaded to run it |
 | `the capsule at … answers for session …` | Another session holds that address |
+| `the agent card from … names no session` | The capsule was started by `mur` v0.4.0 or earlier, whose [agent card](agent-card.md#no-supported-interfaces) this version cannot read a session from. It stays unreachable until it ends; `mur stop` still ends it |
 | `pid N's start time could not be read` | A process holds the process id and the host would not say when it started, so whether it is the capsule is unknown |
 
 ### E-RUN-024 — the session could not be ended { #e-run-024 }

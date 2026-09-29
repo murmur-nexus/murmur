@@ -66,9 +66,9 @@ pub(crate) async fn bind_local_port(
 ///
 /// This is the door's whole method table: dispatch resolves a request's `method` through
 /// [`DoorMethod::resolve`], and the method list on the agent card's door extension is
-/// [`served_methods`], which asks the same resolver. Adding a method means adding a variant, its wire name and its `ALL`
-/// entry; the handler arm is then demanded by the exhaustive matches in the dispatcher, and the
-/// card lists it without further change.
+/// [`served_methods`], which asks the same resolver. Adding a method means adding a variant, its
+/// wire name and its `ALL` entry; the handler arm is then demanded by the exhaustive matches in the
+/// dispatcher, and the card lists it without further change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DoorMethod {
     MessageSend,
