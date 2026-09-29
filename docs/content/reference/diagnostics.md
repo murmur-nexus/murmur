@@ -102,6 +102,8 @@ section that explains it.
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
+| `W-DEPLOY-001` | A deploy's target compiled none, or not all, of the uploaded artifacts; those compile on the capsule's first launch | [W-DEPLOY-001](#w-deploy-001) |
+| `W-DEPLOY-002` | A deploy's target runs under a different `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` from the deploying machine | [W-DEPLOY-002](#w-deploy-002) |
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
@@ -1304,6 +1306,42 @@ A wasm or native artifact declares an obvious build input in `requires_files:` �
 payload, not the sources it was built from, so this is almost always a stray declaration.
 
 Static artifacts (`runtime: skill`) are exempt: their files *are* their content.
+
+---
+
+## Deploy warnings
+
+[`mur deploy run`](cli.md#mur-deploy-run) prints these on stderr after it has asked the target to
+compile the uploaded artifacts. The deploy continues, the capsule starts, and `mur deploy run` exits
+`0`. See [Precompile on the target](cli.md#deploy-precompile).
+
+### W-DEPLOY-001 — the target did not precompile { #w-deploy-001 }
+
+Two forms:
+
+```text
+warning[W-DEPLOY-001]: the target did not precompile (error: unrecognized subcommand 'precompile'); the capsule compiles its artifacts on its first launch
+warning[W-DEPLOY-001]: the target could not precompile murmur-tool-echo@1.0.0; the capsule compiles it on its first launch
+```
+
+| Form | Cause | Fix |
+|---|---|---|
+| `did not precompile (<error>)` | The target's `mur` printed no [`mur precompile`](cli.md#mur-precompile) report. The parenthesis quotes the first line it printed on stderr: `unrecognized subcommand 'precompile'` means the target runs a `mur` release older than the command; an SSH error means the command never ran | Set `mur_version` in the manifest to a release that has `mur precompile`, or pass `--mur-binary` |
+| `could not precompile <name@version>, …` | The report names those artifacts `failed`: the payload is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile on the target | Rebuild or re-publish the artifact. An artifact whose WASM does not compile also fails the capsule's launch |
+
+The capsule's first launch compiles what the target did not, taking as long as a launch with
+`--no-precompile`.
+
+### W-DEPLOY-002 — the target's decompression ceiling differs { #w-deploy-002 }
+
+```text
+warning[W-DEPLOY-002]: the artifact decompression ceiling is 524288000 bytes on this machine and 600000000 bytes on the target; the capsule runs, warm, under the target's value. To align them, pass --env MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES=524288000
+```
+
+The target's `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` — the value in the deploy's `.env`, or the
+default — is not this machine's. The target compiled and the capsule runs under the target's value,
+so the first launch is still warm, but an artifact that extracts here may be refused there, or the
+reverse. To run under this machine's value, pass the `--env` the warning gives.
 
 ---
 
