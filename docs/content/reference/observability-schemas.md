@@ -477,7 +477,7 @@ a snapshot taken where the loop stopped, so they may differ from the `residue` a
 `tasks/cancel` response carried, which was taken when that response was sent.
 
 **`task_rejected`**{ #task-rejected } — written once per task the session refused because it
-stopped taking work while the task was still queued. See
+stopped taking work while the task was still queued, as described under
 [Tasks queued when the session ends](manifest.md#queued-tasks-at-session-end)
 
 | Field | Type | Notes |
@@ -493,7 +493,7 @@ stopped taking work while the task was still queued. See
 | `session_ended` | The session ended on its own: its task finished under `after_task: exit` or `task_acceptance: single`, its launch task failed, or the [idle timeout](manifest.md#idle-timeout) fired |
 | `session_stopped` | [`mur stop`](cli.md#mur-stop) or `SIGTERM` ended the session |
 
-Written after the task loop ends and before `session_end`, whatever
+Written when the session stops taking work, before `session_end` and whatever
 [`trace.capture`](manifest.md#field-trace) is. A refused task never started, so it has no
 `task_start` and no `task_end`, and never a `task_failed` — this is its only record. A task
 cancelled while still queued keeps its [`task_canceled`](#task-canceled) line and has no

@@ -365,10 +365,6 @@ struct TaskRejectedEvent {
     source: Option<String>,
     /// `"session_ended"` or `"session_stopped"`.
     cause: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    // part of the record; `mur trace show` and `steps` name the cause instead
-    reason: String,
 }
 
 /// A task attempt failed, and why.
@@ -4203,7 +4199,6 @@ mod tests {
         let TraceEvent::TaskRejected(e) = serde_json::from_str::<TraceEvent>(bare).unwrap() else {
             panic!("a task_rejected line without source or reason still parses");
         };
-        assert_eq!(e.reason, "");
         assert_eq!(
             rejected_show_row(&e),
             "task_rejected  tsk_1  session_stopped  source unknown"

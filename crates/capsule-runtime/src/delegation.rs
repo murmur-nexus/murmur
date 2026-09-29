@@ -456,8 +456,9 @@ pub fn deliver_completion(
         ],
     )?;
 
-    // A door that refuses answers `200` with a JSON-RPC error, and one whose queue is full
-    // answers a `rejected` task. Neither delivered the completion, so neither is success.
+    // A door that refuses answers `200` with a JSON-RPC error, and one whose queue is full or
+    // whose session has stopped taking work answers a `rejected` task. Neither delivered the
+    // completion, so neither is success.
     if let Some(error) = response.get("error") {
         let message = error
             .get("message")
@@ -470,7 +471,10 @@ pub fn deliver_completion(
         .and_then(Value::as_str)
         == Some("rejected")
     {
-        return Err("the parent rejected the completion: its queue is full".to_string());
+        return Err(
+            "the parent rejected the completion: its queue is full or its session has stopped taking work"
+                .to_string(),
+        );
     }
     Ok(())
 }
