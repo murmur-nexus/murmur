@@ -1,5 +1,5 @@
-//! A remote consumer's view of what a capsule's door answers: the agent card's `serves` block,
-//! checked against the answers the same door gives over real HTTP.
+//! A remote consumer's view of what a capsule's door answers: the agent card's door and capsule
+//! extensions, checked against the answers the same door gives over real HTTP.
 //!
 //! Each test launches a real capsule through `stage_session` and `launch_session`, reads its card,
 //! and then asks the door every method the card lists — and one it does not — so an advertisement
@@ -170,18 +170,6 @@ fn rpc(method: &str, params: Value) -> Value {
 
 fn message_params(id: &str) -> Value {
     json!({"message": {"messageId": id, "role": "user", "parts": [{"text": "hello"}]}})
-}
-
-fn string_list(value: &Value) -> Vec<&str> {
-    value
-        .as_array()
-        .unwrap_or_else(|| panic!("expected an array; got {value}"))
-        .iter()
-        .map(|item| {
-            item.as_str()
-                .unwrap_or_else(|| panic!("expected a string; got {item}"))
-        })
-        .collect()
 }
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -363,8 +351,8 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
     let capsule = launch(TaskAcceptance::Queue, None);
     let card = capsule.card();
 
-    assert_eq!(string_list(&card["serves"]["methods"]), ALL_METHODS);
-    assert_eq!(card["serves"]["planes"], json!([]));
+    assert_eq!(common::card_door_methods(&card), ALL_METHODS);
+    assert_eq!(common::card_capsule_params(&card)["planes"], json!([]));
     assert_eq!(card["capabilities"]["streaming"], true);
 
     let sent = post_jsonrpc(&capsule.url, &rpc("message/send", message_params("m-send")));
@@ -422,10 +410,12 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
     let card = capsule.card();
 
     assert_eq!(
-        string_list(&card["serves"]["methods"]),
+        common::card_door_methods(&card),
         ["stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
     );
     assert_eq!(card["capabilities"]["streaming"], false);
+    assert_eq!(card["skills"], json!([]), "no task can be started: {card}");
+    common::assert_a2a_agent_card(&card);
 
     for (method, params) in [
         ("message/send", message_params("m-send")),
@@ -455,7 +445,10 @@ fn a_declared_files_export_is_listed_and_serves() {
         return;
     }
     let capsule = launch(TaskAcceptance::Queue, Some(EXPORTS_FILES));
-    assert_eq!(capsule.card()["serves"]["planes"], json!(["files"]));
+    assert_eq!(
+        common::card_capsule_params(&capsule.card())["planes"],
+        json!(["files"])
+    );
 
     let listed = http_request(&capsule.url, "GET", "/resources/files", &[]);
     assert_eq!(listed.status, 200, "body: {}", listed.json());
@@ -467,7 +460,10 @@ fn a_declared_peer_files_export_is_listed_and_serves() {
         return;
     }
     let capsule = launch(TaskAcceptance::Queue, Some(EXPORTS_PEER_FILES));
-    assert_eq!(capsule.card()["serves"]["planes"], json!(["peer_files"]));
+    assert_eq!(
+        common::card_capsule_params(&capsule.card())["planes"],
+        json!(["peer_files"])
+    );
 
     let redeemed = http_request(
         &capsule.url,
@@ -485,7 +481,10 @@ fn an_undeclared_plane_is_not_listed_and_only_refuses() {
         return;
     }
     let capsule = launch(TaskAcceptance::Queue, None);
-    assert_eq!(capsule.card()["serves"]["planes"], json!([]));
+    assert_eq!(
+        common::card_capsule_params(&capsule.card())["planes"],
+        json!([])
+    );
 
     let listed = http_request(&capsule.url, "GET", "/resources/files", &[]);
     assert_eq!(listed.status, 404);
@@ -508,7 +507,7 @@ fn both_declared_planes_are_listed_files_first() {
     }
     let capsule = launch(TaskAcceptance::Queue, Some(EXPORTS_BOTH));
     assert_eq!(
-        capsule.card()["serves"]["planes"],
+        common::card_capsule_params(&capsule.card())["planes"],
         json!(["files", "peer_files"])
     );
     assert_eq!(
@@ -517,59 +516,70 @@ fn both_declared_planes_are_listed_files_first() {
     );
 }
 
-// ── S5: the card change is additive ───────────────────────────────────────────
+// ── S5: the card is an A2A v1.0 AgentCard and nothing else ─────────────────────
+
+fn key_set(object: &serde_json::Map<String, Value>) -> HashSet<&str> {
+    object.keys().map(String::as_str).collect()
+}
 
 #[test]
-fn the_card_keeps_every_existing_key_and_adds_only_serves() {
-    if common::skip_without_host_support("the_card_keeps_every_existing_key_and_adds_only_serves") {
+fn the_card_is_an_a2a_agent_card_with_exactly_its_keys() {
+    if common::skip_without_host_support("the_card_is_an_a2a_agent_card_with_exactly_its_keys") {
         return;
     }
     let capsule = launch(TaskAcceptance::Single, None);
     let card = capsule.card();
+    common::assert_a2a_agent_card(&card);
 
-    let keys: HashSet<&str> = card
-        .as_object()
-        .expect("the card is an object")
-        .keys()
-        .map(String::as_str)
-        .collect();
     assert_eq!(
-        keys,
+        key_set(card.as_object().expect("the card is an object")),
         HashSet::from([
-            "name",
-            "version",
-            "url",
-            "session_id",
             "capabilities",
-            "serves"
+            "defaultInputModes",
+            "defaultOutputModes",
+            "description",
+            "name",
+            "securityRequirements",
+            "securitySchemes",
+            "skills",
+            "supportedInterfaces",
+            "version",
         ])
     );
-
-    let capabilities = card["capabilities"]
-        .as_object()
-        .expect("capabilities is an object");
-    let capability_keys: HashSet<&str> = capabilities.keys().map(String::as_str).collect();
     assert_eq!(
-        capability_keys,
-        HashSet::from(["tools", "shell", "network", "streaming", "cancellation"])
+        key_set(
+            card["capabilities"]
+                .as_object()
+                .expect("capabilities is an object")
+        ),
+        HashSet::from([
+            "extendedAgentCard",
+            "extensions",
+            "pushNotifications",
+            "streaming"
+        ])
+    );
+    let capsule_params = common::card_capsule_params(&card);
+    assert_eq!(
+        key_set(capsule_params),
+        HashSet::from(["sessionId", "tools", "shell", "network", "planes"])
     );
 
     assert_eq!(card["name"], "door-discovery-agent");
     assert_eq!(card["version"], "0.1.0");
-    assert_eq!(card["url"], capsule.url.as_str());
-    assert_eq!(card["session_id"], capsule.session_id.as_str());
-    assert!(capabilities["tools"].is_array());
-    assert_eq!(capabilities["shell"], false);
-    assert_eq!(capabilities["network"], true, "the endpoint is allowlisted");
-    assert_eq!(capabilities["streaming"], true);
     assert_eq!(
-        capabilities["cancellation"], true,
-        "an http capsule can stop a task"
+        card["supportedInterfaces"][0]["url"],
+        format!("http://{}", capsule.url)
     );
-
-    let serves = card["serves"].as_object().expect("serves is an object");
-    let serves_keys: HashSet<&str> = serves.keys().map(String::as_str).collect();
-    assert_eq!(serves_keys, HashSet::from(["methods", "planes"]));
-    assert_eq!(string_list(&serves["methods"]), ALL_METHODS);
-    assert!(serves["planes"].is_array());
+    assert_eq!(capsule_params["sessionId"], capsule.session_id.as_str());
+    assert!(capsule_params["tools"].is_array());
+    assert_eq!(capsule_params["shell"], false);
+    assert_eq!(
+        capsule_params["network"], true,
+        "the endpoint is allowlisted"
+    );
+    assert!(capsule_params["planes"].is_array());
+    assert_eq!(card["capabilities"]["streaming"], true);
+    assert_eq!(common::card_door_methods(&card), ALL_METHODS);
+    assert_eq!(card["skills"][0]["id"], "task");
 }

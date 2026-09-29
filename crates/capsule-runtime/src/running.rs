@@ -9,8 +9,8 @@
 //! 2. **The process's start time matches the recorded one.** Pids are reused, so without this a
 //!    record can name an unrelated process that happens to hold the number now.
 //! 3. **The door answers and identifies itself.** A live pid proves neither that the process is
-//!    the capsule nor that it can still respond, so the agent card is fetched and its `session_id`
-//!    compared.
+//!    the capsule nor that it can still respond, so the agent card is fetched and the `sessionId`
+//!    of its capsule extension compared.
 //!
 //! Reading prunes a record only on evidence: layer 1 finding no process, or layer 2 reading a start
 //! time that differs from the recorded one, which means the pid was reused. That is the only reaper
@@ -472,22 +472,24 @@ mod platform {
 }
 
 /// Layer 3: the session id the door at `url` claims on its agent card.
+///
+/// A card with no capsule extension naming a session — one served by a runtime that predates the
+/// A2A card, among others — names no session, so its capsule reads as unreachable.
 fn probe_session_id(url: &str) -> Result<String, String> {
     let addr = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    crate::http_client::http_json_with_timeouts(
+    let card = crate::http_client::http_json_with_timeouts(
         "GET",
         &format!("http://{addr}/.well-known/agent-card.json"),
         None,
         &[("Accept", "application/json")],
         PROBE_CONNECT_TIMEOUT,
         PROBE_READ_TIMEOUT,
-    )?
-    .get("session_id")
-    .and_then(serde_json::Value::as_str)
-    .map(str::to_string)
-    .ok_or_else(|| format!("the agent card from {addr} names no session"))
+    )?;
+    crate::identity::session_id_from_card(&card)
+        .map(str::to_string)
+        .ok_or_else(|| format!("the agent card from {addr} names no session"))
 }
 
 #[cfg(test)]

@@ -1821,7 +1821,11 @@ fn the_door_answers_by_the_time_its_address_is_announced() {
         .unwrap_or_else(|| panic!("no HTTP body in: {response:?}"));
     let card: Value = serde_json::from_str(body.trim())
         .unwrap_or_else(|err| panic!("the agent card is not JSON ({err}): {body:?}"));
-    assert_eq!(card["session_id"], capsule.session_id(), "{card}");
+    assert_eq!(
+        common::card_capsule_params(&card)["sessionId"],
+        capsule.session_id(),
+        "{card}"
+    );
 }
 
 // ── 18. A door that accepts and never answers ─────────────────────────────────

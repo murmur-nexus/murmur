@@ -1053,12 +1053,16 @@ fn the_agent_card_names_the_session_it_answers_for() {
     let body = http_get(&capsule.url(), "/.well-known/agent-card.json");
     let card: Value = serde_json::from_str(&body).unwrap_or_else(|_| panic!("card was {body}"));
 
-    assert_eq!(card["session_id"], capsule.session_id());
+    let capsule_params = common::card_capsule_params(&card);
+    assert_eq!(capsule_params["sessionId"], capsule.session_id());
     assert_eq!(card["name"], "address-card");
     assert_eq!(card["version"], "0.1.0");
-    assert_eq!(card["url"], capsule.url());
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"],
+        format!("http://{}", capsule.url())
+    );
     assert_eq!(card["capabilities"]["streaming"], true);
-    assert!(card["capabilities"]["tools"].is_array());
+    assert!(capsule_params["tools"].is_array());
 }
 
 // ── 4. A session that ends leaves no record, however it ends ──────────────────

@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+/// The strict `lf.a2a.v1.AgentCard` check the runtime's own tests use, compiled from the same
+/// file so a served card is judged against the same vendored `a2a.proto`.
+#[path = "../../../capsule-runtime/src/a2a_card_conformance.rs"]
+pub mod a2a_card_conformance;
 pub mod hook_wat;
 pub mod idle_capsule;
 pub mod recording_upstream;
@@ -906,4 +910,45 @@ pub fn parse_workdir_from_stdout(stdout: &str) -> PathBuf {
             .unwrap_or_default()
             .trim(),
     )
+}
+
+/// URI of the agent card's door extension: every JSON-RPC method the door answers. Written out
+/// here rather than imported because it is the wire contract an external client reads.
+pub const DOOR_EXTENSION_URI: &str =
+    "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1";
+
+/// URI of the agent card's capsule extension: the session and what the capsule may do.
+pub const CAPSULE_EXTENSION_URI: &str =
+    "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1";
+
+/// The `params` of the extension in `card.capabilities.extensions` whose `uri` is `uri`; fails the
+/// test when the card has no such extension.
+pub fn card_extension_params<'a>(card: &'a Value, uri: &str) -> &'a serde_json::Map<String, Value> {
+    card["capabilities"]["extensions"]
+        .as_array()
+        .and_then(|extensions| extensions.iter().find(|extension| extension["uri"] == uri))
+        .and_then(|extension| extension["params"].as_object())
+        .unwrap_or_else(|| panic!("the card has no extension {uri} with params: {card}"))
+}
+
+/// The methods the card's door extension lists, in order.
+pub fn card_door_methods(card: &Value) -> Vec<&str> {
+    card_extension_params(card, DOOR_EXTENSION_URI)["methods"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the door extension's methods are not an array: {card}"))
+        .iter()
+        .map(|method| method.as_str().expect("each method is a string"))
+        .collect()
+}
+
+/// The card's capsule extension `params`: `sessionId`, `tools`, `shell`, `network`, `planes`.
+pub fn card_capsule_params(card: &Value) -> &serde_json::Map<String, Value> {
+    card_extension_params(card, CAPSULE_EXTENSION_URI)
+}
+
+/// Fails the test with every error a strict `lf.a2a.v1.AgentCard` parse of `card` raises.
+pub fn assert_a2a_agent_card(card: &Value) {
+    if let Err(errors) = a2a_card_conformance::check_agent_card(card) {
+        panic!("the served card is not an A2A v1.0 AgentCard: {errors:#?}\n{card:#}");
+    }
 }

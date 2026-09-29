@@ -578,8 +578,8 @@ fn streaming_agent_card_has_streaming_capability() {
         card["capabilities"]["streaming"], true,
         "agent card should include capabilities.streaming: true; got: {card}"
     );
-    assert_eq!(
-        card["capabilities"]["cancellation"], true,
+    assert!(
+        common::card_door_methods(&card).contains(&"tasks/cancel"),
         "an http capsule can stop a task, and its card says so; got: {card}"
     );
 

@@ -4,6 +4,10 @@
 #![deny(unsafe_code)]
 
 pub(crate) mod a2a;
+#[cfg(test)]
+mod a2a_card_conformance;
+#[cfg(test)]
+mod a2a_card_conformance_tests;
 pub(crate) mod agent;
 #[cfg(feature = "alloc-bench")]
 pub mod alloc_bench;

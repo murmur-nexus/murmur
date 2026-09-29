@@ -293,7 +293,9 @@ pub(crate) fn redact_handles_in_json(value: &mut serde_json::Value) {
 
 // ── The audience ──────────────────────────────────────────────────────────────
 
-/// The audience string derived from a peer's own agent card: `<name>@<host:port>`, lowercased.
+/// The audience string derived from a peer's own agent card: `<name>@<host:port>`, lowercased,
+/// where `host:port` is the `url` of the card's `JSONRPC` interface with its scheme and path
+/// stripped.
 ///
 /// Both sides compute the same string without exchanging it, because both compute it from *the
 /// fetching capsule's own advertised identity* — the minter reads it off the card it fetched, and
@@ -304,19 +306,22 @@ pub fn audience_from_card(card: &serde_json::Value) -> Result<String, String> {
         .and_then(serde_json::Value::as_str)
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| "the peer's agent card carries no 'name'".to_string())?;
-    let url = card
-        .get("url")
-        .and_then(serde_json::Value::as_str)
+    let url = crate::identity::jsonrpc_interface_url(card)
         .filter(|url| !url.trim().is_empty())
-        .ok_or_else(|| "the peer's agent card carries no 'url'".to_string())?;
+        .ok_or_else(|| {
+            "the peer's agent card has no 'supportedInterfaces' entry with 'protocolBinding' \
+             JSONRPC and a 'url'"
+                .to_string()
+        })?;
     let host_port = parse_host_port(url)?;
     Ok(format!("{}@{}", name.trim(), host_port).to_lowercase())
 }
 
 /// This capsule's own audience, asserted on every redeem it issues.
 ///
-/// Built from the same two fields `build_agent_card` publishes, so what a peer minted for and
-/// what this runtime asserts are the same string by construction.
+/// Built from the same two identity fields `build_agent_card` publishes as the card's `name` and
+/// its `JSONRPC` interface `url`, so what a peer minted for and what this runtime asserts are the
+/// same string by construction.
 pub(crate) fn own_audience(identity: &CapsuleIdentity) -> String {
     let host_port =
         parse_host_port(&identity.capsule_url).unwrap_or_else(|_| identity.capsule_url.clone());
@@ -1065,9 +1070,21 @@ mod tests {
         assert_ne!(id, handle_id("mh1.abc.deg"));
     }
 
+    /// A card that is an A2A `AgentCard` in every respect `audience_from_card` reads.
+    fn card_with_interfaces(name: &str, interfaces: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "name": name, "supportedInterfaces": interfaces })
+    }
+
     #[test]
     fn an_audience_comes_from_the_peers_own_card() {
-        let card = serde_json::json!({"name": "Reporter", "url": "http://localhost:41234/"});
+        let card = card_with_interfaces(
+            "Reporter",
+            serde_json::json!([{
+                "url": "http://localhost:41234/",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": "0.3",
+            }]),
+        );
         assert_eq!(
             audience_from_card(&card).unwrap(),
             "reporter@localhost:41234"
@@ -1075,31 +1092,75 @@ mod tests {
     }
 
     #[test]
-    fn a_card_without_a_name_or_a_url_is_refused() {
+    fn a_card_without_a_name_or_a_jsonrpc_url_is_refused() {
+        let jsonrpc = serde_json::json!([{
+            "url": "http://localhost:1",
+            "protocolBinding": "JSONRPC",
+            "protocolVersion": "0.3",
+        }]);
         for card in [
-            serde_json::json!({"url": "localhost:1"}),
             serde_json::json!({"name": "a"}),
-            serde_json::json!({"name": "", "url": "localhost:1"}),
-            serde_json::json!({"name": "a", "url": ""}),
+            card_with_interfaces("a", serde_json::json!([])),
+            card_with_interfaces(
+                "a",
+                serde_json::json!([{
+                    "url": "https://localhost:1",
+                    "protocolBinding": "GRPC",
+                    "protocolVersion": "1.0",
+                }]),
+            ),
+            card_with_interfaces(
+                "a",
+                serde_json::json!([{"url": "", "protocolBinding": "JSONRPC", "protocolVersion": "0.3"}]),
+            ),
+            serde_json::json!({"supportedInterfaces": jsonrpc}),
+            card_with_interfaces("", jsonrpc.clone()),
             serde_json::json!("not an object"),
+            serde_json::json!({"name": "a", "url": "localhost:1"}),
         ] {
             assert!(audience_from_card(&card).is_err(), "card: {card}");
         }
     }
 
     #[test]
+    fn a_refusal_names_what_the_card_lacks() {
+        assert_eq!(
+            audience_from_card(&serde_json::json!({"url": "localhost:1"})).unwrap_err(),
+            "the peer's agent card carries no 'name'"
+        );
+        assert!(
+            audience_from_card(&serde_json::json!({"name": "a", "url": "localhost:1"}))
+                .unwrap_err()
+                .contains("'supportedInterfaces' entry with 'protocolBinding' JSONRPC"),
+        );
+    }
+
+    #[test]
     fn own_audience_matches_what_a_peer_would_derive_from_the_card() {
+        for capsule_url in ["localhost:41234", "http://127.0.0.1:41234"] {
+            let identity = CapsuleIdentity {
+                capsule_name: "Reporter".to_string(),
+                capsule_version: "0.1.0".to_string(),
+                session_id: "ses_1".to_string(),
+                capsule_url: capsule_url.to_string(),
+            };
+            let card = crate::identity::build_agent_card(
+                &identity,
+                &[],
+                &crate::types::CapabilityPolicy::default(),
+                &murmur_artifact::TaskAcceptance::Single,
+                crate::identity::DeclaredPlanes::default(),
+                crate::identity::TransportCapabilities { streams_text: true },
+            );
+            assert_eq!(own_audience(&identity), audience_from_card(&card).unwrap());
+        }
         let identity = CapsuleIdentity {
             capsule_name: "Reporter".to_string(),
             capsule_version: "0.1.0".to_string(),
             session_id: "ses_1".to_string(),
             capsule_url: "localhost:41234".to_string(),
         };
-        let card = serde_json::json!({
-            "name": identity.capsule_name,
-            "url": identity.capsule_url,
-        });
-        assert_eq!(own_audience(&identity), audience_from_card(&card).unwrap());
+        assert_eq!(own_audience(&identity), "reporter@localhost:41234");
     }
 
     #[test]

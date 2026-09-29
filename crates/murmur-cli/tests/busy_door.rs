@@ -424,7 +424,11 @@ fn probe_card(capsule: &Capsule, label: &str) -> Duration {
     let elapsed = started.elapsed();
     assert_eq!(status, 200, "{label}: {body}");
     let card: Value = serde_json::from_str(&body).expect("the card is JSON");
-    assert_eq!(card["session_id"], capsule.session_id().as_str(), "{label}");
+    assert_eq!(
+        common::card_capsule_params(&card)["sessionId"],
+        capsule.session_id().as_str(),
+        "{label}"
+    );
     assert!(elapsed < PROBE_BUDGET, "{label}: answered in {elapsed:?}");
     elapsed
 }
