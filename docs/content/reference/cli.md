@@ -10,6 +10,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur new` | Generate a `murmur.yaml` from a plain-language task description |
 | `mur publish` | Publish a built artifact to local or remote registry |
 | `mur install` | Fetch and install artifacts from configured registry sources |
+| `mur precompile` | Compile WASM artifact files for this machine, so their first launch skips compiling |
 | `mur list` | List installed artifacts in the project or global store |
 | `mur doctor` | Check every artifact declared in `murmur.yaml` against the project and global stores |
 | `mur run` | Run a capsule with lockfile-aware artifact resolution |
@@ -424,6 +425,57 @@ Behavior:
 3. Store into the project-local store (or global store with `-g`)
 4. Pin the name, resolved version and SHA-256 in `murmur.lock` — project installs only, since `-g` has no project to pin
 5. Compile each WASM tool, driver and hook for this machine into `~/.murmur/compiled/`, unless `--no-precompile` is given (see the table above)
+
+---
+
+## `mur precompile`
+
+Compile `.mur.zip` files for this machine into [`~/.murmur/compiled/`](config.md#murmur-home-permissions), so the first `mur run` that stages them loads the compiled form instead of compiling. It reads only the files it is given: it resolves nothing, installs nothing and writes no `murmur.lock`. [`mur deploy run`](#mur-deploy-run) runs it on the target.
+
+```bash
+mur precompile [--workdir <dir>] [--json] <ZIP>...
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `<ZIP>...` | — | One or more `.mur.zip` files (required) |
+| `--workdir` | — | The `--workdir` of the `mur run` that will launch these artifacts. When `~/.murmur` is inside it, nothing is stored, as that launch would neither read nor write `compiled/` |
+| `--json` | off | Print the report as one JSON object on stdout |
+
+Each WASM tool, driver and hook is compiled under this machine's `mur` build and [`MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`](../concepts/registry.md#artifact-integrity) value; a later launch loads the form only under the same two. Files are compiled in parallel and reported in argument order, one outcome each:
+
+| Outcome (text) | Outcome (JSON) | Meaning |
+|---|---|---|
+| `compiled` | `compiled` | Compiled and stored |
+| `already stored` | `already_stored` | A usable compiled form was already in `compiled/`; nothing was written |
+| `not wasm` | `not_wasm` | A native tool, a skill or a capsule; nothing to compile |
+| `failed` | `failed` | The file could not be read, is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile. Its first launch compiles it, or fails, as it would have |
+
+**Text output** — one line per file: the outcome, then `name@version`, or the path when the file has no readable manifest.
+
+```text
+compiled        murmur-tool-echo@1.0.0
+not wasm        murmur-tool-git@1.0.0
+failed          ./broken.mur.zip
+```
+
+**JSON output** (`--json`) — exactly one line:
+
+```json
+{"mur_version":"1.0.0","decompression_ceiling":524288000,"artifacts":[{"path":"./echo.mur.zip","name":"murmur-tool-echo","version":"1.0.0","outcome":"compiled"},{"path":"./broken.mur.zip","name":null,"version":null,"outcome":"failed"}]}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `mur_version` | string | Version of the `mur` that compiled |
+| `decompression_ceiling` | integer | The `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` value the forms were compiled under, in bytes |
+| `artifacts[].path` | string | The path as given |
+| `artifacts[].name`, `artifacts[].version` | string or `null` | From the file's `murmur.yaml`; `null` when there is none that parses |
+| `artifacts[].outcome` | string | One of the JSON outcomes above |
+
+**Exit status:** `0` when no file is `failed`; `1`, after the full report, when any is.
+
+A `mur` release older than this command exits with `error: unrecognized subcommand 'precompile'`. A deploy whose target runs such a release prints [`W-DEPLOY-001`](diagnostics.md#w-deploy-001) and continues; set `mur_version` in the manifest to a release that has `mur precompile`, or pass `--mur-binary`.
 
 ---
 
@@ -1101,6 +1153,7 @@ Upload the `mur` binary and capsule files to an existing VM via SSH, start the c
 mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
                [--manifest <path>] [--workdir <path>] [--mur-binary <path>]
                [--env KEY=VALUE] [--env-file <path>] [--deploy-platform <platform>]
+               [--no-precompile]
 ```
 
 | Flag | Default | Description |
@@ -1114,6 +1167,7 @@ mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--env` | — | Environment variable in `KEY=VALUE` format; repeat for multiple vars |
 | `--env-file` | — | Path to a `.env` file of `KEY=VALUE` lines, `#` comments ignored. Takes precedence over the `.env` beside the manifest, which is loaded when neither `--env` nor `--env-file` is given |
 | `--deploy-platform` | `linux-x86_64` | Platform the uploaded artifacts and `mur` binary are resolved for |
+| `--no-precompile` | off | Skip compiling the uploaded WASM artifacts on the target; they compile on the capsule's first launch instead |
 
 **Output — a summary box on stderr.** `mur deploy run` emits no JSON and writes nothing to stdout;
 progress and the final box both go to stderr.
@@ -1139,17 +1193,42 @@ for humans and its layout is not a stable interface.
 
 **Deployment flow:**
 
-1. Validate `--manifest`, `--workdir`, and `--mur-binary` paths (no network calls)
-2. Wait up to 30s for SSH to become available on the VM
-3. Upload `mur` binary via `scp` to `/usr/local/bin/mur`
-4. Upload manifest and optional workdir via `scp`
-5. Run `mur run --manifest <path> --json` on the VM; wait up to 120s for the JSON line
-6. Parse `localhost:PORT` from the JSON output; construct the public URL
-7. Persist to `~/.murmur/deployments.json`; print the summary box
+1. Validate `--manifest`, `--workdir`, `--mur-binary` and every `--env` entry (no network calls)
+2. Resolve every declared artifact for `--deploy-platform`, and the `mur` binary
+3. Wait up to 30s for SSH to become available on the VM
+4. Upload the `mur` binary via `scp` to `/usr/local/bin/mur`
+5. Upload the manifest, the files it references and the optional workdir to `/root/mur-<id>/`
+6. Upload every artifact into the VM's global store, `/root/.murmur/artifacts/<name>/<version>/`
+7. Write the environment variables to `/root/mur-<id>/.env`, mode `600`, when there are any
+8. Run [`mur precompile --json --workdir /root/mur-<id>`](#mur-precompile) on the VM over every uploaded artifact, with the `.env` exported; skipped under `--no-precompile` or when the capsule declares no artifacts
+9. Run `mur run --manifest <path> --workdir /root/mur-<id> --json` on the VM with the same `.env` exported; wait up to 120s for the JSON line
+10. Parse `localhost:PORT` from the JSON output; open the port and construct the public URL
+11. Persist to `~/.murmur/deployments.json`; print the summary box
 
-Artifacts are pre-staged in step 4 (uploaded to `/root/.murmur/artifacts/`), so the remote `mur run` finds them installed and starts without fetching anything.
+Artifacts are pre-staged in step 6, so the remote `mur run` finds them installed and starts without fetching anything. Step 8 compiles them with the VM's own `mur`, so the capsule's first launch loads compiled forms instead of compiling; see [Precompile on the target](#deploy-precompile).
+
+| Measured: release `mur`, a driver, a WASM tool and a native tool, 8 logical CPUs | Median of 5 deploys |
+|---|---|
+| Time step 8 adds | 0.52 s |
+| First launch to first inference request, with step 8 | 0.20 s |
+| First launch to first inference request, `--no-precompile` | 0.63 s |
+| Later launches, either way | 0.20 s |
+
+The compile moves out of the capsule's start rather than adding to it, so a deploy's total time barely changes.
 
 The flow depends on `mur run --json` — see [`mur run`](#mur-run) for the `--json` output shape.
+
+### Precompile on the target { #deploy-precompile }
+
+Steps 8 and 9 start from the same `.env`, so the compile and the capsule share one `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` value, the VM's: set it with `--env`, or it is the default. This machine's value does not reach the VM. When the two differ, deploy prints [`W-DEPLOY-002`](diagnostics.md#w-deploy-002); the capsule still starts warm.
+
+Step 8 never fails a deploy:
+
+| What happened on the VM | Deploy prints | The capsule |
+|---|---|---|
+| Every artifact compiled, was already stored, or is not WASM | nothing | Loads every compiled form on its first launch |
+| Some artifacts `failed` | [`W-DEPLOY-001`](diagnostics.md#w-deploy-001), naming each | Compiles those on its first launch |
+| No report: the VM's `mur` predates `mur precompile`, or the SSH command failed | [`W-DEPLOY-001`](diagnostics.md#w-deploy-001), quoting the first error line | Compiles every artifact on its first launch |
 
 **Example:**
 
@@ -1171,6 +1250,13 @@ mur deploy run \
 | `E-DEPLOY-003` | SSH connection or remote command failed |
 | `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s |
 | `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub |
+
+**Warnings** (the deploy continues and exits `0`):
+
+| Code | Meaning |
+|---|---|
+| [`W-DEPLOY-001`](diagnostics.md#w-deploy-001) | The VM compiled none, or not all, of the uploaded artifacts |
+| [`W-DEPLOY-002`](diagnostics.md#w-deploy-002) | The VM's `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` differs from this machine's |
 
 ---
 

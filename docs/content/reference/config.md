@@ -192,7 +192,7 @@ chmod 600 ~/.murmur/config.yaml
 | `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
 | `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
-| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted by the next `mur install` or `mur run` that compiles a component; deleting the directory is safe | `mur install`, `mur run` at staging, and when a capsule calls `manage.pull()` |
+| `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted by the next `mur install`, `mur precompile` or `mur run` that compiles a component; deleting the directory is safe | `mur install`, `mur precompile`, `mur run` at staging, and when a capsule calls `manage.pull()` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
 
 `mur run` uses a file in `compiled/` only when all of these hold, and otherwise compiles the
@@ -206,7 +206,9 @@ artifact again and replaces the file:
 
 Each value of the [`MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`](../concepts/registry.md#artifact-integrity)
 ceiling keeps its own compiled artifacts, so the first launch after you change it compiles every
-artifact again, unless `mur install` has run under the new value first.
+artifact again, unless `mur install` or `mur precompile` has run under the new value first.
+[`mur deploy run`](cli.md#deploy-precompile) compiles on the target under the target's value, the
+one the capsule runs under.
 
 Which capsules can write to `compiled/`, and so choose what a later launch or pull loads, is set out
 under [Containment class](containment.md#field-containment).

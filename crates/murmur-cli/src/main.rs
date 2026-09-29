@@ -37,6 +37,7 @@ use commands::{
     eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
     install::run_install,
     list::run_list,
+    precompile::run_precompile,
     ps::run_ps,
     publish::run_publish,
     run::run_run,
@@ -175,6 +176,21 @@ enum Commands {
         /// Skip compiling installed WASM artifacts for this machine; they compile on first launch instead.
         #[arg(long)]
         no_precompile: bool,
+    },
+    /// Compile WASM artifacts (.mur.zip files) for this machine, so their first launch loads them instead of compiling
+    Precompile {
+        /// The .mur.zip files to compile
+        #[arg(required = true, value_name = "ZIP")]
+        files: Vec<PathBuf>,
+
+        /// The --workdir of the `mur run` that will launch these artifacts. Nothing is stored when
+        /// ~/.murmur is inside it, exactly as that launch would store and load nothing
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+
+        /// Print the report as one JSON object on stdout
+        #[arg(long)]
+        json: bool,
     },
     /// Run a capsule component with local lockfile-aware tool resolution
     Run {
@@ -523,6 +539,11 @@ fn main() {
             all_platforms,
             no_precompile,
         ),
+        Commands::Precompile {
+            files,
+            workdir,
+            json,
+        } => run_precompile(&files, workdir.as_deref(), json),
         Commands::Run {
             manifest,
             capsule,
@@ -657,6 +678,7 @@ fn main() {
                     env_vars,
                     env_file,
                     deploy_platform,
+                    no_precompile,
                 } => run_deploy(
                     &host,
                     ssh_key.as_deref(),
@@ -667,6 +689,7 @@ fn main() {
                     &env_vars,
                     env_file.as_deref(),
                     &deploy_platform,
+                    no_precompile,
                 ),
                 DeployCommand::Ls => run_deploy_ls(),
             }
