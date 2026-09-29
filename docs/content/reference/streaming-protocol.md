@@ -253,13 +253,15 @@ accepted one. The answer is the final status's `response`.
 ## `artifact` { #event-artifact }
 
 One tool call's result, or one hook artifact. The runtime writes one frame for each tool call it
-dispatches, in dispatch order, and one for each hook artifact when an attempt completes, ahead of
-the task's final status or the [reopen boundary](#reopened-tasks).
+dispatches, in dispatch order.
 
-The hook artifacts forwarded are the ones `on-inference` hooks returned for the attempt's last
-inference turn, in hook-registration order, on both transports. They follow that turn's streamed
-text and precede its whole-result [`text`](#event-text) frame. An attempt that is canceled, fails or
-stops at a spend ceiling forwards none, and neither does a turn that called a tool.
+A hook artifact is what an `on-inference` hook returned as
+[`artifact`](wit-interfaces.md#what-each-handler-can-commit) for the attempt's last inference
+turn. The runtime writes one frame for each, in hook-registration order, only when the attempt
+completes: after that turn's streamed text, before its whole-result [`text`](#event-text) frame,
+and ahead of the task's final status or the [reopen boundary](#reopened-tasks). A turn that called
+a tool forwards none, and neither does an attempt that is canceled, fails or stops at a spend
+ceiling.
 
 On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
 no frame. On [`transport: process`](manifest.md#transport-process) the harness reports the

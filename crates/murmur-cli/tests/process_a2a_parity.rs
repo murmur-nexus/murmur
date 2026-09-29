@@ -869,7 +869,7 @@ fn assert_is_hook_artifact(transport: &str, artifact: &Value) {
     assert_eq!(artifact["truncated"], false, "{transport}: {artifact}");
 }
 
-/// S7. An `on-inference` hook's artifact for the attempt's last turn reaches the client on both
+/// An `on-inference` hook's artifact for the attempt's last turn reaches the client on both
 /// transports, after that turn's work and before its fallback text; the tool-calling turn's
 /// artifact reaches neither.
 #[test]
@@ -917,7 +917,7 @@ fn an_inference_hook_artifact_writes_the_same_frames() {
     assert_eq!(forwarded[0], forwarded[1], "the hook's frame differs");
 }
 
-/// S8. A streamed answer's cursor removal closes the text the client was streamed before the
+/// A streamed answer's cursor removal closes the text the client was streamed before the
 /// hook's artifact arrives, on both transports.
 #[test]
 fn a_streamed_answer_places_the_hook_artifact_after_the_cursor_removal() {
@@ -955,7 +955,7 @@ fn a_streamed_answer_places_the_hook_artifact_after_the_cursor_removal() {
     }
 }
 
-/// S9. A turn the harness fails ran its `on-inference` hooks, and forwards none of what they
+/// A turn the harness fails ran its `on-inference` hooks, and forwards none of what they
 /// returned: the attempt did not complete.
 #[test]
 fn a_failed_turn_forwards_no_hook_artifact() {
