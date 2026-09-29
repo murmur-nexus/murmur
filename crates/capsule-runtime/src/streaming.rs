@@ -117,7 +117,8 @@ impl StreamArtifact {
 
     /// The frame forwarding one hook artifact. No tool call is behind it, so it has no id, no
     /// duration, no exit code and nothing that could have been truncated, and it never reports
-    /// an error. A hook artifact reaches the model unfenced.
+    /// an error. A hook artifact is the capsule operator's own declared hook speaking, not
+    /// content a tool fetched, so it reaches the model unfenced.
     pub(crate) fn hook(hook_name: String, payload: String) -> Self {
         Self {
             tool_name: hook_name,

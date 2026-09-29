@@ -85,6 +85,35 @@ fn publish(home: &TempDir, artifact: &Path) {
     common::publish_local(home, artifact).success();
 }
 
+/// A hook a capsule under test declares: its artifact name, the event it binds to, and its
+/// component. Packed with `commit_policy: none`, which is what an `on-inference` hook needs to
+/// return an artifact.
+struct DeclaredHook {
+    name: &'static str,
+    binding: &'static str,
+    wasm: Vec<u8>,
+}
+
+impl DeclaredHook {
+    /// Publish the hook into `home` and add its manifest entry to `entries`.
+    fn declare(&self, home: &TempDir, artifacts: &Path, entries: &mut String) {
+        publish(
+            home,
+            &common::hook_wat::create_hook_zip(
+                artifacts,
+                self.name,
+                self.binding,
+                "none",
+                &self.wasm,
+            ),
+        );
+        entries.push_str(&format!(
+            "  - name: {}\n    version: {VERSION}\n    runtime: hook\n",
+            self.name
+        ));
+    }
+}
+
 // ── A capsule running as its own process ──────────────────────────────────────
 
 struct Capsule {
@@ -162,8 +191,13 @@ fn start(home: TempDir, project: TempDir, manifest: &Path, env: &[(&str, &str)])
 const LIFECYCLE: &str =
     "lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 8\n";
 
-/// An `http` capsule driven by `server`, optionally declaring the echo tool.
-fn http_capsule(server: &common::ScriptedServer, name: &str, tool: bool) -> Capsule {
+/// An `http` capsule driven by `server`, optionally declaring the echo tool and a hook.
+fn http_capsule(
+    server: &common::ScriptedServer,
+    name: &str,
+    tool: bool,
+    hook: Option<&DeclaredHook>,
+) -> Capsule {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -193,6 +227,9 @@ fn http_capsule(server: &common::ScriptedServer, name: &str, tool: bool) -> Caps
             "  - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n"
         ));
     }
+    if let Some(hook) = hook {
+        hook.declare(&home, artifacts.path(), &mut entries);
+    }
 
     let manifest = project.path().join("murmur.yaml");
     fs::write(
@@ -208,19 +245,25 @@ fn http_capsule(server: &common::ScriptedServer, name: &str, tool: bool) -> Caps
     start(home, project, &manifest, &[])
 }
 
-/// An `http` capsule whose driver streams its text in three chunks and needs no provider.
-fn streaming_http_capsule(name: &str) -> Capsule {
+/// An `http` capsule whose driver streams its text in three chunks and needs no provider,
+/// optionally declaring a hook.
+fn streaming_http_capsule(name: &str, hook: Option<&DeclaredHook>) -> Capsule {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
     publish(&home, &create_streaming_driver_artifact(artifacts.path()));
+    let mut entries = format!(
+        "  - name: {STREAMING_DRIVER}\n    version: {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      api_key: test-key\n"
+    );
+    if let Some(hook) = hook {
+        hook.declare(&home, artifacts.path(), &mut entries);
+    }
     let manifest = project.path().join("murmur.yaml");
     fs::write(
         &manifest,
         format!(
-            "name: {name}\nversion: 0.1.0\n\
-             artifacts:\n  - name: {STREAMING_DRIVER}\n    version: {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      api_key: test-key\n\
+            "name: {name}\nversion: 0.1.0\nartifacts:\n{entries}\
              {LIFECYCLE}inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {STREAMING_DRIVER}\n"
         ),
     )
@@ -233,6 +276,7 @@ struct ProcessCapsule {
     profile: String,
     name: String,
     tool: bool,
+    hook: Option<DeclaredHook>,
     /// `inference.driver.config`, as manifest lines under `driver:`.
     config: Option<String>,
     /// Extra environment for the `mur` process, for the debug inactivity override.
@@ -245,6 +289,7 @@ impl ProcessCapsule {
             profile: profile.to_string(),
             name: name.to_string(),
             tool: false,
+            hook: None,
             config: None,
             env: Vec::new(),
         }
@@ -252,6 +297,11 @@ impl ProcessCapsule {
 
     fn with_tool(mut self) -> Self {
         self.tool = true;
+        self
+    }
+
+    fn with_hook(mut self, hook: DeclaredHook) -> Self {
+        self.hook = Some(hook);
         self
     }
 
@@ -293,6 +343,9 @@ impl ProcessCapsule {
             entries.push_str(&format!(
                 "  - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n"
             ));
+        }
+        if let Some(hook) = self.hook.as_ref() {
+            hook.declare(&home, artifacts.path(), &mut entries);
         }
 
         // The fake harness, copied where this capsule alone points at it.
@@ -563,7 +616,7 @@ fn text_a_tool_call_and_an_answer_write_the_same_frames() {
         return;
     }
     let server = tool_then_answer_server();
-    let http = http_capsule(&server, "parity-http", true);
+    let http = http_capsule(&server, "parity-http", true, None);
     let http_events = collect_sse_events(&http.url(), STREAM_TIMEOUT);
 
     let process = ProcessCapsule::new("parity-process", "parity")
@@ -610,7 +663,7 @@ fn streamed_text_arrives_in_the_same_shape() {
     if common::skip_without_host_support("streamed_text_arrives_in_the_same_shape") {
         return;
     }
-    let http = streaming_http_capsule("stream-http");
+    let http = streaming_http_capsule("stream-http", None);
     let http_events = collect_sse_events(&http.url(), STREAM_TIMEOUT);
 
     let process = ProcessCapsule::new("stream-process", "stream").start();
@@ -777,4 +830,152 @@ fn a_process_capsule_advertises_cancellation_and_streaming() {
             .contains(&Value::from("tasks/cancel")),
         "the door still answers tasks/cancel: {card}"
     );
+}
+
+/// The `on-inference` hook the hook scenarios declare, and what it returns every turn.
+const HOOK: &str = "review-hook";
+const HOOK_PAYLOAD: &str = r#"{"reviewed":true}"#;
+
+fn inference_hook() -> DeclaredHook {
+    DeclaredHook {
+        name: HOOK,
+        binding: "on-inference",
+        wasm: common::hook_wat::artifact_hook_wasm("on-inference", HOOK_PAYLOAD),
+    }
+}
+
+/// The frames of `events` that carry the declared hook's artifact.
+fn hook_artifacts(events: &[SseEvent]) -> Vec<Value> {
+    frames_of(events, "artifact")
+        .into_iter()
+        .map(|frame| frame["artifact"].clone())
+        .filter(|artifact| artifact["tool_name"] == HOOK)
+        .collect()
+}
+
+/// Assert `artifact` is the hook's payload, carried the way the operator's own hook speaks:
+/// unfenced, and with none of a tool call's keys.
+fn assert_is_hook_artifact(transport: &str, artifact: &Value) {
+    assert_eq!(artifact["tool_name"], HOOK, "{transport}: {artifact}");
+    assert_eq!(artifact["content"], HOOK_PAYLOAD, "{transport}: {artifact}");
+    for key in ["fence_source", "tool_call_id", "duration_ms", "exit_code"] {
+        assert_eq!(
+            artifact[key],
+            Value::Null,
+            "{transport}: {key} in {artifact}"
+        );
+    }
+    assert_eq!(artifact["is_error"], false, "{transport}: {artifact}");
+    assert_eq!(artifact["truncated"], false, "{transport}: {artifact}");
+}
+
+/// An `on-inference` hook's artifact for the attempt's last turn reaches the client on both
+/// transports, after that turn's work and before its fallback text; the tool-calling turn's
+/// artifact reaches neither.
+#[test]
+fn an_inference_hook_artifact_writes_the_same_frames() {
+    if common::skip_without_host_support("an_inference_hook_artifact_writes_the_same_frames") {
+        return;
+    }
+    let server = tool_then_answer_server();
+    let http = http_capsule(&server, "hook-http", true, Some(&inference_hook()));
+    let http_events = collect_sse_events(&http.url(), STREAM_TIMEOUT);
+
+    let process = ProcessCapsule::new("hook-process", "parity")
+        .with_tool()
+        .with_hook(inference_hook())
+        .start();
+    let process_events = collect_sse_events(&process.url(), STREAM_TIMEOUT);
+
+    assert_same_frames(
+        &http_events,
+        &process_events,
+        &[
+            "status:working:inference turn 1",
+            "artifact",
+            "status:working:inference turn 2",
+            "artifact",
+            "text:final",
+            "status:completed",
+        ],
+    );
+
+    let mut forwarded = Vec::new();
+    for (transport, events) in [("http", &http_events), ("process", &process_events)] {
+        let artifacts = frames_of(events, "artifact");
+        assert_eq!(artifacts[0]["artifact"]["tool_name"], TOOL, "{transport}");
+        let hooks = hook_artifacts(events);
+        assert_eq!(hooks.len(), 1, "{transport}: {hooks:#?}");
+        assert_is_hook_artifact(transport, &artifacts[1]["artifact"]);
+        assert_eq!(
+            final_status(events)["status"]["response"],
+            "PARITY-ANSWER",
+            "{transport}"
+        );
+        forwarded.push(artifacts[1]["artifact"].clone());
+    }
+    assert_eq!(forwarded[0], forwarded[1], "the hook's frame differs");
+}
+
+/// A streamed answer's cursor removal closes the text the client was streamed before the
+/// hook's artifact arrives, on both transports.
+#[test]
+fn a_streamed_answer_places_the_hook_artifact_after_the_cursor_removal() {
+    if common::skip_without_host_support(
+        "a_streamed_answer_places_the_hook_artifact_after_the_cursor_removal",
+    ) {
+        return;
+    }
+    let http = streaming_http_capsule("hook-stream-http", Some(&inference_hook()));
+    let http_events = collect_sse_events(&http.url(), STREAM_TIMEOUT);
+
+    let process = ProcessCapsule::new("hook-stream-process", "stream")
+        .with_hook(inference_hook())
+        .start();
+    let process_events = collect_sse_events(&process.url(), STREAM_TIMEOUT);
+
+    assert_same_frames(
+        &http_events,
+        &process_events,
+        &[
+            "status:working:inference turn 1",
+            "text:chunk",
+            "text:chunk",
+            "text:chunk",
+            "text:final",
+            "artifact",
+            "status:completed",
+        ],
+    );
+
+    for (transport, events) in [("http", &http_events), ("process", &process_events)] {
+        let texts = frames_of(events, "text");
+        assert_eq!(texts[3]["text"], "", "{transport}: the cursor removal");
+        assert_is_hook_artifact(transport, &frames_of(events, "artifact")[0]["artifact"]);
+    }
+}
+
+/// A turn the harness fails ran its `on-inference` hooks, and forwards none of what they
+/// returned: the attempt did not complete.
+#[test]
+fn a_failed_turn_forwards_no_hook_artifact() {
+    if common::skip_without_host_support("a_failed_turn_forwards_no_hook_artifact") {
+        return;
+    }
+    let capsule = ProcessCapsule::new("hook-fail-process", "text-then-fail")
+        .with_hook(inference_hook())
+        .start();
+    let events = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    let kinds = frame_kinds(&events);
+    println!("process: {kinds:?}");
+
+    assert!(
+        kinds.contains(&"status:working:inference turn 1".to_string()),
+        "the failed turn opened: {kinds:?}"
+    );
+    assert!(
+        frames_of(&events, "artifact").is_empty(),
+        "a failed attempt forwards no artifact: {kinds:?}"
+    );
+    assert_eq!(final_status(&events)["status"]["state"], "failed");
 }

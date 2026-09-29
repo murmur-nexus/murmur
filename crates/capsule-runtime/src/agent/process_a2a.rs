@@ -35,6 +35,14 @@
 //! than being sent the same words twice. The authoritative answer reaches it anyway, as the
 //! `response` of the task's final `completed` status and as `out/result.txt`. The same rule governs
 //! `thinking`, whose frames are always `"final":false`.
+//!
+//! # Hook artifacts
+//!
+//! What the `on-inference` hooks returned for the turn `turn-end` closes reaches the client as one
+//! `artifact` frame each, in hook-registration order, after the cursor removal that turn owed and
+//! before the fallback text — the place the http path writes its last inference turn's. Only an
+//! attempt that completes forwards them: a turn closed by a `tool-result` or by `turn-failed`, an
+//! interrupted attempt and one stopped at a spend ceiling forward none.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -48,6 +56,7 @@ use crate::{
     },
     cancel::CANCELED_STATUS_MESSAGE,
     errors::RuntimeError,
+    hooks::HookArtifact,
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
         SseEventBuffer, StreamArtifact, StreamStatus, TaskArtifactUpdateEvent,
@@ -208,29 +217,30 @@ impl A2aStream {
     pub(super) async fn tool_result(&mut self, artifact: StreamArtifact) {
         self.pay_cursor_removal();
         self.segment.open = false;
-        let Some(target) = self.target.as_ref() else {
-            return;
-        };
-        emit_sse(
-            &target.sse,
-            "artifact",
-            &TaskArtifactUpdateEvent {
-                id: target.task_id.clone(),
-                artifact,
-            },
-        )
-        .await;
+        self.artifact(artifact).await;
     }
 
-    /// The harness ended the turn. Holds the result for the attempt's ending, and sends it as the
-    /// whole of the answer when the last segment streamed the client nothing.
-    pub(super) fn turn_end(&mut self, result: &str) {
+    /// The harness ended the turn. Holds the result for the attempt's ending, forwards what the
+    /// `on-inference` hooks returned for the turn it closed, and sends the result as the whole of
+    /// the answer when the last segment streamed the client nothing.
+    pub(super) async fn turn_end(&mut self, result: &str, hook_artifacts: Vec<HookArtifact>) {
         self.pay_cursor_removal();
         self.segment.open = false;
         self.result = result.to_string();
         // An interrupted attempt delivers no answer: a person stopped it, and what the harness
         // produced anyway reaches them through `out/result.txt` rather than as final text.
-        if self.interrupted || self.segment.streamed_text || result.is_empty() {
+        if self.interrupted {
+            return;
+        }
+        for hook_artifact in hook_artifacts {
+            // The operator's own declared hook speaking, so the frame carries no fence.
+            self.artifact(StreamArtifact::hook(
+                hook_artifact.hook_name,
+                hook_artifact.payload,
+            ))
+            .await;
+        }
+        if self.segment.streamed_text || result.is_empty() {
             return;
         }
         if let Some(wire) = self.wire() {
@@ -282,6 +292,21 @@ impl A2aStream {
         if let Some(wire) = self.wire() {
             emit_chunk_sse_final(wire.tx, wire.buf, wire.task_id, "");
         }
+    }
+
+    async fn artifact(&self, artifact: StreamArtifact) {
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        emit_sse(
+            &target.sse,
+            "artifact",
+            &TaskArtifactUpdateEvent {
+                id: target.task_id.clone(),
+                artifact,
+            },
+        )
+        .await;
     }
 
     async fn status(&self, state: &str, message: &str) {
