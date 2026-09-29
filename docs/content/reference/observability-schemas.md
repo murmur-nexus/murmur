@@ -36,7 +36,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention`, `task_rejected` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
@@ -475,6 +475,29 @@ Nothing named in `detached_work_ids` or `delegation_ids` was stopped: both are r
 operator knows what is still running, and both keep the lifecycle they already had. The arrays are
 a snapshot taken where the loop stopped, so they may differ from the `residue` artifact the
 `tasks/cancel` response carried, which was taken when that response was sent.
+
+**`task_rejected`**{ #task-rejected } — written once per task the session refused because it
+stopped taking work while the task was still queued. See
+[Tasks queued when the session ends](manifest.md#queued-tasks-at-session-end)
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The refused task |
+| `context_id` | string | The task's context id |
+| `source` | string | Where the task came from: `"a2a"` \| `"detached_shell"` \| `"detached_lost"`, as on `task_start` |
+| `cause` | string | Why the session stopped taking work, from the table below |
+| `reason` | string | The `status.message` of the task's final `rejected` [status frame](streaming-protocol.md#one-final-status) |
+
+| `cause` | Written when |
+|---|---|
+| `session_ended` | The session ended on its own: its task finished under `after_task: exit` or `task_acceptance: single`, its launch task failed, or the [idle timeout](manifest.md#idle-timeout) fired |
+| `session_stopped` | [`mur stop`](cli.md#mur-stop) or `SIGTERM` ended the session |
+
+Written after the task loop ends and before `session_end`, whatever
+[`trace.capture`](manifest.md#field-trace) is. A refused task never started, so it has no
+`task_start` and no `task_end`, and never a `task_failed` — this is its only record. A task
+cancelled while still queued keeps its [`task_canceled`](#task-canceled) line and has no
+`task_rejected`.
 
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's
 terminal `task_end`

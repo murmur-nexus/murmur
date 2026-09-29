@@ -355,6 +355,22 @@ struct TaskCanceledEvent {
     delegation_ids: Vec<String>,
 }
 
+/// A queued task the session refused when it stopped taking work. It never started, so this is
+/// its only record.
+#[derive(Debug, Deserialize)]
+struct TaskRejectedEvent {
+    task_id: String,
+    /// `"a2a"`, `"detached_shell"` or `"detached_lost"`.
+    #[serde(default)]
+    source: Option<String>,
+    /// `"session_ended"` or `"session_stopped"`.
+    cause: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    // part of the record; `mur trace show` and `steps` name the cause instead
+    reason: String,
+}
+
 /// A task attempt failed, and why.
 #[derive(Debug, Deserialize)]
 struct TaskFailedEvent {
@@ -636,6 +652,7 @@ enum TraceEvent {
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
     TaskCanceled(TaskCanceledEvent),
+    TaskRejected(TaskRejectedEvent),
     TaskFailed(TaskFailedEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
@@ -905,6 +922,8 @@ struct TraceMetrics {
     compactions_declined: Vec<CompactionDeclinedRecord>,
     /// Every `task_canceled` record, in file order — one per task a person stopped.
     cancels: Vec<CancelRecord>,
+    /// Every `task_rejected` record, in file order — one per queued task the session refused.
+    rejections: Vec<TaskRejectedEvent>,
     /// Every `task_failed` record, in file order — one per failing attempt.
     failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
@@ -969,6 +988,17 @@ struct RetentionRecord {
     removed: u32,
     targets: Vec<String>,
     messages_dropped: Option<u64>,
+}
+
+/// One `task_rejected` record's row under `mur trace show`'s `Rejected` section. A record
+/// written without a `source` shows `source unknown`.
+fn rejected_show_row(r: &TaskRejectedEvent) -> String {
+    format!(
+        "task_rejected  {}  {}  source {}",
+        r.task_id,
+        r.cause,
+        r.source.as_deref().unwrap_or("unknown")
+    )
 }
 
 /// One `task_canceled` trace record, surfaced in `mur trace show`.
@@ -1332,6 +1362,7 @@ fn compute_metrics(
     let mut task_starts: HashSet<String> = HashSet::new();
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut cancels: Vec<CancelRecord> = Vec::new();
+    let mut rejections: Vec<TaskRejectedEvent> = Vec::new();
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
@@ -1488,6 +1519,7 @@ fn compute_metrics(
                         .collect(),
                 });
             }
+            TraceEvent::TaskRejected(e) => rejections.push(e),
             TraceEvent::TaskFailed(e) => failures.push(e),
             TraceEvent::TaskReopened(e) => {
                 reopens.push(ReopenRecord {
@@ -1728,6 +1760,7 @@ fn compute_metrics(
             compaction,
             compactions_declined,
             cancels,
+            rejections,
             failures,
             reopens,
             context_seeds,
@@ -2256,6 +2289,14 @@ fn print_show(m: &TraceMetrics) {
                 format!("still running: {}", c.still_running.join(", "))
             };
             println!("task_canceled  at {}  {still_running}", c.phase);
+        }
+    }
+
+    if !m.rejections.is_empty() {
+        println!();
+        println!("── Rejected ─────────────────────────────────────");
+        for r in &m.rejections {
+            println!("{}", rejected_show_row(r));
         }
     }
 
@@ -3024,6 +3065,12 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             };
             format!("{}{}  {residue}", kind("task_canceled"), e.phase)
         }
+        TraceEvent::TaskRejected(e) => format!(
+            "{}{}  {}",
+            kind("task_rejected"),
+            e.cause,
+            fmt_id_short(&e.task_id, 12)
+        ),
         TraceEvent::TaskFailed(e) => {
             let reason: String = e.reason.chars().take(120).collect();
             format!("{}{}  {reason}", kind("task_failed"), e.cause)
@@ -4134,6 +4181,32 @@ mod tests {
             row(&hook).ends_with("needs 12,100  hook:compact"),
             "{}",
             row(&hook)
+        );
+    }
+
+    /// A refused task's `steps` row names the cause and the task, and its `show` row names the
+    /// task in full, the cause and the source. A record with no `reason` still parses.
+    #[test]
+    fn task_rejected_renders_a_steps_row_and_a_show_row() {
+        let line = r#"{"event_type":"task_rejected","event_id":"evt_7","parent_id":"evt_1","session_id":"s","timestamp":7,"task_id":"tsk_0a1b2c3d4e5f6a7b","context_id":"ctx_1","source":"a2a","cause":"session_ended","reason":"task rejected: the session ended before this task started"}"#;
+        assert_eq!(row(line), "task_rejected session_ended  tsk_0a1b2c3d…");
+
+        let TraceEvent::TaskRejected(e) = serde_json::from_str::<TraceEvent>(line).unwrap() else {
+            panic!("a task_rejected line parses as TaskRejected");
+        };
+        assert_eq!(
+            rejected_show_row(&e),
+            "task_rejected  tsk_0a1b2c3d4e5f6a7b  session_ended  source a2a"
+        );
+
+        let bare = r#"{"event_type":"task_rejected","task_id":"tsk_1","cause":"session_stopped"}"#;
+        let TraceEvent::TaskRejected(e) = serde_json::from_str::<TraceEvent>(bare).unwrap() else {
+            panic!("a task_rejected line without source or reason still parses");
+        };
+        assert_eq!(e.reason, "");
+        assert_eq!(
+            rejected_show_row(&e),
+            "task_rejected  tsk_1  session_stopped  source unknown"
         );
     }
 
