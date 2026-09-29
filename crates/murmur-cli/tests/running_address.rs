@@ -1139,6 +1139,7 @@ fn stage_in_process(
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },
@@ -1225,4 +1226,75 @@ fn a_session_that_ends_leaves_no_record_whether_it_succeeded_or_failed() {
         "a launch that returned Err left its record behind — removal is a guard, not a line at \
          each return"
     );
+}
+
+// ── An authenticated door ─────────────────────────────────────────────────────
+
+/// A capsule named by `--url` has no running record to read a token from: without
+/// `MURMUR_DOOR_TOKEN` the door's refusal is named, and with it the call goes through.
+#[test]
+fn door_auth_url_takes_the_token_from_the_environment() {
+    use common::door_capsule::{authenticated_capsule_with_a_task_in_flight, driver_home, mur};
+    let home = driver_home();
+    let (run, _server, _project, task_id) =
+        authenticated_capsule_with_a_task_in_flight(&home, "url-auth");
+    let url = run.url();
+
+    let refused = mur(home.path(), &[])
+        .args(["cancel", "--url", &url, &task_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(stderr.contains("401"), "{stderr}");
+    assert!(stderr.contains("MURMUR_DOOR_TOKEN"), "{stderr}");
+
+    let watcher = run.token("watcher");
+    let forbidden = mur(home.path(), &[("MURMUR_DOOR_TOKEN", watcher.as_str())])
+        .args(["cancel", "--url", &url, &task_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&forbidden.stderr).to_string();
+    assert!(stderr.contains("403"), "{stderr}");
+    assert!(!stderr.contains(watcher.as_str()), "{stderr}");
+
+    let operator = run.token("operator");
+    let canceled = mur(home.path(), &[("MURMUR_DOOR_TOKEN", operator.as_str())])
+        .args(["cancel", "--url", &url, &task_id])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&canceled.stdout).to_string();
+    assert!(stdout.contains("state:   canceled"), "{stdout}");
+}
+
+/// A session address resolves an authenticated capsule: the liveness probe reads its session id
+/// off the extended card with the record's token.
+#[test]
+fn door_auth_session_address_resolves_an_authenticated_capsule() {
+    use common::door_capsule::{authenticated_capsule_with_a_task_in_flight, driver_home, mur};
+    let home = driver_home();
+    let (run, _server, _project, task_id) =
+        authenticated_capsule_with_a_task_in_flight(&home, "address-auth");
+    let session_id = run.startup["session_id"].as_str().unwrap().to_string();
+    let suffix = &session_id[session_id.len() - 6..];
+
+    let record: Value =
+        serde_json::from_str(&fs::read_to_string(record_for(home.path(), &session_id)).unwrap())
+            .unwrap();
+    assert_eq!(record["door_token"], run.token("operator").as_str());
+    assert_eq!(record.as_object().unwrap().len(), 10, "{record}");
+
+    let canceled = mur(home.path(), &[])
+        .args(["cancel", suffix, &task_id])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&canceled.stdout).to_string();
+    assert!(stdout.contains("state:   canceled"), "{stdout}");
 }

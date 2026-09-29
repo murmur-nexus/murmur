@@ -816,10 +816,20 @@ fn print_uninspectable(report: &FormationEnvReport, findings: &mut FormationFind
     );
 }
 
+/// Who may call the capsule's door: the posture line, always, and `W-SEC-032` when `bind_addr`
+/// exposes a door that declares no `network.authentication`. The warning is rendered from the
+/// manifest by the same function `mur run --bind` uses, so the two lines are byte-identical.
+fn report_door(runtime_manifest: &RuntimeManifest, bind_addr: &str) {
+    println!("{}", capsule_runtime::door_posture(runtime_manifest));
+    if let Some(line) = capsule_runtime::public_door_bind_warning(runtime_manifest, bind_addr) {
+        println!("{line}");
+    }
+}
+
 /// Check every artifact the current project declares against the stores a session
 /// resolves from. The checklist is the manifest — editing `murmur.yaml` changes what
 /// is checked, with no change here.
-pub(crate) fn run_doctor() -> Result<(), CliError> {
+pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let project_root = find_project_root().map_err(|mut error| {
         error.hint = Some("run `mur doctor` from inside a project directory".to_string());
         error
@@ -909,6 +919,8 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         runtime_manifest.inference.as_ref(),
         &runtime_manifest.artifacts,
     );
+
+    report_door(&runtime_manifest, bind_addr);
 
     let effective_config = load_effective_mur_config_if_any_exists()?;
 

@@ -204,6 +204,10 @@ pub struct LaunchedChild {
     /// Minted here, injected into the child as part of [`SPAWNER_ENV`], and echoed back on the
     /// completion — the one value that joins a delegation to the task it produces at the parent.
     pub delegation_id: Option<String>,
+    /// The operator token of a child that declares `network.authentication`, read from
+    /// `tokens.operator` on its readiness line. The parent presents it on every call to the
+    /// child's door. Never printed by `Debug`.
+    pub door_token: Option<crate::door_auth::DoorToken>,
     process: Arc<Mutex<ChildProcess>>,
     /// The child's last [`CHILD_STDERR_TAIL_LINES`] lines, retained so a crash can say why.
     stderr_tail: Arc<StderrTail>,
@@ -221,6 +225,10 @@ impl std::fmt::Debug for LaunchedChild {
             .field("session_id", &self.session_id)
             .field("capsule_url", &self.capsule_url)
             .field("delegation_id", &self.delegation_id)
+            .field(
+                "door_token",
+                &self.door_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("pid", &self.pid())
             .finish()
     }
@@ -399,6 +407,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         argv,
         env,
         delegation_id: handle.as_ref().map(|handle| handle.delegation_id.clone()),
+        door_token: None,
         process: Arc::new(Mutex::new(ChildProcess {
             child: Some(child),
             deliberate: false,
@@ -432,6 +441,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         .unwrap_or_default();
 
     launched.session_id = session_id.to_string();
+    launched.door_token = readiness_door_token(&report);
     // A script capsule binds no port and reports an empty url; promoting that to `http://` would
     // manufacture an address nothing answers on.
     launched.capsule_url = if url.is_empty() {
@@ -456,6 +466,16 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         }
     }
     Ok(launched)
+}
+
+/// The operator token a child's `--json` readiness line carries under `tokens.operator`, present
+/// only when the child declares `network.authentication`.
+fn readiness_door_token(report: &serde_json::Value) -> Option<crate::door_auth::DoorToken> {
+    report
+        .pointer("/tokens/operator")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(|token| crate::door_auth::DoorToken::new(token.to_string()))
 }
 
 /// Report for a child that ended without reporting for itself, and stop one that never ends.
@@ -994,5 +1014,49 @@ mod tests {
             started.elapsed() < CHILD_STDERR_DRAIN_TIMEOUT,
             "{started:?}"
         );
+    }
+
+    #[test]
+    fn child_launch_reads_the_operator_token_from_the_readiness_line() {
+        let report = serde_json::json!({
+            "url": "localhost:1",
+            "session_id": "ses_x",
+            "tokens": {"operator": "mdt1.a.b", "watcher": "mdt1.c.d"},
+        });
+        assert_eq!(
+            readiness_door_token(&report).map(|token| token.expose().to_string()),
+            Some("mdt1.a.b".to_string())
+        );
+        let public = serde_json::json!({"url": "localhost:1", "session_id": "ses_x"});
+        assert_eq!(readiness_door_token(&public), None);
+    }
+
+    #[test]
+    fn child_launch_debug_prints_no_door_token() {
+        let child = LaunchedChild {
+            workdir: PathBuf::from("/tmp/child"),
+            session_id: "ses_child".to_string(),
+            capsule_url: "http://localhost:1".to_string(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            delegation_id: None,
+            door_token: Some(crate::door_auth::DoorToken::new(
+                "mdt1.secretpayload.secretmac".to_string(),
+            )),
+            process: Arc::new(Mutex::new(ChildProcess {
+                child: None,
+                deliberate: false,
+                status: None,
+            })),
+            stderr_tail: Arc::new(StderrTail {
+                state: Mutex::new(StderrState::default()),
+                drained: Condvar::new(),
+            }),
+            started: Instant::now(),
+            released: true,
+        };
+        let debug = format!("{child:?}");
+        assert!(!debug.contains("secretpayload"), "{debug}");
+        assert!(debug.contains("door_token"), "{debug}");
     }
 }

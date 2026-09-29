@@ -1505,6 +1505,15 @@ pub fn stage_session(
             Arc::new(crate::control_plane::ControlState::new(control, inference))
         });
     let injected_secrets = control.as_ref().map(|control| control.secrets());
+    // Minted at staging so the launcher can hand the tokens out before the door opens. The key is
+    // generated here for this session alone and is never written.
+    let door_auth = request
+        .door_authentication
+        .as_ref()
+        .map(crate::door_auth::DoorAuth::mint)
+        .transpose()
+        .map_err(RuntimeError::Runtime)?
+        .map(Arc::new);
     let gateways = stage_gateways(
         request.inference.as_ref(),
         &request.artifacts,
@@ -1699,6 +1708,8 @@ pub fn stage_session(
         gateways,
         spend,
         control,
+        door_authentication: request.door_authentication,
+        door_auth,
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
         context_id: request.context_id,
@@ -2046,7 +2057,7 @@ fn launch(
             &staged.lifecycle,
         );
 
-        let agent_card = identity::build_agent_card(
+        let agent_cards = identity::build_agent_cards(
             &capsule_identity,
             &staged.installed_artifacts,
             &staged.capability_policy,
@@ -2056,11 +2067,24 @@ fn launch(
                 peer_files: staged.exports_peer_files.is_some(),
             },
             transport_capabilities(&staged),
+            staged.door_authentication.as_ref(),
         );
         // Read here, where the staged transport is still in hand, for the door to answer the
         // forget header with.
         let forgettable_session = keeps_a_harness_session(staged.inference.as_ref());
-        let agent_card_json = agent_card.to_string();
+        let agent_card_json = agent_cards.public.to_string();
+        let door_gate =
+            staged
+                .door_auth
+                .as_ref()
+                .zip(agent_cards.extended)
+                .map(|(auth, extended_card)| {
+                    Arc::new(identity::DoorGate {
+                        auth: Arc::clone(auth),
+                        realm: staged.capsule_name.clone(),
+                        extended_card,
+                    })
+                });
 
         // --- Lifecycle config ---
         let effective_lifecycle = staged.lifecycle.clone();
@@ -2390,6 +2414,7 @@ fn launch(
                             Some(Arc::clone(&detached)),
                             Arc::clone(&live_delegations),
                             forgettable_session,
+                            door_gate,
                         ));
 
                     // Read before `capability_policy` moves into the store state below. Hooks
@@ -3567,6 +3592,10 @@ fn launch(
 /// `outlives_launcher` is derived from whether the launching process has a controlling terminal.
 /// A capsule started in a terminal dies with that window; one started without a terminal —
 /// `nohup … </dev/null &`, a `setsid`, a service manager — survives whoever started it.
+///
+/// `door_token` is the operator token of a session declaring `network.authentication`, and the
+/// only one written anywhere: it is how `mur ps`, `mur stop`, `mur cancel` and `mur watch` call
+/// an authenticated door.
 fn running_record_for(
     staged: &StagedSession,
     session_id: &str,
@@ -3585,6 +3614,10 @@ fn running_record_for(
         workdir: staged.workdir.clone(),
         outlives_launcher: !running::has_controlling_terminal(),
         started_at: chrono::Utc::now().to_rfc3339(),
+        door_token: staged
+            .door_auth
+            .as_ref()
+            .map(|auth| auth.operator_token().clone()),
     }
 }
 
@@ -9951,6 +9984,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10050,6 +10084,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10135,6 +10170,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10219,6 +10255,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10355,6 +10392,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10455,6 +10493,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         }

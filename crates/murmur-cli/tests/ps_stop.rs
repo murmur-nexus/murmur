@@ -1875,3 +1875,50 @@ fn a_door_that_accepts_and_never_answers_is_unreachable_and_kept() {
     );
     drop(listener);
 }
+
+// ── An authenticated door ─────────────────────────────────────────────────────
+
+/// `mur ps` and `mur stop` read the operator token from the running record, so a capsule
+/// declaring `network.authentication` is listed as running and stopped with a full account.
+#[test]
+fn door_auth_ps_lists_and_stop_ends_an_authenticated_capsule() {
+    use common::door_capsule::{authenticated_capsule_with_a_task_in_flight, driver_home, mur};
+    let home = driver_home();
+    let (mut run, _server, _project, task_id) =
+        authenticated_capsule_with_a_task_in_flight(&home, "ps-auth");
+    let session_id = run.startup["session_id"].as_str().unwrap().to_string();
+
+    let ps = mur(home.path(), &[])
+        .arg("ps")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let ps = String::from_utf8_lossy(&ps.stdout).to_string();
+    let rows = ps_rows(&ps);
+    assert_eq!(rows.len(), 1, "{ps}");
+    assert!(rows[0].contains(&session_id), "{ps}");
+    assert!(rows[0].contains("running"), "{ps}");
+    assert!(!ps.contains("mdt1."), "mur ps printed a token: {ps}");
+
+    let stopped = mur(home.path(), &[])
+        .args(["stop", "@1"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&stopped.stdout).to_string();
+    assert!(stdout.contains(&format!("canceled: {task_id}")), "{stdout}");
+    assert!(
+        stdout.contains("residue: nothing else was left running"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("residue: unknown"), "{stdout}");
+    assert!(!stdout.contains("mdt1."), "{stdout}");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while run.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the capsule outlived mur stop");
+        thread::sleep(Duration::from_millis(100));
+    }
+}

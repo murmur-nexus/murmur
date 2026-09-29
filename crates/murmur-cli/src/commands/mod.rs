@@ -107,6 +107,10 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid control config for '{field}': {message}"),
         ),
+        RuntimeManifestError::InvalidNetworkConfig { field, message } => CliError::new(
+            E_MAN_003,
+            format!("{MANIFEST_FILENAME}: invalid network config for '{field}': {message}"),
+        ),
         RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid trace config for '{field}': {message}"),

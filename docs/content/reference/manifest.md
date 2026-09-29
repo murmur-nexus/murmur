@@ -135,6 +135,11 @@ capabilities:
 
 network:
   internal_port: 14159  # optional; omit to let the OS assign a free port
+  authentication:       # optional; omit for a door that answers every caller
+    scheme: bearer      # required in the block; the only scheme
+    credentials:        # optional; tokens narrower than the operator token
+      watcher:
+        scopes: [tasks/get, stream/watch]
 
 context:
   max_tokens: 200000   # enables context compaction; omit to disable
@@ -863,6 +868,41 @@ is never contacted.
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `network.internal_port` | integer | no | The port the capsule's A2A HTTP server binds. When set, the runtime binds exactly that port and fails with `E-RUN-010` if it is already in use. When omitted, the OS assigns a free port. Either way the bound port is the one `mur run` prints and the one `MURMUR_CAPSULE_URL` carries. |
+| `network.authentication` | object | no | Makes the A2A door refuse every caller that presents no token this session minted. Default: absent, a public door that answers every caller that reaches the port. See [`network.authentication`](#field-network-authentication). |
+
+The top-level `network:` block configures the capsule's A2A door. It is unrelated to
+[`capabilities.network`](#network-allow-entries), which is where the capsule itself may connect.
+
+##### `network.authentication` { #field-network-authentication }
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `network.authentication.scheme` | `bearer` | yes | How a caller authenticates: `Authorization: Bearer <token>`. `bearer` is the only value; any other is `E-MAN-003`. |
+| `network.authentication.credentials` | map of name → object | no | Default: none. Each entry mints one more token beside the operator token, reaching only its `scopes`. |
+| `network.authentication.credentials.<name>` | object | — | `<name>` matches `^[a-z][a-z0-9_-]{0,31}$`. `operator` is reserved. |
+| `network.authentication.credentials.<name>.scopes` | list<string> | yes | Non-empty. Each entry once, from the scopes below. |
+
+The runtime mints one `operator` token holding every scope, and one token per declared credential.
+[`mur run`](cli.md#mur-run) prints them. A credential exists to hand out less than the operator
+token.
+
+| Scope | Reaches |
+|---|---|
+| `message/send` | Starting a task with `message/send` |
+| `message/stream` | Starting a task with `message/stream` |
+| `stream/watch` | Watching every task on the session |
+| `tasks/get` | Reading any task on the session |
+| `tasks/cancel` | Cancelling any task on the session |
+| `session/stop` | Cancelling every task and reporting the residue |
+| `resources/files` | The [operator resource plane](resource-plane.md#operator-plane) under `/resources/files` |
+
+A scope names a method, not a task: every authenticated caller shares the session's tasks. What the
+door answers each caller, and the public and extended cards, are in
+[Agent Card: Security](agent-card.md#security).
+
+A capsule declaring both `network.authentication` and a non-empty `capabilities.spawn.allow` is
+refused with `E-MAN-003`: a delegated child posts its outcome to its parent's door, and a child
+cannot be issued a token for that door.
 
 #### `inference` { #field-inference }
 

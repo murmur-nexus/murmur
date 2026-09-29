@@ -43,6 +43,19 @@ impl Target {
         }
     }
 
+    /// The door token to present: the operator token in the running record of a session address,
+    /// or `MURMUR_DOOR_TOKEN` for a `--url`. `None` calls the door without one, which a public
+    /// door answers and an authenticated door refuses.
+    pub(crate) fn door_token(&self) -> Option<capsule_runtime::DoorToken> {
+        match self {
+            Target::Session(record) => record.door_token.clone(),
+            Target::Url(_) => std::env::var(capsule_runtime::DOOR_TOKEN_ENV)
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+                .map(|token| capsule_runtime::DoorToken::new(token.trim().to_string())),
+        }
+    }
+
     /// What to call this capsule when telling a person which one they are looking at: the session
     /// it turned out to be, or the address they typed when that is all that was given.
     pub(crate) fn label(&self) -> &str {

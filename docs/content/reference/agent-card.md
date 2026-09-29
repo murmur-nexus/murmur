@@ -7,7 +7,8 @@ under a strict protobuf JSON parser. It names the session answering the address,
 capsule may do, and lists what its listener answers.
 
 The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_acceptance: single`,
-`bash` installed, shell and network granted and `exports.files` declared:
+`bash` installed, shell and network granted, `exports.files` declared and no
+[`network.authentication`](manifest.md#field-network-authentication):
 
 ```json
 {
@@ -66,6 +67,10 @@ What murmur adds to the standard card sits in two [extensions](#extensions):
 | [Door](#murmur-door-v1) | What does this listener answer? | The methods `POST /` dispatches |
 | [Capsule](#murmur-capsule-v1) | Which session is this, and what may the capsule do? | The session, the installed artifacts, `capabilities.*` and the declared `exports` |
 
+A capsule that declares [`network.authentication`](manifest.md#field-network-authentication)
+serves a different public card, and moves the capsule extension to an extended card only an
+authenticated caller can read — see [Security](#security).
+
 ---
 
 ## Keys { #keys }
@@ -79,8 +84,8 @@ Every key below is present on every card this runtime serves.
 | `version` | string | The capsule's `version` from `murmur.yaml` |
 | `supportedInterfaces` | array of objects | One entry — see [`supportedInterfaces`](#supported-interfaces) |
 | `capabilities` | object | See [`capabilities`](#capabilities) |
-| `securitySchemes` | object | `{}` — see [Security](#security) |
-| `securityRequirements` | array | `[]` — see [Security](#security) |
+| `securitySchemes` | object | `{}`, or the `bearer` scheme on an authenticated door — see [Security](#security) |
+| `securityRequirements` | array | `[]`, or one requirement on an authenticated door — see [Security](#security) |
 | `defaultInputModes` | array of strings | `["text/plain"]`. The door reads text parts only |
 | `defaultOutputModes` | array of strings | `["text/plain"]`. The door writes text parts only |
 | `skills` | array of objects | See [`skills`](#skills). Empty under `lifecycle.task_acceptance: none` |
@@ -115,8 +120,8 @@ Task states are kebab-case (`input-required`), as in A2A 0.3.
 |---|---|---|
 | `capabilities.streaming` | boolean | `true` when the [door extension](#murmur-door-v1) lists `message/stream` and the capsule's inference transport streams text |
 | `capabilities.pushNotifications` | boolean | `false` |
-| `capabilities.extendedAgentCard` | boolean | `false`. Every caller gets this card |
-| `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), then the [capsule extension](#murmur-capsule-v1) |
+| `capabilities.extendedAgentCard` | boolean | `false` on a public door, where every caller gets this card. `true` on an [authenticated door](#security) |
+| `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), then the [capsule extension](#murmur-capsule-v1). An authenticated door's public card carries the door extension alone |
 
 `streaming` is the door's answer and the transport's together: a door that answers
 `message/stream` over a transport that streams nothing lists the method on the door extension and
@@ -129,8 +134,183 @@ reports `false` here.
 
 ## Security { #security }
 
-`securitySchemes` is `{}` and `securityRequirements` is `[]`, which declares a public agent: no
-credential is required to call the capsule. The door does not authenticate callers.
+Who may call the door is set by [`network.authentication`](manifest.md#field-network-authentication).
+
+| Manifest | Door | `securitySchemes` | `securityRequirements` | Extended card |
+|---|---|---|---|---|
+| No `network.authentication` | Public: answers every caller that reaches the port, and ignores `Authorization` | `{}` | `[]` | None |
+| `network.authentication.scheme: bearer` | Authenticated: every request but the public card presents a token | `bearer`, an HTTP `Bearer` scheme | Any valid token | The public card plus the capsule extension, in A2A 0.3 shape |
+
+A public door's card is exactly the card at the top of this page.
+
+### Tokens { #tokens }
+
+An authenticated capsule's runtime mints its tokens at launch, and [`mur run`](cli.md#mur-run)
+prints them. A token is valid until the session ends; a restart or a `--resume` mints new ones.
+
+| Credential | Scopes | Minted |
+|---|---|---|
+| `operator` | Every scope | Always |
+| Each name under `network.authentication.credentials` | The scopes that credential lists | One per declared credential |
+
+A scope is a door method's name, or `resources/files` for the
+[operator plane](resource-plane.md#operator-plane). `agent/getAuthenticatedExtendedCard` needs no
+scope: every valid token may read the extended card.
+
+Every authenticated caller shares the session's one task and context space. A scope limits which
+methods a token reaches, not which tasks: a credential holding `tasks/get` or `stream/watch` sees
+every task on the session.
+
+### What the door answers { #door-authentication }
+
+An authenticated door checks, in this order, on every request:
+
+1. `GET /.well-known/agent-card.json` and the [peer plane](resource-plane.md#peer-plane) under
+   `/resources/peer/` are served without a door token.
+2. The token, before the path, the body or the method is read. A refusal here says nothing about
+   whether a task, a file or a path exists.
+3. The scope of a method the door serves, or of the operator plane.
+4. The request itself, whose errors — `-32001 Task not found`, `-32601`, `-32602`, `-32004`, HTTP
+   `404` — reach an authenticated, in-scope caller unchanged.
+
+A refusal at steps 2 and 3 is an HTTP status and a JSON body, never a JSON-RPC envelope:
+
+| Case | Status | `www-authenticate` | Body `error` |
+|---|---|---|---|
+| No `Authorization` header | `401` | `Bearer realm="<capsule name>"` | `unauthenticated` |
+| An `Authorization` header that is not `Bearer <token>`, a token this session did not mint, or more than one `Authorization` header | `401` | `Bearer realm="<capsule name>", error="invalid_token"` | `invalid_token` |
+| A valid token whose credential lacks the scope | `403` | `Bearer realm="<capsule name>", error="insufficient_scope", scope="<scope>"` | `insufficient_scope` |
+
+The body is `{"error": "<code>", "message": "<sentence>"}`. The `403` message names the credential
+and the scope it lacks: `credential 'watcher' does not reach message/send`. The scheme name
+`Bearer` matches in any case; the token matches exactly.
+
+The door speaks plain HTTP, so a token sent across a network travels in clear text. Put a TLS
+terminator in front of a door that is reached off the host.
+
+### The public card of an authenticated door { #authenticated-public-card }
+
+`my-agent` from the top of this page, declaring `network.authentication`:
+
+```json
+{
+  "name": "my-agent",
+  "description": "Murmur capsule my-agent 0.1.0",
+  "version": "0.1.0",
+  "supportedInterfaces": [
+    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+  ],
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "extendedAgentCard": true,
+    "extensions": [
+      {
+        "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
+        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+        "required": false,
+        "params": {
+          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"]
+        }
+      }
+    ]
+  },
+  "securitySchemes": {
+    "bearer": {
+      "httpAuthSecurityScheme": {
+        "scheme": "Bearer",
+        "description": "A token this capsule's runtime mints at launch and accepts until the session ends."
+      }
+    }
+  },
+  "securityRequirements": [ { "schemes": { "bearer": { "list": [] } } } ],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "task",
+      "name": "Run a task",
+      "description": "Runs one task given as a text message and reports its outcome.",
+      "tags": ["task"],
+      "securityRequirements": [
+        { "schemes": { "bearer": { "list": ["message/send"] } } },
+        { "schemes": { "bearer": { "list": ["message/stream"] } } }
+      ]
+    }
+  ]
+}
+```
+
+It differs from a public door's card in these keys:
+
+| Key | Value |
+|---|---|
+| `capabilities.extendedAgentCard` | `true` |
+| `capabilities.extensions` | The door extension alone. The [capsule extension](#murmur-capsule-v1) is on the extended card |
+| Door extension `params.methods` | Gains `agent/getAuthenticatedExtendedCard` |
+| `securitySchemes` | `bearer`: an `httpAuthSecurityScheme` with scheme `Bearer` |
+| `securityRequirements` | `[{"schemes": {"bearer": {"list": []}}}]`: any valid token |
+| `task` skill `securityRequirements` | One alternative per served task-starting method, `message/send` then `message/stream`, each naming the scope it needs |
+
+### The extended card { #extended-card }
+
+`agent/getAuthenticatedExtendedCard` returns the extended card as its JSON-RPC `result`, to any
+valid token. The method answers on the door's A2A 0.3 interface, so the result is an A2A 0.3
+`AgentCard`: an A2A client that picks the `0.3` interface validates it as one. It is the
+authenticated door's v1.0 card with the capsule extension kept, converted to 0.3 field names:
+
+```json
+{
+  "protocolVersion": "0.3.0",
+  "name": "my-agent",
+  "description": "Murmur capsule my-agent 0.1.0",
+  "url": "http://localhost:41873",
+  "preferredTransport": "JSONRPC",
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "extensions": [
+      { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.", "required": false,
+        "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"] } },
+      { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
+        "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } }
+    ]
+  },
+  "securitySchemes": {
+    "bearer": { "type": "http", "scheme": "Bearer", "description": "A token this capsule's runtime mints at launch and accepts until the session ends." }
+  },
+  "security": [ { "bearer": [] } ],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "task",
+      "name": "Run a task",
+      "description": "Runs one task given as a text message and reports its outcome.",
+      "tags": ["task"],
+      "security": [ { "bearer": ["message/send"] }, { "bearer": ["message/stream"] } ]
+    }
+  ],
+  "supportsAuthenticatedExtendedCard": true
+}
+```
+
+| 0.3 key | From the v1.0 card |
+|---|---|
+| `url` | `supportedInterfaces[0].url` |
+| `preferredTransport` | `JSONRPC` |
+| `protocolVersion` | `0.3.0` |
+| `capabilities` | `capabilities`, without `extendedAgentCard` |
+| `supportsAuthenticatedExtendedCard` | `capabilities.extendedAgentCard` |
+| `securitySchemes.bearer` | `{"type": "http", "scheme": …, "description": …}` |
+| `security`, and each skill's `security` | `securityRequirements`, each `{"schemes": {name: {"list": […]}}}` as `{name: […]}` |
+
+The capsule extension's `params.sessionId` is at the same path in both shapes.
+
+A public door has no extended card. It answers `agent/getAuthenticatedExtendedCard` with the A2A
+0.3 error `-32007 Authenticated Extended Card is not configured`, and its card does not list the
+method.
 
 ## `skills` { #skills }
 
@@ -181,6 +361,7 @@ and `session/stop` are murmur methods, not A2A methods. Methods appear in this o
 | `tasks/get` | Returns the task named by `params.id` | Always |
 | `tasks/cancel` | Cancels the task named by `params.id` | Always |
 | `session/stop` | Cancels every live task and reports what the session leaves running | Always |
+| `agent/getAuthenticatedExtendedCard` | Returns the [extended card](#extended-card) | The capsule declares [`network.authentication`](manifest.md#field-network-authentication) |
 
 See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
 answers `message/send` and `message/stream` with `-32601`, so neither is listed,
@@ -208,9 +389,13 @@ answers the header with `-32602` without starting a task — see
 
 URI: `https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1`
 
-This extension is extended-card material: the session id and what the capsule may do. It is on the
-public card because the door does not authenticate callers, and nothing of it appears anywhere else
-on the card.
+This extension is extended-card material: the session id and what the capsule may do. Nothing of
+it appears anywhere else on the card.
+
+| Door | Where the extension is |
+|---|---|
+| Public | The public card |
+| Authenticated | The [extended card](#extended-card) only |
 
 | Key | Type | Value |
 |---|---|---|

@@ -165,6 +165,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             .unwrap_or_default(),
         exports: runtime_manifest.exports.clone(),
         control: None,
+        door_authentication: None,
         spawn_grant: None,
         machine_tokens_per_day: None,
     };

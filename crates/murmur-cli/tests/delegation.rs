@@ -67,6 +67,10 @@ const DEEP_WORKER: &str = "deep-worker";
 /// env axis.
 const THIRSTY_WORKER: &str = "thirsty-worker";
 
+/// The sub-capsule that answers as [`WORKER`] does from behind a door declaring
+/// `network.authentication`, so its parent must present its operator token to drive it.
+const AUTH_WORKER: &str = "auth-worker";
+
 /// The host variable both the parent and [`WORKER`] declare, and the whole of what a delegated
 /// child is handed beyond the names the runtime owns.
 const PROVIDER_KEY_VAR: &str = "MURMUR_TEST_PROVIDER_KEY";
@@ -599,7 +603,7 @@ fn suite() -> &'static Suite {
                  network:\n    allow: [127.0.0.1]\n  \
                  env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
                  spawn:\n    allow: [{WORKER}, {WORKER_TWO}, {WORKER_THREE}, {GREEDY_WORKER}, \
-                 {MUTE_WORKER}, {DEEP_WORKER}, {THIRSTY_WORKER}]\n"
+                 {MUTE_WORKER}, {DEEP_WORKER}, {THIRSTY_WORKER}, {AUTH_WORKER}]\n"
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
@@ -628,6 +632,16 @@ fn suite() -> &'static Suite {
                 None,
             );
         }
+        // The same answer from behind an authenticated door.
+        roost.publish(
+            AUTH_WORKER,
+            VERSION,
+            &format!(
+                "{}network:\n  authentication:\n    scheme: bearer\n",
+                agent_capsule_manifest(&always_replying(WORKER_ANSWER).endpoint)
+            ),
+            None,
+        );
         // The sub-capsule the referee refuses: one grant beyond its parent's envelope. It never
         // launches, so its component only has to resolve.
         roost.publish(
@@ -1018,6 +1032,7 @@ fn stage_request(
         declared_containment_floor: ContainmentClass::Advisory,
         exports: runtime_manifest.exports.clone(),
         control: None,
+        door_authentication: None,
         spawn_grant: None,
         machine_tokens_per_day: None,
     }
@@ -1550,6 +1565,68 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
             !text.contains(&needle),
             "'{needle}' reached the tool result"
         );
+    }
+}
+
+/// A child that declares `network.authentication` is driven by its unauthenticated parent with the
+/// operator token from its readiness line, and its outcome arrives exactly as a public child's
+/// does. No door token reaches the parent's workdir, its trace or its model.
+#[test]
+fn authenticated_child_is_driven_with_its_operator_token() {
+    if common::skip_without_host_support("authenticated_child_is_driven_with_its_operator_token") {
+        return;
+    }
+    let _suite = suite();
+    let parent = Parent::launch(PARENT, &format!("  spawn:\n    allow: [{AUTH_WORKER}]\n"));
+
+    let text = parent.delegate("toolu_auth", AUTH_WORKER, VERSION, "summarise the report");
+    let result: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
+    assert_eq!(result["status"], "started", "{result}");
+    let delegation_id = result["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let outcomes = parent.await_outcomes(1, Duration::from_secs(240));
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0]["origin"], "completion", "{outcomes:?}");
+    assert_eq!(
+        outcomes[0]["delegation_id"],
+        json!(delegation_id),
+        "{outcomes:?}"
+    );
+
+    let handed = await_model_message(&parent, COMPLETION_OPENING, Duration::from_secs(120));
+    assert!(handed.contains("status: ok"), "{handed}");
+
+    let child_dir = parent.only_child_dir();
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(child_dir.join("completion.json"))
+            .expect("the child records its own outcome"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "ok", "{completion}");
+    assert_eq!(completion["delivered"], json!(true), "{completion}");
+
+    let events = parent.events("delegation");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["outcome"], "ok", "{events:?}");
+    assert_eq!(events[0]["capsule"], AUTH_WORKER, "{events:?}");
+
+    let model_context = serde_json::to_string(&parent.server.requests()).unwrap();
+    assert!(
+        !model_context.contains("mdt1."),
+        "a door token reached the model"
+    );
+    assert!(
+        !text.contains("mdt1."),
+        "a door token reached the tool result"
+    );
+    for root in [&parent.project, &parent.session_dir] {
+        if let Some(path) = find_in_files(root, "mdt1.") {
+            panic!("a door token reached {}", path.display());
+        }
     }
 }
 

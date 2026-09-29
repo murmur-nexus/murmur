@@ -314,6 +314,16 @@ pub const W_SEC_030: &str = "W-SEC-030";
 /// harness itself reports, and never names a credential.
 pub const W_SEC_031: &str = "W-SEC-031";
 
+/// The A2A door is exposed off loopback and the manifest declares no `network.authentication`, so
+/// any caller that reaches the port can drive the capsule and read what its agent card publishes.
+///
+/// Exposed means bound to an address outside `127.0.0.0/8`, `::1` and `localhost`, or published
+/// to the network by `mur deploy`. The warning names every method a stranger can call and what the
+/// card discloses. Never a refusal: a public door on a private network is a legitimate choice, and
+/// the warning is what makes it one. Fires once per launch from `mur run`, from
+/// `mur doctor --bind`, and from `mur deploy`.
+pub const W_SEC_032: &str = "W-SEC-032";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -334,7 +344,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
-            W_SEC_025, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031,
+            W_SEC_025, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

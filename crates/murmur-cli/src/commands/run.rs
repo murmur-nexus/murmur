@@ -333,6 +333,13 @@ pub(crate) fn run_run(
     // cannot word one ignored key differently. Never a refusal: the capsule launches regardless.
     warn_on_unknown_manifest_keys(&runtime_manifest, env!("CARGO_PKG_VERSION"));
 
+    // A door bound off loopback with no `network.authentication` answers anyone who reaches it.
+    // Same seam and same reasons as the warning above, and `mur doctor --bind` renders the same
+    // line from the same manifest. Never a refusal.
+    if let Some(line) = capsule_runtime::public_door_bind_warning(&runtime_manifest, bind_addr) {
+        capsule_runtime::runtime_err!("{line}");
+    }
+
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
     // `stage_session` refuses the same thing with the same checker; called here so
@@ -696,6 +703,10 @@ pub(crate) fn run_run(
         declared_containment_floor,
         exports: runtime_manifest.exports.clone(),
         control: runtime_manifest.control.clone(),
+        door_authentication: runtime_manifest
+            .network
+            .as_ref()
+            .and_then(|network| network.authentication.clone()),
         spawn_grant,
         machine_tokens_per_day,
     };
@@ -754,6 +765,10 @@ pub(crate) fn run_run(
             .map_err(|error| fail(&session_id, &workdir, lockfile_error_to_cli(error), json))?;
     }
 
+    // Read before `staged` moves into the launch. Printed only to stdout, and only once the door
+    // is bound: a token is the credential for a door that exists.
+    let door_tokens = staged.door_tokens();
+
     if json {
         let session_id_for_closure = session_id.clone();
         let capsule_name = runtime_manifest.name.clone();
@@ -765,17 +780,25 @@ pub(crate) fn run_run(
             None => staged.workdir.clone(),
         };
         launch_session_handling_sigterm(staged, move |url| {
-            capsule_runtime::runtime_out!(
-                "{}",
-                serde_json::json!({
-                    "url": url,
-                    "pid": pid,
-                    "session_id": session_id_for_closure,
-                    "name": capsule_name,
-                    "version": capsule_version,
-                    "workdir": accessible_workdir_for_json.to_string_lossy(),
-                })
-            );
+            let mut ready = serde_json::json!({
+                "url": url,
+                "pid": pid,
+                "session_id": session_id_for_closure,
+                "name": capsule_name,
+                "version": capsule_version,
+                "workdir": accessible_workdir_for_json.to_string_lossy(),
+            });
+            if door_tokens.is_empty() || url.is_empty() {
+                capsule_runtime::runtime_out!("{ready}");
+            } else {
+                // A JSON object keeps no order, so a reader finds the operator token by name.
+                ready["tokens"] = door_tokens
+                    .iter()
+                    .map(|(name, token)| (name.clone(), serde_json::Value::from(token.expose())))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into();
+                capsule_runtime::diagnostic::credential_to_stdout(&ready.to_string());
+            }
         })
         .map(|_| ())
         .map_err(CliError::from)
@@ -806,6 +829,12 @@ pub(crate) fn run_run(
         match launch_session_handling_sigterm(staged, move |url| {
             if !url.is_empty() {
                 capsule_runtime::runtime_out!("murmur: url {url}");
+                for (name, token) in &door_tokens {
+                    capsule_runtime::diagnostic::credential_to_stdout(&format!(
+                        "murmur: token {name} {}",
+                        token.expose()
+                    ));
+                }
             }
             capsule_runtime::runtime_out!("session: {session_id_for_startup}");
             if verbose {

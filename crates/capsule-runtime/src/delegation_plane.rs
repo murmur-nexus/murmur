@@ -607,7 +607,10 @@ impl DelegationPlane {
             );
         }
         let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
-        if let Err(reason) = deliver_task(&capsule_url, &delegation_id, request) {
+        let door_token = child.door_token.clone();
+        if let Err(reason) =
+            deliver_task(&capsule_url, door_token.as_ref(), &delegation_id, request)
+        {
             return failed(&child.session_id, reason);
         }
 
@@ -728,9 +731,24 @@ impl DelegationPlane {
             );
         }
         let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
+        // Present on every call to a child that declares `network.authentication`.
+        let authorization = child
+            .door_token
+            .as_ref()
+            .map(crate::door_auth::bearer_header);
+        let headers: Vec<(&str, &str)> = authorization
+            .as_deref()
+            .map(|value| ("Authorization", value))
+            .into_iter()
+            .collect();
 
         // Step 3: deliver the task as the child's first user message.
-        let task_id = match deliver_task(&capsule_url, &delegation_id, request) {
+        let task_id = match deliver_task(
+            &capsule_url,
+            child.door_token.as_ref(),
+            &delegation_id,
+            request,
+        ) {
             Ok(task_id) => task_id,
             Err(reason) => return outcome(DelegationStatus::Failed, &child.session_id, reason),
         };
@@ -764,7 +782,7 @@ impl DelegationPlane {
             }
             std::thread::sleep(POLL_INTERVAL);
 
-            let task = match http_json("POST", &capsule_url, Some(&poll_body), &[]) {
+            let task = match http_json("POST", &capsule_url, Some(&poll_body), &headers) {
                 Ok(task) => task,
                 Err(error) => {
                     return outcome(
@@ -833,8 +851,11 @@ impl DelegationPlane {
 /// and the first accept, so this backs off rather than failing on one refusal. `Ok` carries the id
 /// the child gave the task it accepted, which is what makes the child's per-task result file
 /// findable; `Err` is the sentence the delegating caller reports, already naming the capsule.
+///
+/// `door_token` is the child's operator token when it declares `network.authentication`.
 fn deliver_task(
     capsule_url: &str,
+    door_token: Option<&crate::door_auth::DoorToken>,
     delegation_id: &str,
     request: &DelegationRequest,
 ) -> Result<String, String> {
@@ -851,10 +872,16 @@ fn deliver_task(
         }
     })
     .to_string();
+    let authorization = door_token.map(crate::door_auth::bearer_header);
+    let headers: Vec<(&str, &str)> = authorization
+        .as_deref()
+        .map(|value| ("Authorization", value))
+        .into_iter()
+        .collect();
     let send_deadline = Instant::now() + SEND_DEADLINE;
     let mut delay = Duration::from_millis(100);
     let sent = loop {
-        match http_json("POST", capsule_url, Some(&send_body), &[]) {
+        match http_json("POST", capsule_url, Some(&send_body), &headers) {
             Ok(response) => break response,
             Err(_) if Instant::now() < send_deadline => {
                 std::thread::sleep(delay);

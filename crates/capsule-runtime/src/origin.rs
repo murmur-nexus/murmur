@@ -136,9 +136,11 @@ impl TaskProvenance {
 /// at all — is classified `event` / `untrusted` and its trust header is not read. No HTTP caller
 /// can talk itself into a trusted class it was not given by a murmur runtime.
 ///
-/// This does not authenticate the door: a caller that claims `peer` + `trusted` gets what a
-/// genuine trusted peer gets, and nothing on the A2A path tells the two apart. The boundary
-/// closed here is untrust laundering across an honest chain.
+/// Provenance is the caller's claim, whether or not the door authenticates. A door declaring
+/// `network.authentication` decides *who may call*; it does not bind a class to a credential, so
+/// any caller it lets in that claims `peer` + `trusted` gets what a genuine trusted peer gets, and
+/// on a public door that is any caller at all. The boundary closed here is untrust laundering
+/// across an honest chain.
 pub fn from_wire(origin_header: Option<&str>, trust_header: Option<&str>) -> TaskProvenance {
     let origin = origin_header.and_then(TaskOrigin::parse);
     match origin {
