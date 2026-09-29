@@ -661,7 +661,7 @@ fn an_undeclared_runtime_pin_is_not_staged() {
 /// A declared tool whose pin a capsule pulled cannot carry `gateway:`; the refusal comes before
 /// the session directory exists.
 #[test]
-fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_041() {
+fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_043() {
     let home = tempfile::tempdir().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -689,7 +689,7 @@ fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_041() {
 
     common::run_capsule(&home, &manifest_path)
         .failure()
-        .stderr(predicate::str::contains("error[E-RUN-041]"))
+        .stderr(predicate::str::contains("error[E-RUN-043]"))
         .stderr(predicate::str::contains("ses_puller"))
         .stderr(predicate::str::contains(format!(
             "mur install {TOOL_NAME}@{TOOL_VERSION}"

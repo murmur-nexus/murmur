@@ -10,9 +10,9 @@
 //! exactly as wasi-http produced it.
 //!
 //! The key attached to each request is the credential's value at the moment the request is sent,
-//! so a key rotated in the global config reaches the next request. The request body is buffered so
-//! that a `401` can be answered by re-reading the credential and resending once; the response
-//! never is.
+//! so a key rotated in the global config, or injected by a controller, reaches the next request.
+//! The request body is buffered so that a `401` can be answered by re-reading the credential and
+//! resending once; the response never is.
 //!
 //! The gateway is not a listener. A WASM guest runs inside the `mur` process, so there is no
 //! socket to guard and nothing another process can connect to and spend the key through.
@@ -263,7 +263,13 @@ impl CredentialGateway {
             headers: parts.headers,
         };
 
-        let sent = credential.current().await;
+        // An injected credential no controller has supplied: refused here, so the upstream never
+        // sees a keyless request it would answer with a rejection of its own.
+        let Some(sent) = credential.current().await else {
+            return Err(WasiHttpError::InternalError(Some(
+                credential.not_injected_message(),
+            )));
+        };
         let response = send_direct(
             self.rewrite(head.request(body.clone()), Some(&sent))?,
             options,
@@ -275,12 +281,12 @@ impl CredentialGateway {
         }
 
         let reread = credential.reread_after_rejection().await;
-        if reread == sent {
+        let Some(reread) = reread.filter(|reread| *reread != sent) else {
             credential
                 .record_rejection(StatusCode::UNAUTHORIZED.as_u16(), false)
                 .await;
             return Ok(response);
-        }
+        };
         drop(response);
 
         let resent = send_direct(self.rewrite(head.request(body), Some(&reread))?, options).await?;

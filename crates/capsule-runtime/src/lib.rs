@@ -19,6 +19,7 @@ pub(crate) mod cgroup;
 pub mod child_launch;
 pub(crate) mod compiled_forms;
 pub mod containment;
+pub(crate) mod control_plane;
 pub(crate) mod conversation;
 pub(crate) mod conversation_import;
 pub mod delegation;

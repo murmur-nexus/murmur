@@ -20,6 +20,7 @@ use std::{
 };
 
 use assert_cmd::Command;
+use common::leaks::files_containing;
 use common::recording_upstream::{read_request, RecordedRequest};
 use tempfile::TempDir;
 
@@ -501,27 +502,6 @@ fn provider_in_network_allow_warns() {
     let lines = explained.warning_lines("W-SEC-025");
     assert_eq!(lines.len(), 1, "{}", explained.stderr);
     assert!(lines[0].contains(W_SEC_025_LINK));
-}
-
-fn files_containing(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if fs::read(&path)
-                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
-            {
-                found.push(path);
-            }
-        }
-    }
-    found
 }
 
 /// At every `trace.capture` setting the key is nowhere the session writes — its workdir with

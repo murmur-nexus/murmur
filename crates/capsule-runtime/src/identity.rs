@@ -10,6 +10,7 @@ use crate::a2a::{
     TaskRegistry, TaskState, TaskStatus,
 };
 use crate::cancel::{LiveDelegations, Residue};
+use crate::control_plane::{handle_control_request, is_control_path, ControlPlane, ControlRequest};
 use crate::delegation::{COMPLETION_SESSION_HEADER, DELEGATION_ID_HEADER};
 use crate::detached::DetachedRegistry;
 use crate::errors::RuntimeError;
@@ -368,6 +369,7 @@ pub(crate) async fn serve_http(
     conversation_mode: ConversationMode,
     resource_plane: Arc<ResourcePlane>,
     peer_plane: Arc<PeerPlane>,
+    control_plane: Arc<ControlPlane>,
     // This capsule's own session id. The door refuses a completion addressed to any other
     // session, which is what stops a child's outcome landing on whatever session answers the
     // parent's old address after a restart.
@@ -393,7 +395,7 @@ pub(crate) async fn serve_http(
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer_addr)) => {
                         let card = card_json.clone();
                         let registry = Arc::clone(&task_registry);
                         let tx = task_tx.clone();
@@ -403,12 +405,13 @@ pub(crate) async fn serve_http(
                         let mode_str = conversation_mode_str.to_string();
                         let plane = Arc::clone(&resource_plane);
                         let peer = Arc::clone(&peer_plane);
+                        let control = Arc::clone(&control_plane);
                         let session = session_id.clone();
                         let detached_for_conn = detached.clone();
                         let live = Arc::clone(&live_delegations);
                         let closing = closing_rx.clone();
                         connections.spawn(async move {
-                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live, forgettable_session, closing).await;
+                            handle_connection(stream, peer_addr, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, control, session, detached_for_conn, live, forgettable_session, closing).await;
                         });
                     }
                     Err(e) => {
@@ -450,6 +453,8 @@ async fn door_closing(closing: &mut watch::Receiver<bool>) {
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
+    // Read by the control plane alone, which accepts a secret only from a loopback peer.
+    peer_addr: std::net::SocketAddr,
     card_json: String,
     task_registry: Arc<Mutex<TaskRegistry>>,
     task_tx: mpsc::Sender<IncomingTask>,
@@ -459,6 +464,7 @@ async fn handle_connection(
     conversation_mode_str: String,
     resource_plane: Arc<ResourcePlane>,
     peer_plane: Arc<PeerPlane>,
+    control_plane: Arc<ControlPlane>,
     session_id: String,
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
@@ -491,6 +497,7 @@ async fn handle_connection(
     let mut delegation_id: Option<String> = None;
     let mut completion_session: Option<String> = None;
     let mut forget_session = false;
+    let mut authorization: Option<String> = None;
 
     loop {
         let mut line = String::new();
@@ -503,7 +510,10 @@ async fn handle_connection(
         }
         let lower = line.to_ascii_lowercase();
         let lower = lower.trim_end();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
+        if lower.starts_with("authorization:") {
+            // Taken from the line as sent: a control token is base64url and case-sensitive.
+            authorization = Some(line.trim_end()["authorization:".len()..].trim().to_string());
+        } else if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
         } else if lower.starts_with("content-type:") && lower.contains("application/json") {
             is_json = true;
@@ -550,6 +560,23 @@ async fn handle_connection(
     // the wrong authoriser.
     if is_peer_path(&path) {
         let response = handle_peer_request(&peer_plane, &method, &path, audience.as_deref()).await;
+        let _ = writer_half.write_all(&framed_bytes(&response)).await;
+        return;
+    }
+
+    // Routed on its prefix ahead of the JSON-RPC door, answering every method under it including
+    // the ones it refuses, and reading the body itself: a request it refuses unauthenticated, or
+    // for a declared length over its cap, must never have its body read at all.
+    if is_control_path(&path) {
+        let request = ControlRequest {
+            method: &method,
+            path: &path,
+            authorization: authorization.as_deref(),
+            peer: Some(peer_addr.ip()),
+            content_length,
+            is_json,
+        };
+        let response = handle_control_request(&control_plane, request, &mut reader).await;
         let _ = writer_half.write_all(&framed_bytes(&response)).await;
         return;
     }
@@ -1299,6 +1326,7 @@ mod tests {
             version: "1.0.0".to_string(),
             runtime: murmur_artifact::ArtifactRuntime::Tool,
             implementation: None,
+            origin: murmur_artifact::LockOrigin::Operator,
         }
     }
 

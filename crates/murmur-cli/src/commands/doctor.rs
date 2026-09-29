@@ -105,7 +105,7 @@ enum LockVerdict {
     /// whose `manage.pull()` wrote the pin, `None` for an operator-declared one.
     Ok { pulled_by: Option<String> },
     /// A `manage.pull()` pin the manifest declares as a hook, a driver, or with `gateway:` —
-    /// `mur run` fails with E-RUN-041. `declared_as` is that manifest text.
+    /// `mur run` fails with E-RUN-043. `declared_as` is that manifest text.
     RuntimeOriginNotDeclarable {
         session: String,
         declared_as: &'static str,
@@ -605,6 +605,27 @@ fn report_formation_env(
     findings
 }
 
+/// Print the `Control secrets` block: every `control.secrets` name, which a controller supplies
+/// to the running capsule and which no environment or config is asked for. Prints nothing for a
+/// capsule that declares none, and is never a finding.
+fn report_control_secrets(runtime_manifest: &RuntimeManifest) {
+    let Some(control) = runtime_manifest
+        .control
+        .as_ref()
+        .filter(|control| !control.secrets.is_empty())
+    else {
+        return;
+    };
+    println!("Control secrets");
+    let width = control.secrets.iter().map(String::len).max().unwrap_or(0);
+    for name in &control.secrets {
+        println!(
+            "  {name:<width$}   supplied by a controller at run time \u{2014} `mur control secret {name}`"
+        );
+    }
+    println!();
+}
+
 /// Who needs a variable, as one line of attribution.
 ///
 /// A `capabilities.env.allow` source is rendered bare, because that key is what the whole block is
@@ -865,6 +886,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     warn_on_launch_only_gateway_credential(
         &runtime_manifest.artifacts,
         crate::config::mur_config_path().ok().as_deref(),
+        runtime_manifest.control.as_ref(),
     );
 
     // And `W-SEC-030`, from the same emitter `mur run` calls: a gateway the spend ceilings do not
@@ -1026,6 +1048,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         &project_root,
         lock.as_ref(),
     );
+    report_control_secrets(&runtime_manifest);
 
     let project_registry = LocalRegistry::new(project_root.join(".murmur").join("artifacts"));
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;

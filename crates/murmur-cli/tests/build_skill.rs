@@ -358,6 +358,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },

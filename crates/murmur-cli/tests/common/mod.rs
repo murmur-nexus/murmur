@@ -6,6 +6,7 @@
 pub mod a2a_card_conformance;
 pub mod hook_wat;
 pub mod idle_capsule;
+pub mod leaks;
 pub mod loopback_target;
 pub mod recording_upstream;
 
@@ -415,6 +416,7 @@ fn stage_agent_session_inner(
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },
@@ -463,6 +465,18 @@ pub fn create_driver_artifact_with_auth(
 
 /// A WASM tool artifact: `runtime: tool` and the component at `tool.wasm`.
 pub fn create_tool_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
+    create_tool_artifact_with_auth(dir, name, version, wasm_path, "")
+}
+
+/// [`create_tool_artifact`] with `auth_block` appended verbatim to the bundled `murmur.yaml`
+/// (empty for none).
+pub fn create_tool_artifact_with_auth(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    wasm_path: &Path,
+    auth_block: &str,
+) -> PathBuf {
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -473,6 +487,7 @@ pub fn create_tool_artifact(dir: &Path, name: &str, version: &str, wasm_path: &P
     writeln!(zip, "name: {name}").unwrap();
     writeln!(zip, "version: {version}").unwrap();
     writeln!(zip, "runtime: tool").unwrap();
+    zip.write_all(auth_block.as_bytes()).unwrap();
 
     zip.start_file("tool.wasm", options).unwrap();
     zip.write_all(&fs::read(wasm_path).unwrap()).unwrap();

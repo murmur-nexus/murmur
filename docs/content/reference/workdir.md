@@ -493,7 +493,7 @@ own session.
 pulled that the manifest does not declare is never staged. A declared artifact whose pin has
 `origin: runtime` stages only as a tool or skill without `gateway:`; declaring it as
 `runtime: hook`, `runtime: driver` or with `gateway:` is refused with
-[`E-RUN-041`](diagnostics.md#e-run-041) until `mur install <name>@<version>` adopts the pin.
+[`E-RUN-043`](diagnostics.md#e-run-043) until `mur install <name>@<version>` adopts the pin.
 [`mur doctor`](cli.md#mur-doctor) reports every runtime pin.
 
 A `mur` that predates `origin` reads a lock that has it, and drops both keys if it rewrites the

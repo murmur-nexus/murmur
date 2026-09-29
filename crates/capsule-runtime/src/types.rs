@@ -413,6 +413,12 @@ pub struct StageRequest {
     /// operator makes, not a capability the guest holds, and nothing derived from this field ever
     /// reaches the achieved containment class.
     pub exports: Option<murmur_artifact::Exports>,
+    /// The manifest's top-level `control:` block. `None` means the session has no control
+    /// surface: no token is minted and every request under `/control` is answered `404`.
+    ///
+    /// Beside `exports` and on the same terms: what a controller may change is not a capability
+    /// the guest holds, and nothing derived from it reaches the containment class.
+    pub control: Option<murmur_artifact::ControlConfig>,
     /// The approval a delegated child was handed by its parent, presented once at registration.
     ///
     /// `None` for every top-level launch, which the daemon admits against its own `--spawn-allow`
@@ -465,6 +471,10 @@ pub struct StagedSession {
     /// [`StageRequest::machine_tokens_per_day`]. Always present: a session with no ceiling gets a
     /// meter that admits everything, so every driver call has an admission to open.
     pub(crate) spend: Arc<crate::spend::SpendMeter>,
+    /// What a controller has changed on this session, built at staging from
+    /// [`StageRequest::control`]. `None` for a capsule with no `control:` block, which mints no
+    /// control token and answers `404` under `/control`.
+    pub(crate) control: Option<Arc<crate::control_plane::ControlState>>,
     /// Copied from [`StageRequest::system_prompt_overridden`] — the only record left that the
     /// prompt in `inference` came from `--system-prompt` and not from the manifest. Passed to
     /// `TraceWriter::open`, which turns it into `session_start.system_prompt_source`.

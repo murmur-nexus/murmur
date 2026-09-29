@@ -18,6 +18,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur watch` | Stream live events from a running capsule's output to stdout |
 | `mur cancel` | Stop one running task on a capsule, leaving the session running |
 | `mur stop` | End one running capsule, and report what it left behind |
+| `mur control` | Show or change what a running capsule's `control:` block lets a controller change |
 | `mur deploy run` | Upload a capsule to an existing VM and return its public URL |
 | `mur deploy ls` | List all deployed capsules |
 | `mur destroy` | Remove a deployment record from the local tracking list |
@@ -99,6 +100,10 @@ removes it when the session ends.
 | File mode | `0600` |
 | Written by | The runtime, once the capsule is serving its door and just before `mur run` prints its URL |
 | Removed by | The runtime, when the session ends |
+
+A session whose manifest declares `control:` also holds its control token beside its record, at
+`~/.murmur/running/<session_id>.control`, mode `0600`, removed with the record — see
+[Control surface](control-surface.md#token).
 
 Each record carries the session id, the capsule address, the process id and its start time, the
 capsule name and version, the session workdir, whether the session outlives its launcher, and the
@@ -666,7 +671,7 @@ one of three lines:
 | Line | Meaning | Effect |
 |---|---|---|
 | `⚠ name@version   — pulled at runtime by session <session>` | A declared tool or skill whose pin a capsule pulled. `mur run` stages it | Warning: `Fix: mur install name@version`. Exit code unchanged |
-| `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver` or `gateway:`. `mur run` refuses it with [`E-RUN-041`](diagnostics.md#e-run-041) | Failure: `Fix: mur install name@version`. Exit `1` |
+| `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver` or `gateway:`. `mur run` refuses it with [`E-RUN-043`](diagnostics.md#e-run-043) | Failure: `Fix: mur install name@version`. Exit `1` |
 | `· name@version   pulled at runtime by session <session> — not declared in murmur.yaml, so mur run does not stage it` | A pulled entry `murmur.yaml` does not declare, printed after the checklist | None |
 
 **Output — runtime-pulled pins:**
@@ -754,7 +759,7 @@ Fix: mur install murmur-tool-git@1.0.0
 **Exit codes:**
 
 - `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform; and the formation block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
-- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-041`, or hold a native binary this host cannot run (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
+- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, or hold a native binary this host cannot run (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -764,7 +769,7 @@ Fix: mur install murmur-tool-git@1.0.0
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
 | `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 2, which is refused rather than migrated |
 | `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
-| `E-RUN-041` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
+| `E-RUN-043` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-CAP-014` | A variable the formation's `capabilities.env.allow` closure declares is unset in this environment |
 | `E-CAP-015` | A capsule in the formation declares a `capabilities.env.allow` entry the capsule that spawns it does not hold |
 | `W-REG-002` | A capsule in the formation could not be inspected, so what it declares is missing from the report — a warning; the exit code is unchanged |
@@ -1172,6 +1177,79 @@ Exit codes:
 
 - `0` — the capsule holds this task; the line printed says what state it is in
 - `1` — the capsule does not hold this task id, the session address named nothing running
+  (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
+
+---
+
+## `mur control`
+
+Show or change what a running capsule's [`control:`](manifest.md#field-control) block lets a
+controller change, over its [control surface](control-surface.md).
+
+```bash
+mur control show [SESSION] [--json]
+mur control set <SETTING> <VALUE> [SESSION]
+mur control secret <NAME> [SESSION]
+mur control forget <NAME> [SESSION]
+```
+
+| Subcommand | Does |
+|---|---|
+| `show` | Lists the declared settings with their current values, and the declared secrets with whether each is set |
+| `set` | Changes a declared setting from the capsule's next inference call |
+| `secret` | Supplies a declared secret's value, read from standard input |
+| `forget` | Drops a declared secret's value, so its gateway's keyed requests are refused again |
+
+| Argument | Default | Description |
+|---|---|---|
+| `SESSION` | `@1` | A [session address](#session-addresses) naming a running capsule |
+| `SETTING` | — | A setting `control.settings` declares, e.g. `inference.max_tokens` |
+| `VALUE` | — | The new value. Sent as JSON when it parses as JSON, as a string otherwise; the capsule decides what the setting takes |
+| `NAME` | — | A secret `control.secrets` declares |
+| `--json` | off | `show` only: print the control surface's JSON as it answered |
+
+Each subcommand resolves `SESSION` through its running record, reads the control token beside it,
+and makes one request to the capsule. There is no `--url`: the token is found only through the
+record.
+
+`mur control secret` reads the value from standard input and strips exactly one trailing `\n` or
+`\r\n`. On a terminal it prompts `value for NAME: ` on stderr and turns echo off for the read,
+restoring it on return, `SIGINT`, `SIGTERM` or `SIGHUP`. The value is sent only when the capsule is
+reached over loopback; the control surface refuses it otherwise.
+
+Output:
+
+```text
+$ mur control show
+session:  ses_0199c4e2f1b7712a9d3e4f5061728394
+settings:
+  inference.max_tokens   4096
+secrets:
+  CARD_TOKEN             not set
+
+$ mur control set inference.max_tokens 2048
+setting:  inference.max_tokens
+previous: 4096
+value:    2048
+applies:  next inference call
+
+$ printf '%s\n' "$CARD_TOKEN_VALUE" | mur control secret CARD_TOKEN
+secret: CARD_TOKEN
+set:    yes (new)
+
+$ mur control forget CARD_TOKEN
+secret: CARD_TOKEN
+set:    no
+```
+
+`set:` reads `yes (replaced)` when a value was already held. Neither the token nor a secret value
+appears in any output or error.
+
+Exit codes:
+
+- `0` — the control surface accepted the request
+- `1` — the session has no control surface or the surface refused the request (`E-RUN-042`, which
+  states the HTTP status and the surface's reason), the session address named nothing running
   (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
 
 ---

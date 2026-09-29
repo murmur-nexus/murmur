@@ -61,7 +61,9 @@ pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inferenc
 pub const E_RUN_038: &str = "E-RUN-038"; // a spend ceiling is set against a process driver that reports no usage
 pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose transport keeps no harness session
 pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not complete
-pub const E_RUN_041: &str = "E-RUN-041"; // a runtime-pulled lock pin is declared as a hook, a driver, or with gateway:
+pub const E_RUN_041: &str = "E-RUN-041"; // a capsule declaring control: could not write its control token
+pub const E_RUN_042: &str = "E-RUN-042"; // a session has no control surface, or its control surface refused the request
+pub const E_RUN_043: &str = "E-RUN-043"; // a runtime-pulled lock pin is declared as a hook, a driver, or with gateway:
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -257,7 +259,7 @@ impl From<RuntimeError> for CliError {
                     "run `mur install {name}@{version}` to adopt the pin as operator-declared, or \
                      remove {declared_as} from its murmur.yaml entry"
                 );
-                CliError::with_hint(E_RUN_041, error.to_string(), hint)
+                CliError::with_hint(E_RUN_043, error.to_string(), hint)
             }
             RuntimeError::ArtifactArchive {
                 name,
@@ -646,6 +648,13 @@ impl From<RuntimeError> for CliError {
                  cannot be kept without its ledger; make ~/.murmur/spend a directory this user can \
                  write, or remove spend.machine_tokens_per_day",
             ),
+            error @ RuntimeError::ControlTokenUnwritable { .. } => CliError::with_hint(
+                E_RUN_041,
+                error.to_string(),
+                "make ~/.murmur/running a directory this user can write, or remove control: from \
+                 murmur.yaml — a capsule whose declared controllability no controller could reach \
+                 does not run",
+            ),
             RuntimeError::AgentLoopFailed(message) => CliError::new(
                 E_RUN_007,
                 format!("agent loop failed: {message}"),
@@ -904,14 +913,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_origin_refusal_maps_to_e_run_041() {
+    fn runtime_origin_refusal_maps_to_e_run_043() {
         let cli = CliError::from(RuntimeError::RuntimeOriginNotDeclarable {
             name: "pulled-tool".to_string(),
             version: "1.2.3".to_string(),
             session: "ses_puller".to_string(),
             declared_as: "gateway:",
         });
-        assert_eq!(cli.code, E_RUN_041);
+        assert_eq!(cli.code, E_RUN_043);
         assert!(
             cli.message.contains("'pulled-tool@1.2.3'") && cli.message.contains("ses_puller"),
             "{}",

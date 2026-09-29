@@ -2,6 +2,7 @@ pub(crate) mod beta;
 pub(crate) mod build;
 pub(crate) mod cancel;
 pub(crate) mod config_cmd;
+pub(crate) mod control;
 pub(crate) mod conversation;
 #[cfg(feature = "beta-mur-deploy")]
 pub(crate) mod deploy;
@@ -101,6 +102,10 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
         RuntimeManifestError::InvalidExports { field, message } => CliError::new(
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid exports config for '{field}': {message}"),
+        ),
+        RuntimeManifestError::InvalidControl { field, message } => CliError::new(
+            E_MAN_003,
+            format!("{MANIFEST_FILENAME}: invalid control config for '{field}': {message}"),
         ),
         RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
             E_MAN_003,
