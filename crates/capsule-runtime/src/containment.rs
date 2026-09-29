@@ -266,8 +266,8 @@ pub struct StateStoreReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreopenSurface {
-    /// The entire accessible workdir, preopened as `"."` with `DirPerms::all()` and
-    /// `FilePerms::all()`. The wide default a `runtime: tool` or `runtime: driver` entry with no
+    /// The entire accessible workdir, preopened as `"."` with `FsPerms::ReadWrite`. The wide
+    /// default a `runtime: tool` or `runtime: driver` entry with no
     /// `capabilities.filesystem.scope` resolves to — see
     /// [`crate::network_policy::ToolCapabilityGrant`] for the threat that default is chosen
     /// against and the threat it is not.
