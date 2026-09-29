@@ -165,7 +165,7 @@ of the harness:
 | Reports the complete text of what it streamed | [`text`](#event-text), `"final":true`, empty — the client keeps the fragments it was sent |
 | Streams a fragment of reasoning, or reports reasoning nothing streamed | [`thinking`](#event-thinking) |
 | Answers a tool call | [`artifact`](#event-artifact) |
-| Ends the turn | The whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the task's final `status` `completed` |
+| Ends the turn | One [`artifact`](#event-artifact) frame for each artifact an `on-inference` hook returned for that turn, then the whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the task's final `status` `completed` |
 | Fails the turn | The task's final `status` `failed` |
 
 A process task ends in the same [one final status](#one-final-status) as an http task, on every
@@ -254,7 +254,14 @@ accepted one. The answer is the final status's `response`.
 
 One tool call's result, or one hook artifact. The runtime writes one frame for each tool call it
 dispatches, in dispatch order, and one for each hook artifact when an attempt completes, ahead of
-the task's final status or the [reopen boundary](#reopened-tasks). On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
+the task's final status or the [reopen boundary](#reopened-tasks).
+
+The hook artifacts forwarded are the ones `on-inference` hooks returned for the attempt's last
+inference turn, in hook-registration order, on both transports. They follow that turn's streamed
+text and precede its whole-result [`text`](#event-text) frame. An attempt that is canceled, fails or
+stops at a spend ceiling forwards none, and neither does a turn that called a tool.
+
+On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
 no frame. On [`transport: process`](manifest.md#transport-process) the harness reports the
 refusal it was handed as its own failed tool call, and that report writes a frame with
 `artifact.is_error` set to `true`.
