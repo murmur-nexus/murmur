@@ -224,7 +224,21 @@ pub(crate) struct TaskRegistry {
     /// plane. Lives here because every terminal state passes through this registry, so a third
     /// [`Self::finish_task`] call site cannot appear with no matching increment beside it.
     resource_generation: Arc<AtomicU64>,
+    /// Set by [`Self::close_to_new_work`] once the task loop has ended. A closed registry
+    /// accepts nothing, whatever its acceptance mode and depth.
+    closed: bool,
 }
+
+/// The `status.message` of a task refused because the session ended before it started.
+pub(crate) const REJECTED_SESSION_ENDED_MESSAGE: &str =
+    "task rejected: the session ended before this task started";
+
+/// The `status.message` of a task refused because `mur stop` ended the session before it started.
+pub(crate) const REJECTED_SESSION_STOPPED_MESSAGE: &str =
+    "task rejected: the session was stopped before this task started";
+
+/// The `status.message` the door's `message/stream` refusal carries once the registry is closed.
+pub(crate) const REJECTED_SESSION_CLOSING_MESSAGE: &str = "task rejected: the session is closing";
 
 impl TaskRegistry {
     pub(crate) fn new(queue_depth: usize, task_acceptance: TaskAcceptance) -> Self {
@@ -238,6 +252,7 @@ impl TaskRegistry {
             input_timeouts: HashSet::new(),
             cancels: HashMap::new(),
             resource_generation: Arc::new(AtomicU64::new(0)),
+            closed: false,
         }
     }
 
@@ -261,6 +276,9 @@ impl TaskRegistry {
     }
 
     pub(crate) fn can_accept(&self) -> bool {
+        if self.closed {
+            return false;
+        }
         match self.task_acceptance {
             TaskAcceptance::None => false,
             TaskAcceptance::Single => {
@@ -472,6 +490,37 @@ impl TaskRegistry {
         // order on every call and nothing can diff two stops.
         canceled.sort();
         canceled
+    }
+
+    /// Stop taking work, and end every task still `submitted` in `Rejected`. Returns the refused
+    /// tasks' `(task_id, context_id)`, sorted by task id, which for UUIDv7 ids is acceptance order.
+    ///
+    /// Taken under the same lock the door enqueues under, so no task can be enqueued after the
+    /// call returns: [`Self::can_accept`] answers `false` from here on. Only `Submitted` tasks are
+    /// touched. A `Canceled` task keeps its state, and a task that ran keeps the state it ended in.
+    /// No turn ran, so the resource generation does not advance. A second call returns nothing.
+    pub(crate) fn close_to_new_work(&mut self) -> Vec<(String, String)> {
+        self.closed = true;
+        let mut refused: Vec<(String, String)> = self
+            .history
+            .iter()
+            .filter(|(_, (state, _))| matches!(state, TaskState::Submitted))
+            .map(|(task_id, (_, context_id))| (task_id.clone(), context_id.clone()))
+            .collect();
+        refused.sort();
+        for (task_id, context_id) in &refused {
+            self.history
+                .insert(task_id.clone(), (TaskState::Rejected, context_id.clone()));
+            self.cancels.remove(task_id);
+        }
+        self.pending_count = self.pending_count.saturating_sub(refused.len());
+        refused
+    }
+
+    /// Whether [`Self::close_to_new_work`] has run. The door reads it to tell a closing session
+    /// from a busy one when it refuses a task.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// Return the prompt stored for an input-required task.
@@ -760,6 +809,60 @@ mod tests {
         assert!(!r.can_accept(), "the queue is full");
         assert_eq!(r.request_cancel("tsk_b"), CancelOutcome::Accepted);
         assert!(r.can_accept(), "a cancelled task holds no slot");
+    }
+
+    #[test]
+    fn close_to_new_work_rejects_every_submitted_task_and_nothing_else() {
+        let mut r = TaskRegistry::new(4, TaskAcceptance::Queue);
+        for id in ["tsk_a", "tsk_b", "tsk_c", "tsk_d"] {
+            r.enqueue(id, &format!("ctx_{id}"));
+        }
+        r.start_task("tsk_a".to_string(), "ctx_tsk_a".to_string(), TaskLane::Bg);
+        let (tx, _rx) = oneshot::channel();
+        r.set_input_required("tsk_a", "prompt".into(), tx).unwrap();
+        assert_eq!(r.request_cancel("tsk_c"), CancelOutcome::Accepted);
+        let pending_before = r.pending_count;
+
+        let refused = r.close_to_new_work();
+
+        assert_eq!(
+            refused,
+            vec![
+                ("tsk_b".to_string(), "ctx_tsk_b".to_string()),
+                ("tsk_d".to_string(), "ctx_tsk_d".to_string()),
+            ]
+        );
+        for id in ["tsk_b", "tsk_d"] {
+            assert_eq!(r.get_task(id).unwrap().status.state, TaskState::Rejected);
+        }
+        assert_eq!(r.pending_count, pending_before - 2);
+        assert_eq!(r.pending_count, 0);
+        assert_eq!(
+            r.get_task("tsk_a").unwrap().status.state,
+            TaskState::InputRequired,
+            "a live task that is not submitted is left alone"
+        );
+        assert_eq!(
+            r.get_task("tsk_c").unwrap().status.state,
+            TaskState::Canceled
+        );
+        assert_eq!(r.request_cancel("tsk_b"), CancelOutcome::AlreadyTerminal);
+        assert!(!r.is_canceled("tsk_b"));
+    }
+
+    #[test]
+    fn a_closed_registry_accepts_nothing_and_closes_once() {
+        for (depth, mode) in [(1, TaskAcceptance::Single), (4, TaskAcceptance::Queue)] {
+            let mut r = TaskRegistry::new(depth, mode.clone());
+            assert!(r.can_accept());
+            assert!(!r.is_closed());
+            r.enqueue("tsk_a", "ctx_001");
+            assert_eq!(r.close_to_new_work().len(), 1);
+            assert!(r.is_closed());
+            assert!(!r.can_accept(), "{mode:?}: a closed registry refuses work");
+            assert!(r.close_to_new_work().is_empty(), "{mode:?}: closes once");
+            assert!(!r.can_accept());
+        }
     }
 
     #[test]

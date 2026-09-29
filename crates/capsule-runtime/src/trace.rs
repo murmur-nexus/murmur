@@ -881,6 +881,37 @@ struct TaskCanceledEvent {
     delegation_ids: Vec<String>,
 }
 
+/// `task_rejected.cause` when the session ended on its own — close-out, `after_task: exit`, a
+/// failed launch task or the idle timeout — with the task still queued.
+pub(crate) const TASK_REJECTED_SESSION_ENDED: &str = "session_ended";
+
+/// `task_rejected.cause` when `mur stop` (`SIGTERM`) ended the session with the task still queued.
+pub(crate) const TASK_REJECTED_SESSION_STOPPED: &str = "session_stopped";
+
+/// The session stopped taking work while this task was still queued, so it was refused rather
+/// than run. Written once per refused task, after the task loop has ended and before
+/// `session_end`.
+///
+/// A refused task never started, so it has no `task_start`, no `task_end` and never a
+/// `task_failed`: this is its only record. It hangs off the session node.
+#[derive(Serialize)]
+struct TaskRejectedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: String,
+    context_id: String,
+    /// The `IncomingTask::source` the task was enqueued with: `a2a`, `detached_shell` or
+    /// `detached_lost`.
+    source: String,
+    /// One of the `TASK_REJECTED_*` constants.
+    cause: String,
+    /// The `status.message` the task's final `rejected` frame carries.
+    reason: String,
+}
+
 /// `task_failed.cause` when the driver returned an error status or a response whose
 /// `stop_reason` is `"error"`, and no credential rejection is pending.
 pub(crate) const TASK_FAILED_DRIVER_ERROR: &str = "driver_error";
@@ -2156,6 +2187,34 @@ impl TraceWriter {
             phase: phase.to_string(),
             detached_work_ids,
             delegation_ids,
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that a queued task was refused when the session stopped taking work, with `cause`
+    /// from the `TASK_REJECTED_*` vocabulary. Written whatever `trace.capture` is.
+    ///
+    /// Leaves `active_task_id` alone: the refused task never started, so there is no task frame
+    /// to open or close, and with no task active the record hangs off the session.
+    pub(crate) async fn write_task_rejected(
+        &mut self,
+        task_id: &str,
+        context_id: &str,
+        source: &str,
+        cause: &str,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = TaskRejectedEvent {
+            event_type: "task_rejected",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            context_id: context_id.to_string(),
+            source: source.to_string(),
+            cause: cause.to_string(),
+            reason: reason.to_string(),
         };
         self.write_event(&event).await
     }
@@ -5079,6 +5138,53 @@ mod tests {
         w.flush().await.unwrap();
         let events = read_events(framed.path());
         assert_eq!(events[1]["parent_id"], events[0]["event_id"]);
+    }
+
+    /// `task_rejected` carries every field and, with no task active, hangs off `session_start`.
+    #[tokio::test]
+    async fn task_rejected_names_the_task_source_cause_and_reason_under_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_task_start("tsk_ran", "ctx_ran", "a2a", event_provenance(), None, 3)
+            .await
+            .unwrap();
+        w.write_task_end("tsk_ran", "ok", 0).await.unwrap();
+        w.write_task_rejected(
+            "tsk_1",
+            "ctx_1",
+            "detached_shell",
+            TASK_REJECTED_SESSION_ENDED,
+            "task rejected: the session ended before this task started",
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let session = events
+            .iter()
+            .find(|e| e["event_type"] == "session_start")
+            .unwrap();
+        let rejected: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "task_rejected")
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        let rejected = rejected[0];
+        assert_eq!(rejected["parent_id"], session["event_id"], "{rejected}");
+        assert_eq!(rejected["session_id"], session["session_id"]);
+        assert_eq!(rejected["task_id"], "tsk_1");
+        assert_eq!(rejected["context_id"], "ctx_1");
+        assert_eq!(rejected["source"], "detached_shell");
+        assert_eq!(rejected["cause"], "session_ended");
+        assert_eq!(
+            rejected["reason"],
+            "task rejected: the session ended before this task started"
+        );
+        assert!(rejected["event_id"].is_string());
+        assert!(rejected["timestamp"].is_u64());
+        assert_eq!(rejected.as_object().unwrap().len(), 10, "{rejected}");
     }
 
     /// `task_failed` hangs off the task it failed, and a reason past the cap is cut on a character

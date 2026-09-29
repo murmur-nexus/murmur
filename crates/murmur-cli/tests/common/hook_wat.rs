@@ -657,6 +657,18 @@ fn event_shape(fn_name: &str) -> EventShape {
     (field "exit-status" string)))"#,
             type_exports: "    (export \"task-end-event\" (type $event))",
         },
+        "on-session-end" => EventShape {
+            params: "(param i32 i64 i64 i32 i32 i64 i32 i32)",
+            decls: r#"  (type $event (record
+    (field "total-turns" u32)
+    (field "total-input-tokens" u64)
+    (field "total-output-tokens" u64)
+    (field "total-tool-calls" u32)
+    (field "total-shell-calls" u32)
+    (field "duration-ms" u64)
+    (field "exit-status" string)))"#,
+            type_exports: "    (export \"session-end-event\" (type $event))",
+        },
         other => panic!("no event shape for {other}"),
     }
 }

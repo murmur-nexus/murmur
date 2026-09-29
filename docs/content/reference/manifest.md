@@ -1725,15 +1725,31 @@ lifecycle:
 | Value | Behaviour |
 |---|---|
 | `none` | Capsule runs from `task.md` if present, then exits. All incoming messages return JSON-RPC error `-32601`. |
-| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active returns `state: "rejected"`. |
-| `queue` | Capsule accepts up to `queue_depth` pending tasks simultaneously. Tasks are processed serially; new tasks are accepted as soon as the pending queue drops below `queue_depth`. |
+| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active returns `state: "rejected"`. A task accepted while a `task.md` task runs is never started: it ends `rejected` when the session ends — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
+| `queue` | Capsule accepts up to `queue_depth` pending tasks simultaneously. Tasks are processed serially; new tasks are accepted as soon as the pending queue drops below `queue_depth`. Under `after_task: exit`, a task still queued when the session ends is never started: it ends `rejected` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 
 ### `lifecycle.after_task` { #lifecycle-after-task }
 
 | Value | Behaviour |
 |---|---|
-| `exit` (default) | The session ends as soon as the task finishes, whether the task came from `--task` or over A2A. A launch that receives no task ends when the [idle timeout](#idle-timeout) fires. |
+| `exit` (default) | The session ends as soon as the task finishes, whether the task came from `--task` or over A2A. A launch that receives no task ends when the [idle timeout](#idle-timeout) fires. A task the door accepted that the session never started ends `rejected` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 | `sleep` | The capsule loops back to wait for the next task. Only useful with `task_acceptance: queue`; with `single` it behaves like `exit`. |
+
+### Tasks queued when the session ends { #queued-tasks-at-session-end }
+
+Every lifecycle except `task_acceptance: queue` with `after_task: sleep` stops taking work once its
+task is done. A task the door accepted before that point but the session never started is refused,
+not run: running it would contradict `after_task: exit`.
+
+| Task | What it gets |
+|---|---|
+| Accepted, never started, when the session stops taking work | State `rejected` over [`tasks/get`](agent-card.md#serves-methods), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
+| Cancelled while still queued | Stays `canceled`, with its `task_canceled` trace line. Never `rejected` |
+| A message arriving after the session stops taking work | Answered `rejected` at the door. Nothing is recorded in the trace |
+
+A refused task does not change the session's own outcome: `session_end.exit_status`, the
+`on-session-end` hook's `exit_status` and the `mur run` exit code are what the tasks that ran make
+them. To have queued work run, declare `task_acceptance: queue` with `after_task: sleep`.
 
 ### `lifecycle.input_timeout_secs` { #lifecycle-input-timeout-secs }
 

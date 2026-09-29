@@ -57,7 +57,8 @@ Which frames each endpoint can deliver:
 | Frame | `message/stream` | `stream/watch` |
 |---|---|---|
 | [`status`](#event-status) | yes | yes |
-| [`status`](#event-status) with state `rejected` | yes | no |
+| [`status`](#event-status) with state `rejected`, refused at the door | yes, only to the connection that submitted the task | no |
+| [`status`](#event-status) with state `rejected`, refused when the session ended | yes | yes |
 | [`artifact`](#event-artifact) | yes | yes |
 | [`text`](#event-text) | yes | yes |
 | [`thinking`](#event-thinking) | yes | yes |
@@ -88,7 +89,9 @@ absent — and matches each frame on `context_id` in its `data`.
 3. When the params do not parse as a message, an [`error`](#event-error) frame, and the
    connection closes.
 4. When the capsule cannot accept another task, a `rejected` [`status`](#event-status), and the
-   connection closes.
+   connection closes. Its message is `task rejected: capsule is busy` when the capsule has no room
+   for the task, and `task rejected: the session is closing` once the session has stopped taking
+   work.
 5. When the task cannot be handed to the capsule's queue, an [`error`](#event-error) frame, and
    the connection closes.
 6. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the first delivered
@@ -206,13 +209,16 @@ resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 | `completed` | `true` | `session ended` |
 | `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
 | `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed rather than stopping when it was asked |
-| `rejected` | `true` | `task rejected: capsule is busy`. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered |
+| `rejected` | `true` | Refused at the door: `task rejected: capsule is busy` when the capsule has no room for the task, `task rejected: the session is closing` once the session has stopped taking work. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered. Refused when the session ended: `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under [`mur stop`](cli.md#mur-stop). Written to every connection and buffered with an `id:` like any other `status` |
 
 ### One final status { #one-final-status }
 
-Every task the capsule runs ends in exactly one `status` frame with `"final":true`. It is the
-task's last frame, and it is written after every `on-task-end` hook has run, after `task_end` is
-in the trace and after [`tasks/get`](agent-card.md#serves-methods) answers the same state.
+Every task the capsule accepts ends in exactly one `status` frame with `"final":true`, whether it
+ran or not. It is the task's last frame, and it is written after
+[`tasks/get`](agent-card.md#serves-methods) answers the same state. For a task that ran, it is
+also written after every `on-task-end` hook has run and after `task_end` is in the trace. For a
+task the session refused, it follows the task's
+[`task_rejected`](observability-schemas.md#task-rejected) trace line.
 
 | How the task ended | `status.state` | `status.message` | `status.response` |
 |---|---|---|---|
@@ -220,6 +226,7 @@ in the trace and after [`tasks/get`](agent-card.md#serves-methods) answers the s
 | A hook still wanted a reopen that `lifecycle.max_task_reopens` or `inference.max_turns` did not allow | `failed` | The refusal, naming the limit | Absent |
 | The last attempt failed | `failed` | The reason, from the `failed` row above | Absent |
 | The task was cancelled | `canceled` | From the `canceled` row above | Absent |
+| The session ended before the task started | `rejected` | `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under `mur stop` | Absent |
 
 A `request-input` wait that times out ends the attempt, not the task: the tool that asked fails,
 and the task's final status — `failed` with message `input-timeout` — follows once the hooks have
@@ -459,7 +466,8 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 | `text`, `thinking` | yes | The session's sequence |
 | `status` `input-required`, `working` `resumed` | yes | The session's sequence |
 | `status` `canceled` with message `task canceled before it started` | yes | The session's sequence |
-| `status` `rejected` | no | — |
+| `status` `rejected`, refused at the door | no | — |
+| `status` `rejected`, refused when the session ended | yes | The session's sequence |
 | `gap` | no | — |
 | `lagged` | no | — |
 | `connection-ack` | no | — |
@@ -485,8 +493,8 @@ Frames without an id never take a number, so they leave no hole in the sequence.
 
 Each session keeps its most recent 512 frames with ids in one replay buffer shared by both
 endpoints, in the order they were written. When the buffer is full, a new frame evicts the oldest.
-The heartbeat, `connection-ack`, `gap`, `lagged`, `capsule-closed`, `error` and the `rejected`
-status never enter it.
+The heartbeat, `connection-ack`, `gap`, `lagged`, `capsule-closed`, `error` and a `rejected`
+status refused at the door never enter it.
 
 | Endpoint | `Last-Event-ID` sent | `Last-Event-ID` absent | `Last-Event-ID` not a number |
 |---|---|---|---|
@@ -536,11 +544,11 @@ client that follows them.
 | `Last-Event-ID` | Sends `Last-Event-ID: 0`, so it replays the buffer on attach |
 | `id:` lines | Read, only to report where a lost connection stopped |
 | Reconnecting | Does not reconnect |
-| `status`, `artifact`, `text` | Printed to stdout |
+| `status`, `artifact`, `text` | Printed to stdout, including a `rejected` status refused when the session ended |
 | `thinking` | Not shown |
 | `connection-ack` | Read for `conversation_mode`, which sets how `status` lines are labelled |
 | Heartbeat | Read and discarded |
-| `error`, `rejected` status | Never delivered to this endpoint |
+| `error`, a `rejected` status refused at the door | Never delivered to this endpoint |
 | `gap` | A warning on stderr naming `first_available_id` |
 | `lagged` | A warning on stderr naming `missed` |
 | Unknown event types and keys | Ignored |

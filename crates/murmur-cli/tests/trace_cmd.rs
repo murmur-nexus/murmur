@@ -382,6 +382,32 @@ const SECOND_TURN_READ: &str = concat!(
     "\"state_effect\":\"read\",\"resource_id\":\"src/lib.rs\"}\n"
 );
 
+/// A session whose launch task ran and whose two queued tasks were refused when it ended.
+const FIXTURE_REJECTED: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_eeeeeeeeeeee4eee8eee000000000001\",\"parent_id\":null,",
+    "\"session_id\":\"ses_eeeeeeeeeeee4eee8eee000000000005\",\"timestamp\":7000,",
+    "\"capsule_name\":\"rejected-capsule\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[]}\n",
+
+    "{\"event_type\":\"task_rejected\",\"event_id\":\"evt_eeeeeeeeeeee4eee8eee000000000002\",",
+    "\"parent_id\":\"evt_eeeeeeeeeeee4eee8eee000000000001\",",
+    "\"session_id\":\"ses_eeeeeeeeeeee4eee8eee000000000005\",\"timestamp\":7100,",
+    "\"task_id\":\"tsk_0197aaaa0000700080000000000000b1\",\"context_id\":\"ctx_1\",\"source\":\"a2a\",",
+    "\"cause\":\"session_ended\",\"reason\":\"task rejected: the session ended before this task started\"}\n",
+
+    "{\"event_type\":\"task_rejected\",\"event_id\":\"evt_eeeeeeeeeeee4eee8eee000000000003\",",
+    "\"parent_id\":\"evt_eeeeeeeeeeee4eee8eee000000000001\",",
+    "\"session_id\":\"ses_eeeeeeeeeeee4eee8eee000000000005\",\"timestamp\":7110,",
+    "\"task_id\":\"tsk_0197aaaa0000700080000000000000c2\",\"context_id\":\"ctx_2\",\"source\":\"detached_shell\",",
+    "\"cause\":\"session_ended\",\"reason\":\"task rejected: the session ended before this task started\"}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_eeeeeeeeeeee4eee8eee000000000004\",",
+    "\"parent_id\":\"evt_eeeeeeeeeeee4eee8eee000000000001\",",
+    "\"session_id\":\"ses_eeeeeeeeeeee4eee8eee000000000005\",\"timestamp\":7200,",
+    "\"total_turns\":0,\"total_input_tokens\":0,\"total_output_tokens\":0,",
+    "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":200,\"exit_status\":\"ok\"}\n"
+);
+
 fn write_fixture(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     fs::write(&path, content).unwrap();
@@ -535,6 +561,59 @@ fn steps_renders_each_protected_path_refusal_on_its_own_line() {
             .contains("protected_path_denied tool  bench/fixtures/case.json  rule bench/fixtures"),
         "{stdout}"
     );
+}
+
+/// Each refused task is listed under `Rejected` in file order, with its id, cause and source,
+/// and gets its own `task_rejected` row in the steps tree.
+#[test]
+fn show_and_steps_render_each_rejected_task() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "rejected.jsonl", FIXTURE_REJECTED);
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let section = stdout
+        .split_once("── Rejected ")
+        .unwrap_or_else(|| panic!("no Rejected section:\n{stdout}"))
+        .1;
+    let first = section
+        .find("task_rejected  tsk_0197aaaa0000700080000000000000b1  session_ended  source a2a")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let second = section
+        .find(
+            "task_rejected  tsk_0197aaaa0000700080000000000000c2  session_ended  source detached_shell",
+        )
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(first < second, "file order: {stdout}");
+
+    let out = mur()
+        .args(["trace", "steps", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        stdout
+            .matches("task_rejected session_ended  tsk_0197aaaa…")
+            .count(),
+        2,
+        "{stdout}"
+    );
+}
+
+/// A trace with no refused task prints no `Rejected` section.
+#[test]
+fn show_omits_the_rejected_section_when_there_are_none() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "trace-a.jsonl", FIXTURE_A);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rejected").not());
 }
 
 #[test]

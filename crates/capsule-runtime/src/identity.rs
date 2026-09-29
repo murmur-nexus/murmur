@@ -645,23 +645,26 @@ async fn handle_message_stream(
         .clone()
         .unwrap_or_else(|| format!("ctx_{}", uuid::Uuid::now_v7().simple()));
 
-    // Capacity check and enqueue — release lock before any await
-    let accepted = {
+    // Capacity check and enqueue — release lock before any await. `refusal` is the refused
+    // frame's message, read under the lock that decided the refusal.
+    let refusal = {
         let mut reg = task_registry.lock().unwrap();
         if reg.can_accept() {
             reg.enqueue(&task_id, &context_id);
-            true
+            None
+        } else if reg.is_closed() {
+            Some(crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE)
         } else {
-            false
+            Some(REJECTED_BUSY_MESSAGE)
         }
     };
-    if !accepted {
+    if let Some(refusal) = refusal {
         let rejected_event = TaskStatusUpdateEvent {
             id: task_id.clone(),
             context_id: Some(context_id.clone()),
             status: StreamStatus {
                 state: "rejected".into(),
-                message: "task rejected: capsule is busy".into(),
+                message: refusal.into(),
                 response: None,
                 reopen: None,
             },
@@ -774,8 +777,11 @@ async fn write_replay(
     Ok(last_written)
 }
 
-/// The `rejected` status written to a `message/stream` connection the capsule is too busy to
-/// accept. It goes to that one connection and is never buffered, so it carries no `id:` line:
+/// The `status.message` of a `message/stream` refusal from a capsule with no room for the task.
+const REJECTED_BUSY_MESSAGE: &str = "task rejected: capsule is busy";
+
+/// The `rejected` status written to a `message/stream` connection the door refuses, busy or
+/// closing. It goes to that one connection and is never buffered, so it carries no `id:` line:
 /// it has no place in the session's sequence, and an id would move a client's resume cursor.
 fn format_rejected_event(event: &TaskStatusUpdateEvent) -> String {
     let data = serde_json::to_string(event).unwrap_or_default();
@@ -1228,6 +1234,152 @@ mod tests {
         assert!(!frame.contains("id: "), "{frame}");
         assert!(frame.contains(r#""state":"rejected""#), "{frame}");
         assert!(frame.ends_with("\n\n"), "{frame}");
+    }
+
+    fn message_send_params(message_id: &str) -> Value {
+        serde_json::json!({
+            "message": {
+                "messageId": message_id,
+                "role": "user",
+                "parts": [{"text": "hello"}]
+            }
+        })
+    }
+
+    fn response_json(response: &str) -> Value {
+        let body = &response[response.find("\r\n\r\n").expect("header terminator") + 4..];
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+    }
+
+    /// A closed registry refuses `message/send` whatever room its queue has, and the refused
+    /// message never reaches the task loop or the registry.
+    #[test]
+    fn a_closed_registry_answers_message_send_rejected_and_enqueues_nothing() {
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        assert!(task_registry.lock().unwrap().close_to_new_work().is_empty());
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+
+        let response = response_json(&handle_message_send(
+            serde_json::json!(1),
+            &message_send_params("msg_late"),
+            &task_registry,
+            &task_tx,
+            None,
+            TaskProvenance::derive(TaskOrigin::User, None),
+            None,
+            false,
+        ));
+
+        assert_eq!(
+            response["result"]["status"]["state"], "rejected",
+            "{response}"
+        );
+        assert!(
+            task_rx.try_recv().is_err(),
+            "nothing was handed to the loop"
+        );
+        let reg = task_registry.lock().unwrap();
+        assert_eq!(reg.pending_count, 0);
+        assert!(reg.history.is_empty(), "the refused id is not held");
+    }
+
+    /// A task refused when the session closed reads `rejected` over `tasks/get`.
+    #[test]
+    fn tasks_get_serves_a_refused_task_as_rejected() {
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        task_registry
+            .lock()
+            .unwrap()
+            .enqueue("tsk_refused", "ctx_refused");
+        task_registry.lock().unwrap().close_to_new_work();
+
+        let response = handle_tasks_get(
+            serde_json::json!(1),
+            &serde_json::json!({"id": "tsk_refused"}),
+            &task_registry,
+        );
+
+        assert!(response.contains(r#""state":"rejected""#), "{response}");
+        let response = response_json(&response);
+        assert_eq!(response["result"]["id"], "tsk_refused");
+        assert_eq!(response["result"]["contextId"], "ctx_refused");
+    }
+
+    /// A `message/stream` the door refuses because the session is closing is told so, in the
+    /// same unnumbered final frame a busy refusal uses; a busy refusal keeps its own message.
+    #[tokio::test]
+    async fn message_stream_refused_by_a_closed_registry_says_the_session_is_closing() {
+        for (close, expected) in [
+            (true, crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE),
+            (false, REJECTED_BUSY_MESSAGE),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, lines) = spawn_sse_line_reader(
+                listener.local_addr().unwrap(),
+                std::time::Duration::from_secs(30),
+            );
+            let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<String>>(4);
+            let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+            let task_registry = Arc::new(Mutex::new(TaskRegistry::new(1, TaskAcceptance::Single)));
+            if close {
+                task_registry.lock().unwrap().close_to_new_work();
+            } else {
+                task_registry
+                    .lock()
+                    .unwrap()
+                    .enqueue("tsk_busy", "ctx_busy");
+            }
+            let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: serde_json::json!(1),
+                method: "message/stream".to_string(),
+                params: message_send_params("msg_refused"),
+            };
+
+            let (sock, _peer) = listener.accept().await.unwrap();
+            let (_read_half, write_half) = sock.into_split();
+            let (_closing_tx, closing) = watch::channel(false);
+            handle_message_stream(
+                write_half,
+                req,
+                &task_registry,
+                &task_tx,
+                None,
+                TaskProvenance::derive(TaskOrigin::User, None),
+                None,
+                false,
+                None,
+                sse_tx,
+                Arc::clone(&sse_buffer),
+                closing,
+            )
+            .await;
+            let mut received = String::new();
+            collect_sse_lines(&lines, &mut received, None).await;
+            client.join().unwrap();
+
+            let body = sse_body(&received);
+            let data = body
+                .strip_prefix("event: status\ndata: ")
+                .and_then(|rest| rest.strip_suffix("\n\n"))
+                .unwrap_or_else(|| panic!("one unnumbered status frame expected:\n{body}"));
+            let frame: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(frame["status"]["state"], "rejected", "{frame}");
+            assert_eq!(frame["status"]["message"], expected, "{frame}");
+            assert_eq!(frame["final"], true, "{frame}");
+            assert!(
+                task_rx.try_recv().is_err(),
+                "nothing was handed to the loop"
+            );
+            assert!(
+                matches!(
+                    sse_buffer.lock().unwrap().replay_from(0),
+                    ReplayResult::Complete(frames) if frames.is_empty()
+                ),
+                "a door refusal is never buffered"
+            );
+        }
     }
 
     #[test]
