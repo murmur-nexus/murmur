@@ -17,6 +17,7 @@ pub(crate) mod install;
 pub(crate) mod list;
 #[cfg(feature = "beta-mur-new")]
 pub(crate) mod new;
+pub(crate) mod precompile;
 pub(crate) mod ps;
 pub(crate) mod publish;
 pub(crate) mod run;

@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use capsule_runtime::precompile::Precompiled;
 use chrono::Utc;
 use clap::Subcommand;
 use console::{measure_text_width, style};
@@ -21,12 +22,20 @@ use crate::{
 };
 
 use super::deploy_state::{append_deployment, DeploymentRecord};
+use super::precompile::PrecompileReport;
 
 // ─── error codes ─────────────────────────────────────────────────────────────
 
 const E_DEPLOY_003: &str = "E-DEPLOY-003";
 const E_DEPLOY_004: &str = "E-DEPLOY-004";
 const E_DEPLOY_006: &str = "E-DEPLOY-006";
+
+/// The target stored no compiled form for some or all of the uploaded artifacts; those compile on
+/// the capsule's first launch.
+const W_DEPLOY_001: &str = "W-DEPLOY-001";
+/// The target's artifact decompression ceiling differs from this machine's; the capsule runs, and
+/// its forms were compiled, under the target's.
+const W_DEPLOY_002: &str = "W-DEPLOY-002";
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -79,6 +88,10 @@ pub(crate) enum DeployCommand {
         /// Artifacts are pulled and staged for this platform before deploying.
         #[arg(long, default_value = "linux-x86_64")]
         deploy_platform: String,
+
+        /// Skip compiling the uploaded WASM artifacts on the target; they compile on the capsule's first launch instead.
+        #[arg(long)]
+        no_precompile: bool,
     },
     /// List all deployed capsules
     Ls,
@@ -318,6 +331,22 @@ fn ssh_exec(
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Runs `command` on the target like [`ssh_exec`], but hands back its exit status, stdout and
+/// stderr whatever the status. Fails only when `ssh` itself cannot be started.
+fn ssh_exec_output(
+    ip: &str,
+    key_path: Option<&str>,
+    user: &str,
+    command: &str,
+) -> Result<std::process::Output, CliError> {
+    let mut args = ssh_args_base(key_path, user, ip);
+    args.push(command.to_string());
+    Command::new("ssh")
+        .args(&args)
+        .output()
+        .map_err(|e| CliError::new(E_IO_003, format!("ssh exec: {e}")))
 }
 
 fn scp_upload(
@@ -785,6 +814,90 @@ fn abandon_step(pb: &ProgressBar, style: &ProgressStyle, msg: impl Into<String>)
     pb.abandon_with_message(msg.into());
 }
 
+/// The target's global-store directory of the artifact `name@version`, which holds
+/// `{name}-{version}.mur.zip` and its `.sha256`.
+fn remote_store_dir(name: &str, version: &str) -> String {
+    format!("/root/.murmur/artifacts/{name}/{version}")
+}
+
+/// The path deploy uploads the payload of `name@version` to, and the target compiles it from.
+fn remote_payload_path(name: &str, version: &str) -> String {
+    format!(
+        "{}/{name}-{version}.mur.zip",
+        remote_store_dir(name, version)
+    )
+}
+
+/// The start of every command that runs `mur` on the target: it exports the deploy's `.env`, when
+/// there is one. The compile and the capsule both start with it, so they share one
+/// `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`, which keys every compiled form.
+fn remote_env_prefix(remote_deploy_dir: &str) -> String {
+    format!("[ -f {remote_deploy_dir}/.env ] && set -a && . {remote_deploy_dir}/.env && set +a; ")
+}
+
+/// Build the command that compiles `remote_zip_paths` on the target with the target's own `mur`,
+/// under the `--workdir` [`build_start_script`] gives `mur run`, and prints one JSON report line.
+fn build_precompile_command(remote_deploy_dir: &str, remote_zip_paths: &[String]) -> String {
+    format!(
+        "{}/usr/local/bin/mur precompile --json --workdir {remote_deploy_dir} {}",
+        remote_env_prefix(remote_deploy_dir),
+        remote_zip_paths.join(" ")
+    )
+}
+
+/// The report on the last non-empty line of a target's `mur precompile --json` stdout, or `None`
+/// when that line is not one: a `mur` that predates the command prints nothing there.
+fn read_precompile_report(stdout: &str) -> Option<PrecompileReport> {
+    let line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
+    serde_json::from_str(line.trim()).ok()
+}
+
+/// The warnings a deploy prints for the target's compile: `report` as [`read_precompile_report`]
+/// read it, `stderr` the target command's, `local_ceiling` this machine's decompression ceiling.
+fn precompile_warnings(
+    report: Option<&PrecompileReport>,
+    stderr: &str,
+    local_ceiling: u64,
+) -> Vec<String> {
+    let Some(report) = report else {
+        let reason = stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.chars().take(200).collect::<String>())
+            .unwrap_or_else(|| "no report and no error output".to_string());
+        return vec![format!(
+            "warning[{W_DEPLOY_001}]: the target did not precompile ({reason}); \
+             the capsule compiles its artifacts on its first launch"
+        )];
+    };
+    let mut warnings = Vec::new();
+    let failed: Vec<String> = report
+        .artifacts
+        .iter()
+        .filter(|file| file.outcome == Precompiled::Failed)
+        .map(|file| file.label())
+        .collect();
+    if !failed.is_empty() {
+        warnings.push(format!(
+            "warning[{W_DEPLOY_001}]: the target could not precompile {}; \
+             the capsule compiles {} on its first launch",
+            failed.join(", "),
+            if failed.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    if report.decompression_ceiling != local_ceiling {
+        warnings.push(format!(
+            "warning[{W_DEPLOY_002}]: the artifact decompression ceiling is {local_ceiling} bytes \
+             on this machine and {} bytes on the target; the capsule runs, warm, under the \
+             target's value. To align them, pass --env {}={local_ceiling}",
+            report.decompression_ceiling,
+            murmur_artifact::MAX_ARTIFACT_DECOMPRESSED_BYTES_ENV
+        ));
+    }
+    warnings
+}
+
 /// Build the shell script that starts the capsule on the remote host.
 ///
 /// The flags here must stay a subset of what `mur run` actually accepts — an
@@ -793,13 +906,13 @@ fn abandon_step(pb: &ProgressBar, style: &ProgressStyle, msg: impl Into<String>)
 /// by the upload step before this runs, so no fetch flag belongs here.
 fn build_start_script(remote_deploy_dir: &str, remote_manifest: &str) -> String {
     format!(
-        "[ -f {remote_deploy_dir}/.env ] && set -a && . {remote_deploy_dir}/.env && set +a; \
-         > /tmp/mur-start.json; \
+        "{}> /tmp/mur-start.json; \
          nohup /usr/local/bin/mur run --manifest {remote_manifest} \
          --workdir {remote_deploy_dir} \
          --json \
          >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
-         timeout 120 tail -f /tmp/mur-start.json | head -n 1"
+         timeout 120 tail -f /tmp/mur-start.json | head -n 1",
+        remote_env_prefix(remote_deploy_dir)
     )
 }
 
@@ -816,6 +929,7 @@ pub(crate) fn run_deploy(
     env_vars: &[String],
     env_file_arg: Option<&Path>,
     target_platform: &str,
+    no_precompile: bool,
 ) -> Result<(), CliError> {
     let deploy_start = Instant::now();
 
@@ -1045,6 +1159,22 @@ pub(crate) fn run_deploy(
             )
         })
         .collect();
+
+    // ─ Compile on the target ─────────────────────────────────────────────────
+    let compile_pb: Option<ProgressBar> = if !no_precompile && n_arts > 0 {
+        Some(add_pending(
+            &multi,
+            &pending_style,
+            format!(
+                "{} ⚙ compile {} artifact{}",
+                style("·").dim(),
+                n_arts,
+                s(n_arts)
+            ),
+        ))
+    } else {
+        None
+    };
 
     // ─ Start capsule ─────────────────────────────────────────────────────────
     let start_pb = add_pending(
@@ -1425,17 +1555,14 @@ pub(crate) fn run_deploy(
                     let stem = format!("{}-{}", artifact.name, artifact.version);
                     let staged_zip = staging_dir.join(format!("{stem}.mur.zip"));
                     let staged_sha = staging_dir.join(format!("{stem}.sha256"));
-                    let remote_dir = format!(
-                        "/root/.murmur/artifacts/{}/{}",
-                        artifact.name, artifact.version
-                    );
+                    let remote_dir = remote_store_dir(&artifact.name, &artifact.version);
                     ssh_exec(host, key_ref, ssh_user, &format!("mkdir -p {remote_dir}"))?;
                     scp_upload(
                         host,
                         key_ref,
                         ssh_user,
                         &staged_zip.to_string_lossy(),
-                        &format!("{remote_dir}/{stem}.mur.zip"),
+                        &remote_payload_path(&artifact.name, &artifact.version),
                         false,
                     )?;
                     scp_upload(
@@ -1532,6 +1659,80 @@ pub(crate) fn run_deploy(
             "printf '%s' '{encoded}' | base64 -d > {remote_deploy_dir}/.env && chmod 600 {remote_deploy_dir}/.env"
         );
         ssh_exec(host, key_ref, ssh_user, &cmd)?;
+    }
+
+    // ── 7.1. Compile the uploaded artifacts on the target ─────────────────────
+    // After the `.env` and under its prefix, so the forms are keyed under the ceiling the capsule
+    // launches with. Nothing here fails the deploy: a form the target did not store is compiled
+    // on the capsule's first launch.
+    if let Some(ref pb) = compile_pb {
+        activate_step(
+            pb,
+            &spinner_style,
+            format!("⚙ compile {} artifact{}", n_arts, s(n_arts)),
+        );
+        let remote_zips: Vec<String> = staged
+            .iter()
+            .map(|artifact| remote_payload_path(&artifact.name, &artifact.version))
+            .collect();
+        let command = build_precompile_command(&remote_deploy_dir, &remote_zips);
+        let compile_start = Instant::now();
+        let (report, stderr) = match ssh_exec_output(host, key_ref, ssh_user, &command) {
+            Ok(output) => (
+                read_precompile_report(&String::from_utf8_lossy(&output.stdout)),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ),
+            Err(e) => (None, e.message),
+        };
+        let elapsed = compile_start.elapsed().as_secs_f64();
+        let warnings = precompile_warnings(
+            report.as_ref(),
+            &stderr,
+            murmur_artifact::max_artifact_decompressed_bytes(),
+        );
+        match &report {
+            Some(report) => {
+                let count = |outcome| {
+                    report
+                        .artifacts
+                        .iter()
+                        .filter(|file| file.outcome == outcome)
+                        .count()
+                };
+                let failed = count(Precompiled::Failed);
+                let mark = if failed == 0 {
+                    style("✓").green().bold()
+                } else {
+                    style("!").yellow().bold()
+                };
+                finish_step(
+                    pb,
+                    &done_style,
+                    format!(
+                        "{mark} ⚙ compile {} artifact{}  {} compiled · {} stored · {} not wasm · {failed} failed  {elapsed:.1}s",
+                        n_arts,
+                        s(n_arts),
+                        count(Precompiled::Compiled),
+                        count(Precompiled::AlreadyStored),
+                        count(Precompiled::NotWasm),
+                    ),
+                );
+            }
+            None => abandon_step(
+                pb,
+                &done_style,
+                format!(
+                    "{} ⚙ compile  skipped  {elapsed:.1}s",
+                    style("!").yellow().bold()
+                ),
+            ),
+        }
+        // Bar text is drawn only on a terminal; a warning must reach a pipe or a log too.
+        multi.suspend(|| {
+            for warning in &warnings {
+                eprintln!("{warning}");
+            }
+        });
     }
 
     // ── 8. Start capsule ──────────────────────────────────────────────────────
@@ -1710,6 +1911,157 @@ mod tests {
         );
         assert!(script.contains("--workdir /root/mur-abc123"), "{script}");
         assert!(script.contains("--json"), "{script}");
+    }
+
+    #[test]
+    fn the_start_script_is_pinned_byte_for_byte() {
+        assert_eq!(
+            build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml"),
+            "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
+             > /tmp/mur-start.json; \
+             nohup /usr/local/bin/mur run --manifest /root/mur-abc123/murmur.yaml \
+             --workdir /root/mur-abc123 --json \
+             >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
+             timeout 120 tail -f /tmp/mur-start.json | head -n 1"
+        );
+    }
+
+    // ─── precompile on the target ─────────────────────────────────────────────
+
+    #[test]
+    fn the_compile_and_the_start_script_share_one_env_prefix() {
+        let prefix = remote_env_prefix("/root/mur-abc123");
+        assert_eq!(
+            prefix,
+            "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; "
+        );
+        let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        let compile = build_precompile_command(
+            "/root/mur-abc123",
+            &["/root/.murmur/artifacts/a/0.1.0/a-0.1.0.mur.zip".to_string()],
+        );
+        assert!(start.starts_with(&prefix), "{start}");
+        assert!(compile.starts_with(&prefix), "{compile}");
+    }
+
+    #[test]
+    fn the_compile_command_names_every_payload_under_the_start_scripts_workdir() {
+        let paths = [
+            remote_payload_path("a", "0.1.0"),
+            remote_payload_path("b", "1.2.3"),
+        ];
+        assert_eq!(
+            build_precompile_command("/root/mur-abc123", &paths),
+            "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
+             /usr/local/bin/mur precompile --json --workdir /root/mur-abc123 \
+             /root/.murmur/artifacts/a/0.1.0/a-0.1.0.mur.zip \
+             /root/.murmur/artifacts/b/1.2.3/b-1.2.3.mur.zip"
+        );
+        let start = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        assert!(start.contains(" --workdir /root/mur-abc123 "), "{start}");
+    }
+
+    fn report_line(outcomes: &[(Option<&str>, &str)], ceiling: u64) -> String {
+        let artifacts: Vec<serde_json::Value> = outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, (label, outcome))| {
+                let (name, version) = match label.and_then(|l| l.split_once('@')) {
+                    Some((name, version)) => (Some(name), Some(version)),
+                    None => (None, None),
+                };
+                serde_json::json!({
+                    "path": format!("/root/.murmur/artifacts/{i}.mur.zip"),
+                    "name": name,
+                    "version": version,
+                    "outcome": outcome,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "mur_version": "0.4.0",
+            "decompression_ceiling": ceiling,
+            "artifacts": artifacts,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_clean_report_under_the_same_ceiling_warns_nothing() {
+        let stdout = report_line(
+            &[
+                (Some("echo-tool@0.1.0"), "compiled"),
+                (Some("native@0.1.0"), "not_wasm"),
+                (Some("driver@0.1.0"), "already_stored"),
+            ],
+            524_288_000,
+        );
+        let report = read_precompile_report(&format!("{stdout}\n\n")).unwrap();
+        assert_eq!(report.artifacts.len(), 3);
+        assert!(precompile_warnings(Some(&report), "", 524_288_000).is_empty());
+    }
+
+    #[test]
+    fn a_failed_entry_is_named_in_one_w_deploy_001() {
+        let stdout = report_line(
+            &[
+                (Some("echo-tool@0.1.0"), "compiled"),
+                (Some("broken-tool@0.2.0"), "failed"),
+                (None, "failed"),
+            ],
+            524_288_000,
+        );
+        let report = read_precompile_report(&stdout).unwrap();
+        let warnings = precompile_warnings(Some(&report), "", 524_288_000);
+        assert_eq!(
+            warnings,
+            [
+                "warning[W-DEPLOY-001]: the target could not precompile broken-tool@0.2.0, \
+              /root/.murmur/artifacts/2.mur.zip; the capsule compiles them on its first launch"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_report_and_a_failed_exit_is_the_skipped_w_deploy_001() {
+        let stdout = "Usage: mur <COMMAND>\n";
+        let stderr = "\nerror: unrecognized subcommand 'precompile'\n\nUsage: mur <COMMAND>\n";
+        let report = read_precompile_report(stdout);
+        assert!(report.is_none());
+        assert_eq!(
+            precompile_warnings(report.as_ref(), stderr, 524_288_000),
+            ["warning[W-DEPLOY-001]: the target did not precompile \
+              (error: unrecognized subcommand 'precompile'); \
+              the capsule compiles its artifacts on its first launch"]
+        );
+    }
+
+    #[test]
+    fn a_long_error_line_is_cut_at_a_character_boundary() {
+        let stderr = "é".repeat(500);
+        let [warning] = &precompile_warnings(None, &stderr, 524_288_000)[..] else {
+            panic!("one warning");
+        };
+        assert!(warning.contains(&"é".repeat(200)), "{warning}");
+        assert!(!warning.contains(&"é".repeat(201)), "{warning}");
+    }
+
+    #[test]
+    fn a_different_target_ceiling_is_one_w_deploy_002_naming_both_values() {
+        let report = read_precompile_report(&report_line(
+            &[(Some("echo-tool@0.1.0"), "compiled")],
+            600_000_000,
+        ))
+        .unwrap();
+        assert_eq!(
+            precompile_warnings(Some(&report), "", 524_288_000),
+            [
+                "warning[W-DEPLOY-002]: the artifact decompression ceiling is 524288000 bytes on \
+              this machine and 600000000 bytes on the target; the capsule runs, warm, under the \
+              target's value. To align them, pass \
+              --env MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES=524288000"
+            ]
+        );
     }
 
     // ─── parse_env_var ────────────────────────────────────────────────────────

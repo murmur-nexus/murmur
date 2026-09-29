@@ -64,7 +64,9 @@ inference:
 
 When `mur_version` is set, `mur deploy run` downloads that exact binary from GitHub releases and caches it at `~/.murmur/bin/mur-{version}-linux-x86_64`. Subsequent deploys with the same version skip the download entirely.
 
-If `mur_version` is omitted, the version of the `mur` binary currently running on your machine is used instead.
+If `mur_version` is omitted, the version of the `mur` binary running on your machine is used instead.
+
+Pin a release that has `mur precompile`. With an older one the deploy prints [`W-DEPLOY-001`](../reference/diagnostics.md#w-deploy-001) and the capsule compiles its artifacts on its first launch.
 
 ---
 
@@ -144,6 +146,7 @@ All output goes to **stderr**. Save the deployment ID from the box — you will 
 | `--env-file` | *(auto-detect)* | Path to a `.env` file; `KEY=VALUE` or `export KEY=VALUE`; `#` comments ignored. If neither `--env` nor `--env-file` is passed, `.env` next to the manifest is loaded automatically |
 | `--workdir` | *(none)* | Local directory to upload as the capsule working directory |
 | `--deploy-platform` | `linux-x86_64` | Target platform for artifact resolution and staging |
+| `--no-precompile` | *(off)* | Skip compiling the uploaded WASM artifacts on the VM; the capsule compiles them on its first launch instead |
 
 ### What `mur deploy run` does
 
@@ -156,8 +159,9 @@ All output goes to **stderr**. Save the deployment ID from the box — you will 
 7. Uploads the manifest, any manifest-referenced local files, and the optional workdir
 8. Uploads all pre-staged artifacts to `/root/.murmur/artifacts/`
 9. Writes env vars to `/root/mur-{short_id}/.env` with mode `600`; env vars come from `--env`, `--env-file`, or `.env` next to the manifest (auto-detected); skipped when none are set
-10. Sources `/root/mur-{short_id}/.env` (if present) and starts `mur run --manifest <path> --json`; waits up to 120 seconds for startup
-11. Appends the deployment record to `~/.murmur/deployments.json`
+10. Sources `/root/mur-{short_id}/.env` (if present) and runs [`mur precompile`](../reference/cli.md#mur-precompile) over the uploaded artifacts with the VM's own `mur`, so the capsule's first launch loads them compiled; about half a second for a small capsule, taken off the start that follows. Skipped with `--no-precompile`. A VM that cannot precompile prints [`W-DEPLOY-001`](../reference/diagnostics.md#w-deploy-001) and the deploy continues
+11. Sources `/root/mur-{short_id}/.env` (if present) and starts `mur run --manifest <path> --json`; waits up to 120 seconds for startup
+12. Appends the deployment record to `~/.murmur/deployments.json`
 
 Steps 1–4 all run locally before any SSH connection. A bad manifest, missing artifact, missing file, or malformed `--env` entry causes `mur deploy run` to exit with a clear error message and no VM interaction.
 

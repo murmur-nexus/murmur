@@ -6,6 +6,7 @@
 pub mod a2a_card_conformance;
 pub mod hook_wat;
 pub mod idle_capsule;
+pub mod loopback_target;
 pub mod recording_upstream;
 
 use std::{
@@ -452,6 +453,26 @@ pub fn create_driver_artifact_with_auth(
     writeln!(zip, "version: {version}").unwrap();
     writeln!(zip, "runtime: driver").unwrap();
     zip.write_all(auth_block.as_bytes()).unwrap();
+
+    zip.start_file("tool.wasm", options).unwrap();
+    zip.write_all(&fs::read(wasm_path).unwrap()).unwrap();
+
+    zip.finish().unwrap();
+    artifact_path
+}
+
+/// A WASM tool artifact: `runtime: tool` and the component at `tool.wasm`.
+pub fn create_tool_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
+    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
+    let file = fs::File::create(&artifact_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("murmur.yaml", options).unwrap();
+    writeln!(zip, "name: {name}").unwrap();
+    writeln!(zip, "version: {version}").unwrap();
+    writeln!(zip, "runtime: tool").unwrap();
 
     zip.start_file("tool.wasm", options).unwrap();
     zip.write_all(&fs::read(wasm_path).unwrap()).unwrap();
