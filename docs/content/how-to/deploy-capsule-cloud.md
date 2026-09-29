@@ -180,23 +180,56 @@ A 200 response confirms the capsule is running:
 ```json
 {
   "name": "my-agent",
+  "description": "Murmur capsule my-agent 0.1.0",
   "version": "0.1.0",
-  "url": "1.2.3.4:9000",
-  "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
+  "supportedInterfaces": [
+    { "url": "http://localhost:9000", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+  ],
   "capabilities": {
-    "tools": ["bash"],
-    "shell": true,
-    "network": false,
-    "streaming": true
+    "streaming": true,
+    "pushNotifications": false,
+    "extendedAgentCard": false,
+    "extensions": [
+      {
+        "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
+        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+        "required": false,
+        "params": {
+          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+        }
+      },
+      {
+        "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1",
+        "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.",
+        "required": false,
+        "params": {
+          "sessionId": "ses_019f01a940ce7761854e768ecbe3d399",
+          "tools": ["bash"],
+          "shell": true,
+          "network": false,
+          "planes": []
+        }
+      }
+    ]
   },
-  "serves": {
-    "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
-    "planes": []
-  }
+  "securitySchemes": {},
+  "securityRequirements": [],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "task",
+      "name": "Run a task",
+      "description": "Runs one task given as a text message and reports its outcome.",
+      "tags": ["task"]
+    }
+  ]
 }
 ```
 
-See [Agent Card](../reference/agent-card.md) for what each key means.
+The card names the address the capsule's listener answers on inside the VM, `localhost:9000`;
+reach it from outside at the VM's public IP. See [Agent Card](../reference/agent-card.md) for what
+each key means.
 
 ---
 

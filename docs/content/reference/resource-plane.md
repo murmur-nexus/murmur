@@ -277,13 +277,15 @@ HMAC-SHA256(instance key, "murmur-peer-handle-v1" ‖ 0x1f ‖ <payload base64ur
 
 Both sides compute the audience without exchanging it, because both compute it from the *fetching*
 capsule's own advertised identity. At mint, the minter fetches the peer's agent card from
-`GET /.well-known/agent-card.json` and reads its `name` and `url`; at redeem, the fetcher asserts
-the same two fields of its own identity in an `x-murmur-audience` header. In both cases the string
-is `<name>@<host:port>`, lowercased.
+`GET /.well-known/agent-card.json` and reads its `name` and the `url` of its
+[`JSONRPC` interface](agent-card.md#supported-interfaces); at redeem, the fetcher asserts the same
+two fields of its own identity in an `x-murmur-audience` header. In both cases the string is
+`<name>@<host:port>`, lowercased, with the scheme dropped from the URL.
 
 That card fetch is an ordinary outbound request and is enforced against
 `capabilities.network.allow`. **Minting grants no new outbound authority.** A peer that cannot be
-reached, or whose card carries no `name` and `url`, fails the mint with `peer_unreachable`.
+reached, or whose card carries no `name` or no `JSONRPC` interface `url`, fails the mint with
+`peer_unreachable`.
 
 !!! warning "Audience binding is not peer authentication"
 

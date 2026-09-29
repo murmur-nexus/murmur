@@ -131,7 +131,9 @@ sweep there is, and it is enough because a record is never treated as truth.
 | Layer 3: the agent card did not answer for the session | Kept, reported as unreachable | Yes |
 
 A kept record names a process that is alive, and the command reports
-[`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
+[`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away. A capsule started by
+`mur` v0.4.0 or earlier fails layer 3 until it ends: this version cannot read a session from
+[its agent card](agent-card.md#no-supported-interfaces).
 
 When `~/.murmur/running/` itself cannot be read, every command that reads the records fails with
 [`E-RUN-028`](diagnostics.md#e-run-028) and removes nothing.

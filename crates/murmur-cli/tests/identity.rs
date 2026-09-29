@@ -250,22 +250,36 @@ fn agent_card_served_at_well_known_path() {
     let card_json = http_get(&capsule_url, "/.well-known/agent-card.json");
     let card: Value = serde_json::from_str(&card_json).expect("agent card should be valid JSON");
 
+    assert_eq!(
+        common::a2a_card_conformance::check_agent_card(&card),
+        Ok(()),
+        "the served card is an A2A v1.0 AgentCard: {card:#}"
+    );
     assert_eq!(card["name"], "identity-agent");
     assert_eq!(card["version"], "0.2.0");
     assert!(
-        card["url"].as_str().unwrap_or("").starts_with("localhost:"),
-        "agent card url should be localhost:port"
-    );
-    assert!(
-        card["capabilities"]["tools"].is_array(),
-        "capabilities.tools should be an array"
+        capsule_url.starts_with("localhost:"),
+        "the capsule url is localhost:port: {capsule_url}"
     );
     assert_eq!(
-        card["capabilities"]["network"], true,
+        card["supportedInterfaces"][0],
+        serde_json::json!({
+            "url": format!("http://{capsule_url}"),
+            "protocolBinding": "JSONRPC",
+            "protocolVersion": "0.3",
+        })
+    );
+    let capsule = common::card_capsule_params(&card);
+    assert_eq!(capsule["sessionId"], staged_session_id.as_str());
+    assert!(capsule["tools"].is_array(), "tools should be an array");
+    assert_eq!(
+        capsule["network"], true,
         "network capability should be true (endpoint is allowlisted)"
     );
+    assert_eq!(card["securitySchemes"], serde_json::json!({}));
+    assert_eq!(card["securityRequirements"], serde_json::json!([]));
+    assert_eq!(card["capabilities"]["extendedAgentCard"], false);
 
-    let _ = staged_session_id; // ensure borrow survives
     let launched = handle.join().expect("launch thread should not panic");
     assert!(
         launched.workdir.join("out/result.txt").exists(),

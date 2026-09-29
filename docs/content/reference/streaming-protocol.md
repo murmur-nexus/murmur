@@ -215,7 +215,7 @@ resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 
 Every task the capsule accepts ends in exactly one `status` frame with `"final":true`, whether it
 ran or not. It is the task's last frame, and it is written after
-[`tasks/get`](agent-card.md#serves-methods) answers the same state. For a task that ran, it is
+[`tasks/get`](agent-card.md#murmur-door-v1) answers the same state. For a task that ran, it is
 also written after every `on-task-end` hook has run and after `task_end` is in the trace. For a
 task the session refused, it follows the task's
 [`task_rejected`](observability-schemas.md#task-rejected) trace line.

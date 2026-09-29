@@ -808,8 +808,8 @@ fn thinking_reaches_the_client_once() {
     assert_eq!(thinking[0]["final"], false);
 }
 
-/// S6. A process capsule's card advertises what its transport can do: cancellation, which every
-/// transport supports, and streaming, which is its driver's answer.
+/// S6. A process capsule's card advertises what its transport can do: `tasks/cancel` on the door
+/// extension, which every transport supports, and streaming, which is its driver's answer.
 #[test]
 fn a_process_capsule_advertises_cancellation_and_streaming() {
     if common::skip_without_host_support("a_process_capsule_advertises_cancellation_and_streaming")
@@ -821,14 +821,10 @@ fn a_process_capsule_advertises_cancellation_and_streaming() {
     println!("process card: {served}");
     let card: Value = serde_json::from_str(&served).expect("the card is JSON");
 
-    assert_eq!(card["capabilities"]["cancellation"], true, "{card}");
     assert_eq!(card["capabilities"]["streaming"], true, "{card}");
     assert!(
-        card["serves"]["methods"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from("tasks/cancel")),
-        "the door still answers tasks/cancel: {card}"
+        common::card_door_methods(&card).contains(&"tasks/cancel"),
+        "the door answers tasks/cancel: {card}"
     );
 }
 

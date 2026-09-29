@@ -1,35 +1,70 @@
 # Agent Card
 
-Every capsule serves an agent card at `GET /.well-known/agent-card.json` on its HTTP listener. The
-card names the session answering the address, states what the capsule may do, and lists what its
-listener answers.
+Every capsule serves an [A2A](https://a2a-protocol.org) v1.0 `AgentCard` at
+`GET /.well-known/agent-card.json` on its HTTP listener. The card parses as `lf.a2a.v1.AgentCard`,
+as defined by [`a2a.proto` at `v1.0.0`](https://github.com/a2aproject/A2A/blob/v1.0.0/specification/a2a.proto),
+under a strict protobuf JSON parser. It names the session answering the address, states what the
+capsule may do, and lists what its listener answers.
+
+The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_acceptance: single`,
+`bash` installed, shell and network granted and `exports.files` declared:
 
 ```json
 {
   "name": "my-agent",
+  "description": "Murmur capsule my-agent 0.1.0",
   "version": "0.1.0",
-  "url": "localhost:41873",
-  "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
+  "supportedInterfaces": [
+    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+  ],
   "capabilities": {
-    "tools": ["bash"],
-    "shell": true,
-    "network": true,
     "streaming": true,
-    "cancellation": true
+    "pushNotifications": false,
+    "extendedAgentCard": false,
+    "extensions": [
+      {
+        "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
+        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+        "required": false,
+        "params": {
+          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+        }
+      },
+      {
+        "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1",
+        "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.",
+        "required": false,
+        "params": {
+          "sessionId": "ses_019f01a940ce7761854e768ecbe3d399",
+          "tools": ["bash"],
+          "shell": true,
+          "network": true,
+          "planes": ["files"]
+        }
+      }
+    ]
   },
-  "serves": {
-    "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
-    "planes": ["files"]
-  }
+  "securitySchemes": {},
+  "securityRequirements": [],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "task",
+      "name": "Run a task",
+      "description": "Runs one task given as a text message and reports its outcome.",
+      "tags": ["task"]
+    }
+  ]
 }
 ```
 
-The card answers two separate questions:
+What murmur adds to the standard card sits in two [extensions](#extensions):
 
-| Block | Answers | Derived from |
+| Extension | Answers | Derived from |
 |---|---|---|
-| [`capabilities`](#capabilities) | What may this capsule do? | The capsule's permissions: installed artifacts and `capabilities.*` in the manifest |
-| [`serves`](#serves) | What does this listener answer? | The methods `POST /` dispatches and the declared `exports` |
+| [Door](#murmur-door-v1) | What does this listener answer? | The methods `POST /` dispatches |
+| [Capsule](#murmur-capsule-v1) | Which session is this, and what may the capsule do? | The session, the installed artifacts, `capabilities.*` and the declared `exports` |
 
 ---
 
@@ -37,53 +72,106 @@ The card answers two separate questions:
 
 Every key below is present on every card this runtime serves.
 
-| Key | Type | Meaning |
+| Key | Type | Value |
 |---|---|---|
 | `name` | string | The capsule's `name` from `murmur.yaml` |
+| `description` | string | `Murmur capsule <name> <version>` |
 | `version` | string | The capsule's `version` from `murmur.yaml` |
-| `url` | string | The `host:port` this capsule's listener answers on |
-| `session_id` | string | The session answering this address. Compare it with the session you expect before sending a task |
+| `supportedInterfaces` | array of objects | One entry — see [`supportedInterfaces`](#supported-interfaces) |
 | `capabilities` | object | See [`capabilities`](#capabilities) |
-| `serves` | object | See [`serves`](#serves) |
+| `securitySchemes` | object | `{}` — see [Security](#security) |
+| `securityRequirements` | array | `[]` — see [Security](#security) |
+| `defaultInputModes` | array of strings | `["text/plain"]`. The door reads text parts only |
+| `defaultOutputModes` | array of strings | `["text/plain"]`. The door writes text parts only |
+| `skills` | array of objects | See [`skills`](#skills). Empty under `lifecycle.task_acceptance: none` |
+
+The card carries no `provider`, `documentationUrl`, `iconUrl` or `signatures`.
+
+## `supportedInterfaces` { #supported-interfaces }
+
+One interface: the JSON-RPC door at `POST /`.
+
+| Key | Value |
+|---|---|
+| `url` | `http://<host:port>` — the address this capsule's listener answers on. The door speaks plain HTTP |
+| `protocolBinding` | `JSONRPC` |
+| `protocolVersion` | `0.3` |
+
+The card's shape is A2A v1.0; the interface is declared at A2A `0.3` because the door answers the
+0.3 method names and task states:
+
+| The door answers | A2A v1.0 name, answered with `-32601 Method not found` |
+|---|---|
+| `message/send` | `SendMessage` |
+| `message/stream` | `SendStreamingMessage` |
+| `tasks/get` | `GetTask` |
+| `tasks/cancel` | `CancelTask` |
+
+Task states are kebab-case (`input-required`), as in A2A 0.3.
 
 ## `capabilities` { #capabilities }
 
-This capsule's permissions.
-
-| Key | Type | Meaning |
+| Key | Type | Value |
 |---|---|---|
-| `capabilities.tools` | array of strings | Names of the installed artifacts the model can call |
-| `capabilities.shell` | boolean | `true` when `capabilities.shell.allow` lists at least one command |
-| `capabilities.network` | boolean | `true` when `capabilities.network.allow` lists at least one destination |
-| `capabilities.streaming` | boolean | `true` when [`serves.methods`](#serves-methods) contains `message/stream` and the capsule's inference transport streams text |
-| `capabilities.cancellation` | boolean | `true` when [`serves.methods`](#serves-methods) contains `tasks/cancel` |
+| `capabilities.streaming` | boolean | `true` when the [door extension](#murmur-door-v1) lists `message/stream` and the capsule's inference transport streams text |
+| `capabilities.pushNotifications` | boolean | `false` |
+| `capabilities.extendedAgentCard` | boolean | `false`. Every caller gets this card |
+| `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), then the [capsule extension](#murmur-capsule-v1) |
 
 `streaming` is the door's answer and the transport's together: a door that answers
-`message/stream` over a transport that streams nothing lists the method under
-[`serves.methods`](#serves-methods) and reports `false` here. `cancellation` is the served method
-alone, because every transport can be stopped.
+`message/stream` over a transport that streams nothing lists the method on the door extension and
+reports `false` here.
 
-| Transport | `streaming` | `cancellation` |
+| Transport | `streaming` |
+|---|---|
+| `http` | `true` when `message/stream` is served |
+| `process` | `true` when `message/stream` is served and the [process driver](manifest.md#process-driver) reports `streams-text` |
+
+## Security { #security }
+
+`securitySchemes` is `{}` and `securityRequirements` is `[]`, which declares a public agent: no
+credential is required to call the capsule. The door does not authenticate callers.
+
+## `skills` { #skills }
+
+A door that serves `message/send` advertises one skill: running a task. Under
+[`lifecycle.task_acceptance: none`](manifest.md#lifecycle-task-acceptance) no task can be started,
+and `skills` is `[]`.
+
+| Key | Value |
+|---|---|
+| `id` | `task` |
+| `name` | `Run a task` |
+| `description` | `Runs one task given as a text message and reports its outcome.` |
+| `tags` | `["task"]` |
+
+Installed tools are not skills: a caller cannot invoke a tool directly. They are listed on the
+[capsule extension](#murmur-capsule-v1).
+
+## Extensions { #extensions }
+
+Both extensions are A2A `AgentExtension` objects with `required: false`: a standard A2A client can
+call the capsule without understanding either. The door does not require an `A2A-Extensions`
+header to activate them.
+
+| Key | Value |
+|---|---|
+| `uri` | The extension's identifier, which is the address of its section on this page |
+| `description` | What the extension carries |
+| `required` | `false` |
+| `params` | The extension's content, below |
+
+### Door extension { #murmur-door-v1 }
+
+URI: `https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1`
+
+| Key | Type | Value |
 |---|---|---|
-| `http` | `true` when `message/stream` is served | `true` |
-| `process` | `true` when `message/stream` is served and the [process driver](manifest.md#process-driver) reports `streams-text` | `true` |
-
-## `serves` { #serves }
-
-What this listener answers. Both keys are always present; `serves.planes` may be empty.
-
-| Key | Type | Meaning |
-|---|---|---|
-| `serves.methods` | array of strings | The JSON-RPC methods `POST /` answers — see [`serves.methods`](#serves-methods) |
-| `serves.planes` | array of strings | The HTTP planes that serve content — see [`serves.planes`](#serves-planes) |
-
-The card endpoint itself is not listed.
-
-### `serves.methods` { #serves-methods }
+| `params.methods` | array of strings | The JSON-RPC methods `POST /` answers, standard and murmur alike |
 
 A method is listed exactly when `POST /` answers it with something other than `-32601 Method not
-found`. Method names match exactly: case and surrounding whitespace are significant. Methods appear
-in this order:
+found`. Method names match exactly: case and surrounding whitespace are significant. `stream/watch`
+and `session/stop` are murmur methods, not A2A methods. Methods appear in this order:
 
 | Method | Answers | Listed when |
 |---|---|---|
@@ -95,11 +183,12 @@ in this order:
 | `session/stop` | Cancels every live task and reports what the session leaves running | Always |
 
 See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
-answers `message/send` and `message/stream` with `-32601`, so neither is listed and
-`capabilities.streaming` is `false`. `tasks/cancel` is answered under every acceptance, so
-`capabilities.cancellation` is `true` on every card.
+answers `message/send` and `message/stream` with `-32601`, so neither is listed,
+`capabilities.streaming` is `false` and `skills` is `[]`.
 
-### Request headers { #request-headers }
+The card endpoint itself is not listed.
+
+#### Request headers { #request-headers }
 
 The door reads `x-murmur-*` request headers alongside the JSON-RPC body. One of them changes what
 the methods that start a turn do:
@@ -115,7 +204,23 @@ answers the header with `-32602` without starting a task — see
 [`E-RUN-039`](diagnostics.md#e-run-039). What the forget does, and what it records, is
 [what removes an entry](workdir.md#what-removes-an-entry).
 
-### `serves.planes` { #serves-planes }
+### Capsule extension { #murmur-capsule-v1 }
+
+URI: `https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1`
+
+This extension is extended-card material: the session id and what the capsule may do. It is on the
+public card because the door does not authenticate callers, and nothing of it appears anywhere else
+on the card.
+
+| Key | Type | Value |
+|---|---|---|
+| `params.sessionId` | string | The session answering this address. Compare it with the session you expect before sending a task |
+| `params.tools` | array of strings | Names of the installed artifacts the model can call |
+| `params.shell` | boolean | `true` when `capabilities.shell.allow` lists at least one command |
+| `params.network` | boolean | `true` when `capabilities.network.allow` lists at least one destination |
+| `params.planes` | array of strings | The HTTP planes that serve content — see [planes](#capsule-planes) |
+
+#### Planes { #capsule-planes }
 
 A plane is listed only when the manifest declares it. An undeclared plane answers every request
 with a refusal. Planes appear in this order:
@@ -125,7 +230,34 @@ with a refusal. Planes appear in this order:
 | `files` | [`exports.files`](manifest.md#field-exports) is declared | The [operator plane](resource-plane.md#operator-plane) under `/resources/files` |
 | `peer_files` | [`exports.peer_files`](manifest.md#field-exports) is declared | The [peer plane](resource-plane.md#peer-plane) under `/resources/peer/<handle>` |
 
-## A card with no `serves` key { #no-serves-key }
+## A card with no `supportedInterfaces` { #no-supported-interfaces }
 
-A card without `serves` comes from a runtime at v0.3.0 or earlier, which predates discovery. Gate on
-the runtime version for such a capsule; for any card that has `serves`, read `serves` instead.
+A card without `supportedInterfaces` comes from a runtime at v0.4.0 or earlier, which serves the
+[previous card](#migrating). A capsule serving it is reachable over the same methods, and:
+
+| Reader | Result |
+|---|---|
+| [`mur ps`](cli.md#mur-ps), [`mur stop`](cli.md#mur-stop) | Lists the capsule as unreachable: its card names no session. The record is kept, never pruned |
+| [Peer handle](resource-plane.md#audience) minting for the capsule | Fails with `peer_unreachable`: its card has no `JSONRPC` interface |
+
+Both hold until that capsule ends.
+
+## Migrating from the previous card { #migrating }
+
+Where each key of the card served by v0.4.0 and earlier is on this card:
+
+| Previous key | On this card |
+|---|---|
+| `name` | `name` |
+| `version` | `version` |
+| `url` (`localhost:41873`) | `supportedInterfaces[0].url`, with the scheme (`http://localhost:41873`) |
+| `session_id` | Capsule extension `params.sessionId` |
+| `capabilities.tools` | Capsule extension `params.tools` |
+| `capabilities.shell` | Capsule extension `params.shell` |
+| `capabilities.network` | Capsule extension `params.network` |
+| `capabilities.streaming` | `capabilities.streaming`, derived the same way |
+| `capabilities.cancellation` | Removed. It was `true` on every card; the door extension's `params.methods` lists `tasks/cancel` |
+| `serves.methods` | Door extension `params.methods`, same values and order |
+| `serves.planes` | Capsule extension `params.planes`, same values and order |
+
+Find an extension by its `uri` in `capabilities.extensions`, not by its position.

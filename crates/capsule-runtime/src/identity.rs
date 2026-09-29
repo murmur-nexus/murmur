@@ -65,10 +65,10 @@ pub(crate) async fn bind_local_port(
 /// A JSON-RPC method the door at `POST /` answers.
 ///
 /// This is the door's whole method table: dispatch resolves a request's `method` through
-/// [`DoorMethod::resolve`], and the agent card's `serves.methods` is [`served_methods`], which
-/// asks the same resolver. Adding a method means adding a variant, its wire name and its `ALL`
-/// entry; the handler arm is then demanded by the exhaustive matches in the dispatcher, and the
-/// card lists it without further change.
+/// [`DoorMethod::resolve`], and the method list on the agent card's door extension is
+/// [`served_methods`], which asks the same resolver. Adding a method means adding a variant, its
+/// wire name and its `ALL` entry; the handler arm is then demanded by the exhaustive matches in the
+/// dispatcher, and the card lists it without further change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DoorMethod {
     MessageSend,
@@ -139,8 +139,8 @@ pub(crate) struct DeclaredPlanes {
 }
 
 /// What the capsule's inference transport can actually do, beyond what the served method list
-/// already says. Every transport can be stopped, so cancellation is not here: it is the served
-/// method alone.
+/// already says. Every transport can be stopped, so cancellation is not here: `tasks/cancel` is
+/// served under every acceptance.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportCapabilities {
     /// Whether the transport emits streaming text frames.
@@ -159,23 +159,56 @@ pub(crate) struct TransportCapabilities {
 /// `inference.transport: process`.
 pub(crate) const FORGET_SESSION_HEADER: &str = "x-murmur-forget-session";
 
-/// Build the Agent Card JSON derived from capsule identity and capability policy.
+/// URI of the agent-card extension that lists every JSON-RPC method the door answers, murmur's
+/// own methods among them. It is the address of that extension's section in the reference docs.
+pub(crate) const DOOR_EXTENSION_URI: &str =
+    "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1";
+
+/// URI of the agent-card extension that carries the extended-card material: the session id and
+/// what the capsule may do. It is the address of that extension's section in the reference docs.
+pub(crate) const CAPSULE_EXTENSION_URI: &str =
+    "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1";
+
+/// The id of the one skill a door that starts tasks advertises: running a task.
+pub(crate) const TASK_SKILL_ID: &str = "task";
+
+/// The A2A protocol version the card's JSON-RPC interface declares.
 ///
-/// `session_id` is served alongside the rest because the card is how a caller confirms that the
-/// capsule answering an address is the session it went looking for. A session id is already
-/// non-secret here — the door names the addressed session when it refuses a completion meant for
-/// another one.
+/// The card's shape is A2A v1.0, but the door answers the 0.3 method names (`message/send`,
+/// `tasks/get`, …) and 0.3 task states, which v1.0 renamed. An `AgentInterface` carries its own
+/// `protocolVersion` so that a v1.0 card can declare an interface at another version.
+pub(crate) const INTERFACE_PROTOCOL_VERSION: &str = "0.3";
+
+/// The `protocolBinding` of the door's interface.
+const JSONRPC_BINDING: &str = "JSONRPC";
+
+/// The media type of every part the door reads and writes.
+const TEXT_MODE: &str = "text/plain";
+
+/// Build the A2A v1.0 `AgentCard` the door serves at `/.well-known/agent-card.json`.
 ///
-/// `capabilities` is what this capsule may do; `serves` is what this door answers. `serves.methods`
-/// is [`served_methods`] for the acceptance the door is given, so it cannot list a method the
-/// dispatcher refuses or omit one it serves. `serves.planes` lists `files` then `peer_files`, each
-/// only when declared.
+/// Every card this returns parses as `lf.a2a.v1.AgentCard` under a strict protobuf JSON parser.
+/// It declares one `JSONRPC` interface at [`INTERFACE_PROTOCOL_VERSION`], whose `url` is
+/// `capsule_url` with the `http://` scheme the door speaks. `securitySchemes` and
+/// `securityRequirements` are present and empty, which declares a public agent.
 ///
-/// The two capability booleans a client reads before it waits on anything are read off
-/// `serves.methods`: `capabilities.cancellation` is `true` when it contains `tasks/cancel`, and
-/// `capabilities.streaming` when it contains `message/stream` and the transport streams text. A
-/// door that answers a method whose effect its transport cannot deliver still lists the method —
-/// `serves.methods` names what the dispatcher answers — and says so here.
+/// `capabilities.extensions` holds two murmur extensions, in this order:
+///
+/// - [`DOOR_EXTENSION_URI`], whose `params.methods` is [`served_methods`] for the acceptance the
+///   door is given, so the card cannot list a method the dispatcher refuses or omit one it serves.
+/// - [`CAPSULE_EXTENSION_URI`], whose `params` are `sessionId`, `tools`, `shell`, `network` and
+///   `planes`. This object is all of the card's extended-card material and none of it appears
+///   anywhere else, so it can move to an extended card whole; the card conforms without it.
+///   `sessionId` is served because the card is how a caller confirms that the capsule answering an
+///   address is the session it went looking for. `planes` lists `files` then `peer_files`, each
+///   only when declared.
+///
+/// `capabilities.streaming` is read off the served methods and the transport together: `true`
+/// when `message/stream` is served and the transport streams text. A door that answers a method
+/// whose effect its transport cannot deliver still lists the method and says so here.
+///
+/// `skills` is the one [`TASK_SKILL_ID`] skill when the door serves `message/send`, and empty
+/// otherwise. Installed tools are not skills: a caller cannot invoke one directly.
 pub(crate) fn build_agent_card(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
@@ -193,29 +226,115 @@ pub(crate) fn build_agent_card(
     let methods = served_methods(task_acceptance);
     let streaming =
         methods.contains(&DoorMethod::MessageStream.wire_name()) && transport.streams_text;
-    let cancellation = methods.contains(&DoorMethod::TasksCancel.wire_name());
     let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
         .into_iter()
         .filter_map(|(declared, name)| declared.then_some(name))
         .collect();
+    let skills: Vec<Value> = if methods.contains(&DoorMethod::MessageSend.wire_name()) {
+        vec![serde_json::json!({
+            "id": TASK_SKILL_ID,
+            "name": "Run a task",
+            "description": "Runs one task given as a text message and reports its outcome.",
+            "tags": [TASK_SKILL_ID],
+        })]
+    } else {
+        Vec::new()
+    };
 
     serde_json::json!({
         "name": identity.capsule_name,
+        "description": format!(
+            "Murmur capsule {} {}",
+            identity.capsule_name, identity.capsule_version
+        ),
         "version": identity.capsule_version,
-        "url": identity.capsule_url,
-        "session_id": identity.session_id,
+        "supportedInterfaces": [{
+            "url": interface_url(&identity.capsule_url),
+            "protocolBinding": JSONRPC_BINDING,
+            "protocolVersion": INTERFACE_PROTOCOL_VERSION,
+        }],
         "capabilities": {
-            "tools": tools,
-            "shell": !capability_policy.shell_allow.is_empty(),
-            "network": !capability_policy.network_allow.is_empty(),
             "streaming": streaming,
-            "cancellation": cancellation,
+            "pushNotifications": false,
+            "extendedAgentCard": false,
+            "extensions": [
+                {
+                    "uri": DOOR_EXTENSION_URI,
+                    "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+                    "required": false,
+                    "params": { "methods": methods },
+                },
+                {
+                    "uri": CAPSULE_EXTENSION_URI,
+                    "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.",
+                    "required": false,
+                    "params": {
+                        "sessionId": identity.session_id,
+                        "tools": tools,
+                        "shell": !capability_policy.shell_allow.is_empty(),
+                        "network": !capability_policy.network_allow.is_empty(),
+                        "planes": declared_planes,
+                    },
+                },
+            ],
         },
-        "serves": {
-            "methods": methods,
-            "planes": declared_planes,
-        }
+        "securitySchemes": {},
+        "securityRequirements": [],
+        "defaultInputModes": [TEXT_MODE],
+        "defaultOutputModes": [TEXT_MODE],
+        "skills": skills,
     })
+}
+
+/// `capsule_url` as an absolute URL: the door speaks plain HTTP, so a bare `host:port` gains
+/// `http://`. A trailing `/` is dropped.
+fn interface_url(capsule_url: &str) -> String {
+    let url = capsule_url.trim_end_matches('/');
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    }
+}
+
+/// The `params` object of the extension in `card.capabilities.extensions` whose `uri` is `uri`.
+///
+/// This and the two readers below are the only code that knows where a card keeps what murmur
+/// reads back out of it.
+pub(crate) fn extension_params<'a>(
+    card: &'a Value,
+    uri: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    card.get("capabilities")?
+        .get("extensions")?
+        .as_array()?
+        .iter()
+        .find(|extension| extension.get("uri").and_then(Value::as_str) == Some(uri))?
+        .get("params")?
+        .as_object()
+}
+
+/// The non-empty `sessionId` the card's capsule extension names, or `None` for a card that has no
+/// capsule extension or names no session.
+pub(crate) fn session_id_from_card(card: &Value) -> Option<&str> {
+    extension_params(card, CAPSULE_EXTENSION_URI)?
+        .get("sessionId")?
+        .as_str()
+        .filter(|session_id| !session_id.is_empty())
+}
+
+/// The non-empty `url` of the first `supportedInterfaces` entry whose `protocolBinding` is
+/// `JSONRPC`: the address the door answers JSON-RPC on.
+pub(crate) fn jsonrpc_interface_url(card: &Value) -> Option<&str> {
+    card.get("supportedInterfaces")?
+        .as_array()?
+        .iter()
+        .find(|interface| {
+            interface.get("protocolBinding").and_then(Value::as_str) == Some(JSONRPC_BINDING)
+        })?
+        .get("url")?
+        .as_str()
+        .filter(|url| !url.is_empty())
 }
 
 /// Serve the agent-card endpoint and A2A JSON-RPC endpoints until shutdown.
@@ -1165,9 +1284,424 @@ mod tests {
         )
     }
 
+    fn identity() -> CapsuleIdentity {
+        CapsuleIdentity {
+            capsule_name: "my-agent".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            session_id: "ses_019f01a940ce7761854e768ecbe3d399".to_string(),
+            capsule_url: "localhost:41873".to_string(),
+        }
+    }
+
+    fn tool(name: &str) -> InstalledArtifactSummary {
+        InstalledArtifactSummary {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            runtime: murmur_artifact::ArtifactRuntime::Tool,
+            implementation: None,
+        }
+    }
+
+    /// The card for `my-agent` 0.1.0 on port 41873 with `bash` installed, shell and network
+    /// granted and `exports.files` declared.
+    fn full_card(acceptance: &TaskAcceptance) -> Value {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["git".to_string()],
+            network_allow: vec!["api.example.com".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        build_agent_card(
+            &identity(),
+            &[tool("bash")],
+            &policy,
+            acceptance,
+            DeclaredPlanes {
+                files: true,
+                peer_files: false,
+            },
+            HTTP_TRANSPORT,
+        )
+    }
+
+    fn door_params(card: &Value) -> &serde_json::Map<String, Value> {
+        extension_params(card, DOOR_EXTENSION_URI).expect("the card has the door extension")
+    }
+
+    fn capsule_params(card: &Value) -> &serde_json::Map<String, Value> {
+        extension_params(card, CAPSULE_EXTENSION_URI).expect("the card has the capsule extension")
+    }
+
+    fn door_methods(card: &Value) -> Vec<&str> {
+        door_params(card)["methods"]
+            .as_array()
+            .expect("the door extension's methods are an array")
+            .iter()
+            .map(|m| m.as_str().expect("each method is a string"))
+            .collect()
+    }
+
+    fn keys(value: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn assert_conforms(card: &Value) {
+        if let Err(errors) = crate::a2a_card_conformance::check_agent_card(card) {
+            panic!("the card does not conform to lf.a2a.v1.AgentCard: {errors:#?}\n{card:#}");
+        }
+    }
+
+    #[test]
+    fn a2a_card_every_builder_output_conforms() {
+        let plane_sets = [(false, false), (true, false), (false, true), (true, true)];
+        let tool_sets: [&[InstalledArtifactSummary]; 2] = [&[], &[tool("bash")]];
+        let mut checked = 0;
+        for acceptance in &ACCEPTANCES {
+            for streams_text in [false, true] {
+                for (files, peer_files) in plane_sets {
+                    for tools in tool_sets {
+                        let card = build_agent_card(
+                            &identity(),
+                            tools,
+                            &CapabilityPolicy::default(),
+                            acceptance,
+                            DeclaredPlanes { files, peer_files },
+                            TransportCapabilities { streams_text },
+                        );
+                        assert_conforms(&card);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 2 * 4 * 2);
+    }
+
+    #[test]
+    fn a2a_card_is_the_documented_document() {
+        let card = full_card(&TaskAcceptance::Single);
+        println!("{card:#}");
+        assert_eq!(
+            card,
+            serde_json::json!({
+                "name": "my-agent",
+                "description": "Murmur capsule my-agent 0.1.0",
+                "version": "0.1.0",
+                "supportedInterfaces": [
+                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+                ],
+                "capabilities": {
+                    "streaming": true,
+                    "pushNotifications": false,
+                    "extendedAgentCard": false,
+                    "extensions": [
+                        {
+                            "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
+                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+                            "required": false,
+                            "params": {
+                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+                            }
+                        },
+                        {
+                            "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1",
+                            "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.",
+                            "required": false,
+                            "params": {
+                                "sessionId": "ses_019f01a940ce7761854e768ecbe3d399",
+                                "tools": ["bash"],
+                                "shell": true,
+                                "network": true,
+                                "planes": ["files"]
+                            }
+                        }
+                    ]
+                },
+                "securitySchemes": {},
+                "securityRequirements": [],
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": [
+                    {
+                        "id": "task",
+                        "name": "Run a task",
+                        "description": "Runs one task given as a text message and reports its outcome.",
+                        "tags": ["task"]
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a2a_card_keeps_no_key_of_the_previous_shape() {
+        for acceptance in &ACCEPTANCES {
+            let card = full_card(acceptance);
+            for key in ["url", "session_id", "serves"] {
+                assert!(card.get(key).is_none(), "top-level {key}: {card}");
+            }
+            assert!(
+                !card.to_string().contains("cancellation"),
+                "no cancellation anywhere: {card}"
+            );
+            assert_eq!(
+                keys(&card),
+                [
+                    "capabilities",
+                    "defaultInputModes",
+                    "defaultOutputModes",
+                    "description",
+                    "name",
+                    "securityRequirements",
+                    "securitySchemes",
+                    "skills",
+                    "supportedInterfaces",
+                    "version"
+                ]
+            );
+            assert_eq!(
+                keys(&card["capabilities"]),
+                [
+                    "extendedAgentCard",
+                    "extensions",
+                    "pushNotifications",
+                    "streaming"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_card_name_version_and_description_come_from_the_identity() {
+        let card = full_card(&TaskAcceptance::Single);
+        assert_eq!(card["name"], "my-agent");
+        assert_eq!(card["version"], "0.1.0");
+        assert_eq!(card["description"], "Murmur capsule my-agent 0.1.0");
+    }
+
+    #[test]
+    fn a2a_card_interface_is_the_door_url_over_http_at_0_3() {
+        let card = full_card(&TaskAcceptance::Single);
+        assert_eq!(
+            card["supportedInterfaces"],
+            serde_json::json!([{
+                "url": "http://localhost:41873",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": "0.3",
+            }])
+        );
+        assert_eq!(INTERFACE_PROTOCOL_VERSION, "0.3");
+        assert_eq!(jsonrpc_interface_url(&card), Some("http://localhost:41873"));
+    }
+
+    #[test]
+    fn a2a_card_interface_url_is_not_given_a_second_scheme() {
+        for (capsule_url, expected) in [
+            ("localhost:41873", "http://localhost:41873"),
+            ("localhost:41873/", "http://localhost:41873"),
+            ("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            ("http://127.0.0.1:1/", "http://127.0.0.1:1"),
+            ("https://agent.example.com", "https://agent.example.com"),
+        ] {
+            let identity = CapsuleIdentity {
+                capsule_url: capsule_url.to_string(),
+                ..identity()
+            };
+            let card = build_agent_card(
+                &identity,
+                &[],
+                &CapabilityPolicy::default(),
+                &TaskAcceptance::Single,
+                DeclaredPlanes::default(),
+                HTTP_TRANSPORT,
+            );
+            assert_eq!(
+                card["supportedInterfaces"][0]["url"], expected,
+                "{capsule_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_card_declares_a_public_agent_with_no_extended_card_or_push() {
+        for acceptance in &ACCEPTANCES {
+            let card = full_card(acceptance);
+            assert_eq!(card["securitySchemes"], serde_json::json!({}));
+            assert_eq!(card["securityRequirements"], serde_json::json!([]));
+            assert_eq!(card["capabilities"]["extendedAgentCard"], false);
+            assert_eq!(card["capabilities"]["pushNotifications"], false);
+            assert_eq!(card["defaultInputModes"], serde_json::json!(["text/plain"]));
+            assert_eq!(
+                card["defaultOutputModes"],
+                serde_json::json!(["text/plain"])
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_card_skills_are_the_task_skill_only_when_a_task_can_start() {
+        for acceptance in [TaskAcceptance::Single, TaskAcceptance::Queue] {
+            let card = full_card(&acceptance);
+            let skills = card["skills"].as_array().expect("skills is an array");
+            assert_eq!(skills.len(), 1, "{acceptance:?}");
+            assert_eq!(skills[0]["id"], TASK_SKILL_ID);
+            assert_eq!(skills[0]["tags"], serde_json::json!([TASK_SKILL_ID]));
+        }
+        assert_eq!(TASK_SKILL_ID, "task");
+        let card = full_card(&TaskAcceptance::None);
+        assert_eq!(card["skills"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a2a_card_extensions_are_the_door_then_the_capsule() {
+        let card = full_card(&TaskAcceptance::Single);
+        let extensions = card["capabilities"]["extensions"]
+            .as_array()
+            .expect("extensions is an array");
+        let uris: Vec<&Value> = extensions.iter().map(|e| &e["uri"]).collect();
+        assert_eq!(uris, [DOOR_EXTENSION_URI, CAPSULE_EXTENSION_URI]);
+        for extension in extensions {
+            assert_eq!(extension["required"], false, "{extension}");
+            assert_eq!(
+                keys(extension),
+                ["description", "params", "required", "uri"],
+                "{extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn a2a_card_capsule_extension_carries_the_session_and_permissions() {
+        let card = full_card(&TaskAcceptance::Single);
+        let params = capsule_params(&card);
+        assert_eq!(
+            keys(&Value::Object(params.clone())),
+            ["network", "planes", "sessionId", "shell", "tools"]
+        );
+        assert_eq!(params["sessionId"], "ses_019f01a940ce7761854e768ecbe3d399");
+        assert_eq!(params["tools"], serde_json::json!(["bash"]));
+        assert_eq!(params["shell"], true);
+        assert_eq!(params["network"], true);
+        assert_eq!(
+            session_id_from_card(&card),
+            Some("ses_019f01a940ce7761854e768ecbe3d399")
+        );
+
+        let bare = card_for(&TaskAcceptance::Single, DeclaredPlanes::default());
+        let params = capsule_params(&bare);
+        assert_eq!(params["tools"], serde_json::json!([]));
+        assert_eq!(params["shell"], false);
+        assert_eq!(params["network"], false);
+    }
+
+    #[test]
+    fn a2a_card_tools_are_the_llm_visible_artifacts() {
+        let hook = InstalledArtifactSummary {
+            runtime: murmur_artifact::ArtifactRuntime::Hook,
+            ..tool("guard")
+        };
+        let card = build_agent_card(
+            &identity(),
+            &[tool("bash"), hook, tool("search")],
+            &CapabilityPolicy::default(),
+            &TaskAcceptance::Single,
+            DeclaredPlanes::default(),
+            HTTP_TRANSPORT,
+        );
+        assert_eq!(
+            capsule_params(&card)["tools"],
+            serde_json::json!(["bash", "search"])
+        );
+    }
+
+    #[test]
+    fn a_card_without_the_capsule_extension_still_conforms() {
+        for acceptance in &ACCEPTANCES {
+            let mut card = full_card(acceptance);
+            card["capabilities"]["extensions"]
+                .as_array_mut()
+                .expect("extensions is an array")
+                .retain(|extension| extension["uri"] != CAPSULE_EXTENSION_URI);
+            assert_conforms(&card);
+            assert!(extension_params(&card, DOOR_EXTENSION_URI).is_some());
+            assert!(extension_params(&card, CAPSULE_EXTENSION_URI).is_none());
+            assert!(card["capabilities"]["streaming"].is_boolean());
+            let serialised = card.to_string();
+            for key in ["sessionId", "tools", "shell", "network", "planes"] {
+                assert!(
+                    !serialised.contains(key),
+                    "{key} is extended-card material and belongs to the capsule extension alone: {serialised}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_id_from_card_reads_the_capsule_extension_only() {
+        let card = full_card(&TaskAcceptance::Single);
+        assert_eq!(
+            session_id_from_card(&card),
+            Some("ses_019f01a940ce7761854e768ecbe3d399")
+        );
+
+        let previous = serde_json::json!({
+            "name": "my-agent",
+            "version": "0.1.0",
+            "url": "localhost:41873",
+            "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
+        });
+        assert_eq!(session_id_from_card(&previous), None);
+
+        let mut without = card.clone();
+        without["capabilities"]["extensions"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|extension| extension["uri"] != CAPSULE_EXTENSION_URI);
+        assert_eq!(session_id_from_card(&without), None);
+
+        let mut empty = card.clone();
+        empty["capabilities"]["extensions"][1]["params"]["sessionId"] = Value::from("");
+        assert_eq!(session_id_from_card(&empty), None);
+
+        assert_eq!(session_id_from_card(&Value::from("not a card")), None);
+    }
+
+    #[test]
+    fn jsonrpc_interface_url_picks_the_first_jsonrpc_interface() {
+        let card = serde_json::json!({
+            "supportedInterfaces": [
+                { "url": "https://grpc.example.com", "protocolBinding": "GRPC", "protocolVersion": "1.0" },
+                { "url": "http://localhost:1", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" },
+                { "url": "http://localhost:2", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" },
+            ]
+        });
+        assert_eq!(jsonrpc_interface_url(&card), Some("http://localhost:1"));
+
+        for card in [
+            serde_json::json!({
+                "supportedInterfaces": [
+                    { "url": "https://grpc.example.com", "protocolBinding": "GRPC", "protocolVersion": "1.0" },
+                ]
+            }),
+            serde_json::json!({ "supportedInterfaces": [] }),
+            serde_json::json!({
+                "supportedInterfaces": [{ "url": "", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }]
+            }),
+            serde_json::json!({ "url": "localhost:41873" }),
+        ] {
+            assert_eq!(jsonrpc_interface_url(&card), None, "{card}");
+        }
+    }
+
     /// `streaming` is the served method AND the transport's answer, so a door that answers
     /// `message/stream` over a transport that streams nothing advertises the method and not the
-    /// capability. `cancellation` is the served method alone: every transport can be stopped.
+    /// capability. `tasks/cancel` is served whatever the transport: every transport can be stopped.
     #[test]
     fn card_capabilities_are_the_method_and_the_transport() {
         for (transport, streaming) in [
@@ -1185,23 +1719,15 @@ mod tests {
                 transport,
             );
             assert_eq!(card["capabilities"]["streaming"], streaming, "{card}");
-            assert_eq!(
-                card["capabilities"]["cancellation"], true,
-                "a door that answers tasks/cancel advertises cancellation: {card}"
-            );
-            assert!(
-                card["serves"]["methods"]
-                    .as_array()
-                    .expect("serves.methods is an array")
-                    .contains(&Value::from("tasks/cancel")),
-                "{card}"
-            );
+            let methods = door_methods(&card);
+            assert!(methods.contains(&"message/stream"), "{card}");
+            assert!(methods.contains(&"tasks/cancel"), "{card}");
         }
     }
 
     /// A door that starts no task streams nothing, whatever its transport can do: neither
     /// task-starting method is served under `TaskAcceptance::None`. `tasks/cancel` is served
-    /// under every acceptance, so cancellation stays advertised.
+    /// under every acceptance.
     #[test]
     fn a_door_that_starts_no_task_advertises_no_streaming() {
         for transport in [
@@ -1213,7 +1739,7 @@ mod tests {
             let card =
                 card_for_transport(&TaskAcceptance::None, DeclaredPlanes::default(), transport);
             assert_eq!(card["capabilities"]["streaming"], false, "{card}");
-            assert_eq!(card["capabilities"]["cancellation"], true, "{card}");
+            assert!(door_methods(&card).contains(&"tasks/cancel"), "{card}");
         }
     }
 
@@ -1454,21 +1980,11 @@ mod tests {
     fn door_method_card_advertises_what_the_resolver_serves() {
         for acceptance in &ACCEPTANCES {
             let card = card_for(acceptance, DeclaredPlanes::default());
-            let methods: Vec<&str> = card["serves"]["methods"]
-                .as_array()
-                .expect("serves.methods is an array")
-                .iter()
-                .map(|m| m.as_str().expect("each method is a string"))
-                .collect();
+            let methods = door_methods(&card);
             assert_eq!(methods, served_methods(acceptance), "{acceptance:?}");
             assert_eq!(
                 card["capabilities"]["streaming"],
                 methods.contains(&"message/stream"),
-                "{acceptance:?}"
-            );
-            assert_eq!(
-                card["capabilities"]["cancellation"],
-                methods.contains(&"tasks/cancel"),
                 "{acceptance:?}"
             );
         }
@@ -1487,7 +2003,7 @@ mod tests {
                 &TaskAcceptance::Single,
                 DeclaredPlanes { files, peer_files },
             );
-            assert_eq!(card["serves"]["planes"], expected);
+            assert_eq!(capsule_params(&card)["planes"], expected);
         }
     }
 

@@ -886,23 +886,19 @@ fn s5_a_cancelled_task_writes_exactly_one_terminal_status() {
 
 // ── S6: the agent card ────────────────────────────────────────────────────────
 
-/// Every process driver capsule advertises cancellation, because every one can now be stopped.
+/// Every process driver capsule's door lists `tasks/cancel`, because every one can be stopped.
 #[test]
 fn s6_a_process_capsule_advertises_cancellation() {
-    println!("S6: a process capsule's card advertises cancellation");
+    println!("S6: a process capsule's card lists tasks/cancel");
     let capsule = Built::new("process-cancel-card", "happy").launch();
     let card = http_get(&capsule.url, "/.well-known/agent-card.json");
 
-    assert_eq!(card["capabilities"]["cancellation"], true, "{card}");
     assert_eq!(
         card["capabilities"]["streaming"], true,
         "the fixture driver reports streams-text: {card}"
     );
     assert!(
-        card["serves"]["methods"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from("tasks/cancel")),
+        common::card_door_methods(&card).contains(&"tasks/cancel"),
         "{card}"
     );
 }

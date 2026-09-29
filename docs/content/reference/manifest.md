@@ -1743,7 +1743,7 @@ not run: running it would contradict `after_task: exit`.
 
 | Task | What it gets |
 |---|---|
-| Accepted, never started, when the session stops taking work | State `rejected` over [`tasks/get`](agent-card.md#serves-methods), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
+| Accepted, never started, when the session stops taking work | State `rejected` over [`tasks/get`](agent-card.md#murmur-door-v1), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
 | Cancelled while still queued | Stays `canceled`, with its `task_canceled` trace line. Never `rejected` |
 | A message arriving after the session stops taking work | Answered `rejected` at the door. Nothing is recorded in the trace |
 
