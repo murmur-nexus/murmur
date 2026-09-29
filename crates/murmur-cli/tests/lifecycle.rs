@@ -1513,3 +1513,431 @@ fn lifecycle_a_blank_untrusted_message_is_never_sent_to_the_model() {
     assert!(events_named(&events, "inference").is_empty());
     assert_eq!(server.requests().len(), 0, "nothing was sent to the model");
 }
+
+// ── Tasks still queued when the session stops taking work ─────────────────────
+
+/// The `status.message` of a task refused because the session ended before it started.
+const REJECTED_SESSION_ENDED_MESSAGE: &str =
+    "task rejected: the session ended before this task started";
+
+/// A body the fixture driver fails the task on: another provider's response shape.
+const CHAT_COMPLETIONS_BODY: &str = r#"{"id":"x","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+
+/// A provider answering its one request with `body`, and only once the test releases it. The
+/// first receiver fires when the request arrives, so the test knows the `task.md` task is running
+/// and not yet finished.
+fn held_provider(
+    body: String,
+) -> (
+    common::ScriptedServer,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let server = common::ScriptedServer::start_answering(1, move |_| {
+        let _ = arrived_tx.send(());
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(60));
+        body.clone()
+    });
+    (server, arrived_rx, release_tx)
+}
+
+/// `launch_session` on a thread, and the capsule URL it announced.
+fn launch_in_background(
+    staged: capsule_runtime::StagedSession,
+) -> (
+    std::thread::JoinHandle<Result<capsule_runtime::LaunchResult, capsule_runtime::RuntimeError>>,
+    String,
+) {
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+    (handle, capsule_url)
+}
+
+/// A `queue` + `exit` capsule with room for four queued tasks.
+fn queue_exit_lifecycle() -> LifecycleConfig {
+    LifecycleConfig {
+        task_acceptance: TaskAcceptance::Queue,
+        after_task: AfterTask::Exit,
+        queue_depth: 4,
+        input_timeout_secs: None,
+        ..Default::default()
+    }
+}
+
+/// `message/send` of `text`, returning the task id and the state it was answered with.
+fn send_task(addr: &str, message_id: &str, text: &str) -> (String, String) {
+    let response = http_post_json(addr, "/", &message_send_body(message_id, text));
+    let task_id = response["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("message/send returned no task id: {response}"))
+        .to_string();
+    let state = response["result"]["status"]["state"]
+        .as_str()
+        .unwrap_or_else(|| panic!("message/send returned no state: {response}"))
+        .to_string();
+    (task_id, state)
+}
+
+/// Open a `message/stream` for `text` and read it until the server closes it, returning every
+/// `status` frame's data in order. `headers_tx` fires once the response headers have arrived,
+/// which the door writes directly before it enqueues the task.
+fn stream_until_closed(
+    addr: String,
+    text: &str,
+    headers_tx: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<Vec<Value>> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "message/stream",
+        "params": {"message": {"messageId": "m-stream", "role": "user", "parts": [{"text": text}]}}
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(&addr).expect("should connect for SSE");
+        stream
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(90)))
+            .unwrap();
+        let mut reader = BufReader::new(&stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                break;
+            }
+        }
+        let _ = headers_tx.send(());
+        let mut statuses = Vec::new();
+        let mut current_type = String::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Err(error) => panic!("the SSE connection errored instead of closing: {error}"),
+                Ok(_) => {}
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            if let Some(rest) = line.strip_prefix("event: ") {
+                current_type = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("data: ") {
+                if current_type == "status" {
+                    statuses.push(serde_json::from_str(rest).expect("a status frame is JSON"));
+                }
+            }
+        }
+        statuses
+    })
+}
+
+/// Every trace event that names `task_id`.
+fn events_naming<'a>(events: &'a [Value], task_id: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|event| event["task_id"] == task_id)
+        .collect()
+}
+
+/// Asserts `task_id`'s only trace record is one `task_rejected` with `cause`, parented to the
+/// session node, and returns it.
+fn assert_sole_rejection<'a>(events: &'a [Value], task_id: &str, cause: &str) -> &'a Value {
+    let named = events_naming(events, task_id);
+    let kinds: Vec<&str> = named
+        .iter()
+        .map(|event| event["event_type"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["task_rejected"],
+        "a refused task has one record and it is task_rejected: {named:?}"
+    );
+    let rejected = named[0];
+    assert_eq!(rejected["cause"], cause, "{rejected}");
+    assert_eq!(rejected["source"], "a2a", "{rejected}");
+    assert!(
+        rejected["context_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{rejected}"
+    );
+    let session_start = events_named(events, "session_start")[0];
+    assert_eq!(
+        rejected["parent_id"], session_start["event_id"],
+        "a refused task hangs off the session: {rejected}"
+    );
+    rejected
+}
+
+/// A task queued behind a `queue` + `exit` capsule's own `task.md` task is refused when that
+/// task closes the session: it never runs, it reads `rejected` everywhere, and the launch's own
+/// outcome is the `task.md` task's.
+#[test]
+fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_closes() {
+    let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
+    fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
+    let trace_path = staged.workdir.join("trace.jsonl");
+    let session_id = staged.session_id.clone();
+    let sessions_root = staged.workdir.parent().unwrap().to_path_buf();
+
+    let (handle, capsule_url) = launch_in_background(staged);
+    arrived
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the task.md task reached the provider");
+
+    let (task_b, state) = send_task(&capsule_url, "m-b", "queued behind the launch task");
+    assert_eq!(state, "submitted");
+    let (headers_tx, headers_rx) = std::sync::mpsc::channel();
+    let stream_c = stream_until_closed(capsule_url.clone(), "streamed behind it", headers_tx);
+    headers_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the stream was answered");
+    // The door enqueues directly after writing the headers, with no await in between.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    release.send(()).unwrap();
+
+    let result = handle.join().expect("launch thread should not panic");
+    assert!(result.is_ok(), "the launch task completed: {result:?}");
+    let statuses = stream_c.join().expect("stream thread should not panic");
+
+    let events = read_trace(&trace_path);
+    let task_starts = events_named(&events, "task_start");
+    assert_eq!(task_starts.len(), 1, "only the task.md task ran");
+    assert_eq!(task_starts[0]["source"], "task_md");
+    let task_ends = events_named(&events, "task_end");
+    assert_eq!(task_ends.len(), 1);
+    assert_eq!(task_ends[0]["task_id"], task_starts[0]["task_id"]);
+
+    let rejections = events_named(&events, "task_rejected");
+    assert_eq!(rejections.len(), 2, "{rejections:?}");
+    let task_c = rejections
+        .iter()
+        .map(|event| event["task_id"].as_str().unwrap().to_string())
+        .find(|task_id| *task_id != task_b)
+        .expect("the streamed task was refused too");
+    for task_id in [&task_b, &task_c] {
+        assert_sole_rejection(&events, task_id, "session_ended");
+    }
+    assert!(events_named(&events, "a2a_task_received").is_empty());
+    assert_eq!(server.requests().len(), 1, "only the task.md task was sent");
+    assert_eq!(events_named(&events, "session_end")[0]["exit_status"], "ok");
+
+    let final_c = statuses
+        .iter()
+        .rfind(|status| status["final"] == true)
+        .unwrap_or_else(|| panic!("the stream carried no final status: {statuses:?}"));
+    assert_eq!(final_c["id"], task_c.as_str(), "{statuses:?}");
+    assert_eq!(final_c["status"]["state"], "rejected");
+    assert_eq!(final_c["status"]["message"], REJECTED_SESSION_ENDED_MESSAGE);
+
+    let shown = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["trace", "show", &session_id, "--workdir"])
+        .arg(&sessions_root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(stdout.contains("Rejected"), "{stdout}");
+    assert!(stdout.contains(&task_b), "{stdout}");
+    assert!(stdout.contains(&task_c), "{stdout}");
+}
+
+/// A refused task reads `rejected` over `tasks/get` for as long as the door is up, a cancel of it
+/// is a cancel of any ended task, and the closed door refuses new work without recording it.
+///
+/// The `on-session-end` hook spins until its deadline, which holds teardown — and so the door —
+/// open after the refusal.
+#[test]
+fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
+    let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let artifacts = tempfile::tempdir().unwrap();
+    let hook = common::hook_wat::create_hook_zip(
+        artifacts.path(),
+        "session-end-spinner",
+        "on-session-end",
+        "none",
+        &common::hook_wat::spin_hook_wasm("on-session-end"),
+    );
+    common::publish_local(&home, &hook).success();
+    let manifest = fs::read_to_string(&manifest_path)
+        .unwrap()
+        .replace(
+            "capabilities:\n",
+            "  - name: session-end-spinner\n    version: 0.1.0\n    runtime: hook\ncapabilities:\n  limits:\n    deadline_seconds: 5\n",
+        );
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
+    fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (handle, capsule_url) = launch_in_background(staged);
+    arrived
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the task.md task reached the provider");
+    let (task_b, state) = send_task(&capsule_url, "m-b", "queued behind the launch task");
+    assert_eq!(state, "submitted");
+    release.send(()).unwrap();
+
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let got = http_post_json(
+            &capsule_url,
+            "/",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": task_b}})
+                .to_string(),
+        );
+        let state = got["result"]["status"]["state"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tasks/get answered no state: {got}"))
+            .to_string();
+        let done = state == "rejected";
+        seen.push(state);
+        if done {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tasks/get never read rejected: {seen:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let (last, before) = seen.split_last().unwrap();
+    assert_eq!(last, "rejected");
+    assert!(
+        before.iter().all(|state| state == "submitted"),
+        "B read only submitted before rejected: {seen:?}"
+    );
+
+    let (late_task, late_state) = send_task(&capsule_url, "m-late", "after the close");
+    assert_eq!(late_state, "rejected", "a closed door refuses new work");
+
+    let canceled = http_post_json(
+        &capsule_url,
+        "/",
+        &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/cancel", "params": {"id": task_b}})
+            .to_string(),
+    );
+    assert!(canceled.get("error").is_none(), "{canceled}");
+    assert_eq!(canceled["result"]["id"], task_b.as_str(), "{canceled}");
+    assert_eq!(
+        canceled["result"]["status"]["state"], "rejected",
+        "an ended task is returned unchanged: {canceled}"
+    );
+    assert!(
+        canceled["result"].get("artifacts").is_none(),
+        "no residue on an ended task: {canceled}"
+    );
+
+    // The trapped hook is reported as a hook fault; the launch result is not this test's subject.
+    let _ = handle.join().expect("launch thread should not panic");
+
+    let events = read_trace(&trace_path);
+    assert_sole_rejection(&events, &task_b, "session_ended");
+    assert!(
+        events_naming(&events, &late_task).is_empty(),
+        "a door refusal is not recorded"
+    );
+    assert_eq!(events_named(&events, "task_rejected").len(), 1);
+}
+
+/// Under the default lifecycle (`single` + `exit`) the door takes one task while the `task.md`
+/// task runs and refuses the next as busy. The one it took is refused when the session closes.
+#[test]
+fn lifecycle_single_exit_rejects_the_task_it_accepted_during_its_task_md_task() {
+    let (server, arrived, release) = held_provider(end_turn_response("msg_1", "done"));
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let staged = stage_agent(&home, &manifest_path, None, None);
+    fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (handle, capsule_url) = launch_in_background(staged);
+    arrived
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the task.md task reached the provider");
+    let (task_b, state) = send_task(&capsule_url, "m-b", "taken while the launch task runs");
+    assert_eq!(state, "submitted");
+    let (busy_task, busy_state) = send_task(&capsule_url, "m-c", "one too many");
+    assert_eq!(busy_state, "rejected", "a single capsule holds one task");
+    release.send(()).unwrap();
+
+    let result = handle.join().expect("launch thread should not panic");
+    assert!(result.is_ok(), "the launch task completed: {result:?}");
+
+    let events = read_trace(&trace_path);
+    assert_sole_rejection(&events, &task_b, "session_ended");
+    assert!(
+        events_naming(&events, &busy_task).is_empty(),
+        "a busy refusal is not recorded"
+    );
+    assert_eq!(events_named(&events, "task_rejected").len(), 1);
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(events_named(&events, "session_end")[0]["exit_status"], "ok");
+}
+
+/// A launch task that fails still fails the launch, and a task queued behind it is still refused
+/// rather than run or folded into that failure.
+#[test]
+fn lifecycle_a_failed_exit_task_still_rejects_what_queued_behind_it() {
+    let (server, arrived, release) = held_provider(CHAT_COMPLETIONS_BODY.to_string());
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let staged = stage_agent(&home, &manifest_path, Some(queue_exit_lifecycle()), None);
+    fs::write(staged.accessible_workdir.join("task.md"), "Say done.").unwrap();
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (handle, capsule_url) = launch_in_background(staged);
+    arrived
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the task.md task reached the provider");
+    let (task_b, state) = send_task(&capsule_url, "m-b", "queued behind a failing task");
+    assert_eq!(state, "submitted");
+    release.send(()).unwrap();
+
+    let result = handle.join().expect("launch thread should not panic");
+    match result {
+        Err(capsule_runtime::RuntimeError::TaskDidNotComplete { exit_status, .. }) => {
+            assert_eq!(exit_status, "failed");
+        }
+        other => panic!("the failed launch task fails the launch: {other:?}"),
+    }
+
+    let events = read_trace(&trace_path);
+    assert_eq!(
+        events_named(&events, "session_end")[0]["exit_status"],
+        "failed"
+    );
+    let failures = events_named(&events, "task_failed");
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_ne!(failures[0]["task_id"], task_b.as_str());
+    assert_eq!(
+        failures[0]["task_id"],
+        events_named(&events, "task_start")[0]["task_id"]
+    );
+    assert_sole_rejection(&events, &task_b, "session_ended");
+    assert_eq!(events_named(&events, "task_rejected").len(), 1);
+}

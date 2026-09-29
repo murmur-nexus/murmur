@@ -3116,6 +3116,25 @@ fn launch(
                     }
                     // ── LOOP BODY ENDS HERE ────────────────────────────────
 
+                    // Every task the door accepted reaches a terminal state before the door
+                    // closes. One still queued here is refused, not run: the session has stopped
+                    // taking work, and a refused task is not a run, so it never touches `outcome`.
+                    refuse_undelivered_tasks(
+                        if terminating.is_canceled() {
+                            crate::trace::TASK_REJECTED_SESSION_STOPPED
+                        } else {
+                            crate::trace::TASK_REJECTED_SESSION_ENDED
+                        },
+                        &mut lanes,
+                        &mut task_rx,
+                        &task_registry,
+                        &mut trace,
+                        &detached,
+                        &live_delegations,
+                        &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
+                    )
+                    .await;
+
                     // on-session-end fires ONCE per launch, after the task loop exits.
                     // total_turns is the whole-launch aggregate accumulated by HookRuntime
                     // (one per Inference event across every task). exit_status is the launch's
@@ -8451,7 +8470,7 @@ async fn record_canceled_before_start(
 ///
 /// A task the `SIGTERM` handler cancelled is recorded as cancelled before it started, exactly as
 /// the activation step records one. A task the door accepted after the handler ran is not
-/// `Canceled` and is dropped without a record.
+/// `Canceled`; [`refuse_undelivered_tasks`] refuses it when the loop ends.
 async fn close_lanes_on_termination(
     lanes: &mut LaneQueue,
     task_registry: &Arc<Mutex<TaskRegistry>>,
@@ -8466,6 +8485,78 @@ async fn close_lanes_on_termination(
             record_canceled_before_start(&task, trace, detached, live_delegations, sse).await;
         }
     }
+}
+
+/// Close the registry to new work and end every task it still holds as `submitted` in
+/// `Rejected`, starting nothing. Runs once, after the task loop has ended.
+///
+/// A refused task gets one `task_rejected` record and one buffered final `rejected` status
+/// frame, which is what closes a `message/stream` connection on it. It gets no `task_start`,
+/// `task_end`, hook dispatch or provider request, and it is not folded into the launch outcome.
+///
+/// The registry is closed before the channel is drained, under the lock the door enqueues under,
+/// so nothing is enqueued after the refusal list is taken. `task_rx` stays open: a task enqueued
+/// just before the close may still be between the door's `enqueue` and its `try_send`, and a
+/// closed receiver would send it down the door's rollback path. Such a task is refused with the
+/// rest, under [`crate::a2a::SOURCE_A2A`] because only the door enqueues outside a lane.
+///
+/// A task a person cancelled while queued keeps `Canceled` and is recorded as cancelled before
+/// it started, never as refused.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_undelivered_tasks(
+    cause: &'static str,
+    lanes: &mut LaneQueue,
+    task_rx: &mut tokio::sync::mpsc::Receiver<IncomingTask>,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    trace: &mut TraceWriter,
+    detached: &Arc<DetachedRegistry>,
+    live_delegations: &crate::cancel::LiveDelegations,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+) {
+    let refused = task_registry.lock().unwrap().close_to_new_work();
+    while let Ok(task) = task_rx.try_recv() {
+        lanes.push(task);
+    }
+    let mut sources: HashMap<String, &'static str> = HashMap::new();
+    // `None` for the active lane is safe only because nothing taken here is started.
+    while let Some((_, task)) = lanes.next(None) {
+        if task_registry.lock().unwrap().is_canceled(&task.task_id) {
+            record_canceled_before_start(&task, trace, detached, live_delegations, sse).await;
+        } else {
+            sources.insert(task.task_id, task.source);
+        }
+    }
+    let reason = if cause == crate::trace::TASK_REJECTED_SESSION_STOPPED {
+        crate::a2a::REJECTED_SESSION_STOPPED_MESSAGE
+    } else {
+        crate::a2a::REJECTED_SESSION_ENDED_MESSAGE
+    };
+    for (task_id, context_id) in refused {
+        let source = sources
+            .get(&task_id)
+            .copied()
+            .unwrap_or(crate::a2a::SOURCE_A2A);
+        let _ = trace
+            .write_task_rejected(&task_id, &context_id, source, cause, reason)
+            .await;
+        emit_sse(
+            sse,
+            "status",
+            &crate::streaming::TaskStatusUpdateEvent {
+                id: task_id,
+                context_id: Some(context_id),
+                status: crate::streaming::StreamStatus {
+                    state: "rejected".into(),
+                    message: reason.into(),
+                    response: None,
+                    reopen: None,
+                },
+                r#final: true,
+            },
+        )
+        .await;
+    }
+    let _ = trace.flush().await;
 }
 
 /// Turn a report about work this runtime started into a queued `completion`-origin task, and

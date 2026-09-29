@@ -1378,6 +1378,7 @@ Output sections, in the order they are printed:
 | Shell calls | always | Count, exit code distribution, average latency |
 | Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
 | Cancelled | one or more [`task_canceled`](observability-schemas.md#task-canceled) records | One `task_canceled  at <phase>` row per cancel, naming what was still running |
+| Rejected | one or more [`task_rejected`](observability-schemas.md#task-rejected) records | One `task_rejected  <task id>  <cause>  source <source>` row per refused task, in file order |
 | Failed | one or more [`task_failed`](observability-schemas.md#task-failed) records | One `task_failed  <cause>  <task id>  at turn <n>` row per failed attempt, followed by its `reason:` |
 | Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, whether the next attempt `continued` the task's conversation or `restarted` it, the turns it had left, and the hook's feedback — `reopen 1  by gatekeeper  continued, 7 turns left  “…”` |
 | Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
@@ -1547,6 +1548,18 @@ A failed attempt renders as a `task_failed` row under its task, naming the
 ```text
 task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
   task_failed driver_error  {"error":"driver: failed to parse Anthropic response JSON: EOF while parsing a string at line 1 column 38","stop_reason"
+```
+
+A task the session refused when it stopped taking work renders as a `task_rejected` row under the
+session, naming the [cause](observability-schemas.md#task-rejected) and the task. It has no task
+row of its own, because it never started:
+
+```text
+Session ses_019f01a940ce7761854e768ecbe3d399  (1 task, 1 turn)
+
+task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
+  turn 0  end_turn
+task_rejected session_ended  tsk_33334444…
 ```
 
 A [plan run](observability-schemas.md#plan-events) renders as its own subtree: a `plan_start` row
