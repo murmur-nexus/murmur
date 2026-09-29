@@ -61,6 +61,7 @@ pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inferenc
 pub const E_RUN_038: &str = "E-RUN-038"; // a spend ceiling is set against a process driver that reports no usage
 pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose transport keeps no harness session
 pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not complete
+pub const E_RUN_041: &str = "E-RUN-041"; // a runtime-pulled lock pin is declared as a hook, a driver, or with gateway:
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -243,6 +244,21 @@ impl From<RuntimeError> for CliError {
                     "lockfile version mismatch for '{name}': manifest requested {requested}, lock pinned {pinned}"
                 ),
             ),
+            // Staging refuses this before any session directory, credential lookup or registry
+            // resolution, so the operator has nothing to clean up — only the pin to adopt or the
+            // role to drop.
+            RuntimeError::RuntimeOriginNotDeclarable {
+                ref name,
+                ref version,
+                declared_as,
+                ..
+            } => {
+                let hint = format!(
+                    "run `mur install {name}@{version}` to adopt the pin as operator-declared, or \
+                     remove {declared_as} from its murmur.yaml entry"
+                );
+                CliError::with_hint(E_RUN_041, error.to_string(), hint)
+            }
             RuntimeError::ArtifactArchive {
                 name,
                 version,
@@ -890,6 +906,25 @@ mod tests {
     // Regression coverage for the versioned-only export errors (see
     // capsule-runtime/src/errors.rs): the CLI mapping must surface the versioned
     // interface name and the rebuild hint, not reconstruct stale unversioned text.
+    #[test]
+    fn runtime_origin_refusal_maps_to_e_run_041() {
+        let cli = CliError::from(RuntimeError::RuntimeOriginNotDeclarable {
+            name: "pulled-tool".to_string(),
+            version: "1.2.3".to_string(),
+            session: "ses_puller".to_string(),
+            declared_as: "gateway:",
+        });
+        assert_eq!(cli.code, E_RUN_041);
+        assert!(
+            cli.message.contains("'pulled-tool@1.2.3'") && cli.message.contains("ses_puller"),
+            "{}",
+            cli.message
+        );
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("mur install pulled-tool@1.2.3"), "{hint}");
+        assert!(hint.contains("gateway:"), "{hint}");
+    }
+
     #[test]
     fn capsule_export_missing_surfaces_versioned_name_and_rebuild_hint() {
         let cli = CliError::from(RuntimeError::CapsuleExportMissing);

@@ -20,8 +20,8 @@ use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
     read_lockfile, registry_warning_link, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
-    InferenceConfig, LocalRegistry, LockedArtifact, LockfileError, MurmurLock, PlatformMatch,
-    Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
+    InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError, MurmurLock,
+    PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
 
 use crate::{
@@ -601,6 +601,7 @@ pub(crate) fn run_run(
                             name: artifact.name.clone(),
                             resolved_version: entry.resolved_version.clone(),
                             sha256: sha256.to_string(),
+                            origin: entry.origin.clone(),
                         });
                     }
                     (pinned_artifacts, Some(expectations), false)
@@ -742,6 +743,7 @@ pub(crate) fn run_run(
                     name: entry.name.clone(),
                     resolved_version: entry.resolved_version.clone(),
                     sha256: locked_sha256(entry),
+                    origin: LockOrigin::Operator,
                 })
                 .collect(),
         };

@@ -67,6 +67,20 @@ pub enum RuntimeError {
         pinned: String,
     },
 
+    /// A `murmur.lock` pin written by `manage.pull()` is declared in a role only an
+    /// operator-declared pin may carry. `declared_as` is the offending manifest text:
+    /// `runtime: hook`, `runtime: driver` or `gateway:`.
+    #[error(
+        "murmur.lock pins '{name}@{version}' from a runtime pull by session {session}, and \
+         murmur.yaml declares it with {declared_as}, which only an operator-declared pin may carry"
+    )]
+    RuntimeOriginNotDeclarable {
+        name: String,
+        version: String,
+        session: String,
+        declared_as: &'static str,
+    },
+
     #[error("failed to read artifact archive for {name}@{version}: {message}")]
     ArtifactArchive {
         name: String,

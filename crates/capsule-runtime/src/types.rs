@@ -127,6 +127,10 @@ pub struct LockExpectation {
     /// `sha256` for the platform staging runs on, so it is whichever of `any` or
     /// `platforms.<platform>` applies to this host.
     pub sha256: String,
+    /// Who wrote the lock entry. A [`murmur_artifact::LockOrigin::Runtime`] pin stages only as a
+    /// tool or skill without a `gateway:` block; staging refuses anything else with
+    /// [`crate::RuntimeError::RuntimeOriginNotDeclarable`].
+    pub origin: murmur_artifact::LockOrigin,
 }
 
 /// What staging actually resolved, for the caller to write back into `murmur.lock`.
@@ -279,6 +283,10 @@ pub struct InstalledArtifactSummary {
     pub version: String,
     pub runtime: ArtifactRuntime,
     pub implementation: Option<ArtifactImplementation>,
+    /// Who pinned the artifact: its `murmur.lock` entry's origin, both for an artifact staged
+    /// from the lock and for one `manage.pull()` installed mid-session. An artifact staged
+    /// without a lock, and a `source:` skill, are [`murmur_artifact::LockOrigin::Operator`].
+    pub origin: murmur_artifact::LockOrigin,
 }
 
 #[derive(Clone)]

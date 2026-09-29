@@ -10,8 +10,8 @@ use murmur_artifact::{
     current_platform, load_manifest_from_artifact_bytes, load_runtime_manifest, read_lockfile,
     registry_warning_link, resolve_manifest_path, sha256_hex, split_platform_suffix,
     split_platform_tag, verify_sha256, write_lockfile_atomic, ArtifactMeta, ArtifactRef,
-    LocalRegistry, LockedSha256, LockfileError, MurmurLock, Platform, RegistryError, RuntimeType,
-    LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
+    LocalRegistry, LockOrigin, LockedSha256, LockfileError, MurmurLock, Platform, RegistryError,
+    RuntimeType, LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
 };
 use rayon::prelude::*;
 
@@ -104,14 +104,17 @@ fn warn_untagged_native(name: &str, version: &str) {
     );
 }
 
-/// Upsert a single artifact's entry into `murmur.lock` at `lock_path`, creating the lockfile
-/// if it doesn't exist yet and preserving every other pre-existing entry.
+/// Upsert a single artifact's entry into `murmur.lock` at `lock_path` as operator-declared,
+/// creating the lockfile if it doesn't exist yet and preserving every other pre-existing entry.
+///
+/// Returns the line announcing the adoption when the entry was a `manage.pull()` pin, for the
+/// caller to print once nothing else is drawing on the terminal.
 fn upsert_lock_entry(
     lock_path: &Path,
     name: &str,
     version: &str,
     sha256: LockedSha256,
-) -> Result<(), CliError> {
+) -> Result<Option<String>, CliError> {
     let mut lock = match read_lockfile(lock_path) {
         Ok(lock) => lock,
         Err(LockfileError::NotFound(_)) => MurmurLock {
@@ -121,9 +124,23 @@ fn upsert_lock_entry(
         Err(err) => return Err(super::lockfile_error_to_cli(err)),
     };
 
-    lock.upsert(name, version, sha256);
+    let previous = lock.upsert(name, version, sha256, LockOrigin::Operator);
 
-    write_lockfile_atomic(lock_path, &lock).map_err(super::lockfile_error_to_cli)
+    write_lockfile_atomic(lock_path, &lock).map_err(super::lockfile_error_to_cli)?;
+    Ok(match previous {
+        Some(LockOrigin::Runtime { session }) => Some(format!(
+            "Adopted {name}@{version} as operator-declared (it was pulled at runtime by session \
+             {session})"
+        )),
+        Some(LockOrigin::Operator) | None => None,
+    })
+}
+
+/// Print each adoption line [`upsert_lock_entry`] returned, once the progress bars are finished.
+fn print_adoptions(adoptions: &[String]) {
+    for adoption in adoptions {
+        println!("{adoption}");
+    }
 }
 
 // ─── source-chain helpers ─────────────────────────────────────────────────────
@@ -178,7 +195,11 @@ pub(crate) fn install_resolved(
     // install stores the artifact but leaves murmur.lock without an entry, so `mur run`
     // later fails with E-RUN-003.
     if let Some(lock_path) = lock_path {
-        upsert_lock_entry(lock_path, &manifest.name, &installed_version, pin)?;
+        if let Some(adoption) =
+            upsert_lock_entry(lock_path, &manifest.name, &installed_version, pin)?
+        {
+            println!("{adoption}");
+        }
     }
     println!(
         "Installed {}@{} from {}",
@@ -400,7 +421,11 @@ fn install_single(
                 .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
             if let Some(root) = project_root {
-                upsert_lock_entry(&root.join("murmur.lock"), name, version, pin)?;
+                if let Some(adoption) =
+                    upsert_lock_entry(&root.join("murmur.lock"), name, version, pin)?
+                {
+                    println!("{adoption}");
+                }
             }
             resolved.bytes
         }
@@ -651,9 +676,15 @@ fn install_manifest_deps(
     // Upsert murmur.lock sequentially (not inside the parallel fetch loop) so concurrent
     // fetches never race on the same lockfile write. Every success is pinned regardless of
     // how many other artifacts failed.
+    let mut adoptions = Vec::new();
     for (_, outcome) in &successes {
         if let Some((name, version, sha256)) = &outcome.lock_upsert {
-            upsert_lock_entry(&lock_path, name, version, sha256.clone())?;
+            adoptions.extend(upsert_lock_entry(
+                &lock_path,
+                name,
+                version,
+                sha256.clone(),
+            )?);
         }
     }
 
@@ -688,6 +719,7 @@ fn install_manifest_deps(
             &done_style,
             format!("{} ↓ {}", style("✓").green().bold(), summary_tail),
         );
+        print_adoptions(&adoptions);
         return Ok(());
     }
 
@@ -696,6 +728,7 @@ fn install_manifest_deps(
         &done_style,
         format!("{} ↓ artifacts  failed", style("✗").red().bold()),
     );
+    print_adoptions(&adoptions);
 
     // Plain `println!` rather than indicatif bar text: MultiProgress writes nothing at all
     // when stdout/stderr is not a terminal, so bar messages are cosmetic-only and would make

@@ -199,7 +199,9 @@ new artifact. `search` and `remove` are unimplemented: calling either returns an
 
 `pull` resolves an artifact from the session's registry, verifies its bytes against the registry
 hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/` and
-updates `murmur.lock`. A hash mismatch, or a version or hash that conflicts with an existing
+updates `murmur.lock`. A new entry is pinned as [`origin: runtime`](workdir.md#lock-origin) with
+the id of the pulling session, which the runtime supplies itself; an entry that already exists
+keeps its origin. A hash mismatch, or a version or hash that conflicts with an existing
 `murmur.lock` pin, returns an error before anything is written. A pulled artifact is immediately
 visible to `list()` and `describe()`. A pulled WASM tool is callable via `invoke()` only when the
 manifest's `artifacts` list declares it.

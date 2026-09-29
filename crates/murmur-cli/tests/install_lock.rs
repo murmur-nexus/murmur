@@ -6,7 +6,7 @@ use std::{
 
 use assert_cmd::Command;
 use murmur_artifact::{
-    read_lockfile, sha256_hex, LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION,
+    read_lockfile, sha256_hex, LockOrigin, LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION,
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -359,6 +359,7 @@ fn install_upserts_lock_preserving_existing_entries() {
             name: "already-pinned".to_string(),
             resolved_version: "0.4.0".to_string(),
             sha256: LockedSha256::any("preexisting-hash".to_string()),
+            origin: LockOrigin::Operator,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &preexisting).unwrap();
@@ -398,6 +399,7 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
             name: "conflict-tool".to_string(),
             resolved_version: "1.0.0".to_string(),
             sha256: LockedSha256::any("a-completely-different-hash-from-a-prior-pull".to_string()),
+            origin: LockOrigin::Operator,
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &pinned).unwrap();
@@ -418,4 +420,128 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
         entry.sha256.any.as_deref().unwrap(),
         "a-completely-different-hash-from-a-prior-pull"
     );
+}
+
+/// Both install paths — a named artifact and the manifest's declared set — pin as
+/// operator-declared, and an operator entry names no session.
+#[test]
+fn an_installed_artifact_is_pinned_with_operator_origin() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    publish_fixture(&work, &home, "named-tool", "1.0.0");
+    publish_fixture(&work, &home, "declared-tool", "1.0.0");
+    write_manifest_with_deps(project.path(), &[("declared-tool", "1.0.0")]);
+
+    run_install_project("named-tool@1.0.0", &home, project.path()).success();
+    run_install_manifest_deps(&home, project.path()).success();
+
+    let lock_path = project.path().join("murmur.lock");
+    let lock = read_lockfile(&lock_path).unwrap();
+    for name in ["named-tool", "declared-tool"] {
+        assert_eq!(
+            lock.artifact_for(name).unwrap().origin,
+            LockOrigin::Operator,
+            "{name}"
+        );
+    }
+    let raw = fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(raw.matches("origin: operator").count(), 2, "{raw}");
+    assert!(!raw.contains("session:"), "{raw}");
+}
+
+fn pulled_by(session: &str) -> LockOrigin {
+    LockOrigin::Runtime {
+        session: session.to_string(),
+    }
+}
+
+/// `mur install` for an artifact a capsule pulled makes the pin operator-declared, says so in
+/// one line, and leaves every other entry's origin as it was — on the named path and on the
+/// manifest path, whose line is printed after the progress bars.
+#[test]
+fn installing_a_runtime_pin_adopts_it_as_operator() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let named_sha = publish_fixture(&work, &home, "pulled-tool", "1.0.0");
+    let declared_sha = publish_fixture(&work, &home, "pulled-dep", "1.0.0");
+    write_manifest_with_deps(project.path(), &[("pulled-dep", "1.0.0")]);
+
+    let lock_path = project.path().join("murmur.lock");
+    let untouched = vec![
+        LockedArtifact {
+            name: "operator-tool".to_string(),
+            resolved_version: "0.1.0".to_string(),
+            sha256: LockedSha256::any("operator-hash".to_string()),
+            origin: LockOrigin::Operator,
+        },
+        LockedArtifact {
+            name: "other-pull".to_string(),
+            resolved_version: "0.2.0".to_string(),
+            sha256: LockedSha256::any("other-hash".to_string()),
+            origin: pulled_by("ses_other"),
+        },
+    ];
+    let mut artifacts = untouched.clone();
+    artifacts.push(LockedArtifact {
+        name: "pulled-tool".to_string(),
+        resolved_version: "1.0.0".to_string(),
+        sha256: LockedSha256::any(named_sha),
+        origin: pulled_by("ses_puller"),
+    });
+    artifacts.push(LockedArtifact {
+        name: "pulled-dep".to_string(),
+        resolved_version: "1.0.0".to_string(),
+        sha256: LockedSha256::any(declared_sha),
+        origin: pulled_by("ses_dep_puller"),
+    });
+    murmur_artifact::write_lockfile_atomic(
+        &lock_path,
+        &MurmurLock {
+            lock_version: LOCK_VERSION,
+            artifacts,
+        },
+    )
+    .unwrap();
+
+    let adopted_named = "Adopted pulled-tool@1.0.0 as operator-declared (it was pulled at \
+                         runtime by session ses_puller)";
+    let output = run_install_project("pulled-tool@1.0.0", &home, project.path())
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert_eq!(stdout.matches(adopted_named).count(), 1, "{stdout}");
+
+    let adopted_declared = "Adopted pulled-dep@1.0.0 as operator-declared (it was pulled at \
+                            runtime by session ses_dep_puller)";
+    run_install_manifest_deps(&home, project.path())
+        .success()
+        .stdout(predicate::str::contains(adopted_declared));
+
+    let lock = read_lockfile(&lock_path).unwrap();
+    assert_eq!(
+        lock.artifact_for("pulled-tool").unwrap().origin,
+        LockOrigin::Operator
+    );
+    assert_eq!(
+        lock.artifact_for("pulled-dep").unwrap().origin,
+        LockOrigin::Operator
+    );
+    for entry in &untouched {
+        assert_eq!(lock.artifact_for(&entry.name).unwrap(), entry);
+    }
+    let raw = fs::read_to_string(&lock_path).unwrap();
+    assert!(!raw.contains("ses_puller"), "{raw}");
+    assert!(!raw.contains("ses_dep_puller"), "{raw}");
+    assert!(raw.contains("session: ses_other"), "{raw}");
+
+    // Installing an operator pin again adopts nothing.
+    run_install_project("pulled-tool@1.0.0", &home, project.path())
+        .success()
+        .stdout(predicate::str::contains("Adopted").not());
 }

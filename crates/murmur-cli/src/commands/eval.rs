@@ -12,8 +12,8 @@ use capsule_runtime::{
 use clap::Subcommand;
 use murmur_artifact::{
     current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
-    resolve_manifest_path, write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockedArtifact,
-    LockfileError, MurmurLock, Registry, LOCK_VERSION,
+    resolve_manifest_path, write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockOrigin,
+    LockedArtifact, LockfileError, MurmurLock, Registry, LOCK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -606,6 +606,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         name: artifact.name.clone(),
                         resolved_version: entry.resolved_version.clone(),
                         sha256: sha256.to_string(),
+                        origin: entry.origin.clone(),
                     });
                 } else {
                     pinned.push(artifact.clone());
@@ -709,6 +710,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         name: entry.name.clone(),
                         resolved_version: entry.resolved_version.clone(),
                         sha256: super::locked_sha256(entry),
+                        origin: LockOrigin::Operator,
                     })
                     .collect(),
             };

@@ -14,7 +14,8 @@ use capsule_runtime::{
 };
 use murmur_artifact::{
     load_runtime_manifest, read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
-    LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock, LOCK_VERSION,
+    LocalRegistry, LockOrigin, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
+    LOCK_VERSION,
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -187,6 +188,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                         name: artifact.name.clone(),
                         resolved_version: entry.resolved_version.clone(),
                         sha256: entry.sha256.any.clone().unwrap(),
+                        origin: entry.origin.clone(),
                     });
                 }
 
@@ -245,6 +247,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                     name: entry.name.clone(),
                     resolved_version: entry.resolved_version.clone(),
                     sha256: LockedSha256::any(entry.sha256.clone()),
+                    origin: LockOrigin::Operator,
                 })
                 .collect(),
         };
