@@ -5436,10 +5436,10 @@ impl manage::Host for CapsuleStoreState {
     }
 
     fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
-        // 0. The capsule's own `capabilities.install` grant, decided on the name alone, so a
-        // refused name never reaches the registry.
+        // 0. The capsule's own `capabilities.install` grant, decided on the name and version
+        // alone, so a refused request never reaches the registry.
         if let Some(refusal) =
-            crate::install_grant::refuse_before_resolve(&self.capability_policy, &name)
+            crate::install_grant::refuse_before_resolve(&self.capability_policy, &name, &version)
         {
             return Err(refusal);
         }

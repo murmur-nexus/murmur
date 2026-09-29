@@ -1,8 +1,11 @@
 //! The `capabilities.install` gate on `murmur:artifact-manager/manage.pull`.
 //!
 //! A pull is decided in two halves. [`refuse_before_resolve`] needs only the requested name and
-//! runs before the registry is read, so an ungranted capsule, a name outside the artifact-name
-//! rule (a path, a `github:` reference) and a name no entry matches never reach the registry.
+//! version and runs before the registry is read, so an ungranted capsule, a name outside the
+//! artifact-name rule (a path, a `github:` reference), a version that is not one path segment and
+//! a name no entry matches never reach the registry. The version check is part of the grant: the
+//! registry joins both arguments into a path, so a version such as `1.0.0/../../x` would resolve
+//! outside the granted name's directory.
 //! [`refuse_after_resolve`] needs the resolved [`ArtifactMeta`], because whether a name is a skill
 //! or a tool is a property of the payload, and runs before `murmur.lock` is read and before
 //! anything is written or compiled.
@@ -67,10 +70,14 @@ pub(crate) fn is_granted(policy: &CapabilityPolicy) -> bool {
     !(policy.install_skill.is_empty() && policy.install_tool.is_empty())
 }
 
-/// The refusal for pulling `name`, decided without the registry, or `None` to go on and resolve
-/// it. Checks, in order: the session holds a grant; `name` is an artifact name; some entry of
-/// either list matches it.
-pub(crate) fn refuse_before_resolve(policy: &CapabilityPolicy, name: &str) -> Option<String> {
+/// The refusal for pulling `name` at `version`, decided without the registry, or `None` to go on
+/// and resolve it. Checks, in order: the session holds a grant; `name` is an artifact name;
+/// `version` is one path segment; some entry of either list matches `name`.
+pub(crate) fn refuse_before_resolve(
+    policy: &CapabilityPolicy,
+    name: &str,
+    version: &str,
+) -> Option<String> {
     if !is_granted(policy) {
         return Some(format!(
             "{NOT_GRANTED} this capsule declares no capabilities.install, so pulling '{name}' is \
@@ -81,6 +88,13 @@ pub(crate) fn refuse_before_resolve(policy: &CapabilityPolicy, name: &str) -> Op
         return Some(format!(
             "{NOT_GRANTED} '{name}' is not an artifact name ({reason}); capabilities.install \
              matches bare artifact names only"
+        ));
+    }
+    // The store-name rule is the crate's one "single path segment" check.
+    if crate::state_store::validate_store_name(version).is_err() {
+        return Some(format!(
+            "{NOT_GRANTED} '{version}' is not an artifact version (it must be one path segment); \
+             capabilities.install reaches only what the session's registry holds under '{name}'"
         ));
     }
     let matched = policy
@@ -614,6 +628,31 @@ mod tests {
         assert!(state.installed_artifacts.is_empty());
     }
 
+    /// The registry joins the version into a path, so a granted name with a traversing version
+    /// must never reach it.
+    #[test]
+    fn a_version_that_is_not_one_path_segment_is_refused_before_resolving() {
+        let project = Project::new();
+        project.publish_skill("my-skill", "# guidance");
+        let mut state = project.session(&["*"], &["*"]);
+        let before = tree(project._dir.path());
+
+        for version in ["1.0.0/../1.0.0", "../1.0.0", "..", ".", "", "a/b", "1.0.0/"] {
+            let err = manage::Host::pull(&mut state, "my-skill".to_string(), version.to_string())
+                .expect_err("a version that is not one path segment is refused");
+            assert!(err.starts_with("not-granted:"), "{version:?}: {err}");
+            assert!(
+                err.contains("is not an artifact version"),
+                "{version:?}: {err}"
+            );
+        }
+
+        assert!(project.registry.resolved().is_empty());
+        assert_eq!(tree(project._dir.path()), before);
+        assert!(state.installed_artifacts.is_empty());
+        pull(&mut state, "my-skill").expect("the same name at a plain version pulls");
+    }
+
     #[test]
     fn a_pulled_artifact_gains_no_grant_of_its_own() {
         under_scratch_home("inner_a_pulled_artifact_gains_no_grant_of_its_own");
@@ -737,7 +776,7 @@ mod tests {
             ..CapabilityPolicy::default()
         };
         assert_eq!(
-            refuse_before_resolve(&policy, "stylist").unwrap(),
+            refuse_before_resolve(&policy, "stylist", VERSION).unwrap(),
             "not-granted: 'stylist' matches no capabilities.install entry (skill: code-review, \
              style-*; tool: jq)"
         );
@@ -752,14 +791,19 @@ mod tests {
              skills and tools"
         );
         assert_eq!(
-            refuse_before_resolve(&CapabilityPolicy::default(), "jq").unwrap(),
+            refuse_before_resolve(&CapabilityPolicy::default(), "jq", VERSION).unwrap(),
             "not-granted: this capsule declares no capabilities.install, so pulling 'jq' is \
              refused"
         );
-        assert!(refuse_before_resolve(&policy, "Upper")
+        assert!(refuse_before_resolve(&policy, "Upper", VERSION)
             .unwrap()
             .starts_with("not-granted: 'Upper' is not an artifact name ("));
-        assert_eq!(refuse_before_resolve(&policy, "style-rust"), None);
+        assert_eq!(
+            refuse_before_resolve(&policy, "jq", "../1.0.0").unwrap(),
+            "not-granted: '../1.0.0' is not an artifact version (it must be one path segment); \
+             capabilities.install reaches only what the session's registry holds under 'jq'"
+        );
+        assert_eq!(refuse_before_resolve(&policy, "style-rust", VERSION), None);
         assert_eq!(
             refuse_after_resolve(&policy, "jq", &meta(RuntimeType::Native, "tool")),
             None

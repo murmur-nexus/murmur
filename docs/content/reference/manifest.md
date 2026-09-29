@@ -827,7 +827,8 @@ payload.
 A pull resolves from the registry the session was staged against. For `mur run` and `mur eval`
 that is the project artifact store, falling back to the global store under `~/.murmur`, so a grant
 admits only what [`mur install`](cli.md#mur-install) or [`mur publish`](cli.md#mur-publish) has
-already placed on this host. A pull names a bare artifact name; a `github:` reference is refused.
+already placed on this host. A pull names a bare artifact name and a version that is a single
+path segment; a `github:` reference, a path, or a version containing `/` or `..` is refused.
 
 A pulled artifact runs on this capsule's own grants. It gains no per-artifact capabilities, no
 gateway and no place in the `invoke()` allowlist, and the `capabilities:` block in its own bundled

@@ -207,17 +207,18 @@ visible to `list()` and `describe()`. A pulled WASM tool is callable via `invoke
 manifest's `artifacts` list declares it.
 
 `pull` requires the capsule's [`capabilities.install`](manifest.md#field-install) grant. A pull
-the grant does not admit returns an error string beginning `not-granted:`, followed by the
-artifact name, the manifest key and the entries the capsule declares. The checks run in this
-order:
+the grant does not admit returns an error string beginning `not-granted:`, which names the
+artifact and the `capabilities.install` key it failed, and lists the capsule's entries where the
+refusal is about a name. The checks run in this order:
 
 | Order | Refused when | Registry read |
 |---:|---|---|
 | 1 | The capsule declares no `capabilities.install` | No |
 | 2 | The name is not a bare artifact name | No |
-| 3 | No entry in either install list matches the name | No |
-| 4 | The artifact is not a skill or a tool — a `driver`, a `hook`, or a role that disagrees with its payload | Yes |
-| 5 | No entry in the list for the artifact's own kind matches the name | Yes |
+| 3 | The version is not a single path segment: empty, `.`, `..`, or containing `/` | No |
+| 4 | No entry in either install list matches the name | No |
+| 5 | The artifact is not a skill or a tool — a `driver`, a `hook`, or a role that disagrees with its payload | Yes |
+| 6 | No entry in the list for the artifact's own kind matches the name | Yes |
 
 A refused pull writes nothing: no file under `tools/`, no `murmur.lock` change, and no compiled
 form. `diagnostics` states the grant in `runtime-state.capabilities`, as

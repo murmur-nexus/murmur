@@ -90,8 +90,8 @@ impl EnvelopeAxis {
 pub struct EnvelopeViolation {
     pub axis: EnvelopeAxis,
     /// The child declaration that exceeded, rendered as the operator wrote it: one allow-list
-    /// entry, one install entry, one filesystem scope, one store name, one containment class, or the literal `true`
-    /// for a boolean widening.
+    /// entry, one install entry, one filesystem scope, one store name, one containment class, or
+    /// the literal `true` for a boolean widening.
     ///
     /// Empty on the one axis where the offending declaration is an *absence*: a child that
     /// declares no `capabilities.filesystem.scope` under a parent that declares one reaches the
