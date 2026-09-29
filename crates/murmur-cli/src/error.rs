@@ -903,9 +903,6 @@ fn extract_interface_name(message: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Regression coverage for the versioned-only export errors (see
-    // capsule-runtime/src/errors.rs): the CLI mapping must surface the versioned
-    // interface name and the rebuild hint, not reconstruct stale unversioned text.
     #[test]
     fn runtime_origin_refusal_maps_to_e_run_041() {
         let cli = CliError::from(RuntimeError::RuntimeOriginNotDeclarable {
@@ -925,6 +922,9 @@ mod tests {
         assert!(hint.contains("gateway:"), "{hint}");
     }
 
+    // Regression coverage for the versioned-only export errors (see
+    // capsule-runtime/src/errors.rs): the CLI mapping must surface the versioned
+    // interface name and the rebuild hint, not reconstruct stale unversioned text.
     #[test]
     fn capsule_export_missing_surfaces_versioned_name_and_rebuild_hint() {
         let cli = CliError::from(RuntimeError::CapsuleExportMissing);

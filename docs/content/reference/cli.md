@@ -763,8 +763,8 @@ Fix: mur install murmur-tool-git@1.0.0
 | `E-IO-001` | No `murmur.yaml` found in the current directory or any parent |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
 | `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 2, which is refused rather than migrated |
-| `E-RUN-041` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
+| `E-RUN-041` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-CAP-014` | A variable the formation's `capabilities.env.allow` closure declares is unset in this environment |
 | `E-CAP-015` | A capsule in the formation declares a `capabilities.env.allow` entry the capsule that spawns it does not hold |
 | `W-REG-002` | A capsule in the formation could not be inspected, so what it declares is missing from the report — a warning; the exit code is unchanged |

@@ -5472,22 +5472,17 @@ impl manage::Host for CapsuleStoreState {
         };
 
         // 4. Files are on disk — now, and only now, update murmur.lock. The origin is this
-        // store's own session: the guest has no input to it. `upsert` keeps an existing entry's
-        // origin, so an operator pin stays operator and an earlier pull keeps its session.
-        lock.upsert(
-            &name,
-            &version,
-            incoming_sha256,
-            LockOrigin::Runtime {
-                session: self.session_id.clone(),
-            },
-        );
+        // store's own session: the guest has no input to it. A runtime upsert keeps an existing
+        // entry's origin, so an operator pin stays operator and an earlier pull keeps its
+        // session — which makes the entry's origin now its previous one, or ours if it is new.
+        let pulled_by = LockOrigin::Runtime {
+            session: self.session_id.clone(),
+        };
+        let origin = lock
+            .upsert(&name, &version, incoming_sha256, pulled_by.clone())
+            .unwrap_or(pulled_by);
         write_lockfile_atomic(&self.lock_path, &lock)
             .map_err(|err| format!("failed to write murmur.lock: {err}"))?;
-        let origin = lock
-            .artifact_for(&name)
-            .map(|entry| entry.origin.clone())
-            .unwrap_or_default();
 
         // 5. Reflect the pulled artifact in in-memory session state so list()/describe() (and,
         // for WASM tools, invoke()) see it immediately.

@@ -749,9 +749,9 @@ and the error and exit code are the same.
 ### E-RUN-041 — a runtime pull declared in an operator-only role { #e-run-041 }
 
 A `murmur.lock` entry with [`origin: runtime`](workdir.md#lock-origin) was written by a capsule's
-`manage.pull()`, not by an operator command. `mur run` and `mur eval` stage such a pin only as a
-tool or a skill without a `gateway:` block, and refuse the launch before any session directory
-exists when its `murmur.yaml` entry declares one of:
+`manage.pull()`, not by an operator command. Such a pin stages only as a tool or a skill without a
+`gateway:` block. `mur run` refuses the launch, before any session directory exists, when its
+`murmur.yaml` entry declares one of:
 
 - `runtime: hook`
 - `runtime: driver`
@@ -761,6 +761,9 @@ exists when its `murmur.yaml` entry declares one of:
 error[E-RUN-041]: murmur.lock pins 'some-tool@1.2.3' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with gateway:, which only an operator-declared pin may carry
   hint: run `mur install some-tool@1.2.3` to adopt the pin as operator-declared, or remove gateway: from its murmur.yaml entry
 ```
+
+`mur eval run` refuses the same pin per case: the case is recorded as `stage_failed` with this
+message.
 
 `mur install <name>@<version>` rewrites the entry as `origin: operator` and the next launch stages
 it. [`mur doctor`](cli.md#mur-doctor) reports the same refusal ahead of a run.

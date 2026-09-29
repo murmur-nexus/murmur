@@ -478,31 +478,22 @@ block only when everything in it is stale: a different `resolved_version`, or a 
 | `origin` | `operator`, `runtime` | Always | `operator`: written by `mur install`, or by the `mur run` or `mur eval` that created the lock. `runtime`: written by a running capsule through `manage.pull()`. An entry with no `origin` key reads as `operator` |
 | `session` | A session id (`ses_…`) | Only for `origin: runtime` | The session whose capsule pulled the artifact. Required and non-blank for `runtime`; refused on `operator` |
 
-An upsert sets the origin by who is writing:
+Each writer sets the origin like this:
 
 | Writer | New entry | Existing entry |
 |---|---|---|
-| `mur install`, or `mur run` / `mur eval` creating the lock | `origin: operator` | Becomes `origin: operator`, and `session` is dropped |
+| `mur run` / `mur eval` creating the lock | `origin: operator` | — (they never rewrite an existing lock) |
+| `mur install` | `origin: operator` | Becomes `origin: operator` and `session` is dropped; `mur install` [prints one line](cli.md#mur-install) for each runtime pin it adopts |
 | `manage.pull()` | `origin: runtime` with the pulling session | Origin left exactly as it was |
 
-A pull therefore never turns an operator pin into a runtime one, and never relabels an earlier
-pull with its own session. When `mur install` adopts a runtime pin, it prints:
-
-```
-Adopted some-tool@1.2.3 as operator-declared (it was pulled at runtime by session ses_0190a1b2c3d4...)
-```
+A pull never turns an operator pin into a runtime one, and never relabels an earlier pull with its
+own session.
 
 `mur run` and `mur eval` stage only the artifacts `murmur.yaml` declares, so an entry a capsule
 pulled that the manifest does not declare is never staged. A declared artifact whose pin has
-`origin: runtime` is staged as a runtime-acquired tool or skill. Staging refuses it with
-`E-RUN-041`, before any session directory exists, when its `murmur.yaml` entry declares:
-
-- `runtime: hook`
-- `runtime: driver`
-- a `gateway:` block
-
-To launch it in that role, run `mur install <name>@<version>`, which adopts the pin as
-operator-declared, or remove the offending key from its entry.
+`origin: runtime` stages only as a tool or skill without `gateway:`; declaring it as
+`runtime: hook`, `runtime: driver` or with `gateway:` is refused with
+[`E-RUN-041`](diagnostics.md#e-run-041) until `mur install <name>@<version>` adopts the pin.
 [`mur doctor`](cli.md#mur-doctor) reports every runtime pin.
 
 A `mur` that predates `origin` reads a lock that has it, and drops both keys if it rewrites the
@@ -517,6 +508,6 @@ A `lock_version: 1` file is refused rather than migrated — it pinned one `sha2
 artifact, which cannot describe a native artifact's per-platform payloads. Delete `murmur.lock` and
 run `mur install` to regenerate it.
 
-A missing entry for a manifest artifact, an entry with no hash for this host's platform, or an
-unsupported `lock_version`, or a malformed `origin` / `session` pair, fails the run with `E-RUN-003`. An install whose registry hash
-disagrees with the pin fails with `E-REG-005`. See [Diagnostics](diagnostics.md).
+A missing entry for a manifest artifact, an entry with no hash for this host's platform, an
+unsupported `lock_version`, or a malformed `origin` / `session` pair fails the run with
+`E-RUN-003`. An install whose registry hash disagrees with the pin fails with `E-REG-005`. See [Diagnostics](diagnostics.md).
