@@ -9,7 +9,9 @@ use std::{
 };
 
 use assert_cmd::Command;
-use murmur_artifact::read_lockfile;
+use murmur_artifact::{
+    read_lockfile, write_lockfile_atomic, LockOrigin, LockedArtifact, LockedSha256,
+};
 use predicates::prelude::*;
 use zip::{
     write::{FileOptions, SimpleFileOptions},
@@ -574,6 +576,125 @@ fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() 
         .stderr(predicate::str::contains("E-MAN-003").not())
         .stderr(predicate::str::contains("E-RUN-008"))
         .stderr(predicate::str::contains("missing-tool@0.0.1"));
+}
+
+/// A project declaring `echo-tool` with its artifact installed and no `murmur.lock` yet.
+fn echo_tool_project(project: &Path, fixture: &Path, artifacts_yaml: &str) -> PathBuf {
+    let artifact_path = create_tool_artifact(
+        fixture,
+        TOOL_NAME,
+        TOOL_VERSION,
+        &fixture_component("echo-tool.wasm"),
+    );
+    let manifest_path = create_project(project, "capsule-allowlisted.wasm", artifacts_yaml, None);
+    common::install_artifact_to_project(project, &artifact_path).success();
+    manifest_path
+}
+
+#[test]
+fn the_lock_mur_run_creates_marks_every_entry_operator() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = echo_tool_project(
+        project.path(),
+        fixture.path(),
+        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+    );
+    let lock_path = project.path().join("murmur.lock");
+    let _ = fs::remove_file(&lock_path);
+
+    common::run_capsule(&home, &manifest_path).success();
+
+    let lock = read_lockfile(&lock_path).unwrap();
+    assert!(!lock.artifacts.is_empty());
+    assert!(lock
+        .artifacts
+        .iter()
+        .all(|entry| entry.origin == LockOrigin::Operator));
+    let raw = fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(
+        raw.matches("origin: operator").count(),
+        lock.artifacts.len(),
+        "{raw}"
+    );
+    assert!(!raw.contains("session:"), "{raw}");
+}
+
+/// Adds an entry a capsule pulled under `session` that murmur.yaml does not declare, and whose
+/// artifact is in no store, so staging it would fail the run.
+fn add_undeclared_runtime_pin(lock_path: &Path, session: &str) {
+    let mut lock = read_lockfile(lock_path).unwrap();
+    lock.artifacts.push(LockedArtifact {
+        name: "pulled-elsewhere".to_string(),
+        resolved_version: "3.0.0".to_string(),
+        sha256: LockedSha256::any("pulled-hash".to_string()),
+        origin: LockOrigin::Runtime {
+            session: session.to_string(),
+        },
+    });
+    write_lockfile_atomic(lock_path, &lock).unwrap();
+}
+
+#[test]
+fn an_undeclared_runtime_pin_is_not_staged() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = echo_tool_project(
+        project.path(),
+        fixture.path(),
+        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+    );
+    common::run_capsule(&home, &manifest_path).success();
+    let lock_path = project.path().join("murmur.lock");
+    add_undeclared_runtime_pin(&lock_path, "ses_earlier");
+    let before = fs::read(&lock_path).unwrap();
+
+    common::run_capsule(&home, &manifest_path)
+        .success()
+        .stdout(predicate::str::contains("status:  ok"));
+
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
+}
+
+/// A declared tool whose pin a capsule pulled cannot carry `gateway:`; the refusal comes before
+/// the session directory exists.
+#[test]
+fn a_runtime_pin_declared_with_a_gateway_fails_with_e_run_043() {
+    let home = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = echo_tool_project(
+        project.path(),
+        fixture.path(),
+        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
+    );
+    common::run_capsule(&home, &manifest_path).success();
+    let lock_path = project.path().join("murmur.lock");
+    let mut lock = read_lockfile(&lock_path).unwrap();
+    lock.artifacts[0].origin = LockOrigin::Runtime {
+        session: "ses_puller".to_string(),
+    };
+    write_lockfile_atomic(&lock_path, &lock).unwrap();
+    fs::remove_dir_all(project.path().join("workdir")).unwrap();
+    create_project(
+        project.path(),
+        "capsule-allowlisted.wasm",
+        &format!(
+            "  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n    gateway:\n      endpoint: https://api.example.com\n      api_key: test-key\n"
+        ),
+        None,
+    );
+
+    common::run_capsule(&home, &manifest_path)
+        .failure()
+        .stderr(predicate::str::contains("error[E-RUN-043]"))
+        .stderr(predicate::str::contains("ses_puller"))
+        .stderr(predicate::str::contains(format!(
+            "mur install {TOOL_NAME}@{TOOL_VERSION}"
+        )));
+    assert!(!project.path().join("workdir").exists());
 }
 
 fn fixture_component(name: &str) -> PathBuf {

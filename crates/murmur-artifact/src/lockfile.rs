@@ -23,10 +23,100 @@ pub struct MurmurLock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawLockedArtifact", into = "RawLockedArtifact")]
 pub struct LockedArtifact {
     pub name: String,
     pub resolved_version: String,
     pub sha256: LockedSha256,
+    pub origin: LockOrigin,
+}
+
+/// Who wrote a lock entry's pin.
+///
+/// On disk this is two flat keys on the entry: `origin` (always written) and `session` (only
+/// for [`LockOrigin::Runtime`]). An entry with no `origin` key reads as [`LockOrigin::Operator`],
+/// so a lock with no `origin` keys at all reads as entirely operator-declared.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LockOrigin {
+    /// Written by an operator command: `mur install`, or the `mur run` / `mur eval` that created
+    /// the lock.
+    #[default]
+    Operator,
+    /// Written by a running capsule through `manage.pull()`. `session` is the id of the session
+    /// whose store performed the pull — host state, never an argument the guest supplied.
+    Runtime { session: String },
+}
+
+const ORIGIN_OPERATOR: &str = "operator";
+const ORIGIN_RUNTIME: &str = "runtime";
+
+/// The on-disk shape of a [`LockedArtifact`]: `origin` and `session` as flat keys after
+/// `sha256`.
+#[derive(Serialize, Deserialize)]
+struct RawLockedArtifact {
+    name: String,
+    resolved_version: String,
+    sha256: LockedSha256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+}
+
+impl TryFrom<RawLockedArtifact> for LockedArtifact {
+    type Error = String;
+
+    /// Refuses the combinations [`LockOrigin`] cannot hold: an unknown `origin`, `runtime`
+    /// without `session`, and `operator` with one. A blank `session` is carried through and
+    /// refused by [`MurmurLock::validate`], which the write path runs too.
+    fn try_from(raw: RawLockedArtifact) -> Result<Self, Self::Error> {
+        let origin = match (raw.origin.as_deref(), raw.session) {
+            (None | Some(ORIGIN_OPERATOR), None) => LockOrigin::Operator,
+            (None | Some(ORIGIN_OPERATOR), Some(_)) => {
+                return Err(format!(
+                    "artifact '{}' is origin: operator but carries a session key (only an \
+                     origin: runtime entry names a session)",
+                    raw.name
+                ))
+            }
+            (Some(ORIGIN_RUNTIME), Some(session)) => LockOrigin::Runtime { session },
+            (Some(ORIGIN_RUNTIME), None) => {
+                return Err(format!(
+                    "artifact '{}' is origin: runtime but has no session key",
+                    raw.name
+                ))
+            }
+            (Some(other), _) => {
+                return Err(format!(
+                    "artifact '{}' has unknown origin '{other}' (expected {ORIGIN_OPERATOR} or \
+                     {ORIGIN_RUNTIME})",
+                    raw.name
+                ))
+            }
+        };
+        Ok(Self {
+            name: raw.name,
+            resolved_version: raw.resolved_version,
+            sha256: raw.sha256,
+            origin,
+        })
+    }
+}
+
+impl From<LockedArtifact> for RawLockedArtifact {
+    fn from(entry: LockedArtifact) -> Self {
+        let (origin, session) = match entry.origin {
+            LockOrigin::Operator => (ORIGIN_OPERATOR, None),
+            LockOrigin::Runtime { session } => (ORIGIN_RUNTIME, Some(session)),
+        };
+        Self {
+            name: entry.name,
+            resolved_version: entry.resolved_version,
+            sha256: entry.sha256,
+            origin: Some(origin.to_string()),
+            session,
+        }
+    }
 }
 
 /// The pinned hash (or hashes) of one artifact's payload.
@@ -144,7 +234,14 @@ impl LockedArtifact {
     /// build against it. So the incoming hashes are merged into the existing map, and the whole
     /// `sha256` is replaced only when everything already in it is stale: a different
     /// `resolved_version`, or a change of shape between platform-independent and per-platform.
-    pub fn pin(&mut self, resolved_version: &str, sha256: LockedSha256) {
+    ///
+    /// A [`LockOrigin::Operator`] pin makes the entry operator-declared, whatever it was. A
+    /// [`LockOrigin::Runtime`] pin leaves the entry's origin as it was: a runtime pull never
+    /// demotes an operator pin or relabels an earlier pull with its own session.
+    pub fn pin(&mut self, resolved_version: &str, sha256: LockedSha256, origin: LockOrigin) {
+        if origin == LockOrigin::Operator {
+            self.origin = LockOrigin::Operator;
+        }
         let stale =
             self.resolved_version != resolved_version || !self.sha256.same_shape_as(&sha256);
         if stale || sha256.platforms.is_empty() {
@@ -234,18 +331,31 @@ impl MurmurLock {
         self.artifacts.iter().find(|entry| entry.name == name)
     }
 
-    /// Pin `name` at `version`/`sha256`, creating the entry when it is not there yet and
-    /// merging into it through [`LockedArtifact::pin`] when it is. Every other entry is left
-    /// untouched.
-    pub fn upsert(&mut self, name: &str, version: &str, sha256: LockedSha256) {
+    /// Pin `name` at `version`/`sha256`, creating the entry with `origin` when it is not there
+    /// yet and merging into it through [`LockedArtifact::pin`] when it is. Every other entry is
+    /// left untouched.
+    ///
+    /// Returns the entry's origin before the call, or `None` when the entry was created — so an
+    /// operator command can tell that it adopted a runtime pin.
+    pub fn upsert(
+        &mut self,
+        name: &str,
+        version: &str,
+        sha256: LockedSha256,
+        origin: LockOrigin,
+    ) -> Option<LockOrigin> {
         if let Some(entry) = self.artifacts.iter_mut().find(|entry| entry.name == name) {
-            entry.pin(version, sha256);
+            let previous = entry.origin.clone();
+            entry.pin(version, sha256, origin);
+            Some(previous)
         } else {
             self.artifacts.push(LockedArtifact {
                 name: name.to_string(),
                 resolved_version: version.to_string(),
                 sha256,
+                origin,
             });
+            None
         }
     }
 
@@ -271,6 +381,14 @@ impl MurmurLock {
                 )));
             }
             entry.sha256.validate(&entry.name)?;
+            if let LockOrigin::Runtime { session } = &entry.origin {
+                if session.trim().is_empty() {
+                    return Err(LockfileError::Invalid(format!(
+                        "artifact '{}' is origin: runtime with an empty session",
+                        entry.name
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -367,6 +485,13 @@ mod tests {
             name: name.to_string(),
             resolved_version: version.to_string(),
             sha256,
+            origin: LockOrigin::Operator,
+        }
+    }
+
+    fn runtime(session: &str) -> LockOrigin {
+        LockOrigin::Runtime {
+            session: session.to_string(),
         }
     }
 
@@ -381,6 +506,10 @@ mod tests {
                 "0.1.0",
                 LockedSha256::for_one_platform("linux-x86_64", "def456"),
             ),
+            LockedArtifact {
+                origin: runtime("ses_0190a1b2"),
+                ..entry("pulled-tool", "1.2.3", LockedSha256::any("fed789"))
+            },
         ]);
 
         write_lockfile_atomic(&path, &lock).unwrap();
@@ -416,6 +545,145 @@ mod tests {
         );
         assert!(raw.contains("any: aaa"), "{raw}");
         assert!(raw.contains("linux-x86_64: bbb"), "{raw}");
+        assert_eq!(raw.matches("origin: operator").count(), 2, "{raw}");
+        assert!(!raw.contains("session:"), "{raw}");
+    }
+
+    #[test]
+    fn a_lock_without_origin_reads_as_all_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        fs::write(
+            &path,
+            "lock_version: 2\nartifacts:\n  - name: echo-tool\n    resolved_version: 0.0.1\n    sha256:\n      any: abc\n  - name: native-tool\n    resolved_version: 0.1.0\n    sha256:\n      platforms:\n        linux-x86_64: def\n",
+        )
+        .unwrap();
+
+        let lock = read_lockfile(&path).unwrap();
+        assert!(lock
+            .artifacts
+            .iter()
+            .all(|entry| entry.origin == LockOrigin::Operator));
+
+        write_lockfile_atomic(&path, &lock).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches("origin: operator").count(), 2, "{raw}");
+        assert!(!raw.contains("session:"), "{raw}");
+    }
+
+    #[test]
+    fn a_runtime_upsert_keeps_the_existing_origin() {
+        let mut lock = lock_with(vec![
+            entry("operator-tool", "0.1.0", LockedSha256::any("aaa")),
+            LockedArtifact {
+                origin: runtime("ses_first"),
+                ..entry("pulled-tool", "0.1.0", LockedSha256::any("bbb"))
+            },
+        ]);
+
+        let previous = lock.upsert(
+            "operator-tool",
+            "0.1.0",
+            LockedSha256::any("aaa"),
+            runtime("ses_second"),
+        );
+        assert_eq!(previous, Some(LockOrigin::Operator));
+        let previous = lock.upsert(
+            "pulled-tool",
+            "0.2.0",
+            LockedSha256::any("ccc"),
+            runtime("ses_second"),
+        );
+        assert_eq!(previous, Some(runtime("ses_first")));
+
+        assert_eq!(
+            lock.artifact_for("operator-tool").unwrap().origin,
+            LockOrigin::Operator
+        );
+        let pulled = lock.artifact_for("pulled-tool").unwrap();
+        assert_eq!(pulled.origin, runtime("ses_first"));
+        assert_eq!(pulled.resolved_version, "0.2.0");
+
+        let created = lock.upsert(
+            "new-tool",
+            "0.1.0",
+            LockedSha256::any("ddd"),
+            runtime("ses_second"),
+        );
+        assert_eq!(created, None);
+        assert_eq!(
+            lock.artifact_for("new-tool").unwrap().origin,
+            runtime("ses_second")
+        );
+    }
+
+    #[test]
+    fn an_operator_upsert_adopts_a_runtime_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        let mut lock = lock_with(vec![LockedArtifact {
+            origin: runtime("ses_puller"),
+            ..entry("pulled-tool", "0.1.0", LockedSha256::any("aaa"))
+        }]);
+
+        let previous = lock.upsert(
+            "pulled-tool",
+            "0.1.0",
+            LockedSha256::any("aaa"),
+            LockOrigin::Operator,
+        );
+
+        assert_eq!(previous, Some(runtime("ses_puller")));
+        assert_eq!(
+            lock.artifact_for("pulled-tool").unwrap().origin,
+            LockOrigin::Operator
+        );
+        write_lockfile_atomic(&path, &lock).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("origin: operator"), "{raw}");
+        assert!(!raw.contains("session"), "{raw}");
+    }
+
+    #[test]
+    fn malformed_origin_fields_are_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        let refusal = |origin_keys: &str| {
+            fs::write(
+                &path,
+                format!(
+                    "lock_version: 2\nartifacts:\n  - name: odd-tool\n    resolved_version: 0.1.0\n    sha256:\n      any: abc\n{origin_keys}"
+                ),
+            )
+            .unwrap();
+            match read_lockfile(&path).unwrap_err() {
+                LockfileError::Invalid(message) => message,
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+        };
+
+        let message = refusal("    origin: runtime\n");
+        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("session"), "{message}");
+
+        let message = refusal("    origin: runtime\n    session: \"  \"\n");
+        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("session"), "{message}");
+
+        let message = refusal("    origin: operator\n    session: ses_x\n");
+        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("session"), "{message}");
+
+        let message = refusal("    origin: capsule\n");
+        assert!(message.contains("'odd-tool'"), "{message}");
+        assert!(message.contains("origin"), "{message}");
+        assert!(message.contains("capsule"), "{message}");
+
+        let blank_on_write = lock_with(vec![LockedArtifact {
+            origin: runtime(""),
+            ..entry("odd-tool", "0.1.0", LockedSha256::any("abc"))
+        }]);
+        assert!(write_lockfile_atomic(&path, &blank_on_write).is_err());
     }
 
     #[test]
@@ -519,6 +787,7 @@ mod tests {
             "native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
+            LockOrigin::Operator,
         );
 
         let pinned = &lock.artifact_for("native-tool").unwrap().sha256;
@@ -537,12 +806,14 @@ mod tests {
             "native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
+            LockOrigin::Operator,
         );
 
         lock.upsert(
             "native-tool",
             "0.1.0",
             LockedSha256::for_one_platform("linux-x86_64", "rebuilt-linux-hash"),
+            LockOrigin::Operator,
         );
 
         let pinned = &lock.artifact_for("native-tool").unwrap().sha256;
@@ -565,6 +836,7 @@ mod tests {
             "native-tool",
             "0.2.0",
             LockedSha256::for_one_platform("linux-x86_64", "linux-hash"),
+            LockOrigin::Operator,
         );
 
         let pinned = &lock.artifact_for("native-tool").unwrap();
@@ -580,7 +852,12 @@ mod tests {
             LockedSha256::for_one_platform("darwin-aarch64", "mac-hash"),
         )]);
 
-        lock.upsert("tool", "0.1.0", LockedSha256::any("wasm-hash"));
+        lock.upsert(
+            "tool",
+            "0.1.0",
+            LockedSha256::any("wasm-hash"),
+            LockOrigin::Operator,
+        );
 
         let pinned = &lock.artifact_for("tool").unwrap().sha256;
         assert_eq!(pinned.any.as_deref(), Some("wasm-hash"));

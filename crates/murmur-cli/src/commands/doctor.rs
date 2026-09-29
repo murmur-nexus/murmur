@@ -6,18 +6,18 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
-    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
-    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
+    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
     parse_tool_implementation_from_yaml, read_lockfile, read_runtime_manifest_text,
     registry_warning_link, resolve_manifest_path, sha256_hex, warn_on_unknown_manifest_keys,
-    ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockfileError, MurmurLock,
+    ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockOrigin, LockfileError, MurmurLock,
     NativeBinaryVerdict, PlatformMatch, RuntimeManifest, W_REG_001, W_REG_002,
 };
 
@@ -101,8 +101,15 @@ fn check_artifact_platform(
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
 /// so a green doctor line means a session would accept the same artifact.
 enum LockVerdict {
-    /// Lock agrees with the manifest pin and with the bytes on disk.
-    Ok,
+    /// Lock agrees with the manifest pin and with the bytes on disk. `pulled_by` is the session
+    /// whose `manage.pull()` wrote the pin, `None` for an operator-declared one.
+    Ok { pulled_by: Option<String> },
+    /// A `manage.pull()` pin the manifest declares as a hook, a driver, or with `gateway:` —
+    /// `mur run` fails with E-RUN-043. `declared_as` is that manifest text.
+    RuntimeOriginNotDeclarable {
+        session: String,
+        declared_as: &'static str,
+    },
     /// No entry for this artifact — `mur run` fails with E-RUN-003.
     MissingEntry,
     /// The lock pins a different version than the manifest declares.
@@ -120,13 +127,16 @@ enum LockVerdict {
 /// for `platform` must equal the hash of the bytes that were actually resolved.
 ///
 /// A version mismatch short-circuits the hash comparison — hashing bytes for a version
-/// already known to be wrong would report one drifted artifact as two failures.
+/// already known to be wrong would report one drifted artifact as two failures. The pin's origin
+/// is judged last, against the manifest entry's `runtime` and whether it declares `gateway:`.
 fn check_lock_entry(
     lock: &MurmurLock,
     name: &str,
     version: &str,
     artifact_bytes: &[u8],
     platform: &str,
+    runtime: &ArtifactRuntime,
+    declares_gateway: bool,
 ) -> LockVerdict {
     let Some(entry) = lock.artifact_for(name) else {
         return LockVerdict::MissingEntry;
@@ -152,7 +162,20 @@ fn check_lock_entry(
         };
     }
 
-    LockVerdict::Ok
+    match &entry.origin {
+        LockOrigin::Operator => LockVerdict::Ok { pulled_by: None },
+        LockOrigin::Runtime { session } => {
+            match undeclarable_runtime_pin_role(runtime, declares_gateway) {
+                Some(declared_as) => LockVerdict::RuntimeOriginNotDeclarable {
+                    session: session.clone(),
+                    declared_as,
+                },
+                None => LockVerdict::Ok {
+                    pulled_by: Some(session.clone()),
+                },
+            }
+        }
+    }
 }
 
 /// Prints where this `mur` is and which AppArmor profile, if any, the kernel reports confining it.
@@ -1077,12 +1100,20 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             ArtifactPresence::Installed(resolved) => {
                 // No lockfile: presence is the whole check, as it has always been.
                 let verdict = match &lock {
-                    Some(lock) => check_lock_entry(lock, name, version, &resolved.bytes, platform),
-                    None => LockVerdict::Ok,
+                    Some(lock) => check_lock_entry(
+                        lock,
+                        name,
+                        version,
+                        &resolved.bytes,
+                        platform,
+                        &artifact.runtime,
+                        artifact.gateway.is_some(),
+                    ),
+                    None => LockVerdict::Ok { pulled_by: None },
                 };
 
                 match verdict {
-                    LockVerdict::Ok => {
+                    LockVerdict::Ok { pulled_by } => {
                         let platform_verdict = check_artifact_platform(
                             name,
                             version,
@@ -1093,8 +1124,8 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                         // A binary this host cannot run is an error whether or not the store
                         // recorded a platform for it, and it is reported ahead of the missing
                         // tag: reinstalling fixes both, but only one of them stops `mur run`.
-                        match platform_verdict {
-                            PlatformVerdict::Mismatch { binary_platform } => {
+                        match (platform_verdict, pulled_by) {
+                            (PlatformVerdict::Mismatch { binary_platform }, _) => {
                                 println!(
                                     "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} native binary is built for {binary_platform}, this host is {platform}"
                                 );
@@ -1102,7 +1133,18 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                                     "{name}: native binary is built for {binary_platform} \u{2014} reinstall {ref_str} on this host"
                                 ));
                             }
-                            _ if resolved.platform_match == PlatformMatch::UntaggedFallback => {
+                            // `mur install` both adopts the pin and records a missing platform
+                            // tag, so one warning covers an artifact that has both findings.
+                            (_, Some(session)) => {
+                                println!(
+                                    "  \u{26A0}  {ref_str:<col_width$}   \u{2014} pulled at runtime by session {session}"
+                                );
+                                warnings.push(format!("mur install {ref_str}"));
+                                total_pass += 1;
+                            }
+                            (_, None)
+                                if resolved.platform_match == PlatformMatch::UntaggedFallback =>
+                            {
                                 println!(
                                     "  \u{26A0}  {ref_str:<col_width$}   {platform}   \u{2014} native artifact with no recorded platform (warning[{W_REG_001}])"
                                 );
@@ -1112,21 +1154,30 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                             // A green line names only what was read: the host platform appears
                             // on it solely for a native binary this check identified and
                             // matched, never for an artifact whose payload doctor never opened.
-                            PlatformVerdict::Independent => {
+                            (PlatformVerdict::Independent, None) => {
                                 println!(
                                     "  \u{2713}  {ref_str:<col_width$}   platform-independent"
                                 );
                                 total_pass += 1;
                             }
-                            PlatformVerdict::Matches => {
+                            (PlatformVerdict::Matches, None) => {
                                 println!("  \u{2713}  {ref_str:<col_width$}   {platform}");
                                 total_pass += 1;
                             }
-                            PlatformVerdict::Unverified => {
+                            (PlatformVerdict::Unverified, None) => {
                                 println!("  \u{2713}  {ref_str:<col_width$}   platform unverified");
                                 total_pass += 1;
                             }
                         }
+                    }
+                    LockVerdict::RuntimeOriginNotDeclarable {
+                        session,
+                        declared_as,
+                    } => {
+                        println!(
+                            "  \u{2717}  {ref_str:<col_width$}   \u{2014} murmur.lock pins '{name}' from a runtime pull by session {session}; murmur.yaml declares it with {declared_as}"
+                        );
+                        fixes.push(format!("mur install {ref_str}"));
                     }
                     LockVerdict::MissingEntry => {
                         println!(
@@ -1166,6 +1217,27 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                 println!("  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} missing");
                 fixes.push(format!("mur install {ref_str}"));
             }
+        }
+    }
+
+    // `mur run` stages only what murmur.yaml declares, so a pin a capsule pulled on its own is
+    // reported but neither fails nor warns.
+    if let Some(lock) = &lock {
+        for entry in &lock.artifacts {
+            let LockOrigin::Runtime { session } = &entry.origin else {
+                continue;
+            };
+            if runtime_manifest
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.name == entry.name)
+            {
+                continue;
+            }
+            let ref_str = format!("{}@{}", entry.name, entry.resolved_version);
+            println!(
+                "  \u{00B7}  {ref_str:<col_width$}   pulled at runtime by session {session} \u{2014} not declared in murmur.yaml, so mur run does not stage it"
+            );
         }
     }
 

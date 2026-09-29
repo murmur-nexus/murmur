@@ -57,7 +57,7 @@ section that explains it.
 | `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused, unreachable, or misconfigured — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
-| `E-RUN-003` | Unsupported `lock_version`, missing lock entry, or a lock entry with no hash for this host's platform | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-003` | Unsupported `lock_version`, missing lock entry, a lock entry with no hash for this host's platform, or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-006` | Inference driver artifact not installed, or a `transport: process` harness binary was not found | [E-RUN-006](#e-run-006) |
@@ -96,6 +96,7 @@ section that explains it.
 | `E-RUN-040` | The session ran and its task did not complete: it failed, spent `inference.max_turns`, hit a spend ceiling, or was canceled | [E-RUN-040](#e-run-040) |
 | `E-RUN-041` | A capsule declaring `control:` could not write its control token beside its running record, and did not launch | [E-RUN-041](#e-run-041) |
 | `E-RUN-042` | `mur control` named a session with no control surface, or the control surface refused the request | [E-RUN-042](#e-run-042) |
+| `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, or with `gateway:` | [E-RUN-043](#e-run-043) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -771,6 +772,28 @@ No inference call is made. The message names the path and the failure, never the
 
 What is controllable is fixed at launch, so the first case is answered by declaring `control:` and
 restarting the capsule. Neither message carries the token or a secret value.
+
+### E-RUN-043 — a runtime pull declared in an operator-only role { #e-run-043 }
+
+A `murmur.lock` entry with [`origin: runtime`](workdir.md#lock-origin) was written by a capsule's
+`manage.pull()`, not by an operator command. Such a pin stages only as a tool or a skill without a
+`gateway:` block. `mur run` refuses the launch, before any session directory exists, when its
+`murmur.yaml` entry declares one of:
+
+- `runtime: hook`
+- `runtime: driver`
+- `gateway:`
+
+```text
+error[E-RUN-043]: murmur.lock pins 'some-tool@1.2.3' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with gateway:, which only an operator-declared pin may carry
+  hint: run `mur install some-tool@1.2.3` to adopt the pin as operator-declared, or remove gateway: from its murmur.yaml entry
+```
+
+`mur eval run` refuses the same pin per case: the case is recorded as `stage_failed` with this
+message.
+
+`mur install <name>@<version>` rewrites the entry as `origin: operator` and the next launch stages
+it. [`mur doctor`](cli.md#mur-doctor) reports the same refusal ahead of a run.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

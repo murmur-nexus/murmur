@@ -34,8 +34,8 @@ pub use build_lints::{
 };
 pub use dotenv::{dotenv_variable_names, load_dotenv_non_override, DotenvError};
 pub use lockfile::{
-    read_lockfile, write_lockfile_atomic, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
-    LOCK_VERSION,
+    read_lockfile, write_lockfile_atomic, LockOrigin, LockedArtifact, LockedSha256, LockfileError,
+    MurmurLock, LOCK_VERSION,
 };
 pub use manifest::{
     load_manifest, parse_upstream_auth, refuse_retired_auth_block, Manifest, ManifestError,

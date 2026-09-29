@@ -421,7 +421,7 @@ the turn and the two token counts, not the text.
 ## Lockfile (`murmur.lock`) { #lockfile-murmurlock }
 
 `murmur.lock` sits in the project directory beside `murmur.yaml`, not in the workdir. It pins every
-registry-resolved artifact to a version and a hash:
+registry-resolved artifact to a version and a hash, and records who wrote the pin:
 
 ```yaml
 lock_version: 2
@@ -430,12 +430,15 @@ artifacts:
     resolved_version: "1.2.3"
     sha256:
       any: "<sha256>"
+    origin: runtime
+    session: ses_0190a1b2c3d4...
   - name: some-native-tool
     resolved_version: "0.4.2"
     sha256:
       platforms:
         darwin-aarch64: "<sha256>"
         linux-x86_64: "<sha256>"
+    origin: operator
 ```
 
 `lock_version` must be `2`. An entry carries exactly one of two hash shapes:
@@ -462,16 +465,49 @@ to the lock. A platform the entry has no key for is not a disagreement.
 | `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
 | `mur eval` | As `mur run`, once for the whole dataset run |
 | `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory), for local-file installs, and for `--all-platforms`, which installs into the global store |
-| `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI |
+| `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI. Pins a new entry as `origin: runtime` — see [Pin origin](#lock-origin) |
 
 An upsert adds this platform's key beside the keys already there. It replaces the whole `sha256`
 block only when everything in it is stale: a different `resolved_version`, or a change between the
 `any` and `platforms` shapes.
 
+### Pin origin { #lock-origin }
+
+| Key | Values | Written | Notes |
+|---|---|---|---|
+| `origin` | `operator`, `runtime` | Always | `operator`: written by `mur install`, or by the `mur run` or `mur eval` that created the lock. `runtime`: written by a running capsule through `manage.pull()`. An entry with no `origin` key reads as `operator` |
+| `session` | A session id (`ses_…`) | Only for `origin: runtime` | The session whose capsule pulled the artifact. Required and non-blank for `runtime`; refused on `operator` |
+
+Each writer sets the origin like this:
+
+| Writer | New entry | Existing entry |
+|---|---|---|
+| `mur run` / `mur eval` creating the lock | `origin: operator` | — (they never rewrite an existing lock) |
+| `mur install` | `origin: operator` | Becomes `origin: operator` and `session` is dropped; `mur install` [prints one line](cli.md#mur-install) for each runtime pin it adopts |
+| `manage.pull()` | `origin: runtime` with the pulling session | Origin left exactly as it was |
+
+A pull never turns an operator pin into a runtime one, and never relabels an earlier pull with its
+own session.
+
+`mur run` and `mur eval` stage only the artifacts `murmur.yaml` declares, so an entry a capsule
+pulled that the manifest does not declare is never staged. A declared artifact whose pin has
+`origin: runtime` stages only as a tool or skill without `gateway:`; declaring it as
+`runtime: hook`, `runtime: driver` or with `gateway:` is refused with
+[`E-RUN-043`](diagnostics.md#e-run-043) until `mur install <name>@<version>` adopts the pin.
+[`mur doctor`](cli.md#mur-doctor) reports every runtime pin.
+
+A `mur` that predates `origin` reads a lock that has it, and drops both keys if it rewrites the
+file; every entry then reads as `operator`.
+
+A capsule with write access to the project directory — one run with the project as its
+`--workdir` — can edit `murmur.lock` like any other file there, `origin` included. List
+`murmur.lock` in [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) to have the
+runtime refuse the writes to it that it can identify.
+
 A `lock_version: 1` file is refused rather than migrated — it pinned one `sha256.wasm` per
 artifact, which cannot describe a native artifact's per-platform payloads. Delete `murmur.lock` and
 run `mur install` to regenerate it.
 
-A missing entry for a manifest artifact, an entry with no hash for this host's platform, or an
-unsupported `lock_version`, fails the run with `E-RUN-003`. An install whose registry hash
-disagrees with the pin fails with `E-REG-005`. See [Diagnostics](diagnostics.md).
+A missing entry for a manifest artifact, an entry with no hash for this host's platform, an
+unsupported `lock_version`, or a malformed `origin` / `session` pair fails the run with
+`E-RUN-003`. An install whose registry hash disagrees with the pin fails with `E-REG-005`. See [Diagnostics](diagnostics.md).

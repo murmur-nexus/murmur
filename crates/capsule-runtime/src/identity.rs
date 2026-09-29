@@ -1326,6 +1326,7 @@ mod tests {
             version: "1.0.0".to_string(),
             runtime: murmur_artifact::ArtifactRuntime::Tool,
             implementation: None,
+            origin: murmur_artifact::LockOrigin::Operator,
         }
     }
 

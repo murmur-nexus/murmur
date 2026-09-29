@@ -430,7 +430,12 @@ Behavior:
 1. Resolve the artifact from the registry — the local store by default, a remote Nexus with `--registry`
 2. On a registry hit, verify the bytes against the SHA-256 the registry reports; on a miss, fall through to the configured source chain and download from there
 3. Store into the project-local store (or global store with `-g`)
-4. Pin the name, resolved version and SHA-256 in `murmur.lock` — project installs only, since `-g` has no project to pin
+4. Pin the name, resolved version and SHA-256 in `murmur.lock` as [`origin: operator`](workdir.md#lock-origin) — project installs only, since `-g` has no project to pin. An entry a capsule pinned through `manage.pull()` is adopted as operator-declared, with one line after the lock is written:
+
+    ```text
+    Adopted some-tool@1.2.3 as operator-declared (it was pulled at runtime by session ses_0190a1b2c3d4...)
+    ```
+
 5. Compile each WASM tool, driver and hook for this machine into `~/.murmur/compiled/`, unless `--no-precompile` is given (see the table above)
 
 ---
@@ -660,6 +665,29 @@ failure lines:
 - `✗ name@version   <platform>   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
 - `✗ name@version   <platform>   — murmur.lock has no sha256 for 'name' on <platform>: it pins <platforms>` — the lock was written on another platform and has never been installed against on this one
 
+A pin a capsule wrote through `manage.pull()` ([`origin: runtime`](workdir.md#lock-origin)) adds
+one of three lines:
+
+| Line | Meaning | Effect |
+|---|---|---|
+| `⚠ name@version   — pulled at runtime by session <session>` | A declared tool or skill whose pin a capsule pulled. `mur run` stages it | Warning: `Fix: mur install name@version`. Exit code unchanged |
+| `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver` or `gateway:`. `mur run` refuses it with [`E-RUN-043`](diagnostics.md#e-run-043) | Failure: `Fix: mur install name@version`. Exit `1` |
+| `· name@version   pulled at runtime by session <session> — not declared in murmur.yaml, so mur run does not stage it` | A pulled entry `murmur.yaml` does not declare, printed after the checklist | None |
+
+**Output — runtime-pulled pins:**
+
+```text
+Checking /path/to/murmur.yaml for linux-x86_64...
+  ⚠  demo-skill@0.1.0   — pulled at runtime by session ses_0190a1b2c3d4
+  ✗  demo-tool@0.1.0    — murmur.lock pins 'demo-tool' from a runtime pull by session ses_0190a1b2c3d4; murmur.yaml declares it with gateway:
+  ·  other-tool@2.0.0   pulled at runtime by session ses_0190a1b2c3d4 — not declared in murmur.yaml, so mur run does not stage it
+
+1 check passed, 1 error found, 1 warning.
+
+Fix: mur install demo-tool@0.1.0
+Fix: mur install demo-skill@0.1.0
+```
+
 **Output — lock hash mismatch:**
 
 ```text
@@ -731,7 +759,7 @@ Fix: mur install murmur-tool-git@1.0.0
 **Exit codes:**
 
 - `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform; and the formation block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
-- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, or hold a native binary this host cannot run (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
+- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, or hold a native binary this host cannot run (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -741,6 +769,7 @@ Fix: mur install murmur-tool-git@1.0.0
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
 | `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 2, which is refused rather than migrated |
 | `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
+| `E-RUN-043` | A declared artifact's pin was written by `manage.pull()` and `murmur.yaml` declares it as a hook, a driver, or with `gateway:` — reported on the checklist line; `mur run` refuses the same artifact at staging |
 | `E-CAP-014` | A variable the formation's `capabilities.env.allow` closure declares is unset in this environment |
 | `E-CAP-015` | A capsule in the formation declares a `capabilities.env.allow` entry the capsule that spawns it does not hold |
 | `W-REG-002` | A capsule in the formation could not be inspected, so what it declares is missing from the report — a warning; the exit code is unchanged |

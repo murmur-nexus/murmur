@@ -63,6 +63,7 @@ pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose 
 pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not complete
 pub const E_RUN_041: &str = "E-RUN-041"; // a capsule declaring control: could not write its control token
 pub const E_RUN_042: &str = "E-RUN-042"; // a session has no control surface, or its control surface refused the request
+pub const E_RUN_043: &str = "E-RUN-043"; // a runtime-pulled lock pin is declared as a hook, a driver, or with gateway:
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -245,6 +246,21 @@ impl From<RuntimeError> for CliError {
                     "lockfile version mismatch for '{name}': manifest requested {requested}, lock pinned {pinned}"
                 ),
             ),
+            // Staging refuses this before any session directory, credential lookup or registry
+            // resolution, so the operator has nothing to clean up — only the pin to adopt or the
+            // role to drop.
+            RuntimeError::RuntimeOriginNotDeclarable {
+                ref name,
+                ref version,
+                declared_as,
+                ..
+            } => {
+                let hint = format!(
+                    "run `mur install {name}@{version}` to adopt the pin as operator-declared, or \
+                     remove {declared_as} from its murmur.yaml entry"
+                );
+                CliError::with_hint(E_RUN_043, error.to_string(), hint)
+            }
             RuntimeError::ArtifactArchive {
                 name,
                 version,
@@ -895,6 +911,25 @@ fn extract_interface_name(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_origin_refusal_maps_to_e_run_043() {
+        let cli = CliError::from(RuntimeError::RuntimeOriginNotDeclarable {
+            name: "pulled-tool".to_string(),
+            version: "1.2.3".to_string(),
+            session: "ses_puller".to_string(),
+            declared_as: "gateway:",
+        });
+        assert_eq!(cli.code, E_RUN_043);
+        assert!(
+            cli.message.contains("'pulled-tool@1.2.3'") && cli.message.contains("ses_puller"),
+            "{}",
+            cli.message
+        );
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("mur install pulled-tool@1.2.3"), "{hint}");
+        assert!(hint.contains("gateway:"), "{hint}");
+    }
 
     // Regression coverage for the versioned-only export errors (see
     // capsule-runtime/src/errors.rs): the CLI mapping must surface the versioned

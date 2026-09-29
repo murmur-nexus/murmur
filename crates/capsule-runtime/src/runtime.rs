@@ -15,12 +15,12 @@ use murmur_artifact::{
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
     security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask, ApiKeyReference,
     ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
-    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedSha256, LockfileError,
-    MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact, RuntimeType,
-    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006,
-    W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-    W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027,
-    W_SEC_030,
+    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockOrigin, LockedSha256,
+    LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact,
+    RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
+    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025,
+    W_SEC_027, W_SEC_030,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -851,6 +851,44 @@ fn resolve_harness_binary(
     Ok((absolute, source.to_string()))
 }
 
+/// The manifest text that declares a `manage.pull()` pin in a role only an operator-declared pin
+/// may carry — `runtime: hook`, `runtime: driver`, or a `gateway:` block — or `None` when the
+/// entry asks only for what a pull can produce: a tool or a skill with no gateway.
+///
+/// Staging refuses a runtime-origin pin for which this is `Some` with
+/// [`RuntimeError::RuntimeOriginNotDeclarable`]; `mur doctor` predicts that refusal from it.
+#[must_use]
+pub fn undeclarable_runtime_pin_role(
+    runtime: &ArtifactRuntime,
+    declares_gateway: bool,
+) -> Option<&'static str> {
+    match runtime {
+        ArtifactRuntime::Hook => Some("runtime: hook"),
+        ArtifactRuntime::Driver => Some("runtime: driver"),
+        ArtifactRuntime::Tool | ArtifactRuntime::Skill if declares_gateway => Some("gateway:"),
+        ArtifactRuntime::Tool | ArtifactRuntime::Skill => None,
+    }
+}
+
+/// Refuse a `manage.pull()` pin that [`undeclarable_runtime_pin_role`] names a role for. Runs
+/// before registry resolution and before any credential lookup, so the refusal leaves nothing
+/// behind.
+fn refuse_undeclarable_runtime_pin(
+    artifact: &ArtifactRequest,
+    version: &str,
+    session: &str,
+) -> Result<(), RuntimeError> {
+    match undeclarable_runtime_pin_role(&artifact.runtime, artifact.gateway.is_some()) {
+        Some(declared_as) => Err(RuntimeError::RuntimeOriginNotDeclarable {
+            name: artifact.name.clone(),
+            version: version.to_string(),
+            session: session.to_string(),
+            declared_as,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Resolves and verifies all artifacts, compiles components, and prepares session state.
 ///
 /// This function is intentionally separate from `launch_session` so policy/capability
@@ -1134,11 +1172,12 @@ pub fn stage_session(
                 version: artifact.version.clone(),
                 runtime: artifact.runtime.clone(),
                 implementation: None,
+                origin: LockOrigin::Operator,
             });
             continue;
         }
 
-        let (resolved_version, expected_hash) = match &lock_expectations {
+        let (resolved_version, expected_hash, origin) = match &lock_expectations {
             Some(expected_by_name) => {
                 let expected = expected_by_name.get(&artifact.name).ok_or_else(|| {
                     RuntimeError::LockMissingEntry {
@@ -1154,12 +1193,17 @@ pub fn stage_session(
                     });
                 }
 
+                if let LockOrigin::Runtime { session } = &expected.origin {
+                    refuse_undeclarable_runtime_pin(artifact, &expected.resolved_version, session)?;
+                }
+
                 (
                     expected.resolved_version.clone(),
                     Some(expected.sha256.clone()),
+                    expected.origin.clone(),
                 )
             }
-            None => (artifact.version.clone(), None),
+            None => (artifact.version.clone(), None, LockOrigin::Operator),
         };
 
         // Always pass current_platform(). LocalRegistry and RemoteRegistry both implement a
@@ -1385,6 +1429,7 @@ pub fn stage_session(
             version: resolved_version,
             runtime: artifact.runtime.clone(),
             implementation: artifact_implementation,
+            origin,
         });
     }
 
@@ -5370,6 +5415,7 @@ impl manage::Host for CapsuleStoreState {
                 version: "0.0.0".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 implementation: Some(ArtifactImplementation::Native),
+                origin: LockOrigin::Operator,
             };
             &fallback_summary
         } else {
@@ -5469,8 +5515,16 @@ impl manage::Host for CapsuleStoreState {
             }
         };
 
-        // 4. Files are on disk — now, and only now, update murmur.lock.
-        lock.upsert(&name, &version, incoming_sha256);
+        // 4. Files are on disk — now, and only now, update murmur.lock. The origin is this
+        // store's own session: the guest has no input to it. A runtime upsert keeps an existing
+        // entry's origin, so an operator pin stays operator and an earlier pull keeps its
+        // session — which makes the entry's origin now its previous one, or ours if it is new.
+        let pulled_by = LockOrigin::Runtime {
+            session: self.session_id.clone(),
+        };
+        let origin = lock
+            .upsert(&name, &version, incoming_sha256, pulled_by.clone())
+            .unwrap_or(pulled_by);
         write_lockfile_atomic(&self.lock_path, &lock)
             .map_err(|err| format!("failed to write murmur.lock: {err}"))?;
 
@@ -5485,6 +5539,7 @@ impl manage::Host for CapsuleStoreState {
             version: version.clone(),
             runtime: artifact_runtime,
             implementation,
+            origin,
         };
         if let Some(existing) = self
             .installed_artifacts
@@ -9948,6 +10003,7 @@ inference:
                 name: "echo-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
                 sha256: "different".to_string(),
+                origin: LockOrigin::Operator,
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -10032,6 +10088,7 @@ inference:
                 name: "different-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
                 sha256: "abc".to_string(),
+                origin: LockOrigin::Operator,
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -10115,6 +10172,7 @@ inference:
                 name: "echo-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
                 sha256: "abc".to_string(),
+                origin: LockOrigin::Operator,
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -10426,6 +10484,173 @@ inference:
                 "the cl100k tables were not built within 30 s of staging an agent session"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A `stage_session` request for an agent session (`inference` declared, so no capsule
+    /// component) staging `artifacts` against `lock_expectations`, with its session directory
+    /// under `project/workdir`.
+    fn origin_stage_request(
+        project: &Path,
+        artifacts: Vec<crate::types::ArtifactRequest>,
+        lock_expectations: Vec<crate::types::LockExpectation>,
+    ) -> StageRequest {
+        StageRequest {
+            artifacts,
+            lock_expectations: Some(lock_expectations),
+            ..local_source_skill_agent_request(project)
+        }
+    }
+
+    fn registry_artifact(name: &str, runtime: ArtifactRuntime) -> crate::types::ArtifactRequest {
+        crate::types::ArtifactRequest {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            runtime,
+            source: None,
+            on_overflow: Default::default(),
+            capabilities: None,
+            config: None,
+            gateway: None,
+        }
+    }
+
+    fn expectation(name: &str, sha256: &str, origin: LockOrigin) -> crate::types::LockExpectation {
+        crate::types::LockExpectation {
+            name: name.to_string(),
+            resolved_version: "1.0.0".to_string(),
+            sha256: sha256.to_string(),
+            origin,
+        }
+    }
+
+    fn pulled_by(session: &str) -> LockOrigin {
+        LockOrigin::Runtime {
+            session: session.to_string(),
+        }
+    }
+
+    #[test]
+    fn staging_carries_the_lock_origin_onto_each_staged_artifact() {
+        let registry = FakeSkillRegistry::new(zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: some-skill\nversion: 1.0.0\nruntime: skill\n",
+            ),
+            ("skill.md", b"# guidance"),
+        ]));
+        let sha256 = registry.sha256.clone();
+        let project = tempfile::tempdir().unwrap();
+        let mut artifacts = local_source_skill_agent_request(project.path()).artifacts;
+        artifacts.push(registry_artifact("declared-skill", ArtifactRuntime::Skill));
+        artifacts.push(registry_artifact("pulled-skill", ArtifactRuntime::Skill));
+        let request = origin_stage_request(
+            project.path(),
+            artifacts,
+            vec![
+                expectation("declared-skill", &sha256, LockOrigin::Operator),
+                expectation("pulled-skill", &sha256, pulled_by("ses_earlier")),
+            ],
+        );
+
+        let staged = stage_session(Arc::new(registry), request).unwrap();
+
+        let origin_of = |name: &str| {
+            staged
+                .installed_artifacts
+                .iter()
+                .find(|artifact| artifact.name == name)
+                .unwrap_or_else(|| panic!("{name} was not staged"))
+                .origin
+                .clone()
+        };
+        assert_eq!(origin_of("my-skill"), LockOrigin::Operator);
+        assert_eq!(origin_of("declared-skill"), LockOrigin::Operator);
+        assert_eq!(origin_of("pulled-skill"), pulled_by("ses_earlier"));
+    }
+
+    /// Panics on every call: a runtime-origin refusal precedes registry resolution.
+    struct RefusalPrecedesRegistry;
+    impl Registry for RefusalPrecedesRegistry {
+        fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
+            panic!("the runtime-origin refusal must precede registry resolution");
+        }
+        fn publish(
+            &self,
+            _: ArtifactMeta,
+            _: &[u8],
+        ) -> Result<murmur_artifact::PublishResult, RegistryError> {
+            unreachable!()
+        }
+        fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_runtime_origin_pin_cannot_carry_a_gateway() {
+        let project = tempfile::tempdir().unwrap();
+        let mut tool = registry_artifact("pulled-tool", ArtifactRuntime::Tool);
+        tool.gateway = Some(murmur_artifact::ArtifactGateway {
+            endpoint: "https://api.example.com".to_string(),
+            api_key: Some(ApiKeyReference::Environment("EXAMPLE_API_KEY".to_string())),
+            keyless: false,
+        });
+        let request = origin_stage_request(
+            project.path(),
+            vec![tool],
+            vec![expectation("pulled-tool", "abc", pulled_by("ses_puller"))],
+        );
+
+        match stage_session(Arc::new(RefusalPrecedesRegistry), request) {
+            Err(RuntimeError::RuntimeOriginNotDeclarable {
+                name,
+                version,
+                session,
+                declared_as,
+            }) => {
+                assert_eq!(name, "pulled-tool");
+                assert_eq!(version, "1.0.0");
+                assert_eq!(session, "ses_puller");
+                assert_eq!(declared_as, "gateway:");
+            }
+            Err(other) => panic!("expected RuntimeOriginNotDeclarable, got {other}"),
+            Ok(_) => panic!("a runtime-origin pin with gateway: must not stage"),
+        }
+        assert!(
+            !project.path().join("workdir").exists(),
+            "the refusal must leave no session directory"
+        );
+    }
+
+    #[test]
+    fn a_runtime_origin_pin_cannot_be_staged_as_a_hook_or_driver() {
+        for (runtime, declared) in [
+            (ArtifactRuntime::Hook, "runtime: hook"),
+            (ArtifactRuntime::Driver, "runtime: driver"),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let request = origin_stage_request(
+                project.path(),
+                vec![registry_artifact("pulled-thing", runtime)],
+                vec![expectation("pulled-thing", "abc", pulled_by("ses_puller"))],
+            );
+
+            match stage_session(Arc::new(RefusalPrecedesRegistry), request) {
+                Err(RuntimeError::RuntimeOriginNotDeclarable {
+                    name,
+                    session,
+                    declared_as,
+                    ..
+                }) => {
+                    assert_eq!(name, "pulled-thing");
+                    assert_eq!(session, "ses_puller");
+                    assert_eq!(declared_as, declared);
+                }
+                Err(other) => panic!("expected RuntimeOriginNotDeclarable, got {other}"),
+                Ok(_) => panic!("a runtime-origin pin must not stage as {declared}"),
+            }
+            assert!(!project.path().join("workdir").exists());
         }
     }
 
@@ -10998,6 +11223,7 @@ inference:
                     name: "my-skill".to_string(),
                     resolved_version: "1.0.0".to_string(),
                     sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
+                    origin: LockOrigin::Operator,
                 }],
             },
         )
@@ -11027,6 +11253,91 @@ inference:
             entry.sha256.any.as_deref().unwrap(),
             "pinned-hash-from-earlier-pull"
         );
+    }
+
+    /// A static skill `.mur.zip` for `name` at 1.0.0, and the registry serving it.
+    fn pulled_skill_registry(name: &str) -> FakeSkillRegistry {
+        FakeSkillRegistry::new(zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                format!("name: {name}\nversion: 1.0.0\nruntime: skill\n").as_bytes(),
+            ),
+            ("skill.md", b"# guidance"),
+        ]))
+    }
+
+    #[test]
+    fn a_runtime_pull_records_runtime_origin_and_its_session() {
+        let registry = Arc::new(pulled_skill_registry("my-skill"));
+        let project = tempfile::tempdir().unwrap();
+        let workdir = project.path().join("workdir");
+        fs::create_dir_all(&workdir).unwrap();
+        let lock_path = project.path().join("murmur.lock");
+        let mut state = build_test_state(registry, workdir, lock_path.clone());
+
+        manage::Host::pull(&mut state, "my-skill".to_string(), "1.0.0".to_string())
+            .expect("pull should succeed");
+
+        let expected = LockOrigin::Runtime {
+            session: "ses_test".to_string(),
+        };
+        let lock = read_lockfile(&lock_path).unwrap();
+        assert_eq!(lock.artifact_for("my-skill").unwrap().origin, expected);
+        let raw = fs::read_to_string(&lock_path).unwrap();
+        assert!(raw.contains("origin: runtime"), "{raw}");
+        assert!(raw.contains("session: ses_test"), "{raw}");
+        let installed = state
+            .installed_artifacts
+            .iter()
+            .find(|artifact| artifact.name == "my-skill")
+            .unwrap();
+        assert_eq!(installed.origin, expected);
+    }
+
+    #[test]
+    fn a_runtime_pull_never_changes_an_existing_entrys_origin() {
+        for (name, pinned_origin) in [
+            ("operator-skill", LockOrigin::Operator),
+            (
+                "earlier-skill",
+                LockOrigin::Runtime {
+                    session: "ses_earlier".to_string(),
+                },
+            ),
+        ] {
+            let registry = pulled_skill_registry(name);
+            let pinned = LockedArtifact {
+                name: name.to_string(),
+                resolved_version: "1.0.0".to_string(),
+                sha256: LockedSha256::any(registry.sha256.clone()),
+                origin: pinned_origin.clone(),
+            };
+            let project = tempfile::tempdir().unwrap();
+            let workdir = project.path().join("workdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let lock_path = project.path().join("murmur.lock");
+            write_lockfile_atomic(
+                &lock_path,
+                &MurmurLock {
+                    lock_version: LOCK_VERSION,
+                    artifacts: vec![pinned.clone()],
+                },
+            )
+            .unwrap();
+            let mut state = build_test_state(Arc::new(registry), workdir, lock_path.clone());
+
+            manage::Host::pull(&mut state, name.to_string(), "1.0.0".to_string())
+                .expect("pull should succeed");
+
+            let lock = read_lockfile(&lock_path).unwrap();
+            assert_eq!(lock.artifacts, vec![pinned]);
+            let installed = state
+                .installed_artifacts
+                .iter()
+                .find(|artifact| artifact.name == name)
+                .unwrap();
+            assert_eq!(installed.origin, pinned_origin);
+        }
     }
 
     // ── manage.pull() through the compiled-form cache ─────────────────────────
@@ -11636,6 +11947,7 @@ inference:
                     name: PULLED_WASM_TOOL.to_string(),
                     resolved_version: "0.9.0".to_string(),
                     sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
+                    origin: LockOrigin::Operator,
                 }],
             },
         )

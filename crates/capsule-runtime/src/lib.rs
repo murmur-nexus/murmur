@@ -175,11 +175,11 @@ pub use running::{Liveness, ProcessState, RunningGuard, RunningRecord, SignalOut
 pub use runtime::{
     check_env_allow_reaches_guests, check_no_reserved_tool_names, launch_session,
     launch_session_handling_sigterm, secret_shaped_env_grants, stage_session,
-    stripped_env_allow_entries, warn_on_gateway_endpoint_in_network_allow,
-    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
-    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, SecretShapedEnvGrant,
-    StrippedEnvAllowEntry,
+    stripped_env_allow_entries, undeclarable_runtime_pin_role,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
+    warn_on_unmetered_gateways, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, SecretShapedEnvGrant, StrippedEnvAllowEntry,
 };
 // The one question about a variable name a caller outside the runtime needs answered: would the
 // credential backstop drop it, and by which pattern. `shell` is otherwise crate-private, and these

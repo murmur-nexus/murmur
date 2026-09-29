@@ -18,7 +18,7 @@ use std::{
 
 use assert_cmd::Command;
 use murmur_artifact::{
-    current_platform, read_lockfile, sha256_hex, write_lockfile_atomic, LocalRegistry,
+    current_platform, read_lockfile, sha256_hex, write_lockfile_atomic, LocalRegistry, LockOrigin,
     LockedArtifact, LockedSha256, MurmurLock, PlatformMatch, Registry, RuntimeType, LOCK_VERSION,
     SUPPORTED_PLATFORMS,
 };
@@ -463,6 +463,7 @@ fn a_lock_written_for_another_platform_names_the_platform_and_is_repaired_by_ins
                 name: NAME.to_string(),
                 resolved_version: VERSION.to_string(),
                 sha256: LockedSha256::for_one_platform(other, "hash-from-the-other-machine"),
+                origin: LockOrigin::Operator,
             }],
         },
     )

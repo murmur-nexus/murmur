@@ -12,7 +12,8 @@ use std::time::Duration;
 use assert_cmd::assert::Assert;
 use assert_cmd::Command;
 use murmur_artifact::{
-    sha256_hex, write_lockfile_atomic, LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION,
+    sha256_hex, write_lockfile_atomic, LockOrigin, LockedArtifact, LockedSha256, MurmurLock,
+    LOCK_VERSION,
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -155,6 +156,7 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
                 name: name.to_string(),
                 resolved_version: resolved_version.to_string(),
                 sha256: LockedSha256::any(sha256.to_string()),
+                origin: LockOrigin::Operator,
             }],
         },
     )
@@ -535,6 +537,96 @@ fn doctor_passes_when_the_lock_matches_the_installed_artifact() {
         .success()
         .stdout(predicate::str::contains("\u{2713}  locked-skill@0.1.0"))
         .stdout(predicate::str::contains("All checks passed."));
+}
+
+/// Rewrite the origin of each `(name, session)` in `project_dir/murmur.lock` to a runtime pull by
+/// that session, and add `stray-tool@2.0.0` as a pull the manifest does not declare.
+fn mark_pulled_at_runtime(project_dir: &Path, pulls: &[(&str, &str)]) {
+    let lock_path = project_dir.join("murmur.lock");
+    let mut lock = murmur_artifact::read_lockfile(&lock_path).unwrap();
+    for (name, session) in pulls {
+        let entry = lock
+            .artifacts
+            .iter_mut()
+            .find(|entry| entry.name == *name)
+            .unwrap();
+        entry.origin = LockOrigin::Runtime {
+            session: (*session).to_string(),
+        };
+    }
+    lock.artifacts.push(LockedArtifact {
+        name: "stray-tool".to_string(),
+        resolved_version: "2.0.0".to_string(),
+        sha256: LockedSha256::any("stray-hash".to_string()),
+        origin: LockOrigin::Runtime {
+            session: "ses_stray".to_string(),
+        },
+    });
+    write_lockfile_atomic(&lock_path, &lock).unwrap();
+}
+
+#[test]
+fn doctor_reports_runtime_origin_pins() {
+    let home = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let skill = skill_artifact(&staging, "pulled-skill", "0.1.0");
+    let tool = common::create_tool_artifact(
+        staging.path(),
+        "gated-tool",
+        "0.1.0",
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/run/components/echo-tool.wasm"),
+    );
+    common::publish_local(&home, &skill).success();
+    common::publish_local(&home, &tool).success();
+    let declared = "  - name: pulled-skill\n    version: 0.1.0\n    runtime: skill\n\
+                    \x20 - name: gated-tool\n    version: 0.1.0\n    runtime: tool\n";
+    create_project(project.path(), declared);
+    install_pinned_to_project(&home, project.path(), "pulled-skill@0.1.0").success();
+    install_pinned_to_project(&home, project.path(), "gated-tool@0.1.0").success();
+    mark_pulled_at_runtime(
+        project.path(),
+        &[("pulled-skill", "ses_skill"), ("gated-tool", "ses_tool")],
+    );
+    create_project(
+        project.path(),
+        &format!(
+            "{declared}    gateway:\n      endpoint: https://api.example.com\n      api_key: test-key\n"
+        ),
+    );
+
+    mur_doctor(&home, project.path())
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "\u{26A0}  pulled-skill@0.1.0   \u{2014} pulled at runtime by session ses_skill",
+        ))
+        .stdout(predicate::str::contains(
+            "\u{2717}  gated-tool@0.1.0     \u{2014} murmur.lock pins 'gated-tool' from a runtime \
+             pull by session ses_tool; murmur.yaml declares it with gateway:",
+        ))
+        .stdout(predicate::str::contains(
+            "\u{00B7}  stray-tool@2.0.0     pulled at runtime by session ses_stray \u{2014} not \
+             declared in murmur.yaml, so mur run does not stage it",
+        ))
+        .stdout(predicate::str::contains("1 error found, 1 warning"))
+        .stdout(predicate::str::contains(
+            "Fix: mur install gated-tool@0.1.0",
+        ))
+        .stdout(predicate::str::contains(
+            "Fix: mur install pulled-skill@0.1.0",
+        ))
+        .stdout(predicate::str::contains("Fix: mur install stray-tool").not());
+
+    create_project(project.path(), declared);
+    mur_doctor(&home, project.path())
+        .success()
+        .stdout(predicate::str::contains(
+            "\u{26A0}  gated-tool@0.1.0     \u{2014} pulled at runtime by session ses_tool",
+        ))
+        .stdout(predicate::str::contains("0 errors found, 2 warnings"))
+        .stdout(predicate::str::contains("stray-tool@2.0.0"));
 }
 
 /// The gap this closes: bytes on disk that `mur run` would reject with E-REG-002 must
