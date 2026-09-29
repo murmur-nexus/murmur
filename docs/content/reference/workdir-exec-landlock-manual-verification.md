@@ -335,6 +335,8 @@ Effective grants
   spawn allow: <none>
   env allow: <none>
   plan submit:      false
+  install skill: <none>
+  install tool: <none>
   interpreter runtime: <none>
   staged runtime: <none>
 ```
@@ -365,6 +367,8 @@ Effective grants
   spawn allow: <none>
   env allow: <none>
   plan submit:      false
+  install skill: <none>
+  install tool: <none>
   interpreter runtime: <none>
   staged runtime: <none>
 ```

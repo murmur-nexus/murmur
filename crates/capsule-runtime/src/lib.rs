@@ -40,6 +40,7 @@ pub(crate) mod hooks;
 pub(crate) mod http_client;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
+pub(crate) mod install_grant;
 pub mod lanes;
 pub mod limits;
 pub mod mac_token;
@@ -88,8 +89,8 @@ pub use artifact_config::{
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
     detect_sealed_blocker, detect_userns_grant, explain_scope, read_only_advisory_for,
-    render_read_only, ExportsFilesReport, FilesystemBoundaryReport, FilesystemRestriction,
-    PreopenReport, PreopenSurface, ScopeReport, StateStoreReport,
+    render_install, render_read_only, ExportsFilesReport, FilesystemBoundaryReport,
+    FilesystemRestriction, PreopenReport, PreopenSurface, ScopeReport, StateStoreReport,
 };
 pub use diagnostic::{diagnostic_workdir, set_diagnostic_workdir, Emitted};
 pub use network_namespace::{

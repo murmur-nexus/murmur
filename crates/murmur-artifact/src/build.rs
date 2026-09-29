@@ -342,37 +342,45 @@ fn check_declared_entry(source_dir: &Path, declared: &str) -> Result<(), BuildEr
 
 /// Validate an artifact `name:` as a format, and nothing more.
 ///
-/// A name becomes a filename, a registry key and a store directory, so it is held to the
-/// lowest common denominator of all three: ASCII lowercase, digits and inner hyphens. This is
-/// deliberately *not* a namespace or prefix policy — who may publish which name is a registry
-/// question, not something `mur build` gets an opinion about.
+/// The rule itself is [`artifact_name_format_error`]; this wraps its reason in the build error.
 fn validate_artifact_name(name: &str) -> Result<(), BuildError> {
-    let invalid = |reason: &str| BuildError::InvalidArtifactName {
-        name: name.to_string(),
-        reason: reason.to_string(),
-    };
+    match artifact_name_format_error(name) {
+        Some(reason) => Err(BuildError::InvalidArtifactName {
+            name: name.to_string(),
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
 
+/// The reason `name` is not a valid artifact name, or `None` when it is.
+///
+/// A name becomes a filename, a registry key and a store directory, so it is held to the
+/// lowest common denominator of all three: ASCII lowercase, digits and inner hyphens, at most
+/// [`MAX_ARTIFACT_NAME_LEN`] characters. This is a format rule, not a namespace or prefix policy —
+/// who may publish which name is a registry question. `mur build` and the runtime's install grant
+/// both apply this one rule.
+pub fn artifact_name_format_error(name: &str) -> Option<String> {
     if name.is_empty() {
-        return Err(invalid("must not be empty"));
+        return Some("must not be empty".to_string());
     }
     if name.chars().count() > MAX_ARTIFACT_NAME_LEN {
-        return Err(invalid(&format!(
+        return Some(format!(
             "must be at most {MAX_ARTIFACT_NAME_LEN} characters"
-        )));
+        ));
     }
     if let Some(bad) = name
         .chars()
         .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'))
     {
-        return Err(invalid(&format!(
+        return Some(format!(
             "may contain only lowercase letters, digits and '-' (found {bad:?})"
-        )));
+        ));
     }
     if name.starts_with('-') || name.ends_with('-') {
-        return Err(invalid("must not start or end with '-'"));
+        return Some("must not start or end with '-'".to_string());
     }
-
-    Ok(())
+    None
 }
 
 fn absolute_normalized(path: &Path) -> Result<PathBuf, BuildError> {

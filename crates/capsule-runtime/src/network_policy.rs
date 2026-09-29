@@ -627,6 +627,7 @@ mod tests {
             task_io: None,
             conversation: None,
             plan: None,
+            install: None,
             containment: None,
         }
     }

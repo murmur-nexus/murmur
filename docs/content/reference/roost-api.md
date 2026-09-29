@@ -574,6 +574,8 @@ determines the manifest the comparison read.
 | Filesystem scope | `capabilities.filesystem.scope` | A parent that declares no scope holds the whole workdir and covers anything. A parent that declares one covers a child scope equal to it or beneath it, and refuses a child that declares none |
 | Workdir exec | `capabilities.filesystem.workdir_exec` | A child `true` requires a parent `true` |
 | State stores | `capabilities.state.store` | Every store the child's artifacts would open is one the parent's artifacts also open. An artifact that declares `state:` without a `store:` opens a store named after its own capsule |
+| Install skill | `capabilities.install.skill` | Every child entry is covered by a parent entry: `*` covers everything, `p*` covers names and patterns beginning with `p`, an exact name covers only itself |
+| Install tool | `capabilities.install.tool` | The install coverage rule above, applied to the separate list |
 | Containment | `capabilities.containment` | The child's floor is at or above the parent's |
 
 Containment is the one axis where a difference in the child's favour is allowed. A floor is a

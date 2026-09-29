@@ -206,6 +206,24 @@ keeps its origin. A hash mismatch, or a version or hash that conflicts with an e
 visible to `list()` and `describe()`. A pulled WASM tool is callable via `invoke()` only when the
 manifest's `artifacts` list declares it.
 
+`pull` requires the capsule's [`capabilities.install`](manifest.md#field-install) grant. A pull
+the grant does not admit returns an error string beginning `not-granted:`, followed by the
+artifact name, the manifest key and the entries the capsule declares. The checks run in this
+order:
+
+| Order | Refused when | Registry read |
+|---:|---|---|
+| 1 | The capsule declares no `capabilities.install` | No |
+| 2 | The name is not a bare artifact name | No |
+| 3 | No entry in either install list matches the name | No |
+| 4 | The artifact is not a skill or a tool — a `driver`, a `hook`, or a role that disagrees with its payload | Yes |
+| 5 | No entry in the list for the artifact's own kind matches the name | Yes |
+
+A refused pull writes nothing: no file under `tools/`, no `murmur.lock` change, and no compiled
+form. `diagnostics` states the grant in `runtime-state.capabilities`, as
+`install skill: <entries>; install tool: <entries>`, or as `pull: not granted` when the capsule
+declares none.
+
 A pulled WASM artifact is compiled once per version and kept in
 [`~/.murmur/compiled`](config.md#murmur-home-permissions), shared with `mur run`, so a later pull
 or launch of that version, in any session, skips compiling it.

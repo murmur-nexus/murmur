@@ -1199,6 +1199,20 @@ pub struct PlanCapabilities {
     pub submit: bool,
 }
 
+/// The `capabilities.install` block — the operator's grant to pull artifacts into a running
+/// session through `murmur:artifact-manager/manage.pull`. Read from the capsule-wide block only.
+/// Each entry is an exact artifact name, a `<prefix>*` or `*`, as
+/// [`crate::install_pattern::validate`] accepts it, kept verbatim in declaration order. At least
+/// one list is non-empty: omitting the block, not declaring an empty one, is how a capsule grants
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallCapabilities {
+    /// Entries admitting skill artifacts (`skill.md`, no executable payload).
+    pub skill: Vec<String>,
+    /// Entries admitting tool artifacts, WASM or native alike.
+    pub tool: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCapabilities {
     pub allow: Vec<String>,
@@ -1500,6 +1514,9 @@ pub struct Capabilities {
     /// Capsule-wide grant of the runtime-provided `submit-plan` tool. `None` is deny: the tool's
     /// synthetic manifest is not written, so it is absent from the model's inventory entirely.
     pub plan: Option<PlanCapabilities>,
+    /// Capsule-wide grant to pull skills and tools at runtime. `None` is deny: every
+    /// `manage.pull` is refused. See [`InstallCapabilities`].
+    pub install: Option<InstallCapabilities>,
     /// Minimum containment class this capsule declares. `None` (the overwhelmingly common
     /// case) means the capsule states no requirement and inherits whatever the workspace
     /// config or `--containment` asks for, defaulting to `advisory`.
@@ -1857,6 +1874,8 @@ struct RawCapabilities {
     conversation: Option<RawConversationCapabilities>,
     #[serde(default)]
     plan: Option<RawPlanCapabilities>,
+    #[serde(default)]
+    install: Option<RawInstallCapabilities>,
     /// Kept as a raw `String` rather than a `ContainmentClass` so a typo reports through
     /// `InvalidCapabilities` like every other bad capability value, instead of a bare serde
     /// "unknown variant" error attributed to the whole `capabilities:` block.
@@ -1892,6 +1911,16 @@ struct RawPlanCapabilities {
     // than defaulted.
     #[serde(default)]
     submit: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInstallCapabilities {
+    #[serde(default)]
+    skill: Vec<String>,
+    #[serde(default)]
+    tool: Vec<String>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2366,6 +2395,7 @@ impl RawBlock for RawCapabilities {
         "task_io",
         "conversation",
         "plan",
+        "install",
         "containment",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
@@ -2412,6 +2442,9 @@ impl RawBlock for RawCapabilities {
         if let Some(plan) = &self.plan {
             collect_block(plan, &child_path(path, "plan"), out);
         }
+        if let Some(install) = &self.install {
+            collect_block(install, &child_path(path, "install"), out);
+        }
     }
 }
 
@@ -2431,6 +2464,13 @@ impl RawBlock for RawConversationCapabilities {
 
 impl RawBlock for RawPlanCapabilities {
     const KNOWN_KEYS: &'static [&'static str] = &["submit"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawInstallCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["skill", "tool"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -2915,6 +2955,18 @@ impl RuntimeManifest {
                 let capabilities = match artifact.capabilities {
                     None => None,
                     Some(raw_caps) => {
+                        // The install grant is held by the session, not by one artifact: a
+                        // per-artifact block would reach no pull at all.
+                        if raw_caps.install.is_some() {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares 'capabilities.install:'; the \
+                                     grant is capsule-wide and is only recognized in the \
+                                     top-level capabilities block"
+                                ),
+                            });
+                        }
                         if runtime == ArtifactRuntime::Skill {
                             return Err(RuntimeManifestError::InvalidArtifact {
                                 index,
@@ -3754,6 +3806,8 @@ fn parse_capabilities(
         })
         .transpose()?;
 
+    let install = raw_caps.install.map(parse_install).transpose()?;
+
     let containment = raw_caps
         .containment
         .as_deref()
@@ -3782,8 +3836,39 @@ fn parse_capabilities(
         task_io,
         conversation,
         plan,
+        install,
         containment,
     }))
+}
+
+/// Lower `capabilities.install`, refusing a block that names nothing and any entry outside
+/// [`crate::install_pattern`]'s grammar.
+fn parse_install(raw: RawInstallCapabilities) -> Result<InstallCapabilities, RuntimeManifestError> {
+    if raw.skill.is_empty() && raw.tool.is_empty() {
+        return Err(RuntimeManifestError::InvalidCapabilities {
+            field: "capabilities.install".to_string(),
+            message: "must name at least one 'skill' or 'tool' entry — a capability is never \
+                      inferred; omit the block to grant no install at all"
+                .to_string(),
+        });
+    }
+    for (key, entries) in [("skill", &raw.skill), ("tool", &raw.tool)] {
+        for entry in entries {
+            crate::install_pattern::validate(entry).map_err(|reason| {
+                RuntimeManifestError::InvalidCapabilities {
+                    field: format!("capabilities.install.{key}"),
+                    message: format!(
+                        "entry {entry:?} is invalid ({reason}); expected {}",
+                        crate::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM
+                    ),
+                }
+            })?;
+        }
+    }
+    Ok(InstallCapabilities {
+        skill: raw.skill,
+        tool: raw.tool,
+    })
 }
 
 /// Lower `capabilities.state`. Infallible: the only field is a name, and a name's *shape* is a
@@ -6155,6 +6240,152 @@ capabilities:
                 .any(|key| key.block_path == "capabilities.plan" && key.key == "depth"),
             "{:?}",
             manifest.unknown_keys
+        );
+    }
+
+    // ── capabilities.install (capsule-wide) ──────────────────────────────────
+
+    /// A capsule manifest whose capsule-wide capabilities carry `install: <block>`.
+    fn manifest_with_install(block: &str) -> String {
+        format!("name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  install:\n{block}")
+    }
+
+    #[test]
+    fn capabilities_install_parses_both_lists_verbatim_in_declaration_order() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_install(
+            "    skill: [code-review, \"style-*\"]\n    tool: [\"b-*\", a, \"*\"]\n",
+        ))
+        .expect("an install block parses");
+        assert_eq!(
+            manifest.capabilities.unwrap().install,
+            Some(InstallCapabilities {
+                skill: vec!["code-review".into(), "style-*".into()],
+                tool: vec!["b-*".into(), "a".into(), "*".into()],
+            })
+        );
+    }
+
+    /// Either list alone is a grant; the other defaults to empty, which admits nothing of its
+    /// kind.
+    #[test]
+    fn capabilities_install_accepts_either_list_alone() {
+        let skill_only = RuntimeManifest::from_yaml_str(&manifest_with_install("    skill: [a]\n"))
+            .expect("skill alone parses");
+        assert_eq!(
+            skill_only.capabilities.unwrap().install,
+            Some(InstallCapabilities {
+                skill: vec!["a".into()],
+                tool: vec![],
+            })
+        );
+        let tool_only =
+            RuntimeManifest::from_yaml_str(&manifest_with_install("    tool: [\"b-*\"]\n"))
+                .expect("tool alone parses");
+        assert_eq!(
+            tool_only.capabilities.unwrap().install,
+            Some(InstallCapabilities {
+                skill: vec![],
+                tool: vec!["b-*".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn capabilities_install_absent_is_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  plan:\n    submit: true\n",
+        )
+        .expect("a capabilities block without install parses");
+        assert_eq!(manifest.capabilities.unwrap().install, None);
+    }
+
+    /// A block that names nothing is refused rather than read as "grant nothing": omitting the
+    /// block is how a capsule grants nothing.
+    #[test]
+    fn capabilities_install_that_names_nothing_is_refused() {
+        for block in [
+            "    {}\n",
+            "    skill: []\n",
+            "    skill: []\n    tool: []\n",
+            "    driver: [x]\n",
+        ] {
+            let err = RuntimeManifest::from_yaml_str(&manifest_with_install(block))
+                .expect_err("an install block naming nothing is refused");
+            match &err {
+                RuntimeManifestError::InvalidCapabilities { field, message } => {
+                    assert_eq!(field, "capabilities.install", "{block:?}");
+                    assert!(message.contains("at least one"), "{message}");
+                    assert!(message.contains("omit the block"), "{message}");
+                }
+                other => panic!("{block:?}: expected InvalidCapabilities, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn capabilities_install_refuses_an_entry_outside_the_grammar_naming_it() {
+        for entry in ["a*b", "*x", "**", "Foo", "-a", "a/b", " "] {
+            for key in ["skill", "tool"] {
+                let block = format!("    {key}: [{entry:?}]\n");
+                let err = RuntimeManifest::from_yaml_str(&manifest_with_install(&block))
+                    .expect_err("a bad entry is refused");
+                match &err {
+                    RuntimeManifestError::InvalidCapabilities { field, message } => {
+                        assert_eq!(field, &format!("capabilities.install.{key}"));
+                        assert!(message.contains(&format!("{entry:?}")), "{message}");
+                        assert!(
+                            message.contains(crate::install_pattern::INSTALL_ENTRY_ACCEPTED_FORM),
+                            "{message}"
+                        );
+                    }
+                    other => panic!("{entry:?}: expected InvalidCapabilities, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The grant is held by the session, so a per-artifact block is refused on every role.
+    #[test]
+    fn capabilities_install_on_an_artifact_entry_is_refused_on_every_role() {
+        for runtime in ["tool", "hook", "driver", "skill"] {
+            let yaml = format!(
+                "name: cap\nversion: 0.0.1\nartifacts:\n  - name: a\n    version: 0.1.0\n    \
+                 runtime: {runtime}\n    capabilities:\n      install:\n        skill: [x]\n"
+            );
+            let err = RuntimeManifest::from_yaml_str(&yaml)
+                .expect_err("a per-artifact install block is refused");
+            match &err {
+                RuntimeManifestError::InvalidArtifact { index, message } => {
+                    assert_eq!(*index, 0);
+                    assert!(message.contains("capabilities.install"), "{message}");
+                    assert!(message.contains("capsule-wide"), "{message}");
+                }
+                other => panic!("{runtime}: expected InvalidArtifact, got {other:?}"),
+            }
+        }
+    }
+
+    /// An unknown key inside the block is reported by path and grants nothing.
+    #[test]
+    fn capabilities_install_unknown_key_is_reported_by_path_and_grants_nothing() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_install(
+            "    skill: [a]\n    driver: [x]\n",
+        ))
+        .expect("an unknown key beside a real entry is a warning, not a parse error");
+        assert!(
+            manifest
+                .unknown_keys
+                .iter()
+                .any(|key| key.block_path == "capabilities.install" && key.key == "driver"),
+            "{:?}",
+            manifest.unknown_keys
+        );
+        assert_eq!(
+            manifest.capabilities.unwrap().install,
+            Some(InstallCapabilities {
+                skill: vec!["a".into()],
+                tool: vec![],
+            })
         );
     }
 
@@ -11084,6 +11315,8 @@ capabilities:
     probe_task_io: 1
   conversation:
     probe_conversation: 1
+  install:
+    probe_install: 1
 inference:
   probe_inference: 1
   driver:
@@ -11147,6 +11380,7 @@ control:
             ("probe_state", "capabilities.state"),
             ("probe_task_io", "capabilities.task_io"),
             ("probe_conversation", "capabilities.conversation"),
+            ("probe_install", "capabilities.install"),
             ("probe_inference", "inference"),
             ("probe_driver", "inference.driver"),
             ("probe_provider", "inference.provider"),

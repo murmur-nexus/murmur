@@ -5,6 +5,7 @@ pub mod artifact_ref;
 pub mod build;
 pub mod build_lints;
 pub mod dotenv;
+pub mod install_pattern;
 pub mod lockfile;
 pub mod manifest;
 pub mod manifest_path;
@@ -27,7 +28,10 @@ pub use artifact::{
     load_manifest_yaml_from_artifact_bytes, ArtifactError, DeclaredRuntime,
 };
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
-pub use build::{build_artifact, BuildError, MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY};
+pub use build::{
+    artifact_name_format_error, build_artifact, BuildError, MAX_ARTIFACT_NAME_LEN,
+    PACKED_MANIFEST_ENTRY,
+};
 pub use build_lints::{
     build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
     W_BLD_002, W_BLD_003,
@@ -66,16 +70,16 @@ pub use runtime_manifest::{
     ContextRetainConfig, ControlConfig, ControllableSetting, ConversationCapabilities,
     ConversationMode, EnvCapabilities, EvalConfig, ExportMode, Exports, FileExport,
     FilesystemCapabilities, HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode,
-    HookOverflowPolicy, InferenceConfig, InferenceDriver, InterpreterRuntimeDir,
-    InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride, NetworkCapabilities,
-    NetworkConfig, ObservabilityConfig, ParseContainmentClassError, PeerFetchCapabilities,
-    PeerFilesExport, PlanCapabilities, ReferencedEnvVariable, ResourceCapabilities, ResourceLimits,
-    RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities,
-    StagedRuntimeGrant, StateCapabilities, TaskAcceptance, TaskIoCapabilities, TraceConfig,
-    TraceRetainConfig, BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES,
-    DEFAULT_PEER_FILES_MAX_BYTES, DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET,
-    DEFAULT_SEED_OVERFLOW_MARGIN, DURATION_ACCEPTED_FORM, PEER_FETCH_ALLOW_ACCEPTED_FORM,
-    PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
+    HookOverflowPolicy, InferenceConfig, InferenceDriver, InstallCapabilities,
+    InterpreterRuntimeDir, InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride,
+    NetworkCapabilities, NetworkConfig, ObservabilityConfig, ParseContainmentClassError,
+    PeerFetchCapabilities, PeerFilesExport, PlanCapabilities, ReferencedEnvVariable,
+    ResourceCapabilities, ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError,
+    ScorerConfig, ShellCapabilities, StagedRuntimeGrant, StateCapabilities, TaskAcceptance,
+    TaskIoCapabilities, TraceConfig, TraceRetainConfig, BYTE_SIZE_ACCEPTED_FORM,
+    DEFAULT_EXPORT_MAX_BYTES, DEFAULT_PEER_FILES_MAX_BYTES, DEFAULT_PEER_HANDLE_TTL_SECS,
+    DEFAULT_SEED_BUDGET, DEFAULT_SEED_OVERFLOW_MARGIN, DURATION_ACCEPTED_FORM,
+    PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
 pub use runtime_warnings::{runtime_warning_link, W_RUN_001, W_RUN_002};
 pub use secrets::{
