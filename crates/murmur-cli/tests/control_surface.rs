@@ -1298,6 +1298,9 @@ fn no_control_block_means_no_surface() {
 /// The control token is handed to nothing inside the capsule: a tool's environment does not hold
 /// it, no provider request, record or trace line carries it, a shell subprocess on a Landlock
 /// host cannot read the file it is in, and the capsule's scope names nothing under `~/.murmur`.
+///
+/// The shell half runs only where a shell-granting capsule can launch at all: on a host with no
+/// network namespace or cgroup scope to give its subprocesses, such a capsule is refused at launch.
 #[test]
 fn the_control_token_is_unreachable_from_inside_the_capsule() {
     let home = Home::new();
@@ -1309,10 +1312,16 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
 
     // Which of the two cases runs is decided before launch, from the same probe the session uses.
     let probe_project = project("http://127.0.0.1:9", None, "");
-    let scope = common::explain_scope_json(&home.dir, &probe_project.manifest_path());
-    let landlock = scope["enforcement_tier"]
+    let tier = common::explain_scope_json(&home.dir, &probe_project.manifest_path())
+        ["enforcement_tier"]
         .as_str()
-        .is_some_and(|tier| tier.contains("landlock"));
+        .unwrap_or_default()
+        .to_string();
+    let landlock = tier.contains("landlock");
+    let shell_half = landlock
+        && !common::skip_without_host_support(
+            "the_control_token_is_unreachable_from_inside_the_capsule (shell half)",
+        );
 
     let provider = RecordingUpstream::with_handler(move |index, _| {
         Reply::json(match index {
@@ -1329,7 +1338,7 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
                 assert!(set.ok, "{}", set.context());
                 probe_turn("probe", &token)
             }
-            1 if landlock => {
+            1 if shell_half => {
                 let (path, _) = handler_token.lock().unwrap().clone().unwrap();
                 tool_turn(
                     "cat",
@@ -1340,8 +1349,12 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
             _ => end_turn(),
         })
     });
-    let extra =
-        format!("capabilities:\n  shell:\n    allow:\n      - bash\n      - cat\n{SETTINGS_ONLY}");
+    let shell = if shell_half {
+        "capabilities:\n  shell:\n    allow:\n      - bash\n      - cat\n"
+    } else {
+        ""
+    };
+    let extra = format!("{shell}{SETTINGS_ONLY}");
     let project = project(
         &provider.endpoint,
         Some(&keyless_tool(&tool_upstream.endpoint)),
@@ -1391,17 +1404,16 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
     }
     assert!(!run.holds(&token));
 
-    if landlock {
+    if shell_half {
         let cat_result = String::from_utf8_lossy(&requests[2].body).into_owned();
         assert!(
             cat_result.contains("Permission denied"),
             "the shell read the token file: {cat_result}"
         );
-    } else {
+    } else if !landlock {
         eprintln!(
-            "the_control_token_is_unreachable_from_inside_the_capsule: the Landlock half skipped, \
-             this host's enforcement tier is {}",
-            scope
+            "the_control_token_is_unreachable_from_inside_the_capsule: the shell half skipped, \
+             this host's enforcement tier is {tier}"
         );
     }
 }
