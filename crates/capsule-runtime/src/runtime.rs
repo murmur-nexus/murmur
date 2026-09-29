@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,15 +27,10 @@ use wasmtime::{
     component::{Component, HasSelf, Linker, ResourceTable},
     Config, Engine, Store,
 };
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
-    p2::{
-        bindings::http::types::ErrorCode as WasiHttpErrorCode,
-        body::HyperOutgoingBody,
-        types::{HostFutureIncomingResponse, OutgoingRequestConfig},
-        HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
-    },
-    WasiHttpCtx,
+    Error as WasiHttpError, RequestOptions, WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks,
+    WasiHttpView,
 };
 
 use crate::{
@@ -51,7 +47,9 @@ use crate::{
     cgroup,
     compiled_forms::CompiledForms,
     containment::{achieved_containment_class, check_containment_floor},
-    credential_gateway::{CredentialGateway, GatewayMetering, GatewayTable},
+    credential_gateway::{
+        send_direct, ConnectionIo, CredentialGateway, GatewayMetering, GatewayTable,
+    },
     delegation::SpawnerHandle,
     detached::{
         self, demotion_tool_result, AbandonedDisposition, AbandonedWork, DetachPolicy,
@@ -4743,17 +4741,12 @@ fn build_wasi_ctx(
     };
 
     builder
-        .preopened_dir(&preopen_root, ".", DirPerms::all(), FilePerms::all())
+        .preopened_dir(&preopen_root, ".", FsPerms::ReadWrite)
         .map_err(|err| RuntimeError::wasi(preopen_root, err.to_string()))?;
 
     if let Some(state_dir) = state_dir {
         builder
-            .preopened_dir(
-                state_dir,
-                STATE_PREOPEN_NAME,
-                DirPerms::all(),
-                FilePerms::all(),
-            )
+            .preopened_dir(state_dir, STATE_PREOPEN_NAME, FsPerms::ReadWrite)
             .map_err(|err| RuntimeError::wasi(state_dir.to_path_buf(), err.to_string()))?;
     }
 
@@ -4923,14 +4916,15 @@ pub(crate) struct NetworkPolicyHooks {
     pub(crate) gateway: Option<Arc<CredentialGateway>>,
 }
 
-impl WasiHttpHooks for NetworkPolicyHooks {
-    fn send_request(
-        &mut self,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
+impl NetworkPolicyHooks {
+    /// Where this store may send a request for `uri`: through its gateway (`Ok(Some)`), straight to
+    /// `uri` (`Ok(None)`), or nowhere. Decided before any connection exists.
+    pub(crate) fn admit(
+        &self,
+        uri: &http::Uri,
+    ) -> Result<Option<Arc<CredentialGateway>>, WasiHttpError> {
         if let Some(gateway) = self.gateway.as_ref() {
-            if CredentialGateway::is_addressed_to_gateway(request.uri()) {
+            if CredentialGateway::is_addressed_to_gateway(uri) {
                 // The inference gateway's request is refused before the key is attached unless
                 // some admission is open. The check is session-wide, not per-request: it holds only
                 // because the inference gateway is attached to the agent loop's driver dispatch and
@@ -4938,38 +4932,44 @@ impl WasiHttpHooks for NetworkPolicyHooks {
                 // by name through tool dispatch. An unmetered gateway never reads the meter.
                 if let GatewayMetering::Inference(spend) = &gateway.metering {
                     if !spend.has_open_admission() {
-                        return Err(wasmtime_wasi_http::p2::HttpError::from(
-                            WasiHttpErrorCode::HttpRequestDenied,
-                        ));
+                        return Err(WasiHttpError::HttpRequestDenied);
                     }
                 }
-                let gateway = Arc::clone(gateway);
-                return Ok(HostFutureIncomingResponse::pending(
-                    wasmtime_wasi::runtime::spawn(async move {
-                        Ok(gateway.send(request, config).await)
-                    }),
-                ));
+                return Ok(Some(Arc::clone(gateway)));
             }
         }
 
-        let target =
-            RequestTarget::from_request(request.uri(), config.use_tls).ok_or_else(|| {
-                wasmtime_wasi_http::p2::HttpError::from(WasiHttpErrorCode::HttpRequestDenied)
-            })?;
+        let target = RequestTarget::from_request(uri, uri.scheme_str() == Some("https"))
+            .ok_or(WasiHttpError::HttpRequestDenied)?;
 
         if !self
             .network_allow_rules
             .iter()
             .any(|rule| rule.matches(&target))
         {
-            return Err(wasmtime_wasi_http::p2::HttpError::from(
-                WasiHttpErrorCode::HttpRequestDenied,
-            ));
+            return Err(WasiHttpError::HttpRequestDenied);
         }
 
-        Ok(wasmtime_wasi_http::p2::default_send_request(
-            request, config,
-        ))
+        Ok(None)
+    }
+}
+
+impl WasiHttpHooks for NetworkPolicyHooks {
+    fn send_request(
+        &mut self,
+        request: http::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        _response_errors: Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>,
+    ) -> Box<
+        dyn Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>> + Send,
+    > {
+        // A refused request gets a future that has already failed, so no connection is opened
+        // for it. The guest reads the refusal from its response future.
+        match self.admit(request.uri()) {
+            Err(refused) => Box::new(std::future::ready(Err(refused))),
+            Ok(Some(gateway)) => Box::new(gateway.send(request, options)),
+            Ok(None) => Box::new(send_direct(request, options)),
+        }
     }
 }
 
@@ -11531,8 +11531,7 @@ inference:
             format!(
                 "failed to compile pulled component 'bad-tool': {}",
                 Component::new(&build_engine().unwrap(), bad_wasm)
-                    .err()
-                    .expect("Component::new fails")
+                    .expect_err("Component::new fails")
             )
         );
         assert!(cwasm_entries(&scratch_compiled_dir()).is_empty());
@@ -12439,40 +12438,14 @@ inference:
             .expect("grant is valid")
     }
 
-    /// Push a request through the very `NetworkPolicyHooks` a tool store is built with, so
-    /// the assertion is on the real wasi-http gate rather than on the rule list.
-    fn send_through_tool_hooks(rules: &[NetworkAllowRule], uri: &str, use_tls: bool) -> bool {
-        use http_body_util::{BodyExt, Empty};
-
-        let mut hooks = NetworkPolicyHooks {
+    /// Whether the very `NetworkPolicyHooks` a tool store is built with admits a request for
+    /// `uri`, so the assertion is on the real wasi-http gate rather than on the rule list.
+    fn tool_hooks_admit(rules: &[NetworkAllowRule], uri: &str) -> bool {
+        let hooks = NetworkPolicyHooks {
             network_allow_rules: rules.to_vec(),
             gateway: None,
         };
-        let body = Empty::<bytes::Bytes>::new()
-            .map_err(|err| match err {})
-            .boxed_unsync();
-        let request = hyper::Request::builder()
-            .uri(uri)
-            .body(body)
-            .expect("request builds");
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls,
-            connect_timeout: std::time::Duration::from_millis(1),
-            first_byte_timeout: std::time::Duration::from_millis(1),
-            between_bytes_timeout: std::time::Duration::from_millis(1),
-        };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async { hooks.send_request(request, config).is_ok() })
-    }
-
-    fn gateway_test_config() -> wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-        wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: std::time::Duration::from_millis(1),
-            first_byte_timeout: std::time::Duration::from_millis(1),
-            between_bytes_timeout: std::time::Duration::from_millis(1),
-        }
+        hooks.admit(&uri.parse().expect("uri parses")).is_ok()
     }
 
     /// A keyed gateway for `artifact`, with `key` as a literal credential.
@@ -12557,7 +12530,7 @@ inference:
             network_allow_rules: Vec::new(),
             gateway: gateway_for_store(table.for_artifact("other-tool"), "other-tool"),
         };
-        let request = hyper::Request::builder()
+        let request = http::Request::builder()
             .uri("http://127.0.0.1:9/")
             .body(
                 Empty::<bytes::Bytes>::new()
@@ -12566,15 +12539,14 @@ inference:
             )
             .unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let Err(denied) = rt.block_on(async { hooks.send_request(request, gateway_test_config()) })
-        else {
-            panic!("a store without a gateway has its request to the gateway authority denied");
-        };
-        assert!(matches!(
-            denied.downcast_ref(),
-            Some(WasiHttpErrorCode::HttpRequestDenied)
-        ));
-        assert!(!format!("{denied:?}").contains(KEY));
+        let sent = hooks.send_request(request, None, Box::new(async { Ok(()) }));
+        assert!(
+            matches!(
+                rt.block_on(Box::into_pin(sent)),
+                Err(WasiHttpError::HttpRequestDenied)
+            ),
+            "a store without a gateway has its request to the gateway authority denied"
+        );
     }
 
     fn http_inference() -> InferenceConfig {
@@ -12682,16 +12654,8 @@ inference:
         let ceiling = narrowing_ceiling();
         let rules = effective_tool_network_rules(None, &ceiling);
 
-        assert!(send_through_tool_hooks(
-            rules,
-            "http://127.0.0.1:1/x",
-            false
-        ));
-        assert!(send_through_tool_hooks(
-            rules,
-            "http://127.0.0.1:2/x",
-            false
-        ));
+        assert!(tool_hooks_admit(rules, "http://127.0.0.1:1/x"));
+        assert!(tool_hooks_admit(rules, "http://127.0.0.1:2/x"));
     }
 
     /// A narrowed tool reaches only its declared host; the ceiling's other host is gone for
@@ -12703,20 +12667,16 @@ inference:
         let narrowed = effective_tool_network_rules(Some(&grant), &ceiling);
 
         assert!(
-            send_through_tool_hooks(narrowed, "http://127.0.0.1:1/x", false),
+            tool_hooks_admit(narrowed, "http://127.0.0.1:1/x"),
             "the declared host stays reachable"
         );
         assert!(
-            !send_through_tool_hooks(narrowed, "http://127.0.0.1:2/x", false),
+            !tool_hooks_admit(narrowed, "http://127.0.0.1:2/x"),
             "the rest of the ceiling is dropped for this artifact"
         );
         // The sibling with no entry is unaffected by its neighbour's narrowing.
         let sibling = effective_tool_network_rules(None, &ceiling);
-        assert!(send_through_tool_hooks(
-            sibling,
-            "http://127.0.0.1:2/x",
-            false
-        ));
+        assert!(tool_hooks_admit(sibling, "http://127.0.0.1:2/x"));
     }
 
     /// An entry outside the ceiling is dropped rather than granted, and reported so staging
@@ -12730,11 +12690,7 @@ inference:
         );
         let narrowed = effective_tool_network_rules(Some(&grant), &ceiling);
 
-        assert!(!send_through_tool_hooks(
-            narrowed,
-            "https://evil.example.com/x",
-            true
-        ));
+        assert!(!tool_hooks_admit(narrowed, "https://evil.example.com/x"));
         assert_eq!(
             grant.dropped_network_entries,
             vec!["https://evil.example.com".to_string()]
