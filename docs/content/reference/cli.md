@@ -446,7 +446,7 @@ Each WASM tool, driver and hook is compiled under this machine's `mur` build and
 
 | Outcome (text) | Outcome (JSON) | Meaning |
 |---|---|---|
-| `compiled` | `compiled` | Compiled and stored |
+| `compiled` | `compiled` | Compiled, and stored unless `compiled/` cannot be written or `--workdir` holds it back |
 | `already stored` | `already_stored` | A usable compiled form was already in `compiled/`; nothing was written |
 | `not wasm` | `not_wasm` | A native tool, a skill or a capsule; nothing to compile |
 | `failed` | `failed` | The file could not be read, is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile. Its first launch compiles it, or fails, as it would have |

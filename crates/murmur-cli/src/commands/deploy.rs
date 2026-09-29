@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use capsule_runtime::precompile::Precompiled;
 use chrono::Utc;
 use clap::Subcommand;
 use console::{measure_text_width, style};
@@ -21,7 +22,7 @@ use crate::{
 };
 
 use super::deploy_state::{append_deployment, DeploymentRecord};
-use super::precompile::{PrecompileOutcome, PrecompileReport};
+use super::precompile::PrecompileReport;
 
 // ─── error codes ─────────────────────────────────────────────────────────────
 
@@ -819,6 +820,14 @@ fn remote_store_dir(name: &str, version: &str) -> String {
     format!("/root/.murmur/artifacts/{name}/{version}")
 }
 
+/// The path deploy uploads the payload of `name@version` to, and the target compiles it from.
+fn remote_payload_path(name: &str, version: &str) -> String {
+    format!(
+        "{}/{name}-{version}.mur.zip",
+        remote_store_dir(name, version)
+    )
+}
+
 /// The start of every command that runs `mur` on the target: it exports the deploy's `.env`, when
 /// there is one. The compile and the capsule both start with it, so they share one
 /// `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES`, which keys every compiled form.
@@ -866,7 +875,7 @@ fn precompile_warnings(
     let failed: Vec<String> = report
         .artifacts
         .iter()
-        .filter(|file| file.outcome == PrecompileOutcome::Failed)
+        .filter(|file| file.outcome == Precompiled::Failed)
         .map(|file| file.label())
         .collect();
     if !failed.is_empty() {
@@ -1553,7 +1562,7 @@ pub(crate) fn run_deploy(
                         key_ref,
                         ssh_user,
                         &staged_zip.to_string_lossy(),
-                        &format!("{remote_dir}/{stem}.mur.zip"),
+                        &remote_payload_path(&artifact.name, &artifact.version),
                         false,
                     )?;
                     scp_upload(
@@ -1664,14 +1673,7 @@ pub(crate) fn run_deploy(
         );
         let remote_zips: Vec<String> = staged
             .iter()
-            .map(|artifact| {
-                format!(
-                    "{}/{}-{}.mur.zip",
-                    remote_store_dir(&artifact.name, &artifact.version),
-                    artifact.name,
-                    artifact.version
-                )
-            })
+            .map(|artifact| remote_payload_path(&artifact.name, &artifact.version))
             .collect();
         let command = build_precompile_command(&remote_deploy_dir, &remote_zips);
         let compile_start = Instant::now();
@@ -1697,7 +1699,7 @@ pub(crate) fn run_deploy(
                         .filter(|file| file.outcome == outcome)
                         .count()
                 };
-                let failed = count(PrecompileOutcome::Failed);
+                let failed = count(Precompiled::Failed);
                 let mark = if failed == 0 {
                     style("✓").green().bold()
                 } else {
@@ -1710,9 +1712,9 @@ pub(crate) fn run_deploy(
                         "{mark} ⚙ compile {} artifact{}  {} compiled · {} stored · {} not wasm · {failed} failed  {elapsed:.1}s",
                         n_arts,
                         s(n_arts),
-                        count(PrecompileOutcome::Compiled),
-                        count(PrecompileOutcome::AlreadyStored),
-                        count(PrecompileOutcome::NotWasm),
+                        count(Precompiled::Compiled),
+                        count(Precompiled::AlreadyStored),
+                        count(Precompiled::NotWasm),
                     ),
                 );
             }
@@ -1912,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn start_script_is_byte_identical_to_the_script_before_precompile() {
+    fn the_start_script_is_pinned_byte_for_byte() {
         assert_eq!(
             build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml"),
             "[ -f /root/mur-abc123/.env ] && set -a && . /root/mur-abc123/.env && set +a; \
@@ -1945,8 +1947,8 @@ mod tests {
     #[test]
     fn the_compile_command_names_every_payload_under_the_start_scripts_workdir() {
         let paths = [
-            format!("{}/a-0.1.0.mur.zip", remote_store_dir("a", "0.1.0")),
-            format!("{}/b-1.2.3.mur.zip", remote_store_dir("b", "1.2.3")),
+            remote_payload_path("a", "0.1.0"),
+            remote_payload_path("b", "1.2.3"),
         ];
         assert_eq!(
             build_precompile_command("/root/mur-abc123", &paths),

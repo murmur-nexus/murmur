@@ -287,6 +287,11 @@ fn a_launch_loads_the_form_precompile_stored() {
 
     common::run_capsule(&files.home, &project.path().join("murmur.yaml")).success();
     assert_eq!(
+        files.echo_form(),
+        form,
+        "the launch stored the tool under another key instead of loading this form"
+    );
+    assert_eq!(
         inode_and_mtime(&form),
         before,
         "the launch compiled the tool instead of loading the stored form"

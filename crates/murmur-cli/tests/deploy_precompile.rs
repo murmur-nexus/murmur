@@ -413,7 +413,7 @@ fn remote_deploy_dir(commands: &[String]) -> String {
     dir
 }
 
-// ─── Scenario 1 ──────────────────────────────────────────────────────────────
+// ─── a default deploy ────────────────────────────────────────────────────────
 
 #[test]
 fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
@@ -451,10 +451,10 @@ fn a_deploy_compiles_on_the_target_and_the_first_launch_loads_the_forms() {
     target.stop_capsules();
 }
 
-// ─── Scenario 2 ──────────────────────────────────────────────────────────────
+// ─── --no-precompile ─────────────────────────────────────────────────────────
 
 #[test]
-fn no_precompile_sends_exactly_the_commands_deploy_sent_before() {
+fn no_precompile_sends_every_command_but_the_compile() {
     let deployer = Deployer::new();
 
     let compiled = LoopbackTarget::new();
@@ -491,7 +491,7 @@ fn no_precompile_sends_exactly_the_commands_deploy_sent_before() {
     assert!(String::from_utf8_lossy(&help.stdout).contains("--no-precompile"));
 }
 
-// ─── Scenario 3 ──────────────────────────────────────────────────────────────
+// ─── the decompression ceiling ───────────────────────────────────────────────
 
 /// Deploys under the given ceilings, serves one task, and returns the deploy and the listing the
 /// capsule started with, having checked the launch loaded every form in it.
@@ -576,7 +576,7 @@ fn an_aligned_ceiling_warns_nothing_and_the_launch_is_warm() {
     );
 }
 
-// ─── Scenario 4 ──────────────────────────────────────────────────────────────
+// ─── a target mur without precompile ─────────────────────────────────────────
 
 #[test]
 fn a_target_mur_without_precompile_warns_and_the_capsule_still_serves() {
@@ -614,7 +614,7 @@ fn a_target_mur_without_precompile_warns_and_the_capsule_still_serves() {
     target.stop_capsules();
 }
 
-// ─── Scenario 6 (measured, run by hand) ──────────────────────────────────────
+// ─── measured, run by hand ───────────────────────────────────────────────────
 
 struct Sample {
     first_launch: Duration,
@@ -678,6 +678,16 @@ fn median(mut values: Vec<Duration>) -> Duration {
     }
 }
 
+/// The 1, 5 and 15 minute load averages.
+fn load_average() -> String {
+    fs::read_to_string("/proc/loadavg")
+        .unwrap_or_default()
+        .split(' ')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn host_line(path: &str, key: &str) -> String {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -699,6 +709,7 @@ fn measured_first_launch_after_a_deploy() {
         .map(PathBuf::from)
         .unwrap_or_else(real_mur);
     let deployer = Deployer::new();
+    let load_before = load_average();
     let mut default = Vec::new();
     let mut skipped = Vec::new();
     for _ in 0..TARGETS_PER_ARM {
@@ -709,15 +720,9 @@ fn measured_first_launch_after_a_deploy() {
     let ms = |d: Duration| format!("{:.0} ms", d.as_secs_f64() * 1000.0);
     println!("target mur: {}", mur.display());
     println!(
-        "host: {} · {} logical CPUs · load average {}",
+        "host: {} · {} logical CPUs · load average before {load_before}",
         host_line("/proc/cpuinfo", "model name"),
         std::thread::available_parallelism().map_or(0, |n| n.get()),
-        fs::read_to_string("/proc/loadavg")
-            .unwrap_or_default()
-            .split(' ')
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ")
     );
     println!("| arm | target | first launch | warm launch | precompile step | deploy wall time |");
     println!("|---|---|---|---|---|---|");
@@ -761,15 +766,7 @@ fn measured_first_launch_after_a_deploy() {
     );
     println!("first(default) / warm = {ratio_default:.2} (pass ≤ 1.25)");
     println!("first(--no-precompile) / warm = {ratio_skipped:.2} (pass ≥ 2)");
-    println!(
-        "load average after: {}",
-        fs::read_to_string("/proc/loadavg")
-            .unwrap_or_default()
-            .split(' ')
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    println!("load average after: {}", load_average());
     assert!(
         ratio_default <= 1.25,
         "first(default)/warm = {ratio_default:.2}"

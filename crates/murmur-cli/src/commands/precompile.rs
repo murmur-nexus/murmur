@@ -37,7 +37,7 @@ pub(crate) struct PrecompiledFile {
     pub(crate) name: Option<String>,
     /// The packed manifest's `version`, `None` exactly when `name` is.
     pub(crate) version: Option<String>,
-    pub(crate) outcome: PrecompileOutcome,
+    pub(crate) outcome: Precompiled,
 }
 
 impl PrecompiledFile {
@@ -50,42 +50,19 @@ impl PrecompiledFile {
     }
 }
 
-/// [`Precompiled`], plus `failed` for a file that could not be read at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PrecompileOutcome {
-    Compiled,
-    AlreadyStored,
-    NotWasm,
-    Failed,
-}
-
-impl PrecompileOutcome {
-    /// The words the text report prints.
-    fn as_text(self) -> &'static str {
-        match self {
-            Self::Compiled => "compiled",
-            Self::AlreadyStored => "already stored",
-            Self::NotWasm => "not wasm",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl From<Precompiled> for PrecompileOutcome {
-    fn from(outcome: Precompiled) -> Self {
-        match outcome {
-            Precompiled::Compiled => Self::Compiled,
-            Precompiled::AlreadyStored => Self::AlreadyStored,
-            Precompiled::NotWasm => Self::NotWasm,
-            Precompiled::Failed => Self::Failed,
-        }
+/// The words the text report prints for `outcome`.
+fn outcome_text(outcome: Precompiled) -> &'static str {
+    match outcome {
+        Precompiled::Compiled => "compiled",
+        Precompiled::AlreadyStored => "already stored",
+        Precompiled::NotWasm => "not wasm",
+        Precompiled::Failed => "failed",
     }
 }
 
 /// Compiles every file in `files` with one precompiler whose capsule writable root is `workdir`,
 /// in parallel, and reports them in argument order. Never fails: a file that cannot be read, or
-/// every file when no engine can be built, is [`PrecompileOutcome::Failed`].
+/// every file when no engine can be built, is [`Precompiled::Failed`].
 pub(crate) fn precompile_files(files: &[PathBuf], workdir: Option<&Path>) -> PrecompileReport {
     let precompiler = Precompiler::new(workdir);
     let artifacts = files
@@ -105,10 +82,10 @@ fn precompile_file(precompiler: Option<&Precompiler>, path: &Path) -> Precompile
         .as_deref()
         .and_then(|bytes| murmur_artifact::load_manifest_from_artifact_bytes(bytes).ok());
     let outcome = match (precompiler, &bytes, &manifest) {
-        (Some(precompiler), Some(bytes), Some(manifest)) => precompiler
-            .precompile(&manifest.name, &manifest.version, bytes)
-            .into(),
-        _ => PrecompileOutcome::Failed,
+        (Some(precompiler), Some(bytes), Some(manifest)) => {
+            precompiler.precompile(&manifest.name, &manifest.version, bytes)
+        }
+        _ => Precompiled::Failed,
     };
     PrecompiledFile {
         path: path.to_string_lossy().into_owned(),
@@ -131,13 +108,13 @@ pub(crate) fn run_precompile(
         println!("{line}");
     } else {
         for file in &report.artifacts {
-            println!("{:<14}  {}", file.outcome.as_text(), file.label());
+            println!("{:<14}  {}", outcome_text(file.outcome), file.label());
         }
     }
     if report
         .artifacts
         .iter()
-        .any(|file| file.outcome == PrecompileOutcome::Failed)
+        .any(|file| file.outcome == Precompiled::Failed)
     {
         // The report above names every failed file, which one `CliError` cannot.
         std::process::exit(1);
@@ -159,13 +136,13 @@ mod tests {
                     path: "a.mur.zip".to_string(),
                     name: Some("echo-tool".to_string()),
                     version: Some("0.1.0".to_string()),
-                    outcome: PrecompileOutcome::AlreadyStored,
+                    outcome: Precompiled::AlreadyStored,
                 },
                 PrecompiledFile {
                     path: "b.mur.zip".to_string(),
                     name: None,
                     version: None,
-                    outcome: PrecompileOutcome::Failed,
+                    outcome: Precompiled::Failed,
                 },
             ],
         };
@@ -189,7 +166,7 @@ mod tests {
             path: "x/echo.mur.zip".to_string(),
             name: Some("echo-tool".to_string()),
             version: Some("0.1.0".to_string()),
-            outcome: PrecompileOutcome::Compiled,
+            outcome: Precompiled::Compiled,
         };
         assert_eq!(file.label(), "echo-tool@0.1.0");
         file.name = None;

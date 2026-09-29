@@ -1327,7 +1327,7 @@ warning[W-DEPLOY-001]: the target could not precompile murmur-tool-echo@1.0.0; t
 | Form | Cause | Fix |
 |---|---|---|
 | `did not precompile (<error>)` | The target's `mur` printed no [`mur precompile`](cli.md#mur-precompile) report. The parenthesis quotes the first line it printed on stderr: `unrecognized subcommand 'precompile'` means the target runs a `mur` release older than the command; an SSH error means the command never ran | Set `mur_version` in the manifest to a release that has `mur precompile`, or pass `--mur-binary` |
-| `could not precompile <name@version>, …` | The report names those artifacts `failed`: the payload is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile on the target | Run `mur precompile <file>` on the target for the reason. An artifact whose WASM does not compile also fails the capsule's launch |
+| `could not precompile <name@version>, …` | The report names those artifacts `failed`: the payload is not a `.mur.zip`, has no `murmur.yaml` that parses, or its WASM does not compile on the target | Rebuild or re-publish the artifact. An artifact whose WASM does not compile also fails the capsule's launch |
 
 The capsule's first launch compiles what the target did not, taking as long as a launch with
 `--no-precompile`.

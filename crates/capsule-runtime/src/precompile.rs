@@ -1,6 +1,6 @@
-//! Compiling installed WASM artifacts ahead of their first launch.
+//! Compiling WASM artifacts ahead of their first launch.
 //!
-//! `mur install` hands each payload it has just stored to [`Precompiler::precompile`], which
+//! `mur install` and `mur precompile` hand each payload to [`Precompiler::precompile`], which
 //! stores its compiled form through the same [`CompiledForms`] handle and the same
 //! [`stage_root_component`] that `stage_session` uses, on an engine from the same
 //! [`build_engine`]. A form written here therefore has the name, mode, sidecar and stamp a launch
@@ -27,8 +27,10 @@ pub struct Precompiler {
     forms: CompiledForms,
 }
 
-/// What [`Precompiler::precompile`] did with one payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What [`Precompiler::precompile`] did with one payload. Serialised in `snake_case`, the outcome
+/// `mur precompile --json` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Precompiled {
     /// The payload's root wasm was compiled and its form stored, or storing it was attempted:
     /// a form that could not be written is compiled again on first launch.
