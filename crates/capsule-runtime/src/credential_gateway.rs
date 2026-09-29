@@ -19,23 +19,32 @@
 //!
 //! No error this module returns carries the key or the rendered header.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use bytes::Bytes;
 use http::{
-    header::{HeaderName, HeaderValue},
+    header::{self, HeaderName, HeaderValue},
     HeaderMap, Method, StatusCode, Uri, Version,
 };
 use http_body_util::{BodyExt, Full};
 use murmur_artifact::UpstreamAuth;
-use wasmtime_wasi_http::p2::{
-    bindings::http::types::ErrorCode,
-    body::HyperOutgoingBody,
-    default_send_request_handler,
-    types::{IncomingResponse, OutgoingRequestConfig},
-};
+use wasmtime_wasi_http::{Error as WasiHttpError, RequestOptions, WasiBody};
 
 use crate::{errors::RuntimeError, gateway_credential::GatewayCredential, spend::SpendMeter};
+
+/// The future a sent request's response comes with. It drives the rest of the connection, so the
+/// response body arrives only while it runs.
+pub(crate) type ConnectionIo = Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>;
+
+/// Sends `request` to the authority its URI names, over a connection of its own and with TLS for
+/// an `https` URI, and returns once the response head has arrived.
+pub(crate) async fn send_direct(
+    request: http::Request<WasiBody>,
+    options: Option<RequestOptions>,
+) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
+    let (response, io) = wasmtime_wasi_http::default_send_request(request, options).await?;
+    Ok((response.map(BodyExt::boxed_unsync), Box::new(io)))
+}
 
 /// The authority `MURMUR_GATEWAY_ENDPOINT` names.
 ///
@@ -130,8 +139,8 @@ struct RequestHead {
 }
 
 impl RequestHead {
-    fn request(&self, body: Bytes) -> hyper::Request<HyperOutgoingBody> {
-        let mut request = hyper::Request::new(
+    fn request(&self, body: Bytes) -> http::Request<WasiBody> {
+        let mut request = http::Request::new(
             Full::new(body)
                 .map_err(|never| match never {})
                 .boxed_unsync(),
@@ -141,15 +150,6 @@ impl RequestHead {
         *request.version_mut() = self.version;
         *request.headers_mut() = self.headers.clone();
         request
-    }
-}
-
-fn copy_config(config: &OutgoingRequestConfig) -> OutgoingRequestConfig {
-    OutgoingRequestConfig {
-        use_tls: config.use_tls,
-        connect_timeout: config.connect_timeout,
-        first_byte_timeout: config.first_byte_timeout,
-        between_bytes_timeout: config.between_bytes_timeout,
     }
 }
 
@@ -247,12 +247,11 @@ impl CredentialGateway {
     /// it is.
     pub(crate) async fn send(
         self: Arc<Self>,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> Result<IncomingResponse, ErrorCode> {
+        request: http::Request<WasiBody>,
+        options: Option<RequestOptions>,
+    ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
         let Some(credential) = self.credential.clone() else {
-            let (request, config) = self.rewrite(request, config, None)?;
-            return default_send_request_handler(request, config).await;
+            return send_direct(self.rewrite(request, None)?, options).await;
         };
 
         let (parts, body) = request.into_parts();
@@ -265,13 +264,12 @@ impl CredentialGateway {
         };
 
         let sent = credential.current().await;
-        let (request, first_config) = self.rewrite(
-            head.request(body.clone()),
-            copy_config(&config),
-            Some(&sent),
-        )?;
-        let response = default_send_request_handler(request, first_config).await?;
-        if response.resp.status() != StatusCode::UNAUTHORIZED {
+        let response = send_direct(
+            self.rewrite(head.request(body.clone()), Some(&sent))?,
+            options,
+        )
+        .await?;
+        if response.0.status() != StatusCode::UNAUTHORIZED {
             credential.clear_rejection();
             return Ok(response);
         }
@@ -285,9 +283,8 @@ impl CredentialGateway {
         }
         drop(response);
 
-        let (request, config) = self.rewrite(head.request(body), config, Some(&reread))?;
-        let resent = default_send_request_handler(request, config).await?;
-        if resent.resp.status() == StatusCode::UNAUTHORIZED {
+        let resent = send_direct(self.rewrite(head.request(body), Some(&reread))?, options).await?;
+        if resent.0.status() == StatusCode::UNAUTHORIZED {
             credential
                 .record_rejection(StatusCode::UNAUTHORIZED.as_u16(), true)
                 .await;
@@ -301,23 +298,24 @@ impl CredentialGateway {
     ///
     /// Every header named like `auth.header` is removed and, when a key is given, exactly one is
     /// inserted, marked sensitive. The URI keeps the request's own path and query and takes the
-    /// upstream's scheme and authority; `use_tls` follows the upstream scheme. The body is moved
-    /// through untouched. `host` is left unset — guests cannot set it — so wasi-http's sender fills
-    /// it from the rewritten authority.
+    /// upstream's scheme and authority, so the upstream scheme decides TLS. The body is moved
+    /// through untouched.
+    ///
+    /// `host` must be replaced, not left alone: wasi-http sets it from the authority the guest
+    /// addressed, which is the gateway's, and nothing downstream corrects it.
     fn rewrite(
         &self,
-        request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
+        request: http::Request<WasiBody>,
         key: Option<&str>,
-    ) -> Result<(hyper::Request<HyperOutgoingBody>, OutgoingRequestConfig), ErrorCode> {
+    ) -> Result<http::Request<WasiBody>, WasiHttpError> {
         let (mut parts, body) = request.into_parts();
 
         let header = HeaderName::from_bytes(self.auth.header.as_bytes())
-            .map_err(|_| ErrorCode::InternalError(None))?;
+            .map_err(|_| WasiHttpError::InternalError(None))?;
         parts.headers.remove(&header);
         if let Some(key) = key {
             let mut value = HeaderValue::from_str(&self.auth.render(key))
-                .map_err(|_| ErrorCode::InternalError(None))?;
+                .map_err(|_| WasiHttpError::InternalError(None))?;
             value.set_sensitive(true);
             parts.headers.insert(header, value);
         }
@@ -328,13 +326,16 @@ impl CredentialGateway {
         if let Some(path_and_query) = parts.uri.path_and_query() {
             uri = uri.path_and_query(path_and_query.clone());
         }
-        parts.uri = uri.build().map_err(|_| ErrorCode::HttpRequestUriInvalid)?;
+        parts.uri = uri
+            .build()
+            .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?;
+        parts.headers.insert(
+            header::HOST,
+            HeaderValue::from_str(&self.upstream_authority)
+                .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?,
+        );
 
-        let config = OutgoingRequestConfig {
-            use_tls: self.upstream.scheme() == "https",
-            ..config
-        };
-        Ok((hyper::Request::from_parts(parts, body), config))
+        Ok(http::Request::from_parts(parts, body))
     }
 }
 
@@ -377,8 +378,14 @@ mod tests {
         .unwrap()
     }
 
-    fn request(uri: &str, headers: &[(&str, &str)]) -> hyper::Request<HyperOutgoingBody> {
-        let mut builder = hyper::Request::builder().method("POST").uri(uri);
+    /// A guest request as wasi-http hands it to the `send_request` hook: `host` already set to the
+    /// authority the guest addressed.
+    fn request(uri: &str, headers: &[(&str, &str)]) -> http::Request<WasiBody> {
+        let host = uri.parse::<Uri>().unwrap().authority().unwrap().to_string();
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, host);
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
@@ -389,15 +396,6 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap()
-    }
-
-    fn config() -> OutgoingRequestConfig {
-        OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_millis(11),
-            first_byte_timeout: Duration::from_millis(22),
-            between_bytes_timeout: Duration::from_millis(33),
-        }
     }
 
     #[test]
@@ -415,7 +413,7 @@ mod tests {
                 ("content-type", "application/json"),
             ],
         );
-        let (rewritten, _) = gateway.rewrite(forged, config(), Some(KEY)).unwrap();
+        let rewritten = gateway.rewrite(forged, Some(KEY)).unwrap();
         let values: Vec<_> = rewritten.headers().get_all("x-api-key").iter().collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], KEY);
@@ -430,10 +428,9 @@ mod tests {
             auth("Authorization", "Bearer {key}"),
             Some(KEY),
         );
-        let (rewritten, _) = gateway
+        let rewritten = gateway
             .rewrite(
                 request("http://127.0.0.1:9/v1/chat/completions", &[]),
-                config(),
                 Some(KEY),
             )
             .unwrap();
@@ -450,10 +447,9 @@ mod tests {
             auth("Authorization", "Bearer {key}"),
             Some(KEY),
         );
-        let (rewritten, config) = gateway
+        let rewritten = gateway
             .rewrite(
                 request("http://127.0.0.1:9/v1/chat/completions?x=1", &[]),
-                config(),
                 Some(KEY),
             )
             .unwrap();
@@ -461,10 +457,12 @@ mod tests {
             rewritten.uri().to_string(),
             "https://api.moonshot.ai/v1/chat/completions?x=1"
         );
-        assert!(config.use_tls);
-        assert_eq!(config.connect_timeout, Duration::from_millis(11));
-        assert_eq!(config.first_byte_timeout, Duration::from_millis(22));
-        assert_eq!(config.between_bytes_timeout, Duration::from_millis(33));
+        let hosts: Vec<_> = rewritten.headers().get_all("host").iter().collect();
+        assert_eq!(
+            hosts,
+            vec!["api.moonshot.ai"],
+            "the gateway's host is replaced"
+        );
     }
 
     #[test]
@@ -474,18 +472,14 @@ mod tests {
             auth("x-api-key", "{key}"),
             Some(KEY),
         );
-        let (rewritten, config) = gateway
-            .rewrite(
-                request("http://127.0.0.1:9/api/chat", &[]),
-                config(),
-                Some(KEY),
-            )
+        let rewritten = gateway
+            .rewrite(request("http://127.0.0.1:9/api/chat", &[]), Some(KEY))
             .unwrap();
         assert_eq!(
             rewritten.uri().to_string(),
             "http://localhost:11434/api/chat"
         );
-        assert!(!config.use_tls);
+        assert_eq!(rewritten.headers()["host"], "localhost:11434");
     }
 
     #[test]
@@ -496,10 +490,9 @@ mod tests {
             None,
         );
         assert!(gateway.credential().is_none());
-        let (rewritten, _) = gateway
+        let rewritten = gateway
             .rewrite(
                 request("http://127.0.0.1:9/v1/messages", &[("X-Api-Key", "forged")]),
-                config(),
                 None,
             )
             .unwrap();
@@ -579,25 +572,30 @@ mod tests {
             String::from_utf8_lossy(&head).to_lowercase()
         });
 
+        let upstream_authority = endpoint.trim_start_matches("http://").to_string();
         let gateway = Arc::new(gateway(&endpoint, auth("x-api-key", "{key}"), Some(KEY)));
-        let config = OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_secs(5),
-            first_byte_timeout: Duration::from_secs(5),
-            between_bytes_timeout: Duration::from_secs(5),
+        let options = RequestOptions {
+            connect_timeout: Some(Duration::from_secs(5)),
+            first_byte_timeout: Some(Duration::from_secs(5)),
+            between_bytes_timeout: Some(Duration::from_secs(5)),
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let status = rt.block_on(async {
-            let response = gateway
-                .send(request("http://127.0.0.1:9/v1/probe", &[]), config)
+            let (response, _io) = gateway
+                .send(request("http://127.0.0.1:9/v1/probe", &[]), Some(options))
                 .await
                 .unwrap();
-            response.resp.status()
+            response.status()
         });
         assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
 
         let head = first.join().unwrap();
         assert!(head.contains(&format!("x-api-key: {KEY}")), "{head}");
+        assert!(
+            head.contains(&format!("host: {upstream_authority}\r\n")),
+            "{head}"
+        );
+        assert!(!head.contains("127.0.0.1:9\r\n"), "{head}");
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             elsewhere.accept().is_err(),

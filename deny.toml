@@ -21,7 +21,3 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-skip = [
-    # webpki-roots is a dependency of wasmtime-wasi-http; consider alternatives if licensing becomes critical
-    { name = "webpki-roots" },
-]
