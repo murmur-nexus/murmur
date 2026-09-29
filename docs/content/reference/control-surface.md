@@ -14,7 +14,11 @@ A capsule with no `control:` block — or with `control: {}`, or both lists empt
 surface. It mints no token, and every request under `/control` is answered `404`.
 
 The agent is never a controller. No manifest key hands the token to a tool, hook, driver or shell
-command.
+command. Where the session's filesystem restriction is `advisory`, a shell command or native tool
+can read any file you can, the [token file](#token) included: on such a host, do not grant
+`capabilities.shell` to a capsule whose controls the agent must not reach. `mur run --explain-scope
+--json` reports the restriction as
+[`filesystem_boundary.restriction`](containment.md#testing-containment).
 
 ---
 
@@ -42,7 +46,7 @@ global config's `credentials:` map and the environment are never consulted for a
 `control.secrets`.
 
 The value is held in memory only. It is never written to disk, the trace, the conversation record,
-stderr or an error, and it is never placed in the agent's context or a guest's environment.
+stderr or an error, and it is never placed in the agent's context or a tool's environment.
 
 ---
 
@@ -82,10 +86,10 @@ Every refusal has the body `{"error": "<one sentence>"}`. A secret's value never
 The checks run in this order, and a request stops at the first that refuses it:
 
 1. The capsule declares `control:`.
-2. The token verifies. A request that fails here has no body read, and its refusal names nothing.
+2. The token verifies.
 3. The path, the name and the method.
 4. For a secret, the peer is loopback: `127.0.0.0/8`, `::1`, or an IPv4-mapped `::ffff:127.0.0.0/104`.
-5. The declared `content-length`, checked before anything is read.
+5. The declared `content-length`.
 6. The content type and the value.
 
 ---

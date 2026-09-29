@@ -68,18 +68,23 @@ impl MintKey {
     }
 
     /// Overwrites the key bytes with volatile writes.
-    ///
-    /// Volatile so the compiler cannot elide a write whose result is provably never read — which
-    /// is the whole of what the write is for.
-    #[allow(unsafe_code)]
     fn zeroize(&mut self) {
-        for byte in self.0.iter_mut() {
-            // SAFETY: `byte` is a valid, aligned, exclusively-borrowed `u8` inside an array this
-            // value owns. `write_volatile` of a `u8` through such a reference is always defined.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
+        zeroize(&mut self.0);
     }
+}
+
+/// Overwrites every byte of `bytes` with volatile writes.
+///
+/// Volatile so the compiler cannot elide a write whose result is provably never read — which is
+/// the whole of what the write is for.
+#[allow(unsafe_code)]
+pub(crate) fn zeroize(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: `byte` is a valid, aligned, exclusively-borrowed `u8` inside a slice the caller
+        // holds mutably. `write_volatile` of a `u8` through such a reference is always defined.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 
 impl Drop for MintKey {

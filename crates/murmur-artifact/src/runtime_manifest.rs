@@ -631,11 +631,6 @@ impl ControlConfig {
     pub fn declares_secret(&self, name: &str) -> bool {
         self.secrets.iter().any(|secret| secret == name)
     }
-
-    /// Whether `setting` is one a controller may change.
-    pub fn declares_setting(&self, setting: ControllableSetting) -> bool {
-        self.settings.contains(&setting)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11299,7 +11294,6 @@ mod control_tests {
             assert_eq!(control.secrets, vec!["CARD_TOKEN".to_string()]);
             assert!(control.declares_secret("CARD_TOKEN"));
             assert!(!control.declares_secret("DRIVER_KEY"));
-            assert!(control.declares_setting(ControllableSetting::InferenceMaxTokens));
         }
     }
 

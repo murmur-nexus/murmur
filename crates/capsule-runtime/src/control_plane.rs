@@ -99,14 +99,8 @@ impl SecretValue {
     }
 
     /// Overwrites every byte with volatile writes, as [`MintKey`] does its key.
-    #[allow(unsafe_code)]
     fn zeroize(&mut self) {
-        for byte in self.0.iter_mut() {
-            // SAFETY: `byte` is a valid, aligned, exclusively-borrowed `u8` inside a vector this
-            // value owns. `write_volatile` of a `u8` through such a reference is always defined.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        mac_token::zeroize(&mut self.0);
     }
 }
 

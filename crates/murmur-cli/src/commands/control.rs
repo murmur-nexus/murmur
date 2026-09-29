@@ -339,6 +339,9 @@ fn overwrite(bytes: &mut [u8]) {
 static SAVED_TERMIOS: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
 
 /// Terminal echo turned off on stdin for as long as this lives.
+///
+/// Not `dialoguer::Password`: it leaves echo off when `^C` interrupts the read, and it reads
+/// `/dev/tty` rather than stdin.
 struct EchoOff {
     active: bool,
 }

@@ -496,7 +496,7 @@ fn assert_recorded_nowhere(secret: &str, roots: &[&Path], ran: &[Ran], bodies: &
     }
 }
 
-// ── S1 ───────────────────────────────────────────────────────────────────────
+// ── changing a setting ──────────────────────────────────────────────────────
 
 /// A controller lowers `inference.max_tokens` while the capsule waits on its second inference
 /// call. The first two calls carry the manifest's cap and the third the controller's, and the
@@ -591,7 +591,7 @@ fn a_controller_changes_a_declared_setting_from_the_next_inference_call() {
     );
 }
 
-// ── S2 ───────────────────────────────────────────────────────────────────────
+// ── injecting a secret ──────────────────────────────────────────────────────
 
 /// A secret piped into `mur control secret` reaches the tool's upstream as its key, and no file,
 /// output, provider request or record holds it in any encoding.
@@ -682,7 +682,7 @@ fn an_injected_secret_reaches_the_gateway_and_no_record() {
     );
 }
 
-// ── S3 ───────────────────────────────────────────────────────────────────────
+// ── a keyed call before injection ───────────────────────────────────────────
 
 /// A keyed call made before any controller has injected the secret is refused inside the runtime
 /// and never reaches the upstream; the next call, after injection, does.
@@ -746,7 +746,7 @@ fn a_request_before_injection_never_reaches_the_upstream() {
     assert_eq!(event["reason"], "not_injected");
 }
 
-// ── S4 ───────────────────────────────────────────────────────────────────────
+// ── untrusted callers ───────────────────────────────────────────────────────
 
 /// Nothing but this session's own token, exactly as minted, authenticates: every other caller is
 /// answered `401` with the Bearer challenge before its body is read, nothing changes, and each
@@ -850,7 +850,7 @@ fn an_untrusted_caller_cannot_change_anything() {
     );
 }
 
-// ── S5 ───────────────────────────────────────────────────────────────────────
+// ── what the manifest does not declare ──────────────────────────────────────
 
 /// An authenticated controller is still refused anything the manifest does not declare, any
 /// method a resource does not answer, and any value the setting or secret cannot take — each
@@ -999,7 +999,7 @@ fn a_controller_is_refused_what_is_not_declared() {
     );
 }
 
-// ── S6 ───────────────────────────────────────────────────────────────────────
+// ── secrets over loopback only ──────────────────────────────────────────────
 
 /// This host's own non-loopback IPv4 address, when it has one: the source address a connection
 /// to it arrives from.
@@ -1077,7 +1077,7 @@ fn a_secret_is_accepted_only_over_loopback() {
     }
 }
 
-// ── S7 ───────────────────────────────────────────────────────────────────────
+// ── replacing and forgetting a secret ───────────────────────────────────────
 
 /// A secret replaced between two calls reaches the second with its new value, and once forgotten
 /// the next call never leaves the runtime.
@@ -1218,7 +1218,7 @@ fn a_secret_can_be_replaced_and_forgotten() {
     }
 }
 
-// ── S8 ───────────────────────────────────────────────────────────────────────
+// ── a capsule with no control block ─────────────────────────────────────────
 
 /// A capsule with no `control:` block has no token and no surface: every request under
 /// `/control` is `404` whatever it carries, `mur control` says so, and its agent card is the
@@ -1293,7 +1293,7 @@ fn no_control_block_means_no_surface() {
     assert!(!controlled_card.to_ascii_lowercase().contains("control"));
 }
 
-// ── S9 ───────────────────────────────────────────────────────────────────────
+// ── the token and the agent ─────────────────────────────────────────────────
 
 /// The control token is handed to nothing inside the capsule: a tool's environment does not hold
 /// it, no provider request, record or trace line carries it, a shell subprocess on a Landlock
@@ -1406,7 +1406,7 @@ fn the_control_token_is_unreachable_from_inside_the_capsule() {
     }
 }
 
-// ── S10 ──────────────────────────────────────────────────────────────────────
+// ── the token's lifetime ────────────────────────────────────────────────────
 
 /// The token file is owner-only while the session runs and gone once it is stopped, and a token
 /// saved from that session does not open a new session of the same capsule on the same port.
@@ -1453,7 +1453,7 @@ fn the_control_token_lives_as_long_as_the_session() {
     );
 }
 
-// ── E-RUN-041 ────────────────────────────────────────────────────────────────
+// ── a token that cannot be written ──────────────────────────────────────────
 
 /// A capsule that declares `control:` and cannot write its token beside its running record does
 /// not run: a controllability no controller could reach is refused rather than dropped.
@@ -1471,7 +1471,7 @@ fn a_capsule_that_cannot_write_its_control_token_refuses_to_launch() {
     assert!(provider.requests().is_empty());
 }
 
-// ── S11 (CLI half) ───────────────────────────────────────────────────────────
+// ── manifest refusals and mur doctor ────────────────────────────────────────
 
 /// `mur doctor` names a `control.secrets` credential as one a controller supplies, and never as a
 /// variable this workspace is missing.
@@ -1510,4 +1510,93 @@ fn doctor_does_not_report_a_control_secret_as_missing() {
         "{}",
         doctor.context()
     );
+}
+
+/// `mur run` refuses a `control:` block that declares what cannot be controlled, before anything
+/// reaches a provider, with a manifest error naming the field and the entry it refused.
+#[test]
+fn manifest_refusals_name_the_field() {
+    let home = Home::new();
+    let provider = RecordingUpstream::replying("{}");
+    let keyed = keyed_tool("https://cards.example.com");
+    let driver_keyed = |yaml: String| {
+        yaml.replace(
+            &format!("api_key: {DRIVER_KEY}"),
+            "api_key: ${DRIVER_TOKEN}",
+        )
+    };
+    let process = format!(
+        "name: surface-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
+         {VERSION}\n    runtime: driver\n{keyed}inference:\n  transport: process\n  model: \
+         test-model\n  command: /bin/true\n  driver:\n    artifact: {DRIVER}\n\
+         control:\n  settings: [inference.max_tokens]\n"
+    );
+    let cases: Vec<(String, &str, &str)> = vec![
+        (
+            "control:\n  settings: [inference.model]\n".to_string(),
+            "control.settings",
+            "'inference.model' is not a controllable setting; the controllable settings are: \
+             inference.max_tokens",
+        ),
+        (
+            "control:\n  settings: [inference.max_tokens, inference.max_tokens]\n".to_string(),
+            "control.settings",
+            "'inference.max_tokens' is listed more than once",
+        ),
+        (
+            "control:\n  secrets: [card-token]\n".to_string(),
+            "control.secrets",
+            "'card-token' is not a credential name",
+        ),
+        (
+            "control:\n  secrets: [NOBODY_USES]\n".to_string(),
+            "control.secrets",
+            "'NOBODY_USES' is not referenced by any artifact's gateway.api_key",
+        ),
+        (
+            "control:\n  secrets: [DRIVER_TOKEN]\n".to_string(),
+            "control.secrets",
+            "'DRIVER_TOKEN' keys the configured inference driver's gateway",
+        ),
+    ];
+    let mut manifests: Vec<(String, &str, &str)> = cases
+        .into_iter()
+        .map(|(control, field, message)| {
+            let yaml = fs::read_to_string(
+                project(&provider.endpoint, Some(&keyed), &control).manifest_path(),
+            )
+            .unwrap();
+            (driver_keyed(yaml), field, message)
+        })
+        .collect();
+    manifests.push((
+        process,
+        "control.settings",
+        "'inference.max_tokens' is controllable only under inference.transport: http",
+    ));
+
+    for (yaml, field, message) in manifests {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("murmur.yaml"), &yaml).unwrap();
+        let run = Ran::of(
+            mur(home.path())
+                .args(["run", "--manifest"])
+                .arg(dir.path().join("murmur.yaml"))
+                .args(["--task", "call the tool"])
+                .env("DRIVER_TOKEN", "unused")
+                .current_dir(dir.path())
+                .output()
+                .unwrap(),
+        );
+        assert!(!run.ok, "{yaml}\n{}", run.context());
+        assert!(run.stderr.contains("E-MAN-003"), "{}", run.context());
+        assert!(
+            run.stderr
+                .contains(&format!("invalid control config for '{field}'")),
+            "{}",
+            run.context()
+        );
+        assert!(run.stderr.contains(message), "{}", run.context());
+    }
+    assert!(provider.requests().is_empty());
 }
