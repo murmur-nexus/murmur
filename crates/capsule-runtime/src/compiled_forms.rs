@@ -1069,11 +1069,8 @@ mod tests {
 
         let cached = forms
             .compile(&engine, &key, wasm)
-            .err()
-            .expect("compile fails");
-        let direct = Component::new(&engine, wasm)
-            .err()
-            .expect("Component::new fails");
+            .expect_err("compile fails");
+        let direct = Component::new(&engine, wasm).expect_err("Component::new fails");
         assert_eq!(cached.to_string(), direct.to_string());
     }
 }

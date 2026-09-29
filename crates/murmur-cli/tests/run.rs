@@ -294,7 +294,7 @@ fn run_disallowed_network_call_is_denied_without_panic() {
 }
 
 #[test]
-fn run_allowlisted_network_host_is_not_denied_at_handle_time() {
+fn run_allowlisted_network_host_is_not_denied() {
     let home = tempfile::tempdir().unwrap();
     let fixture = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

@@ -622,9 +622,7 @@ mod tests {
     use chrono::TimeZone;
     use http_body_util::{BodyExt, Empty};
     use tempfile::TempDir;
-    use wasmtime_wasi_http::p2::{
-        bindings::http::types::ErrorCode, types::OutgoingRequestConfig, WasiHttpHooks,
-    };
+    use wasmtime_wasi_http::{Error as WasiHttpError, RequestOptions, WasiHttpHooks};
 
     use super::*;
     use crate::{
@@ -851,15 +849,15 @@ mod tests {
         }
     }
 
-    /// Sends one gateway-addressed request, keeping the in-flight response alive long enough for
-    /// its connection to land, and reports whether it was denied and whether the upstream accepted
-    /// a connection.
+    /// Sends one gateway-addressed request, driving its response future the way wasi-http does
+    /// long enough for its connection to land, and reports whether it was denied and whether the
+    /// upstream accepted a connection.
     fn attempt_through_gateway(
         rt: &tokio::runtime::Runtime,
         upstream: &TcpListener,
         hooks: &mut NetworkPolicyHooks,
     ) -> (bool, bool) {
-        let request = hyper::Request::builder()
+        let request = http::Request::builder()
             .method("POST")
             .uri("http://127.0.0.1:9/v1/messages")
             .body(
@@ -868,25 +866,17 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let config = OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_secs(5),
-            first_byte_timeout: Duration::from_secs(5),
-            between_bytes_timeout: Duration::from_secs(5),
+        let options = RequestOptions {
+            connect_timeout: Some(Duration::from_secs(5)),
+            first_byte_timeout: Some(Duration::from_secs(5)),
+            between_bytes_timeout: Some(Duration::from_secs(5)),
         };
         rt.block_on(async {
-            let sent = hooks.send_request(request, config);
-            let denied = match &sent {
-                Err(err) => {
-                    assert!(matches!(
-                        err.downcast_ref(),
-                        Some(ErrorCode::HttpRequestDenied)
-                    ));
-                    assert!(!format!("{err:?}").contains("sk-spend-gateway-marker"));
-                    true
-                }
-                Ok(_) => false,
-            };
+            let sent = tokio::spawn(Box::into_pin(hooks.send_request(
+                request,
+                Some(options),
+                Box::new(async { Ok(()) }),
+            )));
             let mut connected = false;
             for _ in 0..50 {
                 if let Ok((mut stream, _)) = upstream.accept() {
@@ -897,7 +887,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            drop(sent);
+            // A refusal is the only outcome that lands without a connection; anything else is
+            // still in flight, or failed on the connection this test dropped.
+            sent.abort();
+            let denied = matches!(sent.await, Ok(Err(WasiHttpError::HttpRequestDenied)));
             (denied, connected)
         })
     }

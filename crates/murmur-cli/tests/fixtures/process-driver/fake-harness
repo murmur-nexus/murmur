@@ -155,6 +155,13 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "started fixture-session-1"
     echo "fail ${FIXTURE_HARNESS_PROFILE#fail-} the harness says so"
     ;;
+  text-then-fail)
+    # A turn that opens with text and then fails, so the turn `fail` closes has run its
+    # `on-inference` hooks.
+    echo "started fixture-session-1"
+    echo "text PARTIAL"
+    echo "fail other the harness says so"
+    ;;
   exit-0)
     echo "started fixture-session-1"
     echo "text no terminal event here"

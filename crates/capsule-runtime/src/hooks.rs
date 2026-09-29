@@ -6,13 +6,8 @@ use std::{
 };
 
 use wasmtime::{component::Linker, Store};
-use wasmtime_wasi::{
-    DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
-};
-use wasmtime_wasi_http::{
-    p2::{WasiHttpCtxView, WasiHttpView},
-    WasiHttpCtx,
-};
+use wasmtime_wasi::{FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use murmur_artifact::{
     HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,
@@ -2093,18 +2088,13 @@ fn build_wasi_ctx(
     if let Some(scope) = grant.filesystem_scope.as_deref() {
         let scoped_dir = resolve_scoped_dir(root_dir, scope)?;
         builder
-            .preopened_dir(&scoped_dir, ".", DirPerms::all(), FilePerms::all())
+            .preopened_dir(&scoped_dir, ".", FsPerms::ReadWrite)
             .map_err(|err| RuntimeError::wasi(scoped_dir, err.to_string()))?;
     }
 
     if let Some(state_dir) = grant.state_dir.as_deref() {
         builder
-            .preopened_dir(
-                state_dir,
-                STATE_PREOPEN_NAME,
-                DirPerms::all(),
-                FilePerms::all(),
-            )
+            .preopened_dir(state_dir, STATE_PREOPEN_NAME, FsPerms::ReadWrite)
             .map_err(|err| RuntimeError::wasi(state_dir.to_path_buf(), err.to_string()))?;
     }
 
@@ -4423,29 +4413,12 @@ mod tests {
         }
     }
 
-    /// Ask a hook store's own HTTP gate to send a request, the way
-    /// `wasi:http/outgoing-handler` does. `Err` is a policy denial; `Ok` means the policy
-    /// admitted the request (the returned future is dropped without being driven, so no
-    /// connection is ever completed).
-    fn send_through_hook_store(state: &mut HookStoreState, uri: &str, use_tls: bool) -> bool {
-        use http_body_util::{BodyExt, Empty};
-
-        let body = Empty::<bytes::Bytes>::new()
-            .map_err(|err| match err {})
-            .boxed_unsync();
-        let request = hyper::Request::builder()
-            .uri(uri)
-            .body(body)
-            .expect("request builds");
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls,
-            connect_timeout: Duration::from_millis(1),
-            first_byte_timeout: Duration::from_millis(1),
-            between_bytes_timeout: Duration::from_millis(1),
-        };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async { state.http().hooks.send_request(request, config).is_ok() })
+    /// Whether a hook store's own HTTP gate admits a request for `uri`. Nothing is sent.
+    fn hook_store_admits(state: &HookStoreState, uri: &str) -> bool {
+        state
+            .http_hooks
+            .admit(&uri.parse().expect("uri parses"))
+            .is_ok()
     }
 
     /// A hook whose entry declares `gateway:` has its gateway-addressed request sent to the
@@ -4486,9 +4459,11 @@ mod tests {
         let grant = HookCapabilityGrant::default();
         let mut state = hook_store_state_with_gateway(root.path(), &grant, Some(gateway));
 
-        let request = hyper::Request::builder()
+        // As wasi-http hands it over: `host` set to the gateway authority the guest addressed.
+        let request = http::Request::builder()
             .method("POST")
             .uri("http://127.0.0.1:9/otlp/v1/traces")
+            .header("host", "127.0.0.1:9")
             .header("authorization", "Bearer forged")
             .body(
                 Empty::<bytes::Bytes>::new()
@@ -4496,16 +4471,14 @@ mod tests {
                     .boxed_unsync(),
             )
             .unwrap();
-        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_secs(5),
-            first_byte_timeout: Duration::from_secs(5),
-            between_bytes_timeout: Duration::from_secs(5),
-        };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let head = rt.block_on(async {
-            let sent = state.http().hooks.send_request(request, config);
-            assert!(sent.is_ok(), "the gateway-addressed request is admitted");
+            // wasi-http drives the response future on a task of its own.
+            let sent = tokio::spawn(Box::into_pin(state.http().hooks.send_request(
+                request,
+                None,
+                Box::new(async { Ok(()) }),
+            )));
             let mut head = String::new();
             for _ in 0..100 {
                 if let Ok((mut stream, _)) = upstream.accept() {
@@ -4520,7 +4493,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            drop(sent);
+            sent.abort();
             head
         });
         let head = head.to_ascii_lowercase();
@@ -4530,16 +4503,16 @@ mod tests {
             head.contains(&format!("authorization: bearer {KEY}")),
             "{head}"
         );
+        assert_eq!(head.matches("\r\nhost:").count(), 1, "{head}");
+        assert!(
+            head.contains(&format!("\r\nhost: {}\r\n", upstream.local_addr().unwrap())),
+            "the upstream, not the gateway authority, is named: {head}"
+        );
 
-        assert!(!send_through_hook_store(
-            &mut state,
-            "http://127.0.0.1:1/unlisted",
-            false
-        ));
-        assert!(!send_through_hook_store(
-            &mut state,
-            "https://telemetry.example.com/ingest",
-            true
+        assert!(!hook_store_admits(&state, "http://127.0.0.1:1/unlisted"));
+        assert!(!hook_store_admits(
+            &state,
+            "https://telemetry.example.com/ingest"
         ));
     }
 
@@ -4549,18 +4522,13 @@ mod tests {
     fn ungranted_hook_store_denies_every_outbound_request() {
         let root = TempDir::new().unwrap();
         let grant = HookCapabilityGrant::default();
-        let mut state = hook_store_state(root.path(), &grant);
+        let state = hook_store_state(root.path(), &grant);
 
-        assert!(!send_through_hook_store(
-            &mut state,
-            "https://telemetry.example.com/ingest",
-            true
+        assert!(!hook_store_admits(
+            &state,
+            "https://telemetry.example.com/ingest"
         ));
-        assert!(!send_through_hook_store(
-            &mut state,
-            "http://127.0.0.1:1/local",
-            false
-        ));
+        assert!(!hook_store_admits(&state, "http://127.0.0.1:1/local"));
     }
 
     /// Granted network: exactly the declared host is admitted; every other host is denied
@@ -4571,18 +4539,18 @@ mod tests {
         // A loopback port nothing listens on: the policy decision is observable without
         // the test ever completing a connection.
         let grant = grant_of(Some("http://127.0.0.1:1"), None);
-        let mut state = hook_store_state(root.path(), &grant);
+        let state = hook_store_state(root.path(), &grant);
 
         assert!(
-            send_through_hook_store(&mut state, "http://127.0.0.1:1/ingest", false),
+            hook_store_admits(&state, "http://127.0.0.1:1/ingest"),
             "the granted host must pass the allow-list"
         );
         assert!(
-            !send_through_hook_store(&mut state, "http://127.0.0.1:2/ingest", false),
+            !hook_store_admits(&state, "http://127.0.0.1:2/ingest"),
             "a different port on the granted host must still be denied"
         );
         assert!(
-            !send_through_hook_store(&mut state, "https://evil.example.com/x", true),
+            !hook_store_admits(&state, "https://evil.example.com/x"),
             "an undeclared host must be denied"
         );
     }
@@ -4935,12 +4903,8 @@ artifacts:
         );
 
         let root = TempDir::new().unwrap();
-        let mut state = hook_store_state(root.path(), &grant);
-        assert!(!send_through_hook_store(
-            &mut state,
-            "https://evil.example.com/exfil",
-            true
-        ));
+        let state = hook_store_state(root.path(), &grant);
+        assert!(!hook_store_admits(&state, "https://evil.example.com/exfil"));
         let target = RequestTarget {
             scheme: "https".to_string(),
             host: "evil.example.com".to_string(),

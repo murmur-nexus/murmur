@@ -750,7 +750,8 @@ pub fn deny_hook_wasm(fn_name: &str, reason: &str) -> Vec<u8> {
     )
 }
 
-/// A hook whose `fn_name` returns `artifact(payload)` — an arm no decision point honors.
+/// A hook whose `fn_name` returns `artifact(payload)`: the arm `on-inference` forwards to the
+/// task's stream, and one no decision point (`on-shell`, `on-tool-call`) honors.
 pub fn artifact_hook_wasm(fn_name: &str, payload: &str) -> Vec<u8> {
     policy_component(
         fn_name,

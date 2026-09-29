@@ -31,7 +31,7 @@ use serde_json::Value;
 use crate::{
     agent::DriverUsage,
     errors::RuntimeError,
-    hooks::{HookEvent, HookRuntime},
+    hooks::{HookArtifact, HookEvent, HookRuntime},
     otel::OtelEmitter,
     process_driver::{Event, FailureKind, Usage},
     spend::{SpendMeter, SpendRefusal},
@@ -386,7 +386,9 @@ impl<'a> ProcessEventSink<'a> {
                 // trace reads in the order the work happened: the model decided, then the tool ran.
                 // A ceiling reached by that turn stops the run before the tool call is recorded:
                 // the tool has already run, and its record belongs to a run that is continuing.
-                if let Some(reached) = self.close_turn(hooks, trace, otel).await {
+                // A turn that asked for a tool is not the attempt's last inference turn, and its
+                // `on-inference` artifacts are dropped, as the http path drops that turn's.
+                if let Err(reached) = self.close_turn(hooks, trace, otel).await {
                     return reached;
                 }
                 let Some(call) = self.pending.remove(&result.id) else {
@@ -499,12 +501,13 @@ impl<'a> ProcessEventSink<'a> {
                 // A ceiling the last turn reached outranks the answer: the run stopped at the
                 // operator's limit, and `out/result.txt` says so rather than holding an answer
                 // the next turn would have gone past the ceiling to improve on.
-                if let Some(reached) = self.close_turn(hooks, trace, otel).await {
-                    return reached;
-                }
+                let hook_artifacts = match self.close_turn(hooks, trace, otel).await {
+                    Ok(hook_artifacts) => hook_artifacts,
+                    Err(reached) => return reached,
+                };
                 match super::record_result(hooks, &self.workdir, &result) {
                     Ok(()) => {
-                        self.a2a.turn_end(&result);
+                        self.a2a.turn_end(&result, hook_artifacts).await;
                         SinkOutcome::Ended
                     }
                     Err(message) => SinkOutcome::Failed(RuntimeError::AgentLoopFailed(message)),
@@ -512,7 +515,8 @@ impl<'a> ProcessEventSink<'a> {
             }
             Event::TurnFailed(failure) => {
                 // The failure is the run's own account of itself and outranks a ceiling the same
-                // turn reached: the harness said why it stopped, and that is what is reported.
+                // turn reached: the harness said why it stopped, and that is what is reported. A
+                // failed attempt forwards no hook artifact.
                 let _ = self.close_turn(hooks, trace, otel).await;
                 self.a2a.turn_failed();
                 let kind = failure_kind_name(failure.kind);
@@ -582,8 +586,9 @@ impl<'a> ProcessEventSink<'a> {
         None
     }
 
-    /// Write the open turn's `inference` record, if one is open, charge what it cost, and say
-    /// whether that took the session to a spend ceiling.
+    /// Write the open turn's `inference` record, if one is open, charge what it cost, and hand
+    /// back the artifacts its `on-inference` hooks returned — none when no turn was open — or the
+    /// run's end when that took the session to a spend ceiling.
     ///
     /// The counts are the harness's own, as its driver reported them, and this transport has no
     /// second measurement: the growth of the cumulative `usage` report goes into the record's
@@ -600,8 +605,10 @@ impl<'a> ProcessEventSink<'a> {
         hooks: &mut HookRuntime,
         trace: &mut TraceWriter,
         otel: &mut OtelEmitter,
-    ) -> Option<SinkOutcome> {
-        let open = self.open.take()?;
+    ) -> Result<Vec<HookArtifact>, SinkOutcome> {
+        let Some(open) = self.open.take() else {
+            return Ok(Vec::new());
+        };
         let decision = if open.first_tool.is_some() {
             "tool_call"
         } else {
@@ -645,7 +652,7 @@ impl<'a> ProcessEventSink<'a> {
             reported.as_ref(),
         )
         .await;
-        hooks
+        let hook_artifacts = hooks
             .emit(
                 &self.workdir,
                 HookEvent::Inference {
@@ -667,12 +674,14 @@ impl<'a> ProcessEventSink<'a> {
         // `input + output` on both transports.
         self.spend
             .charge_spent(spent.input.unwrap_or(0), spent.output.unwrap_or(0));
-        let refusal = self.spend.ceiling_crossed()?;
+        let Some(refusal) = self.spend.ceiling_crossed() else {
+            return Ok(hook_artifacts);
+        };
         let _ = trace
             .write_spend_ceiling_reached(open.index, &refusal, None)
             .await;
         self.a2a.mark_spend_refused(&refusal);
-        Some(SinkOutcome::SpendCeilingReached(refusal))
+        Err(SinkOutcome::SpendCeilingReached(refusal))
     }
 }
 
@@ -1643,6 +1652,139 @@ mod tests {
             2,
             "a segment reads the turn counter and never advances it"
         );
+    }
+
+    // ── Hook artifacts on the turn `turn-end` closes ──────────────────────────
+    //
+    // The harness's `HookRuntime` has no hooks staged, so these drive the stream directly with
+    // the artifacts `close_turn` would have handed it.
+
+    fn hook_artifact(hook_name: &str, payload: &str) -> HookArtifact {
+        HookArtifact {
+            hook_name: hook_name.to_string(),
+            payload: payload.to_string(),
+        }
+    }
+
+    /// A turn that streamed nothing sends its hook artifact before the whole result.
+    #[tokio::test]
+    async fn hook_artifact_precedes_the_fallback_text() {
+        let mut h = Harness::new(10).await;
+        h.a2a.open_segment(1).await;
+        h.a2a
+            .turn_end("the answer", vec![hook_artifact("review", "{}")])
+            .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec!["status:working:inference turn 1", "artifact", "text:final"],
+            "{:#?}",
+            h.frames()
+        );
+        assert_eq!(data_of(&h.frames(), "text")[0]["text"], "the answer");
+    }
+
+    /// A streamed turn pays its cursor removal first, so the client's streamed item is complete
+    /// before the hook artifact lands under it, and sends no second text.
+    #[tokio::test]
+    async fn hook_artifact_follows_the_cursor_removal() {
+        let mut h = Harness::new(10).await;
+        h.a2a.open_segment(1).await;
+        h.a2a.text_delta("all of it");
+        h.a2a
+            .turn_end("all of it", vec![hook_artifact("review", "{}")])
+            .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec![
+                "status:working:inference turn 1",
+                "text:chunk",
+                "text:final",
+                "artifact",
+            ],
+            "{:#?}",
+            h.frames()
+        );
+        assert_eq!(data_of(&h.frames(), "text")[1]["text"], "");
+    }
+
+    /// Several hooks' artifacts reach the client in the order they were handed over, which is
+    /// hook-registration order.
+    #[tokio::test]
+    async fn hook_artifact_order_is_kept() {
+        let mut h = Harness::new(10).await;
+        h.a2a
+            .turn_end(
+                "",
+                vec![hook_artifact("first", "1"), hook_artifact("second", "2")],
+            )
+            .await;
+        let names: Vec<Json> = data_of(&h.frames(), "artifact")
+            .iter()
+            .map(|frame| frame["artifact"]["tool_name"].clone())
+            .collect();
+        assert_eq!(names, vec!["first", "second"], "{:#?}", h.frames());
+    }
+
+    /// An interrupted attempt delivers no answer, and a hook's verdict on it is not one either.
+    #[tokio::test]
+    async fn hook_artifact_is_not_sent_by_an_interrupted_attempt() {
+        let mut h = Harness::new(10).await;
+        h.a2a.open_segment(1).await;
+        h.a2a.mark_interrupted();
+        h.a2a
+            .turn_end("the answer", vec![hook_artifact("review", "{}")])
+            .await;
+        assert_eq!(
+            h.frame_kinds(),
+            vec!["status:working:inference turn 1"],
+            "{:#?}",
+            h.frames()
+        );
+    }
+
+    /// A run with no A2A task has nowhere to send a hook artifact, and does not try, even where a
+    /// broadcast exists.
+    #[tokio::test]
+    async fn hook_artifact_without_a_task_writes_nothing() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let frames = Arc::new(Mutex::new(SseEventBuffer::new(16)));
+        let mut a2a = A2aStream::new(
+            Some((tx, Arc::clone(&frames))),
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        a2a.turn_end("the answer", vec![hook_artifact("review", "{}")])
+            .await;
+        let mut bare = A2aStream::new(None, None, None, Arc::new(AtomicBool::new(false)));
+        bare.turn_end("the answer", vec![hook_artifact("review", "{}")])
+            .await;
+        assert!(matches!(
+            frames.lock().unwrap().replay_from(0),
+            crate::streaming::ReplayResult::Complete(frames) if frames.is_empty()
+        ));
+    }
+
+    /// The frame is `StreamArtifact::hook`'s, key for key: the operator's own hook speaking,
+    /// unfenced, with none of a tool call's keys.
+    #[tokio::test]
+    async fn hook_artifact_frame_is_the_hook_constructor() {
+        let mut h = Harness::new(10).await;
+        h.a2a
+            .turn_end("", vec![hook_artifact("review", r#"{"reviewed":true}"#)])
+            .await;
+        let frames = h.frames();
+        let artifact = &data_of(&frames, "artifact")[0]["artifact"];
+        assert_eq!(
+            artifact,
+            &serde_json::to_value(StreamArtifact::hook(
+                "review".to_string(),
+                r#"{"reviewed":true}"#.to_string()
+            ))
+            .unwrap()
+        );
+        assert_eq!(artifact["fence_source"], Json::Null);
+        assert_eq!(artifact["tool_call_id"], Json::Null);
     }
 
     /// The attempt's ending, on the two paths out of a run the harness itself ends. The stream
