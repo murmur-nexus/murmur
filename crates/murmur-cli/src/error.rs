@@ -61,6 +61,8 @@ pub const E_RUN_037: &str = "E-RUN-037"; // --resume-mode compact under inferenc
 pub const E_RUN_038: &str = "E-RUN-038"; // a spend ceiling is set against a process driver that reports no usage
 pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose transport keeps no harness session
 pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not complete
+pub const E_RUN_041: &str = "E-RUN-041"; // a capsule declaring control: could not write its control token
+pub const E_RUN_042: &str = "E-RUN-042"; // a session has no control surface, or its control surface refused the request
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -629,6 +631,13 @@ impl From<RuntimeError> for CliError {
                 "spend.machine_tokens_per_day is set in config.yaml, and the machine spend ceiling \
                  cannot be kept without its ledger; make ~/.murmur/spend a directory this user can \
                  write, or remove spend.machine_tokens_per_day",
+            ),
+            error @ RuntimeError::ControlTokenUnwritable { .. } => CliError::with_hint(
+                E_RUN_041,
+                error.to_string(),
+                "make ~/.murmur/running a directory this user can write, or remove control: from \
+                 murmur.yaml — a capsule whose declared controllability no controller could reach \
+                 does not run",
             ),
             RuntimeError::AgentLoopFailed(message) => CliError::new(
                 E_RUN_007,

@@ -1450,6 +1450,16 @@ pub fn stage_session(
         request.machine_tokens_per_day,
         &session_id,
     )?;
+    // Built here, before the gateways, because an injected credential reads its store. A
+    // capsule with no inference block serves no door, and the manifest refuses `control:` on one.
+    let control = request
+        .control
+        .as_ref()
+        .zip(request.inference.as_ref())
+        .map(|(control, inference)| {
+            Arc::new(crate::control_plane::ControlState::new(control, inference))
+        });
+    let injected_secrets = control.as_ref().map(|control| control.secrets());
     let gateways = stage_gateways(
         request.inference.as_ref(),
         &request.artifacts,
@@ -1457,6 +1467,7 @@ pub fn stage_session(
         &installed_manifests,
         &installed_artifacts,
         &spend,
+        injected_secrets.as_ref(),
     )?;
     for hook in &mut hook_components {
         hook.gateway = gateways.for_artifact(&hook.name).cloned();
@@ -1642,6 +1653,7 @@ pub fn stage_session(
         inference: request.inference,
         gateways,
         spend,
+        control,
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
         context_id: request.context_id,
@@ -1838,6 +1850,7 @@ fn launch(
             max_output_tokens: inference
                 .max_tokens
                 .unwrap_or(agent::DEFAULT_MAX_OUTPUT_TOKENS),
+            control: staged.control.clone(),
             seed_budget,
             seed_overflow_margin: staged
                 .context
@@ -1892,6 +1905,29 @@ fn launch(
         // Built while `staged` is still whole. It is written, and the URL announced, inside the
         // task `LocalSet` below, once the door has been spawned.
         let running_record = running_record_for(&staged, &session_id, &capsule_url);
+
+        // The control token is minted here, from a key generated for this session alone, and
+        // written beside where the running record will be before that record exists. The guard
+        // lives for the rest of the launch, so the file goes when the session does.
+        let session_control = staged.control.as_ref().map(|state| state.session_control());
+        let (control_plane, _control_token) = match staged.control.as_ref() {
+            Some(state) => {
+                let (plane, token) = crate::control_plane::ControlPlane::declared(
+                    session_id.clone(),
+                    Arc::clone(state),
+                )
+                .map_err(|reason| RuntimeError::ControlTokenUnwritable { reason })?;
+                let guard = running::ControlTokenGuard::write(&session_id, &token)
+                    .map_err(|reason| RuntimeError::ControlTokenUnwritable { reason })?;
+                (Arc::new(plane), Some(guard))
+            }
+            None => (
+                Arc::new(crate::control_plane::ControlPlane::undeclared(
+                    session_id.clone(),
+                )),
+                None,
+            ),
+        };
 
         // Taken over from the default disposition, when the caller owns the process, before the
         // door is announced, so a `SIGTERM` sent by anyone who has seen the URL is held for the
@@ -2197,6 +2233,7 @@ fn launch(
                 (None, None) => "none",
             });
             trace.set_gateways(session_gateways(&gateways));
+            trace.set_control(session_control);
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -2233,6 +2270,7 @@ fn launch(
             // for the same reason: the gateway sends from a task the loop's writer cannot reach,
             // and the record should land when the request does.
             if let Some(appender) = &resource_trace {
+                control_plane.attach_trace(Arc::clone(appender));
                 for gateway in gateways.iter() {
                     if let Some(credential) = gateway.credential() {
                         let event = if gateway.is_metered() {
@@ -2302,6 +2340,7 @@ fn launch(
                             conversation_mode.clone(),
                             std::sync::Arc::clone(&resource_plane),
                             std::sync::Arc::clone(&peer_plane),
+                            Arc::clone(&control_plane),
                             session_id.clone(),
                             Some(Arc::clone(&detached)),
                             Arc::clone(&live_delegations),
@@ -4125,9 +4164,13 @@ pub fn warn_on_gateway_endpoint_in_network_allow(
 /// holds the name, never prints a value, and stays silent for a `${NAME}` found nowhere — staging
 /// refuses that one. Shared between `mur run` and `mur doctor` on the same terms as
 /// [`warn_on_gateway_endpoint_in_network_allow`].
+///
+/// A name `control` lists in `control.secrets` is never warned about: a controller supplies it at
+/// run time, and it is read on every request.
 pub fn warn_on_launch_only_gateway_credential(
     artifacts: &[RuntimeArtifact],
     credentials_file: Option<&Path>,
+    control: Option<&murmur_artifact::ControlConfig>,
 ) {
     for artifact in artifacts {
         let Some(reference) = artifact
@@ -4146,7 +4189,8 @@ pub fn warn_on_launch_only_gateway_credential(
                 "<NAME>",
             ),
             ApiKeyReference::Environment(name) => {
-                if credentials_file.is_some_and(|path| config_holds_credential(path, name))
+                if control.is_some_and(|control| control.declares_secret(name))
+                    || credentials_file.is_some_and(|path| config_holds_credential(path, name))
                     || std::env::var_os(name).is_none_or(|value| value.is_empty())
                 {
                     continue;
@@ -5499,6 +5543,9 @@ fn gateway_for_store(
 /// The configured `transport: http` driver's gateway is metered against `spend` and becomes the
 /// table's inference gateway; every other gateway is unmetered. An artifact without `gateway:` is
 /// never asked for `upstream_auth:`.
+///
+/// A `${NAME}` that `injected` declares resolves to an injected credential reading that store,
+/// and neither `credentials_file` nor the environment is consulted for it.
 fn stage_gateways(
     inference: Option<&InferenceConfig>,
     artifacts: &[ArtifactRequest],
@@ -5506,6 +5553,7 @@ fn stage_gateways(
     installed_manifests: &[(String, String)],
     installed_artifacts: &[InstalledArtifactSummary],
     spend: &Arc<SpendMeter>,
+    injected: Option<&Arc<crate::control_plane::InjectedSecrets>>,
 ) -> Result<GatewayTable, RuntimeError> {
     let inference_driver = inference
         .filter(|inference| inference.transport == "http")
@@ -5525,9 +5573,16 @@ fn stage_gateways(
         let credential = declared
             .api_key
             .as_ref()
-            .map(|reference| {
-                GatewayCredential::resolve(&artifact.name, reference, credentials_file)
-                    .map(Arc::new)
+            .map(|reference| match (reference, injected) {
+                (ApiKeyReference::Environment(name), Some(secrets)) if secrets.declares(name) => {
+                    Ok(Arc::new(GatewayCredential::injected(
+                        &artifact.name,
+                        name,
+                        Arc::clone(secrets),
+                    )))
+                }
+                _ => GatewayCredential::resolve(&artifact.name, reference, credentials_file)
+                    .map(Arc::new),
             })
             .transpose()?;
         let installed = installed_artifacts
@@ -9815,6 +9870,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -9912,6 +9968,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -9995,6 +10052,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10077,6 +10135,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10212,6 +10271,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         };
@@ -10311,6 +10371,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            control: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         }
@@ -13504,6 +13565,7 @@ inference:
             compaction_system_prompt: None,
             compaction_dump_summaries: false,
             max_output_tokens: 1024,
+            control: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root,
@@ -13917,6 +13979,7 @@ inference:
             compaction_system_prompt: None,
             compaction_dump_summaries: false,
             max_output_tokens: 1024,
+            control: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,

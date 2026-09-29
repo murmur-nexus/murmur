@@ -63,8 +63,13 @@ pub(crate) struct AgentRunConfig {
     /// absent = false.
     pub compaction_dump_summaries: bool,
     /// Per-turn output cap sent to the driver as `max_tokens`. Resolved from
-    /// `inference.max_tokens`, falling back to [`DEFAULT_MAX_OUTPUT_TOKENS`].
+    /// `inference.max_tokens`, falling back to [`DEFAULT_MAX_OUTPUT_TOKENS`]. When `control`
+    /// declares the setting, it is only the launch value: each call reads the live one through
+    /// [`AgentRunConfig::output_cap_for_call`].
     pub max_output_tokens: u32,
+    /// What a controller has changed on this session, or `None` for a capsule with no
+    /// `control:` block.
+    pub control: Option<Arc<crate::control_plane::ControlState>>,
     /// Fraction of `context_window` an `on-task-start` `seed-context` may occupy, from
     /// `context.seed_budget`. A window of 0 leaves no budget to enforce, so a seed is
     /// rejected rather than committed unbounded — see [`seed_budget_tokens`].
@@ -97,6 +102,22 @@ pub(crate) struct AgentRunConfig {
     /// `Some` with no root behind it — `context.record: off`, or a host with no usable `HOME` —
     /// still threads the tasks of one launch; it just forgets when the capsule stops.
     pub harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
+}
+
+impl AgentRunConfig {
+    /// The output cap one agent-loop inference call sends, read once so the call's payload, its
+    /// occupancy count, its spend admission and its truncation warning all use the same number.
+    /// The `String` is the `control_change` this call is the first to apply, if any.
+    ///
+    /// Compaction calls and a hook's `run-inference` do not read this.
+    fn output_cap_for_call(&self) -> (u32, Option<String>) {
+        match self.control.as_ref().and_then(|control| {
+            control.for_call(murmur_artifact::ControllableSetting::InferenceMaxTokens)
+        }) {
+            Some(reading) => (reading.value.tokens(), reading.applies_change),
+            None => (self.max_output_tokens, None),
+        }
+    }
 }
 
 /// How many multiples of the seed budget an overflow may reach before the seed is refused
@@ -779,6 +800,25 @@ pub(crate) async fn run_agent_loop(
             });
         }
 
+        // Read once for this call, so its payload, occupancy count, spend admission and
+        // truncation warning never mix a cap a controller changed partway through.
+        let (max_output_tokens, applies_change) = run_config.output_cap_for_call();
+        if let Some(change_id) = applies_change {
+            trace
+                .write_control_applied(
+                    turn_u32,
+                    murmur_artifact::ControllableSetting::InferenceMaxTokens.wire_name(),
+                    json!(max_output_tokens),
+                    &change_id,
+                )
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+        }
+        let occupancy = ContextOccupancy {
+            max_output_tokens,
+            ..occupancy
+        };
+
         // How many logical messages the driver will know once this transmit lands. A held,
         // same-context continuation lets us wire only messages[acked_len..]; otherwise resend all.
         let send_len = messages.len();
@@ -791,7 +831,7 @@ pub(crate) async fn run_agent_loop(
             .collect();
         let payload = build_driver_payload(
             &inference.model,
-            run_config.max_output_tokens,
+            max_output_tokens,
             messages,
             &tools,
             &augmented_system,
@@ -842,10 +882,10 @@ pub(crate) async fn run_agent_loop(
         // Admitted after the call is measured and before anything is sent. The guard is settled
         // once the response's output is counted; every other way out of this turn drops it, which
         // charges the input alone.
-        let admission = match store_state.spend.admit(
-            u64::from(input_tokens),
-            u64::from(run_config.max_output_tokens),
-        ) {
+        let admission = match store_state
+            .spend
+            .admit(u64::from(input_tokens), u64::from(max_output_tokens))
+        {
             Ok(admission) => admission,
             Err(refusal) => {
                 return finish_spend_refused_turn(
@@ -1539,7 +1579,7 @@ pub(crate) async fn run_agent_loop(
                 // The provider honoured the cap the capsule asked for, so nothing failed and
                 // nothing is retried. What the turn leaves behind is a fragment, and every
                 // surface that carries the result says so.
-                let cap = run_config.max_output_tokens;
+                let cap = max_output_tokens;
                 crate::runtime_err!(
                     "[capsule-runtime] warning[{W_RUN_001}]: {} ({})",
                     truncation_warning_message(cap),

@@ -377,6 +377,7 @@ pub(crate) fn run_run(
     capsule_runtime::warn_on_launch_only_gateway_credential(
         &runtime_manifest.artifacts,
         crate::config::mur_config_path().ok().as_deref(),
+        runtime_manifest.control.as_ref(),
     );
 
     // And a gateway nothing meters, so an operator does not read the spend ceilings as covering
@@ -693,6 +694,7 @@ pub(crate) fn run_run(
             .and_then(|n| n.internal_port),
         declared_containment_floor,
         exports: runtime_manifest.exports.clone(),
+        control: runtime_manifest.control.clone(),
         spawn_grant,
         machine_tokens_per_day,
     };

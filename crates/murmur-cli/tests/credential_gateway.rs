@@ -21,10 +21,10 @@ use std::{
 };
 
 use assert_cmd::Command;
+use common::leaks::{files_containing, hex, sha256_hex};
 use common::recording_upstream::{RecordingUpstream, Reply};
 use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeType};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const TOOL: &str = "gateway-probe";
@@ -88,14 +88,6 @@ impl UnlistedHost {
 }
 
 // ── the project under test ──────────────────────────────────────────────────
-
-fn hex(text: &str) -> String {
-    text.bytes().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
 
 fn fixture(relative: &str) -> PathBuf {
     common::fixture_path(relative)
@@ -281,27 +273,6 @@ fn write_credentials(path: &Path, credentials: &BTreeMap<String, String>) {
     fs::write(&staging, text).unwrap();
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).unwrap();
     fs::rename(&staging, path).unwrap();
-}
-
-fn files_containing(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if fs::read(&path)
-                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
-            {
-                found.push(path);
-            }
-        }
-    }
-    found
 }
 
 fn session_dirs(root: &Path) -> Vec<PathBuf> {

@@ -182,6 +182,7 @@ nav:
       - Runtime-Provided Tools: reference/runtime-provided-tools.md
       - Plans: reference/plans.md
       - Resource Plane: reference/resource-plane.md
+      - Control Surface: reference/control-surface.md
       - Agent Card: reference/agent-card.md
       - Observability Schemas: reference/observability-schemas.md
       - Streaming Protocol: reference/streaming-protocol.md

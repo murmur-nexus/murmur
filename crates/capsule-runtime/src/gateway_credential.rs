@@ -2,13 +2,16 @@
 //! artifact's keyed requests, and where it comes from.
 //!
 //! A `${NAME}` in an artifact entry's `gateway.api_key` is looked up at staging, first in the global config's
-//! `credentials:` map and then in the launching environment. A value from the config stays
+//! `credentials:` map and then in the launching environment — unless the manifest's
+//! `control.secrets` lists `NAME`, in which case neither is consulted and the value is whatever a
+//! controller has injected over the control surface, read from memory on every keyed request. A value from the config stays
 //! re-readable for the whole session: every keyed request reads `credentials.NAME` from the file
 //! and compares it with the value last read, so a key replaced by `mur config set -g` or by any
 //! editor, in place or by rename, reaches a running capsule on the next request that reads the
 //! file after the write. File metadata never decides whether to read: a same-size in-place write
 //! can leave inode, size and timestamps as they were. A value from the environment or written
-//! literally in the manifest is read once.
+//! literally in the manifest is read once. An injected credential with no value held refuses its
+//! artifact's keyed requests locally, and nothing reaches the upstream.
 //!
 //! The credentials file is read by the runtime itself; no guest, tool or shell subprocess is handed
 //! its path or its contents. Nothing here writes a value, a hash of one, its length or any prefix to
@@ -25,7 +28,10 @@ use std::{
 use murmur_artifact::ApiKeyReference;
 use serde::Deserialize;
 
-use crate::{errors::RuntimeError, murmur_home::FileStamp, trace::ResourceTraceAppender};
+use crate::{
+    control_plane::InjectedSecrets, errors::RuntimeError, murmur_home::FileStamp,
+    trace::ResourceTraceAppender,
+};
 
 /// The diagnostic code a session fails with when the provider keeps rejecting its credential.
 pub(crate) const E_RUN_027: &str = "E-RUN-027";
@@ -39,6 +45,9 @@ pub enum CredentialSource {
     Environment { name: String },
     /// A literal `gateway.api_key` in the manifest. Read once at launch.
     ManifestLiteral,
+    /// A `control.secrets` name, supplied by a controller over the control surface and held in
+    /// memory only. Read before every keyed request.
+    Injected { name: String },
 }
 
 impl CredentialSource {
@@ -55,6 +64,9 @@ impl CredentialSource {
                 "written literally as gateway.api_key on artifact '{artifact}' in murmur.yaml, \
                  which is read once at launch"
             ),
+            Self::Injected { name } => format!(
+                "{name}, injected by a controller over the control surface and held in memory only"
+            ),
         }
     }
 
@@ -65,13 +77,16 @@ impl CredentialSource {
             Self::Config { .. } => "config",
             Self::Environment { .. } => "environment",
             Self::ManifestLiteral => "manifest",
+            Self::Injected { .. } => "injected",
         }
     }
 
     /// The credential name `${NAME}` referenced, or `None` for a manifest literal.
     pub fn credential_name(&self) -> Option<&str> {
         match self {
-            Self::Config { name, .. } | Self::Environment { name } => Some(name),
+            Self::Config { name, .. } | Self::Environment { name } | Self::Injected { name } => {
+                Some(name)
+            }
             Self::ManifestLiteral => None,
         }
     }
@@ -92,7 +107,9 @@ pub(crate) enum CredentialChange {
     Rotated { trigger: &'static str },
     /// The provider answered a request carrying the credential with `status`.
     Rejected { status: u16, retried: bool },
-    /// The config could not supply a value; the last good one stays in use.
+    /// The config could not supply a value, and the last good one stays in use; or, for an
+    /// injected credential, no controller has injected one (`not_injected`) and keyed requests are
+    /// refused.
     Unreadable { reason: &'static str },
 }
 
@@ -145,8 +162,12 @@ pub(crate) fn config_holds_credential(path: &Path, name: &str) -> bool {
     matches!(read_entry(path, name).1, EntryRead::Value(_))
 }
 
+/// [`CredentialChange::Unreadable`]'s reason for an injected credential with no value held.
+pub(crate) const NOT_INJECTED: &str = "not_injected";
+
 struct CredentialState {
-    /// The last good value. Never cleared: an unreadable source keeps it.
+    /// The last good value. Never cleared: an unreadable source keeps it. Always empty for an
+    /// injected credential, whose value stays in its store.
     value: String,
     /// The file state and reason an `unreadable` event was last written for, so a broken file read
     /// on every request is reported once. `None` after a read that yielded a value. The stamp
@@ -170,6 +191,8 @@ pub(crate) struct GatewayCredential {
     /// The artifact whose `gateway.api_key` this is.
     artifact: String,
     source: CredentialSource,
+    /// The store an [`CredentialSource::Injected`] credential reads; `None` for every other source.
+    injected: Option<Arc<InjectedSecrets>>,
     state: Mutex<CredentialState>,
     /// The session trace's `O_APPEND` handle and the event changes are written as, set once the
     /// trace is open. Events are written only when it is set.
@@ -244,10 +267,26 @@ impl GatewayCredential {
         }
     }
 
+    /// `artifact`'s credential `name`, supplied by a controller into `secrets` and read from it on
+    /// every keyed request. Consults neither the config nor the environment, so a stale value in
+    /// either can never stand in for the controller's.
+    pub(crate) fn injected(artifact: &str, name: &str, secrets: Arc<InjectedSecrets>) -> Self {
+        let mut credential = Self::new(
+            artifact,
+            CredentialSource::Injected {
+                name: name.to_string(),
+            },
+            String::new(),
+        );
+        credential.injected = Some(secrets);
+        credential
+    }
+
     fn new(artifact: &str, source: CredentialSource, value: String) -> Self {
         Self {
             artifact: artifact.to_string(),
             source,
+            injected: None,
             state: Mutex::new(CredentialState {
                 value,
                 unreadable_reported_for: None,
@@ -277,37 +316,70 @@ impl GatewayCredential {
     /// The value to attach to the next request. For a config source, reads `credentials.NAME` from
     /// the file on every call; a value different from the last one read replaces it. An unreadable
     /// file or entry keeps the last value read.
-    pub(crate) async fn current(&self) -> String {
+    ///
+    /// `None` only for an injected credential with no value held: the caller sends nothing.
+    pub(crate) async fn current(&self) -> Option<String> {
         self.refresh(false).await
     }
 
-    /// Reads a config source again after the provider rejected the value, since the file may have
-    /// changed after the rejected request read it. A different value is recorded with the trigger
-    /// `"rejection"`.
-    pub(crate) async fn reread_after_rejection(&self) -> String {
+    /// Reads a config or injected source again after the provider rejected the value, since it
+    /// may have changed after the rejected request read it. A different config value is recorded
+    /// with the trigger `"rejection"`.
+    pub(crate) async fn reread_after_rejection(&self) -> Option<String> {
         self.refresh(true).await
     }
 
-    async fn refresh(&self, after_rejection: bool) -> String {
+    async fn refresh(&self, after_rejection: bool) -> Option<String> {
         let (value, change) = self.refresh_locked(after_rejection);
         if let Some(change) = change {
             if let CredentialChange::Unreadable { reason } = change {
-                crate::runtime_err!(
-                    "[capsule-runtime] warning: the gateway credential of artifact '{}' {} could \
-                     not be read ({reason}); the value read before stays in use",
-                    self.artifact,
-                    self.label()
-                );
+                if self.injected.is_some() {
+                    crate::runtime_err!(
+                        "[capsule-runtime] warning: the gateway credential of artifact '{}' is {} \
+                         and no controller has injected it; its keyed requests are refused until \
+                         one does",
+                        self.artifact,
+                        self.label()
+                    );
+                } else {
+                    crate::runtime_err!(
+                        "[capsule-runtime] warning: the gateway credential of artifact '{}' {} \
+                         could not be read ({reason}); the value read before stays in use",
+                        self.artifact,
+                        self.label()
+                    );
+                }
             }
             self.write_event(change).await;
         }
         value
     }
 
-    fn refresh_locked(&self, after_rejection: bool) -> (String, Option<CredentialChange>) {
+    fn refresh_locked(&self, after_rejection: bool) -> (Option<String>, Option<CredentialChange>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(secrets), CredentialSource::Injected { name }) = (&self.injected, &self.source)
+        {
+            self.count_read();
+            return match secrets.value(name) {
+                Some(value) => {
+                    state.unreadable_reported_for = None;
+                    (Some(value), None)
+                }
+                // Reported once per period with no value, which a controller's forget reopens.
+                None if state.unreadable_reported_for.is_some() => (None, None),
+                None => {
+                    state.unreadable_reported_for = Some((None, NOT_INJECTED));
+                    (
+                        None,
+                        Some(CredentialChange::Unreadable {
+                            reason: NOT_INJECTED,
+                        }),
+                    )
+                }
+            };
+        }
         let CredentialSource::Config { path, name } = &self.source else {
-            return (state.value.clone(), None);
+            return (Some(state.value.clone()), None);
         };
         // The read happens under the lock, so concurrent requests take values in file order.
         self.count_read();
@@ -337,7 +409,7 @@ impl GatewayCredential {
                 }
             }
         };
-        (state.value.clone(), change)
+        (Some(state.value.clone()), change)
     }
 
     /// Records that the provider rejected a request carrying this credential, for the failure
@@ -384,12 +456,27 @@ impl GatewayCredential {
         message
     }
 
+    /// The message a keyed request refused for want of an injected value carries back to the
+    /// guest. Names the credential and never a value.
+    pub(crate) fn not_injected_message(&self) -> String {
+        let name = self.source.credential_name().unwrap_or("<NAME>");
+        format!(
+            "gateway credential {name} of artifact '{}' has not been injected: no controller has \
+             supplied it over the control surface, so nothing was sent upstream",
+            self.artifact
+        )
+    }
+
     /// What the operator does about a rejection from this source.
     pub(crate) fn rejection_hint(&self) -> String {
         match &self.source {
             CredentialSource::Config { name, .. } => format!(
                 "replace it with `mur config set -g credentials.{name} <key>`; running capsules \
                  use it on their next call"
+            ),
+            CredentialSource::Injected { name } => format!(
+                "inject a valid value with `mur control secret {name}`; the gateway uses it on its \
+                 next request"
             ),
             other => {
                 let name = other.credential_name().unwrap_or("<NAME>");
@@ -501,7 +588,7 @@ mod tests {
         let (_, credential) = config_credential(&dir);
         assert_eq!(credential.source().trace_name(), "config");
         for _ in 0..5 {
-            assert_eq!(credential.current().await, OLD);
+            assert_eq!(credential.current().await.unwrap(), OLD);
         }
         assert_eq!(reads(&credential), 6);
         assert_eq!(credential.refresh_locked(false).1, None);
@@ -512,10 +599,10 @@ mod tests {
     async fn gateway_credential_rename_replace_is_seen_on_the_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
-        assert_eq!(credential.current().await, OLD);
+        assert_eq!(credential.current().await.unwrap(), OLD);
         replace_config(&path, NEW);
-        assert_eq!(credential.current().await, NEW);
-        assert_eq!(credential.current().await, NEW);
+        assert_eq!(credential.current().await.unwrap(), NEW);
+        assert_eq!(credential.current().await.unwrap(), NEW);
         assert_eq!(reads(&credential), 4);
     }
 
@@ -524,7 +611,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         write_config(&path, &format!("{NEW}-longer"));
-        assert_eq!(credential.current().await, format!("{NEW}-longer"));
+        assert_eq!(credential.current().await.unwrap(), format!("{NEW}-longer"));
         assert_eq!(reads(&credential), 2);
     }
 
@@ -533,7 +620,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         assert_eq!(OLD.len(), NEW.len());
-        assert_eq!(credential.current().await, OLD);
+        assert_eq!(credential.current().await.unwrap(), OLD);
         overwrite_in_place(&path, NEW);
         assert_eq!(
             credential.refresh_locked(false).1,
@@ -541,7 +628,7 @@ mod tests {
                 trigger: "file_changed"
             })
         );
-        assert_eq!(credential.current().await, NEW);
+        assert_eq!(credential.current().await.unwrap(), NEW);
     }
 
     /// An editor that truncates and then writes can be read between the two.
@@ -556,26 +643,29 @@ mod tests {
             .unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
         let (value, change) = credential.refresh_locked(false);
-        assert_eq!(value, OLD);
+        assert_eq!(value.as_deref(), Some(OLD));
         assert!(
             matches!(change, Some(CredentialChange::Unreadable { .. })),
             "{change:?}"
         );
-        assert_eq!(credential.refresh_locked(false), (OLD.to_string(), None));
-        assert_eq!(credential.current().await, OLD);
+        assert_eq!(
+            credential.refresh_locked(false),
+            (Some(OLD.to_string()), None)
+        );
+        assert_eq!(credential.current().await.unwrap(), OLD);
         assert_eq!(reads(&credential), 4);
 
         write_config(&path, NEW);
         assert_eq!(
             credential.refresh_locked(false),
             (
-                NEW.to_string(),
+                Some(NEW.to_string()),
                 Some(CredentialChange::Rotated {
                     trigger: "file_changed"
                 })
             )
         );
-        assert_eq!(credential.current().await, NEW);
+        assert_eq!(credential.current().await.unwrap(), NEW);
         assert_eq!(reads(&credential), 6);
     }
 
@@ -604,7 +694,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         for _ in 0..CALLS {
-            credential.current().await;
+            credential.current().await.unwrap();
         }
         let mean = started.elapsed() / CALLS;
         println!(
@@ -631,7 +721,7 @@ mod tests {
         // One missing file is reported once, whether or not a rejection forced the read.
         assert_eq!(unreadable(&credential, false), None);
         assert_eq!(unreadable(&credential, true), None);
-        assert_eq!(credential.current().await, OLD);
+        assert_eq!(credential.current().await.unwrap(), OLD);
 
         // A symlink to itself fails to open with a reason other than `missing`, and the file state
         // is unavailable either way: the different reason alone is reported again.
@@ -669,7 +759,7 @@ mod tests {
             unreadable(&credential, false),
             Some(CredentialChange::Unreadable { reason: "no_entry" })
         );
-        assert_eq!(credential.current().await, OLD);
+        assert_eq!(credential.current().await.unwrap(), OLD);
 
         replace_config(&path, NEW);
         assert_eq!(
@@ -678,7 +768,7 @@ mod tests {
                 trigger: "file_changed"
             })
         );
-        assert_eq!(credential.current().await, NEW);
+        assert_eq!(credential.current().await.unwrap(), NEW);
 
         // A read that yielded a value resets the dedupe, so a failure seen before is reported again.
         fs::remove_file(&path).unwrap();
@@ -720,8 +810,8 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         for (credential, value) in [(&environment, NEW), (&literal, OLD)] {
-            assert_eq!(credential.current().await, value);
-            assert_eq!(credential.reread_after_rejection().await, value);
+            assert_eq!(credential.current().await.unwrap(), value);
+            assert_eq!(credential.reread_after_rejection().await.unwrap(), value);
             assert_eq!(reads(credential), 0);
         }
     }
@@ -796,7 +886,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         replace_config(&path, NEW);
-        credential.current().await;
+        credential.current().await.unwrap();
         let literal =
             GatewayCredential::resolve("driver", &ApiKeyReference::Literal(OLD.to_string()), None)
                 .unwrap();
@@ -841,5 +931,49 @@ mod tests {
             "{missing}"
         );
         assert!(missing.contains("${UNIT_GATEWAY_NOWHERE_KEY}"), "{missing}");
+    }
+
+    fn injected_credential() -> (Arc<InjectedSecrets>, GatewayCredential) {
+        let secrets = Arc::new(InjectedSecrets::new(&[NAME.to_string()]));
+        let credential = GatewayCredential::injected("card-api", NAME, Arc::clone(&secrets));
+        (secrets, credential)
+    }
+
+    /// An injected credential never consults the config or the environment, even when both hold
+    /// a value under its name.
+    #[tokio::test]
+    async fn gateway_credential_injected_ignores_config_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(&dir.path().join("config.yaml"), OLD);
+        let (_, credential) = injected_credential();
+        assert_eq!(credential.source().trace_name(), "injected");
+        assert_eq!(credential.source().credential_name(), Some(NAME));
+        assert_eq!(credential.current().await, None);
+        assert!(credential.label().contains("injected by a controller"));
+        assert!(credential
+            .rejection_hint()
+            .contains(&format!("mur control secret {NAME}")));
+        assert!(credential.not_injected_message().contains(NAME));
+    }
+
+    /// `not_injected` is reported once per period with no value: once before the first
+    /// injection, and once more after a forget.
+    #[tokio::test]
+    async fn gateway_credential_injected_reports_not_injected_once_per_unset_period() {
+        let (secrets, credential) = injected_credential();
+        let unreadable = Some(CredentialChange::Unreadable {
+            reason: NOT_INJECTED,
+        });
+        assert_eq!(credential.refresh_locked(false), (None, unreadable));
+        assert_eq!(credential.refresh_locked(false), (None, None));
+
+        crate::control_plane::tests_support::set(&secrets, NAME, NEW);
+        assert_eq!(
+            credential.refresh_locked(false),
+            (Some(NEW.to_string()), None)
+        );
+        crate::control_plane::tests_support::forget(&secrets, NAME);
+        assert_eq!(credential.refresh_locked(false), (None, unreadable));
+        assert_eq!(credential.refresh_locked(false), (None, None));
     }
 }

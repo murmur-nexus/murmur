@@ -211,6 +211,10 @@ exports:
     root: out/handoff/    # required; relative to the accessible workdir
     max_ttl: 15m          # optional when after_task: exit (default 1h); required, max 15m, when sleep
     max_bytes: 10Mi       # optional; per-file ceiling on a redeemed read, default 10Mi
+
+control:                  # optional: what a controller may change while the capsule runs
+  settings: [inference.max_tokens]
+  secrets: [TAVILY_API_KEY]   # each backs some artifact's gateway.api_key: ${NAME}
 ```
 
 ### Field reference
@@ -982,6 +986,23 @@ gives the agent one [runtime-provided tool](runtime-provided-tools.md), `share-f
 
 There is no `list` verb and no path addressing on this plane. `share-file` clamps a requested `ttl`
 down to `max_ttl` and never up.
+
+#### `control` { #field-control }
+
+What a controller holding the session's control token may change while the capsule runs, over the
+[control surface](control-surface.md). Absent, `control: {}`, or both lists empty means the capsule
+has no control surface and mints no token.
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `control.settings` | list of strings | no | Default: empty. Settings a controller may change. Accepted: `inference.max_tokens`, valid only under `inference.transport: http`. Each listed once. |
+| `control.secrets` | list of strings | no | Default: empty. Credential names a controller supplies at run time. Each must be a credential name (uppercase letters, digits and `_`, not starting with a digit), listed once, and referenced by some artifact's `gateway.api_key` as `${NAME}` — but not by the configured `transport: http` driver's. The global config and the environment are never consulted for a listed name, and `mur doctor` reports it as supplied by a controller rather than as unset. |
+
+`control:` requires an `inference:` block: only an agent capsule serves the listener the control
+surface is on. Every refusal above is `E-MAN-003`, naming `control.settings`, `control.secrets` or
+`control` and quoting the entry. An unknown key under `control:` is reported as
+[`W-SEC-019`](diagnostics.md#w-sec-019). Nothing a controller sets is persisted: a restart starts
+from these values again.
 
 ---
 
