@@ -277,7 +277,7 @@ fn with_producer(mut message: Value, producer: Option<&Value>) -> Value {
 /// A `thinking` block is sent only to the driver and model that produced it: the provider signed
 /// it for that model, and a different one would reject it or misread it. Every other part of every
 /// message is carried unchanged. Built only for a capsule that declares alternates; without one
-/// there is no view, and the wire is the stored list as it always was.
+/// there is no view, and the wire carries the stored list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireView<'a> {
     pub(crate) driver: &'a str,
@@ -760,7 +760,7 @@ pub(crate) async fn run_agent_loop(
     // it; it depends on nothing the task message contributes.
     // A capsule that declares alternates marks every assistant message with its producer and
     // gives every call a wire view; one that declares none writes and filters nothing, so its
-    // payloads, trace lines and record lines are exactly what they were without the feature.
+    // payloads, trace lines and record lines carry nothing about driver choices.
     let has_alternates = !inference.alternates.is_empty();
     let primary_view = has_alternates.then_some(WireView {
         driver: driver_name,

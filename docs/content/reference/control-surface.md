@@ -17,8 +17,10 @@ A capsule with no `control:` block — or with `control: {}`, or all three lists
 The agent is never a controller. No manifest key hands the token to a tool, hook, driver or shell
 command. `control.agent_settings` lets the agent change a setting about itself through the
 runtime-provided [`switch-driver`](runtime-provided-tools.md#switch-driver) tool, which the runtime
-answers in-process without the token or the surface. Where the session's filesystem restriction is `advisory`, a shell command or native tool
-can read any file you can, the [token file](#token) included: on such a host, do not grant
+answers in-process without the token or the surface.
+
+Where the session's filesystem restriction is `advisory`, a shell command or native tool can read
+any file you can, the [token file](#token) included: on such a host, do not grant
 `capabilities.shell` to a capsule whose controls the agent must not reach. `mur run --explain-scope
 --json` reports the restriction as
 [`filesystem_boundary.restriction`](containment.md#testing-containment).
@@ -30,7 +32,7 @@ can read any file you can, the [token file](#token) included: on such a host, do
 | Setting | Value | Valid under | Read by |
 |---|---|---|---|
 | `inference.driver` | The name of a declared [driver choice](manifest.md#inference-alternates): `primary` or an `inference.alternates` entry | `inference.transport: http`, with at least one alternate | Every agent-loop inference call: the driver it is dispatched to, the model, the gateway and credential, the context-occupancy count and the trace. Starts on `primary` |
-| `inference.max_tokens` | Integer, `1` to `4294967295` | Every agent-loop inference call: the `max_tokens` sent to the driver, the spend admission, the context-occupancy count and the truncation warning |
+| `inference.max_tokens` | Integer, `1` to `4294967295` | `inference.transport: http` | Every agent-loop inference call: the `max_tokens` sent to the driver, the spend admission, the context-occupancy count and the truncation warning |
 
 Each inference call reads each setting once, so one call never mixes two values. Compaction calls
 and a hook's `run-inference` read neither: they stay on the primary driver and the manifest's cap.

@@ -655,13 +655,6 @@ impl ControlConfig {
     pub fn agent_may_set(&self, setting: ControllableSetting) -> bool {
         self.agent_settings.contains(&setting)
     }
-
-    /// Whether a controller has anything to call: a setting it may change or a secret it may
-    /// supply. A block that grants only the agent mints no control token and serves no
-    /// `/control`.
-    pub fn has_controller_surface(&self) -> bool {
-        !self.settings.is_empty() || !self.secrets.is_empty()
-    }
 }
 
 /// The top-level `network:` block, which configures the A2A door. Unrelated to
@@ -12485,7 +12478,6 @@ mod driver_choice_tests {
             let control = manifest.control.unwrap();
             assert_eq!(control.settings, vec![ControllableSetting::InferenceDriver]);
             assert!(control.agent_settings.is_empty());
-            assert!(control.has_controller_surface());
         }
     }
 
@@ -12511,7 +12503,7 @@ mod driver_choice_tests {
         );
         assert!(control.agent_may_set(ControllableSetting::InferenceDriver));
         assert!(!control.controller_may_set(ControllableSetting::InferenceDriver));
-        assert!(!control.has_controller_surface());
+        assert!(control.secrets.is_empty());
     }
 
     #[test]

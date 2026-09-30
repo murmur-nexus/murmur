@@ -73,5 +73,6 @@ Each turn's `inference` line in `trace.jsonl` names the choice that served it, b
 provider's own counts in `input_tokens_actual` and `output_tokens_actual`, so the gap between the
 estimate and each model's own count is visible per model.
 
-Only agent-loop turns follow a switch. Compaction, a hook's `run-inference` and seed
-summarization stay on the primary driver, and a switch does not survive a restart.
+Only agent-loop turns follow a switch; see
+[what follows a switch](../reference/manifest.md#inference-alternates) for the calls that stay on
+the primary.

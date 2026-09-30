@@ -50,9 +50,9 @@ are additionally checked against that list again at dispatch.
 
 ## Reserved names
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan` and `switch-driver` are reserved. A capsule declaring
-an artifact under one of them is refused at staging, before any artifact is resolved, pulled or hash-verified,
-with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan` and `switch-driver` are reserved.
+A capsule declaring an artifact under one of them is refused at staging, before any artifact is
+pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
 `manage.pull()` of that name.
 
 A name is reserved whether or not the capsule declares the grant that would provide the tool, so
