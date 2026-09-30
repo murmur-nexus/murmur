@@ -1087,6 +1087,7 @@ impl ToolRefresh {
     pub const ALL: [ToolRefresh; 2] = [Self::Compaction, Self::Immediate];
 
     /// The value as written in the manifest and in `trace.jsonl`.
+    #[must_use]
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Compaction => "compaction",
@@ -4677,7 +4678,10 @@ fn parse_tool_refresh(raw: Option<&str>) -> Result<ToolRefresh, RuntimeManifestE
         .find(|refresh| refresh.wire_name() == value)
         .ok_or_else(|| RuntimeManifestError::InvalidInferenceConfig {
             field: "inference.tool_refresh".to_string(),
-            message: format!("must be one of: compaction, immediate; got '{value}'"),
+            message: format!(
+                "must be one of: {}; got '{value}'",
+                ToolRefresh::ALL.map(ToolRefresh::wire_name).join(", ")
+            ),
         })
 }
 

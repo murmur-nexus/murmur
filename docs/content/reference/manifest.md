@@ -1322,6 +1322,9 @@ miss for everything after it — see [Measured cost](#inference-tool-refresh-cos
 capsule that installs an artifact and uses it on the following turn must set `immediate`.
 
 A session that installs nothing sends the same tool list on every call under either value.
+`manage` is provided to a script capsule's own component, and not to tools or hooks, so an agent
+session with `transport: http` has no way to install mid-task: its tool list changes only at the
+start of a task, whichever value is set.
 
 What the model can do with an artifact once it is offered depends on its runtime:
 

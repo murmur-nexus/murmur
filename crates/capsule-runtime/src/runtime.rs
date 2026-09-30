@@ -2286,12 +2286,12 @@ fn launch(
             //
             // Both transports derive `tools_declared` from this same inventory, so one call
             // site serves both.
-            let tools_declared: Vec<String> =
-                agent::inventory::build_tool_inventory(&workdir, inference.system_prompt_artifact.as_deref())
-                    .iter()
-                    .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
-                    .map(str::to_string)
-                    .collect();
+            let tools_declared = agent::inventory::tool_names(
+                &agent::inventory::build_tool_inventory(
+                    &workdir,
+                    inference.system_prompt_artifact.as_deref(),
+                ),
+            );
             let inference_credential = gateways
                 .inference()
                 .and_then(|gateway| gateway.credential())
@@ -11218,7 +11218,8 @@ inference:
     /// call's tool array, and calling it is served as a skill result.
     #[tokio::test(flavor = "multi_thread")]
     async fn immediate_trigger_offers_a_pulled_skill_on_the_next_call() {
-        use crate::agent::inventory::{HeldInventory, RefreshReason};
+        use crate::agent::inventory::HeldInventory;
+        use murmur_artifact::ToolRefresh;
         let (_project, workdir, mut state) = late_skill_fixture();
 
         let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
@@ -11237,12 +11238,12 @@ inference:
             .refresh_before_call(
                 &workdir,
                 None,
-                murmur_artifact::ToolRefresh::Immediate,
+                ToolRefresh::Immediate,
                 state.installed_generation,
                 false,
             )
             .expect("an immediate trigger rebuilds on the next call");
-        assert_eq!(refresh.reason, RefreshReason::Immediate);
+        assert_eq!(refresh.trigger, ToolRefresh::Immediate);
         assert_eq!(refresh.added, vec!["aaa-late-skill"]);
         assert!(refresh.removed.is_empty());
         assert_eq!(refresh.offered, vec!["aaa-late-skill", "zzz-existing-tool"]);
@@ -11286,7 +11287,7 @@ inference:
     /// until the first call after a committed compaction, which carries the rebuilt array.
     #[test]
     fn compaction_trigger_holds_a_pulled_artifact_until_compaction() {
-        use crate::agent::inventory::{HeldInventory, RefreshReason};
+        use crate::agent::inventory::HeldInventory;
         use murmur_artifact::ToolRefresh;
         let (_project, workdir, mut state) = late_skill_fixture();
 
@@ -11319,7 +11320,7 @@ inference:
                 true,
             )
             .expect("the call after a committed compaction carries the rebuilt array");
-        assert_eq!(refresh.reason, RefreshReason::Compaction);
+        assert_eq!(refresh.trigger, ToolRefresh::Compaction);
         assert_eq!(refresh.added, vec!["aaa-late-skill"]);
         assert!(refresh.removed.is_empty());
 

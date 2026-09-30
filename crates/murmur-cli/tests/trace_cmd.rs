@@ -505,6 +505,32 @@ fn show_lists_declined_compactions_with_turn_and_reason() {
         .stdout(predicate::str::contains("5,000"));
 }
 
+/// A turn whose tool array was rebuilt says so under Wire, beside the `tools` hash it changed:
+/// the trigger, what entered and left the array, and the turn.
+#[test]
+fn show_lists_tool_refreshes_under_wire() {
+    let tmp = TempDir::new().unwrap();
+    let refreshed = FIXTURE_NO_TOOLS.replacen(
+        "{\"event_type\":\"inference\"",
+        "{\"event_type\":\"tools_refreshed\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\
+         \"timestamp\":4050,\"turn\":1,\"task_id\":null,\"trigger\":\"immediate\",\
+         \"added\":[\"aaa-late-skill\"],\"removed\":[\"old-tool\"],\
+         \"tools\":[\"aaa-late-skill\"]}\n{\"event_type\":\"inference\"",
+        1,
+    );
+    let path = write_fixture(tmp.path(), "refreshed.jsonl", &refreshed);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("── Wire"))
+        .stdout(predicate::str::contains(
+            "refreshed:  turn 1  immediate  +aaa-late-skill  -old-tool",
+        ))
+        .stdout(predicate::str::contains("mur trace show --body").not());
+}
+
 /// A refused write is not a write that never happened: every `protected_path_denied` record is
 /// rendered under its own heading with its path and rule, and the count is reported beside them.
 #[test]

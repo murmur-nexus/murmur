@@ -835,7 +835,7 @@ pub(crate) async fn run_agent_loop(
             trace
                 .write_tools_refreshed(
                     turn_u32,
-                    refresh.reason.wire_name(),
+                    refresh.trigger.wire_name(),
                     &refresh.added,
                     &refresh.removed,
                     &refresh.offered,

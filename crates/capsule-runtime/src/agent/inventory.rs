@@ -136,32 +136,15 @@ pub(crate) struct HeldInventory {
     generation: u64,
 }
 
-/// Why a held tool array was rebuilt before an inference call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RefreshReason {
-    /// `inference.tool_refresh: immediate`, on a call no compaction had already made a full
-    /// cache miss: this call pays the miss for the refresh alone.
-    Immediate,
-    /// A compaction committed a replacement context since the previous call, whatever the
-    /// declared trigger: the message history was already a full miss.
-    Compaction,
-}
-
-impl RefreshReason {
-    /// The value `tools_refreshed.trigger` carries.
-    pub(crate) fn wire_name(self) -> &'static str {
-        match self {
-            Self::Immediate => ToolRefresh::Immediate.wire_name(),
-            Self::Compaction => ToolRefresh::Compaction.wire_name(),
-        }
-    }
-}
-
 /// A rebuild that changed the bytes the next call sends. The new array is
 /// [`HeldInventory::tools`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InventoryRefresh {
-    pub(crate) reason: RefreshReason,
+    /// What released the rebuild. [`ToolRefresh::Compaction`] whenever a compaction committed
+    /// since the previous call, whatever the declared trigger, because that call's message
+    /// history was already a full cache miss; [`ToolRefresh::Immediate`] only when this call
+    /// pays the miss for the refresh alone.
+    pub(crate) trigger: ToolRefresh,
     /// Names offered now and not before, sorted.
     pub(crate) added: Vec<String>,
     /// Names offered before and not now, sorted.
@@ -213,10 +196,10 @@ impl HeldInventory {
         if current_generation == self.generation {
             return None;
         }
-        let reason = if compaction_committed {
-            RefreshReason::Compaction
+        let released_by = if compaction_committed {
+            ToolRefresh::Compaction
         } else if trigger == ToolRefresh::Immediate {
-            RefreshReason::Immediate
+            ToolRefresh::Immediate
         } else {
             return None;
         };
@@ -243,7 +226,7 @@ impl HeldInventory {
         removed.sort();
         self.tools = rebuilt;
         Some(InventoryRefresh {
-            reason,
+            trigger: released_by,
             added,
             removed,
             offered,
@@ -256,7 +239,8 @@ fn serialized(tools: &[Value]) -> String {
     serde_json::to_string(tools).unwrap_or_default()
 }
 
-fn tool_names(tools: &[Value]) -> Vec<String> {
+/// Every tool's `name`, in array order.
+pub(crate) fn tool_names(tools: &[Value]) -> Vec<String> {
     tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))

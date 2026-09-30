@@ -1635,7 +1635,7 @@ Output sections, in the order they are printed:
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
 | Turns | always | Turn count and configured max |
 | Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing each reported count — `in`, `out`, `cached`, `cache write`, `thinking` — over the turns that reported it. A count no turn reported is left off the line. Under [`transport: process`](manifest.md#transport-process) the harness's input and output counts are the totals above, so only the cache and thinking counts appear here |
-| Wire | one or more turns carrying content hashes | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried, then the `--body` command that prints one of them |
+| Wire | one or more turns carrying content hashes, or one or more [`tools_refreshed`](observability-schemas.md#tools-refreshed) records | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried. Then one `refreshed:  turn <n>  <trigger>  +<added>  -<removed>` row per turn whose tool list changed, and the `--body` command that prints one of the hashes |
 | Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
 | Redundant calls | always | Calls that re-read a resource nothing had changed since. Agent turns and plan steps are scored against one shared history, so either can be named as the call or as the earlier read it duplicates |
 | Skill calls | always | Count, ok/error breakdown, success rate, average latency |

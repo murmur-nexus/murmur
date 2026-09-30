@@ -675,6 +675,18 @@ struct ToolsRefreshedEvent {
     removed: Vec<String>,
 }
 
+impl ToolsRefreshedEvent {
+    /// `<trigger>  +<added>…  -<removed>…`, the part `show` and `steps` render alike.
+    fn changes(&self) -> String {
+        let added = self.added.iter().map(|name| format!("  +{name}"));
+        let removed = self.removed.iter().map(|name| format!("  -{name}"));
+        std::iter::once(self.trigger.clone())
+            .chain(added)
+            .chain(removed)
+            .collect()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -967,6 +979,8 @@ struct TraceMetrics {
     /// Every `compaction_declined` record, in file order. A decline leaves the session running
     /// over budget, so all of them are kept rather than just the last.
     compactions_declined: Vec<CompactionDeclinedRecord>,
+    /// Every `tools_refreshed` record, in file order: each is a turn whose `tools` hash changed.
+    tool_refreshes: Vec<ToolsRefreshedEvent>,
     /// Every `task_canceled` record, in file order — one per task a person stopped.
     cancels: Vec<CancelRecord>,
     /// Every `task_rejected` record, in file order — one per queued task the session refused.
@@ -1448,6 +1462,7 @@ fn compute_metrics(
     let mut skill_call_records: Vec<SkillCallRecord> = Vec::new();
     let mut compaction: Option<CompactionRecord> = None;
     let mut compactions_declined: Vec<CompactionDeclinedRecord> = Vec::new();
+    let mut tool_refreshes: Vec<ToolsRefreshedEvent> = Vec::new();
     // Task ids seen on a `task_start`, so a `task_end` with no opening line is ignored rather
     // than counted as a task.
     let mut task_starts: HashSet<String> = HashSet::new();
@@ -1810,8 +1825,7 @@ fn compute_metrics(
                     record.applied_turn = Some(applied.turn);
                 }
             }
-            // Rendered in the step list, beside the call that first carried the new array.
-            TraceEvent::ToolsRefreshed(_) => {}
+            TraceEvent::ToolsRefreshed(refresh) => tool_refreshes.push(refresh),
             TraceEvent::ControlRefused(refused) => {
                 *control_refusals
                     .entry(format!("HTTP {}", refused.status))
@@ -1871,6 +1885,7 @@ fn compute_metrics(
             skill_call_records,
             compaction,
             compactions_declined,
+            tool_refreshes,
             cancels,
             rejections,
             failures,
@@ -2237,7 +2252,7 @@ fn print_show(m: &TraceMetrics) {
         .iter()
         .filter(|rec| rec.is_agent_loop() && rec.has_hashes())
         .collect();
-    if !wire_turns.is_empty() {
+    if !wire_turns.is_empty() || !m.tool_refreshes.is_empty() {
         println!("── Wire ─────────────────────────────────────────");
         for rec in &wire_turns {
             println!(
@@ -2259,10 +2274,15 @@ fn print_show(m: &TraceMetrics) {
                 if rec.message_shas.len() == 1 { "" } else { "s" }
             );
         }
-        println!(
-            "bodies:     mur trace show --body system --turn {}",
-            wire_turns[0].turn
-        );
+        for refresh in &m.tool_refreshes {
+            println!("refreshed:  turn {}  {}", refresh.turn, refresh.changes());
+        }
+        if let Some(first) = wire_turns.first() {
+            println!(
+                "bodies:     mur trace show --body system --turn {}",
+                first.turn
+            );
+        }
         println!();
     }
 
@@ -3272,20 +3292,14 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.turn,
             fmt_id_short(&e.change_id, 12)
         ),
-        TraceEvent::ToolsRefreshed(e) => format!(
-            "{}{}{}{}  turn {}",
-            kind("tools_refreshed"),
-            e.trigger,
-            e.added
-                .iter()
-                .map(|name| format!("  +{name}"))
-                .collect::<String>(),
-            e.removed
-                .iter()
-                .map(|name| format!("  -{name}"))
-                .collect::<String>(),
-            e.turn
-        ),
+        TraceEvent::ToolsRefreshed(e) => {
+            format!(
+                "{}{}  turn {}",
+                kind("tools_refreshed"),
+                e.changes(),
+                e.turn
+            )
+        }
         TraceEvent::PlanEnd(e) => format!(
             "{}{}{}",
             kind("plan_end"),
