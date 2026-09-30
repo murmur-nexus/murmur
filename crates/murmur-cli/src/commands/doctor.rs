@@ -104,8 +104,9 @@ enum LockVerdict {
     /// Lock agrees with the manifest pin and with the bytes on disk. `pulled_by` is the session
     /// whose `manage.pull()` wrote the pin, `None` for an operator-declared one.
     Ok { pulled_by: Option<String> },
-    /// A `manage.pull()` pin the manifest declares as a hook, a driver, or with `gateway:` —
-    /// `mur run` fails with E-RUN-043. `declared_as` is that manifest text.
+    /// A `manage.pull()` pin the manifest declares as a hook, a driver, with `gateway:`, or binds
+    /// as `inference.system_prompt_artifact` — `mur run` fails with E-RUN-043. `declared_as` is
+    /// that manifest text.
     RuntimeOriginNotDeclarable {
         session: String,
         declared_as: &'static str,
@@ -128,7 +129,9 @@ enum LockVerdict {
 ///
 /// A version mismatch short-circuits the hash comparison — hashing bytes for a version
 /// already known to be wrong would report one drifted artifact as two failures. The pin's origin
-/// is judged last, against the manifest entry's `runtime` and whether it declares `gateway:`.
+/// is judged last, against the manifest entry's `runtime`, whether it declares `gateway:`, and
+/// whether `inference.system_prompt_artifact` names it.
+#[allow(clippy::too_many_arguments)]
 fn check_lock_entry(
     lock: &MurmurLock,
     name: &str,
@@ -137,6 +140,7 @@ fn check_lock_entry(
     platform: &str,
     runtime: &ArtifactRuntime,
     declares_gateway: bool,
+    bound_as_system_prompt: bool,
 ) -> LockVerdict {
     let Some(entry) = lock.artifact_for(name) else {
         return LockVerdict::MissingEntry;
@@ -165,7 +169,7 @@ fn check_lock_entry(
     match &entry.origin {
         LockOrigin::Operator => LockVerdict::Ok { pulled_by: None },
         LockOrigin::Runtime { session } => {
-            match undeclarable_runtime_pin_role(runtime, declares_gateway) {
+            match undeclarable_runtime_pin_role(runtime, declares_gateway, bound_as_system_prompt) {
                 Some(declared_as) => LockVerdict::RuntimeOriginNotDeclarable {
                     session: session.clone(),
                     declared_as,
@@ -1138,6 +1142,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                         platform,
                         &artifact.runtime,
                         artifact.gateway.is_some(),
+                        runtime_manifest
+                            .inference
+                            .as_ref()
+                            .and_then(|inference| inference.system_prompt_artifact.as_deref())
+                            == Some(name.as_str()),
                     ),
                     None => LockVerdict::Ok { pulled_by: None },
                 };

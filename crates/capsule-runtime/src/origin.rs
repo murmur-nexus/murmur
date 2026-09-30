@@ -172,6 +172,22 @@ pub fn stamp_for_completion(inherited: Option<TrustClass>) -> TaskProvenance {
     TaskProvenance::derive(TaskOrigin::Completion, inherited)
 }
 
+/// How far an installed artifact's text is trusted, from who pinned it in `murmur.lock`.
+///
+/// A pin the operator wrote is [`TrustClass::Trusted`]; a pin a running capsule fetched through
+/// `manage.pull()` is [`TrustClass::Untrusted`] whatever session it names, an empty one
+/// included. The lock origin is the only input, so no runtime pin can come out trusted.
+///
+/// Like a task's trust class this is a marker, not a control: it decides whether the artifact's
+/// tool-array entry carries the runtime-origin marker and whether its skill guidance is fenced,
+/// and nothing is refused, delayed or regranted for it.
+pub fn artifact_trust(origin: &murmur_artifact::LockOrigin) -> TrustClass {
+    match origin {
+        murmur_artifact::LockOrigin::Operator => TrustClass::Trusted,
+        murmur_artifact::LockOrigin::Runtime { .. } => TrustClass::Untrusted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +367,28 @@ mod tests {
             let stamped = stamp_for_completion(Some(trust));
             assert_eq!(stamped.origin(), TaskOrigin::Completion);
             assert_eq!(stamped.trust(), trust);
+        }
+    }
+
+    #[test]
+    fn artifact_trust_of_an_operator_pin_is_trusted() {
+        assert_eq!(
+            artifact_trust(&murmur_artifact::LockOrigin::Operator),
+            TrustClass::Trusted
+        );
+    }
+
+    #[test]
+    fn artifact_trust_of_a_runtime_pin_is_untrusted_for_any_session() {
+        for session in ["ses_puller", "", "operator", "trusted"] {
+            let origin = murmur_artifact::LockOrigin::Runtime {
+                session: session.to_string(),
+            };
+            assert_eq!(
+                artifact_trust(&origin),
+                TrustClass::Untrusted,
+                "session {session:?} must not make a runtime pin trusted"
+            );
         }
     }
 

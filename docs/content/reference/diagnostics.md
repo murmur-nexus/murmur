@@ -96,7 +96,7 @@ section that explains it.
 | `E-RUN-040` | The session ran and its task did not complete: it failed, spent `inference.max_turns`, hit a spend ceiling, or was canceled | [E-RUN-040](#e-run-040) |
 | `E-RUN-041` | A capsule declaring `control:` could not write its control token beside its running record, and did not launch | [E-RUN-041](#e-run-041) |
 | `E-RUN-042` | `mur control` named a session with no control surface, or the control surface refused the request | [E-RUN-042](#e-run-042) |
-| `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, or with `gateway:` | [E-RUN-043](#e-run-043) |
+| `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, with `gateway:`, or bound as `inference.system_prompt_artifact` | [E-RUN-043](#e-run-043) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -778,17 +778,29 @@ restarting the capsule. Neither message carries the token or a secret value.
 
 A `murmur.lock` entry with [`origin: runtime`](workdir.md#lock-origin) was written by a capsule's
 `manage.pull()`, not by an operator command. Such a pin stages only as a tool or a skill without a
-`gateway:` block. `mur run` refuses the launch, before any session directory exists, when its
-`murmur.yaml` entry declares one of:
+`gateway:` block, reached by the model as a marked [tool-array entry](../concepts/access-control.md#artifact-origin).
+`mur run` refuses the launch, before any session directory exists, when `murmur.yaml` gives it one
+of these roles. When more than one applies, the first in the table is named:
 
-- `runtime: hook`
-- `runtime: driver`
-- `gateway:`
+| Named in the message | Where `murmur.yaml` declares it | Hint's second remedy |
+|---|---|---|
+| `runtime: hook` | The artifact's entry | `remove runtime: hook from its murmur.yaml entry` |
+| `runtime: driver` | The artifact's entry | `remove runtime: driver from its murmur.yaml entry` |
+| `gateway:` | The artifact's entry | `remove gateway: from its murmur.yaml entry` |
+| `inference.system_prompt_artifact` | `inference:`, naming the skill as the system prompt | `stop binding it as inference.system_prompt_artifact in murmur.yaml` |
 
 ```text
 error[E-RUN-043]: murmur.lock pins 'some-tool@1.2.3' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with gateway:, which only an operator-declared pin may carry
   hint: run `mur install some-tool@1.2.3` to adopt the pin as operator-declared, or remove gateway: from its murmur.yaml entry
 ```
+
+```text
+error[E-RUN-043]: murmur.lock pins 'some-skill@1.0.0' from a runtime pull by session ses_0190a1b2c3d4..., and murmur.yaml declares it with inference.system_prompt_artifact, which only an operator-declared pin may carry
+  hint: run `mur install some-skill@1.0.0` to adopt the pin as operator-declared, or stop binding it as inference.system_prompt_artifact in murmur.yaml
+```
+
+A `mur run --system-prompt` override replaces the binding, so an overridden launch stages the skill
+as an ordinary marked entry.
 
 `mur eval run` refuses the same pin per case: the case is recorded as `stage_failed` with this
 message.

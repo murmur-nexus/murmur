@@ -228,7 +228,13 @@ declares none.
 A pulled artifact reaches the tool list an `http` agent's model is offered at the boundary
 [`inference.tool_refresh`](manifest.md#inference-tool-refresh) names: the next inference call
 under `immediate`, or the first call after a compaction under the default `compaction`, and at the
-start of the next task under either.
+start of the next task under either. It is offered marked untrusted, there and on every later
+launch whose `murmur.yaml` declares it, until `mur install` adopts its pin — see
+[Artifact origin](../concepts/access-control.md#artifact-origin).
+
+A successful pull writes one [`artifact_pulled`](observability-schemas.md#session-trace-tracejsonl)
+line to the session's `trace.jsonl`, naming the artifact, its origin and its trust class; a refused
+or failed pull writes none.
 
 A pulled WASM artifact is compiled once per version and kept in
 [`~/.murmur/compiled`](config.md#murmur-home-permissions), shared with `mur run`, so a later pull

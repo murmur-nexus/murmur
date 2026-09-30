@@ -50,6 +50,17 @@ pub enum LockOrigin {
 const ORIGIN_OPERATOR: &str = "operator";
 const ORIGIN_RUNTIME: &str = "runtime";
 
+impl LockOrigin {
+    /// The lowercase spelling of the entry's `origin` key: `operator` or `runtime`. The same
+    /// spelling a trace record carries for an artifact's origin.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Operator => ORIGIN_OPERATOR,
+            Self::Runtime { .. } => ORIGIN_RUNTIME,
+        }
+    }
+}
+
 /// The on-disk shape of a [`LockedArtifact`]: `origin` and `session` as flat keys after
 /// `sha256`.
 #[derive(Serialize, Deserialize)]
@@ -492,6 +503,25 @@ mod tests {
     fn runtime(session: &str) -> LockOrigin {
         LockOrigin::Runtime {
             session: session.to_string(),
+        }
+    }
+
+    /// `as_str` is the spelling the lock file writes, so an entry read back carries the origin
+    /// `as_str` named.
+    #[test]
+    fn lock_origin_as_str_round_trips_through_the_lock_file() {
+        assert_eq!(LockOrigin::Operator.as_str(), "operator");
+        assert_eq!(runtime("ses_puller").as_str(), "runtime");
+        assert_eq!(runtime("").as_str(), "runtime");
+
+        for origin in [LockOrigin::Operator, runtime("ses_puller")] {
+            let raw = RawLockedArtifact::from(LockedArtifact {
+                origin: origin.clone(),
+                ..entry("a", "1.0.0", LockedSha256::any("abc"))
+            });
+            assert_eq!(raw.origin.as_deref(), Some(origin.as_str()));
+            let read_back = LockedArtifact::try_from(raw).unwrap();
+            assert_eq!(read_back.origin, origin);
         }
     }
 

@@ -63,7 +63,7 @@ pub const E_RUN_039: &str = "E-RUN-039"; // --forget-session on a capsule whose 
 pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not complete
 pub const E_RUN_041: &str = "E-RUN-041"; // a capsule declaring control: could not write its control token
 pub const E_RUN_042: &str = "E-RUN-042"; // a session has no control surface, or its control surface refused the request
-pub const E_RUN_043: &str = "E-RUN-043"; // a runtime-pulled lock pin is declared as a hook, a driver, or with gateway:
+pub const E_RUN_043: &str = "E-RUN-043"; // a runtime-pulled lock pin is declared as a hook, a driver, with gateway:, or bound as inference.system_prompt_artifact
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -255,9 +255,16 @@ impl From<RuntimeError> for CliError {
                 declared_as,
                 ..
             } => {
+                // The system-prompt binding lives under `inference:`, not on the artifact's own
+                // entry, so it is the one role whose remedy names a different place.
+                let remedy = if declared_as == "inference.system_prompt_artifact" {
+                    "stop binding it as inference.system_prompt_artifact in murmur.yaml".to_string()
+                } else {
+                    format!("remove {declared_as} from its murmur.yaml entry")
+                };
                 let hint = format!(
                     "run `mur install {name}@{version}` to adopt the pin as operator-declared, or \
-                     remove {declared_as} from its murmur.yaml entry"
+                     {remedy}"
                 );
                 CliError::with_hint(E_RUN_043, error.to_string(), hint)
             }
@@ -929,6 +936,24 @@ mod tests {
         let hint = cli.hint.as_deref().unwrap_or_default();
         assert!(hint.contains("mur install pulled-tool@1.2.3"), "{hint}");
         assert!(hint.contains("gateway:"), "{hint}");
+    }
+
+    #[test]
+    fn runtime_origin_system_prompt_refusal_hint_names_the_inference_binding() {
+        let cli = CliError::from(RuntimeError::RuntimeOriginNotDeclarable {
+            name: "pulled-style".to_string(),
+            version: "1.0.0".to_string(),
+            session: "ses_puller".to_string(),
+            declared_as: "inference.system_prompt_artifact",
+        });
+        assert_eq!(cli.code, E_RUN_043);
+        assert_eq!(
+            cli.hint.as_deref(),
+            Some(
+                "run `mur install pulled-style@1.0.0` to adopt the pin as operator-declared, or \
+                 stop binding it as inference.system_prompt_artifact in murmur.yaml"
+            )
+        );
     }
 
     // Regression coverage for the versioned-only export errors (see

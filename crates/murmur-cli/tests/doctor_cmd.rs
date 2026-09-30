@@ -629,6 +629,74 @@ fn doctor_reports_runtime_origin_pins() {
         .stdout(predicate::str::contains("stray-tool@2.0.0"));
 }
 
+/// A runtime pin bound as `inference.system_prompt_artifact` is the refusal `mur run` makes with
+/// E-RUN-043, predicted from the same role table; the same pin left unbound is only a warning.
+#[test]
+fn doctor_reports_a_runtime_pin_bound_as_the_system_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let staging = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let skill = skill_artifact(&staging, "pulled-skill", "0.1.0");
+    let driver = common::create_driver_artifact(
+        staging.path(),
+        "murmur-driver-anthropic",
+        "0.1.4",
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &skill).success();
+    common::publish_local(&home, &driver).success();
+    let declared = "  - name: pulled-skill\n    version: 0.1.0\n    runtime: skill\n\
+                    \x20 - name: murmur-driver-anthropic\n    version: 0.1.4\n    runtime: driver\n\
+                    \x20   gateway:\n      endpoint: http://127.0.0.1:9\n      keyless: true\n";
+    let inference = |bound: &str| {
+        format!(
+            "inference:\n  transport: http\n  model: test-model\n{bound}  driver:\n    \
+             artifact: murmur-driver-anthropic\n"
+        )
+    };
+    create_project(project.path(), &format!("{declared}{}", inference("")));
+    install_pinned_to_project(&home, project.path(), "pulled-skill@0.1.0").success();
+    install_pinned_to_project(&home, project.path(), "murmur-driver-anthropic@0.1.4").success();
+    let lock_path = project.path().join("murmur.lock");
+    let mut lock = murmur_artifact::read_lockfile(&lock_path).unwrap();
+    lock.artifacts
+        .iter_mut()
+        .find(|entry| entry.name == "pulled-skill")
+        .unwrap()
+        .origin = LockOrigin::Runtime {
+        session: "ses_skill".to_string(),
+    };
+    write_lockfile_atomic(&lock_path, &lock).unwrap();
+
+    create_project(
+        project.path(),
+        &format!(
+            "{declared}{}",
+            inference("  system_prompt_artifact: pulled-skill\n")
+        ),
+    );
+    mur_doctor(&home, project.path())
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("\u{2717}  pulled-skill@0.1.0"))
+        .stdout(predicate::str::contains(
+            "\u{2014} murmur.lock pins 'pulled-skill' from a runtime pull by session ses_skill; \
+             murmur.yaml declares it with inference.system_prompt_artifact",
+        ))
+        .stdout(predicate::str::contains(
+            "Fix: mur install pulled-skill@0.1.0",
+        ));
+
+    create_project(project.path(), &format!("{declared}{}", inference("")));
+    mur_doctor(&home, project.path())
+        .success()
+        .stdout(predicate::str::contains(
+            "\u{2014} pulled at runtime by session ses_skill",
+        ))
+        .stdout(predicate::str::contains("inference.system_prompt_artifact").not());
+}
+
 /// The gap this closes: bytes on disk that `mur run` would reject with E-REG-002 must
 /// never read as a green doctor line.
 #[test]

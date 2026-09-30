@@ -154,6 +154,20 @@ struct SessionStartEvent {
     spawned_by: Option<String>,
     #[serde(default)]
     delegation_id: Option<String>,
+    /// The staged artifacts whose `murmur.lock` pin a running capsule fetched. Absent on a trace
+    /// from a runtime predating the key, which reads as none.
+    #[serde(default)]
+    runtime_artifacts: Vec<RuntimeArtifactEntry>,
+}
+
+/// One element of `session_start.runtime_artifacts`.
+#[derive(Debug, Deserialize)]
+struct RuntimeArtifactEntry {
+    name: String,
+    version: String,
+    /// The session whose `manage.pull()` wrote the pin.
+    #[serde(default)]
+    session: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +235,36 @@ struct SkillCallEvent {
     skill_name: String,
     duration_ms: u64,
     status: String,
+    /// The skill's `murmur.lock` origin (`operator` / `runtime`) and the trust class derived
+    /// from it. Both empty on a trace from a runtime predating the keys, which renders as an
+    /// operator skill always did.
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    trust: String,
+}
+
+impl SkillCallEvent {
+    /// ` (runtime/untrusted)`-style annotation for a skill whose guidance reached the model
+    /// fenced, and nothing for every other skill.
+    fn untrusted_marker(&self) -> Option<String> {
+        (capsule_runtime::TrustClass::parse(&self.trust)
+            == Some(capsule_runtime::TrustClass::Untrusted))
+        .then(|| format!("{}/{}", self.origin, self.trust))
+    }
+}
+
+/// One `artifact_pulled` record: an artifact a running capsule fetched through `manage.pull()`.
+#[derive(Debug, Deserialize)]
+struct ArtifactPulledEvent {
+    name: String,
+    version: String,
+    #[serde(default)]
+    runtime: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    trust: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -736,6 +780,7 @@ enum TraceEvent {
     ControlRefused(ControlRefusedEvent),
     ControlApplied(ControlAppliedEvent),
     ToolsRefreshed(ToolsRefreshedEvent),
+    ArtifactPulled(ArtifactPulledEvent),
     #[serde(other)]
     Unknown,
 }
@@ -871,6 +916,8 @@ struct SkillCallRecord {
     skill_name: String,
     status: String,
     duration_ms: u64,
+    /// `runtime/untrusted` for a runtime-origin skill, `None` for every other.
+    untrusted: Option<String>,
 }
 
 /// A call that re-observed a resource already observed earlier in the session with no
@@ -1012,6 +1059,10 @@ struct TraceMetrics {
     a2a_tasks_received: u32,
     /// The peer URL of every `a2a_send`, in file order.
     a2a_sends: Vec<String>,
+    /// `session_start.runtime_artifacts`, in file order.
+    runtime_artifacts: Vec<RuntimeArtifactEntry>,
+    /// Every `artifact_pulled` record, in file order.
+    artifacts_pulled: Vec<ArtifactPulledEvent>,
     /// The session that spawned this one, and the delegation that created it. Both `None` for a
     /// capsule nobody delegated.
     spawned_by: Option<String>,
@@ -1103,6 +1154,45 @@ fn rejected_show_row(r: &TaskRejectedEvent) -> String {
         r.task_id,
         r.cause,
         r.source.as_deref().unwrap_or("unknown")
+    )
+}
+
+/// The Session block's line naming every runtime-origin artifact and the session that pulled
+/// it, or `None` when the session staged none.
+fn runtime_pins_line(pins: &[RuntimeArtifactEntry]) -> Option<String> {
+    if pins.is_empty() {
+        return None;
+    }
+    let pins: Vec<String> = pins
+        .iter()
+        .map(|pin| format!("{}@{} (pulled by {})", pin.name, pin.version, pin.session))
+        .collect();
+    Some(format!("{:<11} {}", "runtime pins:", pins.join(", ")))
+}
+
+/// One skill call's entry on its turn's row under `mur trace show`'s `Skill calls` section. A
+/// runtime-origin skill's entry ends in its `origin/trust`; every other entry is unannotated.
+fn skill_call_show_entry(rec: &SkillCallRecord) -> String {
+    let icon = if rec.status == "ok" { "✓" } else { "✗" };
+    let untrusted = rec
+        .untrusted
+        .as_deref()
+        .map(|marker| format!(" {marker}"))
+        .unwrap_or_default();
+    format!(
+        "{} {} {}{}",
+        rec.skill_name,
+        fmt_dur(rec.duration_ms),
+        icon,
+        untrusted
+    )
+}
+
+/// One `artifact_pulled` record's row under `mur trace show`'s `Pulled at runtime` section.
+fn artifact_pulled_show_row(e: &ArtifactPulledEvent) -> String {
+    format!(
+        "  {}@{}  {}  {}/{}",
+        e.name, e.version, e.runtime, e.origin, e.trust
     )
 }
 
@@ -1484,6 +1574,7 @@ fn compute_metrics(
     let mut peer_fetches = OutcomeCounts::new();
     let mut a2a_tasks_received = 0u32;
     let mut a2a_sends: Vec<String> = Vec::new();
+    let mut artifacts_pulled: Vec<ArtifactPulledEvent> = Vec::new();
     let mut delegations: Vec<DelegationRecord> = Vec::new();
     let mut plan_runs: Vec<PlanRunRecord> = Vec::new();
     let mut control_changes: Vec<ControlChangeRecord> = Vec::new();
@@ -1565,6 +1656,7 @@ fn compute_metrics(
                 }
                 skill_call_records.push(SkillCallRecord {
                     turn: e.turn,
+                    untrusted: e.untrusted_marker(),
                     skill_name: e.skill_name,
                     status: e.status,
                     duration_ms: e.duration_ms,
@@ -1708,6 +1800,7 @@ fn compute_metrics(
             TraceEvent::PeerFileFetch(e) => *peer_fetches.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::A2aTaskReceived => a2a_tasks_received += 1,
             TraceEvent::A2aSend(e) => a2a_sends.push(e.peer_url),
+            TraceEvent::ArtifactPulled(e) => artifacts_pulled.push(e),
             TraceEvent::DelegationStart(e) => delegations.push(DelegationRecord {
                 delegation_id: Some(e.delegation_id),
                 capsule: e.capsule,
@@ -1903,6 +1996,8 @@ fn compute_metrics(
             peer_fetches,
             a2a_tasks_received,
             a2a_sends,
+            runtime_artifacts: ss.runtime_artifacts,
+            artifacts_pulled,
             spawned_by: ss.spawned_by,
             spawned_by_delegation: ss.delegation_id,
             delegations,
@@ -2133,6 +2228,11 @@ fn print_show(m: &TraceMetrics) {
     }
     if !m.tools_declared.is_empty() {
         println!("{:<11} {}", "tools:", m.tools_declared.join(", "));
+    }
+    // Artifacts a running capsule pinned rather than the operator: each reached the model
+    // marked untrusted.
+    if let Some(line) = runtime_pins_line(&m.runtime_artifacts) {
+        println!("{line}");
     }
     // What was asked for against what this host could enforce. The two are read together:
     // a capsule that declared `sealed` and achieved `advisory` ran with neither.
@@ -2374,15 +2474,20 @@ fn print_show(m: &TraceMetrics) {
         for (turn, records) in &by_turn {
             let parts: Vec<String> = records
                 .iter()
-                .map(|rec| {
-                    let icon = if rec.status == "ok" { "✓" } else { "✗" };
-                    format!("{} {} {}", rec.skill_name, fmt_dur(rec.duration_ms), icon)
-                })
+                .map(|rec| skill_call_show_entry(rec))
                 .collect();
             println!("  turn {}  {}", turn, parts.join("  "));
         }
     }
     println!();
+
+    if !m.artifacts_pulled.is_empty() {
+        println!("── Pulled at runtime ────────────────────────────");
+        for pulled in &m.artifacts_pulled {
+            println!("{}", artifact_pulled_show_row(pulled));
+        }
+        println!();
+    }
 
     println!("── Shell calls ──────────────────────────────────");
     if m.total_shell_calls == 0 {
@@ -3161,11 +3266,22 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_id_short(&e.reconciled_by_session, 12)
         ),
         TraceEvent::SkillCall(e) => format!(
-            "{}{}  {}  {}",
+            "{}{}  {}  {}{}",
             kind("skill_call"),
             e.skill_name,
             fmt_dur(e.duration_ms),
-            if e.status == "ok" { "✓" } else { "✗" }
+            if e.status == "ok" { "✓" } else { "✗" },
+            e.untrusted_marker()
+                .map(|marker| format!(" ({marker})"))
+                .unwrap_or_default()
+        ),
+        TraceEvent::ArtifactPulled(e) => format!(
+            "{}{}@{} ({}/{})",
+            kind("artifact_pulled"),
+            e.name,
+            e.version,
+            e.origin,
+            e.trust
         ),
         TraceEvent::Compaction(e) => format!(
             "{}{} → {} tokens",
@@ -4413,5 +4529,90 @@ mod tests {
             event: serde_json::from_str::<TraceEvent>(line).expect("an unknown type still parses"),
         };
         assert!(steps_row(&record, false).is_none());
+    }
+
+    fn skill_record(line: &str) -> SkillCallRecord {
+        let TraceEvent::SkillCall(e) = serde_json::from_str::<TraceEvent>(line).unwrap() else {
+            panic!("a skill_call line parses as SkillCall");
+        };
+        SkillCallRecord {
+            turn: e.turn,
+            untrusted: e.untrusted_marker(),
+            skill_name: e.skill_name,
+            status: e.status,
+            duration_ms: e.duration_ms,
+        }
+    }
+
+    /// A runtime-origin skill call is annotated on both surfaces; an operator one, and one from a
+    /// trace predating the keys, renders exactly as a skill call always did.
+    #[test]
+    fn runtime_origin_skill_call_rows_are_annotated_only_when_untrusted() {
+        let runtime = r#"{"event_type":"skill_call","event_id":"evt_3","parent_id":"evt_2","session_id":"s","timestamp":3,"turn":1,"task_id":"tsk_1","skill_name":"pulled-style","output_bytes":40,"duration_ms":2,"status":"ok","origin":"runtime","trust":"untrusted"}"#;
+        let operator = r#"{"event_type":"skill_call","event_id":"evt_4","parent_id":"evt_2","session_id":"s","timestamp":4,"turn":1,"task_id":"tsk_1","skill_name":"house-style","output_bytes":40,"duration_ms":2,"status":"ok","origin":"operator","trust":"trusted"}"#;
+        let older = r#"{"event_type":"skill_call","session_id":"s","timestamp":4,"turn":1,"skill_name":"house-style","output_bytes":40,"duration_ms":2,"status":"ok"}"#;
+
+        assert_eq!(
+            row(runtime),
+            "skill_call pulled-style  2ms  ✓ (runtime/untrusted)"
+        );
+        assert_eq!(row(operator), "skill_call house-style  2ms  ✓");
+        assert_eq!(row(older), row(operator));
+
+        assert_eq!(
+            skill_call_show_entry(&skill_record(runtime)),
+            "pulled-style 2ms ✓ runtime/untrusted"
+        );
+        assert_eq!(
+            skill_call_show_entry(&skill_record(operator)),
+            "house-style 2ms ✓"
+        );
+        assert_eq!(
+            skill_call_show_entry(&skill_record(older)),
+            "house-style 2ms ✓"
+        );
+    }
+
+    #[test]
+    fn runtime_origin_artifact_pulled_renders_a_steps_row_and_a_show_row() {
+        let line = r#"{"event_type":"artifact_pulled","event_id":"evt_9","parent_id":null,"session_id":"ses_1","timestamp":9,"name":"pulled-style","version":"0.1.0","runtime":"skill","origin":"runtime","session":"ses_1","trust":"untrusted"}"#;
+        assert_eq!(
+            row(line),
+            "artifact_pulled pulled-style@0.1.0 (runtime/untrusted)"
+        );
+        let TraceEvent::ArtifactPulled(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+        else {
+            panic!("an artifact_pulled line parses as ArtifactPulled");
+        };
+        assert_eq!(
+            artifact_pulled_show_row(&e),
+            "  pulled-style@0.1.0  skill  runtime/untrusted"
+        );
+    }
+
+    /// The Session block names each runtime pin and its puller, and says nothing for a session
+    /// with none — including one whose `session_start` predates the key.
+    #[test]
+    fn runtime_origin_session_block_names_each_runtime_pin() {
+        let with = r#"{"event_type":"session_start","session_id":"s","capsule_name":"c","capsule_version":"0.1.0","model":"m","max_turns":5,"runtime_artifacts":[{"name":"pulled-style","version":"0.1.0","origin":"runtime","session":"ses_puller","trust":"untrusted"},{"name":"fetcher","version":"1.0.0","origin":"runtime","session":"ses_other","trust":"untrusted"}]}"#;
+        let empty = r#"{"event_type":"session_start","session_id":"s","capsule_name":"c","capsule_version":"0.1.0","model":"m","max_turns":5,"runtime_artifacts":[]}"#;
+        let older = r#"{"event_type":"session_start","session_id":"s","capsule_name":"c","capsule_version":"0.1.0","model":"m","max_turns":5}"#;
+        let pins = |line: &str| {
+            let TraceEvent::SessionStart(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+            else {
+                panic!("a session_start line parses as SessionStart");
+            };
+            runtime_pins_line(&e.runtime_artifacts)
+        };
+
+        assert_eq!(
+            pins(with).as_deref(),
+            Some(
+                "runtime pins: pulled-style@0.1.0 (pulled by ses_puller), fetcher@1.0.0 (pulled by \
+                 ses_other)"
+            )
+        );
+        assert_eq!(pins(empty), None);
+        assert_eq!(pins(older), None);
     }
 }
