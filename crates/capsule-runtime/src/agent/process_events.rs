@@ -652,8 +652,10 @@ impl<'a> ProcessEventSink<'a> {
             reported.as_ref(),
         )
         .await;
-        // A hook's `run-inference` is answered with `InferenceUnavailable::ProcessTransport` on
-        // this transport, so it buffers no `HookInferenceRecord` or spend refusal to flush.
+        // No hook inference flush after this emit or the `on-tool-call` one: a hook's
+        // `run-inference` is answered with `InferenceUnavailable::ProcessTransport` on this
+        // transport, so it buffers no `HookInferenceRecord` or spend refusal. A change that lets
+        // the call through must flush at both, ahead of the turn's own record, as http does.
         let hook_artifacts = hooks
             .emit(
                 &self.workdir,

@@ -436,23 +436,28 @@ fn path_value() -> &'static str {
 
 // ── The provider the http parity capsule answers to ───────────────────────────
 
+/// A provider answer that makes one `echo-tool` call.
+fn echo_tool_call() -> String {
+    serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{
+            "type": "tool_use",
+            "id": "call_1",
+            "name": TOOL,
+            "input": { "msg": "ping" }
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
 fn tool_then_answer_server() -> common::ScriptedServer {
     common::ScriptedServer::start(vec![
-        serde_json::json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{
-                "type": "tool_use",
-                "id": "call_1",
-                "name": TOOL,
-                "input": { "msg": "ping" }
-            }],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string(),
+        echo_tool_call(),
         serde_json::json!({
             "id": "msg_2",
             "type": "message",
@@ -1069,20 +1074,6 @@ fn print_inference_evidence(events: &[SseEvent], trace: &[Value]) {
     }
 }
 
-/// A scripted provider answer: `end_turn` carrying `text`.
-fn end_turn(id: &str, text: &str) -> String {
-    serde_json::json!({
-        "id": id,
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()
-}
-
 /// Under `transport: http` a hook's `run-inference` reaches the provider, and its `inference` line
 /// is written on the hook's turn, tagged with the hook's origin, ahead of that turn's own line.
 #[test]
@@ -1095,24 +1086,10 @@ fn a_hook_s_run_inference_is_traced_on_its_turn_ahead_of_the_turn_on_http() {
     // The agent's turn is dispatched before its `on-inference` hooks run, so each turn's answer
     // precedes the hook's completion.
     let server = common::ScriptedServer::start(vec![
-        serde_json::json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{
-                "type": "tool_use",
-                "id": "call_1",
-                "name": TOOL,
-                "input": { "msg": "ping" }
-            }],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string(),
-        end_turn("msg_hook_1", "HOOK-COMPLETION"),
-        end_turn("msg_2", "PARITY-ANSWER"),
-        end_turn("msg_hook_2", "HOOK-COMPLETION"),
+        echo_tool_call(),
+        common::idle_capsule::end_turn(2, "HOOK-COMPLETION"),
+        common::idle_capsule::end_turn(3, "PARITY-ANSWER"),
+        common::idle_capsule::end_turn(4, "HOOK-COMPLETION"),
     ]);
     let capsule = http_capsule(&server, "hook-infer-http", true, Some(&inferring_hook()));
     let events = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);

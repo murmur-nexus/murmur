@@ -443,16 +443,14 @@ pub fn conversation_reading_task_end_hook_wasm() -> Vec<u8> {
 /// Interface a hook imports `run-inference` from.
 const INFERENCE_IFACE: &str = "murmur:runtime/inference@0.4.0";
 
-/// An `on-compaction` hook that calls `run-inference` once — no messages, no system prompt,
-/// `model: none` — and returns `err(<text>)`, where `text` is whichever string the call produced:
-/// the completion's text on `ok`, the error on `err`.
+/// A hook component whose handler calls `run-inference` once — no messages, no system prompt,
+/// `model: none` — then runs `store_output` and returns [`RETURN_AREA`].
 ///
 /// `run-inference`'s `result<inference-response, string>` is written to 256: discriminant at 0 and
-/// either string's ptr/len at 8/12, since both payloads start at the record's 8-byte alignment.
-/// The lifted `result<hook-output, string>` is at [`RETURN_AREA`]: discriminant `1` at 0, the error
-/// string's ptr/len at 4/8.
-pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
-    let wat = format!(
+/// either string's ptr/len at 264/268, since both payloads start at the record's 8-byte alignment.
+/// `store_output` lays the lifted `result<hook-output, string>` at [`RETURN_AREA`] from there.
+fn run_inference_hook_wat(handler_params: &str, store_output: &str, exports: &str) -> String {
+    format!(
         r#"(component
   (import "{INFERENCE_IFACE}" (instance $inf
     (type (option string))
@@ -503,15 +501,13 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
   (core module $m
     (import "libc" "memory" (memory 4))
     (import "inf" "run" (func $run (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
-    (func (export "handler") (param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32) (result i32)
+    (func (export "handler") {handler_params} (result i32)
       (call $run
         (i32.const 0) (i32.const 0)
         (i32.const 0) (i32.const 0) (i32.const 0)
         (i32.const 0) (i32.const 0) (i32.const 0)
         (i32.const 256))
-      (i32.store (i32.const {RETURN_AREA}) (i32.const 1))
-      (i32.store (i32.const {ptr}) (i32.load (i32.const 264)))
-      (i32.store (i32.const {len}) (i32.load (i32.const 268)))
+      {store_output}
       (i32.const {RETURN_AREA}))
     (func (export "noop"))
   )
@@ -520,102 +516,53 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
     (with "inf" (instance (export "run" (func $run_lowered))))))
 
 {exports}
-)"#,
+)"#
+    )
+}
+
+/// An `on-compaction` hook that calls `run-inference` once and returns `err(<text>)`, where `text`
+/// is whichever string the call produced: the completion's text on `ok`, the error on `err`.
+///
+/// The lifted `result<hook-output, string>` is at [`RETURN_AREA`]: discriminant `1` at 0, the error
+/// string's ptr/len at 4/8.
+pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
+    let store_output = format!(
+        "(i32.store (i32.const {RETURN_AREA}) (i32.const 1))
+      (i32.store (i32.const {ptr}) (i32.load (i32.const 264)))
+      (i32.store (i32.const {len}) (i32.load (i32.const 268)))",
         ptr = RETURN_AREA + 4,
         len = RETURN_AREA + 8,
-        exports = lifecycle_exports("on-compaction", COMPACTION_EVENT, "compaction-event"),
+    );
+    let wat = run_inference_hook_wat(
+        "(param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32)",
+        &store_output,
+        &lifecycle_exports("on-compaction", COMPACTION_EVENT, "compaction-event"),
     );
     wat::parse_str(&wat).expect("run-inference compaction hook WAT parses")
 }
 
-/// An `on-inference` hook that calls `run-inference` once — no messages, no system prompt,
-/// `model: none` — and returns `artifact(<text>)`, where `text` is whichever string the call
-/// produced: the completion's text on `ok`, the error on `err`. Bind it with
-/// `commit_policy: none`.
+/// An `on-inference` hook that calls `run-inference` once and returns `artifact(<text>)`, where
+/// `text` is whichever string the call produced: the completion's text on `ok`, the error on
+/// `err`. Bind it with `commit_policy: none`.
 ///
-/// `inference-event` arrives as one pointer the handler ignores. `run-inference`'s result is
-/// written to 256 as in [`run_inference_then_err_compaction_hook_wasm`], either string's ptr/len
-/// at 264/268. The lifted `result<hook-output, string>` is at [`RETURN_AREA`]: `ok` (`0`) at 0,
-/// then the `hook-output` at 4 — discriminant `3` (`artifact`) at 4, the string's ptr/len at
-/// 8/12.
+/// `inference-event` arrives as one pointer the handler ignores. The lifted
+/// `result<hook-output, string>` is at [`RETURN_AREA`]: `ok` (`0`) at 0, then the `hook-output` at
+/// 4 — discriminant `3` (`artifact`) at 4, the string's ptr/len at 8/12.
 pub fn run_inference_then_artifact_hook_wasm() -> Vec<u8> {
     let shape = event_shape("on-inference");
-    let wat = format!(
-        r#"(component
-  (import "{INFERENCE_IFACE}" (instance $inf
-    (type (option string))
-    (type (enum "replace-context" "seed-context"))
-    (export "context-insertion" (type (eq 1)))
-    (type (option 2))
-    (type (record
-      (field "role" string)
-      (field "content" string)
-      (field "id" 0)
-      (field "source-id" 0)
-      (field "inserted-by" 3)))
-    (export "message" (type (eq 4)))
-    (type (list 5))
-    (type (record
-      (field "messages" 6)
-      (field "system-prompt" 0)
-      (field "model" 0)))
-    (export "inference-request" (type (eq 7)))
-    (type (record
-      (field "text" string)
-      (field "model-used" string)
-      (field "input-tokens" u64)
-      (field "output-tokens" u64)))
-    (export "inference-response" (type (eq 9)))
-    (type (result 10 (error string)))
-    (export "run-inference" (func (param "request" 8) (result 11)))
-  ))
-  (alias export $inf "run-inference" (func $runi))
-
-  ;; Memory and `realloc` in their own module, so the lowered import can name them without a
-  ;; cyclic instantiation.
-  (core module $libc
-    (memory (export "memory") 4)
-    (global $bump (mut i32) (i32.const 65536))
-    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
-      (local $p i32)
-      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
-      (global.set $bump (i32.add (local.get $p) (local.get 3)))
-      (local.get $p))
-  )
-  (core instance $li (instantiate $libc))
-  (alias core export $li "memory" (core memory $mem))
-  (alias core export $li "realloc" (core func $realloc))
-  (core func $run_lowered
-    (canon lower (func $runi) (memory $mem) (realloc $realloc) string-encoding=utf8))
-
-  (core module $m
-    (import "libc" "memory" (memory 4))
-    (import "inf" "run" (func $run (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
-    (func (export "handler") {params} (result i32)
-      (call $run
-        (i32.const 0) (i32.const 0)
-        (i32.const 0) (i32.const 0) (i32.const 0)
-        (i32.const 0) (i32.const 0) (i32.const 0)
-        (i32.const 256))
-      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+    let store_output = format!(
+        "(i32.store (i32.const {RETURN_AREA}) (i32.const 0))
       (i32.store (i32.const {disc}) (i32.const 3))
       (i32.store (i32.const {ptr}) (i32.load (i32.const 264)))
-      (i32.store (i32.const {len}) (i32.load (i32.const 268)))
-      (i32.const {RETURN_AREA}))
-    (func (export "noop"))
-  )
-  (core instance $i (instantiate $m
-    (with "libc" (instance $li))
-    (with "inf" (instance (export "run" (func $run_lowered))))))
-
-{exports}
-)"#,
-        params = shape.params,
+      (i32.store (i32.const {len}) (i32.load (i32.const 268)))",
         disc = RETURN_AREA + 4,
         ptr = RETURN_AREA + 8,
         len = RETURN_AREA + 12,
-        exports =
-            lifecycle_exports_with("on-inference", HOOK_OUTPUT, shape.decls, shape.type_exports),
+    );
+    let wat = run_inference_hook_wat(
+        shape.params,
+        &store_output,
+        &lifecycle_exports_with("on-inference", HOOK_OUTPUT, shape.decls, shape.type_exports),
     );
     wat::parse_str(&wat).expect("run-inference inference hook WAT parses")
 }
