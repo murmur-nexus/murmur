@@ -925,6 +925,7 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | `inference.model` | string | yes | Model identifier passed to the driver. |
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
+| `inference.tool_refresh` | `compaction \| immediate` | no | When an artifact installed mid-session reaches the tool list the model is offered. Default: `compaction`. See [Tool refresh](#inference-tool-refresh). |
 
 This field is read under both transports, against a different measurement on each:
 
@@ -1301,6 +1302,60 @@ against a process driver whose `describe()` reports no usage is refused at launc
 A delegated child is bounded by its own `inference.max_session_tokens` and by the machine ceiling,
 not by its parent's session ceiling.
 
+#### Tool refresh: `inference.tool_refresh` { #inference-tool-refresh }
+
+The tool list the model is offered is built from the session's installed artifacts at the start of
+each task, and every inference call of that task sends it unchanged. An artifact installed during
+the task through [`manage.pull`](wit-interfaces.md#murmurartifact-managermanage) is added at the
+boundary `inference.tool_refresh` names:
+
+| Value | The installed artifact is offered from | Cost |
+|---|---|---|
+| `compaction` (default) | The first inference call after a compaction replaces the context, or the start of the next task, whichever comes first | The tool list and system prompt miss the provider's prompt cache on that call. The conversation already misses it after a compaction |
+| `immediate` | The next inference call | That call misses the provider's prompt cache for its whole prompt |
+
+The tool list sits at the head of the prompt the provider caches, so any change to it is a cache
+miss for everything after it — see [Measured cost](#inference-tool-refresh-cost).
+
+**The default does not deliver next-turn use.** Compaction runs only when the conversation reaches
+[`context.max_tokens`](#field-context), which may be many turns away or never within a task. A
+capsule that installs an artifact and uses it on the following turn must set `immediate`.
+
+A session that installs nothing sends the same tool list on every call under either value.
+`manage` is provided to a script capsule's own component, and not to tools or hooks, so an agent
+session with `transport: http` has no way to install mid-task: its tool list changes only at the
+start of a task, whichever value is set.
+
+What the model can do with an artifact once it is offered depends on its runtime:
+
+| Pulled artifact | Offered | Callable |
+|---|---|---|
+| `runtime: skill` | Yes, with no input parameters | Yes: calling it returns its `skill.md` |
+| The skill named by [`inference.system_prompt_artifact`](#inference-system-prompt-artifact) | No | — |
+| A WASM or native tool not declared in `artifacts:` | Yes | No: the call returns `tool '<name>' is not declared in manifest allowlist` |
+| `runtime: driver` or `runtime: hook` | No | — |
+
+Each refresh writes a [`tools_refreshed`](observability-schemas.md#tools-refreshed) line to
+`trace.jsonl` just before the `inference` line of the call that carries the new list, and
+`session_start.tool_refresh` records the value in effect.
+
+Refused under `transport: process` with `E-MAN-003`: the harness owns its tool list.
+
+##### Measured cost { #inference-tool-refresh-cost }
+
+Three consecutive calls of one conversation against OpenAI `gpt-5.6-luna` through
+`murmur-driver-openai`, each within seconds of the last, with the same system prompt and each
+call's messages beginning with every message of the call before:
+
+| Call | Tool list | Input tokens | Read from cache |
+|---|---|---:|---:|
+| Before the install | One skill | 3,325 | 3,303 |
+| First call carrying the new list | One skill added, sorting first | 3,359 | 0 |
+| The call after | Unchanged since the previous call | 3,378 | 3,356 |
+
+The same session's tool list and system prompt count 347 tokens by the runtime's own estimate: that
+is what a `compaction` refresh gives up, against the whole prompt for an `immediate` one.
+
 ### `transport: process` — harness subprocess { #transport-process }
 
 Murmur runs a harness CLI as a subprocess and communicates over stdin/stdout, driving it through
@@ -1338,6 +1393,7 @@ inference:
 | Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
 | Spend ceilings | [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend) are enforced against those reported counts. |
 | Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the harness manages its own context. |
+| Tool refresh | The harness's. [`inference.tool_refresh`](#inference-tool-refresh) is refused with `E-MAN-003`; the tool list is bound once per task. |
 | Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |
 | Conversation | The harness's. Murmur keeps no message list and writes no `conversation.jsonl`; it maps each context to the harness's own session id in a [harness session map](workdir.md#harness-session-map), which is what [`lifecycle.conversation: threaded`](#lifecycle-conversation) and [`mur run --resume`](cli.md#mur-run) continue. A session the harness cannot find fails the turn with [`E-RUN-036`](diagnostics.md#e-run-036). |
 

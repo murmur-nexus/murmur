@@ -1060,6 +1060,40 @@ pub struct InferenceConfig {
     /// counts the harness's driver reports for each turn. Setting it against a process driver
     /// that reports no usage is refused at load.
     pub max_session_tokens: Option<u64>,
+    /// `inference.tool_refresh`: when an artifact installed mid-session reaches the tool array
+    /// the agent loop sends the model. Always [`ToolRefresh::Compaction`] under
+    /// `transport: process`, where the key is refused at parse time and nothing reads it.
+    pub tool_refresh: ToolRefresh,
+}
+
+/// `inference.tool_refresh`: the turn boundary at which the http agent loop rebuilds the tool
+/// array it sends the model, once the session's installed set has changed.
+///
+/// The array comes first in every provider's cached prompt prefix, so rebuilding it is a full
+/// prompt-cache miss on the call that carries it. The start of the next task rebuilds it under
+/// either value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolRefresh {
+    /// Rebuild before the first inference call after a compaction commits a replacement
+    /// context, whose message history is already a full cache miss.
+    #[default]
+    Compaction,
+    /// Rebuild before the next inference call after the install.
+    Immediate,
+}
+
+impl ToolRefresh {
+    /// Every value, in the order refusals name them.
+    pub const ALL: [ToolRefresh; 2] = [Self::Compaction, Self::Immediate];
+
+    /// The value as written in the manifest and in `trace.jsonl`.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Compaction => "compaction",
+            Self::Immediate => "immediate",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2209,6 +2243,8 @@ struct RawInferenceConfig {
     max_tokens: Option<u32>,
     #[serde(default)]
     max_session_tokens: Option<u64>,
+    #[serde(default)]
+    tool_refresh: Option<String>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2739,6 +2775,7 @@ impl RawBlock for RawInferenceConfig {
         "max_task_reopens",
         "max_tokens",
         "max_session_tokens",
+        "tool_refresh",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -4540,6 +4577,7 @@ fn parse_inference(
                     message: "must be greater than 0".to_string(),
                 });
             }
+            let tool_refresh = parse_tool_refresh(raw.tool_refresh.as_deref())?;
 
             Ok(Some(InferenceConfig {
                 transport,
@@ -4553,6 +4591,7 @@ fn parse_inference(
                 max_turns,
                 max_tokens: raw.max_tokens,
                 max_session_tokens: raw.max_session_tokens,
+                tool_refresh,
             }))
         }
         "process" => {
@@ -4569,6 +4608,14 @@ fn parse_inference(
             if raw.max_tokens.is_some() {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.max_tokens".to_string(),
+                    message: "is not valid with transport: process".to_string(),
+                });
+            }
+            // The harness owns its tool list and runs its own compaction, so neither trigger has a
+            // turn boundary here to act on.
+            if raw.tool_refresh.is_some() {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.tool_refresh".to_string(),
                     message: "is not valid with transport: process".to_string(),
                 });
             }
@@ -4611,6 +4658,7 @@ fn parse_inference(
                 max_turns,
                 max_tokens: None,
                 max_session_tokens: raw.max_session_tokens,
+                tool_refresh: ToolRefresh::default(),
             }))
         }
         other => Err(RuntimeManifestError::InvalidInferenceConfig {
@@ -4618,6 +4666,23 @@ fn parse_inference(
             message: format!("unknown value '{other}'"),
         }),
     }
+}
+
+/// `inference.tool_refresh` under `transport: http`: absent is [`ToolRefresh::Compaction`].
+fn parse_tool_refresh(raw: Option<&str>) -> Result<ToolRefresh, RuntimeManifestError> {
+    let Some(value) = raw else {
+        return Ok(ToolRefresh::default());
+    };
+    ToolRefresh::ALL
+        .into_iter()
+        .find(|refresh| refresh.wire_name() == value)
+        .ok_or_else(|| RuntimeManifestError::InvalidInferenceConfig {
+            field: "inference.tool_refresh".to_string(),
+            message: format!(
+                "must be one of: {}; got '{value}'",
+                ToolRefresh::ALL.map(ToolRefresh::wire_name).join(", ")
+            ),
+        })
 }
 
 fn parse_context(
@@ -8984,6 +9049,85 @@ inference:
             "error was: {msg}"
         );
         assert!(msg.contains("greater than 0"), "error was: {msg}");
+    }
+
+    /// An http capsule manifest with `extra` appended to its `inference:` block.
+    fn http_manifest_with_inference(extra: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    \
+             version: 0.1.0\n    runtime: driver\n    gateway:\n      \
+             endpoint: https://api.anthropic.com\n      api_key: test-key\n\
+             inference:\n  transport: http\n  model: claude-opus-4-5\n  driver:\n    \
+             artifact: murmur-driver-anthropic\n{extra}"
+        )
+    }
+
+    #[test]
+    fn inference_tool_refresh_absent_is_compaction() {
+        let manifest = RuntimeManifest::from_yaml_str(&http_manifest_with_inference("")).unwrap();
+        assert_eq!(
+            manifest.inference.unwrap().tool_refresh,
+            ToolRefresh::Compaction
+        );
+        assert_eq!(ToolRefresh::default(), ToolRefresh::Compaction);
+    }
+
+    #[test]
+    fn inference_tool_refresh_parses_both_values() {
+        for (value, expected) in [
+            ("compaction", ToolRefresh::Compaction),
+            ("immediate", ToolRefresh::Immediate),
+        ] {
+            let manifest = RuntimeManifest::from_yaml_str(&http_manifest_with_inference(&format!(
+                "  tool_refresh: {value}\n"
+            )))
+            .unwrap();
+            assert_eq!(manifest.inference.unwrap().tool_refresh, expected);
+            assert_eq!(expected.wire_name(), value);
+            assert!(
+                manifest.unknown_keys.is_empty(),
+                "tool_refresh is a known key: {:?}",
+                manifest.unknown_keys
+            );
+        }
+    }
+
+    #[test]
+    fn inference_tool_refresh_rejects_an_unknown_value() {
+        let err = RuntimeManifest::from_yaml_str(&http_manifest_with_inference(
+            "  tool_refresh: sometimes\n",
+        ))
+        .unwrap_err();
+        match err {
+            RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                assert_eq!(field, "inference.tool_refresh");
+                assert_eq!(
+                    message,
+                    "must be one of: compaction, immediate; got 'sometimes'"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Refused whatever its value: the harness owns its tool list under `transport: process`,
+    /// so the key would be silently inert there.
+    #[test]
+    fn process_transport_rejects_tool_refresh() {
+        for value in ["compaction", "immediate"] {
+            let err = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  \
+                 command: claude\n  model: claude-haiku-4-5-20251001\n  tool_refresh: {value}\n"
+            ))
+            .unwrap_err();
+            match err {
+                RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                    assert_eq!(field, "inference.tool_refresh");
+                    assert_eq!(message, "is not valid with transport: process");
+                }
+                other => panic!("unexpected error for {value}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -664,6 +664,29 @@ struct ControlAppliedEvent {
     change_id: String,
 }
 
+/// The first inference call to send a tool array rebuilt after a mid-session install.
+#[derive(Debug, Deserialize)]
+struct ToolsRefreshedEvent {
+    turn: u32,
+    trigger: String,
+    #[serde(default)]
+    added: Vec<String>,
+    #[serde(default)]
+    removed: Vec<String>,
+}
+
+impl ToolsRefreshedEvent {
+    /// `<trigger>  +<added>…  -<removed>…`, the part `show` and `steps` render alike.
+    fn changes(&self) -> String {
+        let added = self.added.iter().map(|name| format!("  +{name}"));
+        let removed = self.removed.iter().map(|name| format!("  -{name}"));
+        std::iter::once(self.trigger.clone())
+            .chain(added)
+            .chain(removed)
+            .collect()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -712,6 +735,7 @@ enum TraceEvent {
     ControlChange(ControlChangeEvent),
     ControlRefused(ControlRefusedEvent),
     ControlApplied(ControlAppliedEvent),
+    ToolsRefreshed(ToolsRefreshedEvent),
     #[serde(other)]
     Unknown,
 }
@@ -955,6 +979,8 @@ struct TraceMetrics {
     /// Every `compaction_declined` record, in file order. A decline leaves the session running
     /// over budget, so all of them are kept rather than just the last.
     compactions_declined: Vec<CompactionDeclinedRecord>,
+    /// Every `tools_refreshed` record, in file order: each is a turn whose `tools` hash changed.
+    tool_refreshes: Vec<ToolsRefreshedEvent>,
     /// Every `task_canceled` record, in file order — one per task a person stopped.
     cancels: Vec<CancelRecord>,
     /// Every `task_rejected` record, in file order — one per queued task the session refused.
@@ -1436,6 +1462,7 @@ fn compute_metrics(
     let mut skill_call_records: Vec<SkillCallRecord> = Vec::new();
     let mut compaction: Option<CompactionRecord> = None;
     let mut compactions_declined: Vec<CompactionDeclinedRecord> = Vec::new();
+    let mut tool_refreshes: Vec<ToolsRefreshedEvent> = Vec::new();
     // Task ids seen on a `task_start`, so a `task_end` with no opening line is ignored rather
     // than counted as a task.
     let mut task_starts: HashSet<String> = HashSet::new();
@@ -1798,6 +1825,7 @@ fn compute_metrics(
                     record.applied_turn = Some(applied.turn);
                 }
             }
+            TraceEvent::ToolsRefreshed(refresh) => tool_refreshes.push(refresh),
             TraceEvent::ControlRefused(refused) => {
                 *control_refusals
                     .entry(format!("HTTP {}", refused.status))
@@ -1857,6 +1885,7 @@ fn compute_metrics(
             skill_call_records,
             compaction,
             compactions_declined,
+            tool_refreshes,
             cancels,
             rejections,
             failures,
@@ -2223,7 +2252,7 @@ fn print_show(m: &TraceMetrics) {
         .iter()
         .filter(|rec| rec.is_agent_loop() && rec.has_hashes())
         .collect();
-    if !wire_turns.is_empty() {
+    if !wire_turns.is_empty() || !m.tool_refreshes.is_empty() {
         println!("── Wire ─────────────────────────────────────────");
         for rec in &wire_turns {
             println!(
@@ -2245,10 +2274,15 @@ fn print_show(m: &TraceMetrics) {
                 if rec.message_shas.len() == 1 { "" } else { "s" }
             );
         }
-        println!(
-            "bodies:     mur trace show --body system --turn {}",
-            wire_turns[0].turn
-        );
+        for refresh in &m.tool_refreshes {
+            println!("refreshed:  turn {}  {}", refresh.turn, refresh.changes());
+        }
+        if let Some(first) = wire_turns.first() {
+            println!(
+                "bodies:     mur trace show --body system --turn {}",
+                first.turn
+            );
+        }
         println!();
     }
 
@@ -3258,6 +3292,14 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.turn,
             fmt_id_short(&e.change_id, 12)
         ),
+        TraceEvent::ToolsRefreshed(e) => {
+            format!(
+                "{}{}  turn {}",
+                kind("tools_refreshed"),
+                e.changes(),
+                e.turn
+            )
+        }
         TraceEvent::PlanEnd(e) => format!(
             "{}{}{}",
             kind("plan_end"),
@@ -4341,6 +4383,23 @@ mod tests {
         assert_eq!(
             rejected_show_row(&e),
             "task_rejected  tsk_1  session_stopped  source unknown"
+        );
+    }
+
+    /// A `tools_refreshed` line parses into its own variant rather than falling through to
+    /// `Unknown`, and its row names the trigger, what entered and left the array, and the turn.
+    #[test]
+    fn tools_refreshed_renders_a_steps_row() {
+        let line = r#"{"event_type":"tools_refreshed","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"turn":3,"task_id":"tsk_1","trigger":"compaction","added":["aaa-late-skill"],"removed":["old-tool"],"tools":["aaa-late-skill","zzz-existing-tool"]}"#;
+        let TraceEvent::ToolsRefreshed(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+        else {
+            panic!("a tools_refreshed line parses as ToolsRefreshed");
+        };
+        assert_eq!(e.turn, 3);
+        assert_eq!(e.trigger, "compaction");
+        assert_eq!(
+            row(line),
+            "tools_refreshed compaction  +aaa-late-skill  -old-tool  turn 3"
         );
     }
 

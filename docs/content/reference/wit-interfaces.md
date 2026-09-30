@@ -225,6 +225,11 @@ form. `diagnostics` states the grant in `runtime-state.capabilities`, as
 `install skill: <entries>; install tool: <entries>`, or as `pull: not granted` when the capsule
 declares none.
 
+A pulled artifact reaches the tool list an `http` agent's model is offered at the boundary
+[`inference.tool_refresh`](manifest.md#inference-tool-refresh) names: the next inference call
+under `immediate`, or the first call after a compaction under the default `compaction`, and at the
+start of the next task under either.
+
 A pulled WASM artifact is compiled once per version and kept in
 [`~/.murmur/compiled`](config.md#murmur-home-permissions), shared with `mur run`, so a later pull
 or launch of that version, in any session, skips compiling it.

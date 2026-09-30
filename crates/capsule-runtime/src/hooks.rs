@@ -2121,6 +2121,45 @@ async fn log_hook_error(workdir: &Path, hook_name: &str, error: &str) {
     }
 }
 
+/// Hook runtimes other modules' tests drive the compaction path through.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use murmur_artifact::HookBinding;
+
+    use super::{tests, HookRuntime};
+
+    /// A runtime whose one `on-compaction` hook replaces the context with a single message:
+    /// role `role`, content the `inference.compaction.model` it was handed.
+    pub(crate) async fn echo_compaction_hooks(
+        engine: &wasmtime::Engine,
+        workdir: &Path,
+        role: &str,
+    ) -> HookRuntime {
+        let double = tests::hook_compaction_echo_double(engine, "model", role);
+        tests::new_with_hooks(
+            engine,
+            workdir,
+            workdir,
+            vec![tests::staged_double_named(
+                "compactor",
+                HookBinding::OnCompaction,
+                double,
+            )],
+        )
+        .await
+        .expect("compaction double instantiates")
+    }
+
+    /// A runtime with no hook bound, so a compaction is declined for want of a replacement.
+    pub(crate) async fn no_hooks(engine: &wasmtime::Engine, workdir: &Path) -> HookRuntime {
+        tests::new_with_hooks(engine, workdir, workdir, Vec::new())
+            .await
+            .expect("empty hook set")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2201,7 +2240,7 @@ mod tests {
         }
     }
 
-    async fn new_with_hooks(
+    pub(super) async fn new_with_hooks(
         engine: &wasmtime::Engine,
         workdir: &Path,
         accessible: &Path,
@@ -2360,7 +2399,7 @@ mod tests {
         });
     }
 
-    fn staged_double_named(
+    pub(super) fn staged_double_named(
         name: &str,
         binding: HookBinding,
         component: Component,
@@ -2849,7 +2888,7 @@ mod tests {
     /// Unlike the other doubles this one needs a genuine bump `realloc` — a fixed
     /// address would lower the messages list, the model string and the system-prompt
     /// string all on top of each other, and the echoed bytes would be garbage.
-    fn hook_compaction_echo_double(
+    pub(super) fn hook_compaction_echo_double(
         engine: &wasmtime::Engine,
         field: &str,
         role: &str,
