@@ -1478,6 +1478,7 @@ inference:
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. |
 | Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
 | Spend ceilings | [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend) are enforced against those reported counts. |
+| Hook `run-inference` | Unavailable: a hook's [`run-inference`](wit-interfaces.md#murmurruntimeinference) call returns an error, sends nothing, counts toward no spend ceiling, and writes nothing to the trace. |
 | Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the harness manages its own context. |
 | Tool refresh | The harness's. [`inference.tool_refresh`](#inference-tool-refresh) is refused with `E-MAN-003`; the tool list is bound once per task. |
 | Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |

@@ -545,8 +545,8 @@ fail-closed rule that governs a policy hook's failures.
 A runtime-provided import available to any hook component that declares it. Nothing needs to be
 exported and nothing in the manifest changes.
 
-`run-inference` runs exactly one LLM completion through the capsule's configured driver
-(`inference.driver.artifact`).
+`run-inference` runs exactly one LLM completion through the capsule's
+[`transport: http`](manifest.md#transport-http) driver (`inference.driver.artifact`).
 
 | Case | Behaviour |
 |---|---|
@@ -554,14 +554,16 @@ exported and nothing in the manifest changes.
 | `model` given | Sends that model. If the driver or provider rejects it the call returns an error; the runtime never silently falls back. To retry on the primary model, call again without a model. |
 | No `system-prompt` given | No system prompt is sent |
 | No driver configured | Returns an error naming `inference.driver.artifact`. The import still links, so the hook itself runs. |
-| A spend ceiling refuses the call | Returns an error starting `spend ceiling reached:` that names [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) or [`spend.machine_tokens_per_day`](config.md#spend). Nothing is sent, and retrying will not succeed. |
+| Capsule runs under [`transport: process`](manifest.md#transport-process) | Returns an error saying `run-inference` is not available under that transport. Nothing is sent, nothing counts toward a spend ceiling, and nothing is written to the trace. The import still links, so the hook itself runs. |
+| A spend ceiling refuses the call | Returns an error starting `spend ceiling reached:` that names [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) or [`spend.machine_tokens_per_day`](config.md#spend). Nothing is sent, and retrying will not succeed. The refusal is recorded as a [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line carrying the hook's `origin`. |
 
 `model-used` is the model string the runtime actually sent. `input-tokens` and `output-tokens`
-are runtime-side tiktoken counts of the request payload and the raw driver response.
+are the runtime's own `cl100k_base` counts of the request payload and the raw driver response.
 
 Every call that reaches the driver, success or failure, writes one `inference` record to
 `trace.jsonl` and one `capsule.inference` OTel span carrying `origin: "hook:<hook name>"` and
-`model`.
+`model`. A call from an `on-inference` hook is recorded on that hook's turn, ahead of the turn's
+own `inference` line.
 
 ---
 

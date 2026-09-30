@@ -63,7 +63,7 @@ use crate::{
         SessionContextData, ShellDispatchInfo, TaskReopen,
     },
     identity::{self, CapsuleIdentity},
-    inference_import::HookInferenceCtx,
+    inference_import::{HookInferenceCtx, InferenceUnavailable},
     lanes::LaneQueue,
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
@@ -2278,9 +2278,9 @@ fn launch(
         let dataset_id = staged.dataset_id;
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
-        // Non-empty only for the WASM-driver transport; a `transport: process`
-        // capsule has no driver artifact, so a hook's `run-inference` correctly
-        // reports "no driver configured" rather than silently doing nothing.
+        // The driver artifact the manifest names, under either transport. Only a
+        // `transport: http` driver can back a hook's `run-inference`: a process
+        // driver never enters `tool_components` (see `hook_inference`).
         let inference_driver_name = inference
             .driver
             .as_ref()
@@ -2570,42 +2570,49 @@ fn launch(
                         control: control_for_state.clone(),
                     };
 
-                    // Backing for the hooks' `murmur:runtime/inference` import.
+                    // Backing for the hooks' `murmur:runtime/inference` import, or why a
+                    // hook's call has none — decided here, once per session.
                     // Sourced from `state` (built directly above) so a hook's
                     // `run-inference` runs the *same* driver component, under the
                     // same capability policy and network allowlist, as the agent
-                    // loop's own turns. `None` when no driver artifact is staged.
-                    let hook_inference = inference_driver_name
-                        .as_ref()
-                        .and_then(|driver_name| {
-                            state
-                                .tool_components
-                                .get(driver_name)
-                                .map(|component| (driver_name.clone(), component.clone()))
-                        })
-                        .map(|(driver_name, driver_component)| {
-                            // Same grant `dispatch_tool_async` would apply to this driver, so
-                            // a hook's `run-inference` cannot route around its narrowing.
-                            let driver_grant = state.artifact_grants.get(&driver_name).cloned();
-                            let gateway =
-                                gateway_for_store(state.gateways.inference(), &driver_name);
-                            Arc::new(HookInferenceCtx {
-                                driver_name,
-                                driver_component,
-                                model: inference_model.clone(),
-                                engine: state.engine.clone(),
-                                accessible_workdir: state.accessible_workdir.clone(),
-                                workdir: state.workdir.clone(),
-                                inference_env: state.inference_env.clone(),
-                                capability_policy: state.capability_policy.clone(),
-                                network_allow_rules: state.network_allow_rules.clone(),
-                                driver_grant,
-                                gateway,
-                                spend: Arc::clone(&state.spend),
-                                records: std::sync::Mutex::new(Vec::new()),
-                                spend_refusals: std::sync::Mutex::new(Vec::new()),
+                    // loop's own turns. Under `transport: process` the harness runs the
+                    // model and the runtime holds no driver it can call.
+                    let hook_inference = if inference.transport == "process" {
+                        Err(InferenceUnavailable::ProcessTransport)
+                    } else {
+                        inference_driver_name
+                            .as_ref()
+                            .and_then(|driver_name| {
+                                state
+                                    .tool_components
+                                    .get(driver_name)
+                                    .map(|component| (driver_name.clone(), component.clone()))
                             })
-                        });
+                            .map(|(driver_name, driver_component)| {
+                                // Same grant `dispatch_tool_async` would apply to this driver, so
+                                // a hook's `run-inference` cannot route around its narrowing.
+                                let driver_grant = state.artifact_grants.get(&driver_name).cloned();
+                                let gateway =
+                                    gateway_for_store(state.gateways.inference(), &driver_name);
+                                Arc::new(HookInferenceCtx {
+                                    driver_name,
+                                    driver_component,
+                                    model: inference_model.clone(),
+                                    engine: state.engine.clone(),
+                                    accessible_workdir: state.accessible_workdir.clone(),
+                                    workdir: state.workdir.clone(),
+                                    inference_env: state.inference_env.clone(),
+                                    capability_policy: state.capability_policy.clone(),
+                                    network_allow_rules: state.network_allow_rules.clone(),
+                                    driver_grant,
+                                    gateway,
+                                    spend: Arc::clone(&state.spend),
+                                    records: std::sync::Mutex::new(Vec::new()),
+                                    spend_refusals: std::sync::Mutex::new(Vec::new()),
+                                })
+                            })
+                            .ok_or(InferenceUnavailable::NotConfigured)
+                    };
 
                     // Create hooks ONCE — session_start fires once per capsule lifetime
                     let mut hooks = HookRuntime::new(
@@ -15623,7 +15630,7 @@ inference:
             },
             HookEnvVars::default(),
             crate::limits::ExecutionLimits::default(),
-            None,
+            Err(crate::inference_import::InferenceUnavailable::NotConfigured),
             None,
         )
         .await
@@ -16045,7 +16052,7 @@ inference:
             },
             HookEnvVars::default(),
             crate::limits::ExecutionLimits::default(),
-            None,
+            Err(crate::inference_import::InferenceUnavailable::NotConfigured),
             None,
         )
         .await
