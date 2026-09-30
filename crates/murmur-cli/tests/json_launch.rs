@@ -129,6 +129,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },
@@ -808,5 +809,110 @@ fn json_launch_answers_its_door_after_the_supervisor_stops_reading() {
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .any(|event| event["event_type"].as_str() == Some("task_end")),
         "the task submitted through the door should have run; trace was:\n{trace}"
+    );
+}
+
+// ── Door tokens ───────────────────────────────────────────────────────────────
+
+/// A capsule declaring `network.authentication` puts every token it minted on its readiness line,
+/// under `tokens`, and the operator token drives the door.
+#[test]
+fn door_tokens_are_on_the_readiness_line_of_an_authenticated_capsule() {
+    use common::door_capsule::{
+        agent_project, driver_home, end_turn, message, rpc, wait_completed, MurRun,
+        AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    };
+    let server = common::ScriptedServer::start(vec![end_turn(1, "done")]);
+    let home = driver_home();
+    let project = agent_project(
+        &server.endpoint,
+        CAPSULE_NAME,
+        "",
+        &format!("{QUEUE_SLEEP_YAML}{AUTHENTICATION_YAML}"),
+    );
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        true,
+        &[],
+        &[],
+    );
+
+    let mut keys: Vec<&str> = run
+        .startup
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "name",
+            "pid",
+            "session_id",
+            "tokens",
+            "url",
+            "version",
+            "workdir"
+        ]
+    );
+    let mut names: Vec<&str> = run.startup["tokens"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["operator", "reader", "watcher"]);
+    for name in names {
+        assert!(run.token(name).starts_with("mdt1."), "{name}");
+    }
+
+    let addr = run.url();
+    let operator = run.token("operator");
+    let sent = rpc(
+        &addr,
+        Some(&operator),
+        "message/send",
+        message("m-1", "hello"),
+    );
+    assert_eq!(sent.status, 200, "{sent:?}");
+    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    wait_completed(&addr, Some(&operator), &task_id);
+
+    let stderr = run.stderr();
+    assert!(
+        !stderr.contains("mdt1."),
+        "a token reached stderr:\n{stderr}"
+    );
+}
+
+/// A capsule declaring nothing keeps the six keys it always had.
+#[test]
+fn door_tokens_are_absent_from_a_public_capsule_readiness_line() {
+    use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(&server.endpoint, CAPSULE_NAME, "", QUEUE_SLEEP_YAML);
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        true,
+        &[],
+        &[],
+    );
+    let mut keys: Vec<&str> = run
+        .startup
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["name", "pid", "session_id", "url", "version", "workdir"]
     );
 }

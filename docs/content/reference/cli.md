@@ -107,8 +107,12 @@ A session whose manifest declares `control:` also holds its control token beside
 
 Each record carries the session id, the capsule address, the process id and its start time, the
 capsule name and version, the session workdir, whether the session outlives its launcher, and the
-time it started. It carries nothing from the environment: no API key, no granted variable, no
-token.
+time it started. It carries nothing from the environment: no API key, no granted variable.
+
+A session whose manifest declares [`network.authentication`](manifest.md#field-network-authentication)
+also records its operator token, as `door_token`. [`mur ps`](#mur-ps), [`mur stop`](#mur-stop),
+[`mur watch`](#mur-watch) and [`mur cancel`](#mur-cancel) present it to the door when they name the
+session by address. `mur ps` never prints it.
 
 Taken together the records are a map of every reachable capsule on the machine, readable by
 anything running as the same user. The `0700` directory and `0600` files are what keep that map
@@ -124,6 +128,9 @@ read verifies it in three layers, and a session is reported as running only when
 | 1 | Is a process holding that process id? | Little: process ids are handed out again |
 | 2 | Did that process start when the record says it did? | That the process id was not reused by something unrelated |
 | 3 | Does the capsule's agent card answer, naming that session? | That the capsule is the one being addressed and can still respond |
+
+Layer 3 reads the public card, or, for a record holding a `door_token`, the
+[extended card](agent-card.md#extended-card) with that token.
 
 Reading the records removes a record only on evidence that its process is gone — that is the only
 sweep there is, and it is enough because a record is never treated as truth.
@@ -550,10 +557,14 @@ murmur-tool-git          1.0.0    tool     darwin-aarch64  murmur:tool/run@0.1.0
 Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store, current-platform resolution `mur run` performs before staging.
 
 ```bash
-mur doctor
+mur doctor [--bind <ADDR>]
 ```
 
-`mur doctor` takes no flags or arguments. It walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints one checklist line per declared artifact:
+| Flag | Default | Description |
+|---|---|---|
+| `--bind` | `127.0.0.1` | The address `mur run --bind` would bind the capsule's door on. With an address off loopback and no [`network.authentication`](manifest.md#field-network-authentication), prints [`W-SEC-032`](diagnostics.md#w-sec-032) |
+
+It walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints one checklist line per declared artifact:
 
 | Line | Meaning |
 |---|---|
@@ -584,6 +595,17 @@ For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilit
 For the same capsule, `mur doctor` also prints a `Formation environment` block: what the whole formation — that capsule and the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule to an exact version: `murmur.lock` pins it if the lockfile holds an entry for the name, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). No version is guessed — a name that no single source settles is listed as one the walk could not inspect. Nothing is launched and no daemon is contacted.
 
 The block also reports every variable the project manifest itself references as `${VAR}` and neither this shell nor the workspace `.env` sets. [`gateway.api_key`](manifest.md#gateway-api-key) on an artifact entry is the manifest field that takes such a reference. A capsule declaring no `spawn.allow` has no formation to walk, so it gets a block only when it has such a reference to report.
+
+`mur doctor` always prints one `door:` line saying who may call the capsule's A2A door:
+
+| Line | Manifest |
+|---|---|
+| `door: public (no network.authentication)` | No `network.authentication` |
+| `door: bearer — operator, <name> (<scopes>), …` | `network.authentication`, naming each declared credential and its scopes |
+
+When `--bind` is off loopback and the door is public, it also prints the [`W-SEC-032`](diagnostics.md#w-sec-032)
+line, byte for byte the line `mur run --bind` prints for the same manifest. Loopback is an IPv4
+address in `127.0.0.0/8`, `::1` or `localhost`.
 
 `mur doctor` parses the project manifest without resolving what it references, so a reference this shell cannot satisfy is a line in this block rather than a refusal ahead of it. `mur run` needs the value, and refuses the same manifest with [`E-MAN-003`](diagnostics.md#index).
 
@@ -807,7 +829,7 @@ mur run [--manifest <path>] [--task <path-or-text>] [--json]
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018), and `compact` under [`transport: process`](manifest.md#transport-process) — where the harness holds the history and murmur has none to summarize — with [`E-RUN-037`](diagnostics.md#e-run-037) |
 | <span id="run-forget-session">`--forget-session`</span> | off | Drop the harness session `--context` names, then run this launch's first task as a new conversation under the same context id. The answer to [`E-RUN-036`](diagnostics.md#e-run-036), where the harness no longer holds the conversation a context names and every later task in it fails the same way. The entry is deleted from the [harness session map](workdir.md#harness-session-map) and the run's trace records a `harness_session_forgotten` event naming the context, the id that was dropped and `requested_by: "cli"`; asked for a context with no entry, it drops nothing and records nothing. Applies to the launch's first task and to no later one. Requires `--context`, and cannot be combined with `--resume`, which asks for the opposite. Only [`transport: process`](manifest.md#transport-process) has a harness session, so every other transport refuses the launch with [`E-RUN-039`](diagnostics.md#e-run-039) |
 | `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
-| `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines |
+| `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines. An address off loopback on a capsule declaring no [`network.authentication`](manifest.md#field-network-authentication) prints [`W-SEC-032`](diagnostics.md#w-sec-032) on stderr |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |
 | `--verbose`, `-v` | off | Add `workdir:`, `manifest:`, `driver:` and `skills:` to the startup lines |
 | `--lifecycle-task-acceptance` | — | Override `lifecycle.task_acceptance` (`none`\|`single`\|`queue`) |
@@ -822,6 +844,25 @@ For the output modes, the read-only pre-flight checks and driving a capsule over
 
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
 - Creates/uses `murmur.lock` in manifest directory, except under `--capsule`, which has no project directory to hold one
+
+**Door tokens.** A capsule declaring [`network.authentication`](manifest.md#field-network-authentication)
+prints the tokens its runtime minted, on stdout only, once the door is up:
+
+| Mode | Output |
+|---|---|
+| Human | One `murmur: token <name> <token>` line per token, right after `murmur: url`: `operator` first, then the declared credentials by name |
+| `--json` | The readiness line gains `"tokens": {"operator": "<token>", "<name>": "<token>", …}`. A capsule declaring no `network.authentication` prints the line without the key |
+
+```text
+murmur: url localhost:41873
+murmur: token operator mdt1.eyJjcmVkZW50aWFsIjoib3BlcmF0b3IiLC4uLn0.Zk9x…
+murmur: token watcher mdt1.eyJjcmVkZW50aWFsIjoid2F0Y2hlciIsLi4ufQ.q2Lr…
+session: ses_019f01a940ce7761854e768ecbe3d399
+```
+
+A token is valid until the session ends. A line carrying a token that standard output refuses is
+dropped, never written to `logs/bootstrap.log`. What each token reaches is in
+[Agent Card: Security](agent-card.md#tokens).
 
 **Registration.** A capsule whose manifest declares `capabilities.spawn.allow`, and any capsule
 launched with `--spawn-grant-stdin`, registers with the daemon named by `MURMUR_ROOST_URL` at
@@ -1088,6 +1129,11 @@ mur watch --url <host:port>
 | `SESSION` | `@1` | A [session address](#session-addresses) naming a running capsule |
 | `--url` | — | A capsule's address, reached without resolving anything. Conflicts with `SESSION` |
 
+On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), a
+session address presents the operator token from the [running-capsule record](#running-capsule-records),
+and `--url` presents `MURMUR_DOOR_TOKEN` when it is set. A door that answers `401` or `403` fails
+the command with `E-IO-003`, naming the status and `MURMUR_DOOR_TOKEN`.
+
 The session is resolved against the [running-capsule record](#running-capsule-records) and verified
 before the connection is opened.
 
@@ -1167,6 +1213,13 @@ mur cancel --url <host:port> <TASK_ID>
 | `SESSION` | — | A [session address](#session-addresses) naming a running capsule |
 | `TASK_ID` | — | The `tsk_` id `message/send` returned, or the one `tasks/get` reports |
 | `--url` | — | A capsule's address, reached without resolving anything. Takes the place of `SESSION` |
+
+| Environment variable | Read by | Holds |
+|---|---|---|
+| `MURMUR_DOOR_TOKEN` | `mur cancel --url`, `mur watch --url` | A door token `mur run` printed, presented as `Authorization: Bearer` to a capsule declaring [`network.authentication`](manifest.md#field-network-authentication). A session address reads the operator token from the [running-capsule record](#running-capsule-records) instead |
+
+A door that answers `401` or `403` fails the command with `E-IO-003`, naming the status and
+`MURMUR_DOOR_TOKEN`.
 
 The in-flight inference call is dropped rather than waited out, and the task reaches the terminal
 state `canceled`. Nothing else is stopped: a detached shell command keeps its own lifecycle and a
@@ -1287,8 +1340,8 @@ mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--deploy-platform` | `linux-x86_64` | Platform the uploaded artifacts and `mur` binary are resolved for |
 | `--no-precompile` | off | Skip compiling the uploaded WASM artifacts on the target; they compile on the capsule's first launch instead |
 
-**Output — a summary box on stderr.** `mur deploy run` emits no JSON and writes nothing to stdout;
-progress and the final box both go to stderr.
+**Output — a summary box on stderr.** `mur deploy run` emits no JSON; progress and the final box
+both go to stderr. Standard output carries the capsule's door tokens alone, when it has any.
 
 ```
   ┌────────────────────────────────┐
@@ -1321,7 +1374,14 @@ for humans and its layout is not a stable interface.
 8. Run [`mur precompile --json --workdir /root/mur-<id>`](#mur-precompile) on the VM over every uploaded artifact, with the `.env` exported; skipped under `--no-precompile` or when the capsule declares no artifacts
 9. Run `mur run --manifest <path> --workdir /root/mur-<id> --json` on the VM with the same `.env` exported; wait up to 120s for the JSON line
 10. Parse `localhost:PORT` from the JSON output; open the port and construct the public URL
-11. Persist to `~/.murmur/deployments.json`; print the summary box
+11. Say who may call the published door:
+
+    | Manifest | Output |
+    |---|---|
+    | No [`network.authentication`](manifest.md#field-network-authentication) | [`W-SEC-032`](diagnostics.md#w-sec-032) on stderr, naming the public URL |
+    | `network.authentication` | One `token <name> <token>` line per token on stdout, `operator` first, then the declared credentials by name |
+
+12. Persist to `~/.murmur/deployments.json`; print the summary box
 
 Artifacts are pre-staged in step 6, so the remote `mur run` finds them installed and starts without fetching anything. Step 8 compiles them with the VM's own `mur`, so the capsule's first launch loads compiled forms instead of compiling; see [Precompile on the target](#deploy-precompile).
 

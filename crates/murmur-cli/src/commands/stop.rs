@@ -133,7 +133,8 @@ fn ask_the_door(record: &RunningRecord) -> Result<Value, String> {
     })
     .to_string();
 
-    let response = super::cancel::post_json(addr, &body).map_err(|e| e.message)?;
+    let response =
+        super::cancel::post_json(addr, &body, record.door_token.as_ref()).map_err(|e| e.message)?;
     if let Some(error) = response.get("error") {
         let message = error
             .get("message")

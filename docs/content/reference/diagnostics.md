@@ -47,7 +47,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure) | — |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication) or one declared beside a non-empty `capabilities.spawn.allow`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
 | `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
@@ -141,6 +141,7 @@ section that explains it.
 | `W-SEC-029` | A compiler driver could not be run to ask where its helper binaries live, so `W-SEC-012` was not evaluated for it | [W-SEC-029](#w-sec-029) |
 | `W-SEC-030` | An artifact reaches its upstream through an unmetered credential gateway, which the spend ceilings do not cover | [W-SEC-030](#w-sec-030) |
 | `W-SEC-031` | A `transport: process` harness session reports it is authenticating as something other than a subscription | [W-SEC-031](#w-sec-031) |
+| `W-SEC-032` | The A2A door is exposed off loopback and `network.authentication` is not declared | [W-SEC-032](#w-sec-032) |
 
 ---
 
@@ -1576,6 +1577,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-027`, `W-SEC-028`, `W-SEC-029`, `W-SEC-030` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 | `W-SEC-031` — decided mid-session, when the harness reports its session | stderr |
+| `W-SEC-032` — decided at staging by `mur run`, by `mur doctor`, and by `mur deploy run` once the port is published | stderr from `mur run` and `mur deploy run`; stdout from `mur doctor` |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -1702,8 +1704,8 @@ is the mechanism on this list most likely to interfere with an existing workload
 
 **Side effect worth knowing about:** the shell child's capability drop also removes
 `CAP_DAC_OVERRIDE` from a root-run capsule's subprocess, so it no longer bypasses ordinary
-file-permission checks. That is intended, but it is a real behavior change for root deployments
-whose shell steps relied on root's usual "can read anything" posture.
+file-permission checks. That is intended: a shell step that relies on root's usual "can read
+anything" posture fails under it.
 
 **What to do:** keep `shell.allow`, `network.allow` and `filesystem.scope` as narrow as the task
 genuinely needs, and don't run `mur run` as root if you can avoid it — a non-root capsule never had
@@ -2587,3 +2589,34 @@ a `harness_warning` event, beside the `harness_session` event that reported it.
 
 **What to do:** sign the harness in on the plan the run should spend from, or bound the key's spend
 with the provider's own controls.
+
+### W-SEC-032 — a public door off loopback { #w-sec-032 }
+
+**Fires when:** a capsule's A2A door is exposed off this host and its manifest declares no
+[`network.authentication`](manifest.md#field-network-authentication). Once per invocation, from:
+
+| Command | Exposure |
+|---|---|
+| [`mur run --bind <ADDR>`](cli.md#mur-run) | `ADDR` is off loopback |
+| [`mur doctor --bind <ADDR>`](cli.md#mur-doctor) | `ADDR` is off loopback |
+| [`mur deploy run`](cli.md#mur-deploy-run) | Always: it publishes the port at the VM's public address |
+
+Loopback is an IPv4 address in `127.0.0.0/8`, `::1` or `localhost`; `0.0.0.0`, `::` and every other
+address or hostname are off it. A capsule with no `inference:` block serves no door and never
+warns. `mur run` and `mur doctor` print the same bytes for the same manifest and address.
+
+```text
+warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call message/send, message/stream, stream/watch, tasks/get, tasks/cancel, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-032)
+```
+
+**Why it matters:** a public door answers every caller that reaches the port. Anyone on the network
+can start tasks, read and watch every task, and cancel every task at once with `session/stop`, and
+the [agent card](agent-card.md) tells them the session id, the tools, and whether the capsule holds
+shell and network grants. The methods and the disclosure in the line are read from the manifest.
+
+**What the runtime does about it:** nothing is refused. The capsule binds and serves as it would on
+loopback.
+
+**What to do:** declare [`network.authentication`](manifest.md#field-network-authentication), hand
+callers the tokens [`mur run`](cli.md#mur-run) prints, and put a TLS terminator in front of the
+door, which speaks plain HTTP. Or bind to loopback.

@@ -209,7 +209,7 @@ Two flags matter when something other than a local script is the caller:
 
 | Flag | Use it when |
 |---|---|
-| `--bind 0.0.0.0` | The caller is on another machine. The printed `url` stays `localhost:PORT` — substitute the host address yourself |
+| `--bind 0.0.0.0` | The caller is on another machine. The printed `url` stays `localhost:PORT` — substitute the host address yourself. Declare [`network.authentication`](../reference/manifest.md#field-network-authentication) so only callers holding a token can reach the capsule; without it `mur run` prints [`W-SEC-032`](../reference/diagnostics.md#w-sec-032) |
 | `--no-env-file` | Running in CI. It skips auto-loading the workspace-root `.env`, so secrets come only from the environment you injected |
 
 For a port that does not change between runs, declare [`network.internal_port`](../reference/manifest.md#field-network) in the manifest. The runtime then binds that exact port and fails with `error[E-RUN-010]` if it is already taken, instead of picking a free one.
@@ -318,10 +318,10 @@ A manifest that declares nothing is never gated by this check — the effective 
 | `mur run --task task.md` | Human-readable: URL and session ID at port bind, `status:` when the session ends |
 | `--task <text>` | An argument that is not an existing file path is written to `task.md` verbatim |
 | `mur run -v` | Adds `workdir:`, `manifest:`, `driver:`, and `skills:` to the startup lines |
-| `mur run --json` | One JSON line at port bind carrying `url`, `pid`, `session_id`, `name`, `version`, `workdir` |
+| `mur run --json` | One JSON line at port bind carrying `url`, `pid`, `session_id`, `name`, `version`, `workdir`, and `tokens` when the capsule declares `network.authentication` |
 | `--json` with `-v` | `--json` wins; no human-readable output is produced |
 | Launch failure with `--json` | Empty stdout, error on stderr, non-zero exit |
-| `--bind 0.0.0.0` | Accepts connections from other machines; the printed `url` still reads `localhost:PORT` |
+| `--bind 0.0.0.0` | Accepts connections from other machines; the printed `url` still reads `localhost:PORT`. Pair it with [`network.authentication`](../reference/agent-card.md#security) |
 | `--no-env-file` | Skips the workspace-root `.env`; the recommended default in CI |
 | `network.internal_port` | Binds one fixed port; `error[E-RUN-010]` when it is already taken |
 | `mur run --explain-scope` | Prints declared and achieved containment plus every effective grant, then exits `0` without staging anything |

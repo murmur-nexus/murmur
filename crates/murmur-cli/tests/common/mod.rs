@@ -4,6 +4,7 @@
 /// file so a served card is judged against the same vendored `a2a.proto`.
 #[path = "../../../capsule-runtime/src/a2a_card_conformance.rs"]
 pub mod a2a_card_conformance;
+pub mod door_capsule;
 pub mod hook_wat;
 pub mod idle_capsule;
 pub mod leaks;
@@ -417,6 +418,7 @@ fn stage_agent_session_inner(
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use murmur_artifact::{ConversationMode, TaskAcceptance};
+use murmur_artifact::{ConversationMode, NetworkAuthentication, TaskAcceptance};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -78,17 +78,19 @@ pub(crate) enum DoorMethod {
     TasksGet,
     TasksCancel,
     SessionStop,
+    GetAuthenticatedExtendedCard,
 }
 
 impl DoorMethod {
     /// Every method, in the order the card lists them.
-    pub(crate) const ALL: [DoorMethod; 6] = [
+    pub(crate) const ALL: [DoorMethod; 7] = [
         DoorMethod::MessageSend,
         DoorMethod::MessageStream,
         DoorMethod::StreamWatch,
         DoorMethod::TasksGet,
         DoorMethod::TasksCancel,
         DoorMethod::SessionStop,
+        DoorMethod::GetAuthenticatedExtendedCard,
     ];
 
     pub(crate) fn wire_name(self) -> &'static str {
@@ -99,6 +101,17 @@ impl DoorMethod {
             DoorMethod::TasksGet => "tasks/get",
             DoorMethod::TasksCancel => "tasks/cancel",
             DoorMethod::SessionStop => "session/stop",
+            DoorMethod::GetAuthenticatedExtendedCard => "agent/getAuthenticatedExtendedCard",
+        }
+    }
+
+    /// The door-token scope a caller must hold to call this method on an authenticated door: its
+    /// wire name, one of [`murmur_artifact::DOOR_SCOPES`]. `None` for
+    /// `agent/getAuthenticatedExtendedCard`, which every authenticated caller may call.
+    pub(crate) fn scope(self) -> Option<&'static str> {
+        match self {
+            DoorMethod::GetAuthenticatedExtendedCard => None,
+            method => Some(method.wire_name()),
         }
     }
 
@@ -107,23 +120,32 @@ impl DoorMethod {
     ///
     /// The only place a request's method is interpreted and the only place
     /// `lifecycle.task_acceptance` gates one: under `TaskAcceptance::None` neither task-starting
-    /// method is served. The match is exact — no case folding, no trimming — so a name the card
-    /// lists is the name to send.
-    pub(crate) fn resolve(method: &str, acceptance: &TaskAcceptance) -> Option<DoorMethod> {
+    /// method is served. `agent/getAuthenticatedExtendedCard` is served only by an `authenticated`
+    /// door, the only kind with an extended card. The match is exact — no case folding, no
+    /// trimming — so a name the card lists is the name to send.
+    pub(crate) fn resolve(
+        method: &str,
+        acceptance: &TaskAcceptance,
+        authenticated: bool,
+    ) -> Option<DoorMethod> {
         let resolved = Self::ALL.into_iter().find(|m| m.wire_name() == method)?;
         match (resolved, acceptance) {
             (DoorMethod::MessageSend | DoorMethod::MessageStream, TaskAcceptance::None) => None,
+            (DoorMethod::GetAuthenticatedExtendedCard, _) if !authenticated => None,
             _ => Some(resolved),
         }
     }
 }
 
-/// The wire names of every method [`DoorMethod::resolve`] serves under `acceptance`, in `ALL`
-/// order.
-pub(crate) fn served_methods(acceptance: &TaskAcceptance) -> Vec<&'static str> {
+/// The wire names of every method [`DoorMethod::resolve`] serves under `acceptance` on a door that
+/// is or is not `authenticated`, in `ALL` order.
+pub(crate) fn served_methods(
+    acceptance: &TaskAcceptance,
+    authenticated: bool,
+) -> Vec<&'static str> {
     DoorMethod::ALL
         .into_iter()
-        .filter(|m| DoorMethod::resolve(m.wire_name(), acceptance).is_some())
+        .filter(|m| DoorMethod::resolve(m.wire_name(), acceptance, authenticated).is_some())
         .map(DoorMethod::wire_name)
         .collect()
 }
@@ -159,6 +181,20 @@ pub(crate) struct TransportCapabilities {
 /// Refused with `-32602` by a capsule that keeps no harness session, which is every transport but
 /// `inference.transport: process`.
 pub(crate) const FORGET_SESSION_HEADER: &str = "x-murmur-forget-session";
+
+/// A2A 0.3's `AuthenticatedExtendedCardNotConfiguredError`: what a door with no extended card
+/// answers `agent/getAuthenticatedExtendedCard` with.
+pub(crate) const EXTENDED_CARD_NOT_CONFIGURED: i32 = -32007;
+
+/// What a door declaring `network.authentication` holds: the session's key and tokens, the realm
+/// its challenges name, and the extended card an authenticated caller may read.
+pub(crate) struct DoorGate {
+    pub auth: Arc<crate::door_auth::DoorAuth>,
+    /// The capsule name.
+    pub realm: String,
+    /// The A2A 0.3 extended card, from [`build_agent_cards`].
+    pub extended_card: Value,
+}
 
 /// URI of the agent-card extension that lists every JSON-RPC method the door answers, murmur's
 /// own methods among them. It is the address of that extension's section in the reference docs.
@@ -224,7 +260,7 @@ pub(crate) fn build_agent_card(
         .map(|a| a.name.as_str())
         .collect();
 
-    let methods = served_methods(task_acceptance);
+    let methods = served_methods(task_acceptance, false);
     let streaming =
         methods.contains(&DoorMethod::MessageStream.wire_name()) && transport.streams_text;
     let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
@@ -296,6 +332,194 @@ fn interface_url(capsule_url: &str) -> String {
     } else {
         format!("http://{url}")
     }
+}
+
+/// The name the card gives the door's one security scheme.
+pub(crate) const BEARER_SCHEME_NAME: &str = "bearer";
+
+/// The A2A protocol version the extended card declares. `agent/getAuthenticatedExtendedCard`
+/// answers on the door's 0.3 interface, so its result is an A2A 0.3 `AgentCard`.
+pub(crate) const EXTENDED_CARD_PROTOCOL_VERSION: &str = "0.3.0";
+
+/// What the bearer scheme says about the token it takes.
+const BEARER_SCHEME_DESCRIPTION: &str =
+    "A token this capsule's runtime mints at launch and accepts until the session ends.";
+
+/// The cards a door serves: the public card at `/.well-known/agent-card.json`, and the extended
+/// card `agent/getAuthenticatedExtendedCard` returns when the door authenticates.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AgentCards {
+    pub public: Value,
+    pub extended: Option<Value>,
+}
+
+/// Build the cards of a door that does or does not declare `network.authentication`.
+///
+/// With `authentication` `None` the public card is exactly [`build_agent_card`]'s and there is no
+/// extended card. With it declared, the v1.0 card [`build_agent_card`] returns gains
+/// `capabilities.extendedAgentCard: true`, the [`BEARER_SCHEME_NAME`] HTTP scheme with a
+/// requirement any valid token meets, `agent/getAuthenticatedExtendedCard` on the door
+/// extension's methods, and one alternative requirement per served task-starting method on the
+/// [`TASK_SKILL_ID`] skill. The public card is that card without the capsule extension; the
+/// extended card is that card, whole, in 0.3 shape through [`v03_agent_card`].
+pub(crate) fn build_agent_cards(
+    identity: &CapsuleIdentity,
+    installed_artifacts: &[InstalledArtifactSummary],
+    capability_policy: &CapabilityPolicy,
+    task_acceptance: &TaskAcceptance,
+    planes: DeclaredPlanes,
+    transport: TransportCapabilities,
+    authentication: Option<&NetworkAuthentication>,
+) -> AgentCards {
+    let card = build_agent_card(
+        identity,
+        installed_artifacts,
+        capability_policy,
+        task_acceptance,
+        planes,
+        transport,
+    );
+    if authentication.is_none() {
+        return AgentCards {
+            public: card,
+            extended: None,
+        };
+    }
+
+    let mut card = authenticated_card(card, task_acceptance);
+    let extended = v03_agent_card(&card);
+    if let Some(extensions) = card["capabilities"]["extensions"].as_array_mut() {
+        extensions.retain(|extension| extension["uri"] != CAPSULE_EXTENSION_URI);
+    }
+    AgentCards {
+        public: card,
+        extended: Some(extended),
+    }
+}
+
+/// The v1.0 extended card of an authenticated door: `card`, a [`build_agent_card`] output for
+/// `task_acceptance`, with the bearer scheme and requirements the door enforces.
+fn authenticated_card(mut card: Value, task_acceptance: &TaskAcceptance) -> Value {
+    let methods = served_methods(task_acceptance, true);
+    card["capabilities"]["extendedAgentCard"] = Value::Bool(true);
+    card["securitySchemes"] = serde_json::json!({
+        BEARER_SCHEME_NAME: {
+            "httpAuthSecurityScheme": {
+                "scheme": "Bearer",
+                "description": BEARER_SCHEME_DESCRIPTION,
+            },
+        },
+    });
+    card["securityRequirements"] = serde_json::json!([bearer_requirement(&[])]);
+    if let Some(extensions) = card["capabilities"]["extensions"].as_array_mut() {
+        for extension in extensions.iter_mut() {
+            if extension["uri"] == DOOR_EXTENSION_URI {
+                extension["params"]["methods"] = serde_json::json!(methods);
+            }
+        }
+    }
+    let task_requirements: Vec<Value> = [DoorMethod::MessageSend, DoorMethod::MessageStream]
+        .into_iter()
+        .map(DoorMethod::wire_name)
+        .filter(|method| methods.contains(method))
+        .map(|method| bearer_requirement(&[method]))
+        .collect();
+    if let Some(skills) = card["skills"].as_array_mut() {
+        for skill in skills.iter_mut() {
+            if skill["id"] == TASK_SKILL_ID {
+                skill["securityRequirements"] = Value::Array(task_requirements.clone());
+            }
+        }
+    }
+    card
+}
+
+/// One v1.0 `SecurityRequirement` naming the bearer scheme with `scopes`.
+fn bearer_requirement(scopes: &[&str]) -> Value {
+    serde_json::json!({"schemes": {BEARER_SCHEME_NAME: {"list": scopes}}})
+}
+
+/// The A2A 0.3 `AgentCard` a v1.0 card describes, for the door's 0.3 interface.
+///
+/// Mechanical: `url` is the card's [`jsonrpc_interface_url`], `preferredTransport` is `JSONRPC`,
+/// `capabilities` loses `extendedAgentCard`, which 0.3 carries as
+/// `supportsAuthenticatedExtendedCard`, each `httpAuthSecurityScheme` becomes a
+/// `{"type": "http", …}` scheme, and each list of `securityRequirements`, the card's and every
+/// skill's, becomes a 0.3 `security` list of `{scheme: scopes}` objects. Every other field is
+/// copied. The capsule extension keeps its place, so [`session_id_from_card`] reads either shape.
+pub(crate) fn v03_agent_card(card: &Value) -> Value {
+    let mut capabilities = card["capabilities"].clone();
+    let supports_extended = capabilities
+        .as_object_mut()
+        .and_then(|capabilities| capabilities.remove("extendedAgentCard"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    let security_schemes: serde_json::Map<String, Value> = card["securitySchemes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, scheme)| {
+            let http = scheme.get("httpAuthSecurityScheme")?;
+            let mut v03 = serde_json::Map::new();
+            v03.insert("type".to_string(), Value::from("http"));
+            for field in ["scheme", "description", "bearerFormat"] {
+                if let Some(value) = http.get(field) {
+                    v03.insert(field.to_string(), value.clone());
+                }
+            }
+            Some((name.clone(), Value::Object(v03)))
+        })
+        .collect();
+
+    let skills: Vec<Value> = card["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|skill| {
+            let mut skill = skill.clone();
+            if let Some(object) = skill.as_object_mut() {
+                if let Some(requirements) = object.remove("securityRequirements") {
+                    object.insert("security".to_string(), v03_security(&requirements));
+                }
+            }
+            skill
+        })
+        .collect();
+
+    serde_json::json!({
+        "protocolVersion": EXTENDED_CARD_PROTOCOL_VERSION,
+        "name": card["name"],
+        "description": card["description"],
+        "url": jsonrpc_interface_url(card).unwrap_or_default(),
+        "preferredTransport": JSONRPC_BINDING,
+        "version": card["version"],
+        "capabilities": capabilities,
+        "securitySchemes": security_schemes,
+        "security": v03_security(&card["securityRequirements"]),
+        "defaultInputModes": card["defaultInputModes"],
+        "defaultOutputModes": card["defaultOutputModes"],
+        "skills": skills,
+        "supportsAuthenticatedExtendedCard": supports_extended,
+    })
+}
+
+/// v1.0 `[{"schemes": {name: {"list": [..]}}}]` as 0.3 `[{name: [..]}]`.
+fn v03_security(requirements: &Value) -> Value {
+    requirements
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|requirement| {
+            let flattened: serde_json::Map<String, Value> = requirement["schemes"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, list)| (name.clone(), list["list"].clone()))
+                .collect();
+            Value::Object(flattened)
+        })
+        .collect()
 }
 
 /// The `params` object of the extension in `card.capabilities.extensions` whose `uri` is `uri`.
@@ -381,6 +605,9 @@ pub(crate) async fn serve_http(
     // Whether this capsule has a harness session to forget, which is the one thing
     // `FORGET_SESSION_HEADER` needs to know about the transport behind the door.
     forgettable_session: bool,
+    // `Some` when the manifest declares `network.authentication`: every request but the public
+    // card and the two planes with their own authorisers must present one of its tokens.
+    gate: Option<Arc<DoorGate>>,
 ) {
     let conversation_mode_str = match conversation_mode {
         ConversationMode::Stateless => "stateless",
@@ -410,8 +637,9 @@ pub(crate) async fn serve_http(
                         let detached_for_conn = detached.clone();
                         let live = Arc::clone(&live_delegations);
                         let closing = closing_rx.clone();
+                        let gate_for_conn = gate.clone();
                         connections.spawn(async move {
-                            handle_connection(stream, peer_addr, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, control, session, detached_for_conn, live, forgettable_session, closing).await;
+                            handle_connection(stream, peer_addr, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, control, session, detached_for_conn, live, forgettable_session, gate_for_conn, closing).await;
                         });
                     }
                     Err(e) => {
@@ -469,6 +697,7 @@ async fn handle_connection(
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
     forgettable_session: bool,
+    gate: Option<Arc<DoorGate>>,
     closing: watch::Receiver<bool>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -498,6 +727,8 @@ async fn handle_connection(
     let mut completion_session: Option<String> = None;
     let mut forget_session = false;
     let mut authorization: Option<String> = None;
+    // Every `authorization` header, in order: a door token is refused when more than one is sent.
+    let mut authorizations: Vec<String> = Vec::new();
 
     loop {
         let mut line = String::new();
@@ -511,8 +742,11 @@ async fn handle_connection(
         let lower = line.to_ascii_lowercase();
         let lower = lower.trim_end();
         if lower.starts_with("authorization:") {
-            // Taken from the line as sent: a control token is base64url and case-sensitive.
-            authorization = Some(line.trim_end()["authorization:".len()..].trim().to_string());
+            // Taken from the line as sent: a control token and a door token are base64url and
+            // case-sensitive.
+            let value = line.trim_end()["authorization:".len()..].trim().to_string();
+            authorizations.push(value.clone());
+            authorization = Some(value);
         } else if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
         } else if lower.starts_with("content-type:") && lower.contains("application/json") {
@@ -557,7 +791,8 @@ async fn handle_connection(
     // Routed ahead of the operator plane on its own segment, and answering every method under it
     // including the ones it refuses: a `PUT` that fell through would leave no record of somebody
     // trying to write, and a peer request that fell through to `/resources/` would be answered by
-    // the wrong authoriser.
+    // the wrong authoriser. Ahead of the door gate too: the handle is a peer's credential, and a
+    // peer consuming one holds no token for this door.
     if is_peer_path(&path) {
         let response = handle_peer_request(&peer_plane, &method, &path, audience.as_deref()).await;
         let _ = writer_half.write_all(&framed_bytes(&response)).await;
@@ -566,7 +801,9 @@ async fn handle_connection(
 
     // Routed on its prefix ahead of the JSON-RPC door, answering every method under it including
     // the ones it refuses, and reading the body itself: a request it refuses unauthenticated, or
-    // for a declared length over its cap, must never have its body read at all.
+    // for a declared length over its cap, must never have its body read at all. Ahead of the door
+    // gate too: its caller presents the control token in the same `authorization` header, and
+    // neither credential is accepted in the other's place.
     if is_control_path(&path) {
         let request = ControlRequest {
             method: &method,
@@ -581,15 +818,7 @@ async fn handle_connection(
         return;
     }
 
-    // The resource plane is routed on its prefix alone and answers every method under it,
-    // including the ones it refuses: a `PUT` that fell through to the bare 404 below would leave
-    // no trace record of somebody trying to write.
-    if path.starts_with(RESOURCE_PATH_PREFIX) {
-        let response = handle_resource_request(&resource_plane, &method, &path).await;
-        let _ = writer_half.write_all(&framed_bytes(&response)).await;
-        return;
-    }
-
+    // The public card, which A2A requires be readable by anyone.
     if method == "GET" && path == "/.well-known/agent-card.json" {
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -597,6 +826,42 @@ async fn handle_connection(
             card_json,
         );
         let _ = writer_half.write_all(response.as_bytes()).await;
+        return;
+    }
+
+    // Everything past this point is gated on an authenticated door, and the token is checked
+    // before the path, the body or the method is looked at, so no refusal here depends on whether
+    // a named task, file or path exists. A public door ignores `authorization`.
+    let grant = match gate.as_deref() {
+        None => None,
+        Some(gate) => {
+            let headers: Vec<&str> = authorizations.iter().map(String::as_str).collect();
+            match gate.auth.verify(&headers) {
+                Ok(grant) => Some(grant),
+                Err(refusal) => {
+                    let response = framed_bytes(&refusal.response(&gate.realm));
+                    write_refusal(writer_half, reader, &response).await;
+                    return;
+                }
+            }
+        }
+    };
+    let refuse_scope = |scope: &str| -> Option<Vec<u8>> {
+        let (gate, grant) = gate.as_deref().zip(grant.as_ref())?;
+        let refusal = grant.require(scope).err()?;
+        Some(framed_bytes(&refusal.response(&gate.realm)))
+    };
+
+    // The resource plane is routed on its prefix alone and answers every method under it,
+    // including the ones it refuses: a `PUT` that fell through to the bare 404 below would leave
+    // no trace record of somebody trying to write.
+    if path.starts_with(RESOURCE_PATH_PREFIX) {
+        if let Some(refused) = refuse_scope(crate::door_auth::RESOURCES_FILES_SCOPE) {
+            write_refusal(writer_half, reader, &refused).await;
+            return;
+        }
+        let response = handle_resource_request(&resource_plane, &method, &path).await;
+        let _ = writer_half.write_all(&framed_bytes(&response)).await;
         return;
     }
 
@@ -640,6 +905,17 @@ async fn handle_connection(
             }
         };
 
+        let resolved = DoorMethod::resolve(&req.method, &task_acceptance, gate.is_some());
+        // Scope is checked once the method is known to be served and before its handler runs: an
+        // unserved method is `-32601` to anyone the door let in, since the card lists what it
+        // serves.
+        if let Some(scope) = resolved.and_then(DoorMethod::scope) {
+            if let Some(refused) = refuse_scope(scope) {
+                let _ = writer_half.write_all(&refused).await;
+                return;
+            }
+        }
+
         // A forget writes to this capsule's harness session map, and only a `transport: process`
         // capsule has one. Refused here, on the request that carried it, rather than dropped into
         // a task that would ignore it: a caller that asked for a conversation to be dropped and
@@ -662,7 +938,7 @@ async fn handle_connection(
         }
 
         // The streaming methods own the connection; every other method answers one JSON body.
-        let response = match DoorMethod::resolve(&req.method, &task_acceptance) {
+        let response = match resolved {
             Some(DoorMethod::MessageStream) => {
                 handle_message_stream(
                     writer_half,
@@ -693,6 +969,12 @@ async fn handle_connection(
                 .await;
                 return;
             }
+            Some(DoorMethod::GetAuthenticatedExtendedCard) => match gate.as_deref() {
+                Some(gate) => JsonRpcResponse::ok(req.id, &gate.extended_card).into_http_response(),
+                None => {
+                    unreachable!("resolve serves the extended card only on an authenticated door")
+                }
+            },
             Some(door_method) => handle_jsonrpc(
                 door_method,
                 req,
@@ -706,6 +988,16 @@ async fn handle_connection(
                 &live_delegations,
                 &session_id,
             ),
+            // A2A 0.3's answer from an agent with no extended card. The card does not list the
+            // method, since the door does not serve it.
+            None if req.method == DoorMethod::GetAuthenticatedExtendedCard.wire_name() => {
+                JsonRpcResponse::err(
+                    req.id,
+                    EXTENDED_CARD_NOT_CONFIGURED,
+                    "Authenticated Extended Card is not configured",
+                )
+                .into_http_response()
+            }
             None => JsonRpcResponse::err(req.id, -32601, "Method not found").into_http_response(),
         };
         let _ = writer_half.write_all(response.as_bytes()).await;
@@ -715,6 +1007,42 @@ async fn handle_connection(
     let response =
         "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string();
     let _ = writer_half.write_all(response.as_bytes()).await;
+}
+
+/// The most unread request bytes a refused connection discards before it closes.
+const REFUSAL_DRAIN_LIMIT: usize = 64 * 1024;
+
+/// How long a refused connection waits for the caller's unread bytes before it closes.
+const REFUSAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Writes a gate refusal and closes the connection, discarding what the caller already sent.
+///
+/// The door refuses before reading the request's body. A socket closed with unread bytes in its
+/// receive buffer is answered with a reset, which can reach the caller before it has read the
+/// refusal, so up to [`REFUSAL_DRAIN_LIMIT`] bytes are read and dropped, for at most
+/// [`REFUSAL_DRAIN_GRACE`], once the refusal is written. Nothing drained is looked at.
+async fn write_refusal<R: tokio::io::AsyncRead + Unpin>(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut reader: R,
+    response: &[u8],
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if writer.write_all(response).await.is_err() {
+        return;
+    }
+    let _ = writer.shutdown().await;
+    let drain = async {
+        let mut sink = [0u8; 4096];
+        let mut left = REFUSAL_DRAIN_LIMIT;
+        while left > 0 {
+            match reader.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => left = left.saturating_sub(read),
+            }
+        }
+    };
+    let _ = tokio::time::timeout(REFUSAL_DRAIN_GRACE, drain).await;
 }
 
 /// One plane response as bytes on the wire. `connection: close` is appended here rather than by
@@ -1060,8 +1388,10 @@ fn handle_jsonrpc(
         DoorMethod::SessionStop => {
             handle_session_stop(id, task_registry, detached, live_delegations, session_id)
         }
-        DoorMethod::MessageStream | DoorMethod::StreamWatch => {
-            unreachable!("handle_connection answers the streaming methods before this point")
+        DoorMethod::MessageStream
+        | DoorMethod::StreamWatch
+        | DoorMethod::GetAuthenticatedExtendedCard => {
+            unreachable!("handle_connection answers the streaming methods and the extended card")
         }
     }
 }
@@ -1670,6 +2000,262 @@ mod tests {
         }
     }
 
+    fn bearer_authentication() -> NetworkAuthentication {
+        NetworkAuthentication {
+            scheme: murmur_artifact::AuthenticationScheme::Bearer,
+            credentials: vec![murmur_artifact::DoorCredential {
+                name: "watcher".to_string(),
+                scopes: vec!["tasks/get".to_string(), "stream/watch".to_string()],
+            }],
+        }
+    }
+
+    /// The cards for `my-agent` 0.1.0 on port 41873 with `bash` installed, shell and network
+    /// granted and `exports.files` declared, as `full_card` builds them.
+    fn full_cards(
+        acceptance: &TaskAcceptance,
+        authentication: Option<&NetworkAuthentication>,
+    ) -> AgentCards {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["git".to_string()],
+            network_allow: vec!["api.example.com".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        build_agent_cards(
+            &identity(),
+            &[tool("bash")],
+            &policy,
+            acceptance,
+            DeclaredPlanes {
+                files: true,
+                peer_files: false,
+            },
+            HTTP_TRANSPORT,
+            authentication,
+        )
+    }
+
+    #[test]
+    fn a2a_card_every_public_and_extended_card_conforms() {
+        let plane_sets = [(false, false), (true, false), (false, true), (true, true)];
+        let tool_sets: [&[InstalledArtifactSummary]; 2] = [&[], &[tool("bash")]];
+        let policies = [
+            CapabilityPolicy::default(),
+            CapabilityPolicy {
+                shell_allow: vec!["git".to_string()],
+                network_allow: vec!["api.example.com".to_string()],
+                ..CapabilityPolicy::default()
+            },
+        ];
+        let authentication = bearer_authentication();
+        let mut checked = 0;
+        for authenticated in [None, Some(&authentication)] {
+            for acceptance in &ACCEPTANCES {
+                for streams_text in [false, true] {
+                    for (files, peer_files) in plane_sets {
+                        for tools in tool_sets {
+                            for policy in &policies {
+                                let planes = DeclaredPlanes { files, peer_files };
+                                let transport = TransportCapabilities { streams_text };
+                                let cards = build_agent_cards(
+                                    &identity(),
+                                    tools,
+                                    policy,
+                                    acceptance,
+                                    planes,
+                                    transport,
+                                    authenticated,
+                                );
+                                assert_conforms(&cards.public);
+                                let base = build_agent_card(
+                                    &identity(),
+                                    tools,
+                                    policy,
+                                    acceptance,
+                                    planes,
+                                    transport,
+                                );
+                                match authenticated {
+                                    None => {
+                                        assert_eq!(cards.public, base);
+                                        assert_eq!(cards.extended, None);
+                                    }
+                                    Some(_) => {
+                                        let extended_v1 = authenticated_card(base, acceptance);
+                                        assert_conforms(&extended_v1);
+                                        assert_eq!(
+                                            cards.extended,
+                                            Some(v03_agent_card(&extended_v1))
+                                        );
+                                        let mut stripped = extended_v1.clone();
+                                        stripped["capabilities"]["extensions"]
+                                            .as_array_mut()
+                                            .unwrap()
+                                            .retain(|e| e["uri"] != CAPSULE_EXTENSION_URI);
+                                        assert_eq!(cards.public, stripped);
+                                    }
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 3 * 2 * 4 * 2 * 2);
+    }
+
+    #[test]
+    fn a2a_card_authenticated_public_card_is_the_documented_document() {
+        let cards = full_cards(&TaskAcceptance::Single, Some(&bearer_authentication()));
+        println!("{:#}", cards.public);
+        assert_eq!(
+            cards.public,
+            serde_json::json!({
+                "name": "my-agent",
+                "description": "Murmur capsule my-agent 0.1.0",
+                "version": "0.1.0",
+                "supportedInterfaces": [
+                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+                ],
+                "capabilities": {
+                    "streaming": true,
+                    "pushNotifications": false,
+                    "extendedAgentCard": true,
+                    "extensions": [
+                        {
+                            "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
+                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+                            "required": false,
+                            "params": {
+                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"]
+                            }
+                        }
+                    ]
+                },
+                "securitySchemes": {
+                    "bearer": {
+                        "httpAuthSecurityScheme": {
+                            "scheme": "Bearer",
+                            "description": "A token this capsule's runtime mints at launch and accepts until the session ends."
+                        }
+                    }
+                },
+                "securityRequirements": [ { "schemes": { "bearer": { "list": [] } } } ],
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": [
+                    {
+                        "id": "task",
+                        "name": "Run a task",
+                        "description": "Runs one task given as a text message and reports its outcome.",
+                        "tags": ["task"],
+                        "securityRequirements": [
+                            { "schemes": { "bearer": { "list": ["message/send"] } } },
+                            { "schemes": { "bearer": { "list": ["message/stream"] } } }
+                        ]
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a2a_card_extended_card_is_the_documented_0_3_document() {
+        let cards = full_cards(&TaskAcceptance::Single, Some(&bearer_authentication()));
+        let extended = cards
+            .extended
+            .expect("an authenticated door has an extended card");
+        println!("{extended:#}");
+        assert_eq!(
+            extended,
+            serde_json::json!({
+                "protocolVersion": "0.3.0",
+                "name": "my-agent",
+                "description": "Murmur capsule my-agent 0.1.0",
+                "url": "http://localhost:41873",
+                "preferredTransport": "JSONRPC",
+                "version": "0.1.0",
+                "capabilities": {
+                    "streaming": true,
+                    "pushNotifications": false,
+                    "extensions": [
+                        { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.", "required": false,
+                          "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"] } },
+                        { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
+                          "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } }
+                    ]
+                },
+                "securitySchemes": {
+                    "bearer": { "type": "http", "scheme": "Bearer", "description": "A token this capsule's runtime mints at launch and accepts until the session ends." }
+                },
+                "security": [ { "bearer": [] } ],
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": [
+                    {
+                        "id": "task",
+                        "name": "Run a task",
+                        "description": "Runs one task given as a text message and reports its outcome.",
+                        "tags": ["task"],
+                        "security": [ { "bearer": ["message/send"] }, { "bearer": ["message/stream"] } ]
+                    }
+                ],
+                "supportsAuthenticatedExtendedCard": true
+            })
+        );
+        assert_eq!(
+            session_id_from_card(&extended),
+            Some("ses_019f01a940ce7761854e768ecbe3d399")
+        );
+    }
+
+    #[test]
+    fn a2a_card_authenticated_public_card_discloses_no_capsule_material() {
+        let authentication = bearer_authentication();
+        for acceptance in &ACCEPTANCES {
+            let cards = full_cards(acceptance, Some(&authentication));
+            let serialised = cards.public.to_string();
+            for key in ["sessionId", "tools", "shell", "network", "planes"] {
+                assert!(
+                    !serialised.contains(key),
+                    "{key} belongs to the extended card alone: {serialised}"
+                );
+            }
+            assert_eq!(session_id_from_card(&cards.public), None);
+            assert!(extension_params(&cards.public, CAPSULE_EXTENSION_URI).is_none());
+        }
+    }
+
+    #[test]
+    fn a2a_card_a_door_that_starts_no_task_has_no_skill_requirements() {
+        let cards = full_cards(&TaskAcceptance::None, Some(&bearer_authentication()));
+        assert_eq!(cards.public["skills"], serde_json::json!([]));
+        assert_eq!(
+            door_methods(&cards.public),
+            [
+                "stream/watch",
+                "tasks/get",
+                "tasks/cancel",
+                "session/stop",
+                "agent/getAuthenticatedExtendedCard"
+            ]
+        );
+        let extended = cards.extended.unwrap();
+        assert_eq!(extended["skills"], serde_json::json!([]));
+        assert_eq!(extended["security"], serde_json::json!([{"bearer": []}]));
+    }
+
+    #[test]
+    fn a2a_card_public_door_cards_are_build_agent_card() {
+        for acceptance in &ACCEPTANCES {
+            let cards = full_cards(acceptance, None);
+            assert_eq!(cards.public, full_card(acceptance));
+            assert_eq!(cards.extended, None);
+            assert!(!door_methods(&cards.public).contains(&"agent/getAuthenticatedExtendedCard"));
+        }
+    }
+
     #[test]
     fn session_id_from_card_reads_the_capsule_extension_only() {
         let card = full_card(&TaskAcceptance::Single);
@@ -1939,37 +2525,40 @@ mod tests {
     #[test]
     fn door_method_served_methods_are_exactly_what_resolve_serves() {
         for acceptance in &ACCEPTANCES {
-            let served = served_methods(acceptance);
-            for method in DoorMethod::ALL {
-                let resolved = DoorMethod::resolve(method.wire_name(), acceptance);
-                assert_eq!(
-                    served.contains(&method.wire_name()),
-                    resolved.is_some(),
-                    "{} under {acceptance:?}",
-                    method.wire_name()
-                );
-                if let Some(resolved) = resolved {
-                    assert_eq!(resolved, method, "{acceptance:?}");
+            for authenticated in [false, true] {
+                let served = served_methods(acceptance, authenticated);
+                for method in DoorMethod::ALL {
+                    let resolved =
+                        DoorMethod::resolve(method.wire_name(), acceptance, authenticated);
+                    assert_eq!(
+                        served.contains(&method.wire_name()),
+                        resolved.is_some(),
+                        "{} under {acceptance:?}, authenticated {authenticated}",
+                        method.wire_name()
+                    );
+                    if let Some(resolved) = resolved {
+                        assert_eq!(resolved, method, "{acceptance:?}");
+                    }
                 }
+                let listed_in_all_order: Vec<&str> = DoorMethod::ALL
+                    .into_iter()
+                    .map(DoorMethod::wire_name)
+                    .filter(|name| served.contains(name))
+                    .collect();
+                assert_eq!(served, listed_in_all_order, "{acceptance:?}");
             }
-            let listed_in_all_order: Vec<&str> = DoorMethod::ALL
-                .into_iter()
-                .map(DoorMethod::wire_name)
-                .filter(|name| served.contains(name))
-                .collect();
-            assert_eq!(served, listed_in_all_order, "{acceptance:?}");
         }
     }
 
     #[test]
     fn door_method_acceptance_none_serves_no_task_starting_method() {
         assert_eq!(
-            served_methods(&TaskAcceptance::None),
+            served_methods(&TaskAcceptance::None, false),
             ["stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
         );
         for acceptance in [TaskAcceptance::Single, TaskAcceptance::Queue] {
             assert_eq!(
-                served_methods(&acceptance),
+                served_methods(&acceptance, false),
                 [
                     "message/send",
                     "message/stream",
@@ -1979,6 +2568,23 @@ mod tests {
                     "session/stop"
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn door_method_only_an_authenticated_door_serves_the_extended_card() {
+        for acceptance in &ACCEPTANCES {
+            assert_eq!(
+                DoorMethod::resolve("agent/getAuthenticatedExtendedCard", acceptance, false),
+                None
+            );
+            assert_eq!(
+                DoorMethod::resolve("agent/getAuthenticatedExtendedCard", acceptance, true),
+                Some(DoorMethod::GetAuthenticatedExtendedCard)
+            );
+            let mut expected = served_methods(acceptance, false);
+            expected.push("agent/getAuthenticatedExtendedCard");
+            assert_eq!(served_methods(acceptance, true), expected);
         }
     }
 
@@ -1995,11 +2601,13 @@ mod tests {
                 "tasks/get\n",
                 "session/stop/",
             ] {
-                assert_eq!(
-                    DoorMethod::resolve(name, acceptance),
-                    None,
-                    "{name:?} under {acceptance:?}"
-                );
+                for authenticated in [false, true] {
+                    assert_eq!(
+                        DoorMethod::resolve(name, acceptance, authenticated),
+                        None,
+                        "{name:?} under {acceptance:?}"
+                    );
+                }
             }
         }
     }
@@ -2009,7 +2617,7 @@ mod tests {
         for acceptance in &ACCEPTANCES {
             let card = card_for(acceptance, DeclaredPlanes::default());
             let methods = door_methods(&card);
-            assert_eq!(methods, served_methods(acceptance), "{acceptance:?}");
+            assert_eq!(methods, served_methods(acceptance, false), "{acceptance:?}");
             assert_eq!(
                 card["capabilities"]["streaming"],
                 methods.contains(&"message/stream"),

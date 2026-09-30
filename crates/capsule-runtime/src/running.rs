@@ -20,9 +20,11 @@
 //! too: it names a process that is alive, perhaps suspended, and unlinking it would throw away the
 //! only handle to a running capsule because it was slow to answer.
 //!
-//! The record names the process and stores nothing from the environment. The directory is `0700`
-//! and each record `0600`, because the set of records is a map of reachable capsules to anything
-//! on the machine that can read it.
+//! The record names the process and stores nothing from the environment. A session declaring
+//! `network.authentication` also records its operator door token, which is how the host tools
+//! call its door; layer 3 then reads the session id off the extended card with that token. The
+//! directory is `0700` and each record `0600`, because the set of records is a map of reachable
+//! capsules, and of the tokens that drive them, to anything on the machine that can read it.
 //!
 //! A session whose manifest declares `control:` also holds `<session_id>.control` beside its
 //! record: the control token, at the same mode, written before the record and removed with it.
@@ -58,9 +60,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field is required. There is no version field: a record that does not deserialize names
-/// no process that could be checked, and is pruned, which is what "the record is a hint" already
-/// means.
+/// Every field but `door_token` is required. There is no version field: a record that does not
+/// deserialize names no process that could be checked, and is pruned, which is what "the record
+/// is a hint" already means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
@@ -80,6 +82,37 @@ pub struct RunningRecord {
     pub outlives_launcher: bool,
     /// RFC 3339, in UTC.
     pub started_at: String,
+    /// The operator token of a door declaring `network.authentication`, which the host tools
+    /// present to it. Absent for a public door, and in a record an older runtime wrote. Its
+    /// `Debug` is redacted, and it is serialized only here, into a file held at `0600`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "door_token_field"
+    )]
+    pub door_token: Option<crate::door_auth::DoorToken>,
+}
+
+/// The one place a [`crate::door_auth::DoorToken`] is serialized: the running record.
+mod door_token_field {
+    use crate::door_auth::DoorToken;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        token: &Option<DoorToken>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match token {
+            Some(token) => serializer.serialize_some(token.expose()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<DoorToken>, D::Error> {
+        Ok(Option::<String>::deserialize(deserializer)?.map(DoorToken::new))
+    }
 }
 
 /// `~/.murmur/running`, created if missing and held at `0700`, inside a `~/.murmur` held at `0700`.
@@ -194,7 +227,7 @@ pub fn verify(record: &RunningRecord) -> Liveness {
     if let Some(liveness) = liveness_without_probe(process_state(record)) {
         return liveness;
     }
-    match probe_session_id(&record.url) {
+    match probe_session_id(record) {
         Ok(session_id) if session_id == record.session_id => Liveness::Live,
         Ok(other) => Liveness::Unreachable(format!(
             "the capsule at {} answers for session {other}",
@@ -527,22 +560,48 @@ mod platform {
     }
 }
 
-/// Layer 3: the session id the door at `url` claims on its agent card.
+/// Layer 3: the session id the door at `record.url` claims on its agent card.
 ///
-/// A card with no capsule extension naming a session — one served by a runtime that predates the
-/// A2A card, among others — names no session, so its capsule reads as unreachable.
-fn probe_session_id(url: &str) -> Result<String, String> {
-    let addr = url
+/// A record carrying a door token reads the extended card, the only one an authenticated door
+/// names its session on, by `agent/getAuthenticatedExtendedCard`; any other record reads the
+/// public card. A card with no capsule extension naming a session — one served by a runtime that
+/// predates the A2A card, among others — names no session, so its capsule reads as unreachable.
+fn probe_session_id(record: &RunningRecord) -> Result<String, String> {
+    let addr = record
+        .url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let card = crate::http_client::http_json_with_timeouts(
-        "GET",
-        &format!("http://{addr}/.well-known/agent-card.json"),
-        None,
-        &[("Accept", "application/json")],
-        PROBE_CONNECT_TIMEOUT,
-        PROBE_READ_TIMEOUT,
-    )?;
+    let card = match &record.door_token {
+        Some(token) => {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": crate::identity::DoorMethod::GetAuthenticatedExtendedCard.wire_name(),
+                "params": {},
+            })
+            .to_string();
+            let authorization = crate::door_auth::bearer_header(token);
+            let response = crate::http_client::http_json_with_timeouts(
+                "POST",
+                &format!("http://{addr}/"),
+                Some(&body),
+                &[("Authorization", authorization.as_str())],
+                PROBE_CONNECT_TIMEOUT,
+                PROBE_READ_TIMEOUT,
+            )?;
+            response.get("result").cloned().ok_or_else(|| {
+                format!("the capsule at {addr} did not return its extended agent card")
+            })?
+        }
+        None => crate::http_client::http_json_with_timeouts(
+            "GET",
+            &format!("http://{addr}/.well-known/agent-card.json"),
+            None,
+            &[("Accept", "application/json")],
+            PROBE_CONNECT_TIMEOUT,
+            PROBE_READ_TIMEOUT,
+        )?,
+    };
     crate::identity::session_id_from_card(&card)
         .map(str::to_string)
         .ok_or_else(|| format!("the agent card from {addr} names no session"))
@@ -577,6 +636,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
+            door_token: None,
         };
         let token = ControlTokenGuard::write(&record.session_id, "ctl1.token.mac").unwrap();
         let record_guard = RunningGuard::write(&record).unwrap();
@@ -615,6 +675,7 @@ mod tests {
             workdir: PathBuf::from("/tmp/demo"),
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
+            door_token: None,
         }
     }
 
@@ -644,6 +705,40 @@ mod tests {
                 "workdir",
             ]
         );
+    }
+
+    #[test]
+    fn a_record_with_a_door_token_serializes_it_beside_the_nine_fields() {
+        let mut with_token = record(1, "42");
+        with_token.door_token = Some(crate::door_auth::DoorToken::new(
+            "mdt1.payload.mac".to_string(),
+        ));
+        let value = serde_json::to_value(&with_token).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 10);
+        assert_eq!(object["door_token"], "mdt1.payload.mac");
+        let back: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back, with_token);
+    }
+
+    #[test]
+    fn a_record_debug_prints_no_door_token() {
+        let mut with_token = record(1, "42");
+        with_token.door_token = Some(crate::door_auth::DoorToken::new(
+            "mdt1.secretpayload.secretmac".to_string(),
+        ));
+        let debug = format!("{with_token:?}");
+        assert!(!debug.contains("secretpayload"), "{debug}");
+        assert!(debug.contains("DoorToken(<redacted>)"), "{debug}");
+    }
+
+    /// A record an older runtime wrote has no `door_token` key, and still names a process.
+    #[test]
+    fn a_record_without_a_door_token_key_parses() {
+        let value = serde_json::to_value(record(1, "42")).unwrap();
+        assert!(value.get("door_token").is_none());
+        let parsed: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.door_token, None);
     }
 
     /// Every field is required, so a record missing one is unverifiable rather than partly

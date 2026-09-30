@@ -26,6 +26,7 @@ pub mod delegation;
 pub mod delegation_plane;
 pub mod detached;
 pub(crate) mod detached_reconcile;
+pub mod door_auth;
 // Public so the `runtime_out!` / `runtime_err!` macros resolve `$crate::diagnostic` from outside
 // this crate, and so `mur run`'s launch path writes its lines the same way the runtime does.
 pub(crate) mod credential_gateway;
@@ -138,6 +139,11 @@ pub use delegation_plane::{
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the
 // same facade shape `check_staged_runtime_floor` has, without making the module's internals
 // (`shebang_interpreter_name`, the probe, the prefix helpers) part of any crate's API.
+pub use door_auth::{
+    bearer_header, door_posture, is_loopback_bind, public_door_bind_warning, public_door_warning,
+    render_public_door_warning, AuthRefusal, DoorAuth, DoorExposure, DoorGrant, DoorToken,
+    PublicDoorDisclosure, DOOR_TOKEN_ENV,
+};
 pub use errors::{RuntimeError, UnreachableEntrypoint};
 pub use lanes::TaskLane;
 pub use limits::ExecutionLimits;

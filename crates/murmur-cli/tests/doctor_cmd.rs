@@ -1936,3 +1936,85 @@ fn doctor_reports_the_compiled_forms_directory_as_owner_only() {
         "no W-SEC-028 reading {warning:?}:\n{stderr}"
     );
 }
+
+// ── The door ──────────────────────────────────────────────────────────────────
+
+fn w_sec_032_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| line.contains("warning[W-SEC-032]"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn doctor_stdout(home: &Path, project: &Path, args: &[&str]) -> String {
+    let output = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home)
+        .env_remove("NEXUS_API_KEY")
+        .current_dir(project)
+        .arg("doctor")
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// `mur doctor --bind` and `mur run --bind` render the public-door warning from the same manifest
+/// with the same function, so the two lines are the same bytes.
+#[test]
+fn door_warning_from_doctor_is_byte_identical_to_mur_run() {
+    use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(
+        &server.endpoint,
+        "doctor-door",
+        "",
+        &format!("{QUEUE_SLEEP_YAML}exports:\n  files:\n    root: out\n    mode: read-only\n"),
+    );
+    let manifest = project.path().join("murmur.yaml");
+
+    let run = MurRun::start(home.path(), &manifest, true, &["--bind", "0.0.0.0"], &[]);
+    thread::sleep(Duration::from_millis(500));
+    let from_run = w_sec_032_lines(&run.stderr());
+    drop(run);
+
+    let doctor = doctor_stdout(home.path(), project.path(), &["--bind", "0.0.0.0"]);
+    let from_doctor = w_sec_032_lines(&doctor);
+
+    assert_eq!(from_run.len(), 1, "mur run printed {from_run:?}");
+    assert_eq!(from_doctor.len(), 1, "mur doctor printed:\n{doctor}");
+    assert!(!from_run[0].is_empty());
+    assert_eq!(from_run[0].as_bytes(), from_doctor[0].as_bytes());
+    assert!(
+        doctor
+            .lines()
+            .any(|line| line == "door: public (no network.authentication)"),
+        "{doctor}"
+    );
+
+    let loopback = doctor_stdout(home.path(), project.path(), &[]);
+    assert!(w_sec_032_lines(&loopback).is_empty(), "{loopback}");
+    assert!(
+        loopback
+            .lines()
+            .any(|line| line == "door: public (no network.authentication)"),
+        "{loopback}"
+    );
+}
+
+/// An authenticated door is posture, not a warning: doctor names the operator token and every
+/// declared credential with its scopes.
+#[test]
+fn door_posture_names_every_credential() {
+    use common::door_capsule::{agent_project, driver_home, AUTHENTICATION_YAML};
+    let home = driver_home();
+    let project = agent_project("http://127.0.0.1:9", "doctor-auth", "", AUTHENTICATION_YAML);
+    let doctor = doctor_stdout(home.path(), project.path(), &["--bind", "0.0.0.0"]);
+    assert!(
+        doctor.lines().any(|line| line
+            == "door: bearer — operator, reader (resources/files), watcher (tasks/get, stream/watch)"),
+        "{doctor}"
+    );
+    assert!(w_sec_032_lines(&doctor).is_empty(), "{doctor}");
+}

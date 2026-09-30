@@ -633,10 +633,75 @@ impl ControlConfig {
     }
 }
 
+/// The top-level `network:` block, which configures the A2A door. Unrelated to
+/// `capabilities.network`, which is the guest's egress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConfig {
     /// Internal port the capsule expects to listen on. Default 14159 when absent.
     pub internal_port: Option<u16>,
+    /// `network.authentication`: how a caller of the door proves it may call. `None` is a public
+    /// door, which answers every caller that reaches the port.
+    pub authentication: Option<NetworkAuthentication>,
+}
+
+/// Every scope a door token can carry: the door's JSON-RPC methods that a token gates, by wire
+/// name, and `resources/files`, the operator resource plane. The runtime's method table is held
+/// to this list by a test, in both directions.
+pub const DOOR_SCOPES: &[&str] = &[
+    "message/send",
+    "message/stream",
+    "stream/watch",
+    "tasks/get",
+    "tasks/cancel",
+    "session/stop",
+    "resources/files",
+];
+
+/// The credential the runtime always mints for an authenticated door, holding every scope in
+/// [`DOOR_SCOPES`]. Reserved: no declared credential may take the name.
+pub const OPERATOR_CREDENTIAL: &str = "operator";
+
+/// Longest credential name `network.authentication.credentials` accepts.
+const MAX_CREDENTIAL_NAME_LEN: usize = 32;
+
+/// How a caller of the door authenticates. A required field with one value, so that an
+/// authenticated door is an explicit statement and a second scheme is an addition, not a default
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationScheme {
+    /// `Authorization: Bearer <token>`, with a token the capsule's runtime mints at launch.
+    Bearer,
+}
+
+impl AuthenticationScheme {
+    /// Every scheme a manifest may name, in the order refusals list them.
+    pub const ALL: &'static [AuthenticationScheme] = &[Self::Bearer];
+
+    /// The scheme as written in `network.authentication.scheme`.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+        }
+    }
+}
+
+/// One declared credential: a token the runtime mints beside the operator token, reaching only
+/// `scopes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoorCredential {
+    /// Matches `^[a-z][a-z0-9_-]{0,31}$` and is never [`OPERATOR_CREDENTIAL`].
+    pub name: String,
+    /// Non-empty, each entry in [`DOOR_SCOPES`] and listed once, in declared order.
+    pub scopes: Vec<String>,
+}
+
+/// `network.authentication`: the door refuses every caller that presents no token this session
+/// minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAuthentication {
+    pub scheme: AuthenticationScheme,
+    /// The declared credentials, sorted by name. Empty when only the operator token is minted.
+    pub credentials: Vec<DoorCredential>,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
@@ -1556,6 +1621,11 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidControl { field: String, message: String },
+    #[error(
+        "{}: invalid network config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
+    InvalidNetworkConfig { field: String, message: String },
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
@@ -1717,6 +1787,31 @@ struct RawLifecycleConfig {
 #[derive(Debug, Deserialize)]
 struct RawNetworkConfig {
     internal_port: Option<u16>,
+    #[serde(default)]
+    authentication: Option<RawNetworkAuthentication>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawNetworkAuthentication {
+    #[serde(default)]
+    scheme: Option<String>,
+    /// Keyed by credential name. A `BTreeMap`, so the lowered credentials come out sorted by name
+    /// whatever order the manifest wrote them in.
+    #[serde(default)]
+    credentials: Option<std::collections::BTreeMap<String, RawDoorCredential>>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDoorCredential {
+    /// Untyped, so a value that is not a list of strings is refused as an
+    /// [`RuntimeManifestError::InvalidNetworkConfig`] naming the field rather than as a serde type
+    /// error naming a line number.
+    #[serde(default)]
+    scopes: Option<serde_yaml::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2286,7 +2381,34 @@ impl RawBlock for RawLifecycleConfig {
 }
 
 impl RawBlock for RawNetworkConfig {
-    const KNOWN_KEYS: &'static [&'static str] = &["internal_port"];
+    const KNOWN_KEYS: &'static [&'static str] = &["internal_port", "authentication"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(authentication) = &self.authentication {
+            collect_block(authentication, &child_path(path, "authentication"), out);
+        }
+    }
+}
+
+impl RawBlock for RawNetworkAuthentication {
+    const KNOWN_KEYS: &'static [&'static str] = &["scheme", "credentials"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let credentials_path = child_path(path, "credentials");
+        for (name, credential) in self.credentials.iter().flatten() {
+            collect_block(credential, &child_path(&credentials_path, name), out);
+        }
+    }
+}
+
+impl RawBlock for RawDoorCredential {
+    const KNOWN_KEYS: &'static [&'static str] = &["scopes"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -3174,9 +3296,16 @@ impl RuntimeManifest {
                 Ok::<_, RuntimeManifestError>(TraceConfig { capture, retain })
             })
             .transpose()?;
-        let network = raw.network.map(|n| NetworkConfig {
-            internal_port: n.internal_port,
-        });
+        let network = raw
+            .network
+            .map(|n| {
+                Ok::<_, RuntimeManifestError>(NetworkConfig {
+                    internal_port: n.internal_port,
+                    authentication: parse_network_authentication(n.authentication)?,
+                })
+            })
+            .transpose()?;
+        refuse_authenticated_delegating_parent(network.as_ref(), capabilities.as_ref())?;
         let lifecycle = raw.lifecycle.map(|raw_lc| {
             let defaults = LifecycleConfig::default();
             LifecycleConfig {
@@ -3379,6 +3508,150 @@ fn control_string_list(
             _ => Err(refuse()),
         })
         .collect()
+}
+
+/// Lowers `network.authentication`. An absent or null block is a public door.
+fn parse_network_authentication(
+    raw: Option<RawNetworkAuthentication>,
+) -> Result<Option<NetworkAuthentication>, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let refuse = |field: &str, message: String| RuntimeManifestError::InvalidNetworkConfig {
+        field: field.to_string(),
+        message,
+    };
+    let schemes: Vec<&str> = AuthenticationScheme::ALL
+        .iter()
+        .map(|scheme| scheme.wire_name())
+        .collect();
+    let scheme = match raw.scheme.as_deref().map(str::trim) {
+        None | Some("") => {
+            return Err(refuse(
+                "network.authentication.scheme",
+                format!("is required; the schemes are: {}", schemes.join(", ")),
+            ))
+        }
+        Some(written) => AuthenticationScheme::ALL
+            .iter()
+            .copied()
+            .find(|scheme| scheme.wire_name() == written)
+            .ok_or_else(|| {
+                refuse(
+                    "network.authentication.scheme",
+                    format!(
+                        "'{written}' is not a door authentication scheme; the schemes are: {}",
+                        schemes.join(", ")
+                    ),
+                )
+            })?,
+    };
+
+    let mut credentials = Vec::new();
+    for (name, credential) in raw.credentials.unwrap_or_default() {
+        if name == OPERATOR_CREDENTIAL {
+            return Err(refuse(
+                "network.authentication.credentials",
+                format!(
+                    "'{OPERATOR_CREDENTIAL}' is reserved: the runtime always mints the operator \
+                     token, which holds every scope"
+                ),
+            ));
+        }
+        if !is_valid_credential_name(&name) {
+            return Err(refuse(
+                "network.authentication.credentials",
+                format!(
+                    "'{name}' is not a credential name; a name is a lowercase letter followed by \
+                     at most {} lowercase letters, digits, '_' or '-'",
+                    MAX_CREDENTIAL_NAME_LEN - 1
+                ),
+            ));
+        }
+        let field = format!("network.authentication.credentials.{name}.scopes");
+        let scopes = door_scope_list(&field, credential.scopes)?;
+        credentials.push(DoorCredential { name, scopes });
+    }
+
+    Ok(Some(NetworkAuthentication {
+        scheme,
+        credentials,
+    }))
+}
+
+/// `^[a-z][a-z0-9_-]{0,31}$`.
+fn is_valid_credential_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && name.len() <= MAX_CREDENTIAL_NAME_LEN
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// One credential's `scopes`: required, non-empty, each in [`DOOR_SCOPES`] and listed once.
+fn door_scope_list(
+    field: &str,
+    value: Option<serde_yaml::Value>,
+) -> Result<Vec<String>, RuntimeManifestError> {
+    let refuse = |message: String| RuntimeManifestError::InvalidNetworkConfig {
+        field: field.to_string(),
+        message,
+    };
+    let items = match value {
+        None | Some(serde_yaml::Value::Null) => {
+            return Err(refuse(
+                "is required: a credential reaches only the scopes it lists".to_string(),
+            ))
+        }
+        Some(serde_yaml::Value::Sequence(items)) => items,
+        Some(_) => return Err(refuse("must be a list of scopes".to_string())),
+    };
+    if items.is_empty() {
+        return Err(refuse(
+            "lists no scope; a credential must reach at least one".to_string(),
+        ));
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    for item in items {
+        let serde_yaml::Value::String(scope) = item else {
+            return Err(refuse("must be a list of scopes".to_string()));
+        };
+        let scope = scope.trim().to_string();
+        if !DOOR_SCOPES.contains(&scope.as_str()) {
+            return Err(refuse(format!(
+                "'{scope}' is not a door scope; the scopes are: {}",
+                DOOR_SCOPES.join(", ")
+            )));
+        }
+        if scopes.contains(&scope) {
+            return Err(refuse(format!("'{scope}' is listed more than once")));
+        }
+        scopes.push(scope);
+    }
+    Ok(scopes)
+}
+
+/// Refuses `network.authentication` on a capsule that declares `capabilities.spawn.allow`.
+///
+/// A delegated child posts its completion to its parent's door, and nothing issues a child a token
+/// for that door, so an authenticated parent would refuse every completion it asked for.
+fn refuse_authenticated_delegating_parent(
+    network: Option<&NetworkConfig>,
+    capabilities: Option<&Capabilities>,
+) -> Result<(), RuntimeManifestError> {
+    let authenticated = network.is_some_and(|network| network.authentication.is_some());
+    let delegates = capabilities
+        .and_then(|capabilities| capabilities.spawn.as_ref())
+        .is_some_and(|spawn| !spawn.allow.is_empty());
+    if authenticated && delegates {
+        return Err(RuntimeManifestError::InvalidNetworkConfig {
+            field: "network.authentication".to_string(),
+            message: "cannot be declared together with capabilities.spawn.allow: a delegated \
+                      child posts its outcome to this door, and a delegated child cannot yet be \
+                      issued a token for this door"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Lowers the top-level `exports:` block, rejecting anything the runtime would otherwise have to
@@ -11645,6 +11918,238 @@ mod control_tests {
         assert_eq!(
             manifest.control.unwrap().settings,
             vec![ControllableSetting::InferenceMaxTokens]
+        );
+    }
+}
+
+#[cfg(test)]
+mod network_authentication_tests {
+    use super::*;
+
+    fn network_authentication_of(
+        block: &str,
+    ) -> Result<Option<NetworkAuthentication>, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!("name: cap\nversion: 0.1.0\n{block}"))
+            .map(|manifest| manifest.network.and_then(|network| network.authentication))
+    }
+
+    fn network_authentication_refusal(block: &str) -> (String, String) {
+        match network_authentication_of(block) {
+            Err(RuntimeManifestError::InvalidNetworkConfig { field, message }) => (field, message),
+            other => panic!("expected InvalidNetworkConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_authentication_with_credentials_parses_sorted_by_name() {
+        let auth = network_authentication_of(
+            "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+             watcher:\n        scopes: [tasks/get, stream/watch]\n      \
+             reader:\n        scopes: [resources/files]\n",
+        )
+        .unwrap()
+        .expect("declared");
+        assert_eq!(auth.scheme, AuthenticationScheme::Bearer);
+        assert_eq!(
+            auth.credentials,
+            vec![
+                DoorCredential {
+                    name: "reader".to_string(),
+                    scopes: vec!["resources/files".to_string()],
+                },
+                DoorCredential {
+                    name: "watcher".to_string(),
+                    // Declared order, not sorted.
+                    scopes: vec!["tasks/get".to_string(), "stream/watch".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn network_authentication_scheme_alone_parses() {
+        let auth = network_authentication_of("network:\n  authentication:\n    scheme: bearer\n")
+            .unwrap()
+            .expect("declared");
+        assert_eq!(auth.scheme, AuthenticationScheme::Bearer);
+        assert!(auth.credentials.is_empty());
+    }
+
+    #[test]
+    fn network_authentication_absent_is_a_public_door() {
+        assert_eq!(network_authentication_of("").unwrap(), None);
+        assert_eq!(
+            network_authentication_of("network:\n  internal_port: 8080\n").unwrap(),
+            None
+        );
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\nnetwork:\n  internal_port: 8080\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.network,
+            Some(NetworkConfig {
+                internal_port: Some(8080),
+                authentication: None,
+            })
+        );
+    }
+
+    #[test]
+    fn network_authentication_without_a_scheme_is_refused() {
+        let (field, message) = network_authentication_refusal(
+            "network:\n  authentication:\n    credentials:\n      w:\n        scopes: [tasks/get]\n",
+        );
+        assert_eq!(field, "network.authentication.scheme");
+        assert!(message.contains("required"), "{message}");
+    }
+
+    #[test]
+    fn network_authentication_with_another_scheme_is_refused_naming_bearer() {
+        for scheme in ["mtls", "Bearer", "basic"] {
+            let (field, message) = network_authentication_refusal(&format!(
+                "network:\n  authentication:\n    scheme: {scheme}\n"
+            ));
+            assert_eq!(field, "network.authentication.scheme");
+            assert!(message.contains("bearer"), "{message}");
+            assert!(message.contains(scheme), "{message}");
+        }
+    }
+
+    #[test]
+    fn network_authentication_refuses_a_bad_or_reserved_credential_name() {
+        let long = format!("a{}", "b".repeat(32));
+        for name in [
+            "operator",
+            "Watcher",
+            "1st",
+            "_x",
+            "-x",
+            "wat.cher",
+            long.as_str(),
+        ] {
+            let (field, message) = network_authentication_refusal(&format!(
+                "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+                 '{name}':\n        scopes: [tasks/get]\n"
+            ));
+            assert_eq!(field, "network.authentication.credentials", "{name}");
+            assert!(message.contains(name), "{message}");
+        }
+        let longest = format!("a{}", "b".repeat(31));
+        for name in ["w", "a-b_c9", longest.as_str()] {
+            network_authentication_of(&format!(
+                "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+                 {name}:\n        scopes: [tasks/get]\n"
+            ))
+            .unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn network_authentication_refuses_missing_empty_unknown_or_duplicated_scopes() {
+        let credential = |body: &str| {
+            format!(
+                "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+                 watcher:\n{body}"
+            )
+        };
+        let field = "network.authentication.credentials.watcher.scopes";
+
+        let (got, message) = network_authentication_refusal(&credential("        {}\n"));
+        assert_eq!(got, field);
+        assert!(message.contains("required"), "{message}");
+
+        let (got, message) = network_authentication_refusal(&credential("        scopes: []\n"));
+        assert_eq!(got, field);
+        assert!(message.contains("no scope"), "{message}");
+
+        let (got, message) =
+            network_authentication_refusal(&credential("        scopes: [tasks/list]\n"));
+        assert_eq!(got, field);
+        assert!(message.contains("tasks/list"), "{message}");
+        assert!(message.contains("resources/files"), "{message}");
+
+        let (got, message) = network_authentication_refusal(&credential(
+            "        scopes: [agent/getAuthenticatedExtendedCard]\n",
+        ));
+        assert_eq!(got, field);
+        assert!(
+            message.contains("agent/getAuthenticatedExtendedCard"),
+            "{message}"
+        );
+
+        let (got, message) = network_authentication_refusal(&credential(
+            "        scopes: [tasks/get, stream/watch, tasks/get]\n",
+        ));
+        assert_eq!(got, field);
+        assert!(message.contains("more than once"), "{message}");
+    }
+
+    #[test]
+    fn network_authentication_accepts_every_door_scope() {
+        let auth = network_authentication_of(&format!(
+            "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+             everything:\n        scopes: [{}]\n",
+            DOOR_SCOPES.join(", ")
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.credentials[0].scopes, DOOR_SCOPES);
+        assert_eq!(OPERATOR_CREDENTIAL, "operator");
+    }
+
+    #[test]
+    fn network_authentication_is_refused_beside_spawn_allow() {
+        let (field, message) = network_authentication_refusal(
+            "network:\n  authentication:\n    scheme: bearer\ncapabilities:\n  spawn:\n    \
+             allow: [worker]\n",
+        );
+        assert_eq!(field, "network.authentication");
+        assert!(message.contains("capabilities.spawn.allow"), "{message}");
+        assert!(message.contains("token"), "{message}");
+        let error = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\nnetwork:\n  authentication:\n    scheme: bearer\n\
+             capabilities:\n  spawn:\n    allow: [worker]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("network.authentication"), "{error}");
+        assert!(error.contains("capabilities.spawn.allow"), "{error}");
+
+        // An empty allow-list delegates nothing, so it does not conflict.
+        network_authentication_of(
+            "network:\n  authentication:\n    scheme: bearer\ncapabilities:\n  spawn:\n    \
+             allow: []\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn network_authentication_unknown_keys_are_reported_at_their_full_path() {
+        let keys: Vec<(String, String, Option<String>)> = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\nnetwork:\n  authentication:\n    scheme: bearer\n    \
+             schemes: x\n    credentials:\n      watcher:\n        scopes: [tasks/get]\n        \
+             scope: [tasks/get]\n",
+        )
+        .unwrap()
+        .unknown_keys
+        .into_iter()
+        .map(|key| (key.key, key.block_path, key.nearest_known))
+        .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (
+                    "schemes".to_string(),
+                    "network.authentication".to_string(),
+                    Some("scheme".to_string())
+                ),
+                (
+                    "scope".to_string(),
+                    "network.authentication.credentials.watcher".to_string(),
+                    Some("scopes".to_string())
+                ),
+            ]
         );
     }
 }

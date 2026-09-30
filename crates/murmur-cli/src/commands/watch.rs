@@ -35,7 +35,8 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
     .to_string();
 
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nLast-Event-ID: 0\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\n{}Content-Type: application/json\r\nAccept: text/event-stream\r\nLast-Event-ID: 0\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        super::cancel::authorization_line(target.door_token().as_ref()),
         body.len(),
         body
     );
@@ -55,6 +56,9 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
         .read_line(&mut status_line)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to read response status: {e}")))?;
 
+    if let Some(refused) = super::cancel::door_refusal(&status_line) {
+        return Err(refused);
+    }
     if !status_line.contains("200") {
         return Err(CliError::new(
             E_IO_003,

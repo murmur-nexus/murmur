@@ -40,7 +40,7 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
     })
     .to_string();
 
-    let response = post_json(addr, &body)?;
+    let response = post_json(addr, &body, target.door_token().as_ref())?;
 
     if let Some(error) = response.get("error") {
         let message = error
@@ -83,13 +83,21 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
 /// here rather than at either caller: a door that accepts a connection and then says nothing
 /// would otherwise leave the command waiting on it forever, and `mur stop` has two more steps to
 /// run whatever the door does.
-pub(crate) fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
+///
+/// `door_token` is presented as `Authorization: Bearer` when given. A `401` or `403` is an error
+/// naming the status and [`capsule_runtime::DOOR_TOKEN_ENV`].
+pub(crate) fn post_json(
+    addr: &str,
+    body: &str,
+    door_token: Option<&capsule_runtime::DoorToken>,
+) -> Result<Value, CliError> {
     let stream = connect_with_timeout(addr)?;
     stream.set_read_timeout(Some(DOOR_READ_TIMEOUT)).ok();
     let mut writer = &stream;
 
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        authorization_line(door_token),
         body.len()
     );
     writer
@@ -104,6 +112,9 @@ pub(crate) fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
     reader
         .read_line(&mut status_line)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to read response status: {e}")))?;
+    if let Some(refused) = door_refusal(&status_line) {
+        return Err(refused);
+    }
     if !status_line.contains("200") {
         return Err(CliError::new(
             E_IO_003,
@@ -138,6 +149,37 @@ pub(crate) fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
             format!("the capsule's reply was not JSON ({e}): {response_body}"),
         )
     })
+}
+
+/// The `Authorization` request-header line presenting `door_token`, or nothing without one.
+pub(crate) fn authorization_line(door_token: Option<&capsule_runtime::DoorToken>) -> String {
+    door_token
+        .map(|token| {
+            format!(
+                "Authorization: {}\r\n",
+                capsule_runtime::bearer_header(token)
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// The error for a door that refused the caller's credential, from the response's status line, or
+/// `None` for any other status. Names the status, never the token.
+pub(crate) fn door_refusal(status_line: &str) -> Option<CliError> {
+    let status = status_line.split_whitespace().nth(1)?;
+    if status != "401" && status != "403" {
+        return None;
+    }
+    Some(CliError::new(
+        E_IO_003,
+        format!(
+            "the capsule's door refused the call: {} — it declares network.authentication; a \
+             session address presents the token in its running record, and --url presents \
+             {} when it is set to a token `mur run` printed",
+            status_line.trim(),
+            capsule_runtime::DOOR_TOKEN_ENV
+        ),
+    ))
 }
 
 /// Connect to `addr` under [`DOOR_CONNECT_TIMEOUT`].

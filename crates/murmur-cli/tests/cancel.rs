@@ -203,6 +203,7 @@ fn stage_agent(
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },
@@ -1238,4 +1239,54 @@ fn the_session_frame_is_in_the_trace_when_the_address_is_announced() {
         1,
         "the address was announced before `session_start` was in the trace: {events:?}"
     );
+}
+
+// ── An authenticated door ─────────────────────────────────────────────────────
+
+/// `mur cancel` and `mur watch` named by session address present the operator token from the
+/// running record.
+#[test]
+fn door_auth_cancel_and_watch_by_session_address() {
+    use common::door_capsule::{authenticated_capsule_with_a_task_in_flight, driver_home, mur};
+    let home = driver_home();
+    let (_run, _server, _project, task_id) =
+        authenticated_capsule_with_a_task_in_flight(&home, "cancel-auth");
+
+    let canceled = mur(home.path(), &[])
+        .args(["cancel", "@1", &task_id])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&canceled.stdout).to_string();
+    assert!(stdout.contains(&format!("task:    {task_id}")), "{stdout}");
+    assert!(stdout.contains("state:   canceled"), "{stdout}");
+
+    // `mur watch` reports what it is watching once the door has answered `200`, and keeps
+    // streaming until it is ended.
+    let mut watch = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["watch", "@1"])
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = watch.stderr.take().unwrap();
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = line_tx.send(line);
+        }
+    });
+    let first = line_rx.recv_timeout(Duration::from_secs(30));
+    let _ = watch.kill();
+    let _ = watch.wait();
+    let first = first.expect("mur watch said nothing");
+    assert!(first.starts_with("[murmur] watching "), "{first}");
 }

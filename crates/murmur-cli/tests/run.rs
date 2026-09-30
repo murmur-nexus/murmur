@@ -767,3 +767,99 @@ fn write_registry_source_config(home: &Path, repo: &str) {
     )
     .unwrap();
 }
+
+// ── Door authentication ───────────────────────────────────────────────────────
+
+/// `mur run` prints one `murmur: token` line per token right after the url line, operator first,
+/// then the declared credentials by name, and the printed operator token drives the door.
+#[test]
+fn door_tokens_are_printed_after_the_url_line() {
+    use common::door_capsule::{
+        agent_project, driver_home, end_turn, message, rpc, wait_completed, MurRun,
+        AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    };
+    let server = common::ScriptedServer::start(vec![end_turn(1, "done")]);
+    let home = driver_home();
+    let project = agent_project(
+        &server.endpoint,
+        "door-run",
+        "",
+        &format!("{QUEUE_SLEEP_YAML}{AUTHENTICATION_YAML}"),
+    );
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        false,
+        &[],
+        &[],
+    );
+
+    let url_at = run
+        .stdout_lines
+        .iter()
+        .position(|line| line.starts_with("murmur: url "))
+        .expect("a url line");
+    let printed: Vec<(&str, &str)> = run.stdout_lines[url_at + 1..url_at + 4]
+        .iter()
+        .map(|line| {
+            let rest = line
+                .strip_prefix("murmur: token ")
+                .unwrap_or_else(|| panic!("not a token line: {line:?}"));
+            rest.split_once(' ').unwrap()
+        })
+        .collect();
+    let names: Vec<&str> = printed.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["operator", "reader", "watcher"]);
+    for (_, token) in &printed {
+        assert!(token.starts_with("mdt1."), "{token}");
+    }
+    assert!(run.stdout_lines[url_at + 4].starts_with("session: "));
+
+    let addr = run.url();
+    let operator = run.token("operator");
+    let sent = rpc(
+        &addr,
+        Some(&operator),
+        "message/send",
+        message("m-1", "hello"),
+    );
+    assert_eq!(sent.status, 200, "{sent:?}");
+    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    wait_completed(&addr, Some(&operator), &task_id);
+
+    let stderr = run.stderr();
+    assert!(
+        !stderr.contains("mdt1."),
+        "a token reached stderr:\n{stderr}"
+    );
+}
+
+/// A delegating parent cannot declare `network.authentication`: nothing issues its children a
+/// token for the door they post their outcomes to.
+#[test]
+fn authenticated_parent_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest,
+        "name: auth-parent\nversion: 0.1.0\nartifacts: []\n\
+         capabilities:\n  spawn:\n    allow: [worker]\n\
+         network:\n  authentication:\n    scheme: bearer\n",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args(["run", "--manifest", manifest.to_str().unwrap()])
+        .current_dir(project.path())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("E-MAN-003"), "{stderr}");
+    assert!(stderr.contains("network.authentication"), "{stderr}");
+    assert!(stderr.contains("capabilities.spawn.allow"), "{stderr}");
+}

@@ -19,6 +19,12 @@ without a body is answered `404 Not Found`.
 | `message/stream` | Submit a task and stream the capsule's frames while it runs | An A2A message, under `params.message` or as `params` itself: `messageId` (string, required), `role` (string, required), `parts` (array of `{"text": …}`, required), `contextId` (string, optional) | The first live `status` frame with `"final":true` whose `id` is the task this connection submitted is written. Also after an `error` frame and after a `rejected` status |
 | `stream/watch` | Observe every frame the capsule writes, without submitting anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A `final` status does not close it |
 
+On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), both
+methods require `Authorization: Bearer <token>` with a token holding the method's scope. A request
+without one is refused with `401` or `403` and a JSON body before the stream opens: no
+`text/event-stream` headers are written and no frame is sent. See
+[Agent Card: What the door answers](agent-card.md#door-authentication).
+
 Request a `stream/watch`:
 
 ```bash

@@ -615,9 +615,7 @@ pub(crate) async fn handle_control_request<R: AsyncRead + Unpin>(
 
     let token = request
         .authorization
-        .and_then(|value| value.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, token)| token.trim());
+        .and_then(crate::door_auth::bearer_token);
     let Some(token) =
         token.filter(|token| verify_control_token(&declared.key, &plane.session_id, token))
     else {

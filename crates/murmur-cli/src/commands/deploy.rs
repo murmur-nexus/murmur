@@ -1813,6 +1813,15 @@ pub(crate) fn run_deploy(
             style("✓").green().bold()
         ),
     );
+    // The port is on the network now, whatever the capsule bound: say who may call it.
+    multi.suspend(|| {
+        for line in door_lines(&runtime_manifest, &start_info, &public_url) {
+            match line {
+                DoorLine::Warning(warning) => eprintln!("{warning}"),
+                DoorLine::Token(token) => println!("{token}"),
+            }
+        }
+    });
 
     // ── 10. Persist deployment record ─────────────────────────────────────────
     let record = DeploymentRecord {
@@ -1865,6 +1874,49 @@ pub(crate) fn run_deploy(
     multi.println(format!("  └{h_bar}┘\n"))?;
     drop(multi); // ensure all bars finalize before returning
     Ok(())
+}
+
+/// One line `mur deploy` prints about the door it published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoorLine {
+    /// `W-SEC-032`, for stderr.
+    Warning(String),
+    /// `token <name> <value>`, for stdout.
+    Token(String),
+}
+
+/// What `mur deploy` says about who may call the capsule it published at `public_url`.
+///
+/// A manifest without `network.authentication` is `W-SEC-032`, since deploy publishes the
+/// loopback-bound port through DNAT and no bind check ever sees it exposed. An authenticated one
+/// is one line per token on the remote `mur run --json` readiness line, operator first and the
+/// rest by name.
+fn door_lines(
+    manifest: &RuntimeManifest,
+    start_info: &serde_json::Value,
+    public_url: &str,
+) -> Vec<DoorLine> {
+    if let Some(warning) = capsule_runtime::public_door_warning(
+        manifest,
+        capsule_runtime::DoorExposure::Published(public_url),
+    ) {
+        return vec![DoorLine::Warning(warning)];
+    }
+    let Some(tokens) = start_info
+        .get("tokens")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let mut names: Vec<&String> = tokens.keys().collect();
+    names.sort_by_key(|name| (name.as_str() != murmur_artifact::OPERATOR_CREDENTIAL, *name));
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let token = tokens[name].as_str()?;
+            Some(DoorLine::Token(format!("token {name} {token}")))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3048,5 +3100,57 @@ mod tests {
                 "the fetched payload must be cached under the target platform"
             );
         }
+    }
+
+    fn door_manifest(extra: &str) -> RuntimeManifest {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: my-agent\nversion: 0.1.0\nartifacts:\n  - name: drv\n    version: 1.0.0\n    \
+             runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      \
+             api_key: k\ninference:\n  transport: http\n  model: m\n  driver:\n    \
+             artifact: drv\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn door_lines_warn_about_a_published_public_door() {
+        let lines = door_lines(
+            &door_manifest(""),
+            &serde_json::json!({"url": "localhost:41873"}),
+            "http://203.0.113.9:41873",
+        );
+        assert_eq!(lines.len(), 1);
+        let DoorLine::Warning(warning) = &lines[0] else {
+            panic!("expected a warning: {lines:?}");
+        };
+        assert!(warning.starts_with("warning[W-SEC-032]: the door is published at http://203.0.113.9:41873 and network.authentication is not declared"), "{warning}");
+        assert_eq!(
+            warning,
+            &capsule_runtime::public_door_warning(
+                &door_manifest(""),
+                capsule_runtime::DoorExposure::Published("http://203.0.113.9:41873")
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn door_lines_print_the_tokens_of_an_authenticated_door_operator_first() {
+        let manifest = door_manifest(
+            "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+             watcher: {scopes: [tasks/get]}\n      auditor: {scopes: [tasks/get]}\n",
+        );
+        let start_info = serde_json::json!({
+            "url": "localhost:41873",
+            "tokens": {"watcher": "mdt1.w.w", "auditor": "mdt1.a.a", "operator": "mdt1.o.o"},
+        });
+        assert_eq!(
+            door_lines(&manifest, &start_info, "http://203.0.113.9:41873"),
+            vec![
+                DoorLine::Token("token operator mdt1.o.o".to_string()),
+                DoorLine::Token("token auditor mdt1.a.a".to_string()),
+                DoorLine::Token("token watcher mdt1.w.w".to_string()),
+            ]
+        );
     }
 }

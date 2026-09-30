@@ -12,6 +12,14 @@ audience.
 Declaring one grants nothing about the other. A capsule may declare either, both or neither, and
 both default to deny.
 
+On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), the
+two planes take different credentials:
+
+| Plane | Credential |
+|---|---|
+| Operator plane | A door token holding the `resources/files` scope, as `Authorization: Bearer <token>`. Without one the request is refused `401`, or `403` for a token without the scope, before the path is read — see [Agent Card: What the door answers](agent-card.md#door-authentication) |
+| Peer plane | The handle alone. A peer redeeming a handle presents no door token |
+
 ## Operator plane { #operator-plane }
 
 A capsule that declares [`exports.files`](manifest.md#field-exports) opens a read-only view onto

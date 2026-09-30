@@ -311,6 +311,7 @@ fn stage(home: &TempDir, manifest_path: &Path, sleeps: bool) -> capsule_runtime:
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             control: None,
+            door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
         },

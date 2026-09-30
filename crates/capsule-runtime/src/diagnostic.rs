@@ -68,6 +68,13 @@ pub fn to_stdout(line: &str) -> Emitted {
     emit_to(&mut std::io::stdout().lock(), line, fallback.as_deref())
 }
 
+/// [`to_stdout`] for a line that carries a credential, such as a door token. A line the stream
+/// refuses is [`Emitted::Dropped`], never appended to `logs/bootstrap.log`: a credential written
+/// into the session directory would outlive the one reader it was printed for.
+pub fn credential_to_stdout(line: &str) -> Emitted {
+    emit_to(&mut std::io::stdout().lock(), line, None)
+}
+
 /// Write `line` and a newline to standard error.
 pub fn to_stderr(line: &str) -> Emitted {
     let fallback = diagnostic_workdir();

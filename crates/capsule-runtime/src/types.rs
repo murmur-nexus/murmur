@@ -431,6 +431,9 @@ pub struct StageRequest {
     /// Beside `exports` and on the same terms: what a controller may change is not a capability
     /// the guest holds, and nothing derived from it reaches the containment class.
     pub control: Option<murmur_artifact::ControlConfig>,
+    /// The manifest's `network.authentication` block. `None` is a public door, which answers every
+    /// caller that reaches the port; `Some` makes staging mint this session's door key and tokens.
+    pub door_authentication: Option<murmur_artifact::NetworkAuthentication>,
     /// The approval a delegated child was handed by its parent, presented once at registration.
     ///
     /// `None` for every top-level launch, which the daemon admits against its own `--spawn-allow`
@@ -487,6 +490,11 @@ pub struct StagedSession {
     /// [`StageRequest::control`]. `None` for a capsule with no `control:` block, which mints no
     /// control token and answers `404` under `/control`.
     pub(crate) control: Option<Arc<crate::control_plane::ControlState>>,
+    /// Copied from [`StageRequest::door_authentication`], which the cards are built from.
+    pub(crate) door_authentication: Option<murmur_artifact::NetworkAuthentication>,
+    /// This session's door key and tokens, minted at staging when
+    /// [`Self::door_authentication`] is declared. The key never leaves this value.
+    pub(crate) door_auth: Option<Arc<crate::door_auth::DoorAuth>>,
     /// Copied from [`StageRequest::system_prompt_overridden`] — the only record left that the
     /// prompt in `inference` came from `--system-prompt` and not from the manifest. Passed to
     /// `TraceWriter::open`, which turns it into `session_start.system_prompt_source`.
@@ -618,6 +626,15 @@ impl StagedSession {
     /// The grant set this session was staged with, as written to the trace.
     pub fn scope_report(&self) -> &crate::containment::ScopeReport {
         &self.scope_report
+    }
+
+    /// Every door token this session minted, operator first, then the declared credentials by
+    /// name. Empty for a capsule that declares no `network.authentication`.
+    pub fn door_tokens(&self) -> Vec<(String, crate::door_auth::DoorToken)> {
+        self.door_auth
+            .as_ref()
+            .map(|auth| auth.tokens().to_vec())
+            .unwrap_or_default()
     }
 }
 

@@ -190,6 +190,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
         declared_containment_floor: ContainmentClass::Advisory,
         exports: None,
         control: None,
+        door_authentication: None,
         spawn_grant: None,
         machine_tokens_per_day: None,
     }

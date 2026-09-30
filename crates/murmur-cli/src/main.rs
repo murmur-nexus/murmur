@@ -115,7 +115,12 @@ enum Commands {
         limit: usize,
     },
     /// Check that every artifact declared in murmur.yaml is present locally
-    Doctor,
+    Doctor {
+        /// The address `mur run` would bind the door on, for the public-door check
+        /// (default: 127.0.0.1, as for `mur run`).
+        #[arg(long, default_value = "127.0.0.1", value_name = "ADDR")]
+        bind: String,
+    },
     /// Build a .mur.zip artifact from a source directory
     Build {
         /// Source directory containing murmur.yaml (or input path/zip for --skill)
@@ -509,7 +514,7 @@ fn main() {
             registry,
             limit,
         } => run_search(&query, registry.as_deref(), limit),
-        Commands::Doctor => run_doctor(),
+        Commands::Doctor { bind } => run_doctor(&bind),
         Commands::Build {
             source,
             output,
