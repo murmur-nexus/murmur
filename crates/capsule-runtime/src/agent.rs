@@ -23,6 +23,7 @@ use crate::{
     bindings::host::murmur::tool::run::{Status, ToolInput},
     cancel::{CancelSignal, Residue, PHASE_INFERENCE},
     detached::DetachedDispatchInfo,
+    driver_choice::{DriverChoice, DriverChoices},
     errors::{RuntimeError, E_RUN_033, E_RUN_034, E_RUN_035, E_RUN_036},
     hooks::{
         CallDecision, DispatchFault, HookArtifact, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -115,9 +116,50 @@ impl AgentRunConfig {
         match self.control.as_ref().and_then(|control| {
             control.for_call(murmur_artifact::ControllableSetting::InferenceMaxTokens)
         }) {
-            Some(reading) => (reading.value.tokens(), reading.applies_change),
+            Some(reading) => (
+                reading.value.tokens().unwrap_or(self.max_output_tokens),
+                reading.applies_change,
+            ),
             None => (self.max_output_tokens, None),
         }
+    }
+
+    /// The driver choice one agent-loop inference call is served by, read once so the call's
+    /// payload, count, admission, dispatch and trace name one choice. The `String` is the
+    /// `control_change` this call is the first to apply, if any. The primary for a capsule that
+    /// declares no `inference.driver` setting.
+    ///
+    /// Compaction, a hook's `run-inference` and seed summarization do not read this: they stay on
+    /// the primary.
+    fn driver_choice_for_call(
+        &self,
+        inference: &InferenceConfig,
+    ) -> (DriverChoice, Option<String>) {
+        let Some(control) = self.control.as_ref() else {
+            return (DriverChoices::declared(inference).primary().clone(), None);
+        };
+        let reading = control.for_call(murmur_artifact::ControllableSetting::InferenceDriver);
+        let choice = reading
+            .as_ref()
+            .and_then(|reading| reading.value.driver())
+            .and_then(|index| control.choices().get(index))
+            .unwrap_or_else(|| control.choices().primary())
+            .clone();
+        (choice, reading.and_then(|reading| reading.applies_change))
+    }
+
+    /// The driver choice selected now, without marking it read: what a cancelled turn that never
+    /// reached its call records as its producer.
+    fn selected_driver_choice(&self, inference: &InferenceConfig) -> DriverChoice {
+        let Some(control) = self.control.as_ref() else {
+            return DriverChoices::declared(inference).primary().clone();
+        };
+        control
+            .selected(murmur_artifact::ControllableSetting::InferenceDriver)
+            .and_then(|value| value.driver())
+            .and_then(|index| control.choices().get(index))
+            .unwrap_or_else(|| control.choices().primary())
+            .clone()
     }
 }
 
@@ -209,6 +251,100 @@ const MESSAGE_FENCE_KEY: &str = "fence";
 /// inserted — the task message, model turns, tool results and runtime markers — like the other
 /// envelope keys above. The values are [`ContextInsertion::as_str`]'s.
 const MESSAGE_INSERTED_BY_KEY: &str = "inserted_by";
+
+/// Message field naming the driver and model that produced an assistant message, as
+/// `{"driver": <artifact>, "model": <model>}`. Written to the conversation record, never sent to a
+/// driver, and never served through `murmur:conversation/read`.
+///
+/// Written only by a capsule that declares `inference.alternates`, on every assistant message the
+/// agent loop pushes — truncated and cancelled ones included — because only the runtime knows
+/// which driver choice served a turn. A message without it counts as produced by the primary. The
+/// wire view of each call reads it to keep a `thinking` block, whose signature binds it to the
+/// model that wrote it, away from every other driver and model: see [`WireView`].
+const MESSAGE_PRODUCED_BY_KEY: &str = "produced_by";
+
+/// `message` marked as produced by `producer`, or returned untouched when `producer` is `None`.
+fn with_producer(mut message: Value, producer: Option<&Value>) -> Value {
+    if let (Some(producer), Some(fields)) = (producer, message.as_object_mut()) {
+        fields.insert(MESSAGE_PRODUCED_BY_KEY.to_string(), producer.clone());
+    }
+    message
+}
+
+/// The driver and model one call is served by, and the primary's, for deciding which `thinking`
+/// blocks the call may carry.
+///
+/// A `thinking` block is sent only to the driver and model that produced it: the provider signed
+/// it for that model, and a different one would reject it or misread it. Every other part of every
+/// message is carried unchanged. Built only for a capsule that declares alternates; without one
+/// there is no view, and the wire is the stored list as it always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireView<'a> {
+    pub(crate) driver: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) primary_driver: &'a str,
+    pub(crate) primary_model: &'a str,
+}
+
+impl WireView<'_> {
+    /// Whether `message` was produced by this call's driver and model. A message with no
+    /// [`MESSAGE_PRODUCED_BY_KEY`] counts as the primary's.
+    fn produced_here(&self, message: &Value) -> bool {
+        match message.get(MESSAGE_PRODUCED_BY_KEY) {
+            Some(producer) => {
+                producer.get("driver").and_then(Value::as_str) == Some(self.driver)
+                    && producer.get("model").and_then(Value::as_str) == Some(self.model)
+            }
+            None => self.driver == self.primary_driver && self.model == self.primary_model,
+        }
+    }
+
+    /// `messages` as this call sends them: every assistant message another driver or model
+    /// produced loses its `thinking` blocks, and one left with no block is left out. Borrowed
+    /// through untouched when nothing is dropped, so the stored list is never edited.
+    fn apply<'m>(&self, messages: &'m [Value]) -> std::borrow::Cow<'m, [Value]> {
+        let foreign_thinking = |message: &Value| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && !self.produced_here(message)
+                && message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| content.iter().any(is_thinking_block))
+        };
+        if !messages.iter().any(foreign_thinking) {
+            return std::borrow::Cow::Borrowed(messages);
+        }
+        std::borrow::Cow::Owned(
+            messages
+                .iter()
+                .filter_map(|message| {
+                    if !foreign_thinking(message) {
+                        return Some(message.clone());
+                    }
+                    let mut kept = message.clone();
+                    let content = kept.get_mut("content").and_then(Value::as_array_mut)?;
+                    content.retain(|block| !is_thinking_block(block));
+                    (!content.is_empty()).then_some(kept)
+                })
+                .collect(),
+        )
+    }
+}
+
+fn is_thinking_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("thinking")
+}
+
+/// `messages` under `view`, or borrowed unchanged when there is none.
+fn in_view<'m>(
+    messages: &'m [Value],
+    view: Option<&WireView<'_>>,
+) -> std::borrow::Cow<'m, [Value]> {
+    match view {
+        Some(view) => view.apply(messages),
+        None => std::borrow::Cow::Borrowed(messages),
+    }
+}
 
 /// The hook output a message entered the conversation through, as recorded under
 /// [`MESSAGE_INSERTED_BY_KEY`].
@@ -622,12 +758,23 @@ pub(crate) async fn run_agent_loop(
     // compaction-trigger input and for the recount after a replace-context commit. Built
     // before the task message so `--resume-mode compact` can be measured and committed through
     // it; it depends on nothing the task message contributes.
+    // A capsule that declares alternates marks every assistant message with its producer and
+    // gives every call a wire view; one that declares none writes and filters nothing, so its
+    // payloads, trace lines and record lines are exactly what they were without the feature.
+    let has_alternates = !inference.alternates.is_empty();
+    let primary_view = has_alternates.then_some(WireView {
+        driver: driver_name,
+        model: &inference.model,
+        primary_driver: driver_name,
+        primary_model: &inference.model,
+    });
     let occupancy = ContextOccupancy {
         model: &inference.model,
         max_output_tokens: run_config.max_output_tokens,
         tools: inventory.tools(),
         system: &augmented_system,
         prompt_cache_key: Some(prompt_cache_key.as_str()),
+        view: primary_view,
     };
 
     // Whether a compaction replaced the context since the previous inference call. Read and
@@ -757,6 +904,8 @@ pub(crate) async fn run_agent_loop(
         // honoured here rather than by another request to the provider: an ordinary tool call
         // runs to its own bound, and this is the first place after it that can stop.
         if let Some(signal) = cancel.as_ref().filter(|signal| signal.is_canceled()) {
+            let producer =
+                has_alternates.then(|| run_config.selected_driver_choice(inference).producer());
             return Ok(finish_canceled_turn(
                 store_state,
                 trace,
@@ -768,6 +917,7 @@ pub(crate) async fn run_agent_loop(
                 turn_u32,
                 // Whichever wait claimed the cancel, or `turn` when it landed between two.
                 signal.phase(),
+                producer.as_ref(),
             )
             .await);
         }
@@ -822,6 +972,27 @@ pub(crate) async fn run_agent_loop(
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
         }
+        // Read once for this call, beside the cap and on the same terms: the payload's model, the
+        // wire view, the count, the dispatch, the credential and the trace all name one choice.
+        let (choice, choice_change) = run_config.driver_choice_for_call(inference);
+        if let Some(change_id) = choice_change {
+            trace
+                .write_control_applied(
+                    turn_u32,
+                    murmur_artifact::ControllableSetting::InferenceDriver.wire_name(),
+                    json!(choice.name),
+                    &change_id,
+                )
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+        }
+        let view = has_alternates.then_some(WireView {
+            driver: &choice.driver,
+            model: &choice.model,
+            primary_driver: driver_name,
+            primary_model: &inference.model,
+        });
+        let producer = has_alternates.then(|| choice.producer());
 
         // The one point the tool array can change: before the payload is built, so the occupancy
         // count, the spend admission and the request all carry the same array.
@@ -848,31 +1019,37 @@ pub(crate) async fn run_agent_loop(
         }
         let tools = inventory.tools();
         let occupancy = ContextOccupancy {
-            model: &inference.model,
+            model: &choice.model,
             max_output_tokens,
             tools,
             system: &augmented_system,
             prompt_cache_key: Some(prompt_cache_key.as_str()),
+            view,
         };
 
         // How many logical messages the driver will know once this transmit lands. A held,
         // same-context continuation lets us wire only messages[acked_len..]; otherwise resend all.
+        // The continuation is held for the choice it was returned under, so the first call under
+        // another choice is a full resend.
         let send_len = messages.len();
-        let active_continuation = store_state.active_continuation(context_id.as_deref());
+        let active_continuation =
+            store_state.active_continuation(context_id.as_deref(), &choice.name);
         // Exactly the messages this request embeds, so `message_ids` records what went on the
         // wire rather than what the context held.
-        let message_ids: Vec<String> = wire_messages(messages, active_continuation)
-            .iter()
-            .filter_map(|message| message_id(message).map(str::to_string))
-            .collect();
-        let payload = build_driver_payload(
-            &inference.model,
+        let message_ids: Vec<String> =
+            in_view(wire_messages(messages, active_continuation), view.as_ref())
+                .iter()
+                .filter_map(|message| message_id(message).map(str::to_string))
+                .collect();
+        let payload = build_call_payload(
+            &choice.model,
             max_output_tokens,
             messages,
             tools,
             &augmented_system,
             active_continuation,
             Some(prompt_cache_key.as_str()),
+            view.as_ref(),
         );
 
         let payload_json = serde_json::to_string(&payload).map_err(|e| {
@@ -951,7 +1128,7 @@ pub(crate) async fn run_agent_loop(
                         None
                     }
                     dispatched = store_state.dispatch_driver_async(
-                        driver_name,
+                        &choice,
                         ToolInput {
                             data: Some(payload_json),
                             log_path: None,
@@ -962,7 +1139,7 @@ pub(crate) async fn run_agent_loop(
             None => Some(
                 store_state
                     .dispatch_driver_async(
-                        driver_name,
+                        &choice,
                         ToolInput {
                             data: Some(payload_json),
                             log_path: None,
@@ -984,6 +1161,7 @@ pub(crate) async fn run_agent_loop(
                 &task_id_str,
                 turn_u32,
                 PHASE_INFERENCE,
+                producer.as_ref(),
             )
             .await);
         };
@@ -1012,7 +1190,7 @@ pub(crate) async fn run_agent_loop(
         }
 
         if !matches!(driver_result.status, Status::Passed) {
-            let (cause, error_text) = match credential_failure(store_state) {
+            let (cause, error_text) = match credential_failure(store_state, &choice) {
                 Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
                 None => (
                     TASK_FAILED_DRIVER_ERROR,
@@ -1114,7 +1292,7 @@ pub(crate) async fn run_agent_loop(
             .captures_wire()
             .then(|| WireCapture::from_driver_payload(&payload, raw));
         trace
-            .write_inference(
+            .write_turn_inference(
                 turn_u32,
                 // Always `Some` on this transport: the runtime counted the request itself, so
                 // there is no turn here it did not measure.
@@ -1123,10 +1301,10 @@ pub(crate) async fn run_agent_loop(
                 decision.to_string(),
                 Some(stop_reason),
                 hook_tool_name.clone(),
-                None,
                 driver_usage.as_ref(),
                 message_ids,
                 wire.as_ref(),
+                has_alternates.then_some(&choice),
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -1143,7 +1321,7 @@ pub(crate) async fn run_agent_loop(
         )
         .await;
         if stop_reason == "error" {
-            let (cause, error) = match credential_failure(store_state) {
+            let (cause, error) = match credential_failure(store_state, &choice) {
                 Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
                 None => {
                     let error = response
@@ -1175,7 +1353,12 @@ pub(crate) async fn run_agent_loop(
         // it so the next Turn is a full resend. Applying it here means a replace-context commit
         // inside try_compact_via_hooks deterministically overrides it (universal rule #2).
         match &driver_continuation {
-            Some(id) => store_state.record_continuation(id.clone(), context_id.clone(), send_len),
+            Some(id) => store_state.record_continuation(
+                id.clone(),
+                context_id.clone(),
+                &choice.name,
+                send_len,
+            ),
             None => store_state.clear_continuation(),
         }
 
@@ -1585,10 +1768,13 @@ pub(crate) async fn run_agent_loop(
                 }
 
                 let turn_start = messages.len();
-                messages.push(with_new_id(json!({
-                    "role": "assistant",
-                    "content": content,
-                })));
+                messages.push(with_producer(
+                    with_new_id(json!({
+                        "role": "assistant",
+                        "content": content,
+                    })),
+                    producer.as_ref(),
+                ));
                 messages.extend(tool_messages);
                 // The turn's whole contribution, in the order it entered the context: the
                 // assistant message that asked for the tools, then each tool result.
@@ -1612,6 +1798,7 @@ pub(crate) async fn run_agent_loop(
                     ending,
                     &hook_artifact,
                     None,
+                    producer.as_ref(),
                 )
                 .await;
             }
@@ -1642,6 +1829,7 @@ pub(crate) async fn run_agent_loop(
                     ending,
                     &hook_artifact,
                     Some(cap),
+                    producer.as_ref(),
                 )
                 .await;
             }
@@ -1746,11 +1934,15 @@ async fn finish_canceled_turn(
     task_id_str: &str,
     turn: u32,
     phase: &str,
+    producer: Option<&Value>,
 ) -> AgentLoopExit {
-    let mut canceled = with_new_id(json!({
-        "role": "assistant",
-        "content": [{"type": "text", "text": CANCELED_TURN_TEXT}],
-    }));
+    let mut canceled = with_producer(
+        with_new_id(json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": CANCELED_TURN_TEXT}],
+        })),
+        producer,
+    );
     if let Some(fields) = canceled.as_object_mut() {
         fields.insert(MESSAGE_CANCELED_KEY.to_string(), json!(true));
     }
@@ -1927,6 +2119,7 @@ async fn finish_completed_turn(
     ending: &mut Option<AttemptEnding>,
     hook_artifact: &[HookArtifact],
     truncated_at: Option<u32>,
+    producer: Option<&Value>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let turn_text = extract_text_content(&content);
     let final_text = match truncated_at {
@@ -1947,10 +2140,13 @@ async fn finish_completed_turn(
     // mode: `stateless` decides what a later task *loads*, not what the record holds. The
     // content is the model's own, marker-free: a marker written into it would be replayed to the
     // provider on the next resume as if the model had said it.
-    let mut assistant = with_new_id(json!({
-        "role": "assistant",
-        "content": content,
-    }));
+    let mut assistant = with_producer(
+        with_new_id(json!({
+            "role": "assistant",
+            "content": content,
+        })),
+        producer,
+    );
     if truncated_at.is_some() {
         if let Some(fields) = assistant.as_object_mut() {
             fields.insert(MESSAGE_TRUNCATED_KEY.to_string(), json!(true));
@@ -3349,10 +3545,37 @@ pub(crate) fn build_driver_payload(
     continuation: Option<(&str, usize)>,
     prompt_cache_key: Option<&str>,
 ) -> Value {
+    build_call_payload(
+        model,
+        max_output_tokens,
+        messages,
+        tools,
+        augmented_system,
+        continuation,
+        prompt_cache_key,
+        None,
+    )
+}
+
+/// [`build_driver_payload`] for one agent-loop call under `view`: the messages the continuation
+/// leaves on the wire are passed through [`WireView::apply`] before the envelope keys are
+/// stripped. `None` is [`build_driver_payload`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_call_payload(
+    model: &str,
+    max_output_tokens: u32,
+    messages: &[Value],
+    tools: &[Value],
+    augmented_system: &str,
+    continuation: Option<(&str, usize)>,
+    prompt_cache_key: Option<&str>,
+    view: Option<&WireView<'_>>,
+) -> Value {
     let continuation_id = continuation
         .filter(|(_, acked_len)| *acked_len <= messages.len())
         .map(|(id, _)| id);
-    let wire_messages = strip_message_identity(wire_messages(messages, continuation));
+    let wire_messages =
+        strip_message_identity(&in_view(wire_messages(messages, continuation), view));
     let mut payload = json!({
         "model": model,
         "max_tokens": max_output_tokens,
@@ -3383,9 +3606,10 @@ fn wire_messages<'a>(messages: &'a [Value], continuation: Option<(&str, usize)>)
 
 /// The `messages` array as it goes on the wire: every message minus the runtime's own envelope
 /// keys — [`MESSAGE_ID_KEY`], [`MESSAGE_SOURCE_ID_KEY`], [`MESSAGE_CANCELED_KEY`],
-/// [`MESSAGE_TRUNCATED_KEY`], [`MESSAGE_FENCE_KEY`] and [`MESSAGE_INSERTED_BY_KEY`].
+/// [`MESSAGE_TRUNCATED_KEY`], [`MESSAGE_FENCE_KEY`], [`MESSAGE_INSERTED_BY_KEY`] and
+/// [`MESSAGE_PRODUCED_BY_KEY`].
 ///
-/// All six are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
+/// All seven are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
 /// one is minted, so a seed message carrying its id at the head of the prompt is volatile
 /// content in the exact position a provider matches its cached prefix from — it would turn
 /// every request into a cache miss. A message carrying none of them is cloned through
@@ -3405,7 +3629,8 @@ fn strip_message_identity(messages: &[Value]) -> Value {
                         || fields.contains_key(MESSAGE_CANCELED_KEY)
                         || fields.contains_key(MESSAGE_TRUNCATED_KEY)
                         || fields.contains_key(MESSAGE_FENCE_KEY)
-                        || fields.contains_key(MESSAGE_INSERTED_BY_KEY) =>
+                        || fields.contains_key(MESSAGE_INSERTED_BY_KEY)
+                        || fields.contains_key(MESSAGE_PRODUCED_BY_KEY) =>
                 {
                     let mut stripped = fields.clone();
                     stripped.remove(MESSAGE_ID_KEY);
@@ -3414,6 +3639,7 @@ fn strip_message_identity(messages: &[Value]) -> Value {
                     stripped.remove(MESSAGE_TRUNCATED_KEY);
                     stripped.remove(MESSAGE_FENCE_KEY);
                     stripped.remove(MESSAGE_INSERTED_BY_KEY);
+                    stripped.remove(MESSAGE_PRODUCED_BY_KEY);
                     Value::Object(stripped)
                 }
                 _ => message.clone(),
@@ -3453,13 +3679,16 @@ pub(crate) struct ContextOccupancy<'a> {
     /// The session's real prompt-cache key, so the counted payload is byte-identical to the
     /// one that goes on the wire when no continuation is active.
     pub(crate) prompt_cache_key: Option<&'a str>,
+    /// The wire view of the driver choice the count is for, so the estimate counts what that
+    /// choice is sent. `None` on a capsule with no alternates.
+    pub(crate) view: Option<WireView<'a>>,
 }
 
 impl ContextOccupancy<'_> {
     /// Count the full payload carrying `messages`, independent of whether a continuation is
     /// active — a continuation shrinks the wire payload, never the context the provider holds.
     pub(crate) fn count(&self, messages: &[Value]) -> u32 {
-        let payload = build_driver_payload(
+        let payload = build_call_payload(
             self.model,
             self.max_output_tokens,
             messages,
@@ -3467,6 +3696,7 @@ impl ContextOccupancy<'_> {
             self.system,
             None,
             self.prompt_cache_key,
+            self.view.as_ref(),
         );
         count_tokens(&serde_json::to_string(&payload).unwrap_or_default())
     }
@@ -3715,10 +3945,10 @@ pub(crate) const EMPTY_TASK_REFUSAL: &str =
 ///
 /// The rejection is what the driver's error is about, and the operator's fix depends on where the
 /// credential came from — so its message replaces the driver's text rather than sitting beside it.
-fn credential_failure(store_state: &CapsuleStoreState) -> Option<String> {
+fn credential_failure(store_state: &CapsuleStoreState, choice: &DriverChoice) -> Option<String> {
     store_state
         .gateways
-        .inference()
+        .inference_for(&choice.driver)
         .and_then(|gateway| gateway.credential())
         .and_then(|credential| credential.report_rejection())
 }
@@ -4450,6 +4680,7 @@ forgery: {prompt}"
             tools,
             system,
             prompt_cache_key: Some("cap:1.0.0:ctx-1"),
+            view: None,
         }
     }
 
@@ -5915,6 +6146,7 @@ forgery: {prompt}"
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         }
     }
 
@@ -6015,6 +6247,7 @@ forgery: {prompt}"
             tools: &tools,
             system: &system,
             prompt_cache_key: Some(cache_key.as_str()),
+            view: None,
         };
         let _ = writeln!(
             std::io::stderr(),
@@ -6022,5 +6255,206 @@ forgery: {prompt}"
             tools.len(),
             occupancy.count(&[])
         );
+    }
+}
+
+#[cfg(test)]
+mod driver_choice_tests {
+    use super::*;
+
+    const ANTHROPIC: &str = "murmur-driver-anthropic";
+    const SONNET: &str = "claude-sonnet-4-5";
+    const HAIKU: &str = "claude-haiku-4-5";
+    const OPENAI: &str = "murmur-driver-openai";
+    const GPT: &str = "gpt-5";
+
+    /// The wire view of a call on `driver` with `model`, the primary being sonnet.
+    fn view(driver: &'static str, model: &'static str) -> WireView<'static> {
+        WireView {
+            driver,
+            model,
+            primary_driver: ANTHROPIC,
+            primary_model: SONNET,
+        }
+    }
+
+    fn user(text: &str) -> Value {
+        with_new_id(json!({"role": "user", "content": [{"type": "text", "text": text}]}))
+    }
+
+    /// An assistant message with `content`, marked as produced by `producer` when given.
+    fn assistant(content: Value, producer: Option<(&str, &str)>) -> Value {
+        let producer = producer.map(|(driver, model)| json!({"driver": driver, "model": model}));
+        with_producer(
+            with_new_id(json!({"role": "assistant", "content": content})),
+            producer.as_ref(),
+        )
+    }
+
+    fn thinking(signature: &str) -> Value {
+        json!({"type": "thinking", "text": "pondering", "signature": signature})
+    }
+
+    fn payload_text(messages: &[Value], view: Option<&WireView<'_>>) -> String {
+        build_call_payload("m", 8192, messages, &[], "sys", None, None, view).to_string()
+    }
+
+    /// Thinking reaches the driver and model that produced it and no other, and every other block
+    /// of the same message reaches every choice.
+    #[test]
+    fn driver_choice_thinking_is_sent_only_to_its_producer() {
+        let messages = vec![
+            user("question"),
+            assistant(
+                json!([thinking("sig-sonnet-1"), {"type": "text", "text": "answer"}]),
+                Some((ANTHROPIC, SONNET)),
+            ),
+            user("follow-up"),
+        ];
+        let stored = messages.clone();
+
+        let to_sonnet = payload_text(&messages, Some(&view(ANTHROPIC, SONNET)));
+        assert!(to_sonnet.contains("sig-sonnet-1"), "{to_sonnet}");
+
+        for (driver, model) in [(ANTHROPIC, HAIKU), (OPENAI, GPT)] {
+            let to_other = payload_text(&messages, Some(&view(driver, model)));
+            assert!(!to_other.contains("sig-sonnet-1"), "{model}: {to_other}");
+            assert!(!to_other.contains("pondering"), "{model}: {to_other}");
+            assert!(to_other.contains("\"answer\""), "{model}: {to_other}");
+            assert!(to_other.contains("follow-up"), "{model}: {to_other}");
+        }
+        assert_eq!(messages, stored, "the stored list is never edited");
+    }
+
+    /// An assistant message made only of another model's thinking is left out of the request,
+    /// and so out of the `message_ids` that name what the request embedded.
+    #[test]
+    fn driver_choice_a_message_of_only_foreign_thinking_is_left_off_the_wire_and_message_ids() {
+        let messages = vec![
+            user("question"),
+            assistant(json!([thinking("sig-sonnet-1")]), Some((ANTHROPIC, SONNET))),
+            user("again"),
+        ];
+        let gpt = view(OPENAI, GPT);
+        let wire = in_view(wire_messages(&messages, None), Some(&gpt));
+        let ids: Vec<&str> = wire.iter().filter_map(message_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                message_id(&messages[0]).unwrap(),
+                message_id(&messages[2]).unwrap()
+            ]
+        );
+        let payload = build_call_payload("m", 8192, &messages, &[], "sys", None, None, Some(&gpt));
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 2);
+
+        let own = in_view(&messages, Some(&view(ANTHROPIC, SONNET)));
+        assert!(matches!(own, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(own.len(), 3);
+    }
+
+    /// A message with no `produced_by` — one written before the capsule declared alternates, or
+    /// by a capsule that declares none — counts as the primary's.
+    #[test]
+    fn driver_choice_a_message_without_produced_by_counts_as_the_primarys() {
+        let messages = vec![
+            user("question"),
+            assistant(
+                json!([thinking("sig-unmarked"), {"type": "text", "text": "answer"}]),
+                None,
+            ),
+        ];
+        assert!(payload_text(&messages, Some(&view(ANTHROPIC, SONNET))).contains("sig-unmarked"));
+        assert!(!payload_text(&messages, Some(&view(ANTHROPIC, HAIKU))).contains("sig-unmarked"));
+
+        // Written by an alternate, it goes back to that alternate after a switch there.
+        let by_haiku = vec![assistant(
+            json!([thinking("sig-haiku"), {"type": "text", "text": "a"}]),
+            Some((ANTHROPIC, HAIKU)),
+        )];
+        assert!(payload_text(&by_haiku, Some(&view(ANTHROPIC, HAIKU))).contains("sig-haiku"));
+        assert!(!payload_text(&by_haiku, Some(&view(ANTHROPIC, SONNET))).contains("sig-haiku"));
+    }
+
+    /// `produced_by` is an envelope key: in the record, never on the wire. Without a view the
+    /// payload is exactly [`build_driver_payload`]'s.
+    #[test]
+    fn driver_choice_produced_by_never_reaches_the_wire() {
+        let messages = vec![
+            user("question"),
+            assistant(
+                json!([{"type": "text", "text": "answer"}]),
+                Some((OPENAI, GPT)),
+            ),
+        ];
+        assert!(messages[1].get(MESSAGE_PRODUCED_BY_KEY).is_some());
+        for view in [None, Some(view(OPENAI, GPT)), Some(view(ANTHROPIC, SONNET))] {
+            let text = payload_text(&messages, view.as_ref());
+            assert!(!text.contains("produced_by"), "{text}");
+        }
+        assert_eq!(
+            build_call_payload("m", 8192, &messages, &[], "sys", None, None, None),
+            build_driver_payload("m", 8192, &messages, &[], "sys", None, None)
+        );
+    }
+
+    /// Occupancy counts what the call's choice is sent, so dropped thinking is not counted.
+    #[test]
+    fn driver_choice_occupancy_counts_the_calls_view() {
+        let messages = vec![
+            user("question"),
+            assistant(
+                json!([
+                    {"type": "thinking", "text": "a long chain of reasoning ".repeat(40), "signature": "sig"},
+                    {"type": "text", "text": "answer"}
+                ]),
+                Some((ANTHROPIC, SONNET)),
+            ),
+        ];
+        let count = |view: Option<WireView<'static>>| {
+            ContextOccupancy {
+                model: "m",
+                max_output_tokens: 8192,
+                tools: &[],
+                system: "sys",
+                prompt_cache_key: None,
+                view,
+            }
+            .count(&messages)
+        };
+        assert!(count(Some(view(OPENAI, GPT))) < count(Some(view(ANTHROPIC, SONNET))));
+        assert_eq!(count(Some(view(ANTHROPIC, SONNET))), count(None));
+    }
+
+    /// A held continuation is presented only under the choice it was returned under.
+    #[test]
+    fn driver_choice_a_held_continuation_is_scoped_to_its_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::runtime::build_test_state(
+            Arc::new(murmur_artifact::LocalRegistry::new(
+                dir.path().join("registry"),
+            )),
+            dir.path().to_path_buf(),
+            dir.path().join("murmur.lock"),
+        );
+        state.record_continuation("cont-1".into(), Some("ctx-a".into()), "primary", 2);
+        assert_eq!(
+            state.active_continuation(Some("ctx-a"), "primary"),
+            Some(("cont-1", 2))
+        );
+        assert_eq!(state.active_continuation(Some("ctx-a"), "gpt"), None);
+        // Switching back finds it again: nothing about the other choice's call dropped it.
+        assert_eq!(
+            state.active_continuation(Some("ctx-a"), "primary"),
+            Some(("cont-1", 2))
+        );
+        state.record_continuation("cont-2".into(), Some("ctx-a".into()), "gpt", 3);
+        assert_eq!(state.active_continuation(Some("ctx-a"), "primary"), None);
+        assert_eq!(
+            state.active_continuation(Some("ctx-a"), "gpt"),
+            Some(("cont-2", 3))
+        );
+        state.clear_continuation();
+        assert_eq!(state.active_continuation(Some("ctx-a"), "gpt"), None);
     }
 }

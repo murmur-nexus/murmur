@@ -10,11 +10,14 @@ on `POST /`, and absent from the [agent card](agent-card.md).
 | A setting | `control.settings` | From the agent loop's next inference call | `mur control set` |
 | A secret | `control.secrets` | On the credential gateway's next keyed request | `mur control secret`, `mur control forget` |
 
-A capsule with no `control:` block — or with `control: {}`, or both lists empty — has no control
-surface. It mints no token, and every request under `/control` is answered `404`.
+A capsule with no `control:` block — or with `control: {}`, or all three lists empty, or only
+`control.agent_settings` — has no control surface. It mints no token, and every request under
+`/control` is answered `404`.
 
 The agent is never a controller. No manifest key hands the token to a tool, hook, driver or shell
-command. Where the session's filesystem restriction is `advisory`, a shell command or native tool
+command. `control.agent_settings` lets the agent change a setting about itself through the
+runtime-provided [`switch-driver`](runtime-provided-tools.md#switch-driver) tool, which the runtime
+answers in-process without the token or the surface. Where the session's filesystem restriction is `advisory`, a shell command or native tool
 can read any file you can, the [token file](#token) included: on such a host, do not grant
 `capabilities.shell` to a capsule whose controls the agent must not reach. `mur run --explain-scope
 --json` reports the restriction as
@@ -26,10 +29,23 @@ can read any file you can, the [token file](#token) included: on such a host, do
 
 | Setting | Value | Valid under | Read by |
 |---|---|---|---|
-| `inference.max_tokens` | Integer, `1` to `4294967295` | `inference.transport: http` | Every agent-loop inference call: the `max_tokens` sent to the driver, the spend admission, the context-occupancy count and the truncation warning |
+| `inference.driver` | The name of a declared [driver choice](manifest.md#inference-alternates): `primary` or an `inference.alternates` entry | `inference.transport: http`, with at least one alternate | Every agent-loop inference call: the driver it is dispatched to, the model, the gateway and credential, the context-occupancy count and the trace. Starts on `primary` |
+| `inference.max_tokens` | Integer, `1` to `4294967295` | Every agent-loop inference call: the `max_tokens` sent to the driver, the spend admission, the context-occupancy count and the truncation warning |
 
-Each inference call reads the setting once, so one call never mixes two values. Compaction calls
-and a hook's `run-inference` do not read it.
+Each inference call reads each setting once, so one call never mixes two values. Compaction calls
+and a hook's `run-inference` read neither: they stay on the primary driver and the manifest's cap.
+
+A switch to a driver choice is accepted only when its credential can produce a value now:
+
+| Choice's credential | Switch |
+|---|---|
+| Resolved at launch from the config, the environment or a literal | Accepted |
+| A `control.secrets` name with a value injected | Accepted |
+| A `control.secrets` name with nothing injected | Refused `409 credential_unresolvable` |
+| Found nowhere at launch ([`W-RUN-003`](diagnostics.md#w-run-003)) | Refused `409 credential_unresolvable` |
+
+A secret that keys the choice in use cannot be forgotten: `DELETE` is refused `409 in_use` and the
+value is kept. Switch to another choice first.
 
 ## Controllable secrets { #secrets }
 
@@ -54,8 +70,8 @@ stderr or an error, and it is never placed in the agent's context or a tool's en
 
 | Method | Path | Body | Answers `200` with |
 |---|---|---|---|
-| `GET` | `/control` | — | `{"session_id", "settings": [{"name", "value"}], "secrets": [{"name", "set"}]}` |
-| `PUT` | `/control/settings/<name>` | `content-type: application/json`, `{"value": <n>}` | `{"name", "previous", "value", "applies_from": "next_inference_call"}` |
+| `GET` | `/control` | — | `{"session_id", "settings": [{"name", "value"}], "secrets": [{"name", "set"}]}`. The `inference.driver` entry also carries `"choices": [{"name", "driver", "model", "available"}]`, where `available` is whether a switch to it would be accepted now |
+| `PUT` | `/control/settings/<name>` | `content-type: application/json`, `{"value": <value>}` | `{"name", "previous", "value", "applies_from": "next_inference_call"}`. A driver choice's `previous` and `value` are choice names |
 | `PUT` | `/control/secrets/<name>` | The raw value, exactly as sent: no JSON, no trimming | `{"name", "set": true, "replaced": <bool>}` |
 | `DELETE` | `/control/secrets/<name>` | — | `{"name", "set": false}` |
 
@@ -71,14 +87,17 @@ Every refusal has the body `{"error": "<one sentence>"}`. A secret's value never
 | 404 | — | The capsule declares no `control:` block. Nothing is recorded |
 | 401 | `unauthenticated` | `Authorization: Bearer` is missing or its token does not verify for this session. Carries `WWW-Authenticate: Bearer realm="murmur-control"` |
 | 404 | `unknown_path` | No control resource at the path |
-| 404 | `undeclared_setting` | The setting is not in `control.settings` |
+| 404 | `undeclared_setting` | The setting is not in `control.settings`, including one only `control.agent_settings` lists |
 | 404 | `undeclared_secret` | The secret is not in `control.secrets` |
 | 405 | `method_not_allowed` | A method the resource does not answer. Carries `allow` |
 | 403 | `not_loopback` | A secret `PUT` or `DELETE` from a peer that is not loopback |
 | 413 | `body_too_large` | `content-length` over 1024 bytes for a setting, or 8192 bytes for a secret |
 | 422 | `missing_body` | A `PUT` with no body, or `content-length: 0` |
 | 415 | `unsupported_media_type` | A setting `PUT` without `content-type: application/json` |
-| 422 | `invalid_value` | A setting value outside its range or not an integer, or a secret that is empty or holds any byte other than visible ASCII and space |
+| 422 | `invalid_value` | An `inference.max_tokens` value outside its range or not an integer, or a secret that is empty or holds any byte other than visible ASCII and space |
+| 422 | `undeclared_driver` | An `inference.driver` value that is not a string naming a declared choice. The message lists the declared names |
+| 409 | `credential_unresolvable` | An `inference.driver` choice whose credential cannot produce a value now. The message names the credential |
+| 409 | `in_use` | A secret `DELETE` while the secret keys the driver choice in use |
 | 400 | `truncated_body` | The connection closed before `content-length` bytes arrived |
 
 ### Order of checks { #order-of-checks }
@@ -129,20 +148,24 @@ A capsule is reachable from other hosts only when `mur run --bind` names a non-l
 
 | Event | Written when |
 |---|---|
-| `control_change` | A change is accepted |
-| `control_refused` | A request to a declared surface is refused |
+| `control_change` | A change is accepted. `principal` is `controller`, with the token's `token_id`, or `agent`, with none |
+| `control_refused` | A request to a declared surface, or an agent's `switch-driver` call, is refused. `principal` says which |
 | `control_applied` | The first agent-loop inference call to use a changed setting value, before the call is sent |
-| `session_start.control` | At launch: the declared setting and secret names |
+| `session_start.control` | At launch: the declared setting, secret and agent-setting names |
+| `session_start.inference_choices` | At launch, when alternates are declared: every driver choice and whether its credential resolved |
 | `gateway_credential` with `source: "injected"` | An injected credential's keyed request found no value: once per period with no value |
 
 Field lists are in [Observability schemas](observability-schemas.md#control-events).
 `mur trace show` prints one line per `control_change` under **Control**, with the turn a setting
-applied from.
+applied from and who made the change, and, when alternates are declared, the choice that served
+each turn under **Driver choices**. `mur control show` lists every driver choice with its model,
+its driver and whether it is available.
 
 Nothing is added to the conversation record, the A2A stream or `mur watch`: a control change is not
 a message to the model.
 
 ## What is not persisted { #persistence }
 
-Nothing a controller sets survives the process. A restart or `mur run --resume` starts every setting
-from the manifest, holds no secret, and mints a new token.
+Nothing a controller or the agent sets survives the process. A restart or `mur run --resume` starts
+every setting from the manifest — `inference.driver` on `primary` — holds no secret, and mints a new
+token.

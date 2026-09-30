@@ -40,6 +40,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
+    driver_choice::{DriverChoice, DriverChoices},
     mac_token::{self, MintKey},
     resource_plane::ResourceResponse,
     trace::{ControlChange, ResourceTraceAppender},
@@ -145,6 +146,12 @@ impl InjectedSecrets {
         self.with_slot(name, |_| ()).is_some()
     }
 
+    /// Whether a value is held for `name`. Reads nothing out and records nothing, so a check made
+    /// before a switch leaves no trace of its own.
+    pub(crate) fn holds(&self, name: &str) -> bool {
+        self.with_slot(name, |slot| slot.is_some()).unwrap_or(false)
+    }
+
     /// A copy of `name`'s value for one request, or `None` when nothing is held for it.
     ///
     /// The copy is the rendered header's source and is dropped with the request; the held value
@@ -188,30 +195,63 @@ impl std::fmt::Debug for InjectedSecrets {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
+/// Who changes a setting: the holder of the control token over [`CONTROL_PATH`], or the agent
+/// through the runtime-provided tool its grant writes. Recorded as `principal` on every
+/// `control_change` and `control_refused` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Principal {
+    Controller,
+    Agent,
+}
+
+impl Principal {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 /// A setting's value as the plane validated it. One variant per value shape a
 /// [`ControllableSetting`] takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingValue {
     /// A token count, `1..=u32::MAX`.
     Tokens(u32),
+    /// A driver choice, by its index in the session's [`DriverChoices`].
+    Driver(usize),
 }
 
 impl SettingValue {
-    fn to_json(self) -> Value {
+    /// The value as the surface and the trace spell it: a token count as a number, a driver
+    /// choice by its name.
+    fn to_json(self, choices: &DriverChoices) -> Value {
         match self {
             Self::Tokens(count) => json!(count),
+            Self::Driver(index) => json!(choices.get(index).map(|choice| choice.name.as_str())),
         }
     }
 
     /// The token count, for a setting whose value is one.
-    pub(crate) fn tokens(self) -> u32 {
+    pub(crate) fn tokens(self) -> Option<u32> {
         match self {
-            Self::Tokens(count) => count,
+            Self::Tokens(count) => Some(count),
+            Self::Driver(_) => None,
+        }
+    }
+
+    /// The driver choice's index, for `inference.driver`.
+    pub(crate) fn driver(self) -> Option<usize> {
+        match self {
+            Self::Driver(index) => Some(index),
+            Self::Tokens(_) => None,
         }
     }
 }
 
-/// The value `setting` starts the session with: what the manifest resolved to.
+/// The value `setting` starts the session with: what the manifest resolved to. A driver setting
+/// always starts on the primary, so nothing a controller or the agent chose survives a restart.
 fn launch_value(setting: ControllableSetting, inference: &InferenceConfig) -> SettingValue {
     match setting {
         ControllableSetting::InferenceMaxTokens => SettingValue::Tokens(
@@ -219,14 +259,35 @@ fn launch_value(setting: ControllableSetting, inference: &InferenceConfig) -> Se
                 .max_tokens
                 .unwrap_or(crate::agent::DEFAULT_MAX_OUTPUT_TOKENS),
         ),
+        ControllableSetting::InferenceDriver => SettingValue::Driver(0),
     }
 }
 
-/// `value` as `setting` takes it, or the one-sentence reason it does not.
+/// A change refused before anything changed: its HTTP status, the trace's reason word, and the
+/// one sentence the caller is told. Never quotes a credential value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChangeRefused {
+    pub(crate) status: u16,
+    pub(crate) reason: &'static str,
+    pub(crate) message: String,
+}
+
+impl ChangeRefused {
+    fn new(status: u16, reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+/// `value` as `setting` takes it, or why it does not.
 fn parse_setting_value(
     setting: ControllableSetting,
     value: &Value,
-) -> Result<SettingValue, String> {
+    choices: &DriverChoices,
+) -> Result<SettingValue, ChangeRefused> {
     match setting {
         ControllableSetting::InferenceMaxTokens => value
             .as_u64()
@@ -234,10 +295,29 @@ fn parse_setting_value(
             .filter(|count| *count >= 1)
             .map(SettingValue::Tokens)
             .ok_or_else(|| {
-                format!(
-                    "{} takes an integer from 1 to {}",
-                    setting.wire_name(),
-                    u32::MAX
+                ChangeRefused::new(
+                    422,
+                    "invalid_value",
+                    format!(
+                        "{} takes an integer from 1 to {}",
+                        setting.wire_name(),
+                        u32::MAX
+                    ),
+                )
+            }),
+        ControllableSetting::InferenceDriver => value
+            .as_str()
+            .and_then(|name| choices.index_of(name))
+            .map(SettingValue::Driver)
+            .ok_or_else(|| {
+                ChangeRefused::new(
+                    422,
+                    "undeclared_driver",
+                    format!(
+                        "{} takes the name of a declared driver choice; this capsule declares: {}",
+                        setting.wire_name(),
+                        choices.names()
+                    ),
                 )
             }),
     }
@@ -251,12 +331,40 @@ struct SettingSlot {
     /// The value the last inference call read, so the first call to read a different one can
     /// say so with `control_applied`.
     last_used: SettingValue,
+    /// Whether `control.settings` lists the setting, so a controller may change it.
+    controller: bool,
+    /// Whether `control.agent_settings` lists the setting, so the agent may change it.
+    agent: bool,
 }
 
-/// What a controller has changed on this session, read by the agent loop and the gateways.
+impl SettingSlot {
+    fn permits(&self, principal: Principal) -> bool {
+        match principal {
+            Principal::Controller => self.controller,
+            Principal::Agent => self.agent,
+        }
+    }
+}
+
+/// An accepted setting change, as the caller records and answers it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AcceptedChange {
+    /// The `event_id` its `control_change` is written under, and that `control_applied` names.
+    pub(crate) change_id: String,
+    pub(crate) previous: Value,
+    pub(crate) value: Value,
+}
+
+/// What a controller or the agent has changed on this session, read by the agent loop and the
+/// gateways.
+///
+/// One lock guards the settings, and every check that depends on which driver choice is in use is
+/// made under it: a switch checks the choice's credential and a forget checks the choice in use,
+/// so neither can pass against a state the other is changing.
 pub(crate) struct ControlState {
     settings: Mutex<Vec<SettingSlot>>,
     secrets: Arc<InjectedSecrets>,
+    choices: DriverChoices,
 }
 
 impl std::fmt::Debug for ControlState {
@@ -278,11 +386,23 @@ pub(crate) struct SettingForCall {
 
 impl ControlState {
     /// State for a session that declares `config`, every setting at the value `inference`
-    /// resolves it to and no secret held.
-    pub(crate) fn new(config: &ControlConfig, inference: &InferenceConfig) -> Self {
-        let settings = config
+    /// resolves it to. `choices` is the session's driver choice table as staging left it, and
+    /// `secrets` the store every injected gateway credential reads.
+    pub(crate) fn new(
+        config: &ControlConfig,
+        inference: &InferenceConfig,
+        choices: DriverChoices,
+        secrets: Arc<InjectedSecrets>,
+    ) -> Self {
+        let declared = config
             .settings
             .iter()
+            .chain(
+                config
+                    .agent_settings
+                    .iter()
+                    .filter(|setting| !config.settings.contains(setting)),
+            )
             .map(|setting| {
                 let value = launch_value(*setting, inference);
                 SettingSlot {
@@ -290,45 +410,152 @@ impl ControlState {
                     value,
                     change_id: None,
                     last_used: value,
+                    controller: config.controller_may_set(*setting),
+                    agent: config.agent_may_set(*setting),
                 }
             })
             .collect();
         Self {
-            settings: Mutex::new(settings),
-            secrets: Arc::new(InjectedSecrets::new(&config.secrets)),
+            settings: Mutex::new(declared),
+            secrets,
+            choices,
         }
     }
 
-    /// The secrets store every injected gateway credential reads.
-    pub(crate) fn secrets(&self) -> Arc<InjectedSecrets> {
-        Arc::clone(&self.secrets)
+    /// The session's driver choices.
+    pub(crate) fn choices(&self) -> &DriverChoices {
+        &self.choices
+    }
+
+    /// Whether a controller has anything to call: a setting it may change or a secret it may
+    /// supply. A session whose `control:` block grants only the agent mints no control token and
+    /// answers `404` under [`CONTROL_PATH`].
+    pub(crate) fn has_controller_surface(&self) -> bool {
+        self.lock_settings().iter().any(|slot| slot.controller)
+            || !self.secrets.listing().is_empty()
     }
 
     fn lock_settings(&self) -> std::sync::MutexGuard<'_, Vec<SettingSlot>> {
         self.settings.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn setting_value(&self, setting: ControllableSetting) -> Option<SettingValue> {
+    /// Whether `principal` may change `setting` on this session.
+    pub(crate) fn permits(&self, principal: Principal, setting: ControllableSetting) -> bool {
+        self.lock_settings()
+            .iter()
+            .any(|slot| slot.setting == setting && slot.permits(principal))
+    }
+
+    /// Whether a switch to `choice` would be accepted now: its credential resolved at launch and,
+    /// for an injected one, a value is held.
+    fn choice_available(&self, choice: &DriverChoice) -> bool {
+        choice.staged()
+            && choice
+                .injected_secret
+                .as_deref()
+                .is_none_or(|name| self.secrets.holds(name))
+    }
+
+    /// Why a switch to `choice` is refused, or `None` when it would be accepted.
+    fn unresolvable(&self, choice: &DriverChoice) -> Option<ChangeRefused> {
+        if let Some(credential) = &choice.unresolved_credential {
+            return Some(ChangeRefused::new(
+                409,
+                "credential_unresolvable",
+                format!(
+                    "driver choice '{}' cannot be selected: its credential {credential} was not \
+                     found when the capsule launched",
+                    choice.name
+                ),
+            ));
+        }
+        let name = choice
+            .injected_secret
+            .as_deref()
+            .filter(|name| !self.secrets.holds(name))?;
+        Some(ChangeRefused::new(
+            409,
+            "credential_unresolvable",
+            format!(
+                "driver choice '{}' cannot be selected: its credential {name} is a control.secrets \
+                 name with no value injected; supply it with `mur control secret {name}` first",
+                choice.name
+            ),
+        ))
+    }
+
+    /// Validates `requested` for `setting` and applies it for `principal`, returning the change
+    /// the caller records. Everything is decided under the settings lock, so a driver choice's
+    /// credential is checked against the same state a forget is.
+    pub(crate) fn request_change(
+        &self,
+        principal: Principal,
+        setting: ControllableSetting,
+        requested: &Value,
+    ) -> Result<AcceptedChange, ChangeRefused> {
+        let value = parse_setting_value(setting, requested, &self.choices)?;
+        let mut settings = self.lock_settings();
+        let Some(slot) = settings
+            .iter_mut()
+            .find(|slot| slot.setting == setting && slot.permits(principal))
+        else {
+            return Err(ChangeRefused::new(
+                404,
+                "undeclared_setting",
+                "this capsule's control: block does not declare that setting",
+            ));
+        };
+        if let Some(refusal) = value
+            .driver()
+            .and_then(|index| self.choices.get(index))
+            .and_then(|choice| self.unresolvable(choice))
+        {
+            return Err(refusal);
+        }
+        let change_id = crate::trace::new_event_id();
+        let previous = slot.value;
+        slot.value = value;
+        slot.change_id = Some(change_id.clone());
+        Ok(AcceptedChange {
+            change_id,
+            previous: previous.to_json(&self.choices),
+            value: value.to_json(&self.choices),
+        })
+    }
+
+    /// Drops the value held for secret `name`, refused with `409 in_use` while `name` keys the
+    /// driver choice in use. `Some(was_set)` when `name` is declared.
+    fn forget_secret(&self, name: &str) -> Result<Option<bool>, ChangeRefused> {
+        let settings = self.lock_settings();
+        let in_use = settings
+            .iter()
+            .find(|slot| slot.setting == ControllableSetting::InferenceDriver)
+            .and_then(|slot| slot.value.driver())
+            .and_then(|index| self.choices.get(index))
+            .filter(|choice| choice.injected_secret.as_deref() == Some(name));
+        if let Some(choice) = in_use {
+            return Err(ChangeRefused::new(
+                409,
+                "in_use",
+                format!(
+                    "{name} keys driver choice '{}', which is in use; switch inference.driver to \
+                     another choice before forgetting it",
+                    choice.name
+                ),
+            ));
+        }
+        let forgotten = self.secrets.forget(name);
+        drop(settings);
+        Ok(forgotten)
+    }
+
+    /// The value `setting` holds now, without marking it read by any call. `None` for a setting
+    /// this session does not declare.
+    pub(crate) fn selected(&self, setting: ControllableSetting) -> Option<SettingValue> {
         self.lock_settings()
             .iter()
             .find(|slot| slot.setting == setting)
             .map(|slot| slot.value)
-    }
-
-    /// Sets `setting` to `value` under `change_id` and returns the value it replaces, or `None`
-    /// for a setting this session does not declare.
-    fn change_setting(
-        &self,
-        setting: ControllableSetting,
-        value: SettingValue,
-        change_id: String,
-    ) -> Option<SettingValue> {
-        let mut settings = self.lock_settings();
-        let slot = settings.iter_mut().find(|slot| slot.setting == setting)?;
-        let previous = slot.value;
-        slot.value = value;
-        slot.change_id = Some(change_id);
-        Some(previous)
     }
 
     /// The value one inference call uses for `setting`, read once so the call never mixes two.
@@ -348,25 +575,45 @@ impl ControlState {
 
     /// What `session_start.control` records: every declared name, never a value.
     pub(crate) fn session_control(&self) -> crate::trace::SessionControl {
-        crate::trace::SessionControl {
-            settings: self
-                .lock_settings()
+        let settings = self.lock_settings();
+        let names = |principal: Principal| {
+            settings
                 .iter()
+                .filter(|slot| slot.permits(principal))
                 .map(|slot| slot.setting.wire_name())
-                .collect(),
+                .collect()
+        };
+        crate::trace::SessionControl {
+            settings: names(Principal::Controller),
             secrets: self
                 .secrets
                 .listing()
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect(),
+            agent_settings: names(Principal::Agent),
         }
     }
 
-    fn settings_listing(&self) -> Vec<(ControllableSetting, SettingValue)> {
-        self.lock_settings()
+    /// The `settings` array `GET /control` lists: every setting a controller may change, with its
+    /// value, and for `inference.driver` every choice and whether a switch to it would be
+    /// accepted now.
+    fn settings_listing(&self) -> Vec<Value> {
+        let settings = self.lock_settings();
+        settings
             .iter()
-            .map(|slot| (slot.setting, slot.value))
+            .filter(|slot| slot.controller)
+            .map(|slot| {
+                let mut entry = json!({
+                    "name": slot.setting.wire_name(),
+                    "value": slot.value.to_json(&self.choices),
+                });
+                if slot.setting == ControllableSetting::InferenceDriver {
+                    entry["choices"] =
+                        json!(self.choices.listing(|choice| self.choice_available(choice)));
+                }
+                entry
+            })
             .collect()
     }
 }
@@ -486,7 +733,14 @@ impl ControlPlane {
             None => (None, None, None),
         };
         trace
-            .write_control_refused(refusal.status, refusal.reason, kind, name, token_id)
+            .write_control_refused(
+                Principal::Controller,
+                refusal.status,
+                refusal.reason,
+                kind,
+                name,
+                token_id,
+            )
             .await;
     }
 
@@ -582,6 +836,12 @@ impl<'a> Refusal<'a> {
     }
 }
 
+impl From<ChangeRefused> for Refusal<'_> {
+    fn from(refused: ChangeRefused) -> Self {
+        Self::new(refused.status, refused.reason, refused.message)
+    }
+}
+
 fn json_response(status: u16, headers: Vec<(String, String)>, body: &Value) -> ResourceResponse {
     ResourceResponse::framed(status, headers, body.to_string().into_bytes())
 }
@@ -668,7 +928,7 @@ async fn serve_authenticated<'r, R: AsyncRead + Unpin>(
     if let Some(name) = path.strip_prefix(SETTINGS_PREFIX) {
         let target = Target::setting(name);
         let Some(setting) = ControllableSetting::from_wire_name(name)
-            .filter(|setting| auth.state.setting_value(*setting).is_some())
+            .filter(|setting| auth.state.permits(Principal::Controller, *setting))
         else {
             return Err(Refusal::new(
                 404,
@@ -683,32 +943,31 @@ async fn serve_authenticated<'r, R: AsyncRead + Unpin>(
         let value = read_setting_body(request, body)
             .await
             .map_err(|refusal| refusal.naming(target))?;
-        let value = parse_setting_value(setting, &value)
-            .map_err(|message| Refusal::new(422, "invalid_value", message).naming(target))?;
-        let change_id = crate::trace::new_event_id();
-        let previous = auth
+        let change = auth
             .state
-            .change_setting(setting, value, change_id.clone())
-            .ok_or_else(not_found)?;
+            .request_change(Principal::Controller, setting, &value)
+            .map_err(|refused| Refusal::from(refused).naming(target))?;
+        let answer = json!({
+            "name": setting.wire_name(),
+            "previous": change.previous,
+            "value": change.value,
+            "applies_from": APPLIES_FROM,
+        });
         plane
             .record_change(ControlChange {
-                event_id: change_id,
-                token_id: &auth.token_id,
+                event_id: change.change_id,
+                principal: Principal::Controller,
+                token_id: Some(&auth.token_id),
                 kind: "setting",
                 name: setting.wire_name(),
                 action: "set",
-                previous: Some(previous.to_json()),
-                value: Some(value.to_json()),
+                previous: Some(change.previous),
+                value: Some(change.value),
                 applies_from: Some(APPLIES_FROM),
                 replaced: None,
             })
             .await;
-        return Ok(ok(json!({
-            "name": setting.wire_name(),
-            "previous": previous.to_json(),
-            "value": value.to_json(),
-            "applies_from": APPLIES_FROM,
-        })));
+        return Ok(ok(answer));
     }
 
     if let Some(name) = path.strip_prefix(SECRETS_PREFIX) {
@@ -733,11 +992,14 @@ async fn serve_authenticated<'r, R: AsyncRead + Unpin>(
             .naming(target));
         }
         if request.method == "DELETE" {
-            let _ = auth.state.secrets.forget(name);
+            auth.state
+                .forget_secret(name)
+                .map_err(|refused| Refusal::from(refused).naming(target))?;
             plane
                 .record_change(ControlChange {
                     event_id: crate::trace::new_event_id(),
-                    token_id: &auth.token_id,
+                    principal: Principal::Controller,
+                    token_id: Some(&auth.token_id),
                     kind: "secret",
                     name,
                     action: "forget",
@@ -756,7 +1018,8 @@ async fn serve_authenticated<'r, R: AsyncRead + Unpin>(
         plane
             .record_change(ControlChange {
                 event_id: crate::trace::new_event_id(),
-                token_id: &auth.token_id,
+                principal: Principal::Controller,
+                token_id: Some(&auth.token_id),
                 kind: "secret",
                 name,
                 action: "set",
@@ -773,11 +1036,7 @@ async fn serve_authenticated<'r, R: AsyncRead + Unpin>(
 }
 
 fn listing(session_id: &str, state: &ControlState) -> Value {
-    let settings: Vec<Value> = state
-        .settings_listing()
-        .into_iter()
-        .map(|(setting, value)| json!({"name": setting.wire_name(), "value": value.to_json()}))
-        .collect();
+    let settings = state.settings_listing();
     let secrets: Vec<Value> = state
         .secrets
         .listing()
@@ -904,13 +1163,24 @@ mod tests {
             max_tokens,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         }
+    }
+
+    fn state_for(config: &ControlConfig, inference: &InferenceConfig) -> ControlState {
+        ControlState::new(
+            config,
+            inference,
+            DriverChoices::declared(inference),
+            Arc::new(InjectedSecrets::new(&config.secrets)),
+        )
     }
 
     fn config() -> ControlConfig {
         ControlConfig {
             settings: vec![ControllableSetting::InferenceMaxTokens],
             secrets: vec!["CARD_TOKEN".to_string()],
+            agent_settings: Vec::new(),
         }
     }
 
@@ -924,7 +1194,7 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             let workdir = tempfile::tempdir().unwrap();
-            let state = Arc::new(ControlState::new(&config(), &inference(Some(4096))));
+            let state = Arc::new(state_for(&config(), &inference(Some(4096))));
             let (plane, token) =
                 ControlPlane::declared(SESSION.to_string(), Arc::clone(&state)).unwrap();
             let appender = ResourceTraceAppender::open(
@@ -1078,7 +1348,7 @@ mod tests {
         assert!(printed.contains("<redacted>"), "{printed}");
         assert!(!printed.contains(MARKER), "{printed}");
 
-        let state = ControlState::new(&config(), &inference(None));
+        let state = state_for(&config(), &inference(None));
         state
             .secrets
             .set(
@@ -1092,7 +1362,7 @@ mod tests {
         let credential = crate::gateway_credential::GatewayCredential::injected(
             "card-api",
             "CARD_TOKEN",
-            state.secrets(),
+            Arc::clone(&state.secrets),
         );
         let printed = format!("{credential:?}");
         assert!(printed.contains("<redacted>"), "{printed}");
@@ -1140,9 +1410,9 @@ mod tests {
 
     #[test]
     fn launch_value_is_the_manifest_value_or_the_default() {
-        let state = ControlState::new(&config(), &inference(None));
+        let state = state_for(&config(), &inference(None));
         assert_eq!(
-            state.setting_value(ControllableSetting::InferenceMaxTokens),
+            state.selected(ControllableSetting::InferenceMaxTokens),
             Some(SettingValue::Tokens(
                 crate::agent::DEFAULT_MAX_OUTPUT_TOKENS
             ))
@@ -1151,20 +1421,26 @@ mod tests {
 
     #[test]
     fn the_first_call_to_read_a_changed_value_names_the_change() {
-        let state = ControlState::new(&config(), &inference(Some(4096)));
+        let state = state_for(&config(), &inference(Some(4096)));
         let setting = ControllableSetting::InferenceMaxTokens;
         let first = state.for_call(setting).unwrap();
         assert_eq!(first.value, SettingValue::Tokens(4096));
         assert_eq!(first.applies_change, None);
 
-        state.change_setting(setting, SettingValue::Tokens(1234), "evt_a".to_string());
-        state.change_setting(setting, SettingValue::Tokens(2048), "evt_b".to_string());
+        let set = |value: u32| {
+            state
+                .request_change(Principal::Controller, setting, &json!(value))
+                .unwrap()
+                .change_id
+        };
+        set(1234);
+        let second = set(2048);
         let changed = state.for_call(setting).unwrap();
         assert_eq!(changed.value, SettingValue::Tokens(2048));
-        assert_eq!(changed.applies_change.as_deref(), Some("evt_b"));
+        assert_eq!(changed.applies_change, Some(second));
         assert_eq!(state.for_call(setting).unwrap().applies_change, None);
 
-        state.change_setting(setting, SettingValue::Tokens(2048), "evt_c".to_string());
+        set(2048);
         assert_eq!(state.for_call(setting).unwrap().applies_change, None);
     }
 
@@ -1426,7 +1702,7 @@ mod tests {
         assert_eq!(
             fixture
                 .state
-                .setting_value(ControllableSetting::InferenceMaxTokens),
+                .selected(ControllableSetting::InferenceMaxTokens),
             Some(SettingValue::Tokens(4096))
         );
         for event in fixture.trace_events() {
@@ -1475,5 +1751,310 @@ mod tests {
         let events = fixture.trace_events();
         assert_eq!(events.len(), 5);
         assert_eq!(events[4]["name"], "inference.max_tokens");
+    }
+
+    // ── the driver setting ───────────────────────────────────────────────────
+
+    const ALT_KEY: &str = "ALT_KEY";
+
+    /// A capsule on sonnet with alternates `haiku` (same driver), `gpt` (keyed by the injected
+    /// `ALT_KEY`) and `mini` (whose credential was found nowhere), switchable by a controller.
+    fn switchable(agent: bool) -> (ControlConfig, InferenceConfig, DriverChoices) {
+        let mut inference = inference(Some(4096));
+        inference.driver = Some(murmur_artifact::InferenceDriver {
+            artifact: "anthropic".to_string(),
+            config: None,
+        });
+        for (name, model, driver) in [
+            ("haiku", "claude-haiku-4-5", "anthropic"),
+            ("gpt", "gpt-5", "openai"),
+            ("mini", "gpt-5-mini", "other"),
+        ] {
+            inference
+                .alternates
+                .push(murmur_artifact::InferenceAlternate {
+                    name: name.to_string(),
+                    model: model.to_string(),
+                    driver: driver.to_string(),
+                });
+        }
+        let mut choices = DriverChoices::declared(&inference);
+        choices.record_credential("anthropic", "config", None, None);
+        choices.record_credential("openai", "injected", Some(ALT_KEY), None);
+        choices.record_credential("other", "none", None, Some("MINI_KEY"));
+        let config = ControlConfig {
+            settings: if agent {
+                Vec::new()
+            } else {
+                vec![ControllableSetting::InferenceDriver]
+            },
+            secrets: vec![ALT_KEY.to_string()],
+            agent_settings: if agent {
+                vec![ControllableSetting::InferenceDriver]
+            } else {
+                Vec::new()
+            },
+        };
+        (config, inference, choices)
+    }
+
+    async fn switchable_fixture(agent: bool) -> Fixture {
+        let workdir = tempfile::tempdir().unwrap();
+        let (config, inference, choices) = switchable(agent);
+        let state = Arc::new(ControlState::new(
+            &config,
+            &inference,
+            choices,
+            Arc::new(InjectedSecrets::new(&config.secrets)),
+        ));
+        let (plane, token) =
+            ControlPlane::declared(SESSION.to_string(), Arc::clone(&state)).unwrap();
+        let appender = ResourceTraceAppender::open(
+            workdir.path(),
+            SESSION.to_string(),
+            "evt_session".to_string(),
+        )
+        .await
+        .unwrap();
+        plane.attach_trace(Arc::new(appender));
+        Fixture {
+            plane,
+            token,
+            state,
+            workdir,
+        }
+    }
+
+    async fn put_driver(fixture: &Fixture, body: &str) -> ResourceResponse {
+        let bearer = fixture.bearer();
+        Sent::new("PUT", "/control/settings/inference.driver", Some(&bearer))
+            .json()
+            .body(body.as_bytes())
+            .to(&fixture.plane)
+            .await
+            .0
+    }
+
+    fn selected_driver(fixture: &Fixture) -> Option<usize> {
+        fixture
+            .state
+            .selected(ControllableSetting::InferenceDriver)
+            .and_then(SettingValue::driver)
+    }
+
+    #[tokio::test]
+    async fn driver_choice_a_controller_switch_answers_and_records_choice_names() {
+        let fixture = switchable_fixture(false).await;
+        let response = put_driver(&fixture, r#"{"value": "haiku"}"#).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            body_json(&response),
+            json!({"name": "inference.driver", "previous": "primary", "value": "haiku", "applies_from": "next_inference_call"})
+        );
+        let change = &fixture.trace_events()[0];
+        assert_eq!(change["event_type"], "control_change");
+        assert_eq!(change["principal"], "controller");
+        assert_eq!(change["token_id"], mac_token::token_id(&fixture.token));
+        assert_eq!(change["previous"], "primary");
+        assert_eq!(change["value"], "haiku");
+        let reading = fixture
+            .state
+            .for_call(ControllableSetting::InferenceDriver)
+            .unwrap();
+        assert_eq!(reading.value, SettingValue::Driver(1));
+        assert_eq!(
+            reading.applies_change.as_deref(),
+            change["event_id"].as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_choice_an_undeclared_name_is_422_and_changes_nothing() {
+        let fixture = switchable_fixture(false).await;
+        for body in [
+            r#"{"value": "claude-opus"}"#,
+            r#"{"value": "openai"}"#,
+            r#"{"value": 3}"#,
+            r#"{"value": null}"#,
+        ] {
+            let response = put_driver(&fixture, body).await;
+            assert_eq!(response.status, 422, "{body}");
+            let error = body_json(&response)["error"].as_str().unwrap().to_string();
+            assert!(
+                error.contains("primary, haiku, gpt, mini"),
+                "{body}: {error}"
+            );
+        }
+        assert_eq!(selected_driver(&fixture), Some(0));
+        for event in fixture.trace_events() {
+            assert_eq!(event["event_type"], "control_refused");
+            assert_eq!(event["reason"], "undeclared_driver");
+            assert_eq!(event["principal"], "controller");
+            assert_eq!(event["name"], "inference.driver");
+        }
+    }
+
+    /// An injected credential with nothing injected cannot be selected; once injected it can, and
+    /// while its choice is in use it cannot be forgotten.
+    #[tokio::test]
+    async fn driver_choice_an_injected_credential_gates_the_switch_and_the_forget() {
+        let fixture = switchable_fixture(false).await;
+        let bearer = fixture.bearer();
+        let response = put_driver(&fixture, r#"{"value": "gpt"}"#).await;
+        assert_eq!(response.status, 409);
+        let error = body_json(&response)["error"].as_str().unwrap().to_string();
+        assert!(error.contains(ALT_KEY), "{error}");
+        assert_eq!(selected_driver(&fixture), Some(0));
+
+        let (response, _) = Sent::new("PUT", "/control/secrets/ALT_KEY", Some(&bearer))
+            .body(MARKER.as_bytes())
+            .to(&fixture.plane)
+            .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            put_driver(&fixture, r#"{"value": "gpt"}"#).await.status,
+            200
+        );
+        assert_eq!(selected_driver(&fixture), Some(2));
+
+        let (response, _) = Sent::new("DELETE", "/control/secrets/ALT_KEY", Some(&bearer))
+            .to(&fixture.plane)
+            .await;
+        assert_eq!(response.status, 409);
+        assert!(fixture.state.secrets.holds(ALT_KEY), "the secret is kept");
+
+        assert_eq!(
+            put_driver(&fixture, r#"{"value": "primary"}"#).await.status,
+            200
+        );
+        let (response, _) = Sent::new("DELETE", "/control/secrets/ALT_KEY", Some(&bearer))
+            .to(&fixture.plane)
+            .await;
+        assert_eq!(response.status, 200);
+        assert!(!fixture.state.secrets.holds(ALT_KEY));
+
+        let reasons: Vec<String> = fixture
+            .trace_events()
+            .iter()
+            .filter(|event| event["event_type"] == "control_refused")
+            .map(|event| event["reason"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reasons, vec!["credential_unresolvable", "in_use"]);
+        assert!(!fixture.trace().contains(MARKER));
+    }
+
+    #[tokio::test]
+    async fn driver_choice_a_choice_staged_unavailable_is_409() {
+        let fixture = switchable_fixture(false).await;
+        let response = put_driver(&fixture, r#"{"value": "mini"}"#).await;
+        assert_eq!(response.status, 409);
+        let error = body_json(&response)["error"].as_str().unwrap().to_string();
+        assert!(error.contains("MINI_KEY"), "{error}");
+        assert_eq!(selected_driver(&fixture), Some(0));
+    }
+
+    #[tokio::test]
+    async fn driver_choice_listing_names_every_choice_and_whether_it_can_be_selected() {
+        let fixture = switchable_fixture(false).await;
+        let bearer = fixture.bearer();
+        let (response, _) = Sent::new("GET", "/control", Some(&bearer))
+            .to(&fixture.plane)
+            .await;
+        assert_eq!(
+            body_json(&response)["settings"],
+            json!([{
+                "name": "inference.driver",
+                "value": "primary",
+                "choices": [
+                    {"name": "primary", "driver": "anthropic", "model": "m", "available": true},
+                    {"name": "haiku", "driver": "anthropic", "model": "claude-haiku-4-5", "available": true},
+                    {"name": "gpt", "driver": "openai", "model": "gpt-5", "available": false},
+                    {"name": "mini", "driver": "other", "model": "gpt-5-mini", "available": false},
+                ],
+            }])
+        );
+    }
+
+    /// A setting only the agent may change is undeclared to a controller, and a session granting
+    /// only the agent has no controller surface.
+    #[tokio::test]
+    async fn driver_choice_an_agent_only_setting_is_undeclared_to_a_controller() {
+        let fixture = switchable_fixture(true).await;
+        assert!(
+            fixture.state.has_controller_surface(),
+            "ALT_KEY is a secret"
+        );
+        let response = put_driver(&fixture, r#"{"value": "haiku"}"#).await;
+        assert_eq!(response.status, 404);
+        assert_eq!(fixture.trace_events()[0]["reason"], "undeclared_setting");
+
+        let change = fixture
+            .state
+            .request_change(
+                Principal::Agent,
+                ControllableSetting::InferenceDriver,
+                &json!("haiku"),
+            )
+            .unwrap();
+        assert_eq!(change.previous, json!("primary"));
+        assert_eq!(change.value, json!("haiku"));
+        let refused = fixture
+            .state
+            .request_change(
+                Principal::Agent,
+                ControllableSetting::InferenceDriver,
+                &json!("nope"),
+            )
+            .unwrap_err();
+        assert_eq!((refused.status, refused.reason), (422, "undeclared_driver"));
+        assert_eq!(
+            fixture
+                .state
+                .request_change(
+                    Principal::Controller,
+                    ControllableSetting::InferenceDriver,
+                    &json!("primary"),
+                )
+                .unwrap_err()
+                .status,
+            404
+        );
+        assert_eq!(
+            fixture.state.session_control(),
+            crate::trace::SessionControl {
+                settings: Vec::new(),
+                secrets: vec![ALT_KEY.to_string()],
+                agent_settings: vec!["inference.driver"],
+            }
+        );
+
+        let (config, inference, choices) = switchable(true);
+        let config = ControlConfig {
+            secrets: Vec::new(),
+            ..config
+        };
+        let agent_only = ControlState::new(
+            &config,
+            &inference,
+            choices,
+            Arc::new(InjectedSecrets::new(&[])),
+        );
+        assert!(!agent_only.has_controller_surface());
+    }
+
+    /// Every settings change after launch starts from the primary: a new state is the manifest.
+    #[test]
+    fn driver_choice_launch_value_is_primary() {
+        let (config, inference, choices) = switchable(false);
+        let state = ControlState::new(
+            &config,
+            &inference,
+            choices,
+            Arc::new(InjectedSecrets::new(&config.secrets)),
+        );
+        assert_eq!(
+            state.selected(ControllableSetting::InferenceDriver),
+            Some(SettingValue::Driver(0))
+        );
     }
 }

@@ -72,12 +72,13 @@ before the first task begins
 | `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
 | `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
-| `control` | object | What a controller may change on this session: `settings` (the names `control.settings` lists) and `secrets` (the names `control.secrets` lists). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
+| `control` | object | What may be changed on this session: `settings` (the names `control.settings` lists), `secrets` (the names `control.secrets` lists) and `agent_settings` (the names `control.agent_settings` lists; absent when it lists none). Written only when the manifest declares [`control:`](manifest.md#field-control); absent otherwise. Never a value — see [Control surface](control-surface.md) |
+| `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver`, `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch) and `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch). Written only when `inference.alternates` is declared; absent otherwise |
 | `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `credential_source` | string | `"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` \| `"none"` — where the inference key this session attaches came from: [`credentials.<NAME>`](config.md#credentials) in the global config, the launching environment, a literal `gateway.api_key` on the driver's entry, a driver entry with [`keyless: true`](manifest.md#gateway-keyless), or no inference gateway at all. Never the key, a hash of it, its length or any part of it |
-| `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's name), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` as `credential_source` above, or `"injected"` for a name in [`control.secrets`](manifest.md#field-control), supplied by a controller and held in memory only) and `metered` (`true` only for the configured `transport: http` driver's gateway, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
+| `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's name), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` as `credential_source` above, or `"injected"` for a name in [`control.secrets`](manifest.md#field-control), supplied by a controller and held in memory only) and `metered` (`true` only for the gateways of the configured `transport: http` driver and of each `inference.alternates` driver, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself. Under [`trace.capture: content`](manifest.md#field-trace) those bytes are also stored as `blobs/<system_prompt_sha256>`. Deliberately a different value from `inference.system_sha`, which covers the augmented prompt that went on the wire |
 | `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `read_only_paths` (the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects; `[]` when the manifest declares none), `read_only_advisory_for` (the entries of `shell_allow` that protection is only advisory against; `[]` when it is enforced for every call the runtime can read as a write), `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `install_skill` and `install_tool` (the entries of [`capabilities.install`](manifest.md#field-install); `[]` when the manifest declares none), `interpreter_runtime_grants`, `staged_runtime_grants`, `preopens` (one entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry — `artifact`, `role`, the declared `scope` or `null`, and a `surface` of `whole-workdir`, `scoped-subtree` or `nothing`; `[]` when the capsule declares only skills), `state_stores` (`[]` when no artifact declares [`capabilities.state`](manifest.md#field-capabilities)), `configured_artifacts` (`[]` when no artifact declares [`config:`](manifest.md#artifact-config)), `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)), `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)), `runtime_writes`, `filesystem_boundary` (always present; a `restriction` of `advisory`, `enforced` or `absent` naming the filesystem mechanism this session installs rather than the class this host can back, and `not_protected`, the statements `mur run --explain-scope` prints under `Not protected here` — `[]` at `absent`, and two statements otherwise, one about the filesystem and one about the `HOME` rewrite; see [Testing containment honestly](containment.md#testing-containment)) and `io_max` (always present; `declared_bytes_per_sec`, a `status` of `enforced`, `unavailable`, `not-required` or `not-probed`, and a `reason` absent only when the status is `enforced` — see [Whether the I/O ceiling applied](resource-limits.md#io-max-report)). Where `capabilities` above names categories, this names the actual destinations, binaries, capsule names and paths |
 | `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the accessible workdir, so a consumer for whom that workdir is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`), `scope` (`"accessible"` \| `"session"`) and `condition` (`"always"`, `"workdir-provided"`, `"agent-session"`, `"script-session"`, `"shell"`, `"peer-fetch"`, `"spawn"`, `"delegated"` or `"sealed"`). Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which `session_id` on this same line supplies. The `"sealed"` rows are present exactly when this session composes a sealed root, which needs both a host that reaches the sealed tier and a containment class that asked for it — so a sealed-capable host running an `advisory` capsule reports the sealed `enforcement_tier` with no `"sealed"` rows. Every other condition names when the path appears rather than deciding whether the row is listed. See [Session workdir](workdir.md) |
@@ -99,7 +100,8 @@ before the first task begins
 | `cache_write_tokens` | u64 | Request tokens the provider wrote into its prompt cache. Beside `input_tokens`, never inside it |
 | `thinking_tokens` | u64 | The part of the output reported as reasoning — a subset of `output_tokens`, never an addition to it |
 | `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
-| `model` | string | The model this call was sent to. Written only alongside `origin` |
+| `driver_choice` | string | The [driver choice](manifest.md#inference-alternates) that served an agent-loop turn, by name. Written only when `inference.alternates` is declared |
+| `model` | string | The model this call was sent to. Written alongside `origin`, and alongside `driver_choice` |
 | `message_ids` | array of string | Ids of the messages this request embedded, in the order they sat in it. Under an active [driver continuation](wit-interfaces.md#stateful-driver-continuation) only the tail the driver has not seen is sent, and this names exactly that tail. Absent when the list is empty: a hook's own completion and the `process` transport both send a message list the runtime never minted |
 | `system_sha` | string | SHA-256 (lowercase hex) of this request's `system` string — the resolved prompt with the `[Capsule]` identity block already prepended |
 | `tools_sha` | string | SHA-256 (lowercase hex) of this request's serialized `tools` array |
@@ -160,40 +162,43 @@ before the first injection, and again after a `mur control forget`. A replaced v
 Written by the [control surface](control-surface.md) and the agent loop. No field carries a secret
 value, a hash of it, its length or any part of it, or the control token.
 
-**`control_change`** — a controller's change was accepted
+**`control_change`** — a change was accepted, from a controller or from the agent's
+[`switch-driver`](runtime-provided-tools.md#switch-driver) call
 
 | Field | Type | Notes |
 |---|---|---|
-| `principal` | string | `"controller"` |
-| `token_id` | string | The first 16 hex characters of the SHA-256 of the token the request carried |
+| `principal` | string | `"controller"` \| `"agent"` |
+| `token_id` | string | The first 16 hex characters of the SHA-256 of the token the request carried. Absent when `principal` is `"agent"` |
 | `kind` | string | `"setting"` \| `"secret"` |
 | `name` | string | The setting or secret, as the manifest spells it |
 | `action` | string | `"set"` \| `"forget"` (a secret's `DELETE`) |
-| `previous` | number | The setting's value before the change. Settings only |
-| `value` | number | The setting's new value. Settings only |
+| `previous` | number \| string | The setting's value before the change: a number for `inference.max_tokens`, a choice name for `inference.driver`. Settings only |
+| `value` | number \| string | The setting's new value, on the same terms. Settings only |
 | `applies_from` | string | `"next_inference_call"`. Settings only |
 | `replaced` | bool | Whether the secret replaced a value already held. Secret `set` only |
 
-**`control_refused`** — the control surface refused a request
+**`control_refused`** — the control surface refused a request, or the runtime refused the agent's
+`switch-driver` call
 
 | Field | Type | Notes |
 |---|---|---|
-| `status` | u16 | The HTTP status answered |
-| `reason` | string | `"unauthenticated"`, `"unknown_path"`, `"undeclared_setting"`, `"undeclared_secret"`, `"method_not_allowed"`, `"not_loopback"`, `"body_too_large"`, `"missing_body"`, `"unsupported_media_type"`, `"invalid_value"` or `"truncated_body"` — see [Refusals](control-surface.md#refusals) |
+| `principal` | string | `"controller"` for every request to the surface, `"agent"` for a `switch-driver` call |
+| `status` | u16 | The HTTP status answered, or the one a controller would have been answered for the agent's refusal |
+| `reason` | string | `"unauthenticated"`, `"unknown_path"`, `"undeclared_setting"`, `"undeclared_secret"`, `"method_not_allowed"`, `"not_loopback"`, `"body_too_large"`, `"missing_body"`, `"unsupported_media_type"`, `"invalid_value"`, `"undeclared_driver"`, `"credential_unresolvable"`, `"in_use"` or `"truncated_body"` — see [Refusals](control-surface.md#refusals) |
 | `kind` | string | `"setting"` \| `"secret"`, when the path named one. Absent on a `401` |
 | `name` | string | The setting or secret the path named, declared or not. Absent on a `401` |
-| `token_id` | string | As on `control_change`. Absent on a `401` |
+| `token_id` | string | As on `control_change`. Absent on a `401` and on the agent's refusal |
 
 A capsule with no `control:` block writes nothing: every request under `/control` is `404`.
 
-**`control_applied`** — the first agent-loop inference call to use a setting value a controller set
+**`control_applied`** — the first agent-loop inference call to use a setting value a controller or the agent set
 
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | Zero-based, the same number the turn's own `inference` line carries |
 | `task_id` | string \| null | The task the turn belongs to |
 | `name` | string | The setting |
-| `value` | number | The value this call used |
+| `value` | number \| string | The value this call used: a choice name for `inference.driver` |
 | `change_id` | string | The `event_id` of the `control_change` that set `value` |
 
 Written only when the value differs from the one the previous call used. Compaction calls and a

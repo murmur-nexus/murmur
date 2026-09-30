@@ -59,6 +59,9 @@ pub(crate) struct TraceWriter {
     /// What a controller may change on this session. Set by [`Self::set_control`] before
     /// `session_start` is written; `None` for a capsule with no `control:` block.
     control: Option<SessionControl>,
+    /// The driver choices. Set by [`Self::set_inference_choices`] before `session_start` is
+    /// written; empty for a capsule with no alternates.
+    inference_choices: Vec<SessionInferenceChoice>,
     /// `inference.tool_refresh` as `ToolRefresh::wire_name` spells it, or `None` under
     /// `transport: process`. Set by [`Self::set_tool_refresh`] before `session_start` is written.
     tool_refresh: Option<&'static str>,
@@ -288,6 +291,11 @@ struct SessionStartEvent {
     /// secret names `control:` declares. Omitted entirely for a capsule with no `control:` block.
     #[serde(skip_serializing_if = "Option::is_none")]
     control: Option<SessionControl>,
+    /// Every driver choice the agent loop may be switched to, the primary first, each with its
+    /// credential's source and whether it resolved at launch. Omitted entirely for a capsule that
+    /// declares no `inference.alternates`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inference_choices: Vec<SessionInferenceChoice>,
     /// `inference.tool_refresh`: `"compaction"` or `"immediate"` under `transport: http`, `null`
     /// under `transport: process`, where the harness owns its tool list. Always written.
     tool_refresh: Option<&'static str>,
@@ -375,9 +383,14 @@ struct InferenceEvent {
     /// `run-inference`.
     #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
-    /// Model string actually sent for this call (the attempted model, on
-    /// failure). Only written alongside `origin`: an agent-loop turn's model is
-    /// already on the session-start record and is not repeated per turn.
+    /// The driver choice that served an agent-loop turn, by name. Written only for a capsule that
+    /// declares `inference.alternates`, beside `model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver_choice: Option<String>,
+    /// Model string actually sent for this call (the attempted model, on failure). Written
+    /// alongside `origin` for a hook's completion, and alongside `driver_choice` for an agent-loop
+    /// turn of a capsule that declares alternates. Any other turn's model is the session-start
+    /// record's and is not repeated per turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     /// Identities of the messages this request embedded, in the order they sat in it. Under an
@@ -1611,6 +1624,7 @@ impl TraceWriter {
             credential_source: "none",
             gateways: Vec::new(),
             control: None,
+            inference_choices: Vec::new(),
             tool_refresh: None,
             runtime_artifacts: Vec::new(),
             resumed_from,
@@ -1701,6 +1715,12 @@ impl TraceWriter {
     /// Records what `control:` declares for `session_start.control`.
     pub(crate) fn set_control(&mut self, control: Option<SessionControl>) {
         self.control = control;
+    }
+
+    /// Records the driver choices for `session_start.inference_choices`. Left empty, the key is
+    /// not written.
+    pub(crate) fn set_inference_choices(&mut self, choices: Vec<SessionInferenceChoice>) {
+        self.inference_choices = choices;
     }
 
     /// Records the runtime-origin entries of `installed` for `session_start.runtime_artifacts`,
@@ -1814,6 +1834,7 @@ impl TraceWriter {
             credential_source: self.credential_source,
             gateways: self.gateways.clone(),
             control: self.control.clone(),
+            inference_choices: self.inference_choices.clone(),
             tool_refresh: self.tool_refresh,
             runtime_artifacts: self.runtime_artifacts.clone(),
             resumed_from: self.resumed_from.clone(),
@@ -1848,6 +1869,70 @@ impl TraceWriter {
         usage: Option<&DriverUsage>,
         message_ids: Vec<String>,
         wire: Option<&WireCapture>,
+    ) -> std::io::Result<()> {
+        self.write_inference_event(
+            turn,
+            input_tokens,
+            output_tokens,
+            decision,
+            stop_reason,
+            tool_name,
+            origin,
+            usage,
+            message_ids,
+            wire,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_inference`] for an agent-loop turn, naming the driver choice that served it
+    /// as `driver_choice` and `model`. `choice` is `None` on a capsule with no alternates, whose
+    /// line is exactly what [`Self::write_inference`] writes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_turn_inference(
+        &mut self,
+        turn: u32,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        decision: String,
+        stop_reason: Option<&str>,
+        tool_name: Option<String>,
+        usage: Option<&DriverUsage>,
+        message_ids: Vec<String>,
+        wire: Option<&WireCapture>,
+        choice: Option<&crate::driver_choice::DriverChoice>,
+    ) -> std::io::Result<()> {
+        self.write_inference_event(
+            turn,
+            input_tokens,
+            output_tokens,
+            decision,
+            stop_reason,
+            tool_name,
+            None,
+            usage,
+            message_ids,
+            wire,
+            choice,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_inference_event(
+        &mut self,
+        turn: u32,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        decision: String,
+        stop_reason: Option<&str>,
+        tool_name: Option<String>,
+        origin: Option<&InferenceOrigin>,
+        usage: Option<&DriverUsage>,
+        message_ids: Vec<String>,
+        wire: Option<&WireCapture>,
+        choice: Option<&crate::driver_choice::DriverChoice>,
     ) -> std::io::Result<()> {
         let event_id = new_event_id();
         // The agent loop's own inference *is* the turn node — there is no separate turn line —
@@ -1884,7 +1969,10 @@ impl TraceWriter {
             cache_write_tokens: usage.and_then(|u| u.cache_write_tokens),
             thinking_tokens: usage.and_then(|u| u.thinking_tokens),
             origin: origin.map(|o| o.source.clone()),
-            model: origin.map(|o| o.model.clone()),
+            driver_choice: choice.map(|choice| choice.name.clone()),
+            model: origin
+                .map(|o| o.model.clone())
+                .or_else(|| choice.map(|choice| choice.model.clone())),
             message_ids,
             system_sha,
             tools_sha,
@@ -2946,14 +3034,37 @@ pub(crate) struct SessionControl {
     pub(crate) settings: Vec<&'static str>,
     /// Controller-supplied secret names, as `control.secrets` lists them.
     pub(crate) secrets: Vec<String>,
+    /// Setting names the agent may change, as `control.agent_settings` lists them. Omitted when
+    /// the block grants the agent nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) agent_settings: Vec<&'static str>,
 }
 
-/// One accepted control-plane change, as [`ResourceTraceAppender::write_control_change`] records
-/// it. `event_id` is minted by the caller, because the setting it changed carries it forward to
-/// the `control_applied` that names it.
+/// One element of `session_start.inference_choices`: a driver choice and whether its credential
+/// resolved at launch. Never a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionInferenceChoice {
+    pub(crate) name: String,
+    pub(crate) driver: String,
+    pub(crate) model: String,
+    /// Where the driver's gateway credential came from, as `session_start.gateways` names it, or
+    /// `"none"` for one found nowhere.
+    pub(crate) credential_source: &'static str,
+    /// Whether the credential resolved at launch. An injected credential is `true` here and is
+    /// checked again when a switch asks for it.
+    pub(crate) available: bool,
+}
+
+/// One accepted setting or secret change, as [`ResourceTraceAppender::write_control_change`]
+/// records it. `event_id` is minted by the caller, because the setting it changed carries it
+/// forward to the `control_applied` that names it.
 pub(crate) struct ControlChange<'a> {
     pub(crate) event_id: String,
-    pub(crate) token_id: &'a str,
+    /// Who made the change.
+    pub(crate) principal: crate::control_plane::Principal,
+    /// The control token's id for a controller's change; `None` for the agent's, which presents
+    /// no token.
+    pub(crate) token_id: Option<&'a str>,
     /// `"setting"` or `"secret"`.
     pub(crate) kind: &'static str,
     pub(crate) name: &'a str,
@@ -2978,7 +3089,8 @@ struct ControlChangeEvent<'a> {
     session_id: String,
     timestamp: u64,
     principal: &'static str,
-    token_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<&'a str>,
     kind: &'static str,
     name: &'a str,
     action: &'static str,
@@ -2992,8 +3104,9 @@ struct ControlChangeEvent<'a> {
     replaced: Option<bool>,
 }
 
-/// `control_refused`: the control plane refused a request. `kind`, `name` and `token_id` are
-/// written only once the request authenticated, so a `401` names nothing.
+/// `control_refused`: the control plane refused a request, or the runtime refused the agent's
+/// change. `kind`, `name` and `token_id` are written only once a controller's request
+/// authenticated, so a `401` names nothing; the agent's refusal names its setting and no token.
 #[derive(Serialize)]
 struct ControlRefusedEvent<'a> {
     event_type: &'static str,
@@ -3001,6 +3114,7 @@ struct ControlRefusedEvent<'a> {
     parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
+    principal: &'static str,
     status: u16,
     reason: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3418,7 +3532,7 @@ impl ResourceTraceAppender {
             parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
-            principal: "controller",
+            principal: change.principal.as_str(),
             token_id: change.token_id,
             kind: change.kind,
             name: change.name,
@@ -3431,10 +3545,11 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
-    /// Records one refused control-plane request. `kind`, `name` and `token_id` are `None` for a
+    /// Records one refused change. `kind`, `name` and `token_id` are `None` for a controller's
     /// request that did not authenticate.
     pub(crate) async fn write_control_refused(
         &self,
+        principal: crate::control_plane::Principal,
         status: u16,
         reason: &'static str,
         kind: Option<&'static str>,
@@ -3447,6 +3562,7 @@ impl ResourceTraceAppender {
             parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
+            principal: principal.as_str(),
             status,
             reason,
             kind,

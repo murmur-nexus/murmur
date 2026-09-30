@@ -162,6 +162,9 @@ fn print_listing(listing: &Value) {
                 field(setting, "name", "?"),
                 field(setting, "value", "?")
             );
+            for line in choice_lines(setting) {
+                println!("      {line}");
+            }
         }
     }
     if !secrets.is_empty() {
@@ -175,6 +178,38 @@ fn print_listing(listing: &Value) {
             );
         }
     }
+}
+
+/// One line per driver choice a setting lists under `choices`, names aligned: its model, its
+/// driver, and whether a switch to it would be accepted now. Empty for any other setting.
+fn choice_lines(setting: &Value) -> Vec<String> {
+    let choices = setting
+        .get("choices")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let width = choices
+        .iter()
+        .map(|choice| field(choice, "name", "").len())
+        .max()
+        .unwrap_or(0);
+    choices
+        .iter()
+        .map(|choice| {
+            let available = choice.get("available").and_then(Value::as_bool) == Some(true);
+            format!(
+                "{:<width$}   model {}  driver {}  {}",
+                field(choice, "name", "?"),
+                field(choice, "model", "?"),
+                field(choice, "driver", "?"),
+                if available {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            )
+        })
+        .collect()
 }
 
 /// One running session's control plane: where it listens and the token it takes.
@@ -402,6 +437,27 @@ extern "C" fn restore_and_reraise(signal: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choice_lines_align_names_and_say_whether_each_is_available() {
+        let setting = serde_json::json!({
+            "name": "inference.driver",
+            "value": "primary",
+            "choices": [
+                {"name": "primary", "driver": "murmur-driver-anthropic", "model": "claude-sonnet-4-5", "available": true},
+                {"name": "gpt", "driver": "murmur-driver-openai", "model": "gpt-5", "available": false},
+            ],
+        });
+        assert_eq!(
+            choice_lines(&setting),
+            vec![
+                "primary   model claude-sonnet-4-5  driver murmur-driver-anthropic  available",
+                "gpt       model gpt-5  driver murmur-driver-openai  unavailable",
+            ]
+        );
+        let cap = serde_json::json!({"name": "inference.max_tokens", "value": 2048});
+        assert!(choice_lines(&cap).is_empty());
+    }
 
     #[test]
     fn field_prints_strings_bare_and_numbers_as_json() {

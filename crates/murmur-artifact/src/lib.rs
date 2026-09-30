@@ -70,9 +70,9 @@ pub use runtime_manifest::{
     ContextConfig, ContextRetainConfig, ControlConfig, ControllableSetting,
     ConversationCapabilities, ConversationMode, DoorCredential, EnvCapabilities, EvalConfig,
     ExportMode, Exports, FileExport, FilesystemCapabilities, HookBinding, HookCommitPolicy,
-    HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceConfig, InferenceDriver,
-    InstallCapabilities, InterpreterRuntimeDir, InterpreterRuntimeGrant, LifecycleConfig,
-    LifecycleOverride, NetworkAuthentication, NetworkCapabilities, NetworkConfig,
+    HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceAlternate, InferenceConfig,
+    InferenceDriver, InstallCapabilities, InterpreterRuntimeDir, InterpreterRuntimeGrant,
+    LifecycleConfig, LifecycleOverride, NetworkAuthentication, NetworkCapabilities, NetworkConfig,
     ObservabilityConfig, ParseContainmentClassError, PeerFetchCapabilities, PeerFilesExport,
     PlanCapabilities, ReferencedEnvVariable, ResourceCapabilities, ResourceLimits, RuntimeArtifact,
     RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities, StagedRuntimeGrant,
@@ -80,9 +80,9 @@ pub use runtime_manifest::{
     TraceRetainConfig, BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES,
     DEFAULT_PEER_FILES_MAX_BYTES, DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET,
     DEFAULT_SEED_OVERFLOW_MARGIN, DOOR_SCOPES, DURATION_ACCEPTED_FORM, OPERATOR_CREDENTIAL,
-    PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
+    PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS, PRIMARY_DRIVER_CHOICE,
 };
-pub use runtime_warnings::{runtime_warning_link, W_RUN_001, W_RUN_002};
+pub use runtime_warnings::{runtime_warning_link, W_RUN_001, W_RUN_002, W_RUN_003};
 pub use secrets::{
     is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,
 };

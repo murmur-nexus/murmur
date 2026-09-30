@@ -32,3 +32,46 @@ another turn would run on a context already known to be over budget. No further 
 Compaction requires both `context.max_tokens` to be set and a hook bound to `on-compaction` to be
 staged — see [Enable context compaction](../how-to/context-compaction.md) for the full
 configuration and protocol.
+
+## Switching drivers { #switching-drivers }
+
+A capsule that declares [`inference.alternates`](../reference/manifest.md#inference-alternates) can
+move its agent loop between driver choices while it runs — to a cheaper model of the same provider,
+or to another provider. One rule governs the conversation, whether the switch lands between tasks
+or in the middle of one.
+
+**The history is carried unchanged.** The runtime keeps the conversation in one provider-neutral
+format — text, tool calls and their results, images, reasoning — and every driver translates it
+into its own provider's shape on every request. The next driver receives the same messages the
+previous one did. A switch between tasks and a switch mid-task differ only in how much history
+there is. Tool call ids, tool results, fences, images, the system prompt, the tool list and the
+prompt-cache routing key are all unchanged by a switch.
+
+**What belongs to one provider does not cross.** Only the runtime knows a switch happened, because a
+driver sees one request at a time and cannot tell which model wrote a message in it.
+
+| Provider-bound state | Across a switch |
+|---|---|
+| A held [`continuation_id`](../reference/wit-interfaces.md#stateful-driver-continuation) | Held for the choice it was returned under. The first call under another choice is a full resend |
+| A `thinking` block, which carries its provider's signature for the model that wrote it | Sent only to the driver and model that produced it, and left out of every other choice's request. Sent again after a switch back |
+
+To keep reasoning with its author, every assistant message records its producer under
+[`produced_by`](../reference/workdir.md#the-conversation-record). The stored history and the
+conversation record are never edited: what changes is only what each request is sent. A resumed
+conversation keeps those marks, so reasoning an alternate wrote is not replayed to the primary.
+
+**A switch between a tool call and its result** hands the new model a call it did not make. The
+conversation carries that call and its result faithfully; a provider that insists on seeing its own
+reasoning on that turn is its driver's to accommodate.
+
+**Token counts are an estimate, and a switch makes them a worse one.** Context occupancy, the
+compaction trigger and the spend admission all count the request with one tokenizer (`cl100k`),
+whatever the provider. After a switch they count against a model whose tokenizer and context
+window may differ more from that estimate. There is no per-model window: `context.max_tokens` and
+`inference.max_tokens` are one number each for the session, and must suit every declared model.
+Each turn's `inference` line in `trace.jsonl` names the choice that served it, beside the
+provider's own counts in `input_tokens_actual` and `output_tokens_actual`, so the gap between the
+estimate and each model's own count is visible per model.
+
+Only agent-loop turns follow a switch. Compaction, a hook's `run-inference` and seed
+summarization stay on the primary driver, and a switch does not survive a restart.

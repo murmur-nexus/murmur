@@ -28,6 +28,7 @@ pub mod delegation_plane;
 pub mod detached;
 pub(crate) mod detached_reconcile;
 pub mod door_auth;
+pub(crate) mod driver_choice;
 // Public so the `runtime_out!` / `runtime_err!` macros resolve `$crate::diagnostic` from outside
 // this crate, and so `mur run`'s launch path writes its lines the same way the runtime does.
 pub(crate) mod credential_gateway;
