@@ -3632,8 +3632,8 @@ fn door_scope_list(
 
 /// Refuses `network.authentication` on a capsule that declares `capabilities.spawn.allow`.
 ///
-/// A delegated child posts its completion to its parent's door, and nothing yet issues a child a
-/// token for that door, so an authenticated parent would refuse every completion it asked for.
+/// A delegated child posts its completion to its parent's door, and nothing issues a child a token
+/// for that door, so an authenticated parent would refuse every completion it asked for.
 fn refuse_authenticated_delegating_parent(
     network: Option<&NetworkConfig>,
     capabilities: Option<&Capabilities>,

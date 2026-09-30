@@ -1704,8 +1704,8 @@ is the mechanism on this list most likely to interfere with an existing workload
 
 **Side effect worth knowing about:** the shell child's capability drop also removes
 `CAP_DAC_OVERRIDE` from a root-run capsule's subprocess, so it no longer bypasses ordinary
-file-permission checks. That is intended, but it is a real behavior change for root deployments
-whose shell steps relied on root's usual "can read anything" posture.
+file-permission checks. That is intended: a shell step that relies on root's usual "can read
+anything" posture fails under it.
 
 **What to do:** keep `shell.allow`, `network.allow` and `filesystem.scope` as narrow as the task
 genuinely needs, and don't run `mur run` as root if you can avoid it — a non-root capsule never had
@@ -2610,9 +2610,9 @@ warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is n
 ```
 
 **Why it matters:** a public door answers every caller that reaches the port. Anyone on the network
-can start a task, cancel tasks and end the session, and the [agent card](agent-card.md) tells them
-the session id, the tools, and whether the capsule holds shell and network grants. The methods and
-the disclosure in the line are read from the manifest.
+can start tasks, read and watch every task, and cancel every task at once with `session/stop`, and
+the [agent card](agent-card.md) tells them the session id, the tools, and whether the capsule holds
+shell and network grants. The methods and the disclosure in the line are read from the manifest.
 
 **What the runtime does about it:** nothing is refused. The capsule binds and serves as it would on
 loopback.

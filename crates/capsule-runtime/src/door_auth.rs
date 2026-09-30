@@ -79,6 +79,18 @@ pub fn bearer_header(token: &DoorToken) -> String {
     format!("Bearer {}", token.expose())
 }
 
+/// The token an `Authorization` header value presents under the `Bearer` scheme, or `None` for
+/// any other shape. The scheme is matched without regard to case (RFC 7235); the token is returned
+/// as sent, because every token murmur mints is case-sensitive base64url.
+pub(crate) fn bearer_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization
+        .trim()
+        .split_once(|c: char| c.is_ascii_whitespace())?;
+    scheme
+        .eq_ignore_ascii_case(BEARER_SCHEME)
+        .then(|| token.trim())
+}
+
 // ── Minting and verifying ─────────────────────────────────────────────────────
 
 /// One session's door key and the tokens minted with it.
@@ -143,23 +155,12 @@ impl DoorAuth {
     pub fn verify(&self, authorization_headers: &[&str]) -> Result<DoorGrant, AuthRefusal> {
         let header = match authorization_headers {
             [] => return Err(AuthRefusal::Missing),
-            [header] => header.trim(),
+            [header] => header,
             _ => return Err(AuthRefusal::Invalid),
         };
-        let (scheme, token) = header
-            .split_once(|c: char| c.is_ascii_whitespace())
-            .ok_or(AuthRefusal::Invalid)?;
-        if !scheme.eq_ignore_ascii_case(BEARER_SCHEME) {
-            return Err(AuthRefusal::Invalid);
-        }
-        let payload = mac_token::open(
-            &self.key,
-            DOOR_TOKEN_TAG,
-            DOOR_TOKEN_DOMAIN,
-            token.trim(),
-            &[],
-        )
-        .map_err(|_| AuthRefusal::Invalid)?;
+        let token = bearer_token(header).ok_or(AuthRefusal::Invalid)?;
+        let payload = mac_token::open(&self.key, DOOR_TOKEN_TAG, DOOR_TOKEN_DOMAIN, token, &[])
+            .map_err(|_| AuthRefusal::Invalid)?;
         let payload: Value = serde_json::from_slice(&payload).map_err(|_| AuthRefusal::Invalid)?;
         let credential = payload["credential"]
             .as_str()
