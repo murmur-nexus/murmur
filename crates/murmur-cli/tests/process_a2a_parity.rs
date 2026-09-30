@@ -127,6 +127,35 @@ impl Capsule {
     fn url(&self) -> String {
         self.startup["url"].as_str().unwrap().to_string()
     }
+
+    /// This session's `trace.jsonl`: under `<project>/workdir/<session_id>/`, where a launch with
+    /// no `--workdir` keeps its session.
+    fn trace_path(&self) -> PathBuf {
+        self._project
+            .path()
+            .join("workdir")
+            .join(self.startup["session_id"].as_str().unwrap())
+            .join("trace.jsonl")
+    }
+
+    /// The session's trace once the task has written `task_end`, polled because the stream's final
+    /// frame can reach the client before the line reaches the file.
+    fn trace_after_task_end(&self) -> Vec<Value> {
+        let path = self.trace_path();
+        let deadline = Instant::now() + STREAM_TIMEOUT;
+        loop {
+            let trace = read_trace(&path);
+            if !trace_events(&trace, "task_end").is_empty() {
+                return trace;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for task_end in {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for Capsule {
@@ -281,6 +310,8 @@ struct ProcessCapsule {
     config: Option<String>,
     /// Extra environment for the `mur` process, for the debug inactivity override.
     env: Vec<(String, String)>,
+    /// Extra manifest lines under `inference:`, ahead of `driver:`.
+    inference: String,
 }
 
 impl ProcessCapsule {
@@ -292,6 +323,7 @@ impl ProcessCapsule {
             hook: None,
             config: None,
             env: Vec::new(),
+            inference: String::new(),
         }
     }
 
@@ -312,6 +344,12 @@ impl ProcessCapsule {
 
     fn env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Add `line` under `inference:`, indented as it will sit there: `"  max_session_tokens: 1000\n"`.
+    fn inference_line(mut self, line: &str) -> Self {
+        self.inference.push_str(line);
         self
     }
 
@@ -361,6 +399,7 @@ impl ProcessCapsule {
 
         let name = &self.name;
         let config = self.config.as_deref().unwrap_or_default();
+        let inference = &self.inference;
         let manifest = project.path().join("murmur.yaml");
         fs::write(
             &manifest,
@@ -368,7 +407,7 @@ impl ProcessCapsule {
                 "name: {name}\nversion: 0.1.0\nartifacts:\n{entries}\
                  capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
                  {LIFECYCLE}\
-                 inference:\n  transport: process\n  driver:\n    artifact: {PROCESS_DRIVER}\n{config}\
+                 inference:\n  transport: process\n{inference}  driver:\n    artifact: {PROCESS_DRIVER}\n{config}\
                  \x20 command: {}\n",
                 harness.to_str().unwrap()
             ),
@@ -540,6 +579,24 @@ fn http_get(addr: &str, path: &str) -> String {
         line.clear();
     }
     body
+}
+
+// ── Trace ─────────────────────────────────────────────────────────────────────
+
+fn read_trace(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("every trace line is valid JSON"))
+        .collect()
+}
+
+fn trace_events<'a>(trace: &'a [Value], event_type: &str) -> Vec<&'a Value> {
+    trace
+        .iter()
+        .filter(|event| event["event_type"] == event_type)
+        .collect()
 }
 
 // ── Frame labelling ───────────────────────────────────────────────────────────
@@ -842,10 +899,15 @@ fn inference_hook() -> DeclaredHook {
 
 /// The frames of `events` that carry the declared hook's artifact.
 fn hook_artifacts(events: &[SseEvent]) -> Vec<Value> {
+    artifacts_from(events, HOOK)
+}
+
+/// The frames of `events` that carry an artifact from the hook named `hook`.
+fn artifacts_from(events: &[SseEvent], hook: &str) -> Vec<Value> {
     frames_of(events, "artifact")
         .into_iter()
         .map(|frame| frame["artifact"].clone())
-        .filter(|artifact| artifact["tool_name"] == HOOK)
+        .filter(|artifact| artifact["tool_name"] == hook)
         .collect()
 }
 
@@ -974,4 +1036,155 @@ fn a_failed_turn_forwards_no_hook_artifact() {
         "a failed attempt forwards no artifact: {kinds:?}"
     );
     assert_eq!(final_status(&events)["status"]["state"], "failed");
+}
+
+/// The `on-inference` hook the `run-inference` scenarios declare: it calls `run-inference` once and
+/// returns whatever string the call produced as its artifact.
+const INFERRING_HOOK: &str = "inferring-hook";
+
+fn inferring_hook() -> DeclaredHook {
+    DeclaredHook {
+        name: INFERRING_HOOK,
+        binding: "on-inference",
+        wasm: common::hook_wat::run_inference_then_artifact_hook_wasm(),
+    }
+}
+
+/// What `run-inference` answers a hook with under `transport: process`.
+const PROCESS_TRANSPORT_REFUSAL: &str = "run-inference is not available under \
+     inference.transport: process: the harness runs the model, and this capsule has no inference \
+     driver the runtime can call";
+
+/// Print what the `run-inference` scenarios assert on, before any assertion can stop the test.
+fn print_inference_evidence(events: &[SseEvent], trace: &[Value]) {
+    println!("frames: {:?}", frame_kinds(events));
+    for artifact in artifacts_from(events, INFERRING_HOOK) {
+        println!("hook artifact payload: {}", artifact["content"]);
+    }
+    for line in trace_events(trace, "inference") {
+        println!("inference: {line}");
+    }
+    for line in trace_events(trace, "spend_ceiling_reached") {
+        println!("spend_ceiling_reached: {line}");
+    }
+}
+
+/// A scripted provider answer: `end_turn` carrying `text`.
+fn end_turn(id: &str, text: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
+/// Under `transport: http` a hook's `run-inference` reaches the provider, and its `inference` line
+/// is written on the hook's turn, tagged with the hook's origin, ahead of that turn's own line.
+#[test]
+fn a_hook_s_run_inference_is_traced_on_its_turn_ahead_of_the_turn_on_http() {
+    if common::skip_without_host_support(
+        "a_hook_s_run_inference_is_traced_on_its_turn_ahead_of_the_turn_on_http",
+    ) {
+        return;
+    }
+    // The agent's turn is dispatched before its `on-inference` hooks run, so each turn's answer
+    // precedes the hook's completion.
+    let server = common::ScriptedServer::start(vec![
+        serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{
+                "type": "tool_use",
+                "id": "call_1",
+                "name": TOOL,
+                "input": { "msg": "ping" }
+            }],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string(),
+        end_turn("msg_hook_1", "HOOK-COMPLETION"),
+        end_turn("msg_2", "PARITY-ANSWER"),
+        end_turn("msg_hook_2", "HOOK-COMPLETION"),
+    ]);
+    let capsule = http_capsule(&server, "hook-infer-http", true, Some(&inferring_hook()));
+    let events = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    let trace = capsule.trace_after_task_end();
+    print_inference_evidence(&events, &trace);
+
+    let status = final_status(&events);
+    assert_eq!(status["status"]["state"], "completed", "{status}");
+    assert_eq!(status["status"]["response"], "PARITY-ANSWER", "{status}");
+    let hooks = artifacts_from(&events, INFERRING_HOOK);
+    assert_eq!(hooks.len(), 1, "{hooks:#?}");
+    assert_eq!(hooks[0]["content"], "HOOK-COMPLETION", "{}", hooks[0]);
+
+    let inference = trace_events(&trace, "inference");
+    let lines: Vec<(u64, Option<&str>)> = inference
+        .iter()
+        .map(|line| (line["turn"].as_u64().unwrap(), line["origin"].as_str()))
+        .collect();
+    let hook_origin = format!("hook:{INFERRING_HOOK}");
+    assert_eq!(
+        lines,
+        [
+            (0, Some(hook_origin.as_str())),
+            (0, None),
+            (1, Some(hook_origin.as_str())),
+            (1, None),
+        ],
+        "{inference:#?}"
+    );
+    assert_eq!(inference[1]["decision"], "tool_call", "{}", inference[1]);
+}
+
+/// Under `transport: process` a hook's `run-inference` is answered with an error naming the
+/// transport, before anything is sent or admitted: no hook `inference` line and no
+/// `spend_ceiling_reached` line, under a session ceiling far below the call's 8192-token output
+/// reservation.
+#[test]
+fn a_hook_s_run_inference_under_process_transport_is_refused_and_spends_nothing() {
+    if common::skip_without_host_support(
+        "a_hook_s_run_inference_under_process_transport_is_refused_and_spends_nothing",
+    ) {
+        return;
+    }
+    let capsule = ProcessCapsule::new("hook-infer-process", "parity")
+        .with_tool()
+        .with_hook(inferring_hook())
+        .inference_line("  max_session_tokens: 1000\n")
+        .start();
+    let events = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    let trace = capsule.trace_after_task_end();
+    print_inference_evidence(&events, &trace);
+
+    let inference = trace_events(&trace, "inference");
+    let turns: Vec<(u64, bool)> = inference
+        .iter()
+        .map(|line| (line["turn"].as_u64().unwrap(), line.get("origin").is_some()))
+        .collect();
+    assert_eq!(turns, [(0, false), (1, false)], "{inference:#?}");
+    let refusals = trace_events(&trace, "spend_ceiling_reached");
+    assert!(refusals.is_empty(), "{refusals:#?}");
+    let task_end = trace_events(&trace, "task_end");
+    assert_eq!(task_end.len(), 1, "{task_end:#?}");
+    assert_eq!(task_end[0]["exit_status"], "ok", "{}", task_end[0]);
+
+    let status = final_status(&events);
+    assert_eq!(status["status"]["state"], "completed", "{status}");
+    assert_eq!(status["status"]["response"], "PARITY-ANSWER", "{status}");
+    let hooks = artifacts_from(&events, INFERRING_HOOK);
+    assert_eq!(hooks.len(), 1, "{hooks:#?}");
+    assert_eq!(
+        hooks[0]["content"], PROCESS_TRANSPORT_REFUSAL,
+        "{}",
+        hooks[0]
+    );
 }

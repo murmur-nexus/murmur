@@ -23,7 +23,9 @@ use crate::{
     },
     conversation_import::{add_conversation_to_linker, ConversationState},
     errors::RuntimeError,
-    inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
+    inference_import::{
+        add_inference_to_linker, HookInferenceCtx, HookInferenceRecord, InferenceUnavailable,
+    },
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
     network_policy::{resolve_scoped_dir, HookCapabilityGrant},
     runtime::NetworkPolicyHooks,
@@ -113,10 +115,10 @@ pub(crate) struct HookRuntime {
     fault_tx: mpsc::UnboundedSender<DispatchFault>,
     fault_rx: mpsc::UnboundedReceiver<DispatchFault>,
     context: SessionContextData,
-    /// Backing for the `murmur:runtime/inference` host import. `None` when the
-    /// capsule has no usable inference driver — `run-inference` then returns a
-    /// clear `err` instead of the import failing to link.
-    inference: Option<Arc<HookInferenceCtx>>,
+    /// Backing for the `murmur:runtime/inference` host import. `Err` when the
+    /// capsule has no inference driver a hook can call — `run-inference` then
+    /// returns the reason's `err` instead of the import failing to link.
+    inference: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
     /// Backing for the `murmur:task-io/read` host import: the runtime's single copy of the
     /// in-scope task's input and result text. Held for the whole launch and shared by `Arc`
     /// with each *granted* hook's linker, so what [`Self::begin_task_attempt`] and
@@ -767,7 +769,11 @@ async fn call_stage_once(
     // `on-stage` runs during staging, long before an inference driver exists —
     // the import is defined so an inference-importing hook still links, and
     // always errors.
-    add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), None)?;
+    add_inference_to_linker(
+        &mut linker,
+        format!("hook:{}", staged.name),
+        Err(InferenceUnavailable::NotConfigured),
+    )?;
     // `on-stage` runs before any task exists. A granted hook gets a state of its own so its
     // reads truthfully report `no-task` rather than `not-granted`; the throwaway store this
     // instance lives on is discarded with it.
@@ -882,7 +888,7 @@ impl HookRuntime {
         context: SessionContextData,
         env_vars: HookEnvVars<'_>,
         limits: ExecutionLimits,
-        inference: Option<Arc<HookInferenceCtx>>,
+        inference: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
         conversation_root: Option<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let mut blocking_hooks = Vec::new();
@@ -1546,7 +1552,7 @@ async fn instantiate_hook(
     staged: &StagedHookArtifact,
     env_vars: &HookEnvVars<'_>,
     limits: ExecutionLimits,
-    inference: Option<Arc<HookInferenceCtx>>,
+    inference: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
     host_state: &HookHostState,
 ) -> Result<HookInstance, RuntimeError> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
@@ -2286,6 +2292,28 @@ mod tests {
         limits: ExecutionLimits,
         env_vars: HookEnvVars<'_>,
     ) -> Result<HookRuntime, RuntimeError> {
+        new_with_hooks_unavailable(
+            engine,
+            workdir,
+            accessible,
+            staged,
+            limits,
+            env_vars,
+            InferenceUnavailable::NotConfigured,
+        )
+        .await
+    }
+
+    /// [`new_with_hooks_full`] with the reason every `run-inference` call is answered with.
+    async fn new_with_hooks_unavailable(
+        engine: &wasmtime::Engine,
+        workdir: &Path,
+        accessible: &Path,
+        staged: Vec<StagedHookArtifact>,
+        limits: ExecutionLimits,
+        env_vars: HookEnvVars<'_>,
+        reason: InferenceUnavailable,
+    ) -> Result<HookRuntime, RuntimeError> {
         HookRuntime::new(
             engine,
             workdir,
@@ -2300,7 +2328,7 @@ mod tests {
             },
             env_vars,
             limits,
-            None,
+            Err(reason),
             None,
         )
         .await
@@ -3509,7 +3537,7 @@ mod tests {
                 },
                 HookEnvVars::default(),
                 ExecutionLimits::default(),
-                Some(Arc::clone(&ctx)),
+                Ok(Arc::clone(&ctx)),
                 None,
             )
             .await
@@ -3561,6 +3589,54 @@ mod tests {
             "got: {}",
             artifacts[0].payload
         );
+    }
+
+    /// Same component, under `inference.transport: process`. The call is answered with an `err`
+    /// that names the transport, not the manifest key a process capsule already declares.
+    #[test]
+    fn hook_run_inference_under_process_transport_names_the_transport() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (artifacts, records, refusals) = rt.block_on(async {
+            let mut hooks = new_with_hooks_unavailable(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "caller",
+                    HookBinding::OnInference,
+                    hook_inference_caller_double(&engine),
+                )],
+                ExecutionLimits::default(),
+                HookEnvVars::default(),
+                InferenceUnavailable::ProcessTransport,
+            )
+            .await
+            .expect("the import is defined under process transport, so the hook links");
+            let artifacts = hooks.emit(session.path(), inference_event()).await;
+            (
+                artifacts,
+                hooks.drain_inference_records(),
+                hooks.drain_spend_refusals(),
+            )
+        });
+
+        assert_eq!(artifacts.len(), 1);
+        let payload = &artifacts[0].payload;
+        assert_eq!(payload, InferenceUnavailable::ProcessTransport.message());
+        assert!(
+            payload.contains("inference.transport: process"),
+            "got: {payload}"
+        );
+        assert!(
+            !payload.contains("add inference.driver.artifact"),
+            "got: {payload}"
+        );
+        assert!(records.is_empty(), "{records:?}");
+        assert!(refusals.is_empty(), "{refusals:?}");
     }
 
     fn inference_event() -> HookEvent {
@@ -4234,7 +4310,7 @@ mod tests {
                 },
                 HookEnvVars::default(),
                 ExecutionLimits::default(),
-                None,
+                Err(InferenceUnavailable::NotConfigured),
                 root,
             )
             .await
@@ -4363,7 +4439,7 @@ mod tests {
                 },
                 HookEnvVars::default(),
                 ExecutionLimits::default(),
-                None,
+                Err(InferenceUnavailable::NotConfigured),
                 Some(root),
             )
             .await

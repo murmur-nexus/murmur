@@ -528,6 +528,98 @@ pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
     wat::parse_str(&wat).expect("run-inference compaction hook WAT parses")
 }
 
+/// An `on-inference` hook that calls `run-inference` once — no messages, no system prompt,
+/// `model: none` — and returns `artifact(<text>)`, where `text` is whichever string the call
+/// produced: the completion's text on `ok`, the error on `err`. Bind it with
+/// `commit_policy: none`.
+///
+/// `inference-event` arrives as one pointer the handler ignores. `run-inference`'s result is
+/// written to 256 as in [`run_inference_then_err_compaction_hook_wasm`], either string's ptr/len
+/// at 264/268. The lifted `result<hook-output, string>` is at [`RETURN_AREA`]: `ok` (`0`) at 0,
+/// then the `hook-output` at 4 — discriminant `3` (`artifact`) at 4, the string's ptr/len at
+/// 8/12.
+pub fn run_inference_then_artifact_hook_wasm() -> Vec<u8> {
+    let shape = event_shape("on-inference");
+    let wat = format!(
+        r#"(component
+  (import "{INFERENCE_IFACE}" (instance $inf
+    (type (option string))
+    (type (enum "replace-context" "seed-context"))
+    (export "context-insertion" (type (eq 1)))
+    (type (option 2))
+    (type (record
+      (field "role" string)
+      (field "content" string)
+      (field "id" 0)
+      (field "source-id" 0)
+      (field "inserted-by" 3)))
+    (export "message" (type (eq 4)))
+    (type (list 5))
+    (type (record
+      (field "messages" 6)
+      (field "system-prompt" 0)
+      (field "model" 0)))
+    (export "inference-request" (type (eq 7)))
+    (type (record
+      (field "text" string)
+      (field "model-used" string)
+      (field "input-tokens" u64)
+      (field "output-tokens" u64)))
+    (export "inference-response" (type (eq 9)))
+    (type (result 10 (error string)))
+    (export "run-inference" (func (param "request" 8) (result 11)))
+  ))
+  (alias export $inf "run-inference" (func $runi))
+
+  ;; Memory and `realloc` in their own module, so the lowered import can name them without a
+  ;; cyclic instantiation.
+  (core module $libc
+    (memory (export "memory") 4)
+    (global $bump (mut i32) (i32.const 65536))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (local.get 3)))
+      (local.get $p))
+  )
+  (core instance $li (instantiate $libc))
+  (alias core export $li "memory" (core memory $mem))
+  (alias core export $li "realloc" (core func $realloc))
+  (core func $run_lowered
+    (canon lower (func $runi) (memory $mem) (realloc $realloc) string-encoding=utf8))
+
+  (core module $m
+    (import "libc" "memory" (memory 4))
+    (import "inf" "run" (func $run (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+    (func (export "handler") {params} (result i32)
+      (call $run
+        (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 256))
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 0))
+      (i32.store (i32.const {disc}) (i32.const 3))
+      (i32.store (i32.const {ptr}) (i32.load (i32.const 264)))
+      (i32.store (i32.const {len}) (i32.load (i32.const 268)))
+      (i32.const {RETURN_AREA}))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m
+    (with "libc" (instance $li))
+    (with "inf" (instance (export "run" (func $run_lowered))))))
+
+{exports}
+)"#,
+        params = shape.params,
+        disc = RETURN_AREA + 4,
+        ptr = RETURN_AREA + 8,
+        len = RETURN_AREA + 12,
+        exports =
+            lifecycle_exports_with("on-inference", HOOK_OUTPUT, shape.decls, shape.type_exports),
+    );
+    wat::parse_str(&wat).expect("run-inference inference hook WAT parses")
+}
+
 /// Pack a hook `.mur.zip` whose bundled manifest declares the binding and commit policy the
 /// runtime cross-checks at staging.
 pub fn create_hook_zip(

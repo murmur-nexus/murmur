@@ -336,16 +336,42 @@ fn response_text(response: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Why a session's hooks have no inference driver behind `run-inference`. Every call answers
+/// `err` with [`Self::message`]; nothing is sent, admitted against a spend ceiling, or recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InferenceUnavailable {
+    /// No callable driver is staged — including under `on-stage`, which runs before one exists.
+    NotConfigured,
+    /// The capsule runs under `inference.transport: process`: the harness runs the model.
+    ProcessTransport,
+}
+
+impl InferenceUnavailable {
+    /// The `err` string every `run-inference` call receives.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            // Wording tracks RuntimeError::DriverNotConfigured.
+            Self::NotConfigured => {
+                "inference driver is not configured; add inference.driver.artifact to murmur.yaml"
+            }
+            Self::ProcessTransport => {
+                "run-inference is not available under inference.transport: process: the harness \
+                 runs the model, and this capsule has no inference driver the runtime can call"
+            }
+        }
+    }
+}
+
 /// Register `murmur:runtime/inference@0.4.0#run-inference` on a hook linker.
 ///
 /// `origin` is the `hook:<name>` tag attached to every trace record this hook's
-/// calls produce. `ctx` is `None` when the capsule has no usable inference
-/// driver: the import is still *defined* (so a hook that imports it links and
-/// runs), it just always returns the same `err`.
+/// calls produce. `ctx` is `Err` when the capsule has no inference driver a hook
+/// can call: the import is still *defined* (so a hook that imports it links and
+/// runs), it just always returns the reason's `err`.
 pub(crate) fn add_inference_to_linker<T: 'static>(
     linker: &mut Linker<T>,
     origin: String,
-    ctx: Option<Arc<HookInferenceCtx>>,
+    ctx: Result<Arc<HookInferenceCtx>, InferenceUnavailable>,
 ) -> Result<(), String> {
     let origin = Arc::new(origin);
     linker
@@ -362,11 +388,8 @@ pub(crate) fn add_inference_to_linker<T: 'static>(
                         > + Send,
                 > = Box::new(async move {
                     let result = match ctx {
-                        Some(ctx) => ctx.run(&origin, request).await,
-                        // Wording tracks RuntimeError::DriverNotConfigured.
-                        None => Err("inference driver is not configured; add \
-                                     inference.driver.artifact to murmur.yaml"
-                            .to_string()),
+                        Ok(ctx) => ctx.run(&origin, request).await,
+                        Err(reason) => Err(reason.message().to_string()),
                     };
                     Ok((result,))
                 });

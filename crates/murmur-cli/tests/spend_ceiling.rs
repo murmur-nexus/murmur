@@ -1155,6 +1155,108 @@ fn resume_compact_refused_by_spend_ceiling() {
     assert_eq!(refusal["turn"], json!(0));
 }
 
+// ── An inference hook's call crosses the ceiling ──────────────────────────────
+
+/// An `on-inference` hook that calls `run-inference` and returns whatever string that produced as
+/// its artifact.
+const INFERRING_HOOK: &str = "inferring-hook";
+
+/// A scratch `HOME` with the driver and [`INFERRING_HOOK`] published into it.
+fn home_with_inferring_hook() -> TempDir {
+    let home = home_with_driver();
+    let artifacts = TempDir::new().unwrap();
+    let artifact = common::hook_wat::create_hook_zip(
+        artifacts.path(),
+        INFERRING_HOOK,
+        "on-inference",
+        "none",
+        &common::hook_wat::run_inference_then_artifact_hook_wasm(),
+    );
+    common::publish_local(&home, &artifact).success();
+    home
+}
+
+/// [`http_manifest`] with [`INFERRING_HOOK`] bound.
+fn inferring_hook_manifest(endpoint: &str, inference_extra: &str) -> String {
+    format!(
+        "name: spend-inference-hook\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
+         {DRIVER_VERSION}\n    runtime: driver\n    gateway:\n      endpoint: {endpoint}\n      \
+         api_key: test-key\n  - name: {INFERRING_HOOK}\n    version: 0.1.0\n    runtime: hook\n\
+         inference:\n  transport: http\n  model: test-model\n  max_tokens: {MAX_OUTPUT}\n\
+         {inference_extra}  driver:\n    artifact: {DRIVER}\n"
+    )
+}
+
+fn inferring_hook_responses() -> Vec<String> {
+    vec![
+        end_turn("msg_1", "done"),
+        end_turn("msg_2", "HOOK-COMPLETION"),
+    ]
+}
+
+/// The first agent turn's input under [`inferring_hook_manifest`], from a run with no ceiling, and
+/// a ceiling that turn fits under and the hook's call cannot.
+fn inferring_hook_ceiling(home: &TempDir) -> u64 {
+    let server = common::ScriptedServer::start(inferring_hook_responses());
+    let control = project(&inferring_hook_manifest(&server.endpoint, ""));
+    let run = run_task(home, &control);
+    let trace = run.trace();
+    let turns = agent_turns(&trace);
+    assert_eq!(turns.len(), 1, "{}", run.stderr);
+    let hook_calls: Vec<_> = events(&trace, "inference")
+        .into_iter()
+        .filter(|event| event["origin"] == format!("hook:{INFERRING_HOOK}"))
+        .collect();
+    assert_eq!(hook_calls.len(), 1, "the control's hook call is admitted");
+    let first_input = turns[0].0;
+    let ceiling = ceiling_between_first_and_second_call(first_input);
+    assert!(first_input + MAX_OUTPUT <= ceiling);
+    assert!(HOOK_MAX_OUTPUT > MAX_OUTPUT + first_input / 2);
+    println!("control first input {first_input}; ceiling {ceiling}");
+    ceiling
+}
+
+/// A session ceiling that refuses an `on-inference` hook's `run-inference` writes one
+/// `spend_ceiling_reached` line tagged with the hook's origin, on the hook's turn. The refusal
+/// reaches the hook as its call's `err`; the task itself carries on to its answer.
+#[test]
+fn a_ceiling_that_refuses_an_inference_hook_s_call_is_traced_with_its_origin() {
+    println!("a_ceiling_that_refuses_an_inference_hook_s_call_is_traced_with_its_origin");
+    let home = home_with_inferring_hook();
+    let ceiling = inferring_hook_ceiling(&home);
+
+    let server = common::ScriptedServer::start(inferring_hook_responses());
+    let stopped = project(&inferring_hook_manifest(
+        &server.endpoint,
+        &session_ceiling(ceiling),
+    ));
+    let run = run_task(&home, &stopped);
+    let trace = run.trace();
+    let requests = server.requests().len();
+    println!("upstream requests: {requests}");
+    for line in events(&trace, "inference") {
+        println!("inference: {line}");
+    }
+    for line in events(&trace, "spend_ceiling_reached") {
+        println!("spend_ceiling_reached: {line}");
+    }
+    assert_eq!(requests, 1, "{}", run.stderr);
+
+    let refusals = events(&trace, "spend_ceiling_reached");
+    assert_eq!(refusals.len(), 1, "{}", run.stderr);
+    assert_eq!(refusals[0]["origin"], format!("hook:{INFERRING_HOOK}"));
+    assert_eq!(refusals[0]["limit"], "session");
+    assert_eq!(refusals[0]["turn"], 0);
+    assert!(events(&trace, "inference")
+        .iter()
+        .all(|event| event.get("origin").is_none()));
+    assert_eq!(agent_turns(&trace).len(), 1);
+
+    println!("task_end line: {}", events(&trace, "task_end")[0]);
+    assert_eq!(exit_status(&trace, "task_end"), "ok");
+    assert_eq!(run.result(), "done");
+}
+
 // ── S13: the ceilings cover transport: process ────────────────────────────────
 
 /// A published process driver, the fake harness beside it, and a manifest naming both.
