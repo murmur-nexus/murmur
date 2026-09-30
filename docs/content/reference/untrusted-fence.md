@@ -122,9 +122,9 @@ holds.
 | Boundary | Content | Source name |
 |---|---|---|
 | Tool result | Every agent-facing tool dispatch except a skill — WASM tool, native subprocess tool, shell binary, and the runtime's own peer-handoff tools | `tool:<artifact name>` |
-| Tool result | A skill whose `murmur.lock` origin is `runtime`, on every call | `skill:<artifact name>` |
+| Skill result | A skill whose `murmur.lock` origin is `runtime`, on every call | `skill:<artifact name>` |
 | Task payload | A task whose trust class is `untrusted` | `task:<origin>` |
 
-Both boundaries apply on `inference.transport: http` and `inference.transport: process`. A
+Every boundary applies on `inference.transport: http` and `inference.transport: process`. A
 `process` capsule keeps no conversation record and emits no A2A `artifact` frame, so its fenced
 content is labelled only by the markers themselves.

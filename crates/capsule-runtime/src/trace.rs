@@ -3919,7 +3919,7 @@ mod tests {
         containment::scope_report_for_tier, sandbox::EnforcementTier, sealed::UsernsGrant,
         trace_blobs::BLOB_DIR_NAME, types::CapabilityPolicy,
     };
-    use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
+    use murmur_artifact::{ArtifactRuntime, InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
 
     use crate::origin::TaskOrigin;
@@ -5400,9 +5400,6 @@ mod tests {
         assert_eq!(by_type("session_end")["parent_id"], session["event_id"]);
         assert_eq!(by_type("artifact_pulled")["parent_id"], session["event_id"]);
     }
-
-    use crate::types::InstalledArtifactSummary;
-    use murmur_artifact::ArtifactRuntime;
 
     fn runtime_summary(name: &str, runtime: ArtifactRuntime) -> InstalledArtifactSummary {
         InstalledArtifactSummary {

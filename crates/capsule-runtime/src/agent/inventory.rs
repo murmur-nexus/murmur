@@ -284,6 +284,8 @@ pub(crate) fn tool_names(tools: &[Value]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use murmur_artifact::LockOrigin;
+
     use super::*;
 
     fn write_tool(tools_dir: &Path, name: &str) {
@@ -357,8 +359,6 @@ mod tests {
             session: session.to_string(),
         }
     }
-
-    use murmur_artifact::LockOrigin;
 
     /// A workdir holding a described tool, a described skill and a skill whose only description
     /// is the first line of its `skill.md`.

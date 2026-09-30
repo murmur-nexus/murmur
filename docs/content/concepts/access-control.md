@@ -216,8 +216,8 @@ and a **trust class** derived from it:
 | `operator` | `mur install`, or the `mur run` / `mur eval` that created the lock. A `source:` skill and an artifact staged with no lock read as `operator` too | `trusted` |
 | `runtime` | A running capsule's [`manage.pull()`](../reference/wit-interfaces.md#murmurartifact-managermanage) | `untrusted` |
 
-A `runtime` pin is `untrusted` whatever session it names. The runtime's own tools (`share-file`,
-`fetch-peer-file`, `delegate-task`, `submit-plan`) have no pin and are `operator`.
+The runtime's own tools (`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`) have no
+pin and are `operator`.
 
 An `untrusted` artifact reaches the model marked on every surface it can reach it through:
 
@@ -235,8 +235,7 @@ The marker:
 ```
 
 The tool array is sent beside the conversation rather than inside it, so a compaction that
-replaces the conversation leaves the marker in place. A session whose every artifact is `operator`
-sends the same tool array, system prompt and messages it would with no runtime pin anywhere.
+replaces the conversation leaves the marker in place.
 
 The class is a marker, not a control: a marked artifact is staged, offered and dispatched exactly
 as an operator one is, under the same grants. A skill and a tool are marked alike. The marker
@@ -246,11 +245,9 @@ pulling an artifact the operator already pinned at the same version leaves the p
 The trace records it: `session_start.runtime_artifacts` lists every runtime pin a launch staged,
 `skill_call` carries `origin` and `trust`, and each pull writes an `artifact_pulled` line — see
 [Session trace](../reference/observability-schemas.md#session-trace-tracejsonl).
-`mur trace steps <session>` annotates a runtime skill's call:
-
-```
-skill_call pulled-style  2ms  ✓ (runtime/untrusted)
-```
+[`mur trace show`](../reference/cli.md#mur-trace-show) and
+[`mur trace steps`](../reference/cli.md#mur-trace-steps) annotate a runtime skill's calls with
+`runtime/untrusted`.
 
 ## Prompt injection and network-bypass posture { #threat-model }
 
