@@ -146,12 +146,12 @@ pub(crate) fn refuse_after_resolve(
 pub(crate) fn describe(policy: &CapabilityPolicy) -> String {
     if is_granted(policy) {
         format!(
-            "install skill: {}; install tool: {}; search and remove are not implemented",
+            "install skill: {}; install tool: {}; search is not implemented",
             render_entries(&policy.install_skill),
             render_entries(&policy.install_tool)
         )
     } else {
-        "pull: not granted (no capabilities.install); search and remove are not implemented"
+        "pull and remove: not granted (no capabilities.install); search is not implemented"
             .to_string()
     }
 }
@@ -171,6 +171,10 @@ fn render_entries(entries: &[String]) -> String {
         entries.join(", ")
     }
 }
+
+/// The project and session fixtures `artifact_removal`'s tests share with this module's.
+#[cfg(test)]
+pub(crate) use tests::{pull, tree, Project, VERSION};
 
 #[cfg(test)]
 mod tests {
@@ -193,17 +197,17 @@ mod tests {
     use crate::spawn_envelope::SpawnEnvelope;
     use crate::types::capability_policy_from_runtime_manifest;
 
-    const VERSION: &str = "1.0.0";
+    pub(crate) const VERSION: &str = "1.0.0";
 
     /// A real on-disk [`LocalRegistry`] that records the name of every resolve it serves, so a
     /// test can prove a refusal was decided before the registry was read.
-    struct CountingRegistry {
+    pub(crate) struct CountingRegistry {
         inner: LocalRegistry,
         resolved: Mutex<Vec<String>>,
     }
 
     impl CountingRegistry {
-        fn resolved(&self) -> Vec<String> {
+        pub(crate) fn resolved(&self) -> Vec<String> {
             self.resolved.lock().unwrap().clone()
         }
     }
@@ -238,15 +242,15 @@ mod tests {
 
     /// One project: a registry rooted in a tempdir, and the workdir and `murmur.lock` its
     /// sessions pull into.
-    struct Project {
+    pub(crate) struct Project {
         _dir: TempDir,
-        registry: Arc<CountingRegistry>,
-        workdir: PathBuf,
-        lock_path: PathBuf,
+        pub(crate) registry: Arc<CountingRegistry>,
+        pub(crate) workdir: PathBuf,
+        pub(crate) lock_path: PathBuf,
     }
 
     impl Project {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let workdir = dir.path().join("workdir");
             fs::create_dir_all(&workdir).unwrap();
@@ -263,7 +267,7 @@ mod tests {
         }
 
         /// A session on this project granted `skill` and `tool`.
-        fn session(&self, skill: &[&str], tool: &[&str]) -> CapsuleStoreState {
+        pub(crate) fn session(&self, skill: &[&str], tool: &[&str]) -> CapsuleStoreState {
             let mut state = build_test_state(
                 self.registry.clone(),
                 self.workdir.clone(),
@@ -274,7 +278,7 @@ mod tests {
         }
 
         /// A session on this project holding exactly `policy`.
-        fn session_with(&self, policy: CapabilityPolicy) -> CapsuleStoreState {
+        pub(crate) fn session_with(&self, policy: CapabilityPolicy) -> CapsuleStoreState {
             let mut state = build_test_state(
                 self.registry.clone(),
                 self.workdir.clone(),
@@ -285,6 +289,17 @@ mod tests {
         }
 
         fn publish(&self, name: &str, runtime: RuntimeType, role: &str, bytes: Vec<u8>) -> String {
+            self.publish_at(name, VERSION, runtime, role, bytes)
+        }
+
+        fn publish_at(
+            &self,
+            name: &str,
+            version: &str,
+            runtime: RuntimeType,
+            role: &str,
+            bytes: Vec<u8>,
+        ) -> String {
             let platforms = match runtime {
                 RuntimeType::Native => {
                     let (os, arch) = current_platform()
@@ -296,7 +311,7 @@ mod tests {
             };
             let meta = ArtifactMeta {
                 name: name.to_string(),
-                version: VERSION.to_string(),
+                version: version.to_string(),
                 runtime,
                 artifact_runtime: role.to_string(),
                 platforms,
@@ -308,15 +323,21 @@ mod tests {
         }
 
         /// Publishes skill `name` whose `skill.md` is `text`, returning its sha256.
-        fn publish_skill(&self, name: &str, text: &str) -> String {
-            self.publish(
+        pub(crate) fn publish_skill(&self, name: &str, text: &str) -> String {
+            self.publish_skill_at(name, VERSION, text)
+        }
+
+        /// Publishes skill `name` at `version` whose `skill.md` is `text`, returning its sha256.
+        pub(crate) fn publish_skill_at(&self, name: &str, version: &str, text: &str) -> String {
+            self.publish_at(
                 name,
+                version,
                 RuntimeType::Static,
                 "skill",
                 zip_with_files(&[
                     (
                         PACKED_MANIFEST_ENTRY,
-                        format!("name: {name}\nversion: {VERSION}\nruntime: skill\n").as_bytes(),
+                        format!("name: {name}\nversion: {version}\nruntime: skill\n").as_bytes(),
                     ),
                     ("skill.md", text.as_bytes()),
                 ]),
@@ -324,7 +345,7 @@ mod tests {
         }
 
         /// Publishes a WASM tool `name` whose component compiles.
-        fn publish_wasm_tool(&self, name: &str) {
+        pub(crate) fn publish_wasm_tool(&self, name: &str) {
             self.publish(
                 name,
                 RuntimeType::Wasm,
@@ -334,7 +355,7 @@ mod tests {
         }
 
         /// Publishes a WASM component under role `role` (`driver`, `hook`).
-        fn publish_wasm_role(&self, name: &str, role: &str) {
+        pub(crate) fn publish_wasm_role(&self, name: &str, role: &str) {
             self.publish(
                 name,
                 RuntimeType::Wasm,
@@ -353,7 +374,7 @@ mod tests {
         }
 
         /// Publishes a native tool `name` for this host's platform.
-        fn publish_native_tool(&self, name: &str) {
+        pub(crate) fn publish_native_tool(&self, name: &str) {
             self.publish(
                 name,
                 RuntimeType::Native,
@@ -371,23 +392,26 @@ mod tests {
             );
         }
 
-        fn installed(&self, name: &str) -> PathBuf {
+        pub(crate) fn installed(&self, name: &str) -> PathBuf {
             self.workdir.join("tools").join(name)
         }
 
-        fn locked(&self, name: &str) -> bool {
+        pub(crate) fn locked(&self, name: &str) -> bool {
             read_lockfile(&self.lock_path)
                 .map(|lock| lock.artifact_for(name).is_some())
                 .unwrap_or(false)
         }
     }
 
-    fn pull(state: &mut CapsuleStoreState, name: &str) -> Result<manage::ArtifactSummary, String> {
+    pub(crate) fn pull(
+        state: &mut CapsuleStoreState,
+        name: &str,
+    ) -> Result<manage::ArtifactSummary, String> {
         manage::Host::pull(state, name.to_string(), VERSION.to_string())
     }
 
     /// Every path under `root`, recursively, sorted.
-    fn tree(root: &Path) -> Vec<PathBuf> {
+    pub(crate) fn tree(root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -748,14 +772,9 @@ mod tests {
         let capabilities = manage::Host::diagnostics(&mut ungranted)
             .unwrap()
             .capabilities;
-        assert!(capabilities.contains("pull: not granted"), "{capabilities}");
-        assert!(
-            capabilities.contains("capabilities.install"),
-            "{capabilities}"
-        );
-        assert!(
-            capabilities.ends_with("search and remove are not implemented"),
-            "{capabilities}"
+        assert_eq!(
+            capabilities,
+            "pull and remove: not granted (no capabilities.install); search is not implemented"
         );
 
         let mut granted = project.session(&["a"], &[]);
@@ -764,7 +783,7 @@ mod tests {
             .capabilities;
         assert_eq!(
             capabilities,
-            "install skill: a; install tool: <none>; search and remove are not implemented"
+            "install skill: a; install tool: <none>; search is not implemented"
         );
     }
 

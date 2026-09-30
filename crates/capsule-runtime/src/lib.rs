@@ -13,6 +13,7 @@ pub(crate) mod agent;
 pub mod alloc_bench;
 pub mod artifact;
 pub mod artifact_config;
+pub(crate) mod artifact_removal;
 pub mod bindings;
 pub(crate) mod cancel;
 pub(crate) mod cgroup;
