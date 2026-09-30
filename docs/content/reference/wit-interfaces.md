@@ -246,7 +246,8 @@ or launch of that version, in any session, skips compiling it.
 `remove(name)` uninstalls an artifact the capsule pulled. It needs the same
 [`capabilities.install`](manifest.md#field-install) grant as `pull`, and it removes only an
 artifact that `murmur.lock` pins as [`origin: runtime`](workdir.md#lock-origin) and `murmur.yaml`
-does not declare. The pulling session does not have to be this one.
+does not declare. The artifact must be installed in this session; its `murmur.lock` entry may
+name an earlier session that pulled the same artifact.
 
 | Result | Meaning |
 |---|---|
@@ -261,8 +262,8 @@ A removal deletes the artifact from every place `pull` put it:
 | `<workdir>/tools/<name>/` | Deleted: the manifest, `skill.md` and the native binary |
 | `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
 | `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
-| `invoke()` and the agent's tool calls | A call to the name returns `tool '<name>' was removed from this session by manage.remove; it can no longer be called` |
-| `~/.murmur/compiled` | Kept, so pulling the same version again skips compiling it. `mur install --prune` removes forms nothing uses |
+| `invoke()` | A call to the name returns `tool '<name>' was removed from this session by manage.remove; it can no longer be called` |
+| `~/.murmur/compiled` | Kept, so pulling the same version again skips compiling it. A compiled form not read in 30 days is deleted, as [`~/.murmur/compiled`](config.md#murmur-home-permissions) describes |
 
 The checks run in this order, and a refused removal changes nothing:
 
@@ -287,13 +288,6 @@ Two errors can follow the checks:
 
 Removing an artifact and pulling it again at another version replaces a runtime pin. An operator
 pin cannot be replaced this way: `remove` refuses it, and `pull` refuses to override it.
-
-A native tool pulled under a name that `capabilities.shell.allow` also grants is called in place
-of the shell binary. Removing the tool makes that name call the shell binary again.
-
-The conversation history is never rewritten. Earlier calls to a removed artifact and their results
-stay in the history, the conversation record and `trace.jsonl`. The tool list an `http` agent's
-model is offered drops the name at the same `inference.tool_refresh` boundary a pull is added at.
 
 ---
 

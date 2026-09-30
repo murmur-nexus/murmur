@@ -5228,11 +5228,12 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) allowlisted_tools: HashSet<String>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     /// How many times this session's installed set has changed since launch. `0` at
-    /// construction and moved by exactly one by every successful `manage.pull()` and
-    /// `manage.remove()`; a refused or failed call leaves it alone. The agent loop compares it
-    /// with the generation its held tool array was built at (`agent::inventory::HeldInventory`), so any
-    /// path that adds or removes an artifact under `workdir/tools/` must move it too, or the
-    /// model is never offered the change.
+    /// construction and moved by exactly one by every `manage.pull()` and `manage.remove()` that
+    /// changes the installed set; a refused call leaves it alone. A `remove` whose directory
+    /// cannot be deleted still moves it, since the name is already out of the session. The agent
+    /// loop compares it with the generation its held tool array was built at
+    /// (`agent::inventory::HeldInventory`), so any path that adds or removes an artifact under
+    /// `workdir/tools/` must move it too, or the model is never offered the change.
     pub(crate) installed_generation: u64,
     /// The names `murmur.yaml` declares under `artifacts:`, taken from
     /// [`StagedSession::installed_artifacts`] at construction and never changed. `manage.remove()`

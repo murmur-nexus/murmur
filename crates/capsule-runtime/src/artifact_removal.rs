@@ -20,8 +20,8 @@
 //!
 //! Every refusal is a string beginning [`NOT_REMOVABLE`], or [`NOT_GRANTED`] for a capsule with
 //! no `capabilities.install` or a name outside the artifact-name rule: the same token and
-//! wording `manage.pull` refuses with. A refusal is a value the guest branches on, never a trap, and is
-//! decided before anything changes. A name the session has not installed, including a
+//! wording `manage.pull` refuses with. A refusal is a value the guest branches on, never a trap,
+//! and is decided before anything changes. A name the session has not installed, including a
 //! `shell.allow` binary `manage.list` shows, is `Ok(false)` rather than a refusal.
 //!
 //! # Order of effects
@@ -33,7 +33,7 @@
 //! cannot be deleted is reported with [`undeletable_directory`], and the name is already out of
 //! the session and the lock, so dispatch refuses it. The compiled form under
 //! `~/.murmur/compiled` is shared across sessions and kept, so pulling the same version again is
-//! warm; `mur install --prune` removes stale forms.
+//! warm. A form nothing uses is deleted by the age-based prune in `compiled_forms`.
 //!
 //! # In-flight calls
 //!
@@ -678,5 +678,60 @@ mod tests {
             .await
             .unwrap()
             .contains("# second guidance"));
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Whether a new file can be created in `dir`. A read-only mode does not bind root.
+    fn accepts_new_file(dir: &Path) -> bool {
+        let probe = dir.join(".write-probe");
+        let created = fs::write(&probe, b"").is_ok();
+        let _ = fs::remove_file(&probe);
+        created
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_lock_write_changes_nothing_and_a_failed_deletion_still_refuses_calls() {
+        let project = Project::new();
+        project.publish_skill(SKILL, SKILL_TEXT);
+        let mut state = project.session(&[SKILL], &[]);
+        pull(&mut state, SKILL).unwrap();
+        let root = project.lock_path.parent().unwrap().to_path_buf();
+        let dir = project.installed(SKILL);
+
+        // Root writes through a read-only mode, so neither failure can be provoked there.
+        set_mode(&root, 0o555);
+        if accepts_new_file(&root) {
+            set_mode(&root, 0o755);
+            return;
+        }
+        let before = snapshot(&project, &state);
+        let write_failed = remove(&mut state, SKILL);
+        set_mode(&root, 0o755);
+        let err = write_failed.expect_err("the lock cannot be written");
+        assert!(err.starts_with("failed to write murmur.lock: "), "{err}");
+        assert_eq!(snapshot(&project, &state), before);
+        assert!(dispatch(&state, SKILL).await.unwrap().contains(SKILL_TEXT));
+
+        set_mode(&dir, 0o555);
+        let delete_failed = remove(&mut state, SKILL);
+        set_mode(&dir, 0o755);
+        let err = delete_failed.expect_err("the directory cannot be deleted");
+        let prefix = format!(
+            "'{SKILL}' is removed from this session and from murmur.lock, but {} could not be \
+             deleted: ",
+            dir.display()
+        );
+        assert!(err.starts_with(&prefix), "{err}");
+        assert!(dir.join("skill.md").is_file());
+        assert!(!project.locked(SKILL));
+        assert!(state.installed_artifacts.iter().all(|a| a.name != SKILL));
+        assert_eq!(
+            dispatch(&state, SKILL).await,
+            Err(called_after_removal(SKILL))
+        );
     }
 }
