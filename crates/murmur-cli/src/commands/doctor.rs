@@ -5,8 +5,8 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
-    inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
-    undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
+    inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_install,
+    render_read_only, undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
     warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
     warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
@@ -467,6 +467,20 @@ fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
             &policy.read_only_paths,
             &read_only_advisory_for(&policy.read_only_paths, &policy.shell_allow),
         )
+    );
+    println!();
+}
+
+/// Prints which skills and tools `capabilities.install` lets `manage.pull` install into a session.
+///
+/// Rendered by `render_install`, the same function `ScopeReport::render` calls, so `mur doctor`
+/// and `mur run --explain-scope` state the grant in one voice. A report, never a verdict: an
+/// absent grant is the common case and reaches no `fixes` entry.
+fn report_install(policy: &capsule_runtime::CapabilityPolicy) {
+    println!("Install grant");
+    print!(
+        "{}",
+        render_install(&policy.install_skill, &policy.install_tool)
     );
     println!();
 }
@@ -1019,6 +1033,10 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // The `read_only` declaration and whether it is enforced or advisory, through the renderer
     // `--explain-scope` prints from, for the reason `report_preopens` shares `PreopenReport::render`.
     report_read_only(&capability_policy);
+
+    // Which skills and tools the capsule may pull at runtime, through the renderer
+    // `--explain-scope` prints from.
+    report_install(&capability_policy);
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
     // doctor checks against it too; when it is absent doctor reports presence only,

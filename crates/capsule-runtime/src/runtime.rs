@@ -5436,6 +5436,14 @@ impl manage::Host for CapsuleStoreState {
     }
 
     fn pull(&mut self, name: String, version: String) -> Result<manage::ArtifactSummary, String> {
+        // 0. The capsule's own `capabilities.install` grant, decided on the name and version
+        // alone, so a refused request never reaches the registry.
+        if let Some(refusal) =
+            crate::install_grant::refuse_before_resolve(&self.capability_policy, &name, &version)
+        {
+            return Err(refusal);
+        }
+
         // 1. Resolve + verify against the registry's own self-reported hash.
         let resolved = self
             .registry
@@ -5445,6 +5453,16 @@ impl manage::Host for CapsuleStoreState {
         verify_sha256(&name, &version, &resolved.bytes, &resolved.sha256).map_err(|_| {
             format!("artifact integrity check failed for {name}@{version}: registry-reported hash does not match downloaded bytes")
         })?;
+
+        // The grant's tier half: whether the payload is a skill or a tool is known only once
+        // resolved, and it is decided before the lock is read or anything is written or compiled.
+        if let Some(refusal) = crate::install_grant::refuse_after_resolve(
+            &self.capability_policy,
+            &name,
+            &resolved.meta,
+        ) {
+            return Err(refusal);
+        }
 
         // 2. Cross-check against any existing murmur.lock pin — a runtime pull must never
         // silently override what's already pinned for this artifact.
@@ -5566,7 +5584,7 @@ impl manage::Host for CapsuleStoreState {
         Ok(manage::RuntimeState {
             capsule_id: self.session_id.clone(),
             installed: self.list(),
-            capabilities: "artifact-manager/search and remove are not implemented".to_string(),
+            capabilities: crate::install_grant::describe(&self.capability_policy),
         })
     }
 }
@@ -8772,6 +8790,13 @@ fn resolve_lifecycle(
     config
 }
 
+/// The session-state and artifact fixtures `install_grant`'s pull tests share with this module's.
+#[cfg(test)]
+pub(crate) use tests::{
+    build_test_state, cwasm_entries, grant_install, iface_component_bytes, scratch_compiled_dir,
+    wasm_tool_zip, zip_with_files,
+};
+
 #[cfg(test)]
 mod tests {
     use murmur_artifact::LockedArtifact;
@@ -10800,7 +10825,7 @@ inference:
 
     // ── manage.pull() ──────────────────────────────────────────────────────────
 
-    fn zip_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn zip_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
         zip_with_options(files, zip::write::SimpleFileOptions::default())
     }
 
@@ -10821,7 +10846,7 @@ inference:
         cursor.into_inner()
     }
 
-    fn build_test_state(
+    pub(crate) fn build_test_state(
         registry: Arc<dyn Registry>,
         workdir: PathBuf,
         lock_path: PathBuf,
@@ -10889,6 +10914,13 @@ inference:
             driver_continuation_context_id: None,
             driver_continuation_acked_len: 0,
         }
+    }
+
+    /// Grants `state` the `capabilities.install` entries `skill` and `tool`, as a manifest
+    /// declaring them would.
+    pub(crate) fn grant_install(state: &mut CapsuleStoreState, skill: &[&str], tool: &[&str]) {
+        state.capability_policy.install_skill = skill.iter().map(|s| s.to_string()).collect();
+        state.capability_policy.install_tool = tool.iter().map(|s| s.to_string()).collect();
     }
 
     // ── Driver continuation bookkeeping on CapsuleStoreState ─────────────
@@ -11053,6 +11085,7 @@ inference:
         let lock_path = project.path().join("murmur.lock");
 
         let mut state = build_test_state(registry, workdir.clone(), lock_path.clone());
+        grant_install(&mut state, &["my-skill"], &[]);
 
         let summary = manage::Host::pull(&mut state, "my-skill".to_string(), "1.0.0".to_string())
             .expect("pull should succeed");
@@ -11104,6 +11137,7 @@ inference:
         let lock_path = project.path().join("murmur.lock");
 
         let mut state = build_test_state(registry, workdir.clone(), lock_path);
+        grant_install(&mut state, &["aaa-late-skill"], &[]);
 
         // What run_agent_loop does once, before the turn loop.
         let snapshot = crate::agent::inventory::build_tool_inventory(&workdir, None);
@@ -11188,6 +11222,7 @@ inference:
             workdir.clone(),
             lock_path.clone(),
         );
+        grant_install(&mut state, &["evil-tool"], &[]);
 
         let err = manage::Host::pull(&mut state, "evil-tool".to_string(), "1.0.0".to_string())
             .expect_err("tampered bytes must be rejected");
@@ -11230,6 +11265,7 @@ inference:
         .unwrap();
 
         let mut state = build_test_state(registry, workdir.clone(), lock_path.clone());
+        grant_install(&mut state, &["my-skill"], &[]);
 
         let err = manage::Host::pull(&mut state, "my-skill".to_string(), "2.0.0".to_string())
             .expect_err("lock conflict must be rejected");
@@ -11274,6 +11310,7 @@ inference:
         fs::create_dir_all(&workdir).unwrap();
         let lock_path = project.path().join("murmur.lock");
         let mut state = build_test_state(registry, workdir, lock_path.clone());
+        grant_install(&mut state, &["my-skill"], &[]);
 
         manage::Host::pull(&mut state, "my-skill".to_string(), "1.0.0".to_string())
             .expect("pull should succeed");
@@ -11325,6 +11362,7 @@ inference:
             )
             .unwrap();
             let mut state = build_test_state(Arc::new(registry), workdir, lock_path.clone());
+            grant_install(&mut state, &[name], &[]);
 
             manage::Host::pull(&mut state, name.to_string(), "1.0.0".to_string())
                 .expect("pull should succeed");
@@ -11354,7 +11392,7 @@ inference:
     }
 
     /// A component exporting one empty instance under `iface`, in the binary format.
-    fn iface_component_bytes(iface: &str) -> Vec<u8> {
+    pub(crate) fn iface_component_bytes(iface: &str) -> Vec<u8> {
         wat::parse_str(format!(
             "(component (instance $i) (export \"{iface}\" (instance $i)))"
         ))
@@ -11362,7 +11400,7 @@ inference:
     }
 
     /// A `.mur.zip` for tool `name` whose root component is `root_wasm`.
-    fn wasm_tool_zip(name: &str, root_wasm: &[u8]) -> Vec<u8> {
+    pub(crate) fn wasm_tool_zip(name: &str, root_wasm: &[u8]) -> Vec<u8> {
         zip_with_files(&[
             (
                 PACKED_MANIFEST_ENTRY,
@@ -11424,7 +11462,9 @@ inference:
         }
     }
 
+    /// Pulls WASM tool `name` at `1.0.0` under a `capabilities.install.tool` grant naming it.
     fn pull(state: &mut CapsuleStoreState, name: &str) -> Result<manage::ArtifactSummary, String> {
+        grant_install(state, &[], &[name]);
         manage::Host::pull(state, name.to_string(), "1.0.0".to_string())
     }
 
@@ -11441,14 +11481,14 @@ inference:
         export_names(&state.engine, &state.tool_components[PULLED_WASM_TOOL])
     }
 
-    fn scratch_compiled_dir() -> PathBuf {
+    pub(crate) fn scratch_compiled_dir() -> PathBuf {
         PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
             .join(".murmur")
             .join("compiled")
     }
 
     /// Every `.cwasm` entry directly in `dir`; none when `dir` cannot be read.
-    fn cwasm_entries(dir: &Path) -> Vec<PathBuf> {
+    pub(crate) fn cwasm_entries(dir: &Path) -> Vec<PathBuf> {
         fs::read_dir(dir)
             .map(|entries| {
                 entries
@@ -12805,6 +12845,7 @@ inference:
             task_io: None,
             conversation: None,
             plan: None,
+            install: None,
             containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling(), "test-capsule")
@@ -13273,6 +13314,7 @@ inference:
                 task_io: None,
                 conversation: None,
                 plan: None,
+                install: None,
                 containment: None,
             }),
         };
@@ -13440,6 +13482,7 @@ inference:
                 task_io: None,
                 conversation: None,
                 plan: None,
+                install: None,
                 containment: None,
             }),
         };
@@ -13484,6 +13527,7 @@ inference:
             task_io: None,
             conversation: None,
             plan: None,
+            install: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 

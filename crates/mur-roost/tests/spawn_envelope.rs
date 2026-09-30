@@ -43,6 +43,28 @@ fn a_child_within_its_parents_envelope_launches() {
     assert!(credential.starts_with("msc1."), "{credential}");
 }
 
+/// A child's install entries each fit under a parent entry that covers them: a name under a
+/// prefix, and an exact name under itself.
+#[test]
+fn a_child_install_grant_within_its_parents_is_approved() {
+    let daemon = Daemon::new();
+    daemon.seed(
+        PARENT_SESSION,
+        "capabilities:\n  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n  \
+         spawn:\n    allow: [worker]\n",
+    );
+    daemon.publish_body(
+        "worker",
+        "0.1.0",
+        "artifacts: []\ncapabilities:\n  install:\n    skill: [style-rust]\n    tool: [jq]\n",
+        "",
+    );
+
+    let response = daemon.spawn("worker", Some(PARENT_SESSION));
+
+    assert_eq!(response.status, 200, "{:?}", response.body);
+}
+
 /// The refusal names the manifest key and the entry, not a bare "denied" — and not the name-list
 /// message, which is a different refusal about a different question.
 #[test]
@@ -148,6 +170,27 @@ fn every_axis_refuses_naming_its_own_manifest_key_and_entry() {
             "true",
         ),
         (
+            "child-install-skill",
+            "  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n",
+            "  install:\n    skill: [\"*\"]\n",
+            "capabilities.install.skill",
+            "'*'",
+        ),
+        (
+            "child-install-skill-wider",
+            "  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n",
+            "  install:\n    skill: [\"style*\"]\n",
+            "capabilities.install.skill",
+            "style*",
+        ),
+        (
+            "child-install-tool",
+            "  install:\n    skill: [\"style-*\"]\n    tool: [jq]\n",
+            "  install:\n    tool: [yq]\n",
+            "capabilities.install.tool",
+            "yq",
+        ),
+        (
             "child-containment",
             "  containment: scoped\n",
             "  containment: advisory\n",
@@ -178,6 +221,8 @@ fn every_axis_refuses_naming_its_own_manifest_key_and_entry() {
         "capabilities.filesystem.scope",
         "capabilities.filesystem.workdir_exec",
         "capabilities.state.store",
+        "capabilities.install.skill",
+        "capabilities.install.tool",
         "capabilities.containment",
     ];
 

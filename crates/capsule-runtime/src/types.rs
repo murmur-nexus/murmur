@@ -256,6 +256,18 @@ pub struct CapabilityPolicy {
     /// session's tool dispatch, its shell allowlist and its spawn grant, so a plan reaches exactly
     /// what the model could already call one call at a time.
     pub plan_submit: bool,
+    /// From `capabilities.install.skill`: the entries naming which skill artifacts
+    /// `manage.pull` may install into this session, verbatim and in declaration order. Empty by
+    /// default, which is deny. With [`Self::install_tool`] also empty, every pull is refused.
+    ///
+    /// A pulled skill gains no grant of its own; see `install_grant`.
+    pub install_skill: Vec<String>,
+    /// From `capabilities.install.tool`: the entries naming which tool artifacts, WASM or native,
+    /// `manage.pull` may install, verbatim and in declaration order. Empty by default, which is
+    /// deny.
+    ///
+    /// A pulled tool dispatches on this policy's own ceiling and gains no grant of its own.
+    pub install_tool: Vec<String>,
     /// `capabilities.limits.deadline_seconds` exactly as the manifest declared it — `None`
     /// when it declared nothing. Retained undefaulted alongside the fully-resolved `limits`
     /// above purely so hook calls can apply their own, lower default without mistaking an
@@ -640,6 +652,11 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.plan.as_ref())
         .is_some_and(|plan| plan.submit);
 
+    // Absent `capabilities.install` block means both lists are empty, which is deny.
+    let install = caps.and_then(|c| c.install.as_ref());
+    let install_skill = install.map(|i| i.skill.clone()).unwrap_or_default();
+    let install_tool = install.map(|i| i.tool.clone()).unwrap_or_default();
+
     // Recorded, never applied: see `CapabilityPolicy::state_declared`.
     let state_declared = caps.is_some_and(|c| c.state.is_some());
     let conversation_declared = caps.is_some_and(|c| c.conversation.is_some());
@@ -716,6 +733,8 @@ pub fn capability_policy_from_runtime_manifest(
         state_declared,
         conversation_declared,
         plan_submit,
+        install_skill,
+        install_tool,
         declared_deadline_seconds,
     }
 }

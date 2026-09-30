@@ -16,6 +16,12 @@
 //! mismatch is a mistake in something they control. A refusal is auditable and fixable; a silent
 //! narrowing produces a child that runs and mysteriously cannot do its job.
 //!
+//! **One covering predicate per grammar.** The install axes compare `capabilities.install`
+//! entries with [`murmur_artifact::install_pattern::covers`], the predicate that shares its grammar
+//! with the [`murmur_artifact::install_pattern::matches`] the pull gate decides a name with. A
+//! child that declares no `install` block holds no install grant; nothing reaches it from its
+//! parent.
+//!
 //! **One subset predicate.** Both paths decide "is this network entry covered?" with
 //! [`crate::network_policy::NetworkAllowRule::covers`], which errs toward deny on ambiguity — a
 //! bare `example.com` is not covered by a ceiling of `https://example.com`, because the bare form
@@ -49,6 +55,8 @@ pub enum EnvelopeAxis {
     FilesystemScope,
     WorkdirExec,
     StateStore,
+    InstallSkill,
+    InstallTool,
     Containment,
 }
 
@@ -66,6 +74,8 @@ impl EnvelopeAxis {
             Self::FilesystemScope => "capabilities.filesystem.scope",
             Self::WorkdirExec => "capabilities.filesystem.workdir_exec",
             Self::StateStore => "capabilities.state.store",
+            Self::InstallSkill => "capabilities.install.skill",
+            Self::InstallTool => "capabilities.install.tool",
             Self::Containment => "capabilities.containment",
         }
     }
@@ -80,8 +90,8 @@ impl EnvelopeAxis {
 pub struct EnvelopeViolation {
     pub axis: EnvelopeAxis,
     /// The child declaration that exceeded, rendered as the operator wrote it: one allow-list
-    /// entry, one filesystem scope, one store name, one containment class, or the literal `true`
-    /// for a boolean widening.
+    /// entry, one install entry, one filesystem scope, one store name, one containment class, or
+    /// the literal `true` for a boolean widening.
     ///
     /// Empty on the one axis where the offending declaration is an *absence*: a child that
     /// declares no `capabilities.filesystem.scope` under a parent that declares one reaches the
@@ -161,6 +171,12 @@ pub struct SpawnEnvelope {
     /// A set rather than a list: the axis is "which stores are opened", and an artifact list that
     /// names one store twice is not a wider grant.
     pub state_stores: BTreeSet<String>,
+    /// `capabilities.install.skill`, verbatim. Compared entry by entry with
+    /// [`murmur_artifact::install_pattern::covers`], so a child's `style-rust` fits a parent's
+    /// `style-*` and a child's `*` fits only a parent's `*`.
+    pub install_skill: Vec<String>,
+    /// `capabilities.install.tool`, verbatim, compared on [`Self::install_skill`]'s terms.
+    pub install_tool: Vec<String>,
     /// `capabilities.containment`. The one axis where more is *safer*, so it is the one axis
     /// compared with `>=` rather than by containment of a set — see [`Self::contains`].
     pub containment_floor: ContainmentClass,
@@ -185,6 +201,8 @@ impl SpawnEnvelope {
             filesystem_scope: policy.filesystem_scope,
             workdir_exec_allowed: policy.workdir_exec_allowed,
             state_stores: declared_state_stores(manifest),
+            install_skill: policy.install_skill,
+            install_tool: policy.install_tool,
             containment_floor: policy.containment_floor,
         }
     }
@@ -241,6 +259,12 @@ impl SpawnEnvelope {
             .cloned()
         {
             return Err(violation(EnvelopeAxis::StateStore, store));
+        }
+        if let Some(entry) = first_uncovered_install(&self.install_skill, &child.install_skill) {
+            return Err(violation(EnvelopeAxis::InstallSkill, entry));
+        }
+        if let Some(entry) = first_uncovered_install(&self.install_tool, &child.install_tool) {
+            return Err(violation(EnvelopeAxis::InstallTool, entry));
         }
         if child.containment_floor < self.containment_floor {
             return Err(EnvelopeViolation {
@@ -308,6 +332,20 @@ fn first_absent(ceiling: &[String], candidate: &[String]) -> Option<String> {
     candidate
         .iter()
         .find(|entry| !ceiling.contains(entry))
+        .cloned()
+}
+
+/// The first `candidate` install entry no `ceiling` entry covers, judged by
+/// [`murmur_artifact::install_pattern::covers`]. An entry outside the grammar is covered by
+/// nothing and covers nothing.
+fn first_uncovered_install(ceiling: &[String], candidate: &[String]) -> Option<String> {
+    candidate
+        .iter()
+        .find(|entry| {
+            !ceiling
+                .iter()
+                .any(|parent| murmur_artifact::install_pattern::covers(parent, entry))
+        })
         .cloned()
 }
 
@@ -415,6 +453,7 @@ mod tests {
                 task_io: None,
                 conversation: None,
                 plan: None,
+                install: None,
                 containment: None,
             };
             let narrowed = ToolCapabilityGrant::derive(Some(&capabilities), &ceiling_rules, "cap")
@@ -461,7 +500,8 @@ mod tests {
              shell:\n    allow: [git]\n  \
              spawn:\n    allow: [worker-a]\n  \
              env:\n    allow: [HOME]\n  \
-             filesystem:\n    scope: data\n    workdir_exec: false\n";
+             filesystem:\n    scope: data\n    workdir_exec: false\n  \
+             install:\n    skill: [\"style-*\"]\n    tool: [jq]\n";
         let parent = envelope(parent_yaml);
 
         let cases: &[(&str, EnvelopeAxis, &str)] = &[
@@ -510,6 +550,16 @@ mod tests {
                 EnvelopeAxis::WorkdirExec,
                 "true",
             ),
+            (
+                "capabilities:\n  filesystem:\n    scope: data\n  install:\n    skill: [\"*\"]\n",
+                EnvelopeAxis::InstallSkill,
+                "*",
+            ),
+            (
+                "capabilities:\n  filesystem:\n    scope: data\n  install:\n    tool: [yq]\n",
+                EnvelopeAxis::InstallTool,
+                "yq",
+            ),
         ];
 
         for (child_yaml, axis, entry) in cases {
@@ -520,6 +570,46 @@ mod tests {
             assert!(message.contains(axis.manifest_key()), "{message}");
             assert!(message.contains(entry), "{message}");
         }
+    }
+
+    /// A child install entry fits when some parent entry covers it: a name or a narrower prefix
+    /// under a parent prefix, never a wider prefix or `*`.
+    #[test]
+    fn a_child_install_entry_fits_only_under_a_covering_parent_entry() {
+        let parent = envelope("capabilities:\n  install:\n    skill: [\"style-*\"]\n");
+
+        for (skill, covered) in [
+            ("style-rust", true),
+            ("\"style-rust-*\"", true),
+            ("\"style-*\"", true),
+            ("\"style*\"", false),
+            ("\"*\"", false),
+            ("stylist", false),
+        ] {
+            let child = envelope(&format!(
+                "capabilities:\n  install:\n    skill: [{skill}]\n"
+            ));
+            let verdict = parent.contains(&child);
+            assert_eq!(verdict.is_ok(), covered, "child skill {skill}: {verdict:?}");
+            if let Err(violation) = verdict {
+                assert_eq!(violation.axis, EnvelopeAxis::InstallSkill);
+                assert_eq!(violation.entry, skill.trim_matches('"'));
+            }
+        }
+
+        let child_tool = envelope("capabilities:\n  install:\n    tool: [style-rust]\n");
+        let violation = parent.contains(&child_tool).unwrap_err();
+        assert_eq!(violation.axis, EnvelopeAxis::InstallTool);
+        assert_eq!(violation.entry, "style-rust");
+    }
+
+    /// A child that declares no install block holds none, whatever its parent holds.
+    #[test]
+    fn a_child_declaring_no_install_is_within_any_parent() {
+        let parent = envelope("capabilities:\n  install:\n    skill: [\"*\"]\n    tool: [\"*\"]\n");
+        let child = envelope("capabilities:\n  env:\n    allow: []\n");
+        assert!(child.install_skill.is_empty() && child.install_tool.is_empty());
+        assert_eq!(parent.contains(&child), Ok(()));
     }
 
     /// A parent that scoped itself to a subtree is not widened by a child that declares nothing:
