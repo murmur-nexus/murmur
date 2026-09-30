@@ -14,7 +14,7 @@ version each one carries.
 | [`murmur:tool/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool.wit) | Exported by tool and driver components | The entrypoint the runtime calls to run a tool or an inference driver |
 | [`murmur:tool-registry/invoke`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool-registry.wit) | Imported by capsule components | Call an allowlisted tool by name |
 | [`murmur:capsule/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/capsule.wit) | Exported by capsule components | The capsule entrypoint |
-| [`murmur:artifact-manager/manage`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/artifact-manager.wit) | Provided by the runtime to capsule components | List, describe, and pull artifacts during a session |
+| [`murmur:artifact-manager/manage`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/artifact-manager.wit) | Provided by the runtime to capsule components | List, describe, pull and remove artifacts during a session |
 | [`murmur:shell/execute`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/shell-execute.wit) | Implemented natively by the runtime | Run an allowlisted shell binary |
 | [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
 | [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | Imported by tool components | Pause the agent loop and wait for external input |
@@ -194,8 +194,9 @@ An omitted number is absent from the trace event, never written as `0`.
 ## `murmur:artifact-manager/manage`
 
 Lets a capsule component inspect and install artifacts mid-session: `list` and `describe` report
-what is installed, `diagnostics` returns the session id alongside that list, and `pull` installs a
-new artifact. `search` and `remove` are unimplemented: calling either returns an error.
+what is installed, `diagnostics` returns the session id alongside that list, `pull` installs a
+new artifact, and `remove` uninstalls one the capsule pulled. `search` is unimplemented: calling it
+returns an error.
 
 `pull` resolves an artifact from the session's registry, verifies its bytes against the registry
 hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/` and
@@ -222,8 +223,8 @@ refusal is about a name. The checks run in this order:
 
 A refused pull writes nothing: no file under `tools/`, no `murmur.lock` change, and no compiled
 form. `diagnostics` states the grant in `runtime-state.capabilities`, as
-`install skill: <entries>; install tool: <entries>`, or as `pull: not granted` when the capsule
-declares none.
+`install skill: <entries>; install tool: <entries>`, or as `pull and remove: not granted` when the
+capsule declares none.
 
 A pulled artifact reaches the tool list an `http` agent's model is offered at the boundary
 [`inference.tool_refresh`](manifest.md#inference-tool-refresh) names: the next inference call
@@ -239,6 +240,60 @@ or failed pull writes none.
 A pulled WASM artifact is compiled once per version and kept in
 [`~/.murmur/compiled`](config.md#murmur-home-permissions), shared with `mur run`, so a later pull
 or launch of that version, in any session, skips compiling it.
+
+### `remove` { #manage-remove }
+
+`remove(name)` uninstalls an artifact the capsule pulled. It needs the same
+[`capabilities.install`](manifest.md#field-install) grant as `pull`, and it removes only an
+artifact that `murmur.lock` pins as [`origin: runtime`](workdir.md#lock-origin) and `murmur.yaml`
+does not declare. The pulling session does not have to be this one.
+
+| Result | Meaning |
+|---|---|
+| `ok(true)` | The artifact was removed |
+| `ok(false)` | The session has no installed artifact of that name, including a `shell.allow` binary that `list()` shows and a name already removed. Nothing changed |
+| `err(...)` | A refusal or a failure, in the table below |
+
+A removal deletes the artifact from every place `pull` put it:
+
+| Place | After `remove` |
+|---|---|
+| `<workdir>/tools/<name>/` | Deleted: the manifest, `skill.md` and the native binary |
+| `list()` and `describe()` | The name is gone. `describe()` returns `artifact '<name>' is not installed` |
+| `murmur.lock` | The entry is deleted. Every other entry is rewritten unchanged |
+| `invoke()` and the agent's tool calls | A call to the name returns `tool '<name>' was removed from this session by manage.remove; it can no longer be called` |
+| `~/.murmur/compiled` | Kept, so pulling the same version again skips compiling it. `mur install --prune` removes forms nothing uses |
+
+The checks run in this order, and a refused removal changes nothing:
+
+| Order | Returns | When |
+|---:|---|---|
+| 1 | `not-granted: this capsule declares no capabilities.install, so removing '<name>' is refused` | The capsule declares no `capabilities.install` |
+| 2 | `not-granted: '<name>' is not an artifact name (<reason>); capabilities.install matches bare artifact names only` | The name is not a bare artifact name |
+| 3 | `ok(false)` | The session has no installed artifact of that name |
+| 4 | `not-removable: '<name>' is a <hook\|driver>; hooks and drivers are fixed at launch and cannot be removed while the session runs` | The artifact is a hook or a driver, whatever its origin |
+| 5 | `not-removable: '<name>' is declared in murmur.yaml; an artifact the operator declared stays for the life of the session` | `murmur.yaml` declares the artifact, whatever its origin. The next `mur run` needs its `murmur.lock` entry |
+| 6 | `not-removable: murmur.lock pins '<name>' with origin: operator; only an artifact this capsule pulled (origin: runtime) can be removed` | The pull matched an existing operator pin |
+| 7 | `failed to read murmur.lock: <error>` | `murmur.lock` exists and cannot be read |
+| 8 | `not-removable: murmur.lock has no entry for '<name>', so nothing records that this capsule pulled it` | `murmur.lock`, read at the moment of removal, has no entry for the name, or does not exist |
+| 9 | The order 6 string | `murmur.lock`, read at the moment of removal, pins the name as `origin: operator`, for example after `mur install` adopted it |
+
+Two errors can follow the checks:
+
+| Returns | State after the error |
+|---|---|
+| `failed to write murmur.lock: <error>` | Nothing changed |
+| `'<name>' is removed from this session and from murmur.lock, but <path> could not be deleted: <error>` | The artifact is out of the session and `murmur.lock`, and a call to it returns the removal refusal. The directory is left behind |
+
+Removing an artifact and pulling it again at another version replaces a runtime pin. An operator
+pin cannot be replaced this way: `remove` refuses it, and `pull` refuses to override it.
+
+A native tool pulled under a name that `capabilities.shell.allow` also grants is called in place
+of the shell binary. Removing the tool makes that name call the shell binary again.
+
+The conversation history is never rewritten. Earlier calls to a removed artifact and their results
+stay in the history, the conversation record and `trace.jsonl`. The tool list an `http` agent's
+model is offered drops the name at the same `inference.tool_refresh` boundary a pull is added at.
 
 ---
 

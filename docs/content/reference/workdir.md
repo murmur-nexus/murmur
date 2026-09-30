@@ -466,6 +466,7 @@ to the lock. A platform the entry has no key for is not a disagreement.
 | `mur eval` | As `mur run`, once for the whole dataset run |
 | `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory), for local-file installs, and for `--all-platforms`, which installs into the global store |
 | `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI. Pins a new entry as `origin: runtime` — see [Pin origin](#lock-origin) |
+| `manage.remove()` | Deletes one `origin: runtime` entry the manifest does not declare, and rewrites every other entry unchanged — see [Pin origin](#lock-origin) |
 
 An upsert adds this platform's key beside the keys already there. It replaces the whole `sha256`
 block only when everything in it is stale: a different `resolved_version`, or a change between the
@@ -485,9 +486,14 @@ Each writer sets the origin like this:
 | `mur run` / `mur eval` creating the lock | `origin: operator` | — (they never rewrite an existing lock) |
 | `mur install` | `origin: operator` | Becomes `origin: operator` and `session` is dropped; `mur install` [prints one line](cli.md#mur-install) for each runtime pin it adopts |
 | `manage.pull()` | `origin: runtime` with the pulling session | Origin left exactly as it was |
+| `manage.remove()` | — | An `origin: runtime` entry is deleted, whichever session pulled it. An `origin: operator` entry is never deleted |
 
 A pull never turns an operator pin into a runtime one, and never relabels an earlier pull with its
 own session.
+
+[`manage.remove()`](wit-interfaces.md#manage-remove) reads the entry's origin when it runs, so an
+entry `mur install` adopted mid-session is no longer removable. It also refuses an entry for an
+artifact `murmur.yaml` declares, whatever its origin, because the next `mur run` needs that entry.
 
 `mur run` and `mur eval` stage only the artifacts `murmur.yaml` declares, so an entry a capsule
 pulled that the manifest does not declare is never staged. At the next launch, a declared artifact

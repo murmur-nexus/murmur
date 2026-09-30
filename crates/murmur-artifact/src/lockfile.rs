@@ -370,6 +370,15 @@ impl MurmurLock {
         }
     }
 
+    /// Delete `name`'s entry and return it, or `None` when there is none. Every other entry is
+    /// left untouched and in its order, so the rewritten file differs by that entry alone.
+    ///
+    /// A lock left with no entries is still a valid lock: it serialises as `artifacts: []`.
+    pub fn remove(&mut self, name: &str) -> Option<LockedArtifact> {
+        let index = self.artifacts.iter().position(|entry| entry.name == name)?;
+        Some(self.artifacts.remove(index))
+    }
+
     pub fn validate(&self) -> Result<(), LockfileError> {
         if self.lock_version != LOCK_VERSION {
             return Err(LockfileError::Invalid(format!(
@@ -672,6 +681,35 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("origin: operator"), "{raw}");
         assert!(!raw.contains("session"), "{raw}");
+    }
+
+    #[test]
+    fn removing_a_lock_entry_leaves_every_other_entry_untouched() {
+        let first = entry("operator-tool", "0.1.0", LockedSha256::any("aaa"));
+        let middle = LockedArtifact {
+            origin: runtime("ses_puller"),
+            ..entry("pulled-tool", "1.2.3", LockedSha256::any("bbb"))
+        };
+        let last = entry(
+            "native-tool",
+            "0.2.0",
+            LockedSha256::for_one_platform("linux-x86_64", "ccc"),
+        );
+        let mut lock = lock_with(vec![first.clone(), middle.clone(), last.clone()]);
+
+        assert_eq!(lock.remove("pulled-tool"), Some(middle));
+        assert_eq!(lock.artifacts, vec![first, last]);
+        assert_eq!(lock.remove("absent"), None);
+        assert_eq!(lock.artifacts.len(), 2);
+
+        lock.remove("operator-tool").unwrap();
+        lock.remove("native-tool").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("murmur.lock");
+        write_lockfile_atomic(&path, &lock).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("artifacts: []"), "{raw}");
+        assert_eq!(read_lockfile(&path).unwrap(), lock_with(Vec::new()));
     }
 
     #[test]

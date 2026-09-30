@@ -2230,6 +2230,7 @@ fn launch(
         let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
         let installed_artifacts = staged.installed_artifacts;
+        let declared_artifacts = declared_artifact_names(&installed_artifacts);
         let engine = staged.engine.clone();
         let capability_policy = staged.capability_policy.clone();
         let protected_paths = staged.protected_paths.clone();
@@ -2501,6 +2502,8 @@ fn launch(
                         allowlisted_tools,
                         installed_artifacts,
                         installed_generation: 0,
+                        declared_artifacts,
+                        removed_artifacts: HashSet::new(),
                         session_id: session_id.clone(),
                         pending_a2a_events: Vec::new(),
                         pending_artifact_pulls: Vec::new(),
@@ -3491,8 +3494,10 @@ fn launch(
         process_driver: None,
         artifact_grants: staged.artifact_grants,
         allowlisted_tools: staged.allowlisted_tools,
+        declared_artifacts: declared_artifact_names(&staged.installed_artifacts),
         installed_artifacts: staged.installed_artifacts,
         installed_generation: 0,
+        removed_artifacts: HashSet::new(),
         session_id: staged.session_id.clone(),
         pending_a2a_events: Vec::new(),
         pending_artifact_pulls: Vec::new(),
@@ -5223,12 +5228,20 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) allowlisted_tools: HashSet<String>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     /// How many times this session's installed set has changed since launch. `0` at
-    /// construction and moved by exactly one at the end of every successful `manage.pull()`;
-    /// a refused or failed install leaves it alone. The agent loop compares it with the
-    /// generation its held tool array was built at (`agent::inventory::HeldInventory`), so any
+    /// construction and moved by exactly one by every successful `manage.pull()` and
+    /// `manage.remove()`; a refused or failed call leaves it alone. The agent loop compares it
+    /// with the generation its held tool array was built at (`agent::inventory::HeldInventory`), so any
     /// path that adds or removes an artifact under `workdir/tools/` must move it too, or the
     /// model is never offered the change.
     pub(crate) installed_generation: u64,
+    /// The names `murmur.yaml` declares under `artifacts:`, taken from
+    /// [`StagedSession::installed_artifacts`] at construction and never changed. `manage.remove()`
+    /// refuses every one of them: the next launch fails without their `murmur.lock` entries.
+    pub(crate) declared_artifacts: HashSet<String>,
+    /// The names `manage.remove()` removed in this session and no later `manage.pull()`
+    /// reinstalled. `invoke()` and the agent-loop dispatch refuse a call to one with
+    /// [`crate::artifact_removal::called_after_removal`].
+    pub(crate) removed_artifacts: HashSet<String>,
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
     pub(crate) pending_a2a_events: Vec<PendingA2aSend>,
@@ -5415,6 +5428,9 @@ impl invoke::Host for CapsuleStoreState {
         name: String,
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
+        if self.removed_artifacts.contains(&name) {
+            return Err(crate::artifact_removal::called_after_removal(&name));
+        }
         if !self.allowlisted_tools.contains(&name) {
             return Err(format!(
                 "tool '{name}' is not declared in manifest allowlist"
@@ -5678,6 +5694,7 @@ impl manage::Host for CapsuleStoreState {
         } else {
             self.installed_artifacts.push(summary.clone());
         }
+        self.removed_artifacts.remove(&name);
         self.installed_generation += 1;
         self.pending_artifact_pulls.push(summary.clone());
 
@@ -5688,8 +5705,65 @@ impl manage::Host for CapsuleStoreState {
         })
     }
 
+    /// Removes an artifact this capsule pulled, under the bound [`crate::artifact_removal`]
+    /// states. `Ok(false)` when the session has not installed `name`; every refusal is an `Err`
+    /// decided before anything changes.
+    ///
+    /// Runs on `&mut self`, which every dispatch on this store borrows for its whole duration, so
+    /// no tool call is in flight when it runs; an instance already built keeps its own
+    /// `Component`, and removal applies to calls that start after it. Conversation history is
+    /// never rewritten: earlier calls of `name` stay in the history, the conversation record and
+    /// the trace, and a later call is answered with
+    /// [`crate::artifact_removal::called_after_removal`].
     fn remove(&mut self, name: String) -> Result<bool, String> {
-        Err(format!("not implemented (name: {name})"))
+        if crate::artifact_removal::refuse_before_lock(
+            &self.capability_policy,
+            &name,
+            &self.installed_artifacts,
+            &self.declared_artifacts,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+
+        // Read now rather than trusted from the pull: `mur install` may have adopted the entry as
+        // an operator pin while the session ran. A missing file is a lock with no entries, which
+        // the check refuses.
+        let mut lock = match read_lockfile(&self.lock_path) {
+            Ok(lock) => lock,
+            Err(LockfileError::NotFound(_)) => MurmurLock {
+                lock_version: LOCK_VERSION,
+                artifacts: Vec::new(),
+            },
+            Err(err) => return Err(format!("failed to read murmur.lock: {err}")),
+        };
+        if let Some(refusal) = crate::artifact_removal::refuse_against_lock(&name, &lock) {
+            return Err(refusal);
+        }
+
+        // 1. The lock first: a failed write leaves the session and the workdir untouched.
+        lock.remove(&name);
+        write_lockfile_atomic(&self.lock_path, &lock)
+            .map_err(|err| format!("failed to write murmur.lock: {err}"))?;
+
+        // 2. The session. The compiled form under `~/.murmur/compiled` is shared across sessions
+        // and stays, so a later pull of the same version is warm.
+        self.tool_components.remove(&name);
+        self.installed_artifacts
+            .retain(|artifact| artifact.name != name);
+        self.removed_artifacts.insert(name.clone());
+        self.installed_generation += 1;
+
+        // 3. The files: manifest, `skill.md`, native binary.
+        let dir = self.workdir.join("tools").join(&name);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(err) => Err(crate::artifact_removal::undeletable_directory(
+                &name, &dir, &err,
+            )),
+        }
     }
 
     fn diagnostics(&mut self) -> Result<manage::RuntimeState, String> {
@@ -5699,6 +5773,15 @@ impl manage::Host for CapsuleStoreState {
             capabilities: crate::install_grant::describe(&self.capability_policy),
         })
     }
+}
+
+/// The names `murmur.yaml` declares: staging installs exactly one summary per `artifacts:` entry,
+/// so this is read from the staged summaries before they move into the store state.
+fn declared_artifact_names(installed: &[InstalledArtifactSummary]) -> HashSet<String> {
+    installed
+        .iter()
+        .map(|artifact| artifact.name.clone())
+        .collect()
 }
 
 /// The gateway a store for artifact `name` is built with: `gateway`, and only when it is `name`'s
@@ -6315,7 +6398,10 @@ impl CapsuleStoreState {
             return as_tool();
         }
         let native_bin = self.workdir.join("tools").join(name).join(name);
-        if native_bin.exists() && !self.tool_components.contains_key(name) {
+        if native_bin.exists()
+            && !self.tool_components.contains_key(name)
+            && !self.removed_artifacts.contains(name)
+        {
             return as_tool();
         }
         match resolve_shell_call(
@@ -6429,7 +6515,10 @@ impl CapsuleStoreState {
 
         // Native artifact: packaged binary in workdir/tools/<name>/<name>
         let native_bin = self.workdir.join("tools").join(name).join(name);
-        if native_bin.exists() && !self.tool_components.contains_key(name) {
+        if native_bin.exists()
+            && !self.tool_components.contains_key(name)
+            && !self.removed_artifacts.contains(name)
+        {
             return enforce_allowlist(&self.allowlisted_tools, name, || {
                 dispatch_native_tool(
                     name,
@@ -6486,6 +6575,13 @@ impl CapsuleStoreState {
             })
             .await
             .map_err(|e| format!("shell tool panicked: {e}"));
+        }
+
+        // A name `manage.remove()` took out of the session. Without this, the skill branch
+        // would serve a `skill.md` a failed deletion left behind, and the WASM branch would
+        // answer with a not-found error.
+        if self.removed_artifacts.contains(name) {
+            return Err(crate::artifact_removal::called_after_removal(name));
         }
 
         // Skill artifact: return skill.md content as the tool result (no WASM dispatch).
@@ -11391,6 +11487,8 @@ inference:
             allowlisted_tools: HashSet::new(),
             installed_artifacts: Vec::new(),
             installed_generation: 0,
+            declared_artifacts: HashSet::new(),
+            removed_artifacts: HashSet::new(),
             session_id: "ses_test".to_string(),
             pending_a2a_events: Vec::new(),
             pending_artifact_pulls: Vec::new(),

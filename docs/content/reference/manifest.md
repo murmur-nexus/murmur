@@ -740,8 +740,8 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` directory is mounted — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory, and the runtime's guidance on when to plan in its system prompt; a capsule that declares nothing is offered neither. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
-| `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that `manage.pull` may install into a running session, as [install entries](#install-entries): an exact artifact name, a `<prefix>*`, or `*`. A skill is an artifact whose payload is a `skill.md` and nothing else. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. With both install lists empty or absent, every pull is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
-| `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools, WASM or native, that `manage.pull` may install, as [install entries](#install-entries). Drivers and hooks are never pullable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
+| `capabilities.install.skill` | list<string> | see notes | Default: absent, which is deny. Skills that `manage.pull` may install into a running session, as [install entries](#install-entries): an exact artifact name, a `<prefix>*`, or `*`. A skill is an artifact whose payload is a `skill.md` and nothing else. Capsule-wide only — declaring `install` on an `artifacts[]` entry is refused at parse. The same entries let `manage.remove` uninstall a skill the capsule pulled. With both install lists empty or absent, every pull and every removal is refused. See [`capabilities.install`](#field-install). `mur run --explain-scope` reports it as `install skill`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_skill`. |
+| `capabilities.install.tool` | list<string> | see notes | Default: absent, which is deny. Tools, WASM or native, that `manage.pull` may install, as [install entries](#install-entries). The same entries let `manage.remove` uninstall a tool the capsule pulled. Drivers and hooks are never pullable or removable, under any entry. At least one of `skill` and `tool` must be non-empty when the `install:` block is present — an empty block is refused at parse. Capsule-wide only. `mur run --explain-scope` reports it as `install tool`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.install_tool`. |
 | `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
@@ -811,7 +811,8 @@ without another turn in between.
 #### `capabilities.install` { #field-install }
 
 Grants a capsule component permission to install skills and tools while the session runs, through
-[`murmur:artifact-manager/manage.pull`](wit-interfaces.md#murmurartifact-managermanage).
+[`murmur:artifact-manager/manage.pull`](wit-interfaces.md#murmurartifact-managermanage), and to
+uninstall them again through [`manage.remove`](wit-interfaces.md#manage-remove).
 
 ```yaml
 capabilities:
@@ -838,6 +839,15 @@ path segment; a `github:` reference, a path, or a version containing `/` or `..`
 A pulled artifact runs on this capsule's own grants. It gains no per-artifact capabilities, no
 gateway and no place in the `invoke()` allowlist, and the `capabilities:` block in its own bundled
 `murmur.yaml` is ignored.
+
+`manage.remove` uninstalls only an artifact the capsule pulled:
+
+| Artifact | `manage.remove` |
+|---|---|
+| Pulled, and pinned in `murmur.lock` as `origin: runtime` | Removed |
+| Declared in this `murmur.yaml`'s `artifacts:` | Refused, whatever its pin origin |
+| Pinned in `murmur.lock` as `origin: operator` | Refused |
+| A `hook` or a `driver` | Refused |
 
 A capsule spawned through [`capabilities.spawn.allow`](#field-capabilities) holds only the
 `install` block its own manifest declares. `mur-roost` refuses a child whose entries its parent's
