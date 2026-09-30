@@ -58,6 +58,9 @@ pub(crate) struct TraceWriter {
     /// What a controller may change on this session. Set by [`Self::set_control`] before
     /// `session_start` is written; `None` for a capsule with no `control:` block.
     control: Option<SessionControl>,
+    /// `inference.tool_refresh` as `ToolRefresh::wire_name` spells it, or `None` under
+    /// `transport: process`. Set by [`Self::set_tool_refresh`] before `session_start` is written.
+    tool_refresh: Option<&'static str>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -281,6 +284,9 @@ struct SessionStartEvent {
     /// secret names `control:` declares. Omitted entirely for a capsule with no `control:` block.
     #[serde(skip_serializing_if = "Option::is_none")]
     control: Option<SessionControl>,
+    /// `inference.tool_refresh`: `"compaction"` or `"immediate"` under `transport: http`, `null`
+    /// under `transport: process`, where the harness owns its tool list. Always written.
+    tool_refresh: Option<&'static str>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -1570,6 +1576,7 @@ impl TraceWriter {
             credential_source: "none",
             gateways: Vec::new(),
             control: None,
+            tool_refresh: None,
             resumed_from,
             context_id,
             spawned_by,
@@ -1688,6 +1695,42 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Records `inference.tool_refresh` for `session_start.tool_refresh`: the wire name under
+    /// `transport: http`, `None` under `transport: process`.
+    pub(crate) fn set_tool_refresh(&mut self, tool_refresh: Option<&'static str>) {
+        self.tool_refresh = tool_refresh;
+    }
+
+    /// Records that the tool array the http agent loop sends changed before this call:
+    /// `trigger` is why (`"immediate"` or `"compaction"`), `added` and `removed` the sorted
+    /// names that entered and left it, and `tools` every name it now offers, in array order.
+    ///
+    /// Written before the call is sent, so it precedes the turn's `inference` line and hangs off
+    /// the task, as `control_applied` does.
+    pub(crate) async fn write_tools_refreshed(
+        &mut self,
+        turn: u32,
+        trigger: &str,
+        added: &[String],
+        removed: &[String],
+        tools: &[String],
+    ) -> std::io::Result<()> {
+        let event = ToolsRefreshedEvent {
+            event_type: "tools_refreshed",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            trigger,
+            added,
+            removed,
+            tools,
+        };
+        self.write_event(&event).await
+    }
+
     pub(crate) async fn write_session_start(
         &mut self,
         max_turns: u32,
@@ -1717,6 +1760,7 @@ impl TraceWriter {
             credential_source: self.credential_source,
             gateways: self.gateways.clone(),
             control: self.control.clone(),
+            tool_refresh: self.tool_refresh,
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -2877,6 +2921,22 @@ struct ControlAppliedEvent<'a> {
     name: &'a str,
     value: Value,
     change_id: &'a str,
+}
+
+/// `tools_refreshed`: the first inference call to send a tool array rebuilt after an install.
+#[derive(Serialize)]
+struct ToolsRefreshedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    trigger: &'a str,
+    added: &'a [String],
+    removed: &'a [String],
+    tools: &'a [String],
 }
 
 /// `gateway_credential`: the `inference_credential` event for the credential of any artifact other
@@ -5514,6 +5574,82 @@ mod tests {
                 None => assert!(e["tool_call_id"].is_null(), "given={given:?}"),
             }
         }
+    }
+
+    /// `tools_refreshed` carries the turn, the task, the trigger and three sorted name lists,
+    /// hangs off the task node rather than the previous turn, and `session_start` records the
+    /// declared trigger — `null` under `transport: process`.
+    #[tokio::test]
+    async fn tools_refreshed_event_records_trigger_names_and_task_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.set_tool_refresh(Some("immediate"));
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
+            .await
+            .unwrap();
+        w.write_inference(
+            0,
+            Some(10),
+            Some(5),
+            "tool_call".to_string(),
+            Some("tool_call"),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        w.write_tools_refreshed(
+            1,
+            "immediate",
+            &["aaa-late-skill".to_string()],
+            &[],
+            &[
+                "aaa-late-skill".to_string(),
+                "zzz-existing-tool".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events[0]["tool_refresh"], "immediate");
+        let task = events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .unwrap();
+        let refreshed: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["event_type"] == "tools_refreshed")
+            .collect();
+        assert_eq!(refreshed.len(), 1);
+        let r = refreshed[0];
+        assert!(r["event_id"].as_str().unwrap().starts_with("evt_"));
+        assert_eq!(r["parent_id"], task["event_id"]);
+        assert_eq!(r["session_id"], "test-session-id");
+        assert!(r["timestamp"].as_u64().is_some());
+        assert_eq!(r["turn"], 1);
+        assert_eq!(r["task_id"], "tsk_1");
+        assert_eq!(r["trigger"], "immediate");
+        assert_eq!(r["added"], serde_json::json!(["aaa-late-skill"]));
+        assert_eq!(r["removed"], serde_json::json!([]));
+        assert_eq!(
+            r["tools"],
+            serde_json::json!(["aaa-late-skill", "zzz-existing-tool"])
+        );
+
+        let process_dir = tempfile::tempdir().unwrap();
+        let mut process = make_writer(process_dir.path()).await;
+        process.set_tool_refresh(None);
+        process.write_session_start(10, Vec::new()).await.unwrap();
+        process.flush().await.unwrap();
+        let start = &read_events(process_dir.path())[0];
+        assert!(start.as_object().unwrap().contains_key("tool_refresh"));
+        assert!(start["tool_refresh"].is_null());
     }
 
     /// A declined compaction is a full record of the decline, not a bare marker: it names the

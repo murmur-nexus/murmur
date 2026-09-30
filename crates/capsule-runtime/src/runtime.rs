@@ -2303,6 +2303,9 @@ fn launch(
             });
             trace.set_gateways(session_gateways(&gateways));
             trace.set_control(session_control);
+            trace.set_tool_refresh(
+                (inference.transport != "process").then(|| inference.tool_refresh.wire_name()),
+            );
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -2472,6 +2475,7 @@ fn launch(
                         artifact_grants,
                         allowlisted_tools,
                         installed_artifacts,
+                        installed_generation: 0,
                         session_id: session_id.clone(),
                         pending_a2a_events: Vec::new(),
                         capability_policy,
@@ -3462,6 +3466,7 @@ fn launch(
         artifact_grants: staged.artifact_grants,
         allowlisted_tools: staged.allowlisted_tools,
         installed_artifacts: staged.installed_artifacts,
+        installed_generation: 0,
         session_id: staged.session_id.clone(),
         pending_a2a_events: Vec::new(),
         capability_policy: staged.capability_policy,
@@ -5157,6 +5162,13 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) artifact_grants: HashMap<String, ToolCapabilityGrant>,
     pub(crate) allowlisted_tools: HashSet<String>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
+    /// How many times this session's installed set has changed since launch. `0` at
+    /// construction and moved by exactly one at the end of every successful `manage.pull()`;
+    /// a refused or failed install leaves it alone. The agent loop compares it with the
+    /// generation its held tool array was built at (`agent::inventory::HeldInventory`), so any
+    /// path that adds or removes an artifact under `workdir/tools/` must move it too, or the
+    /// model is never offered the change.
+    pub(crate) installed_generation: u64,
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
     /// (peer_url, message_id, task_id, context_id, traceparent, trust)
@@ -5601,6 +5613,7 @@ impl manage::Host for CapsuleStoreState {
         } else {
             self.installed_artifacts.push(summary.clone());
         }
+        self.installed_generation += 1;
 
         Ok(manage::ArtifactSummary {
             name,
@@ -9522,6 +9535,7 @@ inference:
             max_turns: 10,
             max_tokens: None,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         }
     }
 
@@ -10453,6 +10467,7 @@ inference:
             max_turns: 10,
             max_tokens: None,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         };
 
         StageRequest {
@@ -10929,6 +10944,7 @@ inference:
             artifact_grants: HashMap::new(),
             allowlisted_tools: HashSet::new(),
             installed_artifacts: Vec::new(),
+            installed_generation: 0,
             session_id: "ses_test".to_string(),
             pending_a2a_events: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
@@ -11148,11 +11164,10 @@ inference:
         assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
     }
 
-    /// A mid-session `manage.pull()` lands on disk but does not reach the wire: the agent loop
-    /// holds one tool inventory for the whole session precisely so a pull cannot reorder or grow
-    /// the tool array that is part of the provider's cached prompt prefix.
-    #[test]
-    fn pull_does_not_refresh_the_held_tool_inventory() {
+    /// A workdir with `zzz-existing-tool` installed at launch, and a store whose registry
+    /// serves `aaa-late-skill`, which sorts before it: a pull that reaches the tool array shifts
+    /// the whole array rather than appending to it.
+    fn late_skill_fixture() -> (tempfile::TempDir, PathBuf, CapsuleStoreState) {
         let artifact_bytes = zip_with_files(&[
             (
                 PACKED_MANIFEST_ENTRY,
@@ -11164,8 +11179,6 @@ inference:
 
         let project = tempfile::tempdir().unwrap();
         let workdir = project.path().join("workdir");
-        // One tool already installed at launch. The pulled artifact sorts before it, so a
-        // refreshed inventory would not merely append — it would shift the whole array.
         let existing = workdir.join("tools").join("zzz-existing-tool");
         fs::create_dir_all(&existing).unwrap();
         fs::write(
@@ -11174,42 +11187,545 @@ inference:
         )
         .unwrap();
         let lock_path = project.path().join("murmur.lock");
-
         let mut state = build_test_state(registry, workdir.clone(), lock_path);
         grant_install(&mut state, &["aaa-late-skill"], &[]);
+        (project, workdir, state)
+    }
 
-        // What run_agent_loop does once, before the turn loop.
-        let snapshot = crate::agent::inventory::build_tool_inventory(&workdir, None);
-        assert_eq!(snapshot.len(), 1);
+    fn pull_late_skill(state: &mut CapsuleStoreState) {
+        manage::Host::pull(state, "aaa-late-skill".to_string(), "1.0.0".to_string())
+            .expect("pull should succeed");
+    }
 
-        manage::Host::pull(
-            &mut state,
-            "aaa-late-skill".to_string(),
-            "1.0.0".to_string(),
-        )
-        .expect("pull should succeed");
-
-        // (a) The held snapshot is untouched by the pull.
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0]["name"], "zzz-existing-tool");
-
-        // (b) Every payload built from it still carries exactly that array.
-        let payload = crate::agent::build_driver_payload(
+    /// The payload a call carrying `tools` sends, as `run_agent_loop` builds it.
+    fn tool_refresh_payload(tools: &[serde_json::Value]) -> serde_json::Value {
+        crate::agent::build_driver_payload(
             "m",
             8192,
             &[serde_json::json!({"role": "user", "content": []})],
-            &snapshot,
+            tools,
             "sys",
             None,
             Some("cap:1.0.0"),
-        );
-        assert_eq!(payload["tools"], serde_json::json!(snapshot));
+        )
+    }
 
-        // (c) The pull really did land: a fresh build sees it, and sorts it first.
-        let fresh = crate::agent::inventory::build_tool_inventory(&workdir, None);
-        assert_eq!(fresh.len(), 2);
-        assert_eq!(fresh[0]["name"], "aaa-late-skill");
-        assert_eq!(fresh[1]["name"], "zzz-existing-tool");
+    fn tool_names(tools: &[serde_json::Value]) -> Vec<&str> {
+        tools.iter().map(|t| t["name"].as_str().unwrap()).collect()
+    }
+
+    /// Under `inference.tool_refresh: immediate` a skill pulled mid-session is on the very next
+    /// call's tool array, and calling it is served as a skill result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn immediate_trigger_offers_a_pulled_skill_on_the_next_call() {
+        use crate::agent::inventory::{HeldInventory, RefreshReason};
+        let (_project, workdir, mut state) = late_skill_fixture();
+
+        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        assert_eq!(
+            tool_refresh_payload(held.tools())["tools"],
+            serde_json::json!([{
+                "name": "zzz-existing-tool",
+                "parameters": {"type": "object", "properties": {}},
+            }])
+        );
+
+        pull_late_skill(&mut state);
+        assert_eq!(state.installed_generation, 1);
+
+        let refresh = held
+            .refresh_before_call(
+                &workdir,
+                None,
+                murmur_artifact::ToolRefresh::Immediate,
+                state.installed_generation,
+                false,
+            )
+            .expect("an immediate trigger rebuilds on the next call");
+        assert_eq!(refresh.reason, RefreshReason::Immediate);
+        assert_eq!(refresh.added, vec!["aaa-late-skill"]);
+        assert!(refresh.removed.is_empty());
+        assert_eq!(refresh.offered, vec!["aaa-late-skill", "zzz-existing-tool"]);
+
+        let payload = tool_refresh_payload(held.tools());
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(
+            tool_names(tools),
+            vec!["aaa-late-skill", "zzz-existing-tool"]
+        );
+        assert_eq!(
+            tools[0]["parameters"],
+            serde_json::json!({"type": "object", "properties": {}})
+        );
+
+        let outcome = state
+            .dispatch_agent_tool_async(
+                "aaa-late-skill",
+                murmur::tool::run::ToolInput {
+                    data: Some("{}".to_string()),
+                    log_path: None,
+                },
+                None,
+            )
+            .await
+            .expect("the pulled skill dispatches");
+        assert!(outcome.is_skill);
+        assert!(matches!(
+            outcome.result.status,
+            murmur::tool::run::Status::Passed
+        ));
+        assert!(outcome
+            .result
+            .data
+            .as_deref()
+            .unwrap_or_default()
+            .contains("# guidance"));
+    }
+
+    /// Under the default trigger a pulled artifact waits: every call sends the pre-pull bytes
+    /// until the first call after a committed compaction, which carries the rebuilt array.
+    #[test]
+    fn compaction_trigger_holds_a_pulled_artifact_until_compaction() {
+        use crate::agent::inventory::{HeldInventory, RefreshReason};
+        use murmur_artifact::ToolRefresh;
+        let (_project, workdir, mut state) = late_skill_fixture();
+
+        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        let before = serde_json::to_string(&tool_refresh_payload(held.tools())).unwrap();
+
+        pull_late_skill(&mut state);
+
+        for _ in 0..3 {
+            let refresh = held.refresh_before_call(
+                &workdir,
+                None,
+                ToolRefresh::Compaction,
+                state.installed_generation,
+                false,
+            );
+            assert_eq!(refresh, None);
+            assert_eq!(
+                serde_json::to_string(&tool_refresh_payload(held.tools())).unwrap(),
+                before
+            );
+        }
+
+        let refresh = held
+            .refresh_before_call(
+                &workdir,
+                None,
+                ToolRefresh::Compaction,
+                state.installed_generation,
+                true,
+            )
+            .expect("the call after a committed compaction carries the rebuilt array");
+        assert_eq!(refresh.reason, RefreshReason::Compaction);
+        assert_eq!(refresh.added, vec!["aaa-late-skill"]);
+        assert!(refresh.removed.is_empty());
+
+        assert_eq!(
+            held.refresh_before_call(
+                &workdir,
+                None,
+                ToolRefresh::Compaction,
+                state.installed_generation,
+                false,
+            ),
+            None
+        );
+    }
+
+    /// The rebuilt array is exactly what a fresh launch build of the same workdir produces,
+    /// sort included, so a pull that sorts first shifts the array rather than appending to it.
+    #[test]
+    fn tool_refresh_rebuild_equals_a_fresh_build() {
+        use crate::agent::inventory::{build_tool_inventory, HeldInventory};
+        let (_project, workdir, mut state) = late_skill_fixture();
+
+        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        pull_late_skill(&mut state);
+        held.refresh_before_call(
+            &workdir,
+            None,
+            murmur_artifact::ToolRefresh::Immediate,
+            state.installed_generation,
+            false,
+        )
+        .expect("rebuilt");
+
+        let fresh = build_tool_inventory(&workdir, None);
+        assert_eq!(
+            serde_json::to_string(held.tools()).unwrap(),
+            serde_json::to_string(&fresh).unwrap()
+        );
+        assert_eq!(
+            tool_names(&fresh),
+            vec!["aaa-late-skill", "zzz-existing-tool"]
+        );
+    }
+
+    /// A pulled skill that is the `system_prompt_artifact` rebuilds to the held bytes: nothing is
+    /// refreshed, and the held generation catches up so the next call does not rebuild again.
+    #[test]
+    fn tool_refresh_byte_identical_rebuild_is_not_a_refresh() {
+        use crate::agent::inventory::HeldInventory;
+        use murmur_artifact::ToolRefresh;
+        let (_project, workdir, mut state) = late_skill_fixture();
+
+        let prompt_skill = Some("aaa-late-skill");
+        let mut held = HeldInventory::build(&workdir, prompt_skill, state.installed_generation);
+        let before = serde_json::to_string(held.tools()).unwrap();
+        pull_late_skill(&mut state);
+        assert_eq!(state.installed_generation, 1);
+
+        assert_eq!(
+            held.refresh_before_call(
+                &workdir,
+                prompt_skill,
+                ToolRefresh::Immediate,
+                state.installed_generation,
+                false,
+            ),
+            None
+        );
+        assert_eq!(held.generation(), 1);
+        assert_eq!(serde_json::to_string(held.tools()).unwrap(), before);
+
+        // Hidden from disk: a second rebuild would read the skill back in, so an unchanged
+        // result proves the decision never reached the disk.
+        fs::remove_dir_all(workdir.join("tools").join("zzz-existing-tool")).unwrap();
+        assert_eq!(
+            held.refresh_before_call(
+                &workdir,
+                prompt_skill,
+                ToolRefresh::Immediate,
+                state.installed_generation,
+                true,
+            ),
+            None
+        );
+        assert_eq!(serde_json::to_string(held.tools()).unwrap(), before);
+    }
+
+    /// With no successful pull, no combination of trigger and compaction flag rebuilds, and the
+    /// disk is never read: a tool removed behind the loop's back stays offered.
+    #[test]
+    fn tool_refresh_without_a_pull_never_rebuilds() {
+        use crate::agent::inventory::HeldInventory;
+        use murmur_artifact::ToolRefresh;
+        let (_project, workdir, state) = late_skill_fixture();
+
+        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        let before = serde_json::to_string(held.tools()).unwrap();
+        fs::remove_dir_all(workdir.join("tools").join("zzz-existing-tool")).unwrap();
+
+        for trigger in ToolRefresh::ALL {
+            for compaction_committed in [false, true] {
+                assert_eq!(
+                    held.refresh_before_call(
+                        &workdir,
+                        None,
+                        trigger,
+                        state.installed_generation,
+                        compaction_committed,
+                    ),
+                    None
+                );
+                assert_eq!(serde_json::to_string(held.tools()).unwrap(), before);
+            }
+        }
+    }
+
+    /// A refused pull leaves the installed generation where it was.
+    #[test]
+    fn tool_refresh_generation_ignores_a_refused_pull() {
+        let (_project, _workdir, mut state) = late_skill_fixture();
+        pull_late_skill(&mut state);
+        assert_eq!(state.installed_generation, 1);
+
+        // `aaa-late-skill` is now pinned in murmur.lock at the registry's hash; a pull under a
+        // different version conflicts with that pin and is refused.
+        manage::Host::pull(
+            &mut state,
+            "aaa-late-skill".to_string(),
+            "2.0.0".to_string(),
+        )
+        .expect_err("a conflicting pull is refused");
+        assert_eq!(state.installed_generation, 1);
+    }
+
+    /// A `trace.capture: meta` writer over `workdir`: it hashes each request, so every
+    /// `inference` line carries the `tools_sha` of the array that call sent.
+    async fn tool_refresh_trace(workdir: &Path) -> TraceWriter {
+        TraceWriter::open(
+            workdir,
+            "ses_test".to_string(),
+            "cap".to_string(),
+            "0.1.0".to_string(),
+            "test-model".to_string(),
+            Vec::new(),
+            crate::containment::scope_report_for_tier(
+                &CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                sandbox::EnforcementTier::EnvironmentOnly,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                crate::cgroup::IoMaxReport::default(),
+            ),
+            murmur_artifact::TraceCapture::Meta,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn read_trace_events(workdir: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(workdir.join("trace.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The compaction step says whether it replaced the context, which is what releases a
+    /// pending install under the default trigger: a hook's replacement is a commit, while "no
+    /// hook replacement" and an "unresolved tool_call" are declines that still write
+    /// `compaction_declined`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_reports_whether_it_replaced_the_context() {
+        use crate::agent::{try_compact_via_hooks, CompactionOutcome, ContextOccupancy};
+        use crate::hooks::test_support::{echo_compaction_hooks, no_hooks};
+
+        let unresolved = r#"[{"type":"tool_call","id":"c9","name":"x","input":{}}]"#;
+        let cases: [(&str, Option<&str>, CompactionOutcome, Option<&str>); 3] = [
+            ("user", Some("summary"), CompactionOutcome::Committed, None),
+            (
+                "",
+                None,
+                CompactionOutcome::Declined,
+                Some(crate::trace::COMPACTION_DECLINED_NO_HOOK_REPLACEMENT),
+            ),
+            (
+                "assistant",
+                Some(unresolved),
+                CompactionOutcome::Declined,
+                Some(crate::trace::COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL),
+            ),
+        ];
+
+        for (role, replacement, expected, declined_reason) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let workdir = dir.path().to_path_buf();
+            let mut state = build_test_state(
+                Arc::new(FakeSkillRegistry::new(Vec::new())),
+                workdir.clone(),
+                workdir.join("murmur.lock"),
+            );
+            let mut hooks = match replacement {
+                Some(_) => echo_compaction_hooks(&state.engine, &workdir, role).await,
+                None => no_hooks(&state.engine, &workdir).await,
+            };
+            let mut trace = tool_refresh_trace(&workdir).await;
+            let otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+            let occupancy = ContextOccupancy {
+                model: "test-model",
+                max_output_tokens: 1024,
+                tools: &[],
+                system: "sys",
+                prompt_cache_key: None,
+            };
+            let mut messages = vec![serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "a long conversation"}],
+            })];
+            let mut session_tokens = occupancy.count(&messages);
+
+            let outcome = try_compact_via_hooks(
+                &mut messages,
+                &mut session_tokens,
+                &occupancy,
+                &mut state,
+                3,
+                100,
+                &workdir,
+                &mut hooks,
+                &mut trace,
+                &otel,
+                replacement.map(str::to_string),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("no case fails the session");
+            assert_eq!(outcome, expected, "role {role:?}");
+            trace.flush().await.unwrap();
+
+            let events = read_trace_events(&workdir);
+            let declined: Vec<&serde_json::Value> = events
+                .iter()
+                .filter(|e| e["event_type"] == "compaction_declined")
+                .collect();
+            match declined_reason {
+                Some(reason) => {
+                    assert_eq!(declined.len(), 1, "role {role:?}");
+                    assert_eq!(declined[0]["reason"], reason);
+                    assert_eq!(messages[0]["content"][0]["text"], "a long conversation");
+                }
+                None => {
+                    assert!(declined.is_empty());
+                    assert!(events.iter().any(|e| e["event_type"] == "compaction"));
+                    assert_eq!(messages[0]["content"][0]["text"], "summary");
+                }
+            }
+        }
+    }
+
+    /// Runs one `tsk_1` over `task.md` through the real http agent loop, with `launch-skill`
+    /// installed at launch and a driver double that calls it on every turn, and returns the
+    /// parsed `trace.jsonl`.
+    async fn run_tool_refresh_loop(
+        trigger: murmur_artifact::ToolRefresh,
+    ) -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        fs::write(workdir.join("task.md"), "use the skill").unwrap();
+        let skill = workdir.join("tools").join("launch-skill");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join(PACKED_MANIFEST_ENTRY),
+            "name: launch-skill\nversion: 1.0.0\nruntime: skill\n",
+        )
+        .unwrap();
+        fs::write(skill.join("skill.md"), "# launch guidance").unwrap();
+
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+        fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
+        state.tool_components.insert(
+            "mock-driver".to_string(),
+            crate::inference_import::test_support::driver_double(
+                &state.engine,
+                0,
+                r#"{"stop_reason":"tool_call","content":[{"type":"tool_call","id":"c1","name":"launch-skill","input":{}}]}"#,
+            ),
+        );
+        let inference = InferenceConfig {
+            transport: "http".into(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "mock-driver".to_string(),
+                config: None,
+            }),
+            max_turns: 3,
+            tool_refresh: trigger,
+            ..task_io_inference_config()
+        };
+
+        let mut trace = tool_refresh_trace(&workdir).await;
+        trace.set_tool_refresh(Some(trigger.wire_name()));
+        trace.write_session_start(3, Vec::new()).await.unwrap();
+        let mut otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+        let mut hooks = crate::hooks::test_support::no_hooks(&state.engine, &workdir).await;
+        let run_config = agent::AgentRunConfig {
+            context_window: 0,
+            compaction_threshold: 0.98,
+            compaction_model: None,
+            compaction_system_prompt: None,
+            compaction_dump_summaries: false,
+            max_output_tokens: 1024,
+            control: None,
+            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
+            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            conversation_root: None,
+            record_owner: None,
+            harness_sessions: None,
+            resume: None,
+        };
+        trace
+            .write_task_start(
+                "tsk_1",
+                "ctx_1",
+                "task_md",
+                TaskProvenance::derive(TaskOrigin::User, None),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+
+        // The attempt runs out of turns, which is not what this asserts on.
+        let _ = run_task_with_reopens(
+            &mut state,
+            &workdir,
+            &inference,
+            0,
+            None,
+            run_config,
+            &mut hooks,
+            &mut trace,
+            &mut otel,
+            None,
+            None,
+            &workdir,
+            "cap",
+            "0.1.0",
+            ConversationMode::Stateless,
+            Some("ctx_1".to_string()),
+            "tsk_1",
+            None,
+            None,
+        )
+        .await;
+
+        trace.flush().await.unwrap();
+        read_trace_events(&workdir)
+    }
+
+    /// With no install during the session, every call sends one tool array under either
+    /// trigger and no `tools_refreshed` line is written: the prompt-cache invariant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unchanged_session_sends_one_tool_array_under_either_trigger() {
+        for trigger in murmur_artifact::ToolRefresh::ALL {
+            let events = run_tool_refresh_loop(trigger).await;
+            assert_eq!(events[0]["tool_refresh"], trigger.wire_name());
+
+            let tools_shas: Vec<&str> = events
+                .iter()
+                .filter(|e| e["event_type"] == "inference")
+                .map(|e| {
+                    e["tools_sha"]
+                        .as_str()
+                        .expect("meta capture hashes the tools")
+                })
+                .collect();
+            assert_eq!(tools_shas.len(), 3, "{trigger:?}");
+            assert!(
+                tools_shas.iter().all(|sha| *sha == tools_shas[0]),
+                "{trigger:?}: {tools_shas:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .filter(|e| e["event_type"] == "skill_call")
+                    .count()
+                    >= 2,
+                "{trigger:?}: the launch skill is served on every tool-call turn"
+            );
+            assert!(!events.iter().any(|e| e["event_type"] == "tools_refreshed"));
+        }
     }
 
     #[test]
@@ -11270,6 +11786,7 @@ inference:
         assert!(!workdir.join("tools").join("evil-tool").exists());
         assert!(!lock_path.exists());
         assert!(state.installed_artifacts.is_empty());
+        assert_eq!(state.installed_generation, 0);
     }
 
     #[test]
@@ -13018,6 +13535,7 @@ inference:
             max_turns: 10,
             max_tokens: None,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         }
     }
 
@@ -14083,6 +14601,7 @@ inference:
             max_turns: scenario.max_turns,
             max_tokens: None,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         };
 
         let mut state = build_test_state(
@@ -14442,6 +14961,7 @@ inference:
             max_turns: 10,
             max_tokens: None,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         }
     }
 

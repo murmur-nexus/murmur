@@ -664,6 +664,17 @@ struct ControlAppliedEvent {
     change_id: String,
 }
 
+/// The first inference call to send a tool array rebuilt after a mid-session install.
+#[derive(Debug, Deserialize)]
+struct ToolsRefreshedEvent {
+    turn: u32,
+    trigger: String,
+    #[serde(default)]
+    added: Vec<String>,
+    #[serde(default)]
+    removed: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -712,6 +723,7 @@ enum TraceEvent {
     ControlChange(ControlChangeEvent),
     ControlRefused(ControlRefusedEvent),
     ControlApplied(ControlAppliedEvent),
+    ToolsRefreshed(ToolsRefreshedEvent),
     #[serde(other)]
     Unknown,
 }
@@ -1798,6 +1810,8 @@ fn compute_metrics(
                     record.applied_turn = Some(applied.turn);
                 }
             }
+            // Rendered in the step list, beside the call that first carried the new array.
+            TraceEvent::ToolsRefreshed(_) => {}
             TraceEvent::ControlRefused(refused) => {
                 *control_refusals
                     .entry(format!("HTTP {}", refused.status))
@@ -3258,6 +3272,20 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.turn,
             fmt_id_short(&e.change_id, 12)
         ),
+        TraceEvent::ToolsRefreshed(e) => format!(
+            "{}{}{}{}  turn {}",
+            kind("tools_refreshed"),
+            e.trigger,
+            e.added
+                .iter()
+                .map(|name| format!("  +{name}"))
+                .collect::<String>(),
+            e.removed
+                .iter()
+                .map(|name| format!("  -{name}"))
+                .collect::<String>(),
+            e.turn
+        ),
         TraceEvent::PlanEnd(e) => format!(
             "{}{}{}",
             kind("plan_end"),
@@ -4341,6 +4369,23 @@ mod tests {
         assert_eq!(
             rejected_show_row(&e),
             "task_rejected  tsk_1  session_stopped  source unknown"
+        );
+    }
+
+    /// A `tools_refreshed` line parses into its own variant rather than falling through to
+    /// `Unknown`, and its row names the trigger, what entered and left the array, and the turn.
+    #[test]
+    fn tools_refreshed_renders_a_steps_row() {
+        let line = r#"{"event_type":"tools_refreshed","event_id":"evt_5","parent_id":"evt_1","session_id":"s","timestamp":5,"turn":3,"task_id":"tsk_1","trigger":"compaction","added":["aaa-late-skill"],"removed":["old-tool"],"tools":["aaa-late-skill","zzz-existing-tool"]}"#;
+        let TraceEvent::ToolsRefreshed(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+        else {
+            panic!("a tools_refreshed line parses as ToolsRefreshed");
+        };
+        assert_eq!(e.turn, 3);
+        assert_eq!(e.trigger, "compaction");
+        assert_eq!(
+            row(line),
+            "tools_refreshed compaction  +aaa-late-skill  -old-tool  turn 3"
         );
     }
 

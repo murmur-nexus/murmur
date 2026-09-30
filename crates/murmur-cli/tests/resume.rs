@@ -559,6 +559,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "system_prompt_sha256",
             "system_prompt_source",
             "timestamp",
+            "tool_refresh",
             "tools_declared",
             "userns_grant",
             "workdir_exec",

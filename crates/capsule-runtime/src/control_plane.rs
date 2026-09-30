@@ -903,6 +903,7 @@ mod tests {
             max_turns: 10,
             max_tokens,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         }
     }
 

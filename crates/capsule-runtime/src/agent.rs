@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::{
     a2a::TaskState,
+    agent::inventory::HeldInventory,
     bindings::host::murmur::tool::run::{Status, ToolInput},
     cancel::{CancelSignal, Residue, PHASE_INFERENCE},
     detached::DetachedDispatchInfo,
@@ -575,17 +576,16 @@ pub(crate) async fn run_agent_loop(
     }
 
     let system_prompt_artifact = inference.system_prompt_artifact.as_deref();
-    // Built once, before the turn loop, and held for the session, for prompt caching: the
-    // serialized tool array is part of the prefix the provider matches its cache on, so
-    // re-reading it per turn would let a mid-session `manage.pull()` reorder or grow it and
-    // invalidate the cache entry for every remaining turn. A pulled tool lands on disk and
-    // reaches the model on the next launch.
-    let tools = inventory::build_tool_inventory(workdir, system_prompt_artifact);
-
-    let tools_json = serde_json::to_string_pretty(&tools).map_err(|e| {
-        RuntimeError::AgentLoopFailed(format!("failed to serialize tool inventory: {e}"))
-    })?;
-    append_bootstrap_log(workdir, &format!("Installed tools (JSON):\n{tools_json}"));
+    // Built once per attempt and held across its turns, for prompt caching: the serialized tool
+    // array heads the prefix the provider matches its cache on, so every call sends the same
+    // bytes until an artifact installed mid-session is released onto it at the boundary
+    // `inference.tool_refresh` names — see `HeldInventory::refresh_before_call`.
+    let mut inventory = HeldInventory::build(
+        workdir,
+        system_prompt_artifact,
+        store_state.installed_generation,
+    );
+    log_tool_inventory(workdir, "Installed tools", inventory.tools())?;
 
     let augmented_system = build_augmented_system_prompt(
         name,
@@ -624,10 +624,15 @@ pub(crate) async fn run_agent_loop(
     let occupancy = ContextOccupancy {
         model: &inference.model,
         max_output_tokens: run_config.max_output_tokens,
-        tools: &tools,
+        tools: inventory.tools(),
         system: &augmented_system,
         prompt_cache_key: Some(prompt_cache_key.as_str()),
     };
+
+    // Whether a compaction replaced the context since the previous inference call. Read and
+    // cleared by the tool-array decision before each call, so a commit made after a response
+    // releases a pending install onto the call that follows it.
+    let mut compaction_committed = false;
 
     // Current context occupancy, not a running total: every turn assigns its own
     // full-context input count before anything reads it. The initial value is what a seed
@@ -684,7 +689,9 @@ pub(crate) async fn run_agent_loop(
                 )
                 .await;
                 match compacted {
-                    Ok(()) => {}
+                    Ok(outcome) => {
+                        compaction_committed |= outcome == CompactionOutcome::Committed;
+                    }
                     Err(CompactionFailure::Hook(text)) => {
                         return Err(RuntimeError::AgentLoopFailed(text))
                     }
@@ -814,9 +821,36 @@ pub(crate) async fn run_agent_loop(
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
         }
+
+        // The one point the tool array can change: before the payload is built, so the occupancy
+        // count, the spend admission and the request all carry the same array.
+        let refresh = inventory.refresh_before_call(
+            workdir,
+            system_prompt_artifact,
+            inference.tool_refresh,
+            store_state.installed_generation,
+            std::mem::take(&mut compaction_committed),
+        );
+        if let Some(refresh) = refresh {
+            trace
+                .write_tools_refreshed(
+                    turn_u32,
+                    refresh.reason.wire_name(),
+                    &refresh.added,
+                    &refresh.removed,
+                    &refresh.offered,
+                )
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+            log_tool_inventory(workdir, "Refreshed tools", inventory.tools())?;
+        }
+        let tools = inventory.tools();
         let occupancy = ContextOccupancy {
+            model: &inference.model,
             max_output_tokens,
-            ..occupancy
+            tools,
+            system: &augmented_system,
+            prompt_cache_key: Some(prompt_cache_key.as_str()),
         };
 
         // How many logical messages the driver will know once this transmit lands. A held,
@@ -833,7 +867,7 @@ pub(crate) async fn run_agent_loop(
             &inference.model,
             max_output_tokens,
             messages,
-            &tools,
+            tools,
             &augmented_system,
             active_continuation,
             Some(prompt_cache_key.as_str()),
@@ -1164,6 +1198,9 @@ pub(crate) async fn run_agent_loop(
                     record.as_mut(),
                 )
                 .await;
+                if compacted == Ok(CompactionOutcome::Committed) {
+                    compaction_committed = true;
+                }
                 // A declared compaction hook that returned `Err` ends the session the
                 // same way a driver inference error does — there is no fallback
                 // compactor behind it, so continuing would mean another turn on a
@@ -1788,9 +1825,18 @@ enum RefusalLine {
     AlreadyWritten,
 }
 
+/// What a compaction attempt that did not end the session did to the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionOutcome {
+    /// A hook's replacement was committed: the message list is new, its continuation dropped.
+    Committed,
+    /// The context was left as it stood, and `compaction_declined` records why.
+    Declined,
+}
+
 /// Why a compaction attempt ended the session.
 #[derive(Debug, PartialEq, Eq)]
-enum CompactionFailure {
+pub(crate) enum CompactionFailure {
     /// The hook returned `Err` after a spend ceiling refused its `run-inference` call. Carries the
     /// last refusal drained with that dispatch's records.
     SpendRefused(SpendRefusal),
@@ -2481,7 +2527,7 @@ async fn record_compaction_declined(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn try_compact_via_hooks(
+pub(crate) async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
     session_tokens: &mut u32,
     occupancy: &ContextOccupancy<'_>,
@@ -2496,7 +2542,7 @@ async fn try_compact_via_hooks(
     compaction_system_prompt: Option<String>,
     dump_summaries: bool,
     record: Option<&mut crate::conversation::ConversationRecord>,
-) -> Result<(), CompactionFailure> {
+) -> Result<CompactionOutcome, CompactionFailure> {
     let wit_messages = to_wit_messages(messages);
 
     let tokens_before = *session_tokens;
@@ -2543,7 +2589,7 @@ async fn try_compact_via_hooks(
             crate::trace::COMPACTION_DECLINED_NO_HOOK_REPLACEMENT,
         )
         .await;
-        return Ok(());
+        return Ok(CompactionOutcome::Declined);
     };
 
     let candidate_messages: Vec<Value> =
@@ -2562,7 +2608,7 @@ async fn try_compact_via_hooks(
             crate::trace::COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL,
         )
         .await;
-        return Ok(());
+        return Ok(CompactionOutcome::Declined);
     }
 
     // Compaction is maximal prompt cache loss: replacing the whole message list with one
@@ -2623,7 +2669,7 @@ async fn try_compact_via_hooks(
             "[compaction] hook compaction at turn {turn}; new session_tokens: {session_tokens}"
         ),
     );
-    Ok(())
+    Ok(CompactionOutcome::Committed)
 }
 
 /// The one site that swaps a session's whole message list for a new one.
@@ -3545,6 +3591,15 @@ fn build_augmented_system_prompt(
         "[Capsule]\nName: {name}\nVersion: {version}\nManifest: murmur.yaml (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
     );
     format!("{context}{base}")
+}
+
+/// Write the tool array a call is about to send to `bootstrap.log` under `heading`.
+fn log_tool_inventory(workdir: &Path, heading: &str, tools: &[Value]) -> Result<(), RuntimeError> {
+    let tools_json = serde_json::to_string_pretty(tools).map_err(|e| {
+        RuntimeError::AgentLoopFailed(format!("failed to serialize tool inventory: {e}"))
+    })?;
+    append_bootstrap_log(workdir, &format!("{heading} (JSON):\n{tools_json}"));
+    Ok(())
 }
 
 pub(crate) fn append_bootstrap_log(workdir: &Path, message: &str) {
@@ -5856,6 +5911,7 @@ forgery: {prompt}"
             max_turns: 10,
             max_tokens: None,
             max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
         }
     }
 
@@ -5921,5 +5977,47 @@ forgery: {prompt}"
         assert!(fresh_task_text(&inference_on("http"), dir.path())
             .trim()
             .is_empty());
+    }
+
+    /// Measurement harness, not a check: prints the runtime's own count of the tools and system
+    /// blocks alone — `ContextOccupancy::count(&[])` — for a finished http session, which bounds
+    /// what a tool refresh riding a compaction adds to the call that carries it. Reads the
+    /// session directory and the capsule's identity from the environment:
+    ///
+    /// `MURMUR_OCCUPANCY_WORKDIR=<session dir> MURMUR_OCCUPANCY_NAME=<name>
+    /// MURMUR_OCCUPANCY_VERSION=<version> MURMUR_OCCUPANCY_MODEL=<model>
+    /// MURMUR_OCCUPANCY_SYSTEM_PROMPT=<resolved prompt> MURMUR_OCCUPANCY_CONTEXT_ID=<ctx>
+    /// MURMUR_OCCUPANCY_MAX_TOKENS=<n> cargo test -p capsule-runtime --lib
+    /// tools_and_system_occupancy -- --ignored`
+    #[test]
+    #[ignore = "measurement harness; reads a session directory from MURMUR_OCCUPANCY_WORKDIR"]
+    fn tools_and_system_occupancy() {
+        let var = |name: &str| std::env::var(format!("MURMUR_OCCUPANCY_{name}")).ok();
+        let Some(workdir) = var("WORKDIR") else {
+            return;
+        };
+        let name = var("NAME").unwrap_or_default();
+        let version = var("VERSION").unwrap_or_default();
+        let model = var("MODEL").unwrap_or_default();
+        let max_output_tokens = var("MAX_TOKENS")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let tools = inventory::build_tool_inventory(std::path::Path::new(&workdir), None);
+        let system =
+            build_augmented_system_prompt(&name, &version, var("SYSTEM_PROMPT").as_deref(), false);
+        let cache_key = build_prompt_cache_key(&name, &version, var("CONTEXT_ID").as_deref());
+        let occupancy = ContextOccupancy {
+            model: &model,
+            max_output_tokens,
+            tools: &tools,
+            system: &system,
+            prompt_cache_key: Some(cache_key.as_str()),
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "tools: {}  tools+system tokens: {}",
+            tools.len(),
+            occupancy.count(&[])
+        );
     }
 }

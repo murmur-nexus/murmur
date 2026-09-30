@@ -39,7 +39,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention`, `task_rejected` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
-| `control_applied` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
+| `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation` | The session node |
@@ -64,6 +64,7 @@ before the first task begins
 | `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
 | `tools_declared` | string[] | Names of the tools offered to the model |
+| `tool_refresh` | string \| null | [`inference.tool_refresh`](manifest.md#inference-tool-refresh): `"compaction"` \| `"immediate"` under `transport: http`, `null` under `transport: process`. Always written |
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
 | `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this host can enforce, capped by `workdir_exec`. Nothing in a manifest can raise it. See [Containment](containment.md) |
 | `userns_grant` | string \| null | Where this host's permission to create an unprivileged user namespace came from: `"apparmor_absent"`, `"restriction_disabled_host_wide"`, `"profile_confining"` or `"withheld"`. Always written; `null` only off Linux, where AppArmor does not exist. Two sessions can reach the same `containment_achieved` through different permissions, so read this alongside it. See [`W-SEC-013`](diagnostics.md#w-sec-013) |
@@ -196,6 +197,26 @@ A capsule with no `control:` block writes nothing: every request under `/control
 
 Written only when the value differs from the one the previous call used. Compaction calls and a
 hook's `run-inference` never write it.
+
+### `tools_refreshed` { #tools-refreshed }
+
+Written when the tool list an agent-loop inference call sends differs from the one the previous
+call sent, because an artifact was installed during the task. It comes just before that call's
+`inference` line, whose `tools_sha` is the new list's. See
+[`inference.tool_refresh`](manifest.md#inference-tool-refresh).
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | Zero-based, the same number the call's own `inference` line carries |
+| `task_id` | string \| null | The task the turn belongs to |
+| `trigger` | string | `"immediate"` — `inference.tool_refresh: immediate` released the install; `"compaction"` — a compaction replaced the context since the previous call, under either value |
+| `added` | string[] | Names offered now and not before, sorted |
+| `removed` | string[] | Names offered before and not now, sorted |
+| `tools` | string[] | Every name the list now offers, in the order it is sent, which is sorted |
+
+An install that leaves the list byte-identical, such as a skill that is the
+[`inference.system_prompt_artifact`](manifest.md#inference-system-prompt-artifact), writes nothing.
+Never written under `transport: process`.
 
 ### What the wire hashes cover { #wire-hashes }
 

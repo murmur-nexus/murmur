@@ -76,11 +76,11 @@ pub use runtime_manifest::{
     ObservabilityConfig, ParseContainmentClassError, PeerFetchCapabilities, PeerFilesExport,
     PlanCapabilities, ReferencedEnvVariable, ResourceCapabilities, ResourceLimits, RuntimeArtifact,
     RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities, StagedRuntimeGrant,
-    StateCapabilities, TaskAcceptance, TaskIoCapabilities, TraceConfig, TraceRetainConfig,
-    BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES, DEFAULT_PEER_FILES_MAX_BYTES,
-    DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET, DEFAULT_SEED_OVERFLOW_MARGIN, DOOR_SCOPES,
-    DURATION_ACCEPTED_FORM, OPERATOR_CREDENTIAL, PEER_FETCH_ALLOW_ACCEPTED_FORM,
-    PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
+    StateCapabilities, TaskAcceptance, TaskIoCapabilities, ToolRefresh, TraceConfig,
+    TraceRetainConfig, BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES,
+    DEFAULT_PEER_FILES_MAX_BYTES, DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET,
+    DEFAULT_SEED_OVERFLOW_MARGIN, DOOR_SCOPES, DURATION_ACCEPTED_FORM, OPERATOR_CREDENTIAL,
+    PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
 pub use runtime_warnings::{runtime_warning_link, W_RUN_001, W_RUN_002};
 pub use secrets::{
