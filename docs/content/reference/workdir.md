@@ -490,11 +490,19 @@ A pull never turns an operator pin into a runtime one, and never relabels an ear
 own session.
 
 `mur run` and `mur eval` stage only the artifacts `murmur.yaml` declares, so an entry a capsule
-pulled that the manifest does not declare is never staged. A declared artifact whose pin has
-`origin: runtime` stages only as a tool or skill without `gateway:`; declaring it as
-`runtime: hook`, `runtime: driver` or with `gateway:` is refused with
-[`E-RUN-043`](diagnostics.md#e-run-043) until `mur install <name>@<version>` adopts the pin.
-[`mur doctor`](cli.md#mur-doctor) reports every runtime pin.
+pulled that the manifest does not declare is never staged. At the next launch, a declared artifact
+whose pin has `origin: runtime` is handled by role:
+
+| Declared as | At launch |
+|---|---|
+| A tool or skill without `gateway:` | Staged, and marked untrusted wherever it reaches the model: its tool-array description opens with the runtime-origin marker, and a skill's guidance arrives fenced. See [Artifact origin](../concepts/access-control.md#artifact-origin) |
+| `runtime: hook`, `runtime: driver`, or with `gateway:` | Refused with [`E-RUN-043`](diagnostics.md#e-run-043) |
+| A skill named by `inference.system_prompt_artifact` | Refused with [`E-RUN-043`](diagnostics.md#e-run-043) |
+
+Both hold on every launch until `mur install <name>@<version>` adopts the pin as `operator`.
+`session_start.runtime_artifacts` in [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl)
+lists every runtime pin a launch staged. [`mur doctor`](cli.md#mur-doctor) reports every runtime
+pin.
 
 A `mur` that predates `origin` reads a lock that has it, and drops both keys if it rewrites the
 file; every entry then reads as `operator`.

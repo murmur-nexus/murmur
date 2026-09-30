@@ -27,7 +27,7 @@ A fenced block is an opening marker, a newline, the content, a newline, and a cl
 | Part | Form |
 |---|---|
 | Opening marker | `<untrusted-content source=NAME>` — one line, no attributes other than `source` |
-| Source name | `tool:<artifact name>` for a tool result, `task:<origin>` for a task payload. A `>`, a carriage return or a newline appearing in a name is replaced with `_`, ` ` and ` ` respectively |
+| Source name | `tool:<artifact name>` for a tool result, `skill:<artifact name>` for a runtime-pinned skill's result, `task:<origin>` for a task payload. A `>`, a carriage return or a newline appearing in a name is replaced with `_`, ` ` and ` ` respectively |
 | Closing marker | `</untrusted-content>`, in full. It carries no source name |
 | Separator | Exactly one `\n` after the opening marker and one before the closing marker. The content's own trailing newline, if it has one, sits before that separator |
 
@@ -67,7 +67,8 @@ anywhere inside a block — including one drawn inside an image — is a forgery
 |---|---|---|
 | A2A [`artifact` SSE frame](streaming-protocol.md#event-artifact) | In `artifact.content` | `artifact.fence_source` — the source name, or `null`. Present on every frame |
 | [`conversation.jsonl`](workdir.md#the-conversation-record) message line | In `content` | `fence` — the source name. Absent on an unfenced line |
-| [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `tool_call` | In `output`, and counted in `output_bytes` | Unlabelled. A `tool_call` event carries a fence and a `skill_call` event does not |
+| [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `tool_call` | In `output`, and counted in `output_bytes` | Unlabelled |
+| [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `skill_call` | Not recorded: the event carries no output | `trust` — `"untrusted"` exactly when the skill's result was fenced under `skill:<skill_name>` |
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | In the message's `content` | Unlabelled. The `message` record has no `fence` field; read the markers |
 
 The two labelled surfaces differ on purpose. An SSE consumer may be talking to any runtime
@@ -107,7 +108,7 @@ holds.
 
 | Content | Why |
 |---|---|
-| A declared skill's `skill.md` | The capsule author's own guidance, staged inside the capsule at install. Fencing it as data would make the skill inert |
+| An operator-pinned skill's `skill.md` | The capsule author's own guidance, staged inside the capsule at install. Fencing it as data would make the skill inert. A skill whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule pulled is fenced — see [Artifact origin](../concepts/access-control.md#artifact-origin) |
 | A dispatch failure | The runtime's own text about a call that never reached a tool |
 | A refusal — from [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) or from a hook's decision | The runtime's own text. The call never ran |
 | A hook artifact | The capsule operator's own declared hook speaking |
@@ -121,6 +122,7 @@ holds.
 | Boundary | Content | Source name |
 |---|---|---|
 | Tool result | Every agent-facing tool dispatch except a skill — WASM tool, native subprocess tool, shell binary, and the runtime's own peer-handoff tools | `tool:<artifact name>` |
+| Tool result | A skill whose `murmur.lock` origin is `runtime`, on every call | `skill:<artifact name>` |
 | Task payload | A task whose trust class is `untrusted` | `task:<origin>` |
 
 Both boundaries apply on `inference.transport: http` and `inference.transport: process`. A

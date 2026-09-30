@@ -36,7 +36,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention`, `task_rejected` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -47,9 +47,9 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `plan_step_start`, `plan_step` | The plan node |
 | `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
 
-A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
-a file that has no session frame — writes `parent_id: null` on every line, rather than naming a
-parent that has no line behind it.
+A trace with no `session_start` line — a script capsule flushing buffered `artifact_pulled` and
+`a2a_send` records into a file that has no session frame — writes `parent_id: null` on every line,
+rather than naming a parent that has no line behind it.
 
 **`session_start`** — written once per launch, before the `on-session-start` hooks fire and
 before the first task begins
@@ -65,6 +65,7 @@ before the first task begins
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
 | `tools_declared` | string[] | Names of the tools offered to the model |
 | `tool_refresh` | string \| null | [`inference.tool_refresh`](manifest.md#inference-tool-refresh): `"compaction"` \| `"immediate"` under `transport: http`, `null` under `transport: process`. Always written |
+| `runtime_artifacts` | array of object | Every staged artifact whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule fetched, in staging order. One object per artifact: `name`, `version`, `origin` (always `"runtime"`), `session` (the session whose `manage.pull()` wrote the pin) and `trust` (always `"untrusted"`). Each reached the model marked — see [Artifact origin](../concepts/access-control.md#artifact-origin). Always written; `[]` when every staged artifact is operator-pinned |
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
 | `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this host can enforce, capped by `workdir_exec`. Nothing in a manifest can raise it. See [Containment](containment.md) |
 | `userns_grant` | string \| null | Where this host's permission to create an unprivileged user namespace came from: `"apparmor_absent"`, `"restriction_disabled_host_wide"`, `"profile_confining"` or `"withheld"`. Always written; `null` only off Linux, where AppArmor does not exist. Two sessions can reach the same `containment_achieved` through different permissions, so read this alongside it. See [`W-SEC-013`](diagnostics.md#w-sec-013) |
@@ -284,9 +285,11 @@ storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 | `turn` | u32 | |
 | `task_id` | string \| null | The task this call belongs to. `null` when no task is in scope |
 | `skill_name` | string | |
-| `output_bytes` | u64 | Byte length of the returned `skill.md` text. A skill result carries no [fence](untrusted-fence.md) |
+| `output_bytes` | u64 | Byte length of the returned `skill.md` text. An operator-pinned skill's result carries no [fence](untrusted-fence.md); a runtime-pinned one's does |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
+| `origin` | string | `"operator"` \| `"runtime"` — the skill's [`murmur.lock` origin](workdir.md#lock-origin). A skill with no lock entry, such as a `source:` skill, is `"operator"`. Always written |
+| `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin`, in the spelling `task_start.trust` uses. `"untrusted"` means the guidance reached the model fenced under `skill:<skill_name>`. Always written |
 
 Skill calls are counted separately from tool calls: they never raise `total_tool_calls` or a
 `task_end`'s `tool_calls`.
@@ -496,6 +499,19 @@ loop has exited, on every exit path
 | `context_id` | string | Context ID returned by the peer |
 | `traceparent` | string \| null | W3C `traceparent` injected on the outgoing request |
 | `trust` | string | `"trusted"` \| `"untrusted"` — the class the sending runtime stamped on `x-murmur-task-trust`, which is the class the sending capsule's own task ran under. The receiving capsule records the same value as `task_start.trust` |
+
+**`artifact_pulled`** — written for each successful [`manage.pull()`](wit-interfaces.md#murmurartifact-managermanage). A refused or failed pull writes nothing
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | The artifact pulled |
+| `version` | string | The version pulled |
+| `runtime` | string | `"skill"` \| `"tool"` |
+| `origin` | string | `"runtime"` \| `"operator"` — the lock entry's origin after the pull. `"operator"` when the operator had already pinned the same version, which a pull leaves the operator's |
+| `session` | string \| null | The session the lock entry names as the puller — this session, unless an earlier pull of the same pin recorded another. `null` when `origin` is `"operator"`. Always written |
+| `trust` | string | `"trusted"` \| `"untrusted"`, derived from `origin` |
+
+A script capsule writes these lines, before its buffered `a2a_send` lines, after its `run` returns.
 
 **`task_start`** — written at the start of each task, before the agent loop runs
 

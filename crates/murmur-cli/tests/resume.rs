@@ -555,6 +555,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "model",
             "parent_id",
             "resumed_from",
+            "runtime_artifacts",
             "session_id",
             "system_prompt_sha256",
             "system_prompt_source",

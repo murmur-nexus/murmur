@@ -852,8 +852,13 @@ fn resolve_harness_binary(
 }
 
 /// The manifest text that declares a `manage.pull()` pin in a role only an operator-declared pin
-/// may carry — `runtime: hook`, `runtime: driver`, or a `gateway:` block — or `None` when the
-/// entry asks only for what a pull can produce: a tool or a skill with no gateway.
+/// may carry — `runtime: hook`, `runtime: driver`, a `gateway:` block, or
+/// `inference.system_prompt_artifact` naming a skill — or `None` when the entry asks only for
+/// what a pull can produce: a tool or a skill with no gateway, reached as a callable entry.
+///
+/// A system prompt cannot carry the runtime-origin marker without ceasing to be the operator's
+/// own voice, so a runtime-origin skill may not be bound as one. When several roles apply the
+/// first in the order above is named.
 ///
 /// Staging refuses a runtime-origin pin for which this is `Some` with
 /// [`RuntimeError::RuntimeOriginNotDeclarable`]; `mur doctor` predicts that refusal from it.
@@ -861,11 +866,15 @@ fn resolve_harness_binary(
 pub fn undeclarable_runtime_pin_role(
     runtime: &ArtifactRuntime,
     declares_gateway: bool,
+    bound_as_system_prompt: bool,
 ) -> Option<&'static str> {
     match runtime {
         ArtifactRuntime::Hook => Some("runtime: hook"),
         ArtifactRuntime::Driver => Some("runtime: driver"),
         ArtifactRuntime::Tool | ArtifactRuntime::Skill if declares_gateway => Some("gateway:"),
+        ArtifactRuntime::Skill if bound_as_system_prompt => {
+            Some("inference.system_prompt_artifact")
+        }
         ArtifactRuntime::Tool | ArtifactRuntime::Skill => None,
     }
 }
@@ -877,8 +886,14 @@ fn refuse_undeclarable_runtime_pin(
     artifact: &ArtifactRequest,
     version: &str,
     session: &str,
+    system_prompt_artifact: Option<&str>,
 ) -> Result<(), RuntimeError> {
-    match undeclarable_runtime_pin_role(&artifact.runtime, artifact.gateway.is_some()) {
+    let bound_as_system_prompt = system_prompt_artifact == Some(artifact.name.as_str());
+    match undeclarable_runtime_pin_role(
+        &artifact.runtime,
+        artifact.gateway.is_some(),
+        bound_as_system_prompt,
+    ) {
         Some(declared_as) => Err(RuntimeError::RuntimeOriginNotDeclarable {
             name: artifact.name.clone(),
             version: version.to_string(),
@@ -1194,7 +1209,15 @@ pub fn stage_session(
                 }
 
                 if let LockOrigin::Runtime { session } = &expected.origin {
-                    refuse_undeclarable_runtime_pin(artifact, &expected.resolved_version, session)?;
+                    refuse_undeclarable_runtime_pin(
+                        artifact,
+                        &expected.resolved_version,
+                        session,
+                        request
+                            .inference
+                            .as_ref()
+                            .and_then(|inference| inference.system_prompt_artifact.as_deref()),
+                    )?;
                 }
 
                 (
@@ -2290,6 +2313,7 @@ fn launch(
                 &agent::inventory::build_tool_inventory(
                     &workdir,
                     inference.system_prompt_artifact.as_deref(),
+                    &installed_artifacts,
                 ),
             );
             let inference_credential = gateways
@@ -2306,6 +2330,7 @@ fn launch(
             trace.set_tool_refresh(
                 (inference.transport != "process").then(|| inference.tool_refresh.wire_name()),
             );
+            trace.set_runtime_artifacts(&installed_artifacts);
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -2478,6 +2503,7 @@ fn launch(
                         installed_generation: 0,
                         session_id: session_id.clone(),
                         pending_a2a_events: Vec::new(),
+                        pending_artifact_pulls: Vec::new(),
                         capability_policy,
                         protected_paths,
                         tool_annotations,
@@ -3469,6 +3495,7 @@ fn launch(
         installed_generation: 0,
         session_id: staged.session_id.clone(),
         pending_a2a_events: Vec::new(),
+        pending_artifact_pulls: Vec::new(),
         capability_policy: staged.capability_policy,
         protected_paths: staged.protected_paths,
         tool_annotations: staged.tool_annotations,
@@ -3540,46 +3567,18 @@ fn launch(
         Ok(())
     })?;
 
-    // Drain any buffered a2a_send trace events from the capsule run.
-    let pending = std::mem::take(&mut store.data_mut().pending_a2a_events);
-    if !pending.is_empty() {
-        rt.block_on(async {
-            if let Ok(mut trace) = TraceWriter::open(
-                &staged.workdir,
-                staged.session_id.clone(),
-                staged.capsule_name.clone(),
-                staged.capsule_version.clone(),
-                String::new(),
-                Vec::new(),
-                staged.scope_report.clone(),
-                // This writer exists only to drain buffered `a2a_send` events; it writes no
-                // record that can carry a hash or a body.
-                murmur_artifact::TraceCapture::None,
-                None,
-                false,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            {
-                for (peer_url, message_id, task_id, context_id, traceparent, trust) in pending {
-                    let _ = trace
-                        .write_a2a_send(
-                            &peer_url,
-                            &message_id,
-                            &task_id,
-                            &context_id,
-                            traceparent.as_deref(),
-                            trust,
-                        )
-                        .await;
-                }
-                let _ = trace.flush().await;
-            }
-        });
-    }
+    // The trace lines the capsule's run buffered on its store, written now that it has returned.
+    let pending_pulls = std::mem::take(&mut store.data_mut().pending_artifact_pulls);
+    let pending_sends = std::mem::take(&mut store.data_mut().pending_a2a_events);
+    rt.block_on(drain_script_trace_buffers(
+        &staged.workdir,
+        &staged.session_id,
+        &staged.capsule_name,
+        &staged.capsule_version,
+        &staged.scope_report,
+        pending_pulls,
+        pending_sends,
+    ));
 
     // Notify the caller that the capsule has started (no URL for script capsules).
     on_url("");
@@ -3590,6 +3589,67 @@ fn launch(
         session_id: staged.session_id,
         workdir: staged.workdir,
     })
+}
+
+/// One buffered `a2a_send` line: (peer_url, message_id, task_id, context_id, traceparent, trust).
+pub(crate) type PendingA2aSend = (String, String, String, String, Option<String>, TrustClass);
+
+/// Write the trace lines a script capsule's run buffered on its store: every `artifact_pulled`
+/// line first, then every `a2a_send` line, each in the order it was buffered.
+///
+/// A script capsule writes no `session_start`, so these go through a writer opened here, after
+/// the guest's `run` returned, and parent to nothing. No trace file is opened when both buffers
+/// are empty. A write failure is dropped: the run it describes has already succeeded.
+async fn drain_script_trace_buffers(
+    workdir: &Path,
+    session_id: &str,
+    capsule_name: &str,
+    capsule_version: &str,
+    scope_report: &crate::containment::ScopeReport,
+    pulls: Vec<InstalledArtifactSummary>,
+    sends: Vec<PendingA2aSend>,
+) {
+    if pulls.is_empty() && sends.is_empty() {
+        return;
+    }
+    let Ok(mut trace) = TraceWriter::open(
+        workdir,
+        session_id.to_string(),
+        capsule_name.to_string(),
+        capsule_version.to_string(),
+        String::new(),
+        Vec::new(),
+        scope_report.clone(),
+        // This writer exists only to drain buffered events; it writes no record that can carry a
+        // hash or a body.
+        murmur_artifact::TraceCapture::None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    for artifact in &pulls {
+        let _ = trace.write_artifact_pulled(artifact).await;
+    }
+    for (peer_url, message_id, task_id, context_id, traceparent, trust) in sends {
+        let _ = trace
+            .write_a2a_send(
+                &peer_url,
+                &message_id,
+                &task_id,
+                &context_id,
+                traceparent.as_deref(),
+                trust,
+            )
+            .await;
+    }
+    let _ = trace.flush().await;
 }
 
 /// This session's entry for `~/.murmur/running/`, not yet written — see [`write_running_record`].
@@ -5171,9 +5231,14 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) installed_generation: u64,
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
-    /// (peer_url, message_id, task_id, context_id, traceparent, trust)
-    pub(crate) pending_a2a_events:
-        Vec<(String, String, String, String, Option<String>, TrustClass)>,
+    pub(crate) pending_a2a_events: Vec<PendingA2aSend>,
+    /// One summary per successful `manage.pull()`, as `installed_artifacts` records it after the
+    /// pull, awaiting its `artifact_pulled` trace line. A refused or failed pull pushes nothing.
+    ///
+    /// Only the script-capsule path links `manage` and drains this, after the guest's `run`
+    /// returns ([`drain_script_trace_buffers`]). A path that makes `manage.pull()` reachable
+    /// anywhere else must drain it there too, or its pulls go unrecorded.
+    pub(crate) pending_artifact_pulls: Vec<InstalledArtifactSummary>,
     pub(crate) capability_policy: CapabilityPolicy,
     /// The lowered `capabilities.filesystem.read_only` surface, built and validated once at
     /// staging. Empty for every capsule that declared nothing, and
@@ -5614,6 +5679,7 @@ impl manage::Host for CapsuleStoreState {
             self.installed_artifacts.push(summary.clone());
         }
         self.installed_generation += 1;
+        self.pending_artifact_pulls.push(summary.clone());
 
         Ok(manage::ArtifactSummary {
             name,
@@ -6090,7 +6156,8 @@ pub(crate) async fn invoke_tool_component(
     Ok(result)
 }
 
-/// Reduce a dispatched tool result to the one string the model will read, and fence it.
+/// Reduce a dispatched result to the one string the model will read, and fence it under
+/// `source`.
 ///
 /// The `data` / `summary` reduction happens here, once, rather than at each model-facing caller,
 /// and both fields are consumed: `data` carries the fenced text afterwards and `summary` is left
@@ -6098,36 +6165,64 @@ pub(crate) async fn invoke_tool_component(
 ///
 /// `status`, `data_path`, `truncated` and `metadata` are untouched: they are the tool's own
 /// declarations about the call, not content shown to the model.
-fn fence_tool_result(name: &str, result: &mut murmur::tool::run::ToolResult) {
+fn fence_result(source: &str, result: &mut murmur::tool::run::ToolResult) {
     let data = result.data.take();
     let summary = result.summary.take();
     let text = data
         .or(summary)
         .unwrap_or_else(|| "tool returned no data".to_string());
-    result.data = Some(crate::fence::wrap_untrusted(
-        &crate::fence::tool_source(name),
-        &text,
-    ));
+    result.data = Some(crate::fence::wrap_untrusted(source, &text));
 }
 
 /// Fence a dispatched outcome and record what it was fenced under, in that order and nowhere
 /// else.
 ///
-/// Every branch is fenced except the skill branch. A skill result is `skill.md`, read off disk
-/// from inside the capsule, staged at install and fixed for the whole run: it is the capsule
-/// author's own guidance and its entire purpose is to be followed as instruction, so fencing it
-/// as data would make a declared skill inert. Every other branch returns bytes produced at call
-/// time by something outside the capsule, and the runtime has no notion of a trusted tool, so the
-/// rule for them needs no judgement: all of them are fenced, unconditionally.
+/// Every non-skill branch returns bytes produced at call time by something outside the capsule,
+/// and the runtime has no notion of a trusted tool, so the rule for them needs no judgement: all
+/// of them are fenced under `tool:<name>`, unconditionally.
+///
+/// A skill result is `skill.md`, read off disk from inside the capsule and fixed for the whole
+/// run. Whether it is fenced follows from `origin`, the skill's `murmur.lock` origin: a skill the
+/// operator pinned is the capsule author's own guidance, whose entire purpose is to be followed as
+/// instruction, so it is left unfenced; a skill whose pin a running capsule fetched was never
+/// vetted by the operator, so its guidance is fenced under `skill:<name>` like any other content
+/// from outside, on every call.
 ///
 /// The label is set here rather than by a caller inspecting the text, which is what makes
 /// [`DispatchOutcome::fence_source`] a statement about this outcome rather than a guess: it is
 /// `Some` on exactly the outcomes whose `result.data` now carries the markers.
-fn fence_and_label(name: &str, outcome: &mut DispatchOutcome) {
-    if !outcome.is_skill {
-        fence_tool_result(name, &mut outcome.result);
-        outcome.fence_source = Some(crate::fence::tool_source(name));
+fn fence_and_label(name: &str, origin: &LockOrigin, outcome: &mut DispatchOutcome) {
+    let source = if !outcome.is_skill {
+        crate::fence::tool_source(name)
+    } else if crate::origin::artifact_trust(origin) == crate::origin::TrustClass::Untrusted {
+        crate::fence::skill_source(name)
+    } else {
+        return;
+    };
+    fence_result(&source, &mut outcome.result);
+    outcome.fence_source = Some(source);
+}
+
+impl CapsuleStoreState {
+    /// Who pinned the artifact `name` in `murmur.lock`, as this session staged or pulled it.
+    ///
+    /// The lookup the tool-array marker, the skill fence and `skill_call`'s `origin` / `trust`
+    /// fields all read, through [`artifact_origin_in`]. A name this session holds no summary for is
+    /// [`LockOrigin::Operator`]: the only entries under `workdir/tools/` without one are the
+    /// runtime-provided tools (`share-file`, `fetch-peer-file`, `delegate-task`,
+    /// `submit-plan`), which are the runtime's own and never came from a registry.
+    pub(crate) fn artifact_origin(&self, name: &str) -> LockOrigin {
+        artifact_origin_in(&self.installed_artifacts, name)
     }
+}
+
+/// [`CapsuleStoreState::artifact_origin`] over a bare list, for the callers that hold the
+/// session's installed artifacts before or outside a store.
+pub(crate) fn artifact_origin_in(installed: &[InstalledArtifactSummary], name: &str) -> LockOrigin {
+    installed
+        .iter()
+        .find(|artifact| artifact.name == name)
+        .map_or(LockOrigin::Operator, |artifact| artifact.origin.clone())
 }
 
 impl CapsuleStoreState {
@@ -6283,7 +6378,7 @@ impl CapsuleStoreState {
         gate: Option<&mut crate::agent::CallGate<'_>>,
     ) -> Result<DispatchOutcome, String> {
         let mut outcome = self.dispatch_agent_tool_unfenced(name, input, gate).await?;
-        fence_and_label(name, &mut outcome);
+        fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         Ok(outcome)
     }
 
@@ -10733,6 +10828,357 @@ inference:
         }
     }
 
+    #[test]
+    fn a_runtime_origin_skill_cannot_be_bound_as_the_system_prompt() {
+        let project = tempfile::tempdir().unwrap();
+        let mut request = origin_stage_request(
+            project.path(),
+            vec![registry_artifact("pulled-skill", ArtifactRuntime::Skill)],
+            vec![expectation("pulled-skill", "abc", pulled_by("ses_puller"))],
+        );
+        if let Some(inference) = request.inference.as_mut() {
+            inference.system_prompt_artifact = Some("pulled-skill".to_string());
+        }
+
+        match stage_session(Arc::new(RefusalPrecedesRegistry), request) {
+            Err(RuntimeError::RuntimeOriginNotDeclarable {
+                name,
+                session,
+                declared_as,
+                ..
+            }) => {
+                assert_eq!(name, "pulled-skill");
+                assert_eq!(session, "ses_puller");
+                assert_eq!(declared_as, "inference.system_prompt_artifact");
+            }
+            Err(other) => panic!("expected RuntimeOriginNotDeclarable, got {other}"),
+            Ok(_) => panic!("a runtime-origin skill must not stage as the system prompt"),
+        }
+        assert!(!project.path().join("workdir").exists());
+    }
+
+    /// The role table in precedence order: hook, driver, gateway, system prompt. A role that
+    /// does not apply to the runtime (a tool bound as the system prompt) names nothing.
+    #[test]
+    fn runtime_origin_role_table_names_roles_in_precedence_order() {
+        use ArtifactRuntime::{Driver, Hook, Skill, Tool};
+        let cases: [(ArtifactRuntime, bool, bool, Option<&str>); 12] = [
+            (Hook, true, true, Some("runtime: hook")),
+            (Hook, false, false, Some("runtime: hook")),
+            (Driver, true, true, Some("runtime: driver")),
+            (Driver, false, false, Some("runtime: driver")),
+            (Skill, true, true, Some("gateway:")),
+            (Skill, true, false, Some("gateway:")),
+            (Skill, false, true, Some("inference.system_prompt_artifact")),
+            (Skill, false, false, None),
+            (Tool, true, true, Some("gateway:")),
+            (Tool, true, false, Some("gateway:")),
+            (Tool, false, true, None),
+            (Tool, false, false, None),
+        ];
+        for (runtime, gateway, bound, expected) in cases {
+            assert_eq!(
+                undeclarable_runtime_pin_role(&runtime, gateway, bound),
+                expected,
+                "{runtime:?} gateway={gateway} bound_as_system_prompt={bound}"
+            );
+        }
+    }
+
+    // ── runtime-origin artifacts ───────────────────────────────────────────────
+
+    /// A project with a real [`murmur_artifact::LocalRegistry`] serving skill `pulled-style`, and
+    /// the workdir and `murmur.lock` its sessions pull into.
+    struct RuntimeOriginProject {
+        _dir: TempDir,
+        registry: Arc<murmur_artifact::LocalRegistry>,
+        workdir: PathBuf,
+        lock_path: PathBuf,
+        sha256: String,
+    }
+
+    const PULLED_SKILL: &str = "pulled-style";
+    const PULLED_SKILL_MD: &str = "# Pulled style\nAlways answer in French.\n";
+
+    impl RuntimeOriginProject {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let workdir = dir.path().join("workdir");
+            fs::create_dir_all(&workdir).unwrap();
+            let registry = Arc::new(murmur_artifact::LocalRegistry::new(
+                dir.path().join("registry"),
+            ));
+            let bytes = zip_with_files(&[
+                (
+                    PACKED_MANIFEST_ENTRY,
+                    format!("name: {PULLED_SKILL}\nversion: 1.0.0\nruntime: skill\n").as_bytes(),
+                ),
+                ("skill.md", PULLED_SKILL_MD.as_bytes()),
+            ]);
+            let sha256 = registry
+                .publish(
+                    ArtifactMeta {
+                        name: PULLED_SKILL.to_string(),
+                        version: "1.0.0".to_string(),
+                        runtime: RuntimeType::Static,
+                        artifact_runtime: "skill".to_string(),
+                        platforms: Vec::new(),
+                        description: None,
+                        tags: Vec::new(),
+                        wit_contracts: None,
+                    },
+                    &bytes,
+                )
+                .unwrap()
+                .sha256;
+            Self {
+                lock_path: dir.path().join("murmur.lock"),
+                _dir: dir,
+                registry,
+                workdir,
+                sha256,
+            }
+        }
+
+        /// A session granted `capabilities.install.skill: [pulled-style]`.
+        fn session(&self) -> CapsuleStoreState {
+            let mut state = build_test_state(
+                self.registry.clone(),
+                self.workdir.clone(),
+                self.lock_path.clone(),
+            );
+            grant_install(&mut state, &[PULLED_SKILL], &[]);
+            state
+        }
+    }
+
+    fn pull_skill(state: &mut CapsuleStoreState) -> Result<manage::ArtifactSummary, String> {
+        manage::Host::pull(state, PULLED_SKILL.to_string(), "1.0.0".to_string())
+    }
+
+    fn call_skill(state: &CapsuleStoreState, name: &str) -> DispatchOutcome {
+        let input = murmur::tool::run::ToolInput {
+            data: None,
+            log_path: None,
+        };
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(state.dispatch_agent_tool_async(name, input, None))
+            .unwrap()
+    }
+
+    /// A name the session holds no summary for is a runtime-provided tool, and reads as the
+    /// operator's.
+    #[test]
+    fn runtime_origin_artifact_origin_defaults_to_operator() {
+        let project = RuntimeOriginProject::new();
+        let state = project.session();
+        assert_eq!(state.artifact_origin(SHARE_FILE_TOOL), LockOrigin::Operator);
+        assert_eq!(state.artifact_origin("anything"), LockOrigin::Operator);
+    }
+
+    /// A successful pull records the session as puller on the in-memory summary, and buffers one
+    /// copy of that summary for its `artifact_pulled` line.
+    #[test]
+    fn runtime_origin_pull_buffers_the_runtime_summary() {
+        let project = RuntimeOriginProject::new();
+        let mut state = project.session();
+
+        pull_skill(&mut state).unwrap();
+
+        let pulled_by = LockOrigin::Runtime {
+            session: "ses_test".to_string(),
+        };
+        assert_eq!(state.artifact_origin(PULLED_SKILL), pulled_by);
+        assert_eq!(state.pending_artifact_pulls.len(), 1);
+        assert_eq!(state.pending_artifact_pulls[0].name, PULLED_SKILL);
+        assert_eq!(state.pending_artifact_pulls[0].origin, pulled_by);
+        assert_eq!(
+            state.pending_artifact_pulls[0].runtime,
+            ArtifactRuntime::Skill
+        );
+    }
+
+    /// Pulling what the operator already pinned at the same version keeps the pin the
+    /// operator's, so the pulled artifact is not marked and its line says `operator`.
+    #[test]
+    fn runtime_origin_pull_of_an_operator_pin_stays_operator() {
+        let project = RuntimeOriginProject::new();
+        let mut lock = MurmurLock {
+            lock_version: LOCK_VERSION,
+            artifacts: Vec::new(),
+        };
+        lock.upsert(
+            PULLED_SKILL,
+            "1.0.0",
+            LockedSha256::any(project.sha256.clone()),
+            LockOrigin::Operator,
+        );
+        write_lockfile_atomic(&project.lock_path, &lock).unwrap();
+        let mut state = project.session();
+
+        pull_skill(&mut state).unwrap();
+
+        assert_eq!(state.artifact_origin(PULLED_SKILL), LockOrigin::Operator);
+        assert_eq!(state.pending_artifact_pulls[0].origin, LockOrigin::Operator);
+        let outcome = call_skill(&state, PULLED_SKILL);
+        assert_eq!(outcome.fence_source, None);
+        assert_eq!(outcome.result.data.as_deref(), Some(PULLED_SKILL_MD));
+    }
+
+    /// A refused pull and a failed one buffer nothing.
+    #[test]
+    fn runtime_origin_refused_pull_records_nothing() {
+        let project = RuntimeOriginProject::new();
+
+        let mut ungranted = build_test_state(
+            project.registry.clone(),
+            project.workdir.clone(),
+            project.lock_path.clone(),
+        );
+        let refusal = pull_skill(&mut ungranted).unwrap_err();
+        assert!(refusal.starts_with("not-granted:"), "{refusal}");
+        assert!(ungranted.pending_artifact_pulls.is_empty());
+
+        let mut state = project.session();
+        grant_install(&mut state, &["missing-skill"], &[]);
+        manage::Host::pull(&mut state, "missing-skill".to_string(), "1.0.0".to_string())
+            .unwrap_err();
+        assert!(state.pending_artifact_pulls.is_empty());
+        assert!(state.installed_artifacts.is_empty());
+    }
+
+    /// The script path's drain writes one `artifact_pulled` line per buffered pull, ahead of the
+    /// buffered `a2a_send` lines, and opens no trace when there is nothing to write.
+    #[test]
+    fn runtime_origin_artifact_pulled_is_written() {
+        let project = RuntimeOriginProject::new();
+        let mut state = project.session();
+        pull_skill(&mut state).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = crate::containment::scope_report_for_tier(
+            &CapabilityPolicy::default(),
+            murmur_artifact::ContainmentClass::Advisory,
+            sandbox::EnforcementTier::EnvironmentOnly,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            crate::cgroup::IoMaxReport::default(),
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        rt.block_on(drain_script_trace_buffers(
+            empty.path(),
+            "ses_test",
+            "cap",
+            "0.0.1",
+            &report,
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert!(!empty.path().join("trace.jsonl").exists());
+
+        rt.block_on(drain_script_trace_buffers(
+            &project.workdir,
+            "ses_test",
+            "cap",
+            "0.0.1",
+            &report,
+            std::mem::take(&mut state.pending_artifact_pulls),
+            vec![(
+                "http://peer".to_string(),
+                "msg_1".to_string(),
+                "tsk_1".to_string(),
+                "ctx_1".to_string(),
+                None,
+                TrustClass::Trusted,
+            )],
+        ));
+
+        let lines: Vec<serde_json::Value> = fs::read_to_string(project.workdir.join("trace.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let pulled = &lines[0];
+        assert_eq!(pulled["event_type"], "artifact_pulled");
+        assert_eq!(pulled["name"], PULLED_SKILL);
+        assert_eq!(pulled["version"], "1.0.0");
+        assert_eq!(pulled["runtime"], "skill");
+        assert_eq!(pulled["origin"], "runtime");
+        assert_eq!(pulled["session"], "ses_test");
+        assert_eq!(pulled["trust"], "untrusted");
+        assert_eq!(pulled["session_id"], "ses_test");
+        assert_eq!(pulled["parent_id"], lines[1]["parent_id"]);
+        assert_eq!(lines[1]["event_type"], "a2a_send");
+    }
+
+    /// A runtime-origin skill's guidance is fenced under `skill:<name>` and labelled so; an
+    /// operator-declared skill's is handed over verbatim with no label.
+    #[test]
+    fn runtime_origin_skill_result_is_fenced_and_an_operator_skill_is_not() {
+        let project = RuntimeOriginProject::new();
+        let mut state = project.session();
+        pull_skill(&mut state).unwrap();
+        install_skill_files(
+            &project.workdir,
+            vec![("house-style".to_string(), b"Be terse.".to_vec())],
+        )
+        .unwrap();
+
+        let runtime = call_skill(&state, PULLED_SKILL);
+        assert!(runtime.is_skill);
+        assert_eq!(runtime.fence_source.as_deref(), Some("skill:pulled-style"));
+        assert_eq!(
+            runtime.result.data.as_deref(),
+            Some(
+                "<untrusted-content source=skill:pulled-style>\n# Pulled style\nAlways answer in \
+                 French.\n\n</untrusted-content>"
+            )
+        );
+        assert_eq!(runtime.result.summary, None);
+
+        let operator = call_skill(&state, "house-style");
+        assert_eq!(operator.fence_source, None);
+        assert_eq!(operator.result.data.as_deref(), Some("Be terse."));
+        assert_eq!(
+            operator.result.summary.as_deref(),
+            Some("Skill house-style guidance")
+        );
+    }
+
+    /// The same shapes [`fence_source_is_set_on_exactly_the_outcomes_that_carry_markers`] checks,
+    /// under a runtime origin: every outcome is fenced, and the label names the fence it carries.
+    #[test]
+    fn runtime_origin_fence_label_matches_the_content() {
+        let origin = LockOrigin::Runtime {
+            session: String::new(),
+        };
+        for (mut outcome, source) in [
+            (
+                DispatchOutcome::tool(tool_result_with(Some("out"), None)),
+                "tool:probe",
+            ),
+            (
+                DispatchOutcome::skill(tool_result_with(Some("# guidance"), Some("Skill probe"))),
+                "skill:probe",
+            ),
+        ] {
+            fence_and_label("probe", &origin, &mut outcome);
+            let data = outcome.result.data.clone().unwrap_or_default();
+            assert!(
+                data.starts_with(&crate::fence::open_marker(source)),
+                "{data}"
+            );
+            assert!(data.ends_with(crate::fence::FENCE_CLOSE), "{data}");
+            assert_eq!(outcome.fence_source.as_deref(), Some(source));
+        }
+    }
+
     // ── stage_root_component ───────────────────────────────────────────────────
 
     use crate::compiled_forms::EMPTY_COMPONENT;
@@ -10947,6 +11393,7 @@ inference:
             installed_generation: 0,
             session_id: "ses_test".to_string(),
             pending_a2a_events: Vec::new(),
+            pending_artifact_pulls: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             protected_paths: ProtectedPaths::default(),
             tool_annotations: ToolAnnotationMap::default(),
@@ -11222,7 +11669,12 @@ inference:
         use murmur_artifact::ToolRefresh;
         let (_project, workdir, mut state) = late_skill_fixture();
 
-        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        let mut held = HeldInventory::build(
+            &workdir,
+            None,
+            &state.installed_artifacts,
+            state.installed_generation,
+        );
         assert_eq!(
             tool_refresh_payload(held.tools())["tools"],
             serde_json::json!([{
@@ -11238,6 +11690,7 @@ inference:
             .refresh_before_call(
                 &workdir,
                 None,
+                &state.installed_artifacts,
                 ToolRefresh::Immediate,
                 state.installed_generation,
                 false,
@@ -11258,6 +11711,15 @@ inference:
             tools[0]["parameters"],
             serde_json::json!({"type": "object", "properties": {}})
         );
+        // The pull pinned it as this session's, so the refreshed entry is marked as at launch.
+        assert!(
+            tools[0]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(crate::agent::inventory::RUNTIME_ORIGIN_MARKER),
+            "{tools:?}"
+        );
+        assert!(!tools[1].to_string().contains("[origin: runtime"));
 
         let outcome = state
             .dispatch_agent_tool_async(
@@ -11271,6 +11733,10 @@ inference:
             .await
             .expect("the pulled skill dispatches");
         assert!(outcome.is_skill);
+        assert_eq!(
+            outcome.fence_source.as_deref(),
+            Some("skill:aaa-late-skill")
+        );
         assert!(matches!(
             outcome.result.status,
             murmur::tool::run::Status::Passed
@@ -11291,7 +11757,12 @@ inference:
         use murmur_artifact::ToolRefresh;
         let (_project, workdir, mut state) = late_skill_fixture();
 
-        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        let mut held = HeldInventory::build(
+            &workdir,
+            None,
+            &state.installed_artifacts,
+            state.installed_generation,
+        );
         let before = serde_json::to_string(&tool_refresh_payload(held.tools())).unwrap();
 
         pull_late_skill(&mut state);
@@ -11300,6 +11771,7 @@ inference:
             let refresh = held.refresh_before_call(
                 &workdir,
                 None,
+                &state.installed_artifacts,
                 ToolRefresh::Compaction,
                 state.installed_generation,
                 false,
@@ -11315,6 +11787,7 @@ inference:
             .refresh_before_call(
                 &workdir,
                 None,
+                &state.installed_artifacts,
                 ToolRefresh::Compaction,
                 state.installed_generation,
                 true,
@@ -11328,6 +11801,7 @@ inference:
             held.refresh_before_call(
                 &workdir,
                 None,
+                &state.installed_artifacts,
                 ToolRefresh::Compaction,
                 state.installed_generation,
                 false,
@@ -11343,18 +11817,24 @@ inference:
         use crate::agent::inventory::{build_tool_inventory, HeldInventory};
         let (_project, workdir, mut state) = late_skill_fixture();
 
-        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        let mut held = HeldInventory::build(
+            &workdir,
+            None,
+            &state.installed_artifacts,
+            state.installed_generation,
+        );
         pull_late_skill(&mut state);
         held.refresh_before_call(
             &workdir,
             None,
+            &state.installed_artifacts,
             murmur_artifact::ToolRefresh::Immediate,
             state.installed_generation,
             false,
         )
         .expect("rebuilt");
 
-        let fresh = build_tool_inventory(&workdir, None);
+        let fresh = build_tool_inventory(&workdir, None, &state.installed_artifacts);
         assert_eq!(
             serde_json::to_string(held.tools()).unwrap(),
             serde_json::to_string(&fresh).unwrap()
@@ -11374,7 +11854,12 @@ inference:
         let (_project, workdir, mut state) = late_skill_fixture();
 
         let prompt_skill = Some("aaa-late-skill");
-        let mut held = HeldInventory::build(&workdir, prompt_skill, state.installed_generation);
+        let mut held = HeldInventory::build(
+            &workdir,
+            prompt_skill,
+            &state.installed_artifacts,
+            state.installed_generation,
+        );
         let before = serde_json::to_string(held.tools()).unwrap();
         pull_late_skill(&mut state);
         assert_eq!(state.installed_generation, 1);
@@ -11383,6 +11868,7 @@ inference:
             held.refresh_before_call(
                 &workdir,
                 prompt_skill,
+                &state.installed_artifacts,
                 ToolRefresh::Immediate,
                 state.installed_generation,
                 false,
@@ -11399,6 +11885,7 @@ inference:
             held.refresh_before_call(
                 &workdir,
                 prompt_skill,
+                &state.installed_artifacts,
                 ToolRefresh::Immediate,
                 state.installed_generation,
                 true,
@@ -11416,7 +11903,12 @@ inference:
         use murmur_artifact::ToolRefresh;
         let (_project, workdir, state) = late_skill_fixture();
 
-        let mut held = HeldInventory::build(&workdir, None, state.installed_generation);
+        let mut held = HeldInventory::build(
+            &workdir,
+            None,
+            &state.installed_artifacts,
+            state.installed_generation,
+        );
         let before = serde_json::to_string(held.tools()).unwrap();
         fs::remove_dir_all(workdir.join("tools").join("zzz-existing-tool")).unwrap();
 
@@ -11426,6 +11918,7 @@ inference:
                     held.refresh_before_call(
                         &workdir,
                         None,
+                        &state.installed_artifacts,
                         trigger,
                         state.installed_generation,
                         compaction_committed,
@@ -12994,7 +13487,7 @@ inference:
             tool_result_with(None, None),
         ];
         for mut result in shapes {
-            fence_tool_result("web-fetch", &mut result);
+            fence_result(&crate::fence::tool_source("web-fetch"), &mut result);
             let text = result.data.expect("the fenced text lands in data");
             assert_eq!(
                 text.matches("<untrusted-content source=tool:web-fetch>")
@@ -13015,7 +13508,7 @@ inference:
     #[test]
     fn fence_moves_a_summary_only_result_into_fenced_data() {
         let mut result = tool_result_with(None, Some("ran ok"));
-        fence_tool_result("probe", &mut result);
+        fence_result(&crate::fence::tool_source("probe"), &mut result);
         assert_eq!(
             result.data.as_deref(),
             Some("<untrusted-content source=tool:probe>\nran ok\n</untrusted-content>")
@@ -13031,7 +13524,7 @@ inference:
     #[test]
     fn fence_wraps_the_empty_dispatch_result_too() {
         let mut result = tool_result_with(None, None);
-        fence_tool_result("probe", &mut result);
+        fence_result(&crate::fence::tool_source("probe"), &mut result);
         assert_eq!(
             result.data.as_deref(),
             Some(
@@ -13088,7 +13581,7 @@ inference:
         ];
 
         for mut outcome in shapes {
-            fence_and_label("probe", &mut outcome);
+            fence_and_label("probe", &LockOrigin::Operator, &mut outcome);
             let data = outcome.result.data.clone().unwrap_or_default();
             let fenced = data.contains(&crate::fence::open_marker("tool:probe"))
                 && data.contains(crate::fence::FENCE_CLOSE);
@@ -13116,7 +13609,7 @@ inference:
             truncated: true,
             metadata: vec![("state_effect".to_string(), "read".to_string())],
         };
-        fence_tool_result("probe", &mut result);
+        fence_result(&crate::fence::tool_source("probe"), &mut result);
         assert!(matches!(result.status, murmur::tool::run::Status::Error));
         assert_eq!(result.data_path.as_deref(), Some("out/log.txt"));
         assert!(result.truncated);

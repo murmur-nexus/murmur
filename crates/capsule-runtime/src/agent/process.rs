@@ -773,7 +773,11 @@ async fn run_harness(
         let _ = trace.write_harness_warning(W_RUN_002, &message).await;
     }
 
-    let inventory = build_tool_inventory(workdir, inference.system_prompt_artifact.as_deref());
+    let inventory = build_tool_inventory(
+        workdir,
+        inference.system_prompt_artifact.as_deref(),
+        &store_state.installed_artifacts,
+    );
     let bridge = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory).await;
 
     // A continued attempt's prompt is its reopen feedback alone: the resumed session already

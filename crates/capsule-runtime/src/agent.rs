@@ -583,6 +583,7 @@ pub(crate) async fn run_agent_loop(
     let mut inventory = HeldInventory::build(
         workdir,
         system_prompt_artifact,
+        &store_state.installed_artifacts,
         store_state.installed_generation,
     );
     log_tool_inventory(workdir, "Installed tools", inventory.tools())?;
@@ -827,6 +828,7 @@ pub(crate) async fn run_agent_loop(
         let refresh = inventory.refresh_before_call(
             workdir,
             system_prompt_artifact,
+            &store_state.installed_artifacts,
             inference.tool_refresh,
             store_state.installed_generation,
             std::mem::take(&mut compaction_committed),
@@ -1370,6 +1372,7 @@ pub(crate) async fn run_agent_loop(
                                     .write_skill_call(
                                         turn_u32,
                                         tool_name.clone(),
+                                        &store_state.artifact_origin(&tool_name),
                                         output_bytes,
                                         duration_ms,
                                         status.clone(),
@@ -6002,7 +6005,7 @@ forgery: {prompt}"
         let max_output_tokens = var("MAX_TOKENS")
             .and_then(|n| n.parse().ok())
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-        let tools = inventory::build_tool_inventory(std::path::Path::new(&workdir), None);
+        let tools = inventory::build_tool_inventory(std::path::Path::new(&workdir), None, &[]);
         let system =
             build_augmented_system_prompt(&name, &version, var("SYSTEM_PROMPT").as_deref(), false);
         let cache_key = build_prompt_cache_key(&name, &version, var("CONTEXT_ID").as_deref());

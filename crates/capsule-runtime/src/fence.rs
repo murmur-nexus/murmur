@@ -1,7 +1,8 @@
 //! The untrusted fence: the markers that name where a piece of model-facing content came from.
 //!
-//! Every tool result the runtime hands the model, and every task payload whose derived trust
-//! class is [`crate::origin::TrustClass::Untrusted`], arrives wrapped between
+//! Every tool result the runtime hands the model, every skill result whose `murmur.lock` origin
+//! derives [`crate::origin::TrustClass::Untrusted`] (see [`crate::origin::artifact_trust`]), and
+//! every task payload whose derived trust class is untrusted, arrives wrapped between
 //! [`open_marker`]'s output and [`FENCE_CLOSE`]. The fence is a *marker*, not a capability
 //! control: nothing is refused, delayed or reordered for being fenced, no grant is widened or
 //! narrowed by it, and the model is free to act on what it reads. It gives the model a stable
@@ -52,6 +53,12 @@ pub(crate) fn open_marker(source: &str) -> String {
 /// The source name for a tool result: `tool:<artifact name>`, e.g. `tool:web-fetch`.
 pub(crate) fn tool_source(tool_name: &str) -> String {
     format!("tool:{tool_name}")
+}
+
+/// The source name for a runtime-origin skill's guidance: `skill:<artifact name>`, e.g.
+/// `skill:pulled-style`. An operator-declared skill is never fenced and has no source name.
+pub(crate) fn skill_source(skill_name: &str) -> String {
+    format!("skill:{skill_name}")
 }
 
 /// The source name for a task payload: `task:<origin>`, e.g. `task:event`.
@@ -127,6 +134,15 @@ mod tests {
         );
         assert_eq!(fenced.matches(&open_marker("tool:web-fetch")).count(), 1);
         assert_eq!(fenced.matches(FENCE_CLOSE).count(), 1);
+    }
+
+    #[test]
+    fn fence_skill_source_names_the_skill() {
+        assert_eq!(skill_source("pulled-style"), "skill:pulled-style");
+        assert_eq!(
+            open_marker(&skill_source("pulled-style")),
+            "<untrusted-content source=skill:pulled-style>"
+        );
     }
 
     #[test]

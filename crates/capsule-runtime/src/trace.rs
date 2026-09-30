@@ -3,7 +3,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use murmur_artifact::{ContainmentClass, TraceCapture};
+use murmur_artifact::{ContainmentClass, LockOrigin, TraceCapture};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -18,6 +18,7 @@ use crate::{
     lanes::TaskLane,
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
+    types::InstalledArtifactSummary,
 };
 
 pub(crate) struct TraceWriter {
@@ -61,6 +62,9 @@ pub(crate) struct TraceWriter {
     /// `inference.tool_refresh` as `ToolRefresh::wire_name` spells it, or `None` under
     /// `transport: process`. Set by [`Self::set_tool_refresh`] before `session_start` is written.
     tool_refresh: Option<&'static str>,
+    /// The staged artifacts whose `murmur.lock` pin a running capsule fetched. Set by
+    /// [`Self::set_runtime_artifacts`] before `session_start` is written; empty until then.
+    runtime_artifacts: Vec<RuntimeArtifact>,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -287,6 +291,10 @@ struct SessionStartEvent {
     /// `inference.tool_refresh`: `"compaction"` or `"immediate"` under `transport: http`, `null`
     /// under `transport: process`, where the harness owns its tool list. Always written.
     tool_refresh: Option<&'static str>,
+    /// Every staged artifact whose `murmur.lock` origin is `runtime` — pinned by a running
+    /// capsule's `manage.pull()`, never vetted by the operator — in staging order. Each reaches
+    /// the model marked untrusted. Always written, `[]` when there are none.
+    runtime_artifacts: Vec<RuntimeArtifact>,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -509,6 +517,11 @@ struct SkillCallEvent {
     output_bytes: u64,
     duration_ms: u64,
     status: String,
+    /// The skill's `murmur.lock` origin: `"operator"` or `"runtime"`. Always written.
+    origin: &'static str,
+    /// `"trusted"` for an operator pin, `"untrusted"` for a runtime one, whose guidance reached
+    /// the model fenced. Always written, in the spelling `task_start.trust` uses.
+    trust: &'static str,
 }
 
 #[derive(Serialize)]
@@ -803,6 +816,28 @@ struct A2aSendEvent {
     /// The class this runtime stamped on the outgoing request, so a chain of capsules reads the
     /// same way from the sending end as the receiving end's `task_start` reads it.
     trust: String,
+}
+
+/// A successful `manage.pull()`: the artifact a running capsule fetched and pinned in
+/// `murmur.lock`. A refused or failed pull writes nothing.
+#[derive(Serialize)]
+struct ArtifactPulledEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    name: String,
+    version: String,
+    /// `"skill"` or `"tool"`, the only roles a pull installs.
+    runtime: &'static str,
+    /// The origin the lock entry holds after the pull: `"runtime"`, or `"operator"` when the
+    /// operator had already pinned the same version.
+    origin: &'static str,
+    /// The session the lock entry names as the puller — this one, unless an earlier pull of the
+    /// same pin recorded another. `null` for an `"operator"` entry.
+    session: Option<String>,
+    trust: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1577,6 +1612,7 @@ impl TraceWriter {
             gateways: Vec::new(),
             control: None,
             tool_refresh: None,
+            runtime_artifacts: Vec::new(),
             resumed_from,
             context_id,
             spawned_by,
@@ -1665,6 +1701,24 @@ impl TraceWriter {
     /// Records what `control:` declares for `session_start.control`.
     pub(crate) fn set_control(&mut self, control: Option<SessionControl>) {
         self.control = control;
+    }
+
+    /// Records the runtime-origin entries of `installed` for `session_start.runtime_artifacts`,
+    /// in `installed`'s order. Operator-declared entries are left out.
+    pub(crate) fn set_runtime_artifacts(&mut self, installed: &[InstalledArtifactSummary]) {
+        self.runtime_artifacts = installed
+            .iter()
+            .filter_map(|artifact| match &artifact.origin {
+                LockOrigin::Runtime { session } => Some(RuntimeArtifact {
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    origin: artifact.origin.as_str(),
+                    session: session.clone(),
+                    trust: crate::origin::artifact_trust(&artifact.origin).as_str(),
+                }),
+                LockOrigin::Operator => None,
+            })
+            .collect();
     }
 
     /// Records that this inference call is the first to use a setting value a controller set:
@@ -1761,6 +1815,7 @@ impl TraceWriter {
             gateways: self.gateways.clone(),
             control: self.control.clone(),
             tool_refresh: self.tool_refresh,
+            runtime_artifacts: self.runtime_artifacts.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -1941,10 +1996,14 @@ impl TraceWriter {
 
     /// Records a skill invocation as a `skill_call` event. Skill calls are NOT counted in
     /// `total_tool_calls` — they appear in a separate `── Skill calls ──` section in `mur trace show`.
+    ///
+    /// `origin` is the skill's `murmur.lock` origin; the record's `trust` is derived from it
+    /// through [`crate::origin::artifact_trust`], the same rule that decides the skill's fence.
     pub(crate) async fn write_skill_call(
         &mut self,
         turn: u32,
         skill_name: String,
+        origin: &LockOrigin,
         output_bytes: u64,
         duration_ms: u64,
         status: String,
@@ -1961,6 +2020,8 @@ impl TraceWriter {
             output_bytes,
             duration_ms,
             status,
+            origin: origin.as_str(),
+            trust: crate::origin::artifact_trust(origin).as_str(),
         };
         self.write_event(&event).await
         // Intentionally does not increment total_tool_calls or task_tool_calls.
@@ -2167,6 +2228,34 @@ impl TraceWriter {
             context_id: context_id.to_string(),
             traceparent: traceparent.map(str::to_string),
             trust: trust.as_str().to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Records a successful `manage.pull()` of `artifact`, as the store summarised it after the
+    /// lock was written. Parented to the session node when `session_start` was written through
+    /// this writer, and to nothing otherwise — the script path drains these through a writer it
+    /// opens after the guest returns, as it does its buffered `a2a_send` lines.
+    pub(crate) async fn write_artifact_pulled(
+        &mut self,
+        artifact: &InstalledArtifactSummary,
+    ) -> std::io::Result<()> {
+        let session = match &artifact.origin {
+            LockOrigin::Runtime { session } => Some(session.clone()),
+            LockOrigin::Operator => None,
+        };
+        let event = ArtifactPulledEvent {
+            event_type: "artifact_pulled",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
+            runtime: artifact.runtime.as_str(),
+            origin: artifact.origin.as_str(),
+            session,
+            trust: crate::origin::artifact_trust(&artifact.origin).as_str(),
         };
         self.write_event(&event).await
     }
@@ -2834,6 +2923,20 @@ pub(crate) struct SessionGateway {
     /// Whether the gateway is admitted against the spend meter: true only for the configured
     /// `transport: http` driver's.
     pub(crate) metered: bool,
+}
+
+/// One element of `session_start.runtime_artifacts`: a staged artifact whose `murmur.lock` pin a
+/// running capsule fetched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RuntimeArtifact {
+    name: String,
+    version: String,
+    /// Always `"runtime"`: only runtime-origin entries are listed.
+    origin: &'static str,
+    /// The session the lock entry names as the puller.
+    session: String,
+    /// Always `"untrusted"`, derived from `origin`.
+    trust: &'static str,
 }
 
 /// `session_start.control`: the names a capsule's `control:` block declares, never a value.
@@ -4998,9 +5101,16 @@ mod tests {
     async fn skill_call_writes_skill_call_event() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_skill_call(2, "my-skill".to_string(), 1024, 8, "ok".to_string())
-            .await
-            .unwrap();
+        w.write_skill_call(
+            2,
+            "my-skill".to_string(),
+            &LockOrigin::Operator,
+            1024,
+            8,
+            "ok".to_string(),
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -5033,9 +5143,16 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_skill_call(1, "my-skill".to_string(), 512, 3, "ok".to_string())
-            .await
-            .unwrap();
+        w.write_skill_call(
+            1,
+            "my-skill".to_string(),
+            &LockOrigin::Operator,
+            512,
+            3,
+            "ok".to_string(),
+        )
+        .await
+        .unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
 
@@ -5237,6 +5354,9 @@ mod tests {
         )
         .await
         .unwrap();
+        w.write_artifact_pulled(&runtime_summary("pulled-style", ArtifactRuntime::Skill))
+            .await
+            .unwrap();
         w.write_task_end("tsk_1", "ok", 0).await.unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
@@ -5278,6 +5398,137 @@ mod tests {
         assert_eq!(by_type("shell")["parent_id"], turn["event_id"]);
         assert_eq!(by_type("task_end")["parent_id"], task["event_id"]);
         assert_eq!(by_type("session_end")["parent_id"], session["event_id"]);
+        assert_eq!(by_type("artifact_pulled")["parent_id"], session["event_id"]);
+    }
+
+    use crate::types::InstalledArtifactSummary;
+    use murmur_artifact::ArtifactRuntime;
+
+    fn runtime_summary(name: &str, runtime: ArtifactRuntime) -> InstalledArtifactSummary {
+        InstalledArtifactSummary {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            runtime,
+            implementation: None,
+            origin: LockOrigin::Runtime {
+                session: "ses_puller".to_string(),
+            },
+        }
+    }
+
+    fn operator_summary(name: &str, runtime: ArtifactRuntime) -> InstalledArtifactSummary {
+        InstalledArtifactSummary {
+            origin: LockOrigin::Operator,
+            ..runtime_summary(name, runtime)
+        }
+    }
+
+    /// `runtime_artifacts` is always written: `[]` for a session whose every artifact the operator
+    /// pinned, including one that never called the setter.
+    #[tokio::test]
+    async fn runtime_origin_session_start_lists_nothing_for_an_operator_session() {
+        for set in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            if set {
+                w.set_runtime_artifacts(&[
+                    operator_summary("house-style", ArtifactRuntime::Skill),
+                    operator_summary("fetcher", ArtifactRuntime::Tool),
+                ]);
+            }
+            w.write_session_start(10, Vec::new()).await.unwrap();
+            w.flush().await.unwrap();
+            let events = read_events(dir.path());
+            assert_eq!(events[0]["runtime_artifacts"], serde_json::json!([]));
+        }
+    }
+
+    /// Only runtime-origin entries are listed, in the order staging recorded them, each naming
+    /// its puller.
+    #[tokio::test]
+    async fn runtime_origin_session_start_lists_runtime_artifacts_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.set_runtime_artifacts(&[
+            runtime_summary("zeta-tool", ArtifactRuntime::Tool),
+            operator_summary("house-style", ArtifactRuntime::Skill),
+            InstalledArtifactSummary {
+                origin: LockOrigin::Runtime {
+                    session: "ses_other".to_string(),
+                },
+                ..runtime_summary("alpha-style", ArtifactRuntime::Skill)
+            },
+        ]);
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(
+            events[0]["runtime_artifacts"],
+            serde_json::json!([
+                {"name": "zeta-tool", "version": "1.0.0", "origin": "runtime",
+                 "session": "ses_puller", "trust": "untrusted"},
+                {"name": "alpha-style", "version": "1.0.0", "origin": "runtime",
+                 "session": "ses_other", "trust": "untrusted"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_origin_skill_call_carries_origin_and_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for origin in [
+            LockOrigin::Operator,
+            LockOrigin::Runtime {
+                session: "ses_puller".to_string(),
+            },
+        ] {
+            w.write_skill_call(0, "a-skill".to_string(), &origin, 1, 1, "ok".to_string())
+                .await
+                .unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events[0]["origin"], "operator");
+        assert_eq!(events[0]["trust"], "trusted");
+        assert_eq!(events[1]["origin"], "runtime");
+        assert_eq!(events[1]["trust"], "untrusted");
+    }
+
+    /// Every key is written, `session` included: `null` when the lock entry is the operator's.
+    #[tokio::test]
+    async fn runtime_origin_artifact_pulled_writes_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_artifact_pulled(&runtime_summary("pulled-style", ArtifactRuntime::Skill))
+            .await
+            .unwrap();
+        w.write_artifact_pulled(&operator_summary("fetcher", ArtifactRuntime::Tool))
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let runtime = &events[0];
+        assert_eq!(runtime["event_type"], "artifact_pulled");
+        assert_eq!(runtime["name"], "pulled-style");
+        assert_eq!(runtime["version"], "1.0.0");
+        assert_eq!(runtime["runtime"], "skill");
+        assert_eq!(runtime["origin"], "runtime");
+        assert_eq!(runtime["session"], "ses_puller");
+        assert_eq!(runtime["trust"], "untrusted");
+        assert!(
+            runtime["parent_id"].is_null(),
+            "no session_start was written"
+        );
+
+        let operator = &events[1];
+        assert_eq!(operator["runtime"], "tool");
+        assert_eq!(operator["origin"], "operator");
+        assert!(operator.get("session").is_some_and(Value::is_null));
+        assert_eq!(operator["trust"], "trusted");
     }
 
     /// A hook's `run-inference` record is a product of the turn it ran inside, not a turn of
@@ -5497,9 +5748,16 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_skill_call(0, "house-style".to_string(), 12, 1, "ok".to_string())
-            .await
-            .unwrap();
+        w.write_skill_call(
+            0,
+            "house-style".to_string(),
+            &LockOrigin::Operator,
+            12,
+            1,
+            "ok".to_string(),
+        )
+        .await
+        .unwrap();
         w.write_compaction(0, 100, 40).await.unwrap();
         w.write_task_end("tsk_1", "ok", 0).await.unwrap();
         w.write_inference(

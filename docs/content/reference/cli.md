@@ -701,8 +701,8 @@ one of three lines:
 
 | Line | Meaning | Effect |
 |---|---|---|
-| `⚠ name@version   — pulled at runtime by session <session>` | A declared tool or skill whose pin a capsule pulled. `mur run` stages it | Warning: `Fix: mur install name@version`. Exit code unchanged |
-| `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver` or `gateway:`. `mur run` refuses it with [`E-RUN-043`](diagnostics.md#e-run-043) | Failure: `Fix: mur install name@version`. Exit `1` |
+| `⚠ name@version   — pulled at runtime by session <session>` | A declared tool or skill whose pin a capsule pulled. `mur run` stages it, [marked untrusted](../concepts/access-control.md#artifact-origin) | Warning: `Fix: mur install name@version`. Exit code unchanged |
+| `✗ name@version   — murmur.lock pins 'name' from a runtime pull by session <session>; murmur.yaml declares it with <declared>` | `<declared>` is `runtime: hook`, `runtime: driver`, `gateway:` or `inference.system_prompt_artifact`. `mur run` refuses it with [`E-RUN-043`](diagnostics.md#e-run-043) | Failure: `Fix: mur install name@version`. Exit `1` |
 | `· name@version   pulled at runtime by session <session> — not declared in murmur.yaml, so mur run does not stage it` | A pulled entry `murmur.yaml` does not declare, printed after the checklist | None |
 
 **Output — runtime-pulled pins:**
@@ -1629,7 +1629,7 @@ Output sections, in the order they are printed:
 
 | Section | Printed | Contents |
 |---|---|---|
-| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session` |
+| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session`. For a session that staged a [runtime pin](workdir.md#lock-origin), a `runtime pins: <name>@<version> (pulled by <session>), …` line follows `tools` |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
@@ -1638,7 +1638,8 @@ Output sections, in the order they are printed:
 | Wire | one or more turns carrying content hashes, or one or more [`tools_refreshed`](observability-schemas.md#tools-refreshed) records | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried. Then one `refreshed:  turn <n>  <trigger>  +<added>  -<removed>` row per turn whose tool list changed, and the `--body` command that prints one of the hashes |
 | Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
 | Redundant calls | always | Calls that re-read a resource nothing had changed since. Agent turns and plan steps are scored against one shared history, so either can be named as the call or as the earlier read it duplicates |
-| Skill calls | always | Count, ok/error breakdown, success rate, average latency |
+| Skill calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call. The call of a skill whose `skill_call.trust` is `untrusted` ends in ` runtime/untrusted`: `turn 1  pulled-style 2ms ✓ runtime/untrusted` |
+| Pulled at runtime | one or more [`artifact_pulled`](observability-schemas.md#session-trace-tracejsonl) records | One `<name>@<version>  <runtime>  <origin>/<trust>` row per pull, in file order |
 | Shell calls | always | Count, exit code distribution, average latency |
 | Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
 | Cancelled | one or more [`task_canceled`](observability-schemas.md#task-canceled) records | One `task_canceled  at <phase>` row per cancel, naming what was still running |
@@ -1790,6 +1791,15 @@ task tsk_11112222…  ctx_11112222…  (a2a)
     tool_call  bash  120ms  ✓
     shell      /usr/bin/bash  exit 0  50ms
   turn 2  end_turn
+```
+
+A call to a skill whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule pulled ends
+in its origin and trust class, and a successful `manage.pull()` renders as an `artifact_pulled`
+row:
+
+```text
+    skill_call pulled-style  2ms  ✓ (runtime/untrusted)
+artifact_pulled pulled-style@0.1.0 (runtime/untrusted)
 ```
 
 A call a policy hook refused renders as a `call_denied` row under its turn:

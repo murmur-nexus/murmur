@@ -34,9 +34,11 @@ pub(crate) struct DispatchOutcome {
     /// same branch that applies the fence, so the label and the wrapping cannot drift: a caller
     /// reading this never re-derives a source name by parsing the content back.
     ///
-    /// `None` on every outcome that leaves the private unfenced dispatch — the skill branch,
-    /// and [`crate::runtime::CapsuleStoreState::dispatch_submit_plan`]'s route, whose step
-    /// output is fenced later as one field of a report.
+    /// `Some("tool:<name>")` on every non-skill outcome, `Some("skill:<name>")` on a skill whose
+    /// `murmur.lock` origin is `runtime`, and `None` on an operator-declared skill and on every
+    /// outcome that leaves the private unfenced dispatch — that is,
+    /// [`crate::runtime::CapsuleStoreState::dispatch_submit_plan`]'s route, whose step output is
+    /// fenced later as one field of a report.
     pub fence_source: Option<String>,
     /// Set when this dispatch failed in a way that ends the *session* rather than just this
     /// tool call — today only a `sealed` composed-root construction failure

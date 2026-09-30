@@ -69,7 +69,7 @@ pub enum RuntimeError {
 
     /// A `murmur.lock` pin written by `manage.pull()` is declared in a role only an
     /// operator-declared pin may carry. `declared_as` is the offending manifest text:
-    /// `runtime: hook`, `runtime: driver` or `gateway:`.
+    /// `runtime: hook`, `runtime: driver`, `gateway:` or `inference.system_prompt_artifact`.
     #[error(
         "murmur.lock pins '{name}@{version}' from a runtime pull by session {session}, and \
          murmur.yaml declares it with {declared_as}, which only an operator-declared pin may carry"
