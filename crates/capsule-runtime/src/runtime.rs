@@ -17,10 +17,10 @@ use murmur_artifact::{
     ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockOrigin, LockedSha256,
     LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact,
-    RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
-    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025,
-    W_SEC_027, W_SEC_030,
+    RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_RUN_003,
+    W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
+    W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024,
+    W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -1520,14 +1520,11 @@ pub fn stage_session(
     )?;
     // Built here, before the gateways, because an injected credential reads its store. A
     // capsule with no inference block serves no door, and the manifest refuses `control:` on one.
-    let control = request
+    let injected_secrets = request
         .control
         .as_ref()
-        .zip(request.inference.as_ref())
-        .map(|(control, inference)| {
-            Arc::new(crate::control_plane::ControlState::new(control, inference))
-        });
-    let injected_secrets = control.as_ref().map(|control| control.secrets());
+        .filter(|_| request.inference.is_some())
+        .map(|control| Arc::new(crate::control_plane::InjectedSecrets::new(&control.secrets)));
     // Minted at staging so the launcher can hand the tokens out before the door opens. The key is
     // generated here for this session alone and is never written.
     let door_auth = request
@@ -1537,7 +1534,7 @@ pub fn stage_session(
         .transpose()
         .map_err(RuntimeError::Runtime)?
         .map(Arc::new);
-    let gateways = stage_gateways(
+    let (gateways, unresolved_credentials) = stage_gateways(
         request.inference.as_ref(),
         &request.artifacts,
         request.credentials_file.as_deref(),
@@ -1546,6 +1543,23 @@ pub fn stage_session(
         &spend,
         injected_secrets.as_ref(),
     )?;
+    let driver_choices = request
+        .inference
+        .as_ref()
+        .map(|inference| stage_driver_choices(inference, &gateways, &unresolved_credentials));
+    // Built after the gateways, because whether a driver choice can be selected depends on the
+    // credential staging left it.
+    let control = request
+        .control
+        .as_ref()
+        .zip(request.inference.as_ref())
+        .zip(driver_choices.clone())
+        .zip(injected_secrets)
+        .map(|(((control, inference), choices), secrets)| {
+            Arc::new(crate::control_plane::ControlState::new(
+                control, inference, choices, secrets,
+            ))
+        });
     for hook in &mut hook_components {
         hook.gateway = gateways.for_artifact(&hook.name).cloned();
     }
@@ -1657,6 +1671,18 @@ pub fn stage_session(
     // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
     // plan reaches this session's own tools, so there is no granted list to fold into it.
     write_submit_plan_tool_manifest(&workdir, request.capability_policy.plan_submit)?;
+    write_switch_driver_tool_manifest(
+        &workdir,
+        control
+            .as_ref()
+            .filter(|control| {
+                control.permits(
+                    crate::control_plane::Principal::Agent,
+                    murmur_artifact::ControllableSetting::InferenceDriver,
+                )
+            })
+            .map(|control| control.choices()),
+    )?;
 
     // Read once, here, from the manifests just staged: the schema is fixed before the session
     // starts, so an annotation is the tool author's statement and never a call-time choice. A
@@ -1893,6 +1919,7 @@ fn launch(
         .map(|inference| inference_env_pairs(inference, staged.gateways.inference()))
         .unwrap_or_default();
     let gateways = staged.gateways.clone();
+    let control_for_state = staged.control.clone();
     let spend = Arc::clone(&staged.spend);
 
     if let Some(ref inference) = staged.inference {
@@ -1989,7 +2016,16 @@ fn launch(
         // written beside where the running record will be before that record exists. The guard
         // lives for the rest of the launch, so the file goes when the session does.
         let session_control = staged.control.as_ref().map(|state| state.session_control());
-        let (control_plane, _control_token) = match staged.control.as_ref() {
+        let session_inference_choices = staged
+            .control
+            .as_ref()
+            .map(|state| session_inference_choices(state.choices()))
+            .unwrap_or_default();
+        let (control_plane, _control_token) = match staged
+            .control
+            .as_ref()
+            .filter(|state| state.has_controller_surface())
+        {
             Some(state) => {
                 let (plane, token) = crate::control_plane::ControlPlane::declared(
                     session_id.clone(),
@@ -2328,6 +2364,7 @@ fn launch(
             });
             trace.set_gateways(session_gateways(&gateways));
             trace.set_control(session_control);
+            trace.set_inference_choices(session_inference_choices);
             trace.set_tool_refresh(
                 (inference.transport != "process").then(|| inference.tool_refresh.wire_name()),
             );
@@ -2529,6 +2566,8 @@ fn launch(
                         driver_continuation_id: None,
                         driver_continuation_context_id: None,
                         driver_continuation_acked_len: 0,
+                        driver_continuation_choice: None,
+                        control: control_for_state.clone(),
                     };
 
                     // Backing for the hooks' `murmur:runtime/inference` import.
@@ -3525,6 +3564,8 @@ fn launch(
         driver_continuation_id: None,
         driver_continuation_context_id: None,
         driver_continuation_acked_len: 0,
+        driver_continuation_choice: None,
+        control: None,
         limits: capsule_limits.limiter(),
     };
 
@@ -4363,7 +4404,8 @@ pub fn warn_on_launch_only_gateway_credential(
 }
 
 /// Warns (non-fatal, once per gateway) when an artifact reaches its upstream through a credential
-/// gateway that is not the configured `transport: http` driver's, and so is not metered.
+/// gateway that is not a driver choice's — the configured `transport: http` driver's or an
+/// `inference.alternates` driver's — and so is not metered.
 ///
 /// Such a gateway sends without a spend admission and counts toward neither
 /// `inference.max_session_tokens` nor `spend.machine_tokens_per_day`. Shared between `mur run` and
@@ -4377,11 +4419,23 @@ pub fn warn_on_unmetered_gateways(
         .filter(|inference| inference.transport == "http")
         .and_then(|inference| inference.driver.as_ref())
         .map(|driver| driver.artifact.as_str());
+    let alternate_drivers: Vec<&str> = inference
+        .filter(|inference| inference.transport == "http")
+        .map(|inference| {
+            inference
+                .alternates
+                .iter()
+                .map(|alternate| alternate.driver.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
     for artifact in artifacts {
         let Some(gateway) = artifact.gateway.as_ref() else {
             continue;
         };
-        if inference_driver == Some(artifact.name.as_str()) {
+        if inference_driver == Some(artifact.name.as_str())
+            || alternate_drivers.contains(&artifact.name.as_str())
+        {
             continue;
         }
         let host = gateway_endpoint_host(&gateway.endpoint);
@@ -4995,6 +5049,29 @@ fn inference_env_pairs(
     pairs
 }
 
+/// `env` with the three `MURMUR_INFERENCE_*` variables that name a driver choice replaced by
+/// `choice`'s own: its gateway's endpoint, its model and its driver artifact. Order is kept, so a
+/// primary-choice dispatch sees exactly the session-wide list.
+fn driver_choice_env(
+    env: &[(String, String)],
+    choice: &crate::driver_choice::DriverChoice,
+    gateway: Option<&Arc<CredentialGateway>>,
+) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(key, value)| {
+            let value = match key.as_str() {
+                "MURMUR_INFERENCE_ENDPOINT" => gateway
+                    .map(|gateway| gateway.guest_endpoint())
+                    .unwrap_or_default(),
+                "MURMUR_INFERENCE_MODEL" => choice.model.clone(),
+                "MURMUR_INFERENCE_DRIVER" => choice.driver.clone(),
+                _ => value.clone(),
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
 /// Suspend an A2A task in the InputRequired state, await external input, and resume.
 ///
 /// Called from the `murmur:task/task#request-input` host function registered in the tool linker.
@@ -5332,6 +5409,13 @@ pub(crate) struct CapsuleStoreState {
     /// Number of leading entries of the logical `messages` array the driver has already
     /// acknowledged. On an incremental Turn the host transmits only `messages[acked_len..]`.
     pub(crate) driver_continuation_acked_len: usize,
+    /// The driver choice `driver_continuation_id` was returned under. The id is state held on that
+    /// choice's provider, so a call under any other choice never presents it.
+    pub(crate) driver_continuation_choice: Option<String>,
+    /// What a controller or the agent has changed on this session, shared from
+    /// [`StagedSession::control`]. Read by the runtime-provided `switch-driver` tool; `None` for a
+    /// capsule with no `control:` block, and on the script-capsule path.
+    pub(crate) control: Option<Arc<crate::control_plane::ControlState>>,
 }
 
 impl CapsuleStoreState {
@@ -5358,24 +5442,33 @@ impl CapsuleStoreState {
     /// **and** was established under `context_id`. The context-id guard is required for
     /// correctness: without it, an incremental send against a driver-side continuation from
     /// an unrelated conversation would silently corrupt the driver's context.
-    pub(crate) fn active_continuation(&self, context_id: Option<&str>) -> Option<(&str, usize)> {
+    pub(crate) fn active_continuation(
+        &self,
+        context_id: Option<&str>,
+        choice: &str,
+    ) -> Option<(&str, usize)> {
         let id = self.driver_continuation_id.as_deref()?;
-        if self.driver_continuation_context_id.as_deref() != context_id {
+        if self.driver_continuation_context_id.as_deref() != context_id
+            || self.driver_continuation_choice.as_deref() != Some(choice)
+        {
             return None;
         }
         Some((id, self.driver_continuation_acked_len))
     }
 
-    /// Persist the continuation id a driver returned on this Turn, scoped to `context_id`,
-    /// recording that the driver now knows the first `acked_len` entries of `messages`.
+    /// Persist the continuation id a driver returned on this Turn, scoped to `context_id` and to
+    /// the driver choice `choice` it was returned under, recording that the driver now knows the
+    /// first `acked_len` entries of `messages`.
     pub(crate) fn record_continuation(
         &mut self,
         id: String,
         context_id: Option<String>,
+        choice: &str,
         acked_len: usize,
     ) {
         self.driver_continuation_id = Some(id);
         self.driver_continuation_context_id = context_id;
+        self.driver_continuation_choice = Some(choice.to_string());
         self.driver_continuation_acked_len = acked_len;
     }
 
@@ -5384,6 +5477,7 @@ impl CapsuleStoreState {
     pub(crate) fn clear_continuation(&mut self) {
         self.driver_continuation_id = None;
         self.driver_continuation_context_id = None;
+        self.driver_continuation_choice = None;
         self.driver_continuation_acked_len = 0;
     }
 
@@ -5810,8 +5904,13 @@ fn gateway_for_store(
 /// [`RuntimeError::GatewayWithoutCredential`] before anything is resolved.
 ///
 /// The configured `transport: http` driver's gateway is metered against `spend` and becomes the
-/// table's inference gateway; every other gateway is unmetered. An artifact without `gateway:` is
+/// table's inference gateway, and each `inference.alternates` driver's is metered against the same
+/// meter as an alternate's; every other gateway is unmetered. An artifact without `gateway:` is
 /// never asked for `upstream_auth:`.
+///
+/// An alternate's driver whose `${NAME}` is found nowhere does not refuse the launch: every other
+/// check is still made, no gateway is staged for it, and it is returned as an
+/// [`UnresolvedCredential`] so its choices are staged unavailable.
 ///
 /// A `${NAME}` that `injected` declares resolves to an injected credential reading that store,
 /// and neither `credentials_file` nor the environment is consulted for it.
@@ -5823,12 +5922,23 @@ fn stage_gateways(
     installed_artifacts: &[InstalledArtifactSummary],
     spend: &Arc<SpendMeter>,
     injected: Option<&Arc<crate::control_plane::InjectedSecrets>>,
-) -> Result<GatewayTable, RuntimeError> {
-    let inference_driver = inference
-        .filter(|inference| inference.transport == "http")
+) -> Result<(GatewayTable, Vec<UnresolvedCredential>), RuntimeError> {
+    let http_inference = inference.filter(|inference| inference.transport == "http");
+    let inference_driver = http_inference
         .and_then(|inference| inference.driver.as_ref())
         .map(|driver| driver.artifact.as_str());
+    let alternate_drivers: HashSet<&str> = http_inference
+        .map(|inference| {
+            inference
+                .alternates
+                .iter()
+                .map(|alternate| alternate.driver.as_str())
+                .filter(|driver| Some(*driver) != inference_driver)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut table = GatewayTable::default();
+    let mut unresolved = Vec::new();
     for artifact in artifacts {
         let Some(declared) = artifact.gateway.as_ref() else {
             continue;
@@ -5839,7 +5949,8 @@ fn stage_gateways(
                 endpoint: declared.endpoint.clone(),
             });
         }
-        let credential = declared
+        let is_alternate = alternate_drivers.contains(artifact.name.as_str());
+        let resolved = declared
             .api_key
             .as_ref()
             .map(|reference| match (reference, injected) {
@@ -5853,7 +5964,14 @@ fn stage_gateways(
                 _ => GatewayCredential::resolve(&artifact.name, reference, credentials_file)
                     .map(Arc::new),
             })
-            .transpose()?;
+            .transpose();
+        let (credential, unresolved_credential) = match resolved {
+            Ok(credential) => (credential, None),
+            Err(RuntimeError::GatewayCredentialNotFound { variable, .. }) if is_alternate => {
+                (None, Some(variable))
+            }
+            Err(error) => return Err(error),
+        };
         let installed = installed_artifacts
             .iter()
             .find(|installed| installed.name == artifact.name);
@@ -5881,20 +5999,107 @@ fn stage_gateways(
             Ok(None) => return Err(refuse(None)),
             Err(err) => return Err(refuse(Some(err.to_string()))),
         };
-        let metering = if inference_driver == Some(artifact.name.as_str()) {
+        if let Some(credential) = unresolved_credential {
+            unresolved.push(UnresolvedCredential {
+                driver: artifact.name.clone(),
+                credential,
+            });
+            continue;
+        }
+        let metering = if inference_driver == Some(artifact.name.as_str()) || is_alternate {
             GatewayMetering::Inference(Arc::clone(spend))
         } else {
             GatewayMetering::Unmetered
         };
-        table.insert(CredentialGateway::new(
+        let gateway = CredentialGateway::new(
             artifact.name.clone(),
             &declared.endpoint,
             auth,
             credential,
             metering,
-        )?);
+        )?;
+        if is_alternate {
+            table.insert_alternate(gateway);
+        } else {
+            table.insert(gateway);
+        }
     }
-    Ok(table)
+    Ok((table, unresolved))
+}
+
+/// An `inference.alternates` driver whose gateway credential was found nowhere at launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnresolvedCredential {
+    pub(crate) driver: String,
+    pub(crate) credential: String,
+}
+
+/// The session's driver choices, each with the credential staging left its driver's gateway, and
+/// a `W-RUN-003` printed for every choice staged unavailable.
+fn stage_driver_choices(
+    inference: &InferenceConfig,
+    gateways: &GatewayTable,
+    unresolved: &[UnresolvedCredential],
+) -> crate::driver_choice::DriverChoices {
+    let mut choices = crate::driver_choice::DriverChoices::declared(inference);
+    let drivers: Vec<String> = choices.iter().map(|choice| choice.driver.clone()).collect();
+    for driver in drivers {
+        if let Some(missing) = unresolved.iter().find(|entry| entry.driver == driver) {
+            choices.record_credential(&driver, "none", None, Some(&missing.credential));
+            continue;
+        }
+        let credential = gateways
+            .inference_for(&driver)
+            .map(|gateway| gateway.credential());
+        let (source, injected) = match credential {
+            Some(Some(credential)) => (
+                credential.source().trace_name(),
+                matches!(
+                    credential.source(),
+                    crate::gateway_credential::CredentialSource::Injected { .. }
+                )
+                .then(|| credential.source().credential_name())
+                .flatten(),
+            ),
+            Some(None) => ("keyless", None),
+            None => ("none", None),
+        };
+        choices.record_credential(&driver, source, injected, None);
+    }
+    for choice in choices.iter().filter(|choice| !choice.staged()) {
+        crate::runtime_err!(
+            "[capsule-runtime] warning[{W_RUN_003}]: driver choice '{}' (driver {}, model {}) is \
+             unavailable: its credential {} was found in neither the global config's credentials: \
+             nor the environment, so a switch to it will be refused; the session runs on the \
+             primary ({})",
+            choice.name,
+            choice.driver,
+            choice.model,
+            choice.unresolved_credential.as_deref().unwrap_or_default(),
+            murmur_artifact::runtime_warning_link(W_RUN_003)
+        );
+    }
+    choices
+}
+
+/// `session_start.inference_choices`: every driver choice, the primary first, or nothing for a
+/// capsule with no alternates. Never a key.
+fn session_inference_choices(
+    choices: &crate::driver_choice::DriverChoices,
+) -> Vec<crate::trace::SessionInferenceChoice> {
+    if !choices.has_alternates() {
+        return Vec::new();
+    }
+    choices
+        .iter()
+        .map(|choice| crate::trace::SessionInferenceChoice {
+            name: choice.name.clone(),
+            driver: choice.driver.clone(),
+            model: choice.model.clone(),
+            credential_source: choice.credential_source,
+            available: choice.staged(),
+        })
+        .collect()
 }
 
 /// `session_start.gateways`: every gateway of the session, the inference gateway first. Never a
@@ -6322,14 +6527,21 @@ impl CapsuleStoreState {
             .await
     }
 
-    /// The agent loop's driver turn: the one dispatch the inference gateway is attached to, and
-    /// only under the spend admission the loop opened for it.
+    /// The agent loop's driver turn on `choice`: the one dispatch a driver choice's metered
+    /// gateway is attached to, and only under the spend admission the loop opened for it.
+    ///
+    /// The driver's store sees `MURMUR_INFERENCE_ENDPOINT`, `MURMUR_INFERENCE_MODEL` and
+    /// `MURMUR_INFERENCE_DRIVER` as the choice's own — its gateway, its model, its artifact — and
+    /// every other variable as every store does. For the primary these are the session-wide
+    /// values.
     pub(crate) async fn dispatch_driver_async(
         &self,
-        name: &str,
+        choice: &crate::driver_choice::DriverChoice,
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        self.dispatch_component_async(name, input, self.gateways.inference())
+        let gateway = self.gateways.inference_for(&choice.driver);
+        let env = driver_choice_env(&self.inference_env, choice, gateway);
+        self.dispatch_component_with_env(&choice.driver, input, gateway, &env)
             .await
     }
 
@@ -6339,6 +6551,17 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         gateway: Option<&Arc<CredentialGateway>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
+        self.dispatch_component_with_env(name, input, gateway, &self.inference_env)
+            .await
+    }
+
+    async fn dispatch_component_with_env(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        gateway: Option<&Arc<CredentialGateway>>,
+        inference_env: &[(String, String)],
+    ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
         };
@@ -6346,7 +6569,7 @@ impl CapsuleStoreState {
             ToolInvokeEnv {
                 engine: &self.engine,
                 accessible_workdir: &self.accessible_workdir,
-                inference_env: &self.inference_env,
+                inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
                 // Absent for every artifact that declared no `capabilities:` block, and for
@@ -6395,6 +6618,7 @@ impl CapsuleStoreState {
             || name == FETCH_PEER_FILE_TOOL
             || name == DELEGATE_TASK_TOOL
             || name == SUBMIT_PLAN_TOOL
+            || name == SWITCH_DRIVER_TOOL
         {
             return as_tool();
         }
@@ -6510,6 +6734,12 @@ impl CapsuleStoreState {
         if name == SUBMIT_PLAN_TOOL {
             return self
                 .dispatch_submit_plan(input, gate)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+        if name == SWITCH_DRIVER_TOOL {
+            return self
+                .dispatch_switch_driver(input)
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -6972,6 +7202,87 @@ impl CapsuleStoreState {
             truncated: result.truncated,
             metadata: Vec::new(),
         })
+    }
+
+    /// `switch-driver`: the agent selects the driver choice its next inference call is served by.
+    ///
+    /// Answered here, in-process, because only the runtime knows the caller is the agent. It
+    /// presents no credential, never reaches the control surface, and never reads the controller
+    /// token or its file. The call has already passed the policy decision point by the time it
+    /// lands here, like every tool call, and a plan step cannot name it. The checks and refusals
+    /// are the controller's own, made through [`crate::control_plane::ControlState::request_change`],
+    /// and a refusal comes back to the model as a tool error.
+    async fn dispatch_switch_driver(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        use crate::control_plane::Principal;
+        use murmur_artifact::ControllableSetting;
+
+        let setting = ControllableSetting::InferenceDriver;
+        let Some(control) = self
+            .control
+            .as_ref()
+            .filter(|control| control.permits(Principal::Agent, setting))
+        else {
+            return Err(format!(
+                "'{SWITCH_DRIVER_TOOL}' needs a control.agent_settings: [inference.driver] \
+                 declaration in murmur.yaml; this capsule declares none"
+            ));
+        };
+        let requested = parse_tool_json_input(SWITCH_DRIVER_TOOL, &input)
+            .ok()
+            .and_then(|args| args.get("driver").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        match control.request_change(Principal::Agent, setting, &requested) {
+            Ok(change) => {
+                let summary = format!(
+                    "inference.driver switched from {} to {}; the next inference call is served \
+                     by it",
+                    change.previous.as_str().unwrap_or_default(),
+                    change.value.as_str().unwrap_or_default()
+                );
+                if let Some(trace) = &self.peer_trace {
+                    trace
+                        .write_control_change(crate::trace::ControlChange {
+                            event_id: change.change_id,
+                            principal: Principal::Agent,
+                            token_id: None,
+                            kind: "setting",
+                            name: setting.wire_name(),
+                            action: "set",
+                            previous: Some(change.previous),
+                            value: Some(change.value),
+                            applies_from: Some(crate::control_plane::APPLIES_FROM),
+                            replaced: None,
+                        })
+                        .await;
+                }
+                Ok(murmur::tool::run::ToolResult {
+                    status: murmur::tool::run::Status::Passed,
+                    summary: None,
+                    data: Some(summary),
+                    data_path: None,
+                    truncated: false,
+                    metadata: Vec::new(),
+                })
+            }
+            Err(refused) => {
+                if let Some(trace) = &self.peer_trace {
+                    trace
+                        .write_control_refused(
+                            Principal::Agent,
+                            refused.status,
+                            refused.reason,
+                            Some("setting"),
+                            Some(setting.wire_name()),
+                            None,
+                        )
+                        .await;
+                }
+                Err(refused.message)
+            }
+        }
     }
 
     /// `submit-plan`: run one plan of steps to completion and return every step's result.
@@ -7601,11 +7912,12 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 4] = [
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 5] = [
     SHARE_FILE_TOOL,
     FETCH_PEER_FILE_TOOL,
     DELEGATE_TASK_TOOL,
     SUBMIT_PLAN_TOOL,
+    SWITCH_DRIVER_TOOL,
 ];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
@@ -8048,6 +8360,69 @@ fn write_submit_plan_tool_manifest(workdir: &Path, plan_submit: bool) -> Result<
     }
     write_runtime_provided_tool_manifest(workdir, SUBMIT_PLAN_TOOL, SUBMIT_PLAN_TOOL_MANIFEST)
 }
+
+/// Writes the driver-switch tool's synthetic manifest, only for a capsule whose
+/// `control.agent_settings` lists `inference.driver`; `choices` is `None` for every other.
+///
+/// The grant is the file's existence: without it `switch-driver` is absent from the tool
+/// inventory and from `session_start`'s `tools_declared`. The description lists every choice with
+/// its model, and the schema names the choices, so the model sees what it may select.
+fn write_switch_driver_tool_manifest(
+    workdir: &Path,
+    choices: Option<&crate::driver_choice::DriverChoices>,
+) -> Result<(), RuntimeError> {
+    let Some(choices) = choices else {
+        return Ok(());
+    };
+    write_runtime_provided_tool_manifest(
+        workdir,
+        SWITCH_DRIVER_TOOL,
+        &switch_driver_tool_manifest(choices),
+    )
+}
+
+/// `switch-driver`'s manifest for `choices`. Built from YAML values rather than text, so a model
+/// string carrying a quote or a colon cannot break it.
+fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) -> String {
+    let listed: Vec<String> = choices
+        .iter()
+        .map(|choice| {
+            format!(
+                "{} (model {}, driver {})",
+                choice.name, choice.model, choice.driver
+            )
+        })
+        .collect();
+    let description = format!(
+        "Switch which model serves this conversation, from the next inference call on. `driver` \
+         is the name of one of this capsule's declared choices: {}. The conversation so far is \
+         carried to the new model unchanged, except reasoning another model produced. The \
+         switch lasts until it is switched again or the capsule restarts, which starts on \
+         primary.",
+        listed.join("; ")
+    );
+    let names: Vec<&str> = choices.iter().map(|choice| choice.name.as_str()).collect();
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"driver": {"type": "string", "enum": names}},
+        "required": ["driver"],
+    });
+    let mut manifest = serde_yaml::Mapping::new();
+    for (key, value) in [
+        ("name", SWITCH_DRIVER_TOOL.to_string()),
+        ("version", "0.0.0".to_string()),
+        ("runtime", "tool".to_string()),
+        ("implementation", "native".to_string()),
+        ("description", description),
+        ("input_schema", schema.to_string()),
+    ] {
+        manifest.insert(Value::String(key.to_string()), Value::String(value));
+    }
+    serde_yaml::to_string(&manifest).unwrap_or_default()
+}
+
+/// Tool a capsule gains from `control.agent_settings: [inference.driver]`.
+pub(crate) const SWITCH_DRIVER_TOOL: &str = "switch-driver";
 
 /// What a running plan asks of the session that was handed it. The scheduler thread that sent
 /// one is parked on its `oneshot` until this session replies.
@@ -9136,6 +9511,189 @@ mod tests {
             .exists());
     }
 
+    // ── switch-driver's synthetic manifest ───────────────────────────────────
+
+    fn switchable_choices() -> crate::driver_choice::DriverChoices {
+        let mut inference = murmur_artifact::InferenceConfig {
+            transport: "http".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "murmur-driver-anthropic".to_string(),
+                config: None,
+            }),
+            command: None,
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns: 10,
+            max_tokens: None,
+            max_session_tokens: None,
+            tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
+        };
+        inference
+            .alternates
+            .push(murmur_artifact::InferenceAlternate {
+                name: "gpt".to_string(),
+                model: "gpt-5: \"preview\"".to_string(),
+                driver: "murmur-driver-openai".to_string(),
+            });
+        crate::driver_choice::DriverChoices::declared(&inference)
+    }
+
+    /// The tool's contract: one `driver` argument naming a declared choice, and a description
+    /// listing every choice with its model. A model string carrying YAML punctuation survives.
+    #[test]
+    fn driver_choice_switch_manifest_lists_every_choice() {
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&super::switch_driver_tool_manifest(&switchable_choices()))
+                .expect("the manifest is YAML");
+        assert_eq!(parsed["name"].as_str(), Some("switch-driver"));
+        assert_eq!(parsed["runtime"].as_str(), Some("tool"));
+        assert_eq!(parsed["implementation"].as_str(), Some("native"));
+        let schema: serde_json::Value =
+            serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
+                .expect("the schema is JSON");
+        assert_eq!(schema["required"], serde_json::json!(["driver"]));
+        assert_eq!(
+            schema["properties"]["driver"]["enum"],
+            serde_json::json!(["primary", "gpt"])
+        );
+        let description = parsed["description"].as_str().expect("a description");
+        assert!(
+            description
+                .contains("primary (model claude-sonnet-4-5, driver murmur-driver-anthropic)"),
+            "{description}"
+        );
+        assert!(
+            description.contains("gpt (model gpt-5: \"preview\", driver murmur-driver-openai)"),
+            "{description}"
+        );
+    }
+
+    /// The grant is the file: no grant, no tool.
+    #[test]
+    fn driver_choice_an_ungranted_capsule_is_written_no_switch_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        super::write_switch_driver_tool_manifest(dir.path(), None).unwrap();
+        assert!(!dir.path().join("tools").join("switch-driver").exists());
+        super::write_switch_driver_tool_manifest(dir.path(), Some(&switchable_choices())).unwrap();
+        assert!(dir
+            .path()
+            .join("tools")
+            .join("switch-driver")
+            .join(PACKED_MANIFEST_ENTRY)
+            .exists());
+    }
+
+    /// A driver-choice dispatch replaces exactly the three variables that name the choice, in
+    /// place, and the primary's replacement is the session-wide value.
+    #[test]
+    fn driver_choice_env_names_the_choice_and_keeps_everything_else() {
+        let choices = switchable_choices();
+        let env = vec![
+            ("MURMUR_INFERENCE_TRANSPORT".to_string(), "http".to_string()),
+            (
+                "MURMUR_INFERENCE_ENDPOINT".to_string(),
+                "http://127.0.0.1:9/v1".to_string(),
+            ),
+            (
+                "MURMUR_INFERENCE_MODEL".to_string(),
+                "claude-sonnet-4-5".to_string(),
+            ),
+            (
+                "MURMUR_INFERENCE_DRIVER".to_string(),
+                "murmur-driver-anthropic".to_string(),
+            ),
+            ("MURMUR_SESSION_ID".to_string(), "ses_x".to_string()),
+        ];
+        let gateway = test_gateway(
+            "murmur-driver-openai",
+            "http://127.0.0.1:2/openai/v1",
+            "k",
+            GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
+        );
+        let gateway = Arc::new(gateway);
+        let switched = super::driver_choice_env(&env, choices.get(1).unwrap(), Some(&gateway));
+        assert_eq!(
+            switched,
+            vec![
+                ("MURMUR_INFERENCE_TRANSPORT".to_string(), "http".to_string()),
+                (
+                    "MURMUR_INFERENCE_ENDPOINT".to_string(),
+                    "http://127.0.0.1:9/openai/v1".to_string()
+                ),
+                (
+                    "MURMUR_INFERENCE_MODEL".to_string(),
+                    "gpt-5: \"preview\"".to_string()
+                ),
+                (
+                    "MURMUR_INFERENCE_DRIVER".to_string(),
+                    "murmur-driver-openai".to_string()
+                ),
+                ("MURMUR_SESSION_ID".to_string(), "ses_x".to_string()),
+            ]
+        );
+        let primary_gateway = Arc::new(test_gateway(
+            "murmur-driver-anthropic",
+            "http://127.0.0.1:1/v1",
+            "k",
+            GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
+        ));
+        assert_eq!(
+            super::driver_choice_env(&env, choices.primary(), Some(&primary_gateway)),
+            env
+        );
+    }
+
+    /// Every driver choice's gateway is metered and reachable through `inference_for`, and none
+    /// is ever handed out by artifact name.
+    #[test]
+    fn driver_choice_gateways_are_metered_and_never_handed_out_by_name() {
+        let mut table = GatewayTable::default();
+        let meter = Arc::new(SpendMeter::unlimited());
+        table.insert(test_gateway(
+            "murmur-driver-anthropic",
+            "http://127.0.0.1:1",
+            "k",
+            GatewayMetering::Inference(Arc::clone(&meter)),
+        ));
+        table.insert_alternate(test_gateway(
+            "murmur-driver-openai",
+            "http://127.0.0.1:2",
+            "k",
+            GatewayMetering::Inference(meter),
+        ));
+        assert_eq!(
+            table.inference().unwrap().artifact,
+            "murmur-driver-anthropic"
+        );
+        assert_eq!(
+            table
+                .inference_for("murmur-driver-anthropic")
+                .unwrap()
+                .artifact,
+            "murmur-driver-anthropic"
+        );
+        let openai = table.inference_for("murmur-driver-openai").unwrap();
+        assert!(openai.is_metered());
+        assert!(table.for_artifact("murmur-driver-openai").is_none());
+        assert!(table.for_artifact("murmur-driver-anthropic").is_none());
+        assert!(table.inference_for("web-search").is_none());
+        let listed: Vec<(String, bool)> = super::session_gateways(&table)
+            .into_iter()
+            .map(|gateway| (gateway.artifact, gateway.metered))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("murmur-driver-anthropic".to_string(), true),
+                ("murmur-driver-openai".to_string(), true)
+            ]
+        );
+    }
+
     // ── reserved tool names ──────────────────────────────────────────────────
 
     /// The list is what every runtime-provided writer is routed through, so a further synthetic
@@ -9145,7 +9703,7 @@ mod tests {
     fn the_reserved_set_covers_every_runtime_provided_tool() {
         assert_eq!(
             super::RESERVED_TOOL_NAMES.len(),
-            4,
+            5,
             "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
              raised, before its writer can succeed"
         );
@@ -9154,6 +9712,7 @@ mod tests {
             super::FETCH_PEER_FILE_TOOL,
             super::DELEGATE_TASK_TOOL,
             super::SUBMIT_PLAN_TOOL,
+            super::SWITCH_DRIVER_TOOL,
         ] {
             assert!(
                 super::is_reserved_tool_name(name),
@@ -9728,6 +10287,7 @@ inference:
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         }
     }
 
@@ -10660,6 +11220,7 @@ inference:
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         };
 
         StageRequest {
@@ -11514,6 +12075,8 @@ inference:
             driver_continuation_id: None,
             driver_continuation_context_id: None,
             driver_continuation_acked_len: 0,
+            driver_continuation_choice: None,
+            control: None,
         }
     }
 
@@ -11542,27 +12105,31 @@ inference:
     fn continuation_default_is_none_and_active_query_returns_none() {
         let state = continuation_test_state();
         assert!(state.driver_continuation_id.is_none());
-        assert!(state.active_continuation(Some("ctx-a")).is_none());
-        assert!(state.active_continuation(None).is_none());
+        assert!(state
+            .active_continuation(Some("ctx-a"), "primary")
+            .is_none());
+        assert!(state.active_continuation(None, "primary").is_none());
     }
 
     #[test]
     fn continuation_record_then_active_requires_matching_context() {
         // Scenario 6: a held continuation is only reused under the same context_id.
         let mut state = continuation_test_state();
-        state.record_continuation("cont-1".into(), Some("ctx-a".into()), 2);
+        state.record_continuation("cont-1".into(), Some("ctx-a".into()), "primary", 2);
 
         assert_eq!(
-            state.active_continuation(Some("ctx-a")),
+            state.active_continuation(Some("ctx-a"), "primary"),
             Some(("cont-1", 2)),
             "same context → continuation is active"
         );
         assert!(
-            state.active_continuation(Some("ctx-b")).is_none(),
+            state
+                .active_continuation(Some("ctx-b"), "primary")
+                .is_none(),
             "different context → continuation must not be reused"
         );
         assert!(
-            state.active_continuation(None).is_none(),
+            state.active_continuation(None, "primary").is_none(),
             "absent context → continuation must not be reused"
         );
     }
@@ -11571,11 +12138,13 @@ inference:
     fn continuation_clear_drops_all_bookkeeping() {
         // Scenarios 3 & 5: driver silence / replace-context commit drops the held id.
         let mut state = continuation_test_state();
-        state.record_continuation("cont-1".into(), Some("ctx-a".into()), 5);
+        state.record_continuation("cont-1".into(), Some("ctx-a".into()), "primary", 5);
         state.clear_continuation();
         assert!(state.driver_continuation_id.is_none());
         assert_eq!(state.driver_continuation_acked_len, 0);
-        assert!(state.active_continuation(Some("ctx-a")).is_none());
+        assert!(state
+            .active_continuation(Some("ctx-a"), "primary")
+            .is_none());
     }
 
     #[test]
@@ -11583,7 +12152,7 @@ inference:
         // Scenario 7: end_turn persists an assistant message the driver already knows; the
         // acked length advances so the next same-context Task wires only its new user message.
         let mut state = continuation_test_state();
-        state.record_continuation("cont-1".into(), Some("ctx-a".into()), 1);
+        state.record_continuation("cont-1".into(), Some("ctx-a".into()), "primary", 1);
 
         state.advance_continuation_acked_len(Some("ctx-b"), 9);
         assert_eq!(
@@ -11593,7 +12162,7 @@ inference:
 
         state.advance_continuation_acked_len(Some("ctx-a"), 2);
         assert_eq!(
-            state.active_continuation(Some("ctx-a")),
+            state.active_continuation(Some("ctx-a"), "primary"),
             Some(("cont-1", 2))
         );
 
@@ -12136,6 +12705,7 @@ inference:
                 tools: &[],
                 system: "sys",
                 prompt_cache_key: None,
+                view: None,
             };
             let mut messages = vec![serde_json::json!({
                 "role": "user",
@@ -14129,6 +14699,7 @@ inference:
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         }
     }
 
@@ -15195,6 +15766,7 @@ inference:
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         };
 
         let mut state = build_test_state(
@@ -15555,6 +16127,7 @@ inference:
             max_tokens: None,
             max_session_tokens: None,
             tool_refresh: murmur_artifact::ToolRefresh::Compaction,
+            alternates: Vec::new(),
         }
     }
 

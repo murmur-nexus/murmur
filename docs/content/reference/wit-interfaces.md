@@ -93,6 +93,7 @@ conversation state provider-side can opt out by returning a non-empty `continuat
 | Driver returns a non-empty `continuation_id` | Holds the id for the rest of the session loop |
 | Next turn, same `context_id` | Sends only the messages appended since the driver last acknowledged state, plus the held id |
 | Next turn, different `context_id` | Full resend — a continuation is never reused across unrelated tasks |
+| Next turn under a different [driver choice](manifest.md#inference-alternates) | Full resend with no `continuation_id` — the id is held for the choice it was returned under, and presented again only under that choice |
 | Driver omits the key or returns an empty string | Drops the held id; the next turn is a full resend |
 | A hook commits `replace-context` (for example compaction) | Drops the held id; the next turn resends the post-compaction history |
 
@@ -470,6 +471,9 @@ fail-closed rule that governs a policy hook's failures.
   prefix would break prompt-prefix caching on every request. An `id` a hook returns is kept, and
   the runtime mints one for a message returned without one; a `source-id` a hook sets is carried
   verbatim, and the field is absent when the hook set none.
+- An assistant message's `produced_by` record key, written when the capsule declares
+  [`inference.alternates`](manifest.md#inference-alternates), is stripped before the driver payload
+  like `id` and `source-id`, and is not served through `murmur:conversation/read`.
 - `message.inserted-by` names the hook output that put a message into the conversation. Only the
   runtime sets it, when it commits that output, and it is stripped before the driver payload like
   `id` and `source-id`. A value a hook sets on a message it returns is ignored.

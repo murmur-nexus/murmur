@@ -536,6 +536,7 @@ Which entries accept the block:
 | `runtime: tool` with a native implementation | Refused at launch with [`E-CAP-017`](diagnostics.md#e-cap-017) |
 | `runtime: hook` | Accepted |
 | `runtime: driver` named by `inference.driver.artifact`, `transport: http` | Required |
+| `runtime: driver` named by an [`inference.alternates`](#inference-alternates) entry, `transport: http` | Required, unless it is also the primary's driver |
 | Any other `runtime: driver` entry, or any driver entry under `transport: process` | `E-MAN-003` |
 | `runtime: skill` | `E-MAN-003` |
 
@@ -543,12 +544,12 @@ What the artifact sees and what the runtime does:
 
 | Aspect | Behaviour |
 |---|---|
-| Environment | `MURMUR_GATEWAY_ENDPOINT`, set only for the artifact whose entry declares the block: `http://127.0.0.1:9` plus the path of `gateway.endpoint`, without a trailing `/`. The configured driver also receives it as `MURMUR_INFERENCE_ENDPOINT`. |
+| Environment | `MURMUR_GATEWAY_ENDPOINT`, set only for the artifact whose entry declares the block: `http://127.0.0.1:9` plus the path of `gateway.endpoint`, without a trailing `/`. A driver serving an agent-loop call also receives it as `MURMUR_INFERENCE_ENDPOINT`. |
 | Request | A request to `127.0.0.1:9` is readdressed at `gateway.endpoint`'s scheme, host and port, keeping its own path and query; `https` upstreams get TLS. Every header named like [`upstream_auth.header`](#upstream-auth) is removed and exactly one is attached, rendered from the key. |
 | Network grant | `gateway.endpoint` is the grant for these requests: they are not checked against `capabilities.network.allow` or the entry's own `capabilities.network`. Every other request from the artifact is checked as usual. An allow-list entry naming the upstream warns [`W-SEC-025`](diagnostics.md#w-sec-025). |
 | Scope | Only the declaring artifact's own calls use its gateway. A request another artifact sends to `127.0.0.1:9` carries no key and is checked against the allow-list. |
-| Spend | Only the configured inference driver's gateway is metered by [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend). Every other gateway is unmetered and warns [`W-SEC-030`](diagnostics.md#w-sec-030) at launch and from `mur doctor`. |
-| Rejection | A `401` from the driver's upstream fails the task with [`E-RUN-027`](diagnostics.md#e-run-027). A `401` from any other gateway's upstream goes back to the artifact as the response, and is recorded in the trace. |
+| Spend | Only the gateways of the configured inference driver and of each [`inference.alternates`](#inference-alternates) driver are metered by [`inference.max_session_tokens`](#inference-max-session-tokens) and [`spend.machine_tokens_per_day`](config.md#spend). Every other gateway is unmetered and warns [`W-SEC-030`](diagnostics.md#w-sec-030) at launch and from `mur doctor`. |
+| Rejection | A `401` from the upstream of the driver choice serving an agent-loop turn fails the task with [`E-RUN-027`](diagnostics.md#e-run-027). A `401` from any other gateway's upstream goes back to the artifact as the response, and is recorded in the trace. |
 | Trace | Each gateway is listed in [`session_start.gateways`](observability-schemas.md#session-trace-tracejsonl). |
 
 ###### `gateway.endpoint` validation { #gateway-endpoint-validation }
@@ -936,6 +937,7 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
 | `inference.tool_refresh` | `compaction \| immediate` | no | When an artifact installed mid-session reaches the tool list the model is offered. Default: `compaction`. See [Tool refresh](#inference-tool-refresh). |
+| `inference.alternates` | list | no | Default: empty. Other driver choices the agent loop may be switched to while the capsule runs. Requires `inference.driver` in `control.settings` or `control.agent_settings`. See [Driver alternates](#inference-alternates). |
 
 This field is read under both transports, against a different measurement on each:
 
@@ -962,6 +964,78 @@ that is not a mapping fails the manifest parse with `E-MAN-003`.
 |---|---|---|
 | `inference.driver.artifact` | Required. The inference driver. Its entry must carry [`gateway.endpoint`](#artifact-gateway). | Required. The [process driver](#process-driver). Its entry may carry none of `gateway:`, `capabilities:` or `config:`. |
 | `inference.driver.config` | Optional object. Settings any driver of this role would act on, serialized to compact JSON and set as `MURMUR_INFERENCE_DRIVER_CONFIG` for the driver, every WASM tool and every shell tool in the session. See [Choosing a config block](#which-config-block). | Optional object, handed to the process driver as JSON. |
+
+##### Driver alternates { #inference-alternates }
+
+A **driver choice** is a named pair of one driver artifact and one model. The choice named
+`primary` is `inference.driver.artifact` with `inference.model`; each `inference.alternates` entry
+is another. The agent loop runs on `primary` at launch, and a controller
+(`control.settings: [inference.driver]`) or the agent (`control.agent_settings: [inference.driver]`)
+switches it to another declared choice by name. Nothing is pulled or installed: every alternate's
+driver is an `artifacts:` entry.
+
+```yaml
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 1.0.0
+    runtime: driver
+    gateway: { endpoint: https://api.anthropic.com, api_key: ${ANTHROPIC_API_KEY} }
+  - name: murmur-driver-openai
+    version: 1.0.0
+    runtime: driver
+    gateway: { endpoint: https://api.openai.com/v1, api_key: ${OPENAI_API_KEY} }
+inference:
+  model: claude-sonnet-4-5
+  driver:
+    artifact: murmur-driver-anthropic
+  alternates:
+    - name: haiku
+      model: claude-haiku-4-5
+      driver:
+        artifact: murmur-driver-anthropic
+    - name: gpt
+      model: gpt-5
+      driver:
+        artifact: murmur-driver-openai
+control:
+  settings: [inference.driver]
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `inference.alternates[].name` | string | yes | Matches `^[a-z][a-z0-9-]{0,62}$`. Unique among the alternates. `primary` is reserved. |
+| `inference.alternates[].model` | string | yes | Model identifier the driver sends. Must not be empty. |
+| `inference.alternates[].driver.artifact` | string | yes | An `artifacts:` entry with `runtime: driver`. The entry must carry its own [`gateway:`](#artifact-gateway), unless it is the primary's driver. |
+| `inference.alternates[].driver.config` | — | — | Refused. `inference.driver.config` applies to every declared driver; per-driver settings go in that driver's `artifacts[].config`. |
+
+Every refusal is `E-MAN-003`, naming the field:
+
+| Manifest | Field named |
+|---|---|
+| `inference.alternates` under `transport: process` | `inference.alternates` |
+| Alternates with `inference.driver` in neither `control.settings` nor `control.agent_settings` | `inference.alternates` |
+| A name that is `primary`, repeated, or outside the pattern | `inference.alternates[i].name` |
+| An empty or missing model | `inference.alternates[i].model` |
+| A driver that is not a declared `runtime: driver` entry, or whose entry has no `gateway:` | `inference.alternates[i].driver.artifact` |
+| A `driver.config` on an alternate | `inference.alternates[i].driver.config` |
+| The same driver and model as the primary or another alternate | `inference.alternates[i]` |
+
+What follows a switch:
+
+| Inference call | Served by |
+|---|---|
+| Agent-loop turns | The choice in use: its driver, its model, its gateway and credential |
+| Compaction, a hook's `run-inference`, seed summarization | The primary. `inference.compaction.model` names a model of the primary's provider |
+| `MURMUR_INFERENCE_*` as tools and hooks see it | The primary, for the whole session |
+
+A driver-choice call sets `MURMUR_INFERENCE_ENDPOINT`, `MURMUR_INFERENCE_MODEL` and
+`MURMUR_INFERENCE_DRIVER` in that driver's environment to the choice's own values.
+`inference.max_tokens` and `context.max_tokens` are one number each for the session and must suit
+every declared model. Every choice's gateway is metered like the primary's. An alternate whose
+credential is found nowhere at launch does not refuse the launch: it is staged unavailable and
+warns [`W-RUN-003`](diagnostics.md#w-run-003). Nothing a controller or the agent selects survives a
+restart. What the conversation carries across a switch is in
+[Switching drivers](../concepts/context.md#switching-drivers).
 
 These fields are read under `transport: process`:
 
@@ -1078,17 +1152,19 @@ down to `max_ttl` and never up.
 #### `control` { #field-control }
 
 What a controller holding the session's control token may change while the capsule runs, over the
-[control surface](control-surface.md). Absent, `control: {}`, or both lists empty means the capsule
-has no control surface and mints no token.
+[control surface](control-surface.md), and what the agent may change about itself. Absent,
+`control: {}`, or all three lists empty means the capsule has no control surface and mints no
+token. A block that lists only `control.agent_settings` also mints no token.
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `control.settings` | list of strings | no | Default: empty. Settings a controller may change. Accepted: `inference.max_tokens`, valid only under `inference.transport: http`. Each listed once. |
-| `control.secrets` | list of strings | no | Default: empty. Credential names a controller supplies at run time. Each must be a credential name (uppercase letters, digits and `_`, not starting with a digit), listed once, and referenced by some artifact's `gateway.api_key` as `${NAME}` — but not by the configured `transport: http` driver's. The global config and the environment are never consulted for a listed name, and `mur doctor` reports it as supplied by a controller rather than as unset. |
+| `control.settings` | list of strings | no | Default: empty. Settings a controller may change, each listed once. Accepted: `inference.max_tokens` and `inference.driver`, both valid only under `inference.transport: http`; `inference.driver` also requires at least one [`inference.alternates`](#inference-alternates) entry. |
+| `control.secrets` | list of strings | no | Default: empty. Credential names a controller supplies at run time. Each must be a credential name (uppercase letters, digits and `_`, not starting with a digit), listed once, and referenced by some artifact's `gateway.api_key` as `${NAME}` — but not by the configured `transport: http` driver's. A name keying an alternate driver's gateway is accepted. The global config and the environment are never consulted for a listed name, and `mur doctor` reports it as supplied by a controller rather than as unset. |
+| `control.agent_settings` | list of strings | no | Default: empty. Settings the agent may change about itself, each listed once. Accepted: `inference.driver`, on the same terms as in `control.settings`. The grant is the [`switch-driver`](runtime-provided-tools.md#switch-driver) tool. |
 
 `control:` requires an `inference:` block: only an agent capsule serves the listener the control
-surface is on. Every refusal above is `E-MAN-003`, naming `control.settings`, `control.secrets` or
-`control` and quoting the entry. An unknown key under `control:` is reported as
+surface is on. Every refusal above is `E-MAN-003`, naming `control.settings`, `control.secrets`,
+`control.agent_settings` or `control` and quoting the entry. An unknown key under `control:` is reported as
 [`W-SEC-019`](diagnostics.md#w-sec-019). Nothing a controller sets is persisted: a restart starts
 from these values again.
 

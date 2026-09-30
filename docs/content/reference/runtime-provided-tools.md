@@ -8,7 +8,7 @@ The model sees no difference. A runtime-provided tool has the same manifest shap
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
 and what decides whether it may run.
 
-## The five
+## The six
 
 Each one appears only when the manifest declaration in the second column is present.
 
@@ -19,6 +19,7 @@ Each one appears only when the manifest declaration in the second column is pres
 | `fetch-peer-file` | [`capabilities.peer_fetch`](manifest.md#field-peer-fetch) | Redeems a handle a peer sent and stores the file in this capsule's workdir |
 | `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; the outcome arrives afterwards as a background task — see [The delegation tool](roost-api.md#the-delegation-tool) |
 | `submit-plan` | [`capabilities.plan.submit`](manifest.md#field-capabilities) | Runs one plan of steps against this session's own tools and returns every step's result — see [Plans](plans.md) |
+| `switch-driver` | [`control.agent_settings: [inference.driver]`](manifest.md#field-control) | Selects the [driver choice](manifest.md#inference-alternates) the agent's next inference call is served by — see [`switch-driver`](#switch-driver) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -26,9 +27,9 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 
-`share-file`, `fetch-peer-file`, `delegate-task` and `submit-plan` are answered before the tool
-allowlist is consulted. The allowlist governs which tool *artifacts* may run; it has no say over
-these four.
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan` and `switch-driver` are answered
+before the tool allowlist is consulted. The allowlist governs which tool *artifacts* may run; it has
+no say over these five.
 
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
 nothing under `workdir/tools/<name>/`, so:
@@ -38,8 +39,8 @@ nothing under `workdir/tools/<name>/`, so:
 - A call naming it anyway is refused with a message naming the declaration that is missing.
 
 So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
-it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, and for their
-grants.
+it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, for
+`switch-driver`, and for their grants.
 
 `capabilities.plan.submit` also decides whether the model is told *when* to plan: the runtime's
 plan guidance is part of the system prompt exactly when the tool exists.
@@ -49,9 +50,9 @@ are additionally checked against that list again at dispatch.
 
 ## Reserved names
 
-`share-file`, `fetch-peer-file`, `delegate-task` and `submit-plan` are reserved. A capsule declaring
-an artifact under one of them is refused at staging, before any artifact is resolved, pulled or hash-verified,
-with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan` and `switch-driver` are reserved.
+A capsule declaring an artifact under one of them is refused at staging, before any artifact is
+pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
 `manage.pull()` of that name.
 
 A name is reserved whether or not the capsule declares the grant that would provide the tool, so
@@ -65,3 +66,19 @@ first and the shell manifest yields to it, so the inventory describes the artifa
 Dispatch resolves such a pair by [precedence](../concepts/tools.md#tool-dispatch): a native
 artifact answers ahead of the shell binary, and the shell binary answers ahead of a WASM artifact
 of the same name.
+
+## `switch-driver` { #switch-driver }
+
+| Aspect | Behaviour |
+|---|---|
+| Input | `{"driver": "<choice name>"}`. The schema lists every declared choice |
+| Description | Lists every choice with its model and driver |
+| Accepted | The next agent-loop inference call, and every one after it, is served by the choice. The tool result names the previous and the new choice |
+| Refused | Returned to the model as a tool error, with the same checks and messages a controller gets: an undeclared name, or a choice whose credential cannot produce a value now. Nothing switches |
+| Policy | The call passes the same `on-tool-call` decision point as every tool call, so a policy hook can deny it |
+| Plans | Not callable from a plan step |
+| Trace | `control_change` or `control_refused` with `principal: "agent"` and no `token_id`; `control_applied` at the first call that uses the choice |
+
+The runtime answers the call in-process: it presents no credential and never reaches the
+[control surface](control-surface.md) or its token. What a switch carries across is in
+[Switching drivers](../concepts/context.md#switching-drivers).

@@ -206,7 +206,7 @@ message was created and preserved everywhere after — including across a reload
 that hands the message back. It is the runtime's own and is stripped before the messages go to a
 driver. A `tool` message also carries `tool_call_id` and `is_error`.
 
-Five more keys are the runtime's own envelope, each written when it applies and each stripped
+Six more keys are the runtime's own envelope, each written when it applies and each stripped
 before the messages go to a driver:
 
 | Key | Written on |
@@ -216,6 +216,7 @@ before the messages go to a driver:
 | `truncated` | An assistant message the provider cut off at [`inference.max_tokens`](manifest.md#inference-max-tokens) |
 | `fence` | A message whose `content` is wrapped in the [untrusted fence](untrusted-fence.md) — the source name, `tool:<artifact name>` or `task:<origin>` |
 | `inserted_by` | A message a hook output put into the conversation: `replace-context` for a compaction hook's replacement, `seed-context` for an `on-task-start` hook's seed |
+| `produced_by` | Every assistant message the agent loop writes, when the capsule declares [`inference.alternates`](manifest.md#inference-alternates): `{"driver": "<artifact>", "model": "<model>"}`, the [driver choice](../concepts/context.md#switching-drivers) that produced it. A message without it counts as the primary's |
 
 `inserted_by` is set by the runtime when it commits the hook's output, whatever `role` the message has and whatever the hook claimed. A message a compaction hook hands back unchanged keeps the value it already had, so a person's task message stays without one.
 

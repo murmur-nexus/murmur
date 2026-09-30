@@ -185,6 +185,12 @@ struct InferenceEvent {
     /// of which pair records by turn — keep a hook's completion out of a turn's own record.
     #[serde(default)]
     origin: Option<String>,
+    /// The driver choice that served an agent-loop turn, written only by a capsule that declares
+    /// `inference.alternates`, beside `model`.
+    #[serde(default)]
+    driver_choice: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     /// The provider's own counts, each written only when the driver reported it.
     #[serde(default)]
     input_tokens_actual: Option<u64>,
@@ -677,6 +683,9 @@ struct PlanEndEvent {
 #[derive(Debug, Deserialize)]
 struct ControlChangeEvent {
     event_id: String,
+    /// `"controller"` or `"agent"`.
+    #[serde(default)]
+    principal: Option<String>,
     /// `"setting"` or `"secret"`.
     kind: String,
     name: String,
@@ -693,6 +702,8 @@ struct ControlChangeEvent {
 /// The control surface refused a request. `name` is absent when the caller did not authenticate.
 #[derive(Debug, Deserialize)]
 struct ControlRefusedEvent {
+    #[serde(default)]
+    principal: Option<String>,
     status: u16,
     reason: String,
     #[serde(default)]
@@ -821,6 +832,9 @@ struct InferenceRecord {
     tools_sha: Option<String>,
     response_sha: Option<String>,
     message_shas: Vec<String>,
+    /// The driver choice and model that served an agent-loop turn, on a capsule that declares
+    /// alternates. `None` on every other record.
+    served_by: Option<(String, String)>,
 }
 
 impl InferenceRecord {
@@ -1086,15 +1100,15 @@ struct ControlChangeRecord {
 /// One line for a control change: what changed and, for a setting whose `applied` turn is known,
 /// the turn that first used it.
 fn control_change_line(c: &ControlChangeEvent, applied: Option<Option<u32>>) -> String {
-    let value = |value: &Option<serde_json::Value>| {
-        value
-            .as_ref()
-            .map(serde_json::Value::to_string)
-            .unwrap_or_else(|| "?".to_string())
+    // A driver choice is a name, printed bare; any other value as JSON.
+    let value = |value: &Option<serde_json::Value>| match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "?".to_string(),
     };
     match (c.kind.as_str(), c.action.as_str()) {
         ("setting", _) => format!(
-            "setting {}  {} \u{2192} {}{}",
+            "setting {}  {} \u{2192} {}{}{}",
             c.name,
             value(&c.previous),
             value(&c.value),
@@ -1102,7 +1116,11 @@ fn control_change_line(c: &ControlChangeEvent, applied: Option<Option<u32>>) -> 
                 Some(Some(turn)) => format!("  applied from turn {turn}"),
                 Some(None) => "  not yet used by an inference call".to_string(),
                 None => String::new(),
-            }
+            },
+            c.principal
+                .as_deref()
+                .map(|principal| format!("  by {principal}"))
+                .unwrap_or_default()
         ),
         (_, "forget") => format!("secret {}  forgotten", c.name),
         _ => format!(
@@ -1596,6 +1614,10 @@ fn compute_metrics(
                         .get_or_insert_with(ProviderTokens::default)
                         .add(&e);
                 }
+                let served_by = e
+                    .driver_choice
+                    .clone()
+                    .map(|choice| (choice, e.model.clone().unwrap_or_default()));
                 inference_records.push(InferenceRecord {
                     turn: e.turn,
                     decision: e.decision,
@@ -1604,6 +1626,7 @@ fn compute_metrics(
                     tools_sha: e.tools_sha,
                     response_sha: e.response_sha,
                     message_shas: e.message_shas,
+                    served_by,
                 });
             }
             TraceEvent::ToolCall(e) => {
@@ -2615,6 +2638,23 @@ fn print_show(m: &TraceMetrics) {
         }
     }
 
+    // Only a capsule that declares alternates names a choice per turn, so a cost change between
+    // two turns can be traced to the model that served each.
+    let served: Vec<&InferenceRecord> = m
+        .inference_records
+        .iter()
+        .filter(|rec| rec.is_agent_loop() && rec.served_by.is_some())
+        .collect();
+    if !served.is_empty() {
+        println!();
+        println!("── Driver choices ───────────────────────────────");
+        for rec in served {
+            if let Some((choice, model)) = &rec.served_by {
+                println!("turn {}  on {choice} ({model})", rec.turn);
+            }
+        }
+    }
+
     if !m.control_changes.is_empty() || !m.control_refusals.is_empty() {
         println!();
         println!("── Control ──────────────────────────────────────");
@@ -2875,6 +2915,7 @@ impl WireIndex {
                         tools_sha: e.tools_sha,
                         response_sha: e.response_sha,
                         message_shas: e.message_shas,
+                        served_by: None,
                     };
                     note(record.system_sha.as_ref(), &mut known_hashes);
                     note(record.tools_sha.as_ref(), &mut known_hashes);
@@ -3198,9 +3239,19 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                     Some(MAX_TOKENS_STOP_REASON) => TRUNCATED_TURN_MARKER,
                     _ => "",
                 };
+                // The driver choice that served the turn, for a capsule that declares
+                // alternates, so a cost change between two turns can be read off the list.
+                let served = match (&e.driver_choice, &e.model) {
+                    (Some(choice), Some(model)) => format!("  on {choice} ({model})"),
+                    (Some(choice), None) => format!("  on {choice}"),
+                    _ => String::new(),
+                };
                 match &e.tool_name {
-                    Some(tool) => format!("turn {}  {}  {}{}", e.turn, e.decision, tool, capped),
-                    None => format!("turn {}  {}{}", e.turn, e.decision, capped),
+                    Some(tool) => format!(
+                        "turn {}  {}  {}{}{}",
+                        e.turn, e.decision, tool, capped, served
+                    ),
+                    None => format!("turn {}  {}{}{}", e.turn, e.decision, capped, served),
                 }
             }
         },
@@ -3391,13 +3442,17 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             format!("{}{}", kind("control_change"), control_change_line(e, None))
         }
         TraceEvent::ControlRefused(e) => format!(
-            "{}{} {}{}",
+            "{}{} {}{}{}",
             kind("control_refused"),
             e.status,
             e.reason,
             e.name
                 .as_deref()
                 .map(|name| format!("  {name}"))
+                .unwrap_or_default(),
+            e.principal
+                .as_deref()
+                .map(|principal| format!("  by {principal}"))
                 .unwrap_or_default()
         ),
         TraceEvent::ControlApplied(e) => format!(

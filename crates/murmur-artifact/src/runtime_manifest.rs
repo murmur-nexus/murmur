@@ -590,16 +590,26 @@ pub enum ControllableSetting {
     /// `inference.max_tokens`: the per-turn output cap the agent loop sends as `max_tokens`.
     /// `transport: http` only, on the same terms as the manifest key.
     InferenceMaxTokens,
+    /// `inference.driver`: which driver choice serves the agent loop's inference calls, by name —
+    /// [`PRIMARY_DRIVER_CHOICE`] or an `inference.alternates` entry's `name`. `transport: http`
+    /// only, and only on a capsule that declares at least one alternate.
+    InferenceDriver,
 }
 
 impl ControllableSetting {
     /// Every setting a manifest may list, in the order refusals name them.
-    pub const ALL: &'static [ControllableSetting] = &[Self::InferenceMaxTokens];
+    pub const ALL: &'static [ControllableSetting] =
+        &[Self::InferenceMaxTokens, Self::InferenceDriver];
+
+    /// Every setting `control.agent_settings` may list: the ones the agent may change about
+    /// itself through a runtime-provided tool.
+    pub const AGENT_SETTABLE: &'static [ControllableSetting] = &[Self::InferenceDriver];
 
     /// The manifest key this setting is, as written in `control.settings`.
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::InferenceMaxTokens => "inference.max_tokens",
+            Self::InferenceDriver => "inference.driver",
         }
     }
 
@@ -624,12 +634,26 @@ pub struct ControlConfig {
     /// Every name backs some artifact's `gateway.api_key: ${NAME}`, and none backs the configured
     /// inference driver's. Such a name is never looked up in the config or the environment.
     pub secrets: Vec<String>,
+    /// Settings the agent may change about itself, in manifest order, each listed once. Only
+    /// [`ControllableSetting::AGENT_SETTABLE`] members. The grant is the existence of the
+    /// runtime-provided tool that changes the setting, and never a route to the control surface.
+    pub agent_settings: Vec<ControllableSetting>,
 }
 
 impl ControlConfig {
     /// Whether `name` is a credential a controller supplies.
     pub fn declares_secret(&self, name: &str) -> bool {
         self.secrets.iter().any(|secret| secret == name)
+    }
+
+    /// Whether a controller may change `setting`.
+    pub fn controller_may_set(&self, setting: ControllableSetting) -> bool {
+        self.settings.contains(&setting)
+    }
+
+    /// Whether the agent may change `setting`.
+    pub fn agent_may_set(&self, setting: ControllableSetting) -> bool {
+        self.agent_settings.contains(&setting)
     }
 }
 
@@ -1004,6 +1028,26 @@ pub struct InferenceDriver {
     pub config: Option<String>,
 }
 
+/// The name of the driver choice `inference.driver.artifact` with `inference.model` forms. Reserved:
+/// no `inference.alternates` entry may take it.
+pub const PRIMARY_DRIVER_CHOICE: &str = "primary";
+
+/// One `inference.alternates` entry: a named pair of a declared driver and a model that the
+/// agent loop may be switched to while the capsule runs.
+///
+/// Takes no `driver.config` of its own: `inference.driver.config` reaches every declared driver,
+/// and per-driver settings are that driver's `artifacts[].config`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceAlternate {
+    /// `[a-z][a-z0-9-]{0,62}`, unique among the alternates, and never [`PRIMARY_DRIVER_CHOICE`].
+    pub name: String,
+    /// The model string the driver sends, never empty.
+    pub model: String,
+    /// `driver.artifact`: an `artifacts:` entry with `runtime: driver`, which carries its own
+    /// `gateway:` unless it is the primary's own driver.
+    pub driver: String,
+}
+
 /// What a `gateway.api_key` names, as the manifest wrote it. Parsing never resolves it: the
 /// runtime looks the value up at staging, where it knows where credentials are kept.
 #[derive(Clone, PartialEq, Eq)]
@@ -1064,6 +1108,10 @@ pub struct InferenceConfig {
     /// the agent loop sends the model. Always [`ToolRefresh::Compaction`] under
     /// `transport: process`, where the key is refused at parse time and nothing reads it.
     pub tool_refresh: ToolRefresh,
+    /// `inference.alternates`: the other driver choices the agent loop may be switched to, in
+    /// manifest order. Empty under `transport: process`, where the key is refused at parse time,
+    /// and for every capsule that declares none.
+    pub alternates: Vec<InferenceAlternate>,
 }
 
 /// `inference.tool_refresh`: the turn boundary at which the http agent loop rebuilds the tool
@@ -1751,6 +1799,8 @@ struct RawControl {
     settings: Option<serde_yaml::Value>,
     #[serde(default)]
     secrets: Option<serde_yaml::Value>,
+    #[serde(default)]
+    agent_settings: Option<serde_yaml::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2245,6 +2295,20 @@ struct RawInferenceConfig {
     max_session_tokens: Option<u64>,
     #[serde(default)]
     tool_refresh: Option<String>,
+    #[serde(default)]
+    alternates: Option<Vec<RawInferenceAlternate>>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInferenceAlternate {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    driver: Option<RawInferenceDriver>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2364,7 +2428,7 @@ impl RawBlock for RawRuntimeManifest {
 }
 
 impl RawBlock for RawControl {
-    const KNOWN_KEYS: &'static [&'static str] = &["settings", "secrets"];
+    const KNOWN_KEYS: &'static [&'static str] = &["settings", "secrets", "agent_settings"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -2776,6 +2840,7 @@ impl RawBlock for RawInferenceConfig {
         "max_tokens",
         "max_session_tokens",
         "tool_refresh",
+        "alternates",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -2790,6 +2855,25 @@ impl RawBlock for RawInferenceConfig {
         }
         if let Some(compaction) = &self.compaction {
             collect_block(compaction, &child_path(path, "compaction"), out);
+        }
+        if let Some(alternates) = &self.alternates {
+            let alternates_path = child_path(path, "alternates");
+            for (index, alternate) in alternates.iter().enumerate() {
+                collect_block(alternate, &format!("{alternates_path}[{index}]"), out);
+            }
+        }
+    }
+}
+
+impl RawBlock for RawInferenceAlternate {
+    const KNOWN_KEYS: &'static [&'static str] = &["name", "model", "driver"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(driver) = &self.driver {
+            collect_block(driver, &child_path(path, "driver"), out);
         }
     }
 }
@@ -3291,6 +3375,7 @@ impl RuntimeManifest {
         let capabilities = parse_capabilities(raw.capabilities)?;
         let inference = parse_inference(raw.inference)?;
         validate_driver_gateways(&artifacts, inference.as_ref())?;
+        validate_driver_choices(&artifacts, inference.as_ref())?;
         validate_process_driver_entry(&artifacts, inference.as_ref())?;
 
         // Validate system_prompt_artifact: must name a declared artifact whose payload may be
@@ -3361,6 +3446,7 @@ impl RuntimeManifest {
 
         let exports = parse_exports(raw.exports)?;
         let control = parse_control(raw.control, &gateway_references, inference.as_ref())?;
+        validate_alternates_selectable(inference.as_ref(), control.as_ref())?;
 
         Ok(Self {
             name,
@@ -3420,7 +3506,11 @@ fn parse_control(
     };
     let settings_written = control_string_list("control.settings", raw.settings)?;
     let secrets_written = control_string_list("control.secrets", raw.secrets)?;
-    if settings_written.is_empty() && secrets_written.is_empty() {
+    let agent_settings_written = control_string_list("control.agent_settings", raw.agent_settings)?;
+    if settings_written.is_empty()
+        && secrets_written.is_empty()
+        && agent_settings_written.is_empty()
+    {
         return Ok(None);
     }
     let Some(inference) = inference else {
@@ -3465,8 +3555,42 @@ fn parse_control(
                 ));
             }
             ControllableSetting::InferenceMaxTokens => {}
+            ControllableSetting::InferenceDriver => {
+                check_driver_setting(inference).map_err(|message| {
+                    refuse("control.settings", format!("'{entry}' {message}"))
+                })?;
+            }
         }
         settings.push(setting);
+    }
+
+    let mut agent_settings = Vec::new();
+    for entry in agent_settings_written {
+        let Some(setting) = ControllableSetting::from_wire_name(&entry)
+            .filter(|setting| ControllableSetting::AGENT_SETTABLE.contains(setting))
+        else {
+            let settable: Vec<&str> = ControllableSetting::AGENT_SETTABLE
+                .iter()
+                .map(|setting| setting.wire_name())
+                .collect();
+            return Err(refuse(
+                "control.agent_settings",
+                format!(
+                    "'{entry}' is not a setting the agent may change; control.agent_settings \
+                     accepts only: {}",
+                    settable.join(", ")
+                ),
+            ));
+        };
+        if agent_settings.contains(&setting) {
+            return Err(refuse(
+                "control.agent_settings",
+                format!("'{entry}' is listed more than once"),
+            ));
+        }
+        check_driver_setting(inference)
+            .map_err(|message| refuse("control.agent_settings", format!("'{entry}' {message}")))?;
+        agent_settings.push(setting);
     }
 
     let inference_driver = (inference.transport == "http")
@@ -3521,7 +3645,31 @@ fn parse_control(
         secrets.push(entry);
     }
 
-    Ok(Some(ControlConfig { settings, secrets }))
+    Ok(Some(ControlConfig {
+        settings,
+        secrets,
+        agent_settings,
+    }))
+}
+
+/// Why `inference.driver` cannot be listed for `inference`, or `Ok` when it can: only under
+/// `transport: http`, and only with at least one alternate to select.
+fn check_driver_setting(inference: &InferenceConfig) -> Result<(), String> {
+    if inference.transport != "http" {
+        return Err(format!(
+            "is controllable only under inference.transport: http; a transport: {} harness owns \
+             the model it runs",
+            inference.transport
+        ));
+    }
+    if inference.alternates.is_empty() {
+        return Err(
+            "selects among inference.alternates, and this capsule declares none; declare an \
+             alternate to switch to"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// `value` as a list of strings, trimmed, for `field`. Absent and YAML null are the empty list.
@@ -4578,6 +4726,7 @@ fn parse_inference(
                 });
             }
             let tool_refresh = parse_tool_refresh(raw.tool_refresh.as_deref())?;
+            let alternates = parse_alternates(raw.alternates, &driver.artifact, &model)?;
 
             Ok(Some(InferenceConfig {
                 transport,
@@ -4592,6 +4741,7 @@ fn parse_inference(
                 max_tokens: raw.max_tokens,
                 max_session_tokens: raw.max_session_tokens,
                 tool_refresh,
+                alternates,
             }))
         }
         "process" => {
@@ -4617,6 +4767,16 @@ fn parse_inference(
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.tool_refresh".to_string(),
                     message: "is not valid with transport: process".to_string(),
+                });
+            }
+            // The harness owns the conversation and the model it runs, so there is no agent-loop
+            // call for a switch to reroute.
+            if raw.alternates.is_some() {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.alternates".to_string(),
+                    message: "is not valid with transport: process; the harness owns the \
+                              conversation and the model it runs"
+                        .to_string(),
                 });
             }
 
@@ -4659,6 +4819,7 @@ fn parse_inference(
                 max_tokens: None,
                 max_session_tokens: raw.max_session_tokens,
                 tool_refresh: ToolRefresh::default(),
+                alternates: Vec::new(),
             }))
         }
         other => Err(RuntimeManifestError::InvalidInferenceConfig {
@@ -4666,6 +4827,115 @@ fn parse_inference(
             message: format!("unknown value '{other}'"),
         }),
     }
+}
+
+/// Whether `name` is an alternate's name: a lowercase letter, then up to 62 lowercase letters,
+/// digits and hyphens.
+fn is_valid_driver_choice_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && name.len() <= 63
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Lowers `inference.alternates` under `transport: http`, with the rules one entry and the list
+/// can be judged on alone. What needs `artifacts:` is [`validate_driver_choices`]'s.
+///
+/// `primary_driver` and `primary_model` are the primary choice's pair, which no alternate may
+/// repeat: two names for one pair would make a switch between them a change of nothing.
+fn parse_alternates(
+    raw: Option<Vec<RawInferenceAlternate>>,
+    primary_driver: &str,
+    primary_model: &str,
+) -> Result<Vec<InferenceAlternate>, RuntimeManifestError> {
+    let mut alternates: Vec<InferenceAlternate> = Vec::new();
+    for (index, entry) in raw.unwrap_or_default().into_iter().enumerate() {
+        let refuse = |key: &str, message: String| RuntimeManifestError::InvalidInferenceConfig {
+            field: if key.is_empty() {
+                format!("inference.alternates[{index}]")
+            } else {
+                format!("inference.alternates[{index}].{key}")
+            },
+            message,
+        };
+        let name = optional_trimmed_string(entry.name)
+            .ok_or_else(|| refuse("name", "missing required field".to_string()))?;
+        if name == PRIMARY_DRIVER_CHOICE {
+            return Err(refuse(
+                "name",
+                format!(
+                    "'{PRIMARY_DRIVER_CHOICE}' is reserved for inference.driver with \
+                     inference.model; name the alternate something else"
+                ),
+            ));
+        }
+        if !is_valid_driver_choice_name(&name) {
+            return Err(refuse(
+                "name",
+                format!(
+                    "'{name}' is not a driver choice name; a name is a lowercase letter followed \
+                     by up to 62 lowercase letters, digits and hyphens"
+                ),
+            ));
+        }
+        if alternates.iter().any(|alternate| alternate.name == name) {
+            return Err(refuse(
+                "name",
+                format!("'{name}' names more than one alternate"),
+            ));
+        }
+        let model = optional_trimmed_string(entry.model)
+            .ok_or_else(|| refuse("model", "missing required field".to_string()))?;
+        let Some(driver) = entry.driver else {
+            return Err(refuse(
+                "driver.artifact",
+                "missing required field".to_string(),
+            ));
+        };
+        if driver
+            .config
+            .as_ref()
+            .is_some_and(|config| !matches!(config, serde_yaml::Value::Null))
+        {
+            return Err(refuse(
+                "driver.config",
+                "is not valid on an alternate; inference.driver.config applies to every \
+                 declared driver, and per-driver settings belong in that driver's \
+                 artifacts[].config"
+                    .to_string(),
+            ));
+        }
+        let driver = optional_trimmed_string(driver.artifact)
+            .ok_or_else(|| refuse("driver.artifact", "missing required field".to_string()))?;
+        if driver == primary_driver && model == primary_model {
+            return Err(refuse(
+                "",
+                format!(
+                    "'{name}' is driver '{driver}' with model '{model}', which is the primary \
+                     choice; an alternate names a different pair"
+                ),
+            ));
+        }
+        if let Some(twin) = alternates
+            .iter()
+            .find(|alternate| alternate.driver == driver && alternate.model == model)
+        {
+            return Err(refuse(
+                "",
+                format!(
+                    "'{name}' is driver '{driver}' with model '{model}', which alternate '{}' \
+                     already is; an alternate names a different pair",
+                    twin.name
+                ),
+            ));
+        }
+        alternates.push(InferenceAlternate {
+            name,
+            model,
+            driver,
+        });
+    }
+    Ok(alternates)
 }
 
 /// `inference.tool_refresh` under `transport: http`: absent is [`ToolRefresh::Compaction`].
@@ -5160,10 +5430,10 @@ fn mask_endpoint_userinfo(endpoint: &str) -> std::borrow::Cow<'_, str> {
 
 /// The cross-entry rules for a `gateway:` on a driver, which need the parsed `inference:` block.
 ///
-/// A driver's gateway is the metered inference gateway only when that driver is the configured
-/// `transport: http` driver. On any other driver entry it could be spent only through tool
-/// dispatch, where nothing meters it, so it is refused. Under `transport: http` the configured
-/// driver's entry must exist and must carry the upstream.
+/// A driver's gateway is a metered inference gateway only when that driver is the configured
+/// `transport: http` driver or an `inference.alternates` entry's driver. On any other driver entry
+/// it could be spent only through tool dispatch, where nothing meters it, so it is refused. Under
+/// `transport: http` the configured driver's entry must exist and must carry the upstream.
 fn validate_driver_gateways(
     artifacts: &[RuntimeArtifact],
     inference: Option<&InferenceConfig>,
@@ -5172,6 +5442,15 @@ fn validate_driver_gateways(
         .filter(|inference| inference.transport == "http")
         .and_then(|inference| inference.driver.as_ref())
         .map(|driver| driver.artifact.as_str());
+    let alternate_drivers: Vec<&str> = inference
+        .map(|inference| {
+            inference
+                .alternates
+                .iter()
+                .map(|alternate| alternate.driver.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
     let under_process = inference.is_some_and(|inference| inference.transport == "process");
 
     for (index, artifact) in artifacts.iter().enumerate() {
@@ -5189,13 +5468,16 @@ fn validate_driver_gateways(
                 ),
             });
         }
-        if configured_driver != Some(artifact.name.as_str()) {
+        if configured_driver != Some(artifact.name.as_str())
+            && !alternate_drivers.contains(&artifact.name.as_str())
+        {
             return Err(RuntimeManifestError::InvalidArtifact {
                 index,
                 message: format!(
                     "artifact '{}' declares 'gateway:' on a 'runtime: driver' entry that is not \
                      the configured inference driver; a driver's gateway is accepted only on the \
-                     entry inference.driver.artifact names under transport: http",
+                     entry inference.driver.artifact names under transport: http, or on one an \
+                     inference.alternates entry names",
                     artifact.name
                 ),
             });
@@ -5225,6 +5507,76 @@ fn validate_driver_gateways(
         }
     }
     Ok(())
+}
+
+/// The cross-entry rules for `inference.alternates`, which need `artifacts:`.
+///
+/// Each alternate's `driver.artifact` must be an `artifacts:` entry with `runtime: driver`, and
+/// that entry must carry its own `gateway:` — the credential a switch attaches — unless it is the
+/// primary's own driver, whose gateway [`validate_driver_gateways`] already requires.
+fn validate_driver_choices(
+    artifacts: &[RuntimeArtifact],
+    inference: Option<&InferenceConfig>,
+) -> Result<(), RuntimeManifestError> {
+    let Some(inference) = inference else {
+        return Ok(());
+    };
+    let primary_driver = inference
+        .driver
+        .as_ref()
+        .map(|driver| driver.artifact.as_str());
+    for (index, alternate) in inference.alternates.iter().enumerate() {
+        let refuse = |message: String| RuntimeManifestError::InvalidInferenceConfig {
+            field: format!("inference.alternates[{index}].driver.artifact"),
+            message,
+        };
+        let driver = alternate.driver.as_str();
+        let Some(entry) = artifacts.iter().find(|artifact| artifact.name == driver) else {
+            return Err(refuse(format!(
+                "artifact '{driver}' is not declared in artifacts:"
+            )));
+        };
+        if entry.runtime != ArtifactRuntime::Driver {
+            return Err(refuse(format!(
+                "artifact '{driver}' is declared with runtime: {}; an alternate's driver is a \
+                 runtime: driver entry",
+                entry.runtime.as_str()
+            )));
+        }
+        if entry.gateway.is_none() && primary_driver != Some(driver) {
+            return Err(refuse(format!(
+                "artifact '{driver}' declares no gateway.endpoint; an alternate's driver reaches \
+                 its provider through its own gateway, so set 'gateway: {{ endpoint: <provider \
+                 URL>, api_key: ... }}' on its entry"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses alternates nothing could ever select: `inference.driver` is in neither
+/// `control.settings` nor `control.agent_settings`.
+fn validate_alternates_selectable(
+    inference: Option<&InferenceConfig>,
+    control: Option<&ControlConfig>,
+) -> Result<(), RuntimeManifestError> {
+    if inference.is_none_or(|inference| inference.alternates.is_empty()) {
+        return Ok(());
+    }
+    let selectable = control.is_some_and(|control| {
+        control.controller_may_set(ControllableSetting::InferenceDriver)
+            || control.agent_may_set(ControllableSetting::InferenceDriver)
+    });
+    if selectable {
+        return Ok(());
+    }
+    Err(RuntimeManifestError::InvalidInferenceConfig {
+        field: "inference.alternates".to_string(),
+        message: "declares alternates that nothing could ever select; list inference.driver in \
+                  control.settings for a controller to switch, or in control.agent_settings for \
+                  the agent to"
+            .to_string(),
+    })
 }
 
 /// The cross-entry rules for the `transport: process` driver, which need the parsed
@@ -12063,6 +12415,312 @@ mod control_tests {
             manifest.control.unwrap().settings,
             vec![ControllableSetting::InferenceMaxTokens]
         );
+    }
+}
+
+#[cfg(test)]
+mod driver_choice_tests {
+    use super::*;
+
+    const DRV: &str = "  - name: drv\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://api.example.com\n      api_key: ${DRIVER_KEY}\n";
+    const ALT: &str = "  - name: alt\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: https://alt.example.com\n      api_key: ${ALT_KEY}\n";
+    const ALT_NO_GATEWAY: &str = "  - name: alt\n    version: 0.1.0\n    runtime: driver\n";
+    const TOOL: &str = "  - name: card-api\n    version: 0.1.0\n    runtime: tool\n";
+    const GPT: &str = "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: alt\n";
+    const HAIKU: &str =
+        "    - name: haiku\n      model: haiku\n      driver:\n        artifact: drv\n";
+    const SWITCHABLE: &str = "control:\n  settings: [inference.driver]\n";
+
+    /// An `http` capsule on `drv` with model `m`, `artifacts` after `drv`, `alternates` as the
+    /// `inference.alternates` list body (empty for no key), and `control` at the top level.
+    fn capsule(artifacts: &str, alternates: &str, control: &str) -> String {
+        let alternates = if alternates.is_empty() {
+            String::new()
+        } else {
+            format!("  alternates:\n{alternates}")
+        };
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n{DRV}{artifacts}inference:\n  transport: http\n  model: m\n  driver:\n    artifact: drv\n{alternates}{control}"
+        )
+    }
+
+    fn refusal(yaml: &str) -> (String, String) {
+        match RuntimeManifest::from_yaml_str(yaml) {
+            Err(RuntimeManifestError::InvalidInferenceConfig { field, message })
+            | Err(RuntimeManifestError::InvalidControl { field, message }) => (field, message),
+            other => panic!("expected an inference or control refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn driver_choice_alternates_parse_in_manifest_order() {
+        let yaml = capsule(ALT, &format!("{GPT}{HAIKU}"), SWITCHABLE);
+        for manifest in [
+            RuntimeManifest::from_yaml_str(&yaml).unwrap(),
+            RuntimeManifest::from_yaml_str_without_secrets(&yaml).unwrap(),
+        ] {
+            let inference = manifest.inference.unwrap();
+            assert_eq!(
+                inference.alternates,
+                vec![
+                    InferenceAlternate {
+                        name: "gpt".to_string(),
+                        model: "gpt-5".to_string(),
+                        driver: "alt".to_string(),
+                    },
+                    InferenceAlternate {
+                        name: "haiku".to_string(),
+                        model: "haiku".to_string(),
+                        driver: "drv".to_string(),
+                    },
+                ]
+            );
+            let control = manifest.control.unwrap();
+            assert_eq!(control.settings, vec![ControllableSetting::InferenceDriver]);
+            assert!(control.agent_settings.is_empty());
+        }
+    }
+
+    #[test]
+    fn driver_choice_absent_alternates_are_empty() {
+        let manifest = RuntimeManifest::from_yaml_str(&capsule("", "", "")).unwrap();
+        assert!(manifest.inference.unwrap().alternates.is_empty());
+    }
+
+    #[test]
+    fn driver_choice_agent_settings_alone_grant_the_agent_and_no_controller() {
+        let manifest = RuntimeManifest::from_yaml_str(&capsule(
+            ALT,
+            GPT,
+            "control:\n  agent_settings: [inference.driver]\n",
+        ))
+        .unwrap();
+        let control = manifest.control.unwrap();
+        assert!(control.settings.is_empty());
+        assert_eq!(
+            control.agent_settings,
+            vec![ControllableSetting::InferenceDriver]
+        );
+        assert!(control.agent_may_set(ControllableSetting::InferenceDriver));
+        assert!(!control.controller_may_set(ControllableSetting::InferenceDriver));
+        assert!(control.secrets.is_empty());
+    }
+
+    #[test]
+    fn driver_choice_wire_name_round_trips() {
+        assert_eq!(
+            ControllableSetting::from_wire_name("inference.driver"),
+            Some(ControllableSetting::InferenceDriver)
+        );
+        assert_eq!(
+            ControllableSetting::InferenceDriver.wire_name(),
+            "inference.driver"
+        );
+        assert_eq!(
+            ControllableSetting::AGENT_SETTABLE,
+            &[ControllableSetting::InferenceDriver]
+        );
+    }
+
+    /// An alternate's driver may carry `gateway:`, which a driver entry nothing names may not.
+    #[test]
+    fn driver_choice_gateway_is_accepted_on_an_alternates_driver_only() {
+        RuntimeManifest::from_yaml_str(&capsule(ALT, GPT, SWITCHABLE))
+            .expect("an alternate's driver carries its own gateway");
+        match RuntimeManifest::from_yaml_str(&capsule(ALT, "", "")) {
+            Err(RuntimeManifestError::InvalidArtifact { message, .. }) => {
+                assert!(message.contains("inference.alternates"), "{message}")
+            }
+            other => panic!("expected InvalidArtifact, got {other:?}"),
+        }
+    }
+
+    /// Two models of one provider: the alternate shares the primary's driver and gateway.
+    #[test]
+    fn driver_choice_alternate_on_the_primarys_driver_needs_no_gateway_of_its_own() {
+        let manifest = RuntimeManifest::from_yaml_str(&capsule("", HAIKU, SWITCHABLE)).unwrap();
+        assert_eq!(manifest.inference.unwrap().alternates[0].driver, "drv");
+    }
+
+    #[test]
+    fn driver_choice_secret_keying_an_alternates_gateway_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(&capsule(
+            ALT,
+            GPT,
+            "control:\n  settings: [inference.driver]\n  secrets: [ALT_KEY]\n",
+        ))
+        .unwrap();
+        assert!(manifest.control.unwrap().declares_secret("ALT_KEY"));
+        let (field, message) = refusal(&capsule(
+            ALT,
+            GPT,
+            "control:\n  settings: [inference.driver]\n  secrets: [DRIVER_KEY]\n",
+        ));
+        assert_eq!(field, "control.secrets");
+        assert!(
+            message.contains("keys the configured inference driver's gateway"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn driver_choice_unknown_key_in_an_alternate_is_reported_at_its_block() {
+        let alternate = "    - name: gpt\n      model: gpt-5\n      temperature: 1\n      driver:\n        artifact: alt\n";
+        let manifest =
+            RuntimeManifest::from_yaml_str(&capsule(ALT, alternate, SWITCHABLE)).unwrap();
+        let keys: Vec<(&str, &str)> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.key.as_str(), key.block_path.as_str()))
+            .collect();
+        assert_eq!(keys, vec![("temperature", "inference.alternates[0]")]);
+    }
+
+    /// Every refusal the alternates and the driver setting can draw, each naming its field and
+    /// rendering as the manifest error `E-MAN-003` maps from.
+    #[test]
+    fn driver_choice_manifest_refusals_name_the_field() {
+        let alternate = |name: &str, model: &str, driver: &str| {
+            format!("    - name: {name}\n      model: {model}\n      driver:\n        artifact: {driver}\n")
+        };
+        let process = "name: cap\nversion: 0.0.1\nartifacts:\n  - name: drv\n    version: 0.1.0\n    runtime: driver\ninference:\n  transport: process\n  driver:\n    artifact: drv\n";
+        let cases: Vec<(String, &str, &str)> = vec![
+            (
+                format!("{process}  alternates:\n{GPT}"),
+                "inference.alternates",
+                "is not valid with transport: process",
+            ),
+            (
+                format!("{process}control:\n  settings: [inference.driver]\n"),
+                "control.settings",
+                "'inference.driver' is controllable only under inference.transport: http",
+            ),
+            (
+                capsule(ALT, &alternate("primary", "gpt-5", "alt"), SWITCHABLE),
+                "inference.alternates[0].name",
+                "'primary' is reserved",
+            ),
+            (
+                capsule(
+                    ALT,
+                    &format!("{}{}", alternate("gpt", "gpt-5", "alt"), alternate("gpt", "gpt-4", "alt")),
+                    SWITCHABLE,
+                ),
+                "inference.alternates[1].name",
+                "'gpt' names more than one alternate",
+            ),
+            (
+                capsule(ALT, &alternate("GPT", "gpt-5", "alt"), SWITCHABLE),
+                "inference.alternates[0].name",
+                "'GPT' is not a driver choice name",
+            ),
+            (
+                capsule(ALT, &alternate("5gpt", "gpt-5", "alt"), SWITCHABLE),
+                "inference.alternates[0].name",
+                "'5gpt' is not a driver choice name",
+            ),
+            (
+                capsule(ALT, &alternate(&format!("g{}", "x".repeat(63)), "gpt-5", "alt"), SWITCHABLE),
+                "inference.alternates[0].name",
+                "is not a driver choice name",
+            ),
+            (
+                capsule(ALT, "    - name: gpt\n      model: \"\"\n      driver:\n        artifact: alt\n", SWITCHABLE),
+                "inference.alternates[0].model",
+                "missing required field",
+            ),
+            (
+                capsule(ALT, "    - name: gpt\n      model: gpt-5\n", SWITCHABLE),
+                "inference.alternates[0].driver.artifact",
+                "missing required field",
+            ),
+            (
+                capsule("", &alternate("gpt", "gpt-5", "nowhere"), SWITCHABLE),
+                "inference.alternates[0].driver.artifact",
+                "artifact 'nowhere' is not declared in artifacts:",
+            ),
+            (
+                capsule(TOOL, &alternate("gpt", "gpt-5", "card-api"), SWITCHABLE),
+                "inference.alternates[0].driver.artifact",
+                "artifact 'card-api' is declared with runtime: tool",
+            ),
+            (
+                capsule(ALT_NO_GATEWAY, &alternate("gpt", "gpt-5", "alt"), SWITCHABLE),
+                "inference.alternates[0].driver.artifact",
+                "artifact 'alt' declares no gateway.endpoint",
+            ),
+            (
+                capsule(
+                    ALT,
+                    "    - name: gpt\n      model: gpt-5\n      driver:\n        artifact: alt\n        config:\n          thinking: enabled\n",
+                    SWITCHABLE,
+                ),
+                "inference.alternates[0].driver.config",
+                "is not valid on an alternate; inference.driver.config applies to every declared driver, and per-driver settings belong in that driver's artifacts[].config",
+            ),
+            (
+                capsule("", &alternate("same", "m", "drv"), SWITCHABLE),
+                "inference.alternates[0]",
+                "'same' is driver 'drv' with model 'm', which is the primary choice",
+            ),
+            (
+                capsule(
+                    ALT,
+                    &format!("{}{}", alternate("gpt", "gpt-5", "alt"), alternate("gpt-too", "gpt-5", "alt")),
+                    SWITCHABLE,
+                ),
+                "inference.alternates[1]",
+                "'gpt-too' is driver 'alt' with model 'gpt-5', which alternate 'gpt' already is",
+            ),
+            (
+                capsule(ALT, GPT, ""),
+                "inference.alternates",
+                "declares alternates that nothing could ever select",
+            ),
+            (
+                capsule(ALT, GPT, "control:\n  settings: [inference.max_tokens]\n"),
+                "inference.alternates",
+                "declares alternates that nothing could ever select",
+            ),
+            (
+                capsule("", "", SWITCHABLE),
+                "control.settings",
+                "'inference.driver' selects among inference.alternates, and this capsule declares none",
+            ),
+            (
+                capsule("", "", "control:\n  agent_settings: [inference.driver]\n"),
+                "control.agent_settings",
+                "'inference.driver' selects among inference.alternates, and this capsule declares none",
+            ),
+            (
+                capsule(ALT, GPT, "control:\n  agent_settings: [inference.max_tokens]\n"),
+                "control.agent_settings",
+                "'inference.max_tokens' is not a setting the agent may change; control.agent_settings accepts only: inference.driver",
+            ),
+            (
+                capsule(
+                    ALT,
+                    GPT,
+                    "control:\n  agent_settings: [inference.driver, inference.driver]\n",
+                ),
+                "control.agent_settings",
+                "'inference.driver' is listed more than once",
+            ),
+            (
+                capsule(ALT, GPT, "control:\n  agent_settings: inference.driver\n"),
+                "control.agent_settings",
+                "must be a list of names",
+            ),
+        ];
+        for (yaml, field, message) in &cases {
+            let (got_field, got_message) = refusal(yaml);
+            assert_eq!(&got_field, field, "{yaml}");
+            assert!(got_message.contains(message), "{yaml}\n{got_message}");
+            let rendered = RuntimeManifest::from_yaml_str(yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(rendered.contains(&format!("'{field}'")), "{rendered}");
+        }
     }
 }
 

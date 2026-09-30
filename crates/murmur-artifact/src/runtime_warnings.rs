@@ -25,6 +25,12 @@ pub const W_RUN_001: &str = "W-RUN-001";
 /// the run proceeds on the driver as written, and the version gap is named instead.
 pub const W_RUN_002: &str = "W-RUN-002";
 
+/// An `inference.alternates` driver choice whose credential could not be resolved at launch.
+///
+/// The primary is what the launch needs, and an alternate is an option, so nothing is refused:
+/// the choice is staged unavailable, and a switch to it is refused when it is asked for.
+pub const W_RUN_003: &str = "W-RUN-003";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -41,7 +47,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_RUN_001, W_RUN_002];
+        let codes = [W_RUN_001, W_RUN_002, W_RUN_003];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

@@ -111,6 +111,7 @@ section that explains it.
 | `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
+| `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -1565,6 +1566,26 @@ The version could also not be read at all, in which case the warning says why:
 
 Nothing is refused: the run proceeds on the driver as written. The trace carries the same text as a
 `harness_warning` event, and `harness_start.version_tested` records the verdict.
+
+### W-RUN-003 — an unavailable driver choice { #w-run-003 }
+
+```text
+[capsule-runtime] warning[W-RUN-003]: driver choice 'gpt' (driver murmur-driver-openai, model gpt-5) is unavailable: its credential OPENAI_API_KEY was found in neither the global config's credentials: nor the environment, so a switch to it will be refused; the session runs on the primary
+  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-003)
+```
+
+The gateway of an [`inference.alternates`](manifest.md#inference-alternates) driver is keyed by a
+`${NAME}` that neither [`credentials.<NAME>`](config.md#credentials) nor the launching environment
+holds. The primary's credential is what the launch needs, so the launch goes on:
+
+| Where | What it shows |
+|---|---|
+| `session_start.inference_choices` | The choice with `available: false` and `credential_source: "none"` |
+| `mur control show` | The choice marked `unavailable` |
+| A switch to it | Refused `409 credential_unresolvable` — see [Control surface](control-surface.md#settings) |
+
+Set the credential and restart the capsule to make the choice available. A credential supplied at
+run time goes in [`control.secrets`](manifest.md#field-control) instead of the environment.
 
 ---
 

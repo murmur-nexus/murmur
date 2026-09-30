@@ -710,6 +710,14 @@ fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (Str
                         ),
                     ));
                 }
+                // The agent's own switch is a decision it makes in a turn, which a plan step is
+                // not: the step would change the model under the turn that submitted the plan.
+                if tool == crate::runtime::SWITCH_DRIVER_TOOL {
+                    return Err((
+                        step.id.clone(),
+                        format!("'{tool}' is not callable from inside a plan"),
+                    ));
+                }
                 if !ctx.installed_tools.contains(tool) {
                     return Err((step.id.clone(), format!("tool '{tool}' is not installed")));
                 }

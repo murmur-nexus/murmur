@@ -57,8 +57,8 @@ pub(crate) const GATEWAY_AUTHORITY: &str = "127.0.0.1:9";
 /// Whether a gateway's requests are admitted against the session's spend meter.
 #[derive(Clone)]
 pub(crate) enum GatewayMetering {
-    /// The configured `transport: http` driver's gateway. It sends nothing unless the meter holds
-    /// an open admission.
+    /// A driver choice's gateway: the configured `transport: http` driver's, or an
+    /// `inference.alternates` driver's. It sends nothing unless the meter holds an open admission.
     Inference(Arc<SpendMeter>),
     /// Every other gateway. It never reads the meter, and what its calls spend is not counted.
     Unmetered,
@@ -95,6 +95,8 @@ impl std::fmt::Debug for CredentialGateway {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct GatewayTable {
     inference: Option<Arc<CredentialGateway>>,
+    /// The metered gateways of `inference.alternates` drivers other than the primary's own.
+    alternates: HashMap<String, Arc<CredentialGateway>>,
     by_artifact: HashMap<String, Arc<CredentialGateway>>,
 }
 
@@ -109,10 +111,31 @@ impl GatewayTable {
         }
     }
 
-    /// The configured inference driver's gateway, attached only on the agent loop's driver
-    /// dispatch and a hook's `run-inference`.
+    /// Adds `gateway`, which is metered, as an alternate driver's: reachable only through
+    /// [`Self::inference_for`], never through [`Self::inference`] or [`Self::for_artifact`].
+    pub(crate) fn insert_alternate(&mut self, gateway: CredentialGateway) {
+        debug_assert!(
+            gateway.is_metered(),
+            "an alternate driver's gateway is metered"
+        );
+        self.alternates
+            .insert(gateway.artifact.clone(), Arc::new(gateway));
+    }
+
+    /// The configured inference driver's gateway, attached on the agent loop's primary-choice
+    /// dispatch, a hook's `run-inference` and compaction.
     pub(crate) fn inference(&self) -> Option<&Arc<CredentialGateway>> {
         self.inference.as_ref()
+    }
+
+    /// The metered gateway of the driver choice on artifact `driver`: the primary's when `driver`
+    /// is the configured driver, an alternate's otherwise. `None` for a driver no choice names, or
+    /// whose credential could not be staged. Attached only on the agent loop's driver dispatch.
+    pub(crate) fn inference_for(&self, driver: &str) -> Option<&Arc<CredentialGateway>> {
+        self.inference
+            .as_ref()
+            .filter(|gateway| gateway.artifact == driver)
+            .or_else(|| self.alternates.get(driver))
     }
 
     /// The gateway attached on every dispatch or instantiation of artifact `name`. Never the
@@ -122,11 +145,14 @@ impl GatewayTable {
         self.by_artifact.get(name)
     }
 
-    /// Every gateway, the inference gateway first, then the rest by artifact name.
+    /// Every gateway: the inference gateway first, then the alternates' by artifact name, then
+    /// the rest by artifact name.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<CredentialGateway>> {
+        let mut alternates: Vec<_> = self.alternates.values().collect();
+        alternates.sort_by(|a, b| a.artifact.cmp(&b.artifact));
         let mut rest: Vec<_> = self.by_artifact.values().collect();
         rest.sort_by(|a, b| a.artifact.cmp(&b.artifact));
-        self.inference.iter().chain(rest)
+        self.inference.iter().chain(alternates).chain(rest)
     }
 }
 
