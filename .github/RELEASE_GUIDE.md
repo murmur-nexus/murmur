@@ -32,7 +32,7 @@ four on every PR; the rest are release-time only.
 | WIT contracts moved since the last release | `./scripts/wit-versions-changed-since.sh vX.Y.Z` — pass the *previous* release tag; exits 1 naming every `murmur:*` package whose version moved |
 | Docs | `cd docs && mkdocs build --strict` |
 | Host-only isolation tests | `docs/content/reference/resource-limits-manual-verification.md` — CI reports these as `[SKIP-HOST]`; run them by hand on a real Linux host for any release touching containment |
-| Smoke | the maintainer-local smoke suite: real capsules against the built `mur` |
+| Smoke | `/space/_murmur/smoke/smoke` — the maintainer-local smoke suite: real capsules against the built `mur`. Run it before every release cut and after merging any card that touches staging, install or launch. Exit 3 is SKIPPED, a host that could not measure, and is not a pass: re-run on a quiet baseline host, or rebaseline deliberately |
 
 **If `wit-versions-changed-since.sh` fails, the release has work in another
 repo.** Every artifact in `default-artifacts` built against a package whose
