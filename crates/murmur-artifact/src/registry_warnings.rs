@@ -1,7 +1,7 @@
 //! Registry of `W-REG-*` codes for non-fatal warnings about what an artifact store holds.
 //!
-//! Mirrors [`crate::security_warnings`] and [`crate::build_lints`]: the artifact still resolves
-//! and the session still runs, so the code is printed rather than raised. Each code has a
+//! Mirrors [`crate::security_warnings`] and [`crate::build_lints`]: the command printing the code
+//! refuses nothing over it, so the code is printed rather than raised. Each code has a
 //! matching `#w-reg-nnn` anchor on the diagnostics reference page, so callers append
 //! [`registry_warning_link`] instead of re-explaining the issue inline.
 
@@ -23,6 +23,14 @@ pub const W_REG_001: &str = "W-REG-001";
 /// fails, so it is named and counted rather than raised.
 pub const W_REG_002: &str = "W-REG-002";
 
+/// An installed artifact names a `murmur:` interface version this `mur` does not serve.
+///
+/// `mur run` refuses it at launch, because the host resolves one instance name per interface and
+/// keeps no fallback, and reinstalling the same version fetches the same build. `mur doctor`
+/// names it as a warning when the project does not declare it, since an artifact nothing launches
+/// fails no run; a declared one fails the checklist instead.
+pub const W_REG_003: &str = "W-REG-003";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -39,7 +47,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_REG_001, W_REG_002];
+        let codes = [W_REG_001, W_REG_002, W_REG_003];
         for code in codes {
             assert!(code.starts_with("W-REG-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

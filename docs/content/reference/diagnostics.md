@@ -109,6 +109,7 @@ section that explains it.
 | `W-DEPLOY-002` | A deploy's target runs under a different `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` from the deploying machine | [W-DEPLOY-002](#w-deploy-002) |
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
+| `W-REG-003` | An installed artifact speaks an interface version this `mur` does not serve | [W-REG-003](#w-reg-003) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
@@ -1450,8 +1451,8 @@ An explicit `mur install github:<owner>/<repo>@<tag>` reports a rate limit the s
 ## Registry warnings
 
 `mur run` and `mur doctor` print non-fatal warnings about what an artifact store holds. Each one
-carries a `W-REG-NNN` code and a link back to its section on this page. The artifact still resolves
-and the session still runs, and `mur doctor` still exits `0`.
+carries a `W-REG-NNN` code and a link back to its section on this page, and none of them changes
+the exit code of `mur doctor`.
 
 ### W-REG-001 — installed native artifact with no recorded platform { #w-reg-001 }
 
@@ -1505,8 +1506,27 @@ Three reasons:
 | installed but unreadable | A version resolved, but its archive or packed `murmur.yaml` could not be read |
 
 Install the capsule, or pin its version in `murmur.lock`, and `mur doctor` folds its declarations
-into the report. The exit code is unchanged either way: the walk not being able to read a capsule
-is not evidence that a run fails.
+into the report.
+
+### W-REG-003 — an installed artifact speaks an interface version this mur does not serve { #w-reg-003 }
+
+```text
+Interface versions
+  ⚠  stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-003)
+```
+
+An artifact is built against one version of each Murmur interface it uses, and this `mur` serves
+exactly one version of each. An installed artifact built against any other version does not load:
+`mur run` refuses it at launch. The common cause is upgrading `mur` past an interface change while
+the store still holds artifacts built for the older `mur`.
+
+Reinstalling the same version fetches the same build. Install a release of the artifact built
+against the version this `mur` serves, and pin it in `murmur.yaml` if the project declares it.
+
+[`mur doctor`](cli.md#doctor-interface-versions) prints this warning for every stale artifact in
+the project and global stores that this project does not declare. A stale artifact the project
+does declare fails the checklist instead, because the next `mur run` refuses it.
 
 ---
 

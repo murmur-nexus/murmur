@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::fs::File;
 use std::path::Path;
 
 use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEntryState};
@@ -12,13 +14,16 @@ use capsule_runtime::{
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
     warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
     SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    SERVED_WIT_PACKAGES,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
     parse_tool_implementation_from_yaml, read_lockfile, read_runtime_manifest_text,
     registry_warning_link, resolve_manifest_path, sha256_hex, warn_on_unknown_manifest_keys,
-    ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockOrigin, LockfileError, MurmurLock,
-    NativeBinaryVerdict, PlatformMatch, RuntimeManifest, W_REG_001, W_REG_002,
+    wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader, ArtifactImplementation,
+    ArtifactMeta, ArtifactRuntime, ContractDirection, LocalRegistry, LockOrigin, LockfileError,
+    MurmurLock, NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RuntimeManifest,
+    UnservedInterface, WitContracts, W_REG_001, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
@@ -644,6 +649,261 @@ fn report_control_secrets(runtime_manifest: &RuntimeManifest) {
     println!();
 }
 
+/// Which installed artifact store an inventoried artifact sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreScope {
+    /// The project's `.murmur/artifacts/`.
+    Project,
+    /// `~/.murmur/artifacts/`, shared by every project on the machine.
+    Global,
+}
+
+impl StoreScope {
+    fn label(self) -> &'static str {
+        match self {
+            StoreScope::Project => "project",
+            StoreScope::Global => "global",
+        }
+    }
+}
+
+/// One installed artifact that speaks at least one `murmur:` interface version this `mur` does
+/// not serve.
+struct StaleArtifact {
+    scope: StoreScope,
+    name: String,
+    version: String,
+    /// Never empty.
+    unserved: Vec<UnservedInterface>,
+}
+
+/// What the `Interface versions` inventory found across both stores.
+///
+/// Its findings become warnings only after the checklist runs: an artifact the checklist already
+/// failed for the same stale interfaces gets no second, warning-tier `Fix:` line.
+struct InterfaceFindings {
+    stale: Vec<StaleArtifact>,
+}
+
+/// Print the `Interface versions` block: every artifact in either installed store that names a
+/// `murmur:` interface at a version other than the one [`SERVED_WIT_PACKAGES`] lists, one line per
+/// interface.
+///
+/// Prints nothing at all when every artifact is current and both stores could be listed. A store
+/// whose index cannot be read is named under the heading and skipped; that never changes the exit
+/// code. Reads only: neither store is written to, no registry is contacted, nothing is launched.
+fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) -> InterfaceFindings {
+    let mut stale = Vec::new();
+    let mut unreadable = Vec::new();
+
+    for (scope, registry) in [(StoreScope::Project, project), (StoreScope::Global, global)] {
+        let index = match registry.list_index() {
+            Ok(index) => index,
+            Err(error) => {
+                unreadable.push((scope, error.to_string()));
+                continue;
+            }
+        };
+        for meta in index {
+            let Some(contracts) = installed_contracts(registry, &meta) else {
+                continue;
+            };
+            let unserved = contracts.unserved_against(SERVED_WIT_PACKAGES);
+            if unserved.is_empty() {
+                continue;
+            }
+            stale.push(StaleArtifact {
+                scope,
+                name: meta.name,
+                version: meta.version,
+                unserved,
+            });
+        }
+    }
+
+    if stale.is_empty() && unreadable.is_empty() {
+        return InterfaceFindings { stale };
+    }
+
+    println!("Interface versions");
+    for (scope, error) in &unreadable {
+        println!("  not checked ({} store): {error}", scope.label());
+    }
+    let ref_width = stale
+        .iter()
+        .map(|artifact| artifact.name.len() + 1 + artifact.version.len())
+        .max()
+        .unwrap_or(0);
+    for artifact in &stale {
+        for interface in &artifact.unserved {
+            println!(
+                "{}",
+                render_unserved_line(
+                    &format!("{}@{}", artifact.name, artifact.version),
+                    ref_width,
+                    artifact.scope,
+                    interface
+                )
+            );
+        }
+    }
+    if !stale.is_empty() {
+        println!(
+            "  mur run refuses these at launch (warning[{W_REG_003}], {})",
+            registry_warning_link(W_REG_003)
+        );
+    }
+    println!();
+
+    InterfaceFindings { stale }
+}
+
+/// The interfaces one installed artifact speaks: the `wit_contracts` its sidecar records when the
+/// key is present, otherwise derived from its payload.
+///
+/// The store derives the recorded value from the payload on every write, so a recorded value is
+/// used as is. The key is absent for a sidecar written before the field existed, which is the
+/// case derivation covers, and for a payload with no component, where derivation finds nothing
+/// after one zip central-directory read. Each payload is opened as a file and only its root wasm
+/// entry is read. A platform-tagged version directory holds one payload per platform, and their
+/// names are unioned.
+fn installed_contracts(registry: &LocalRegistry, meta: &ArtifactMeta) -> Option<WitContracts> {
+    if let Some(contracts) = &meta.wit_contracts {
+        return Some(contracts.clone());
+    }
+
+    let generic = registry.artifact_path_for(&meta.name, &meta.version);
+    let payloads = if generic.is_file() {
+        vec![generic]
+    } else {
+        let version_dir = generic.parent()?;
+        let prefix = format!("{}-{}-", meta.name, meta.version);
+        let mut tagged: Vec<_> = std::fs::read_dir(version_dir)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".mur.zip"))
+            })
+            .collect();
+        tagged.sort();
+        tagged
+    };
+
+    let mut union: Option<WitContracts> = None;
+    for payload in payloads {
+        let Some(contracts) = File::open(&payload)
+            .ok()
+            .and_then(wit_contracts_from_artifact_reader)
+        else {
+            continue;
+        };
+        let merged = union.get_or_insert_with(WitContracts::default);
+        merged.exports.extend(contracts.exports);
+        merged.imports.extend(contracts.imports);
+    }
+    if let Some(merged) = &mut union {
+        for names in [&mut merged.exports, &mut merged.imports] {
+            names.sort();
+            names.dedup();
+        }
+    }
+    union
+}
+
+/// The unserved interfaces of one checklist artifact, as `stage_session` would resolve them from
+/// the same resolved bytes: the sidecar's recorded `wit_contracts`, or the payload's own when the
+/// sidecar has none.
+fn resolved_unserved(resolved: &ResolvedArtifact) -> Vec<UnservedInterface> {
+    resolved
+        .meta
+        .wit_contracts
+        .clone()
+        .or_else(|| wit_contracts_from_artifact_bytes(&resolved.bytes))
+        .map(|contracts| contracts.unserved_against(SERVED_WIT_PACKAGES))
+        .unwrap_or_default()
+}
+
+/// An interface name as a doctor line shows it: as recorded, or marked when it carries no version.
+fn interface_label(interface: &UnservedInterface) -> String {
+    match interface.artifact_version {
+        Some(_) => interface.interface.clone(),
+        None => format!("{} (unversioned)", interface.interface),
+    }
+}
+
+/// What this `mur` serves of the interface's package, completing a doctor line.
+fn served_phrase(interface: &UnservedInterface) -> String {
+    match &interface.served_version {
+        Some(served) => format!("this mur serves {}@{served}", interface.package),
+        None => format!("this mur serves no version of {}", interface.package),
+    }
+}
+
+/// One line of the `Interface versions` block.
+fn render_unserved_line(
+    artifact_ref: &str,
+    ref_width: usize,
+    scope: StoreScope,
+    interface: &UnservedInterface,
+) -> String {
+    let direction = match interface.direction {
+        ContractDirection::Export => "exports",
+        ContractDirection::Import => "imports",
+    };
+    format!(
+        "  \u{26A0}  {artifact_ref:<ref_width$}   {scope:<7}   {direction} {label} \u{2014} {served}",
+        scope = scope.label(),
+        label = interface_label(interface),
+        served = served_phrase(interface),
+    )
+}
+
+/// The release an artifact has to be replaced by, named by what it is built against: each
+/// unserved package once, in first-seen order, at its served version, then each package this
+/// `mur` serves none of under `without`.
+fn release_requirement(unserved: &[UnservedInterface]) -> String {
+    let mut against: Vec<String> = Vec::new();
+    let mut without: Vec<String> = Vec::new();
+    for interface in unserved {
+        let term = match &interface.served_version {
+            Some(served) => format!("{}@{served}", interface.package),
+            None => interface.package.clone(),
+        };
+        let terms = match interface.served_version {
+            Some(_) => &mut against,
+            None => &mut without,
+        };
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    let mut clauses = Vec::new();
+    if !against.is_empty() {
+        clauses.push(format!("against {}", against.join(", ")));
+    }
+    if !without.is_empty() {
+        clauses.push(format!("without {}", without.join(", ")));
+    }
+    format!("a release built {}", clauses.join(", "))
+}
+
+/// The warning-tier `Fix:` text for a stale installed artifact. It names a release by what it is
+/// built against, never the installed version: reinstalling that fetches the same build.
+fn stale_install_fix(artifact: &StaleArtifact) -> String {
+    let global_flag = match artifact.scope {
+        StoreScope::Project => "",
+        StoreScope::Global => "-g ",
+    };
+    format!(
+        "mur install {global_flag}{}@<{}>",
+        artifact.name,
+        release_requirement(&artifact.unserved)
+    )
+}
+
 /// Who needs a variable, as one line of attribution.
 ///
 /// A `capabilities.env.allow` source is rendered bare, because that key is what the whole block is
@@ -1088,6 +1348,11 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let platform = current_platform();
 
+    // Every installed artifact in either store, declared or not: the global store serves every
+    // project on the machine, and an operator upgrading `mur` needs the whole list of what the
+    // new host refuses.
+    let interface_findings = report_interface_versions(&project_registry, &global_registry);
+
     println!("Checking {} for {platform}...", manifest_path.display());
 
     // Align every check line on the widest "name@version" reference string.
@@ -1105,6 +1370,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // path still runs, and failing every pre-upgrade store's `mur doctor` in CI would be a
     // worse outcome than the migration it announces.
     let mut warnings: Vec<String> = Vec::new();
+    // `name@version` of every declared artifact the checklist failed for stale interfaces, so
+    // the inventory adds no warning-tier `Fix:` for the same artifact.
+    let mut interface_failed: HashSet<String> = HashSet::new();
 
     fixes.extend(formation_findings.fixes);
     warnings.extend(formation_findings.warnings);
@@ -1153,6 +1421,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
                 match verdict {
                     LockVerdict::Ok { pulled_by } => {
+                        let unserved = resolved_unserved(&resolved);
                         let platform_verdict = check_artifact_platform(
                             name,
                             version,
@@ -1171,6 +1440,27 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                                 fixes.push(format!(
                                     "{name}: native binary is built for {binary_platform} \u{2014} reinstall {ref_str} on this host"
                                 ));
+                            }
+                            // The bytes `stage_session` instantiates on the next `mur run`, and the
+                            // host resolves one instance name per interface with no fallback, so
+                            // a green line here would be one the launch contradicts.
+                            _ if !unserved.is_empty() => {
+                                let first = &unserved[0];
+                                let more = if unserved.len() > 1 {
+                                    format!(" (+{} more)", unserved.len() - 1)
+                                } else {
+                                    String::new()
+                                };
+                                println!(
+                                    "  \u{2717}  {ref_str:<col_width$}   \u{2014} built against {}, {}{more}",
+                                    interface_label(first),
+                                    served_phrase(first)
+                                );
+                                fixes.push(format!(
+                                    "{name}: pin {} in murmur.yaml, then run mur install",
+                                    release_requirement(&unserved)
+                                ));
+                                interface_failed.insert(ref_str.clone());
                             }
                             // `mur install` both adopts the pin and records a missing platform
                             // tag, so one warning covers an artifact that has both findings.
@@ -1280,6 +1570,12 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
+    for artifact in &interface_findings.stale {
+        if !interface_failed.contains(&format!("{}@{}", artifact.name, artifact.version)) {
+            warnings.push(stale_install_fix(artifact));
+        }
+    }
+
     println!();
 
     if fixes.is_empty() && warnings.is_empty() {
@@ -1313,4 +1609,152 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // std::process::exit terminates the process immediately; no destructors run,
     // which is acceptable here because we are done with all I/O.
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unserved(
+        interface: &str,
+        direction: ContractDirection,
+        artifact_version: Option<&str>,
+        served_version: Option<&str>,
+    ) -> UnservedInterface {
+        UnservedInterface {
+            interface: interface.to_string(),
+            direction,
+            package: interface.split_once('/').unwrap().0.to_string(),
+            artifact_version: artifact_version.map(str::to_string),
+            served_version: served_version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unserved_line_names_both_versions() {
+        let line = render_unserved_line(
+            "old-hook@0.1.0",
+            14,
+            StoreScope::Global,
+            &unserved(
+                "murmur:hook/lifecycle@0.8.0",
+                ContractDirection::Export,
+                Some("0.8.0"),
+                Some("0.9.0"),
+            ),
+        );
+        assert_eq!(
+            line,
+            "  \u{26A0}  old-hook@0.1.0   global    exports murmur:hook/lifecycle@0.8.0 \u{2014} this mur serves murmur:hook@0.9.0"
+        );
+    }
+
+    #[test]
+    fn unserved_line_marks_an_unversioned_name() {
+        let line = render_unserved_line(
+            "bare-tool@1.0.0",
+            15,
+            StoreScope::Project,
+            &unserved(
+                "murmur:tool/run",
+                ContractDirection::Export,
+                None,
+                Some("0.1.0"),
+            ),
+        );
+        assert!(
+            line.contains("project   exports murmur:tool/run (unversioned) \u{2014} this mur serves murmur:tool@0.1.0"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn unserved_line_names_a_package_this_mur_does_not_serve() {
+        let line = render_unserved_line(
+            "odd@0.1.0",
+            9,
+            StoreScope::Global,
+            &unserved(
+                "murmur:nonexistent/thing@0.1.0",
+                ContractDirection::Import,
+                Some("0.1.0"),
+                None,
+            ),
+        );
+        assert!(
+            line.ends_with(
+                "imports murmur:nonexistent/thing@0.1.0 \u{2014} this mur serves no version of murmur:nonexistent"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn release_requirement_lists_each_package_once_in_first_seen_order() {
+        let interfaces = [
+            unserved(
+                "murmur:driver/process@0.1.0",
+                ContractDirection::Export,
+                Some("0.1.0"),
+                Some("0.3.0"),
+            ),
+            unserved(
+                "murmur:text/chunks@0.1.0",
+                ContractDirection::Import,
+                Some("0.1.0"),
+                None,
+            ),
+            unserved(
+                "murmur:driver/other@0.1.0",
+                ContractDirection::Import,
+                Some("0.1.0"),
+                Some("0.3.0"),
+            ),
+        ];
+        assert_eq!(
+            release_requirement(&interfaces),
+            "a release built against murmur:driver@0.3.0, without murmur:text"
+        );
+    }
+
+    #[test]
+    fn release_requirement_with_only_unserved_packages_names_what_it_is_built_without() {
+        let interfaces = [unserved(
+            "murmur:nonexistent/thing@0.1.0",
+            ContractDirection::Import,
+            Some("0.1.0"),
+            None,
+        )];
+        assert_eq!(
+            release_requirement(&interfaces),
+            "a release built without murmur:nonexistent"
+        );
+    }
+
+    #[test]
+    fn stale_install_fix_targets_the_store_and_never_the_installed_version() {
+        let artifact = StaleArtifact {
+            scope: StoreScope::Global,
+            name: "old-hook".to_string(),
+            version: "0.1.0".to_string(),
+            unserved: vec![unserved(
+                "murmur:hook/lifecycle@0.8.0",
+                ContractDirection::Export,
+                Some("0.8.0"),
+                Some("0.9.0"),
+            )],
+        };
+        assert_eq!(
+            stale_install_fix(&artifact),
+            "mur install -g old-hook@<a release built against murmur:hook@0.9.0>"
+        );
+        let project = StaleArtifact {
+            scope: StoreScope::Project,
+            ..artifact
+        };
+        assert_eq!(
+            stale_install_fix(&project),
+            "mur install old-hook@<a release built against murmur:hook@0.9.0>"
+        );
+    }
 }

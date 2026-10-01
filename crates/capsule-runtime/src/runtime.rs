@@ -104,18 +104,18 @@ use crate::{
 /// `murmur:capsule@0.1.0` WIT package carries. This is the only name the host
 /// resolves — the legacy unversioned fallback was removed after the dual-accept
 /// runtime shipped (see `wit/VERSIONING.md`).
-const WIT_CAPSULE_IFACE_VERSIONED: &str = "murmur:capsule/run@0.1.0";
+pub(crate) const WIT_CAPSULE_IFACE_VERSIONED: &str = "murmur:capsule/run@0.1.0";
 /// Versioned instance export name a guest built against `murmur:tool@0.1.0`
 /// carries. Only name the host resolves; see `WIT_CAPSULE_IFACE_VERSIONED`.
-const WIT_TOOL_IFACE_VERSIONED: &str = "murmur:tool/run@0.1.0";
+pub(crate) const WIT_TOOL_IFACE_VERSIONED: &str = "murmur:tool/run@0.1.0";
 
 /// The host provides its guest-facing *import* interfaces under the versioned
 /// instance name only. The legacy unversioned provisions were dropped after the
 /// dual-accept runtime shipped; a guest importing only the
 /// unversioned name now fails to link. See `wit/VERSIONING.md`.
-const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.1.0";
-const WIT_TEXT_CHUNKS_IFACE: &str = "murmur:text/chunks@0.1.0";
-const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
+pub(crate) const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.1.0";
+pub(crate) const WIT_TEXT_CHUNKS_IFACE: &str = "murmur:text/chunks@0.1.0";
+pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 
 /// How long an agent session's teardown may run after the first `SIGTERM` before the process
 /// exits with status 143 regardless.

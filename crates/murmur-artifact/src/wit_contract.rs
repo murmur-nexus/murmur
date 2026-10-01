@@ -55,6 +55,74 @@ impl WitContracts {
         sort_dedup(&mut matches);
         matches
     }
+
+    /// The recorded `murmur:` interfaces whose version is not the one `served` lists for their
+    /// package: exports in recorded order, then imports in recorded order.
+    ///
+    /// `served` is a `(package, version)` table such as `capsule_runtime::SERVED_WIT_PACKAGES`.
+    /// Versions compare as exact strings, matching a host that resolves one instance name per
+    /// interface. A name is reported when its package is absent from `served`, when it carries
+    /// no `@version`, or when its version differs. Names outside the `murmur:` namespace are
+    /// never reported: `wasi:*` imports link against any semver-compatible version the host
+    /// provides, and other namespaces are not the host's interfaces.
+    #[must_use]
+    pub fn unserved_against(&self, served: &[(&str, &str)]) -> Vec<UnservedInterface> {
+        let exports = self
+            .exports
+            .iter()
+            .map(|name| (name, ContractDirection::Export));
+        let imports = self
+            .imports
+            .iter()
+            .map(|name| (name, ContractDirection::Import));
+        exports
+            .chain(imports)
+            .filter_map(|(name, direction)| {
+                let (package, rest) = name.split_once('/')?;
+                if !package.starts_with("murmur:") {
+                    return None;
+                }
+                let artifact_version = rest.rsplit_once('@').map(|(_, version)| version);
+                let served_version = served
+                    .iter()
+                    .find(|(served_package, _)| *served_package == package)
+                    .map(|(_, version)| *version);
+                if artifact_version.is_some() && artifact_version == served_version {
+                    return None;
+                }
+                Some(UnservedInterface {
+                    interface: name.clone(),
+                    direction,
+                    package: package.to_string(),
+                    artifact_version: artifact_version.map(str::to_string),
+                    served_version: served_version.map(str::to_string),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Which side of the component boundary a recorded interface name sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractDirection {
+    /// The artifact exports the interface and the host resolves it.
+    Export,
+    /// The artifact imports the interface and the host must provide it.
+    Import,
+}
+
+/// One recorded `murmur:` interface a host serving a given table would refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnservedInterface {
+    /// The fully-qualified instance name as the component carries it.
+    pub interface: String,
+    pub direction: ContractDirection,
+    /// The text before the first `/`, e.g. `murmur:hook`.
+    pub package: String,
+    /// The text after the last `@`; `None` when the name carries no version.
+    pub artifact_version: Option<String>,
+    /// The version the table serves for `package`; `None` when it serves no version of it.
+    pub served_version: Option<String>,
 }
 
 /// Why component bytes could not be read for their WIT contracts.
@@ -123,13 +191,20 @@ pub fn extract_wit_contracts(
 /// decompression cap, a core module, or a binary that does not parse.
 #[must_use]
 pub fn wit_contracts_from_artifact_bytes(artifact_bytes: &[u8]) -> Option<WitContracts> {
-    let wasm = read_root_wasm(artifact_bytes)?;
-    extract_wit_contracts(&wasm).ok().flatten()
+    wit_contracts_from_artifact_reader(Cursor::new(artifact_bytes))
 }
 
-fn read_root_wasm(artifact_bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut archive = ZipArchive::new(Cursor::new(artifact_bytes)).ok()?;
-    read_root_wasm_from_archive(&mut archive)
+/// [`wit_contracts_from_artifact_bytes`] over a seekable reader, typically an open `.mur.zip`
+/// file.
+///
+/// Only the zip central directory and the selected root wasm entry are read, so an archive with
+/// no wasm entry costs one central-directory read rather than the whole payload. Total on the
+/// same terms: `None` for anything that cannot be read as a component.
+#[must_use]
+pub fn wit_contracts_from_artifact_reader<R: Read + Seek>(reader: R) -> Option<WitContracts> {
+    let mut archive = ZipArchive::new(reader).ok()?;
+    let wasm = read_root_wasm_from_archive(&mut archive)?;
+    extract_wit_contracts(&wasm).ok().flatten()
 }
 
 fn read_root_wasm_from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Option<Vec<u8>> {
@@ -292,6 +367,106 @@ mod tests {
         .is_none());
         let module = component(r#"(module (func (export "f")))"#);
         assert!(wit_contracts_from_artifact_bytes(&zip_with(&[("tool.wasm", &module)])).is_none());
+    }
+
+    #[test]
+    fn reader_variant_reads_the_same_contracts_as_the_bytes_variant() {
+        let archive = zip_with(&[("tool.wasm", &component(EXPORTING_COMPONENT))]);
+        assert_eq!(
+            wit_contracts_from_artifact_reader(Cursor::new(&archive)),
+            wit_contracts_from_artifact_bytes(&archive)
+        );
+        assert!(wit_contracts_from_artifact_reader(Cursor::new(b"not-a-zip")).is_none());
+    }
+
+    const SERVED: &[(&str, &str)] = &[
+        ("murmur:hook", "0.9.0"),
+        ("murmur:runtime", "0.4.0"),
+        ("murmur:text", "0.1.0"),
+        ("murmur:tool", "0.1.0"),
+    ];
+
+    fn contracts_of(exports: &[&str], imports: &[&str]) -> WitContracts {
+        WitContracts {
+            exports: exports.iter().map(|name| name.to_string()).collect(),
+            imports: imports.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn unserved_skips_a_name_at_the_served_version() {
+        let contracts = contracts_of(
+            &["murmur:hook/lifecycle@0.9.0"],
+            &["murmur:runtime/inference@0.4.0"],
+        );
+        assert!(contracts.unserved_against(SERVED).is_empty());
+    }
+
+    #[test]
+    fn unserved_reports_a_retired_export_and_import_with_both_versions() {
+        let contracts = contracts_of(
+            &["murmur:hook/lifecycle@0.8.0"],
+            &["murmur:runtime/inference@0.3.0"],
+        );
+        assert_eq!(
+            contracts.unserved_against(SERVED),
+            vec![
+                UnservedInterface {
+                    interface: "murmur:hook/lifecycle@0.8.0".to_string(),
+                    direction: ContractDirection::Export,
+                    package: "murmur:hook".to_string(),
+                    artifact_version: Some("0.8.0".to_string()),
+                    served_version: Some("0.9.0".to_string()),
+                },
+                UnservedInterface {
+                    interface: "murmur:runtime/inference@0.3.0".to_string(),
+                    direction: ContractDirection::Import,
+                    package: "murmur:runtime".to_string(),
+                    artifact_version: Some("0.3.0".to_string()),
+                    served_version: Some("0.4.0".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unserved_reports_a_package_the_table_does_not_serve() {
+        let without_text: Vec<(&str, &str)> = SERVED
+            .iter()
+            .copied()
+            .filter(|(package, _)| *package != "murmur:text")
+            .collect();
+        let contracts = contracts_of(
+            &["murmur:tool/run@0.1.0"],
+            &["murmur:text/chunks@0.1.0", "murmur:text/stream@0.1.0"],
+        );
+        let unserved = contracts.unserved_against(&without_text);
+        assert_eq!(unserved.len(), 2, "{unserved:?}");
+        for interface in &unserved {
+            assert_eq!(interface.package, "murmur:text");
+            assert_eq!(interface.direction, ContractDirection::Import);
+            assert_eq!(interface.artifact_version.as_deref(), Some("0.1.0"));
+            assert_eq!(interface.served_version, None);
+        }
+    }
+
+    #[test]
+    fn unserved_reports_an_unversioned_name() {
+        let contracts = contracts_of(&["murmur:tool/run"], &[]);
+        let unserved = contracts.unserved_against(SERVED);
+        assert_eq!(unserved.len(), 1);
+        assert_eq!(unserved[0].package, "murmur:tool");
+        assert_eq!(unserved[0].artifact_version, None);
+        assert_eq!(unserved[0].served_version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn unserved_never_reports_other_namespaces() {
+        let contracts = contracts_of(
+            &["foo:bar/baz@9.9.9"],
+            &["wasi:cli/environment@0.2.0", "foo:bar/baz@9.9.9"],
+        );
+        assert!(contracts.unserved_against(SERVED).is_empty());
     }
 
     #[test]
