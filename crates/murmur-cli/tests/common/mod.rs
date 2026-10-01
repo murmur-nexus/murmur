@@ -959,6 +959,10 @@ pub const DOOR_EXTENSION_URI: &str =
 pub const CAPSULE_EXTENSION_URI: &str =
     "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1";
 
+/// URI of the agent card's stream extension: every SSE event type the capsule's stream can write.
+pub const STREAM_EXTENSION_URI: &str =
+    "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
+
 /// The `params` of the extension in `card.capabilities.extensions` whose `uri` is `uri`; fails the
 /// test when the card has no such extension.
 pub fn card_extension_params<'a>(card: &'a Value, uri: &str) -> &'a serde_json::Map<String, Value> {
@@ -976,6 +980,16 @@ pub fn card_door_methods(card: &Value) -> Vec<&str> {
         .unwrap_or_else(|| panic!("the door extension's methods are not an array: {card}"))
         .iter()
         .map(|method| method.as_str().expect("each method is a string"))
+        .collect()
+}
+
+/// The frames the card's stream extension lists, in order.
+pub fn card_stream_frames(card: &Value) -> Vec<&str> {
+    card_extension_params(card, STREAM_EXTENSION_URI)["frames"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the stream extension's frames are not an array: {card}"))
+        .iter()
+        .map(|frame| frame.as_str().expect("each frame is a string"))
         .collect()
 }
 

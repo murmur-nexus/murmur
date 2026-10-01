@@ -4,7 +4,7 @@ Every capsule serves an [A2A](https://a2a-protocol.org) v1.0 `AgentCard` at
 `GET /.well-known/agent-card.json` on its HTTP listener. The card parses as `lf.a2a.v1.AgentCard`,
 as defined by [`a2a.proto` at `v1.0.0`](https://github.com/a2aproject/A2A/blob/v1.0.0/specification/a2a.proto),
 under a strict protobuf JSON parser. It names the session answering the address, states what the
-capsule may do, and lists what its listener answers.
+capsule may do, lists what its listener answers, and names the frames its stream can send.
 
 The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_acceptance: single`,
 `bash` installed, shell and network granted, `exports.files` declared and no
@@ -42,6 +42,14 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
           "network": true,
           "planes": ["files"]
         }
+      },
+      {
+        "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
+        "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "required": false,
+        "params": {
+          "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+        }
       }
     ]
   },
@@ -60,12 +68,13 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
 }
 ```
 
-What murmur adds to the standard card sits in two [extensions](#extensions):
+What murmur adds to the standard card sits in three [extensions](#extensions):
 
 | Extension | Answers | Derived from |
 |---|---|---|
 | [Door](#murmur-door-v1) | What does this listener answer? | The methods `POST /` dispatches |
 | [Capsule](#murmur-capsule-v1) | Which session is this, and what may the capsule do? | The session, the installed artifacts, `capabilities.*` and the declared `exports` |
+| [Stream](#stream-extension) | Which frames can its stream send? | The streaming methods the door serves and the inference transport |
 
 A capsule that declares [`network.authentication`](manifest.md#field-network-authentication)
 serves a different public card, and moves the capsule extension to an extended card only an
@@ -121,7 +130,7 @@ Task states are kebab-case (`input-required`), as in A2A 0.3.
 | `capabilities.streaming` | boolean | `true` when the [door extension](#murmur-door-v1) lists `message/stream` and the capsule's inference transport streams text |
 | `capabilities.pushNotifications` | boolean | `false` |
 | `capabilities.extendedAgentCard` | boolean | `false` on a public door, where every caller gets this card. `true` on an [authenticated door](#security) |
-| `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), then the [capsule extension](#murmur-capsule-v1). An authenticated door's public card carries the door extension alone |
+| `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), the [capsule extension](#murmur-capsule-v1), then the [stream extension](#stream-extension). An authenticated door's public card carries the door extension, then the stream extension |
 
 `streaming` is the door's answer and the transport's together: a door that answers
 `message/stream` over a transport that streams nothing lists the method on the door extension and
@@ -212,6 +221,14 @@ terminator in front of a door that is reached off the host.
         "params": {
           "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"]
         }
+      },
+      {
+        "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
+        "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "required": false,
+        "params": {
+          "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+        }
       }
     ]
   },
@@ -246,7 +263,7 @@ It differs from a public door's card in these keys:
 | Key | Value |
 |---|---|
 | `capabilities.extendedAgentCard` | `true` |
-| `capabilities.extensions` | The door extension alone. The [capsule extension](#murmur-capsule-v1) is on the extended card |
+| `capabilities.extensions` | The door extension, then the stream extension. The [capsule extension](#murmur-capsule-v1) is on the extended card |
 | Door extension `params.methods` | Gains `agent/getAuthenticatedExtendedCard` |
 | `securitySchemes` | `bearer`: an `httpAuthSecurityScheme` with scheme `Bearer` |
 | `securityRequirements` | `[{"schemes": {"bearer": {"list": []}}}]`: any valid token |
@@ -274,7 +291,9 @@ authenticated door's v1.0 card with the capsule extension kept, converted to 0.3
       { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.", "required": false,
         "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"] } },
       { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
-        "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } }
+        "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
+      { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
+        "params": { "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
     ]
   },
   "securitySchemes": {
@@ -330,13 +349,13 @@ Installed tools are not skills: a caller cannot invoke a tool directly. They are
 
 ## Extensions { #extensions }
 
-Both extensions are A2A `AgentExtension` objects with `required: false`: a standard A2A client can
-call the capsule without understanding either. The door does not require an `A2A-Extensions`
-header to activate them.
+All three extensions are A2A `AgentExtension` objects with `required: false`: a standard A2A client
+can call the capsule without understanding any of them. The door does not require an
+`A2A-Extensions` header to activate them.
 
 | Key | Value |
 |---|---|
-| `uri` | The extension's identifier, which is the address of its section on this page |
+| `uri` | The extension's identifier, which is the address of its section in these docs |
 | `description` | What the extension carries |
 | `required` | `false` |
 | `params` | The extension's content, below |
@@ -414,6 +433,15 @@ with a refusal. Planes appear in this order:
 |---|---|---|
 | `files` | [`exports.files`](manifest.md#field-exports) is declared | The [operator plane](resource-plane.md#operator-plane) under `/resources/files` |
 | `peer_files` | [`exports.peer_files`](manifest.md#field-exports) is declared | The [peer plane](resource-plane.md#peer-plane) under `/resources/peer/<handle>` |
+
+### Stream extension { #stream-extension }
+
+URI: `https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1`
+
+`params.frames` lists every frame type the capsule's `message/stream` and `stream/watch`
+connections can write. Its key and the frame list are on the streaming protocol page, under
+[Frame vocabulary](streaming-protocol.md#murmur-stream-v1). It is on the public card of every door,
+authenticated or not.
 
 ## A card with no `supportedInterfaces` { #no-supported-interfaces }
 

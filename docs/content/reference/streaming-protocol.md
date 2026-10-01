@@ -137,6 +137,39 @@ A client that needs every frame reconnects with the id of the last frame it rece
 
 ---
 
+## Frame vocabulary { #murmur-stream-v1 }
+
+The agent card's stream extension lists every frame type a capsule's `message/stream` and
+`stream/watch` connections can write. It is an A2A `AgentExtension` with URI
+`https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1` and `required: false`,
+in `capabilities.extensions` after the door and capsule extensions — see
+[Agent Card: Extensions](agent-card.md#extensions). On the public card of a door that declares
+`network.authentication` it follows the door extension, and the extended card carries it too.
+
+| Key | Type | Notes |
+|---|---|---|
+| `params.frames` | array of strings | The event types this capsule's `message/stream` and `stream/watch` connections can write, in the order below |
+
+| Frame | Listed when | A2A counterpart |
+|---|---|---|
+| [`status`](#event-status) | Always, on both transports | A2A `TaskStatusUpdateEvent` |
+| [`artifact`](#event-artifact) | Always, on both transports | A2A `TaskArtifactUpdateEvent` |
+| [`text`](#event-text) | Always, on both transports | None — a murmur frame |
+| [`thinking`](#event-thinking) | Always, on both transports | None — a murmur frame |
+| [`gap`](#event-gap) | Always, on both transports | None — a murmur frame |
+| [`lagged`](#event-lagged) | Always, on both transports | None — a murmur frame |
+| [`connection-ack`](#event-connection-ack) | Always, on both transports | None — a murmur frame |
+| [`capsule-closed`](#event-capsule-closed) | Always, on both transports | None — a murmur frame |
+| [`error`](#event-error) | Only when the door extension lists `message/stream` | None — a murmur frame |
+
+The list is derived from the methods the door serves and the capsule's
+[`inference.transport`](manifest.md#inference-config), so two capsules built from one manifest with
+different transports can list different frames. The extension declares what the stream sends and
+changes nothing about it: a client that never reads it follows
+[Unknown frames and keys](#unknown-events).
+
+---
+
 ## Frame format { #frame-format }
 
 A frame is a group of lines ending with a blank line (`\n\n`). Lines end with `\n`, never `\r\n`.
@@ -189,6 +222,28 @@ ran the turn:
 | `artifact.fence_source` is `null` on every frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
 | `artifact.exit_code` is `null` and `artifact.truncated` is `false` on every frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
 | A provider retry writes no frame on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
+
+### Frame order within a task { #task-frame-order }
+
+One attempt of a task writes its frames in this order:
+
+1. [`status`](#event-status) `working`, message `inference turn <n>`, at the start of each
+   inference turn, before the driver is called.
+2. While the turn runs, [`thinking`](#event-thinking) and [`text`](#event-text) `"final":false`
+   frames, in the order they are produced.
+3. When the turn streamed text, one `text` `"final":true` frame with empty text once the driver
+   returns.
+4. One [`artifact`](#event-artifact) per tool call, written when the call returns, in dispatch
+   order. A tool's own streamed `text` and `thinking` frames, and the `input-required` and
+   `working` `resumed` pair of its `request-input` wait, come before its `artifact`.
+5. The next turn repeats from step 1.
+6. When the attempt completes, one `artifact` per hook artifact, then the whole reply as one
+   `text` `"final":true` frame when the last turn streamed no text.
+7. A reopen writes the [reopen boundary](#reopened-tasks), and the next attempt starts at step 1.
+8. The task's [one final status](#one-final-status) is its last frame.
+
+A `transport: process` capsule writes the same order from its harness's events, through the table
+under [Transports](#transports).
 
 ---
 

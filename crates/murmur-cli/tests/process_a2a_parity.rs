@@ -888,6 +888,72 @@ fn a_process_capsule_advertises_cancellation_and_streaming() {
         common::card_door_methods(&card).contains(&"tasks/cancel"),
         "the door answers tasks/cancel: {card}"
     );
+    assert_eq!(common::card_stream_frames(&card), PROCESS_FRAMES, "{card}");
+}
+
+/// The stream extension's `params.frames` of an http capsule that serves `message/stream`.
+const HTTP_FRAMES: [&str; 9] = [
+    "status",
+    "artifact",
+    "text",
+    "thinking",
+    "gap",
+    "lagged",
+    "connection-ack",
+    "capsule-closed",
+    "error",
+];
+
+/// The stream extension's `params.frames` of a `transport: process` capsule that serves
+/// `message/stream`.
+const PROCESS_FRAMES: [&str; 9] = [
+    "status",
+    "artifact",
+    "text",
+    "thinking",
+    "gap",
+    "lagged",
+    "connection-ack",
+    "capsule-closed",
+    "error",
+];
+
+/// Each capsule's card lists the frames its transport writes, and the S1 work on either
+/// transport writes no frame its card leaves out.
+#[test]
+fn every_frame_a_capsule_writes_is_on_its_card() {
+    if common::skip_without_host_support("every_frame_a_capsule_writes_is_on_its_card") {
+        return;
+    }
+    let server = tool_then_answer_server();
+    let http = http_capsule(&server, "frames-http", true, None);
+    let process = ProcessCapsule::new("frames-process", "parity")
+        .with_tool()
+        .start();
+
+    for (transport, url, expected) in [
+        ("http", http.url(), HTTP_FRAMES),
+        ("process", process.url(), PROCESS_FRAMES),
+    ] {
+        let served = http_get(&url, "/.well-known/agent-card.json");
+        let card: Value = serde_json::from_str(&served).expect("the card is JSON");
+        common::assert_a2a_agent_card(&card);
+        let frames = common::card_stream_frames(&card);
+        println!("{transport} card frames: {frames:?}");
+        assert_eq!(frames, expected, "{transport}: {card}");
+
+        let events = collect_sse_events(&url, STREAM_TIMEOUT);
+        let observed: std::collections::BTreeSet<&str> =
+            events.iter().map(|e| e.event_type.as_str()).collect();
+        println!("{transport} observed event types: {observed:?}");
+        assert!(!observed.is_empty(), "{transport}: no frames");
+        for event_type in &observed {
+            assert!(
+                frames.contains(event_type),
+                "{transport} wrote {event_type}, which its card does not list: {frames:?}"
+            );
+        }
+    }
 }
 
 /// The `on-inference` hook the hook scenarios declare, and what it returns every turn.

@@ -415,6 +415,20 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
         common::card_door_methods(&card),
         ["stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
     );
+    assert_eq!(
+        common::card_stream_frames(&card),
+        [
+            "status",
+            "artifact",
+            "text",
+            "thinking",
+            "gap",
+            "lagged",
+            "connection-ack",
+            "capsule-closed"
+        ],
+        "no message/stream, so no error frame: {card}"
+    );
     assert_eq!(card["capabilities"]["streaming"], false);
     assert_eq!(card["skills"], json!([]), "no task can be started: {card}");
     common::assert_a2a_agent_card(&card);
@@ -565,6 +579,13 @@ fn the_card_is_an_a2a_agent_card_with_exactly_its_keys() {
     assert_eq!(
         key_set(capsule_params),
         HashSet::from(["sessionId", "tools", "shell", "network", "planes"])
+    );
+    assert_eq!(
+        key_set(common::card_extension_params(
+            &card,
+            common::STREAM_EXTENSION_URI
+        )),
+        HashSet::from(["frames"])
     );
 
     assert_eq!(card["name"], "door-discovery-agent");

@@ -59,7 +59,7 @@ use crate::{
     hooks::HookArtifact,
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
-        SseEventBuffer, StreamArtifact, StreamStatus, TaskArtifactUpdateEvent,
+        SseEventBuffer, StreamArtifact, StreamFrame, StreamStatus, TaskArtifactUpdateEvent,
         TaskStatusUpdateEvent,
     },
 };
@@ -300,7 +300,7 @@ impl A2aStream {
         };
         emit_sse(
             &target.sse,
-            "artifact",
+            StreamFrame::Artifact,
             &TaskArtifactUpdateEvent {
                 id: target.task_id.clone(),
                 artifact,
@@ -315,7 +315,7 @@ impl A2aStream {
         };
         emit_sse(
             &target.sse,
-            "status",
+            StreamFrame::Status,
             &TaskStatusUpdateEvent {
                 id: target.task_id.clone(),
                 context_id: target.context_id.clone(),

@@ -133,17 +133,65 @@ impl StreamArtifact {
     }
 }
 
+/// An SSE event type the capsule's stream writes: the `event:` line of every frame on
+/// `message/stream` and `stream/watch`. Every writer takes one, so this is the whole vocabulary
+/// the agent card's stream extension is derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamFrame {
+    Status,
+    Artifact,
+    Text,
+    Thinking,
+    Gap,
+    Lagged,
+    ConnectionAck,
+    CapsuleClosed,
+    Error,
+}
+
+impl StreamFrame {
+    /// Every frame, in the order the stream extension's `params.frames` lists them.
+    pub(crate) const ALL: [StreamFrame; 9] = [
+        StreamFrame::Status,
+        StreamFrame::Artifact,
+        StreamFrame::Text,
+        StreamFrame::Thinking,
+        StreamFrame::Gap,
+        StreamFrame::Lagged,
+        StreamFrame::ConnectionAck,
+        StreamFrame::CapsuleClosed,
+        StreamFrame::Error,
+    ];
+
+    /// The `event:` line's value, and the frame's name in `params.frames`.
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            StreamFrame::Status => "status",
+            StreamFrame::Artifact => "artifact",
+            StreamFrame::Text => "text",
+            StreamFrame::Thinking => "thinking",
+            StreamFrame::Gap => "gap",
+            StreamFrame::Lagged => "lagged",
+            StreamFrame::ConnectionAck => "connection-ack",
+            StreamFrame::CapsuleClosed => "capsule-closed",
+            StreamFrame::Error => "error",
+        }
+    }
+}
+
 /// Format a single SSE event frame:
 ///   id: <event_id>\n
 ///   event: <event_type>\n
 ///   data: <json>\n\n
-pub(crate) fn format_sse_event(event_id: u64, event_type: &str, data: &str) -> String {
+pub(crate) fn format_sse_event(event_id: u64, frame: StreamFrame, data: &str) -> String {
+    let event_type = frame.wire_name();
     format!("id: {event_id}\nevent: {event_type}\ndata: {data}\n\n")
 }
 
 /// Format an SSE event frame with no `id:` line, for a frame that is written straight to one
 /// connection and never takes a place in the session's sequence.
-pub(crate) fn format_unnumbered_sse_event(event_type: &str, data: &str) -> String {
+pub(crate) fn format_unnumbered_sse_event(frame: StreamFrame, data: &str) -> String {
+    let event_type = frame.wire_name();
     format!("event: {event_type}\ndata: {data}\n\n")
 }
 
@@ -184,7 +232,7 @@ pub(crate) enum ReplayResult {
 /// Format a gap SSE event indicating that buffered history starts at `first_available_id`.
 pub(crate) fn format_gap_event(first_available_id: u64) -> String {
     format_unnumbered_sse_event(
-        "gap",
+        StreamFrame::Gap,
         &format!("{{\"first_available_id\":{first_available_id}}}"),
     )
 }
@@ -197,7 +245,7 @@ pub(crate) fn format_gap_event(first_available_id: u64) -> String {
 /// `missed` is the count carried by the broadcast receiver's `RecvError::Lagged`, always at
 /// least 1.
 pub(crate) fn format_lagged_event(missed: u64) -> String {
-    format!("event: lagged\ndata: {{\"missed\":{missed}}}\n\n")
+    format_unnumbered_sse_event(StreamFrame::Lagged, &format!("{{\"missed\":{missed}}}"))
 }
 
 /// The session's event-id sequence and a bounded ring-buffer of the most recent frames for
@@ -224,10 +272,10 @@ impl SseEventBuffer {
     }
 
     /// Number, format and store one frame, returning its id and the formatted text.
-    fn append(&mut self, event_type: &str, data: &str) -> (u64, Arc<String>) {
+    fn append(&mut self, frame: StreamFrame, data: &str) -> (u64, Arc<String>) {
         let id = self.next_id;
         self.next_id += 1;
-        let event = Arc::new(format_sse_event(id, event_type, data));
+        let event = Arc::new(format_sse_event(id, frame, data));
         if self.events.len() >= self.capacity {
             self.events.pop_front();
         }
@@ -269,11 +317,11 @@ impl SseEventBuffer {
 pub(crate) fn emit_frame(
     tx: &SseBroadcast,
     buf: &Arc<Mutex<SseEventBuffer>>,
-    event_type: &str,
+    frame: StreamFrame,
     data: &str,
 ) -> u64 {
     let mut buf = buf.lock().unwrap();
-    let (id, event) = buf.append(event_type, data);
+    let (id, event) = buf.append(frame, data);
     let _ = tx.send(event);
     id
 }
@@ -281,7 +329,7 @@ pub(crate) fn emit_frame(
 /// Serialize and emit one SSE event through [`emit_frame`]. No-op when sse is None.
 pub(crate) async fn emit_sse(
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    event_type: &str,
+    frame: StreamFrame,
     data: &impl Serialize,
 ) {
     let Some((sse_tx, sse_buffer)) = sse else {
@@ -291,7 +339,7 @@ pub(crate) async fn emit_sse(
         Ok(s) => s,
         Err(_) => return,
     };
-    emit_frame(sse_tx, sse_buffer, event_type, &data_str);
+    emit_frame(sse_tx, sse_buffer, frame, &data_str);
 }
 
 /// Whether a pre-formatted SSE event string is `task_id`'s final status: an `event: status`
@@ -302,7 +350,7 @@ pub(crate) fn is_final_status_for(event: &str, task_id: &str) -> bool {
     let mut is_status = false;
     let mut data = None;
     for line in event.lines() {
-        if line == "event: status" {
+        if line.split_once(": ") == Some(("event", StreamFrame::Status.wire_name())) {
             is_status = true;
         } else if let Some(rest) = line.strip_prefix("data: ") {
             data = Some(rest);
@@ -333,7 +381,7 @@ pub(crate) fn emit_chunk_sse(
     emit_frame(
         tx,
         buf,
-        "text",
+        StreamFrame::Text,
         &format_text_sse_data(task_id, chunk, false),
     );
 }
@@ -352,7 +400,7 @@ pub(crate) fn emit_thinking_chunk_sse(
     emit_frame(
         tx,
         buf,
-        "thinking",
+        StreamFrame::Thinking,
         &format_text_sse_data(task_id, chunk, false),
     );
 }
@@ -369,7 +417,12 @@ pub(crate) fn emit_chunk_sse_final(
     task_id: &str,
     text: &str,
 ) {
-    emit_frame(tx, buf, "text", &format_text_sse_data(task_id, text, true));
+    emit_frame(
+        tx,
+        buf,
+        StreamFrame::Text,
+        &format_text_sse_data(task_id, text, true),
+    );
 }
 
 fn format_text_sse_data(task_id: &str, text: &str, is_final: bool) -> String {
@@ -491,7 +544,7 @@ mod tests {
 
     #[test]
     fn format_sse_event_produces_correct_frame() {
-        let out = format_sse_event(3, "status", r#"{"id":"x"}"#);
+        let out = format_sse_event(3, StreamFrame::Status, r#"{"id":"x"}"#);
         assert_eq!(out, "id: 3\nevent: status\ndata: {\"id\":\"x\"}\n\n");
     }
 
@@ -499,7 +552,7 @@ mod tests {
     fn buffer_with(capacity: usize, count: u64) -> SseEventBuffer {
         let mut buf = SseEventBuffer::new(capacity);
         for n in 1..=count {
-            buf.append("status", &n.to_string());
+            buf.append(StreamFrame::Status, &n.to_string());
         }
         buf
     }
@@ -529,11 +582,11 @@ mod tests {
     fn ids_start_at_one_and_rise_by_one() {
         let (tx, mut rx) = broadcast::channel(8);
         let buf = Arc::new(Mutex::new(SseEventBuffer::new(8)));
-        assert_eq!(emit_frame(&tx, &buf, "status", "{}"), 1);
+        assert_eq!(emit_frame(&tx, &buf, StreamFrame::Status, "{}"), 1);
         emit_chunk_sse(&tx, &buf, "t", "a");
         emit_thinking_chunk_sse(&tx, &buf, "t", "b");
         emit_chunk_sse_final(&tx, &buf, "t", "");
-        assert_eq!(emit_frame(&tx, &buf, "artifact", "{}"), 5);
+        assert_eq!(emit_frame(&tx, &buf, StreamFrame::Artifact, "{}"), 5);
         let received: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|e| frame_id(&e).unwrap())
             .collect();
@@ -590,7 +643,7 @@ mod tests {
                         if t % 2 == 0 {
                             emit_chunk_sse(&tx, &buf, "t", "x");
                         } else {
-                            emit_frame(&tx, &buf, "status", "{}");
+                            emit_frame(&tx, &buf, StreamFrame::Status, "{}");
                         }
                     }
                 });
@@ -615,7 +668,7 @@ mod tests {
 
     #[test]
     fn live_frames_already_replayed_are_dropped() {
-        let frame = |id| format_sse_event(id, "status", "{}");
+        let frame = |id| format_sse_event(id, StreamFrame::Status, "{}");
         let mut last = Some(3);
         assert!(!admit_live_frame(&mut last, &frame(2)));
         assert!(!admit_live_frame(&mut last, &frame(3)));
@@ -635,7 +688,7 @@ mod tests {
 
     #[test]
     fn unnumbered_frame_has_no_id_line() {
-        let out = format_unnumbered_sse_event("status", r#"{"id":"x"}"#);
+        let out = format_unnumbered_sse_event(StreamFrame::Status, r#"{"id":"x"}"#);
         assert_eq!(out, "event: status\ndata: {\"id\":\"x\"}\n\n");
         assert_eq!(frame_id(&out), None);
     }
@@ -658,6 +711,108 @@ mod tests {
             .expect("data line");
         let parsed: serde_json::Value = serde_json::from_str(data).expect("data is JSON");
         assert_eq!(parsed, serde_json::json!({"missed": 7}));
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The production lines of a source file, numbered from 1: everything above its test module,
+    /// which starts at the first `#[cfg(test)]` whose item, past any further attributes, is an
+    /// inline `mod … {`. A `#[cfg(test)]` on a helper item or on an out-of-line `mod name;` leaves
+    /// the code after it in scope.
+    fn production_lines(source: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = (0..lines.len())
+            .find(|&i| {
+                lines[i].trim() == "#[cfg(test)]"
+                    && lines[i + 1..]
+                        .iter()
+                        .map(|line| line.trim())
+                        .find(|line| !line.starts_with("#["))
+                        .is_some_and(|item| {
+                            (item.starts_with("mod ") || item.contains(" mod "))
+                                && item.ends_with('{')
+                        })
+            })
+            .unwrap_or(lines.len());
+        lines[..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| (i + 1, *line))
+            .collect()
+    }
+
+    /// Whether a source line writes an `event:` line itself: a string literal that opens with one,
+    /// or one that carries one after a newline escape.
+    fn writes_event_line(line: &str) -> bool {
+        line.contains("\"event: ") || line.contains("\\nevent: ")
+    }
+
+    #[test]
+    fn stream_frame_writers_all_go_through_the_enum() {
+        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        rust_sources(src, &mut files);
+        files.sort();
+        let mut bypasses = Vec::new();
+        let mut formatters = Vec::new();
+        for path in &files {
+            let name = path.strip_prefix(src).unwrap().display().to_string();
+            if name.ends_with("_tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
+            let mut current_fn = "";
+            for (number, line) in production_lines(&source) {
+                let code = line.trim();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if let Some((_, rest)) = code.split_once("fn ") {
+                    current_fn = rest.split('(').next().unwrap_or(rest);
+                }
+                if !writes_event_line(code) {
+                    continue;
+                }
+                let is_formatter = name == "streaming.rs"
+                    && matches!(
+                        current_fn,
+                        "format_sse_event" | "format_unnumbered_sse_event"
+                    );
+                if is_formatter {
+                    formatters.push(format!("{name}:{number}"));
+                } else {
+                    bypasses.push(format!("{name}:{number}: {code}"));
+                }
+            }
+        }
+        assert!(
+            bypasses.is_empty(),
+            "frames written without StreamFrame, outside format_sse_event and \
+             format_unnumbered_sse_event:\n{}",
+            bypasses.join("\n")
+        );
+        assert_eq!(
+            formatters.len(),
+            2,
+            "one event: line in each formatter: {formatters:?}"
+        );
+    }
+
+    #[test]
+    fn stream_frame_wire_names_are_distinct() {
+        let names: std::collections::BTreeSet<&str> =
+            StreamFrame::ALL.iter().map(|f| f.wire_name()).collect();
+        assert_eq!(names.len(), StreamFrame::ALL.len());
     }
 
     #[test]

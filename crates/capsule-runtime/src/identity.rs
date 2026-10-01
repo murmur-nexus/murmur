@@ -21,7 +21,7 @@ use crate::resource_plane::{
 };
 use crate::streaming::{
     admit_live_frame, format_gap_event, format_lagged_event, format_unnumbered_sse_event, frame_id,
-    is_final_status_for, ReplayResult, SseBroadcast, SseEventBuffer, StreamStatus,
+    is_final_status_for, ReplayResult, SseBroadcast, SseEventBuffer, StreamFrame, StreamStatus,
     TaskStatusUpdateEvent, SSE_HEARTBEAT_COMMENT, SSE_HEARTBEAT_INTERVAL,
 };
 use crate::types::{CapabilityPolicy, InstalledArtifactSummary};
@@ -161,13 +161,88 @@ pub(crate) struct DeclaredPlanes {
     pub peer_files: bool,
 }
 
+/// Which family of inference transport a session runs, as far as the frames on its stream go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportKind {
+    /// Every session but `inference.transport: process`: the runtime's own agent loop, including
+    /// a session with no `inference:` block.
+    Http,
+    /// `inference.transport: process`, whose frames come from the harness events its driver reads.
+    Process,
+}
+
+impl TransportKind {
+    /// Every transport family.
+    pub(crate) const ALL: [TransportKind; 2] = [TransportKind::Http, TransportKind::Process];
+}
+
 /// What the capsule's inference transport can actually do, beyond what the served method list
-/// already says. Every transport can be stopped, so cancellation is not here: `tasks/cancel` is
-/// served under every acceptance.
+/// already says: whether the card claims `capabilities.streaming`, and which frames the stream
+/// extension lists. Every transport can be stopped, so cancellation is not here: `tasks/cancel`
+/// is served under every acceptance.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportCapabilities {
     /// Whether the transport emits streaming text frames.
     pub streams_text: bool,
+    /// The transport family, which decides the frames [`served_frames`] lists.
+    pub kind: TransportKind,
+}
+
+/// Whether a connection made with `method` can receive `frame` from a session on `transport`.
+///
+/// Each frame's arm states which streaming methods carry it and which transports write it. Only
+/// `message/stream` and `stream/watch` write frames; `stream/watch` alone writes the observer's
+/// `connection-ack` and `capsule-closed`, and `message/stream` alone answers a request it cannot
+/// take with `error`.
+fn writes_frame(method: DoorMethod, frame: StreamFrame, transport: TransportKind) -> bool {
+    let (on_message_stream, on_stream_watch, transports): (bool, bool, &[TransportKind]) =
+        match frame {
+            StreamFrame::Status
+            | StreamFrame::Artifact
+            | StreamFrame::Text
+            | StreamFrame::Thinking
+            | StreamFrame::Gap
+            | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
+            StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
+                (false, true, &TransportKind::ALL)
+            }
+            StreamFrame::Error => (true, false, &TransportKind::ALL),
+        };
+    let carried = match method {
+        DoorMethod::MessageStream => on_message_stream,
+        DoorMethod::StreamWatch => on_stream_watch,
+        DoorMethod::MessageSend
+        | DoorMethod::TasksGet
+        | DoorMethod::TasksCancel
+        | DoorMethod::SessionStop
+        | DoorMethod::GetAuthenticatedExtendedCard => false,
+    };
+    carried && transports.contains(&transport)
+}
+
+/// The wire names of every frame a connection to this door can receive, in `StreamFrame::ALL`
+/// order: a frame is listed when a streaming method the door serves under `acceptance` carries
+/// it and `transport` writes it.
+///
+/// Whether the door authenticates never changes which streaming methods it serves, so the list is
+/// the same on the public and the extended card.
+pub(crate) fn served_frames(
+    acceptance: &TaskAcceptance,
+    transport: TransportCapabilities,
+) -> Vec<&'static str> {
+    let methods: Vec<DoorMethod> = DoorMethod::ALL
+        .into_iter()
+        .filter(|m| DoorMethod::resolve(m.wire_name(), acceptance, false).is_some())
+        .collect();
+    StreamFrame::ALL
+        .into_iter()
+        .filter(|&frame| {
+            methods
+                .iter()
+                .any(|&method| writes_frame(method, frame, transport.kind))
+        })
+        .map(StreamFrame::wire_name)
+        .collect()
 }
 
 /// Asks the capsule to drop the harness session the request's context names before the turn it
@@ -206,6 +281,15 @@ pub(crate) const DOOR_EXTENSION_URI: &str =
 pub(crate) const CAPSULE_EXTENSION_URI: &str =
     "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1";
 
+/// URI of the agent-card extension that lists every SSE event type the capsule's stream can write.
+/// It is the address of that extension's section in the reference docs, on the streaming protocol
+/// page beside the frames it names.
+pub(crate) const STREAM_EXTENSION_URI: &str =
+    "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
+
+/// What the stream extension says about itself.
+const STREAM_EXTENSION_DESCRIPTION: &str = "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.";
+
 /// The id of the one skill a door that starts tasks advertises: running a task.
 pub(crate) const TASK_SKILL_ID: &str = "task";
 
@@ -229,7 +313,7 @@ const TEXT_MODE: &str = "text/plain";
 /// `capsule_url` with the `http://` scheme the door speaks. `securitySchemes` and
 /// `securityRequirements` are present and empty, which declares a public agent.
 ///
-/// `capabilities.extensions` holds two murmur extensions, in this order:
+/// `capabilities.extensions` holds three murmur extensions, in this order:
 ///
 /// - [`DOOR_EXTENSION_URI`], whose `params.methods` is [`served_methods`] for the acceptance the
 ///   door is given, so the card cannot list a method the dispatcher refuses or omit one it serves.
@@ -239,6 +323,9 @@ const TEXT_MODE: &str = "text/plain";
 ///   `sessionId` is served because the card is how a caller confirms that the capsule answering an
 ///   address is the session it went looking for. `planes` lists `files` then `peer_files`, each
 ///   only when declared.
+/// - [`STREAM_EXTENSION_URI`], whose `params.frames` is [`served_frames`] for the acceptance and
+///   the transport. It describes the stream protocol rather than the session, so it stays on the
+///   public card of an authenticated door.
 ///
 /// `capabilities.streaming` is read off the served methods and the transport together: `true`
 /// when `message/stream` is served and the transport streams text. A door that answers a method
@@ -313,6 +400,12 @@ pub(crate) fn build_agent_card(
                         "planes": declared_planes,
                     },
                 },
+                {
+                    "uri": STREAM_EXTENSION_URI,
+                    "description": STREAM_EXTENSION_DESCRIPTION,
+                    "required": false,
+                    "params": { "frames": served_frames(task_acceptance, transport) },
+                },
             ],
         },
         "securitySchemes": {},
@@ -360,8 +453,9 @@ pub(crate) struct AgentCards {
 /// `capabilities.extendedAgentCard: true`, the [`BEARER_SCHEME_NAME`] HTTP scheme with a
 /// requirement any valid token meets, `agent/getAuthenticatedExtendedCard` on the door
 /// extension's methods, and one alternative requirement per served task-starting method on the
-/// [`TASK_SKILL_ID`] skill. The public card is that card without the capsule extension; the
-/// extended card is that card, whole, in 0.3 shape through [`v03_agent_card`].
+/// [`TASK_SKILL_ID`] skill. The public card is that card without the capsule extension, so it
+/// carries the door and stream extensions; the extended card is that card, whole, in 0.3 shape
+/// through [`v03_agent_card`].
 pub(crate) fn build_agent_cards(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
@@ -1106,7 +1200,7 @@ async fn handle_message_stream(
         Ok(m) => m,
         Err(e) => {
             let error_data = format!("{{\"error\":\"Invalid params: {e}\"}}");
-            let event_text = format!("event: error\ndata: {error_data}\n\n");
+            let event_text = format_unnumbered_sse_event(StreamFrame::Error, &error_data);
             let _ = writer.write_all(event_text.as_bytes()).await;
             return;
         }
@@ -1168,8 +1262,10 @@ async fn handle_message_stream(
             reg.pending_count -= 1;
             reg.history.remove(&task_id);
         } // lock dropped before await
-        let event_text =
-            "event: error\ndata: {\"error\":\"internal error: queue send failed\"}\n\n";
+        let event_text = format_unnumbered_sse_event(
+            StreamFrame::Error,
+            "{\"error\":\"internal error: queue send failed\"}",
+        );
         let _ = writer.write_all(event_text.as_bytes()).await;
         return;
     }
@@ -1259,7 +1355,7 @@ const REJECTED_BUSY_MESSAGE: &str = "task rejected: capsule is busy";
 /// it has no place in the session's sequence, and an id would move a client's resume cursor.
 fn format_rejected_event(event: &TaskStatusUpdateEvent) -> String {
     let data = serde_json::to_string(event).unwrap_or_default();
-    format_unnumbered_sse_event("status", &data)
+    format_unnumbered_sse_event(StreamFrame::Status, &data)
 }
 
 /// Passive observer handler for `stream/watch`.
@@ -1292,8 +1388,9 @@ async fn handle_stream_watch(
     }
 
     // Emit connection-ack so observers know the capsule's conversation mode without reading manifest.
-    let ack = format!(
-        "event: connection-ack\ndata: {{\"role\":\"observer\",\"conversation_mode\":\"{conversation_mode_str}\"}}\n\n"
+    let ack = format_unnumbered_sse_event(
+        StreamFrame::ConnectionAck,
+        &format!("{{\"role\":\"observer\",\"conversation_mode\":\"{conversation_mode_str}\"}}"),
     );
     if writer.write_all(ack.as_bytes()).await.is_err() {
         return;
@@ -1329,9 +1426,8 @@ async fn handle_stream_watch(
                         // Do NOT exit on a final status — it ends one task, not the capsule.
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        let _ = writer
-                            .write_all(b"event: capsule-closed\ndata: {}\n\n")
-                            .await;
+                        let closed = format_unnumbered_sse_event(StreamFrame::CapsuleClosed, "{}");
+                        let _ = writer.write_all(closed.as_bytes()).await;
                         return;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1614,7 +1710,111 @@ mod tests {
     ];
 
     /// The card an http capsule serves: that transport streams text.
-    const HTTP_TRANSPORT: TransportCapabilities = TransportCapabilities { streams_text: true };
+    const HTTP_TRANSPORT: TransportCapabilities = TransportCapabilities {
+        streams_text: true,
+        kind: TransportKind::Http,
+    };
+
+    /// The stream extension's `params.frames` a capsule on each transport serves under each
+    /// acceptance. Written once per transport, so a frame one transport alone writes is an edit to
+    /// that transport's table.
+    const HTTP_FRAMES: [(TaskAcceptance, &[&str]); 3] = [
+        (
+            TaskAcceptance::None,
+            &[
+                "status",
+                "artifact",
+                "text",
+                "thinking",
+                "gap",
+                "lagged",
+                "connection-ack",
+                "capsule-closed",
+            ],
+        ),
+        (
+            TaskAcceptance::Single,
+            &[
+                "status",
+                "artifact",
+                "text",
+                "thinking",
+                "gap",
+                "lagged",
+                "connection-ack",
+                "capsule-closed",
+                "error",
+            ],
+        ),
+        (
+            TaskAcceptance::Queue,
+            &[
+                "status",
+                "artifact",
+                "text",
+                "thinking",
+                "gap",
+                "lagged",
+                "connection-ack",
+                "capsule-closed",
+                "error",
+            ],
+        ),
+    ];
+
+    const PROCESS_FRAMES: [(TaskAcceptance, &[&str]); 3] = [
+        (
+            TaskAcceptance::None,
+            &[
+                "status",
+                "artifact",
+                "text",
+                "thinking",
+                "gap",
+                "lagged",
+                "connection-ack",
+                "capsule-closed",
+            ],
+        ),
+        (
+            TaskAcceptance::Single,
+            &[
+                "status",
+                "artifact",
+                "text",
+                "thinking",
+                "gap",
+                "lagged",
+                "connection-ack",
+                "capsule-closed",
+                "error",
+            ],
+        ),
+        (
+            TaskAcceptance::Queue,
+            &[
+                "status",
+                "artifact",
+                "text",
+                "thinking",
+                "gap",
+                "lagged",
+                "connection-ack",
+                "capsule-closed",
+                "error",
+            ],
+        ),
+    ];
+
+    /// Every `TransportCapabilities` a session can stage.
+    fn every_transport() -> Vec<TransportCapabilities> {
+        TransportKind::ALL
+            .into_iter()
+            .flat_map(|kind| {
+                [false, true].map(|streams_text| TransportCapabilities { streams_text, kind })
+            })
+            .collect()
+    }
 
     fn card_for(acceptance: &TaskAcceptance, planes: DeclaredPlanes) -> Value {
         card_for_transport(acceptance, planes, HTTP_TRANSPORT)
@@ -1721,7 +1921,7 @@ mod tests {
         let tool_sets: [&[InstalledArtifactSummary]; 2] = [&[], &[tool("bash")]];
         let mut checked = 0;
         for acceptance in &ACCEPTANCES {
-            for streams_text in [false, true] {
+            for transport in every_transport() {
                 for (files, peer_files) in plane_sets {
                     for tools in tool_sets {
                         let card = build_agent_card(
@@ -1730,7 +1930,7 @@ mod tests {
                             &CapabilityPolicy::default(),
                             acceptance,
                             DeclaredPlanes { files, peer_files },
-                            TransportCapabilities { streams_text },
+                            transport,
                         );
                         assert_conforms(&card);
                         checked += 1;
@@ -1738,7 +1938,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 3 * 2 * 4 * 2);
+        assert_eq!(checked, 3 * 2 * 2 * 4 * 2);
     }
 
     #[test]
@@ -1777,6 +1977,14 @@ mod tests {
                                 "shell": true,
                                 "network": true,
                                 "planes": ["files"]
+                            }
+                        },
+                        {
+                            "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
+                            "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+                            "required": false,
+                            "params": {
+                                "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
                             }
                         }
                     ]
@@ -1916,20 +2124,153 @@ mod tests {
         assert_eq!(card["skills"], serde_json::json!([]));
     }
 
-    #[test]
-    fn a2a_card_extensions_are_the_door_then_the_capsule() {
-        let card = full_card(&TaskAcceptance::Single);
-        let extensions = card["capabilities"]["extensions"]
+    fn extension_uris(card: &Value) -> Vec<&str> {
+        card["capabilities"]["extensions"]
             .as_array()
-            .expect("extensions is an array");
-        let uris: Vec<&Value> = extensions.iter().map(|e| &e["uri"]).collect();
-        assert_eq!(uris, [DOOR_EXTENSION_URI, CAPSULE_EXTENSION_URI]);
-        for extension in extensions {
-            assert_eq!(extension["required"], false, "{extension}");
+            .expect("extensions is an array")
+            .iter()
+            .map(|e| e["uri"].as_str().expect("each uri is a string"))
+            .collect()
+    }
+
+    #[test]
+    fn a2a_card_extensions_are_the_door_the_capsule_then_the_stream() {
+        for acceptance in &ACCEPTANCES {
+            let card = full_card(acceptance);
             assert_eq!(
-                keys(extension),
-                ["description", "params", "required", "uri"],
-                "{extension}"
+                extension_uris(&card),
+                [
+                    DOOR_EXTENSION_URI,
+                    CAPSULE_EXTENSION_URI,
+                    STREAM_EXTENSION_URI
+                ]
+            );
+            for extension in card["capabilities"]["extensions"].as_array().unwrap() {
+                assert_eq!(extension["required"], false, "{extension}");
+                assert_eq!(
+                    keys(extension),
+                    ["description", "params", "required", "uri"],
+                    "{extension}"
+                );
+            }
+            let stream = extension_params(&card, STREAM_EXTENSION_URI)
+                .expect("the card has the stream extension");
+            assert_eq!(keys(&Value::Object(stream.clone())), ["frames"]);
+        }
+
+        let cards = full_cards(&TaskAcceptance::Single, Some(&bearer_authentication()));
+        assert_eq!(
+            extension_uris(&cards.public),
+            [DOOR_EXTENSION_URI, STREAM_EXTENSION_URI]
+        );
+        assert_eq!(
+            extension_uris(cards.extended.as_ref().expect("an extended card")),
+            [
+                DOOR_EXTENSION_URI,
+                CAPSULE_EXTENSION_URI,
+                STREAM_EXTENSION_URI
+            ]
+        );
+    }
+
+    fn stream_frames(card: &Value) -> Vec<&str> {
+        extension_params(card, STREAM_EXTENSION_URI).expect("the card has the stream extension")
+            ["frames"]
+            .as_array()
+            .expect("the stream extension's frames are an array")
+            .iter()
+            .map(|f| f.as_str().expect("each frame is a string"))
+            .collect()
+    }
+
+    #[test]
+    fn stream_extension_frames_are_pinned_per_transport() {
+        for (kind, table) in [
+            (TransportKind::Http, HTTP_FRAMES),
+            (TransportKind::Process, PROCESS_FRAMES),
+        ] {
+            for (acceptance, expected) in &table {
+                for streams_text in [false, true] {
+                    let transport = TransportCapabilities { streams_text, kind };
+                    assert_eq!(
+                        served_frames(acceptance, transport),
+                        *expected,
+                        "{kind:?} under {acceptance:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_extension_on_the_card_is_served_frames() {
+        let authentication = bearer_authentication();
+        for acceptance in &ACCEPTANCES {
+            for transport in every_transport() {
+                let expected = served_frames(acceptance, transport);
+                let card = card_for_transport(acceptance, DeclaredPlanes::default(), transport);
+                assert_eq!(
+                    stream_frames(&card),
+                    expected,
+                    "{acceptance:?} {transport:?}"
+                );
+
+                let cards = build_agent_cards(
+                    &identity(),
+                    &[],
+                    &CapabilityPolicy::default(),
+                    acceptance,
+                    DeclaredPlanes::default(),
+                    transport,
+                    Some(&authentication),
+                );
+                assert_eq!(stream_frames(&cards.public), expected);
+                assert_eq!(stream_frames(cards.extended.as_ref().unwrap()), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn stream_frame_every_variant_is_listed() {
+        for kind in TransportKind::ALL {
+            let transport = TransportCapabilities {
+                streams_text: true,
+                kind,
+            };
+            let frames = served_frames(&TaskAcceptance::Single, transport);
+            for frame in StreamFrame::ALL {
+                assert!(
+                    frames.contains(&frame.wire_name()),
+                    "{} is never listed on {kind:?}: {frames:?}",
+                    frame.wire_name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_extension_docs_name_every_frame() {
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/content/reference/streaming-protocol.md"
+        ))
+        .expect("the streaming protocol reference page");
+        assert!(
+            page.contains("{ #murmur-stream-v1 }"),
+            "no stream extension section"
+        );
+        assert!(page.contains("params.frames"), "no params.frames key");
+        assert!(
+            STREAM_EXTENSION_URI.ends_with("/reference/streaming-protocol/#murmur-stream-v1"),
+            "the URI addresses the section"
+        );
+        for frame in StreamFrame::ALL {
+            let anchor = format!("{{ #event-{} }}", frame.wire_name());
+            assert!(
+                page.lines()
+                    .any(|line| line.starts_with('#') && line.trim_end().ends_with(&anchor)),
+                "no heading for {}",
+                frame.wire_name()
             );
         }
     }
@@ -2051,12 +2392,11 @@ mod tests {
         let mut checked = 0;
         for authenticated in [None, Some(&authentication)] {
             for acceptance in &ACCEPTANCES {
-                for streams_text in [false, true] {
+                for transport in every_transport() {
                     for (files, peer_files) in plane_sets {
                         for tools in tool_sets {
                             for policy in &policies {
                                 let planes = DeclaredPlanes { files, peer_files };
-                                let transport = TransportCapabilities { streams_text };
                                 let cards = build_agent_cards(
                                     &identity(),
                                     tools,
@@ -2102,7 +2442,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 2 * 3 * 2 * 4 * 2 * 2);
+        assert_eq!(checked, 2 * 3 * 2 * 2 * 4 * 2 * 2);
     }
 
     #[test]
@@ -2129,6 +2469,14 @@ mod tests {
                             "required": false,
                             "params": {
                                 "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"]
+                            }
+                        },
+                        {
+                            "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
+                            "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+                            "required": false,
+                            "params": {
+                                "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
                             }
                         }
                     ]
@@ -2183,7 +2531,9 @@ mod tests {
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.", "required": false,
                           "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"] } },
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
-                          "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } }
+                          "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
+                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
+                          "params": { "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
                     ]
                 },
                 "securitySchemes": {
@@ -2322,10 +2672,11 @@ mod tests {
             (
                 TransportCapabilities {
                     streams_text: false,
+                    kind: TransportKind::Process,
                 },
                 false,
             ),
-            (TransportCapabilities { streams_text: true }, true),
+            (HTTP_TRANSPORT, true),
         ] {
             let card = card_for_transport(
                 &TaskAcceptance::Single,
@@ -2348,6 +2699,7 @@ mod tests {
             HTTP_TRANSPORT,
             TransportCapabilities {
                 streams_text: false,
+                kind: TransportKind::Process,
             },
         ] {
             let card =
@@ -2874,7 +3226,13 @@ mod tests {
     /// from 1.
     fn lag_burst() -> Vec<String> {
         (1..=(LAG_QUEUE + LAG_MISSED) as u64)
-            .map(|id| format_sse_event(id, "text", &format!("{{\"n\":{id},\"final\":false}}")))
+            .map(|id| {
+                format_sse_event(
+                    id,
+                    StreamFrame::Text,
+                    &format!("{{\"n\":{id},\"final\":false}}"),
+                )
+            })
             .collect()
     }
 
@@ -2951,7 +3309,7 @@ mod tests {
         let mut received = String::new();
         collect_sse_lines(&lines, &mut received, Some(retained.last().unwrap())).await;
 
-        let last = format_sse_event(100, "text", "{\"n\":\"last\",\"final\":false}");
+        let last = format_sse_event(100, StreamFrame::Text, "{\"n\":\"last\",\"final\":false}");
         sse_tx.send(Arc::new(last.clone())).unwrap();
         collect_sse_lines(&lines, &mut received, Some(&last)).await;
 
@@ -3040,11 +3398,15 @@ mod tests {
             .await
             .expect("the task was submitted")
             .task_id;
-        let other_final = format_sse_event(100, "status", "{\"id\":\"tsk_other\",\"final\":true}");
+        let other_final = format_sse_event(
+            100,
+            StreamFrame::Status,
+            "{\"id\":\"tsk_other\",\"final\":true}",
+        );
         sse_tx.send(Arc::new(other_final.clone())).unwrap();
         let final_status = format_sse_event(
             101,
-            "status",
+            StreamFrame::Status,
             &format!("{{\"id\":\"{task_id}\",\"final\":true}}"),
         );
         sse_tx.send(Arc::new(final_status.clone())).unwrap();
@@ -3127,7 +3489,7 @@ mod tests {
 
         let final_status = format_sse_event(
             1,
-            "status",
+            StreamFrame::Status,
             &format!("{{\"id\":\"{task_id}\",\"final\":true}}"),
         );
         sse_tx.send(Arc::new(final_status.clone())).unwrap();
@@ -3175,8 +3537,12 @@ mod tests {
         });
         wait_for_subscriber(&sse_tx).await;
 
-        let text = format_sse_event(1, "text", "{\"n\":\"last\",\"final\":false}");
-        let final_status = format_sse_event(2, "status", "{\"id\":\"tsk_closing\",\"final\":true}");
+        let text = format_sse_event(1, StreamFrame::Text, "{\"n\":\"last\",\"final\":false}");
+        let final_status = format_sse_event(
+            2,
+            StreamFrame::Status,
+            "{\"id\":\"tsk_closing\",\"final\":true}",
+        );
         sse_tx.send(Arc::new(text.clone())).unwrap();
         sse_tx.send(Arc::new(final_status.clone())).unwrap();
         closing_tx.send(true).unwrap();
@@ -3318,7 +3684,7 @@ mod tests {
         let page = protocol_page();
         let (tx, _rx) = tokio::sync::broadcast::channel(1);
         let buffer = std::sync::Arc::new(Mutex::new(SseEventBuffer::new(1)));
-        let first = crate::streaming::emit_frame(&tx, &buffer, "status", "{}");
+        let first = crate::streaming::emit_frame(&tx, &buffer, StreamFrame::Status, "{}");
 
         let phrase = format!("| First id | `{first}` |");
         assert!(
