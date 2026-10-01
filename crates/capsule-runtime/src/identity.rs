@@ -194,7 +194,11 @@ pub(crate) struct TransportCapabilities {
 /// `message/stream` and `stream/watch` write frames; `stream/watch` alone writes the observer's
 /// `connection-ack` and `capsule-closed`, and `message/stream` alone answers a request it cannot
 /// take with `error`.
-fn writes_frame(method: DoorMethod, frame: StreamFrame, transport: TransportKind) -> bool {
+pub(crate) fn writes_frame(
+    method: DoorMethod,
+    frame: StreamFrame,
+    transport: TransportKind,
+) -> bool {
     let (on_message_stream, on_stream_watch, transports): (bool, bool, &[TransportKind]) =
         match frame {
             StreamFrame::Status

@@ -1275,53 +1275,23 @@ mod tests {
     /// its own tests, where the launcher rather than a launch path is the unit under test.
     #[test]
     fn a_launch_request_is_built_in_exactly_one_place() {
-        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-        let mut swept = 0_usize;
         let mut found: Vec<(String, usize)> = Vec::new();
 
-        let mut pending = vec![src.to_path_buf()];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).expect("the crate's src directory is readable") {
-                let path = entry.expect("a readable directory entry").path();
-                if path.is_dir() {
-                    pending.push(path);
-                    continue;
-                }
-                if !path.extension().is_some_and(|ext| ext == "rs") {
-                    continue;
-                }
-                swept += 1;
-                let name = path
-                    .strip_prefix(src)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                if name == "child_launch.rs" {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).expect("a readable source file");
-                // Cut at the trailing test module rather than at the first `#[cfg(test)]`:
-                // files in this crate carry test-only items far above their `mod tests`.
-                let body = text
-                    .split("\n#[cfg(test)]\nmod tests")
-                    .next()
-                    .unwrap_or_default();
-                let count = body
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                    .map(|line| line.matches("ChildLaunchRequest {").count())
-                    .sum::<usize>();
-                if count > 0 {
-                    found.push((name, count));
-                }
+        for (name, text) in crate::source_scan::crate_sources() {
+            if name == "child_launch.rs" {
+                continue;
+            }
+            let count = crate::source_scan::production_part(&text)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.matches("ChildLaunchRequest {").count())
+                .sum::<usize>();
+            if count > 0 {
+                found.push((name, count));
             }
         }
 
         found.sort();
-        assert!(
-            swept > 10,
-            "the source sweep found only {swept} files, so it is not sweeping the crate"
-        );
         assert_eq!(
             found,
             vec![("delegation_plane.rs".to_string(), 1)],

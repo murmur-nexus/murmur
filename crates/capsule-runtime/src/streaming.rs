@@ -713,42 +713,45 @@ mod tests {
         assert_eq!(parsed, serde_json::json!({"missed": 7}));
     }
 
-    /// Every `.rs` file under `dir`, recursively.
-    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                rust_sources(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
+    /// One non-comment production line of a file under `src/`, other than a `*_tests.rs` file.
+    struct CodeLine {
+        /// The path relative to `src/`.
+        file: String,
+        /// The `fn`, or the `impl` header, the line most recently entered.
+        item: String,
+        number: usize,
+        code: String,
     }
 
-    /// The production lines of a source file, numbered from 1: everything above its test module,
-    /// which starts at the first `#[cfg(test)]` whose item, past any further attributes, is an
-    /// inline `mod … {`. A `#[cfg(test)]` on a helper item or on an out-of-line `mod name;` leaves
-    /// the code after it in scope.
-    fn production_lines(source: &str) -> Vec<(usize, &str)> {
-        let lines: Vec<&str> = source.lines().collect();
-        let end = (0..lines.len())
-            .find(|&i| {
-                lines[i].trim() == "#[cfg(test)]"
-                    && lines[i + 1..]
-                        .iter()
-                        .map(|line| line.trim())
-                        .find(|line| !line.starts_with("#["))
-                        .is_some_and(|item| {
-                            (item.starts_with("mod ") || item.contains(" mod "))
-                                && item.ends_with('{')
-                        })
-            })
-            .unwrap_or(lines.len());
-        lines[..end]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| (i + 1, *line))
-            .collect()
+    fn production_code() -> Vec<CodeLine> {
+        let mut out = Vec::new();
+        for (file, source) in crate::source_scan::crate_sources() {
+            if file.ends_with("_tests.rs") {
+                continue;
+            }
+            let mut item = String::new();
+            for (index, line) in crate::source_scan::production_part(&source)
+                .lines()
+                .enumerate()
+            {
+                let code = line.trim();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if let Some((_, rest)) = code.split_once("fn ") {
+                    item = rest.split('(').next().unwrap_or(rest).to_string();
+                } else if code.starts_with("impl ") {
+                    item = code.trim_end_matches('{').trim().to_string();
+                }
+                out.push(CodeLine {
+                    file: file.clone(),
+                    item: item.clone(),
+                    number: index + 1,
+                    code: code.to_string(),
+                });
+            }
+        }
+        out
     }
 
     /// Whether a source line writes an `event:` line itself: a string literal that opens with one,
@@ -759,40 +762,21 @@ mod tests {
 
     #[test]
     fn stream_frame_writers_all_go_through_the_enum() {
-        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-        let mut files = Vec::new();
-        rust_sources(src, &mut files);
-        files.sort();
         let mut bypasses = Vec::new();
         let mut formatters = Vec::new();
-        for path in &files {
-            let name = path.strip_prefix(src).unwrap().display().to_string();
-            if name.ends_with("_tests.rs") {
+        for line in production_code() {
+            if !writes_event_line(&line.code) {
                 continue;
             }
-            let source = std::fs::read_to_string(path).unwrap();
-            let mut current_fn = "";
-            for (number, line) in production_lines(&source) {
-                let code = line.trim();
-                if code.starts_with("//") {
-                    continue;
-                }
-                if let Some((_, rest)) = code.split_once("fn ") {
-                    current_fn = rest.split('(').next().unwrap_or(rest);
-                }
-                if !writes_event_line(code) {
-                    continue;
-                }
-                let is_formatter = name == "streaming.rs"
-                    && matches!(
-                        current_fn,
-                        "format_sse_event" | "format_unnumbered_sse_event"
-                    );
-                if is_formatter {
-                    formatters.push(format!("{name}:{number}"));
-                } else {
-                    bypasses.push(format!("{name}:{number}: {code}"));
-                }
+            let is_formatter = line.file == "streaming.rs"
+                && matches!(
+                    line.item.as_str(),
+                    "format_sse_event" | "format_unnumbered_sse_event"
+                );
+            if is_formatter {
+                formatters.push(format!("{}:{}", line.file, line.number));
+            } else {
+                bypasses.push(format!("{}:{}: {}", line.file, line.number, line.code));
             }
         }
         assert!(
@@ -805,6 +789,55 @@ mod tests {
             formatters.len(),
             2,
             "one event: line in each formatter: {formatters:?}"
+        );
+    }
+
+    /// A frame written straight to one streaming connection must be one `writes_frame` lets that
+    /// method carry, or the card of a door that serves only the other method omits a frame it
+    /// sends. Any other write goes to the session's broadcast, which both methods relay.
+    #[test]
+    fn stream_frame_every_write_is_carried_by_its_method() {
+        use crate::identity::{writes_frame, DoorMethod, TransportKind};
+        let mut uncarried = Vec::new();
+        for line in production_code() {
+            let methods: &[DoorMethod] = match (line.file.as_str(), line.item.as_str()) {
+                ("streaming.rs", "impl StreamFrame" | "wire_name")
+                | ("identity.rs", "writes_frame") => continue,
+                ("identity.rs", "handle_message_stream" | "format_rejected_event") => {
+                    &[DoorMethod::MessageStream]
+                }
+                ("identity.rs", "handle_stream_watch") => &[DoorMethod::StreamWatch],
+                _ => &[DoorMethod::MessageStream, DoorMethod::StreamWatch],
+            };
+            let named = line.code.split("StreamFrame::").skip(1).map(|rest| {
+                rest.split(|c: char| !c.is_alphanumeric())
+                    .next()
+                    .unwrap_or("")
+            });
+            for name in named {
+                let Some(frame) = StreamFrame::ALL
+                    .into_iter()
+                    .find(|f| format!("{f:?}") == name)
+                else {
+                    continue;
+                };
+                for &method in methods {
+                    if !TransportKind::ALL
+                        .into_iter()
+                        .any(|transport| writes_frame(method, frame, transport))
+                    {
+                        uncarried.push(format!(
+                            "{}:{}: {frame:?} on {method:?}: {}",
+                            line.file, line.number, line.code
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            uncarried.is_empty(),
+            "frames written on a method writes_frame does not carry them on:\n{}",
+            uncarried.join("\n")
         );
     }
 

@@ -918,8 +918,8 @@ const PROCESS_FRAMES: [&str; 9] = [
     "error",
 ];
 
-/// Each capsule's card lists the frames its transport writes, and the S1 work on either
-/// transport writes no frame its card leaves out.
+/// Each capsule's card lists the frames its transport writes, and text, one tool call and an
+/// answer on either transport write no frame its card leaves out.
 #[test]
 fn every_frame_a_capsule_writes_is_on_its_card() {
     if common::skip_without_host_support("every_frame_a_capsule_writes_is_on_its_card") {

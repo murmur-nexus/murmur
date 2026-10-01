@@ -162,11 +162,10 @@ in `capabilities.extensions` after the door and capsule extensions — see
 | [`capsule-closed`](#event-capsule-closed) | Always, on both transports | None — a murmur frame |
 | [`error`](#event-error) | Only when the door extension lists `message/stream` | None — a murmur frame |
 
-The list is derived from the methods the door serves and the capsule's
-[`inference.transport`](manifest.md#inference-config), so two capsules built from one manifest with
-different transports can list different frames. The extension declares what the stream sends and
-changes nothing about it: a client that never reads it follows
-[Unknown frames and keys](#unknown-events).
+Each capsule computes its own list from the methods its door serves and its
+[`inference.transport`](manifest.md#inference-config). Read the list from the capsule's card rather
+than from this table. The extension declares what the stream sends and changes nothing about it: a
+client that never reads it follows [Unknown frames and keys](#unknown-events).
 
 ---
 
