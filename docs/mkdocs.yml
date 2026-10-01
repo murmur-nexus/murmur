@@ -22,6 +22,7 @@ exclude_docs: |
   reference/workdir-exec-landlock-manual-verification.md
   reference/shell-binary-reachability-manual-verification.md
   reference/seccomp-filter-instruction-budget.md
+  reference/capsule-burst-measurement.md
   reference/workdir-device-node-manual-verification.md
   reference/af-unix-sockets-manual-verification.md
   reference/capsule-device-set-manual-verification.md
