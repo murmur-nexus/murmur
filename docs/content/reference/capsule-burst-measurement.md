@@ -9,8 +9,11 @@ recommended `--max-live-capsules` on this host is **100**, the largest burst mea
 default of **64**.
 
 Every number on this page comes from one run's `result.json`: `/space/_murmur/smoke/_runs/burst-coding/result.json`,
-started 2026-09-30T17:30:35, verdict `pass`. Figures marked *arithmetic* are computed on this page
-from that file's values.
+started 2026-09-30T17:30:35, verdict `pass`, sha256
+`6e2d40e227fac75828d84bd775d77874fa963a279b899501a25550e561f4e52e`. The runner replaces that file
+on every run of the case, so the sha256 is what identifies it. Figures marked *arithmetic* are
+computed on this page from that file's values. The two repeat runs in [The ceiling](#the-ceiling)
+are the only figures from other runs.
 
 ## The host
 
@@ -140,6 +143,23 @@ MB, the median over the 40 capsules, then the median over the three reps.
 `binary_and_libs` is the only category that is shared: 15.5 MB resident per capsule, of which each
 is charged about 1 MB. Everything else is private to its capsule, in both arms.
 
+### Per capsule at every size
+
+Pss in MB, the median over the N capsules, then the median over the three reps. The two arms agree
+to 0.01 MB in every cell, so one table holds both.
+
+| N | `compiled_code` | `form_files` | `binary_and_libs` | `heap_and_other_anon` | `anon_readonly`, part of the previous |
+|---|---|---|---|---|---|
+| 1 | 4.46 | 0.00 | 12.96 | 38.32 | 2.84 |
+| 10 | 4.46 | 0.00 | 2.02 | 38.30–38.31 | 2.84 |
+| 20 | 4.46 | 0.00 | 1.36 | 38.30–38.31 | 2.84 |
+| 40 | 4.46 | 0.00 | 1.02 | 38.29 | 2.84 |
+| 64 | 4.46 | 0.00 | 0.90 | 38.28–38.29 | 2.84 |
+| 100, probe | 4.46 | 0.00 | 0.82 | 38.28 | 2.84 |
+
+Only `binary_and_libs` falls as N grows, because its pages are split across more capsules. The
+compiled code and the heap stay the same per capsule at every size.
+
 What the kernel charged each capsule's own cgroup scope at the same moment:
 
 | `memory.stat` | identical | distinct |
@@ -226,12 +246,23 @@ although the timing figures are indications.
 
 | Form | Value |
 |---|---|
-| Capsules per GB of `MemAvailable` | 8.61 |
+| Capsules per GB of `MemAvailable` | 8.61: the recommended 100 over the 11.6 GB available at idle. At the margin one GB holds about 29 capsules (1,024 ÷ m), *arithmetic* |
 | Default, `DEFAULT_CAPSULES_PER_CORE` 8 × 8 logical CPUs | 64, **below** the recommendation |
 
 The `MemAvailable` slopes sit below the PSS slope, 43.45 MB per capsule in both arms. The
 recommendation is the same under either. *Arithmetic:* C_mem from the PSS slope is
 ⌊0.5 × 11,889.6 ÷ 43.45⌋ = 136, still above C_run.
+
+The `MemAvailable` slope moves between runs on this host, and the PSS slope does not:
+
+| Run | m | C_mem | PSS slope | Verdict | Recommended |
+|---|---|---|---|---|---|
+| 2026-09-30T17:06:54 | 33.35 MB | 180 | 43.45–43.46 MB | copied | 100 |
+| 2026-09-30T17:30:35, this page | 34.75 MB | 171 | 43.45 MB | copied | 100 |
+| 2026-09-30T21:01:52, idle `MemAvailable` 11,338.2 MB | 42.73 MB | 132 | 43.45 MB | copied | 100 |
+
+Other work on the host allocates memory too, and `MemAvailable` counts it. The recommendation, the
+verdict and the runwasi threshold below hold in every run.
 
 Derived on the host above.
 
