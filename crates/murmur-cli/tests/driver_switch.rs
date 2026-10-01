@@ -433,7 +433,11 @@ impl Idle {
                 sink.push('\n');
             }
         });
-        match rx.recv_timeout(Duration::from_secs(120)) {
+        // Each launch stages under a scratch HOME whose `~/.murmur/compiled` is empty, so it
+        // compiles both fixture drivers with a debug-built Cranelift, and libtest starts one such
+        // launch per test thread at once. On a loaded host the door opens after more than two
+        // minutes.
+        match rx.recv_timeout(Duration::from_secs(240)) {
             Ok(startup) => Self {
                 child,
                 startup,
