@@ -48,6 +48,27 @@ pub(crate) struct TaskArtifactUpdateEvent {
     pub artifact: StreamArtifact,
 }
 
+/// A tool call the model has begun writing. Carries the call's id and name and nothing of its
+/// input, which a hook or the call gate has not yet seen.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TaskToolCallStartedEvent {
+    pub id: String,
+    /// The id the call's answering `artifact` frame carries as its `tool_call_id`.
+    pub tool_call_id: String,
+    /// The capsule's tool name, the one the answering `artifact` frame carries.
+    pub tool_name: String,
+}
+
+/// How much of a started call's input the model has written: a byte count, never the bytes.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TaskToolCallProgressEvent {
+    pub id: String,
+    pub tool_call_id: String,
+    /// Bytes of the call's input JSON written so far. Never smaller than an earlier frame's for
+    /// the same call.
+    pub input_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StreamArtifact {
     pub tool_name: String,
@@ -142,6 +163,8 @@ pub(crate) enum StreamFrame {
     Artifact,
     Text,
     Thinking,
+    ToolCallStarted,
+    ToolCallProgress,
     Gap,
     Lagged,
     ConnectionAck,
@@ -151,11 +174,13 @@ pub(crate) enum StreamFrame {
 
 impl StreamFrame {
     /// Every frame, in the order the stream extension's `params.frames` lists them.
-    pub(crate) const ALL: [StreamFrame; 9] = [
+    pub(crate) const ALL: [StreamFrame; 11] = [
         StreamFrame::Status,
         StreamFrame::Artifact,
         StreamFrame::Text,
         StreamFrame::Thinking,
+        StreamFrame::ToolCallStarted,
+        StreamFrame::ToolCallProgress,
         StreamFrame::Gap,
         StreamFrame::Lagged,
         StreamFrame::ConnectionAck,
@@ -170,6 +195,8 @@ impl StreamFrame {
             StreamFrame::Artifact => "artifact",
             StreamFrame::Text => "text",
             StreamFrame::Thinking => "thinking",
+            StreamFrame::ToolCallStarted => "tool-call-started",
+            StreamFrame::ToolCallProgress => "tool-call-progress",
             StreamFrame::Gap => "gap",
             StreamFrame::Lagged => "lagged",
             StreamFrame::ConnectionAck => "connection-ack",
@@ -457,6 +484,42 @@ mod tests {
         assert_eq!(
             json,
             r#"{"id":"task_1","artifact":{"tool_name":"bash","content":"hello","fence_source":"tool:bash","tool_call_id":"call_1","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}}"#
+        );
+    }
+
+    #[test]
+    fn tool_call_started_frame_serializes_every_key_in_declaration_order() {
+        let json = serde_json::to_string(&TaskToolCallStartedEvent {
+            id: "task_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "write_file".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"task_1","tool_call_id":"call_1","tool_name":"write_file"}"#
+        );
+        assert_eq!(
+            format_sse_event(7, StreamFrame::ToolCallStarted, &json),
+            "id: 7\nevent: tool-call-started\ndata: {\"id\":\"task_1\",\"tool_call_id\":\"call_1\",\"tool_name\":\"write_file\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn tool_call_progress_frame_serializes_every_key_in_declaration_order() {
+        let json = serde_json::to_string(&TaskToolCallProgressEvent {
+            id: "task_1".into(),
+            tool_call_id: "call_1".into(),
+            input_bytes: 3172,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"task_1","tool_call_id":"call_1","input_bytes":3172}"#
+        );
+        assert_eq!(
+            format_sse_event(8, StreamFrame::ToolCallProgress, &json),
+            "id: 8\nevent: tool-call-progress\ndata: {\"id\":\"task_1\",\"tool_call_id\":\"call_1\",\"input_bytes\":3172}\n\n"
         );
     }
 

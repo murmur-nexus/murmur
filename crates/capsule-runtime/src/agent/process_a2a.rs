@@ -12,10 +12,21 @@
 //! One piece of state is kept per **segment**: the run of events between the start of the run (or
 //! the last `tool-result`) and the next `tool-result` or terminal event. A segment is this
 //! transport's equivalent of one http inference turn, and opens at the first `text-delta`, `text`,
-//! `thinking-delta`, `thinking` or `tool-call` it sees — a fragment opens one even though the
-//! runner does not count it as a turn, because the http path writes its `working` status before
-//! the driver call and therefore before any chunk. Segments are an A2A notion only: opening one
-//! reads the runner's turn counter and never advances it.
+//! `thinking-delta`, `thinking`, `tool-call-started` or `tool-call` it sees — a fragment or a
+//! started call opens one even though the runner does not count it as a turn, because the http
+//! path writes its `working` status before the driver call and therefore before any chunk.
+//! Segments are an A2A notion only: opening one reads the runner's turn counter and never advances
+//! it.
+//!
+//! # A tool call being written
+//!
+//! `tool-call-started` and `tool-call-progress` tell the client a call is coming while the model
+//! is still writing it. Neither carries any of the call's input: a hook or the call gate has not
+//! seen the complete call yet, and may deny it. Progress is coalesced to at most one frame per call
+//! per [`TOOL_CALL_PROGRESS_INTERVAL`], plus one when the complete call arrives if the largest
+//! count reported has not been written yet, so a harness reporting every few bytes cannot crowd a
+//! task's earlier frames out of the replay buffer. A start for a call already started, written or
+//! answered, and progress for a call not being written, write nothing.
 //!
 //! # The attempt's ending
 //!
@@ -44,9 +55,13 @@
 //! attempt that completes forwards them: a turn closed by a `tool-result` or by `turn-failed`, an
 //! interrupted attempt and one stopped at a spend ceiling forward none.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -60,9 +75,13 @@ use crate::{
     streaming::{
         emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
         SseEventBuffer, StreamArtifact, StreamFrame, StreamStatus, TaskArtifactUpdateEvent,
-        TaskStatusUpdateEvent,
+        TaskStatusUpdateEvent, TaskToolCallProgressEvent, TaskToolCallStartedEvent,
     },
 };
+
+/// The shortest time between two `tool-call-progress` frames for one call. The frame the complete
+/// call flushes is not held to it.
+pub(super) const TOOL_CALL_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Where one attempt's frames go. Absent for a run with no A2A task — `mur run`, a `task.md`
 /// launch — which writes nothing.
@@ -89,6 +108,56 @@ struct Segment {
     /// Whether this segment streamed a `thinking-delta`, which makes a complete `thinking` a
     /// repeat of what the client already has.
     streamed_thinking: bool,
+}
+
+/// A tool call the model is writing: started, its complete `tool-call` not yet arrived.
+struct StartedCall {
+    /// The name its `tool-call-started` frame carried.
+    name: String,
+    /// The largest input size the driver has reported for it.
+    reported: u64,
+    /// The size its last `tool-call-progress` frame carried, and when that frame was written.
+    sent: Option<(u64, Instant)>,
+}
+
+impl StartedCall {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            reported: 0,
+            sent: None,
+        }
+    }
+
+    /// Take a report of `input_bytes` at `now`, and return the size to write a frame for, if one
+    /// is due. A report no larger than an earlier one is ignored. The first is written at once; a
+    /// later one only once [`TOOL_CALL_PROGRESS_INTERVAL`] has passed since the last frame, and
+    /// until then it is held.
+    fn report(&mut self, input_bytes: u64, now: Instant) -> Option<u64> {
+        if input_bytes <= self.reported {
+            return None;
+        }
+        self.reported = input_bytes;
+        let due = self
+            .sent
+            .is_none_or(|(_, at)| now.saturating_duration_since(at) >= TOOL_CALL_PROGRESS_INTERVAL);
+        if !due {
+            return None;
+        }
+        self.sent = Some((input_bytes, now));
+        Some(input_bytes)
+    }
+
+    /// The held size, if a report larger than the last frame is still unwritten, whatever the
+    /// interval says: the call's input is complete and no later report will carry it.
+    fn flush(&mut self, now: Instant) -> Option<u64> {
+        let written = self.sent.map_or(0, |(size, _)| size);
+        if self.reported <= written {
+            return None;
+        }
+        self.sent = Some((self.reported, now));
+        Some(self.reported)
+    }
 }
 
 /// The broadcast, buffer and task id the synchronous chunk emitters take.
@@ -118,6 +187,11 @@ pub(super) struct A2aStream {
     /// A2A has no state for a task stopped by policy, so it is `failed` carrying the refusal —
     /// the same ending the http path records for the same fact.
     spend_refusal: Option<String>,
+    /// The calls the model is writing, by id.
+    writing: HashMap<String, StartedCall>,
+    /// The ids of calls whose complete `tool-call` or whose result has arrived. Nothing more is
+    /// written for them before their `artifact`, and a start arriving now is not believed.
+    settled: HashSet<String>,
 }
 
 impl A2aStream {
@@ -141,6 +215,8 @@ impl A2aStream {
             interrupted: false,
             harness_killed: false,
             spend_refusal: None,
+            writing: HashMap::new(),
+            settled: HashSet::new(),
         }
     }
 
@@ -213,8 +289,62 @@ impl A2aStream {
         }
     }
 
+    /// The model has begun writing tool call `id`, named `name`, in the segment numbered `turn`.
+    ///
+    /// Opens the segment, if none is open, and writes `tool-call-started`. A start with no id, or
+    /// for a call already started, written or answered, writes nothing and opens nothing. Owes and
+    /// pays no cursor removal: the text the segment streamed so far is not yet replaced.
+    pub(super) async fn tool_call_started(&mut self, turn: u32, id: &str, name: &str) {
+        if id.is_empty() || self.writing.contains_key(id) || self.settled.contains(id) {
+            return;
+        }
+        self.writing.insert(id.to_string(), StartedCall::new(name));
+        self.open_segment(turn).await;
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        emit_sse(
+            &target.sse,
+            StreamFrame::ToolCallStarted,
+            &TaskToolCallStartedEvent {
+                id: target.task_id.clone(),
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+            },
+        )
+        .await;
+    }
+
+    /// The model has written `input_bytes` of started call `id`'s input, as of `now`. Writes a
+    /// `tool-call-progress` frame when one is due; nothing for a call not being written.
+    pub(super) async fn tool_call_progress(&mut self, id: &str, input_bytes: u64, now: Instant) {
+        let Some(size) = self
+            .writing
+            .get_mut(id)
+            .and_then(|call| call.report(input_bytes, now))
+        else {
+            return;
+        };
+        self.progress(id, size).await;
+    }
+
+    /// Call `id`'s complete `tool-call` arrived at `now`. Writes the size still held for it, if
+    /// any, and settles it. Returns the name its start carried, for a call that was started.
+    pub(super) async fn tool_call_complete(&mut self, id: &str, now: Instant) -> Option<String> {
+        self.settled.insert(id.to_string());
+        let mut call = self.writing.remove(id)?;
+        if let Some(size) = call.flush(now) {
+            self.progress(id, size).await;
+        }
+        Some(call.name)
+    }
+
     /// One finished tool call, which closes the segment that issued it.
     pub(super) async fn tool_result(&mut self, artifact: StreamArtifact) {
+        if let Some(id) = artifact.tool_call_id.as_deref() {
+            self.writing.remove(id);
+            self.settled.insert(id.to_string());
+        }
         self.pay_cursor_removal();
         self.segment.open = false;
         self.artifact(artifact).await;
@@ -309,6 +439,22 @@ impl A2aStream {
         .await;
     }
 
+    async fn progress(&self, tool_call_id: &str, input_bytes: u64) {
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        emit_sse(
+            &target.sse,
+            StreamFrame::ToolCallProgress,
+            &TaskToolCallProgressEvent {
+                id: target.task_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                input_bytes,
+            },
+        )
+        .await;
+    }
+
     async fn status(&self, state: &str, message: &str) {
         let Some(target) = self.target.as_ref() else {
             return;
@@ -359,3 +505,147 @@ fn canceled_message(harness_killed: bool) -> &'static str {
 /// [`canceled_message`] for a harness the runtime had to kill.
 const CANCELED_KILLED_STATUS_MESSAGE: &str =
     "task canceled; the harness was killed and its session may not resume cleanly";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streaming::ReplayResult;
+
+    /// `ms` milliseconds after `base`.
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// A stream for one task, writing into a real buffer, and that buffer.
+    fn stream() -> (A2aStream, Arc<Mutex<SseEventBuffer>>) {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let frames = Arc::new(Mutex::new(SseEventBuffer::new(64)));
+        let stream = A2aStream::new(
+            Some((tx, Arc::clone(&frames))),
+            Some("tsk_test".to_string()),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (stream, frames)
+    }
+
+    /// The `event:` value of every frame the buffer holds, in order.
+    fn event_types(frames: &Arc<Mutex<SseEventBuffer>>) -> Vec<String> {
+        let ReplayResult::Complete(frames) = frames.lock().unwrap().replay_from(0) else {
+            panic!("a gap in a test buffer");
+        };
+        frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn progress_the_first_report_is_written_at_once() {
+        let now = Instant::now();
+        let mut call = StartedCall::new("write_file");
+        assert_eq!(call.report(12, now), Some(12));
+    }
+
+    #[test]
+    fn progress_a_report_within_the_interval_is_held() {
+        let now = Instant::now();
+        let mut call = StartedCall::new("write_file");
+        call.report(12, now);
+        assert_eq!(call.report(40, at(now, 100)), None);
+        assert_eq!(call.report(60, at(now, 249)), None);
+        assert_eq!(call.reported, 60);
+    }
+
+    #[test]
+    fn progress_a_report_at_the_interval_writes_the_largest_size() {
+        let now = Instant::now();
+        let mut call = StartedCall::new("write_file");
+        call.report(12, now);
+        call.report(40, at(now, 100));
+        assert_eq!(call.report(60, at(now, 250)), Some(60));
+        // The interval runs from the last frame written, not from the last report.
+        assert_eq!(call.report(80, at(now, 400)), None);
+        assert_eq!(call.report(90, at(now, 500)), Some(90));
+    }
+
+    #[test]
+    fn progress_an_equal_or_lower_size_is_never_written() {
+        let now = Instant::now();
+        let mut call = StartedCall::new("write_file");
+        assert_eq!(call.report(0, now), None);
+        call.report(40, now);
+        assert_eq!(call.report(40, at(now, 1_000)), None);
+        assert_eq!(call.report(12, at(now, 2_000)), None);
+        assert_eq!(call.flush(at(now, 3_000)), None);
+    }
+
+    #[test]
+    fn progress_the_complete_call_flushes_the_held_size_once_whatever_the_interval() {
+        let now = Instant::now();
+        let mut call = StartedCall::new("write_file");
+        call.report(12, now);
+        call.report(40, at(now, 1));
+        assert_eq!(call.flush(at(now, 2)), Some(40));
+        assert_eq!(call.flush(at(now, 3)), None);
+    }
+
+    #[test]
+    fn progress_the_complete_call_flushes_nothing_when_nothing_is_held() {
+        let now = Instant::now();
+        let mut call = StartedCall::new("write_file");
+        assert_eq!(call.flush(now), None);
+        call.report(12, now);
+        assert_eq!(call.flush(at(now, 1)), None);
+    }
+
+    #[tokio::test]
+    async fn progress_a_report_after_the_complete_call_writes_nothing() {
+        let (mut stream, frames) = stream();
+        let now = Instant::now();
+        stream.tool_call_started(1, "c1", "write_file").await;
+        stream.tool_call_progress("c1", 12, now).await;
+        assert_eq!(
+            stream.tool_call_complete("c1", at(now, 1)).await.as_deref(),
+            Some("write_file")
+        );
+        stream.tool_call_progress("c1", 40, at(now, 1_000)).await;
+        assert_eq!(
+            event_types(&frames),
+            ["status", "tool-call-started", "tool-call-progress"]
+        );
+    }
+
+    /// A start the stream does not believe opens no segment, so it writes no `working` status.
+    #[tokio::test]
+    async fn a_start_after_the_complete_call_opens_no_segment() {
+        let (mut stream, frames) = stream();
+        assert_eq!(stream.tool_call_complete("c1", Instant::now()).await, None);
+        stream.tool_call_started(1, "c1", "write_file").await;
+        assert!(event_types(&frames).is_empty());
+    }
+
+    #[test]
+    fn progress_interval_is_the_documented_one() {
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/content/reference/streaming-protocol.md"
+        ))
+        .expect("the streaming protocol reference page");
+        let section = page
+            .split("\n## ")
+            .find(|section| section.contains("{ #event-tool-call-progress }"))
+            .expect("a tool-call-progress section");
+        let stated = format!("{} ms", TOOL_CALL_PROGRESS_INTERVAL.as_millis());
+        assert!(
+            section.contains(&stated),
+            "the tool-call-progress section does not state {stated}"
+        );
+    }
+}

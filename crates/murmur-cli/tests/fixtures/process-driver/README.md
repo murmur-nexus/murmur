@@ -2,10 +2,11 @@
 
 A test-only process driver, and a fake harness for it to drive, for `tests/process_driver.rs`,
 `tests/process_runner.rs` and the process driver runner's own tests. The driver exports
-`murmur:driver/process@0.2.0` from the `process-driver` world and imports nothing but WASI.
+`murmur:driver/process@0.3.0` from the `process-driver` world and imports nothing but WASI.
 
-A driver built against the retired `@0.1.0` lives next door, in
-`../process-driver-v1/`, with the frozen `.wit` it was built from; it exists only to be refused.
+Drivers built against the retired `@0.1.0` and `@0.2.0` live next door, in
+`../process-driver-v1/` and `../process-driver-v2/`, each with the frozen `.wit` it was built from;
+they exist only to be refused.
 
 Four components are committed under `tool/`, all built from `src/process-driver`:
 
@@ -72,6 +73,8 @@ One event per line, read from the first word:
 | `tdelta <text>` | `thinking-delta(<text>)` |
 | `thinking <text>` | `thinking(<text>)` |
 | `tool <id> <name> <json>` | `tool-call { id, name with the bridge prefix stripped, input: <json> }` |
+| `tstart <id> <name>` | `tool-call-started { id, name with the bridge prefix stripped }` |
+| `tprogress <id> <bytes>` | `tool-call-progress { id, input-bytes: <bytes> }` |
 | `result <id> ok\|error <output>` | `tool-result { id, output, is-error }` |
 | `retry <n> <reason>` | `retry { attempt: <n>, reason }` |
 | `usage <member>=<n> ...` | `usage { … }` — see below. Read by every build but `no-usage`, where it is "anything else" |
@@ -80,7 +83,8 @@ One event per line, read from the first word:
 | anything else | `note(<line>)` |
 
 A word with nothing after it, an unknown failure kind, a `retry` whose attempt is not a number, and
-a `tool` / `result` line with too few fields are all "anything else".
+a `tool` / `result` / `tstart` / `tprogress` line with too few fields, and a `tprogress` whose
+size is not a number, are all "anything else".
 
 A `usage` line names one or more `<member>=<n>` fields, space-separated, each `<n>` the cumulative
 total for the harness run so far. Members it omits are left `none`, so a later line naming only
@@ -139,6 +143,8 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `interrupt-ignores` | Never reads stdin and sleeps 600 s, so the interrupt grace runs out and the runtime kills it |
 | `interrupt-signal` | Traps `INT`, then `fail canceled interrupted by SIGINT` and exit `0` |
 | `parity` | One `text`, one bridge tool call and its result, then the answer and `end PARITY-ANSWER` |
+| `tool-progress` | `parity`, with `tstart c1`, `tprogress c1 12` and `tprogress c1 40` before the `tool` line |
+| `tool-progress-large` | `tool-progress`, with 350 `tprogress c1` lines in steps of 20, ending at `7000`, printed back to back |
 | `stream` | Three `delta` fragments, the complete `text`, then `end` with the same words |
 | `think` | Two `tdelta` fragments, the complete `thinking`, then `text done` and `end DONE` |
 | `think-whole` | One complete `thinking` with nothing streaming it, then `text done` and `end DONE` |

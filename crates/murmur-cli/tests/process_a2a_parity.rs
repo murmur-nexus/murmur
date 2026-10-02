@@ -475,8 +475,12 @@ fn tool_then_answer_server() -> common::ScriptedServer {
 
 #[derive(Debug, Clone)]
 struct SseEvent {
+    /// The frame's `id:`, or `None` for a frame written without one.
+    id: Option<u64>,
     event_type: String,
     data: String,
+    /// When the frame's blank terminating line reached the client.
+    received: Instant,
 }
 
 impl SseEvent {
@@ -530,7 +534,14 @@ fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
         }
     }
 
+    read_sse_until_final(&mut reader)
+}
+
+/// Read SSE frames off `reader` until the first `status` frame with `"final":true`, or the end of
+/// the stream.
+fn read_sse_until_final(reader: &mut impl BufRead) -> Vec<SseEvent> {
     let mut events = Vec::new();
+    let mut id = None;
     let mut event_type = String::new();
     let mut data = String::new();
     loop {
@@ -547,15 +558,20 @@ fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
             if !event_type.is_empty() && !data.is_empty() {
                 let terminal = event_type == "status" && data.contains("\"final\":true");
                 events.push(SseEvent {
+                    id,
                     event_type: event_type.clone(),
                     data: data.clone(),
+                    received: Instant::now(),
                 });
                 if terminal {
                     break;
                 }
             }
+            id = None;
             event_type.clear();
             data.clear();
+        } else if let Some(rest) = line.strip_prefix("id: ") {
+            id = rest.parse().ok();
         } else if let Some(rest) = line.strip_prefix("event: ") {
             event_type = rest.to_string();
         } else if let Some(rest) = line.strip_prefix("data: ") {
@@ -906,11 +922,13 @@ const HTTP_FRAMES: [&str; 9] = [
 
 /// The stream extension's `params.frames` of a `transport: process` capsule that serves
 /// `message/stream`.
-const PROCESS_FRAMES: [&str; 9] = [
+const PROCESS_FRAMES: [&str; 11] = [
     "status",
     "artifact",
     "text",
     "thinking",
+    "tool-call-started",
+    "tool-call-progress",
     "gap",
     "lagged",
     "connection-ack",
@@ -932,8 +950,8 @@ fn every_frame_a_capsule_writes_is_on_its_card() {
         .start();
 
     for (transport, url, expected) in [
-        ("http", http.url(), HTTP_FRAMES),
-        ("process", process.url(), PROCESS_FRAMES),
+        ("http", http.url(), HTTP_FRAMES.as_slice()),
+        ("process", process.url(), PROCESS_FRAMES.as_slice()),
     ] {
         let served = http_get(&url, "/.well-known/agent-card.json");
         let card: Value = serde_json::from_str(&served).expect("the card is JSON");
@@ -954,6 +972,238 @@ fn every_frame_a_capsule_writes_is_on_its_card() {
             );
         }
     }
+}
+
+// ── A tool call being written ─────────────────────────────────────────────────
+
+/// Assert `data` is an object with exactly `keys`, in that order.
+fn assert_keys_in_order(data: &str, keys: &[&str]) {
+    let parsed: Value = serde_json::from_str(data).expect("frame data is JSON");
+    assert_eq!(
+        parsed.as_object().map(|object| object.len()),
+        Some(keys.len()),
+        "{data}"
+    );
+    let positions: Vec<usize> = keys
+        .iter()
+        .map(|key| {
+            data.find(&format!("\"{key}\":"))
+                .unwrap_or_else(|| panic!("no {key} in {data}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "keys out of order in {data}"
+    );
+}
+
+/// The `inference` records of a finished capsule's task, as `(turn, decision, tool_name)`.
+fn inference_records(capsule: &Capsule) -> Vec<Value> {
+    trace_events(&capsule.trace_after_task_end(), "inference")
+        .into_iter()
+        .map(|record| serde_json::json!([record["turn"], record["decision"], record["tool_name"]]))
+        .collect()
+}
+
+/// Open `stream/watch` with `Last-Event-ID: last_event_id` and read it until a task's final
+/// status, returning every frame after the connection's `connection-ack`. Every test that calls it
+/// runs one task.
+fn watch_until_final(addr: &str, last_event_id: u64) -> Vec<SseEvent> {
+    let conn = common::idle_capsule::open_watch(addr, last_event_id);
+    conn.set_read_timeout(Some(STREAM_TIMEOUT)).unwrap();
+    let mut reader = BufReader::new(&conn);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => panic!("stream/watch closed before its headers ended"),
+            Ok(_) if line.trim().is_empty() => break,
+            Ok(_) => {}
+        }
+    }
+    let frames = read_sse_until_final(&mut reader);
+    assert_eq!(
+        frames.first().map(|frame| frame.event_type.as_str()),
+        Some("connection-ack"),
+        "{frames:#?}"
+    );
+    frames.into_iter().skip(1).collect()
+}
+
+/// `(id, kind)` of every frame, the shape a live stream and its replay are compared in.
+fn ids_and_kinds(events: &[SseEvent]) -> Vec<(Option<u64>, String)> {
+    events
+        .iter()
+        .map(|event| event.id)
+        .zip(frame_kinds(events))
+        .collect()
+}
+
+/// S7. A tool call the harness reports while the model writes it reaches the client as its start
+/// and its size, before the `artifact` that answers it, and changes nothing the trace records.
+#[test]
+fn a_started_tool_call_streams_its_start_and_size_before_its_artifact() {
+    if common::skip_without_host_support(
+        "a_started_tool_call_streams_its_start_and_size_before_its_artifact",
+    ) {
+        return;
+    }
+    let capsule = ProcessCapsule::new("progress-process", "tool-progress")
+        .with_tool()
+        .start();
+    let events = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    let kinds = frame_kinds(&events);
+    println!("process: {kinds:?}");
+    assert_eq!(
+        kinds,
+        [
+            "status:working:inference turn 1",
+            "tool-call-started",
+            "tool-call-progress",
+            "tool-call-progress",
+            "artifact",
+            "status:working:inference turn 2",
+            "text:final",
+            "status:completed",
+        ]
+    );
+
+    let artifact = &frames_of(&events, "artifact")[0]["artifact"];
+    let started = &frames_of(&events, "tool-call-started")[0];
+    assert_eq!(started["tool_call_id"], "c1", "{started}");
+    assert_eq!(
+        started["tool_call_id"], artifact["tool_call_id"],
+        "{artifact}"
+    );
+    assert_eq!(started["tool_name"], TOOL, "{started}");
+    assert_eq!(started["tool_name"], artifact["tool_name"], "{artifact}");
+    let progress = frames_of(&events, "tool-call-progress");
+    assert_eq!(
+        progress
+            .iter()
+            .map(|frame| frame["input_bytes"].clone())
+            .collect::<Vec<_>>(),
+        [12, 40]
+    );
+    for frame in &progress {
+        assert_eq!(frame["tool_call_id"], "c1", "{frame}");
+    }
+    for event in &events {
+        match event.event_type.as_str() {
+            "tool-call-started" => {
+                assert_keys_in_order(&event.data, &["id", "tool_call_id", "tool_name"])
+            }
+            "tool-call-progress" => {
+                assert_keys_in_order(&event.data, &["id", "tool_call_id", "input_bytes"])
+            }
+            _ => {}
+        }
+    }
+
+    let parity = ProcessCapsule::new("progress-parity", "parity")
+        .with_tool()
+        .start();
+    collect_sse_events(&parity.url(), STREAM_TIMEOUT);
+    let reported = inference_records(&capsule);
+    println!("inference: {reported:?}");
+    assert_eq!(reported, inference_records(&parity));
+}
+
+/// S8. A watcher that reconnects after the task replays the started call's frames under the ids
+/// the live stream carried them with.
+#[test]
+fn a_reconnecting_watcher_replays_a_started_tool_call() {
+    if common::skip_without_host_support("a_reconnecting_watcher_replays_a_started_tool_call") {
+        return;
+    }
+    let capsule = ProcessCapsule::new("progress-replay", "tool-progress")
+        .with_tool()
+        .start();
+    let live = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    assert!(live.iter().all(|event| event.id.is_some()), "{live:#?}");
+
+    let replayed = watch_until_final(&capsule.url(), 0);
+    println!("live:   {:?}", ids_and_kinds(&live));
+    println!("replay: {:?}", ids_and_kinds(&replayed));
+    assert_eq!(ids_and_kinds(&replayed), ids_and_kinds(&live));
+
+    let working = live[0].id.expect("the first working status is numbered");
+    let resumed = watch_until_final(&capsule.url(), working);
+    println!("resumed after {working}: {:?}", ids_and_kinds(&resumed));
+    assert_eq!(ids_and_kinds(&resumed), ids_and_kinds(&live[1..]));
+    assert_eq!(resumed[0].event_type, "tool-call-started");
+    for events in [&replayed, &resumed] {
+        assert!(events.iter().all(|event| event.event_type != "gap"));
+    }
+}
+
+/// S9. A 7000-byte input reported in 350 steps writes a handful of progress frames: none of the
+/// task's frames is evicted from the replay buffer, and a watcher reading throughout is never
+/// lagged.
+#[test]
+fn a_large_tool_input_writes_a_bounded_number_of_progress_frames() {
+    if common::skip_without_host_support(
+        "a_large_tool_input_writes_a_bounded_number_of_progress_frames",
+    ) {
+        return;
+    }
+    let capsule = ProcessCapsule::new("progress-large", "tool-progress-large")
+        .with_tool()
+        .start();
+    let url = capsule.url();
+    let watching = {
+        let url = url.clone();
+        thread::spawn(move || watch_until_final(&url, 0))
+    };
+    // The watcher attaches, and has written its `connection-ack`, before the task is submitted.
+    thread::sleep(Duration::from_millis(500));
+    let events = collect_sse_events(&url, STREAM_TIMEOUT);
+    let watched = watching.join().expect("the watcher read to the end");
+
+    println!("process: {:?}", frame_kinds(&events));
+    let started: Vec<&SseEvent> = events
+        .iter()
+        .filter(|event| event.event_type == "tool-call-started")
+        .collect();
+    assert_eq!(started.len(), 1, "{events:#?}");
+    let artifact = events
+        .iter()
+        .find(|event| event.event_type == "artifact")
+        .expect("the call's artifact");
+    let elapsed_ms = artifact
+        .received
+        .duration_since(started[0].received)
+        .as_millis() as u64;
+    let sizes: Vec<u64> = frames_of(&events, "tool-call-progress")
+        .iter()
+        .map(|frame| frame["input_bytes"].as_u64().unwrap())
+        .collect();
+    let ceiling = 2 + elapsed_ms.div_ceil(250);
+    println!(
+        "{} tool-call-progress frames over {elapsed_ms} ms (ceiling {ceiling}): {sizes:?}",
+        sizes.len()
+    );
+    assert!(
+        (1..=ceiling).contains(&(sizes.len() as u64)),
+        "{} progress frames over {elapsed_ms} ms",
+        sizes.len()
+    );
+    assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]), "{sizes:?}");
+    assert_eq!(sizes.last(), Some(&7000));
+
+    assert!(
+        watched.iter().all(|event| event.event_type != "lagged"),
+        "{:?}",
+        frame_kinds(&watched)
+    );
+    assert_eq!(ids_and_kinds(&watched), ids_and_kinds(&events));
+
+    let replayed = watch_until_final(&url, 0);
+    assert!(replayed.iter().all(|event| event.event_type != "gap"));
+    assert_eq!(replayed[0].id, events[0].id);
+    assert_eq!(
+        frame_kinds(&replayed[..1]),
+        ["status:working:inference turn 1"]
+    );
 }
 
 /// The `on-inference` hook the hook scenarios declare, and what it returns every turn.

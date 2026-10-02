@@ -4,7 +4,7 @@
 //! Nothing in `crates/` reads those recordings: the driver that consumes this format lives in the
 //! separate `default-artifacts` repository, and this repository holds them only as the record of
 //! what a real harness emitted. This file is what keeps them honest — that every line is still
-//! JSON, and that the `usage` members `murmur:driver/process@0.2.0`'s `usage` record names are
+//! JSON, and that the `usage` members `murmur:driver/process@0.3.0`'s `usage` record names are
 //! still readable in them.
 //!
 //! The directory is not tracked by git (`.gitignore` excludes `.nexus`), so a clean checkout has

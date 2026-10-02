@@ -11,12 +11,15 @@
 //!
 //! One logical turn is one model action, counted as the `transport: http` path counts it. A turn
 //! opens at the first `text` or `tool-call` since the run started or since the last `tool-result`,
-//! and closes at the next `tool-result` or terminal event. Thinking and the streaming deltas never
-//! open one: a harness that streams its reasoning as its own events would otherwise burn a turn
-//! per thought, and `max_turns` would mean something different on each transport.
+//! and closes at the next `tool-result` or terminal event. Thinking, the streaming deltas and a
+//! tool call still being written (`tool-call-started`, `tool-call-progress`) never open one: a
+//! harness that streams its reasoning as its own events would otherwise burn a turn per thought,
+//! and `max_turns` would mean something different on each transport. The call's turn opens when
+//! its complete `tool-call` arrives, which is also the event a spent budget stops the run at.
 //!
 //! An A2A **segment** is a separate notion, held by [`A2aStream`]: it reads the turn counter to
-//! number itself and never advances it, and a streamed fragment opens one where it opens no turn.
+//! number itself and never advances it, and a streamed fragment or a started call opens one where
+//! it opens no turn.
 
 use std::{
     collections::HashMap,
@@ -360,8 +363,20 @@ impl<'a> ProcessEventSink<'a> {
                 if let Some(exceeded) = self.open_turn(trace).await {
                     return exceeded;
                 }
-                // No frame of its own: the http path emits nothing for a tool request either.
+                // The call's own frame is the `artifact` its result writes. What this event writes
+                // is the size a started call was still holding, so the client's last
+                // `tool-call-progress` is the complete input's.
                 self.a2a.open_segment(self.segment_turn()).await;
+                let started = self.a2a.tool_call_complete(&call.id, Instant::now()).await;
+                if let Some(started) = started.filter(|started| *started != call.name) {
+                    let _ = trace
+                        .write_harness_note(&format!(
+                            "the harness started tool call id {} as '{started}' and completed it \
+                             as '{}'",
+                            call.id, call.name
+                        ))
+                        .await;
+                }
                 let Some(open) = self.open.as_mut() else {
                     return SinkOutcome::Continue;
                 };
@@ -478,6 +493,22 @@ impl<'a> ProcessEventSink<'a> {
             Event::Thinking(text) => {
                 self.a2a.open_segment(self.segment_turn()).await;
                 self.a2a.complete_thinking(&text);
+                SinkOutcome::Continue
+            }
+            // A tool call the model is still writing. Like a fragment it opens no turn: the call's
+            // turn opens, and is counted against the budget, when the complete `tool-call`
+            // arrives. Nothing is traced: the `tool_call` record at its result is the record of
+            // the call.
+            Event::ToolCallStarted(start) => {
+                self.a2a
+                    .tool_call_started(self.segment_turn(), &start.id, &start.name)
+                    .await;
+                SinkOutcome::Continue
+            }
+            Event::ToolCallProgress(progress) => {
+                self.a2a
+                    .tool_call_progress(&progress.id, progress.input_bytes, Instant::now())
+                    .await;
                 SinkOutcome::Continue
             }
             Event::Retry(retry) => {
@@ -692,9 +723,10 @@ impl<'a> ProcessEventSink<'a> {
 /// Whether an event is work the harness actually produced, which is the whole of what makes a
 /// run's session id worth keeping.
 ///
-/// Six events say yes: a complete or streamed piece of text, a complete or streamed thought, a
-/// tool call, and a turn that ended. `turn-end` counts whatever its result text says — a turn that
-/// ran to completion is a conversation the harness holds, however little it had to say.
+/// Eight events say yes: a complete or streamed piece of text, a complete or streamed thought, a
+/// tool call complete or still being written, and a turn that ended. `turn-end` counts whatever
+/// its result text says — a turn that ran to completion is a conversation the harness holds,
+/// however little it had to say.
 ///
 /// The rest say no, and `session-started` is why this predicate exists: a harness prints the name
 /// of its session before the model has produced anything and before it has written a transcript,
@@ -708,6 +740,8 @@ fn produces_observable_work(event: &Event) -> bool {
             | Event::Thinking(_)
             | Event::ThinkingDelta(_)
             | Event::ToolCall(_)
+            | Event::ToolCallStarted(_)
+            | Event::ToolCallProgress(_)
             | Event::TurnEnd(_)
     )
 }
@@ -732,7 +766,8 @@ mod tests {
     use crate::agent::process::{plan_session, HarnessSessionPolicy, SessionPlan};
     use crate::harness_session::HarnessSessionMap;
     use crate::process_driver::{
-        RetryInfo, SessionInfo, ToolCallInfo, ToolResultInfo, TurnFailure,
+        RetryInfo, SessionInfo, ToolCallInfo, ToolCallProgress, ToolCallStart, ToolResultInfo,
+        TurnFailure,
     };
     use crate::streaming::SseEventBuffer;
     use serde_json::Value as Json;
@@ -813,6 +848,8 @@ mod tests {
         planned_id: String,
         /// What the last batch's `finish` handed back for a reopened attempt to resume.
         carried: Option<String>,
+        /// The sink's `current_turn` at the end of the last batch.
+        turn: u32,
     }
 
     impl Harness {
@@ -920,6 +957,7 @@ mod tests {
                 map,
                 planned_id,
                 carried: None,
+                turn: 0,
             }
         }
 
@@ -937,6 +975,7 @@ mod tests {
             let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
                 .await;
+            self.turn = sink.current_turn();
             self.carried = sink.finish(&mut self.trace).await;
             outcome
         }
@@ -996,6 +1035,20 @@ mod tests {
             id: id.to_string(),
             output: "done".to_string(),
             is_error,
+        })
+    }
+
+    fn tool_call_started(id: &str, name: &str) -> Event {
+        Event::ToolCallStarted(ToolCallStart {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    fn tool_call_progress(id: &str, input_bytes: u64) -> Event {
+        Event::ToolCallProgress(ToolCallProgress {
+            id: id.to_string(),
+            input_bytes,
         })
     }
 
@@ -1938,6 +1991,249 @@ mod tests {
         assert!(h.of_type("tool_call").await.is_empty());
     }
 
+    // ── A tool call being written ─────────────────────────────────────────────
+
+    /// The `input_bytes` of every `tool-call-progress` frame, in order.
+    fn progress_sizes(frames: &[String]) -> Vec<u64> {
+        data_of(frames, "tool-call-progress")
+            .iter()
+            .map(|data| data["input_bytes"].as_u64().expect("input_bytes is a u64"))
+            .collect()
+    }
+
+    /// A started call writes its start and its size after the segment's `working` status and
+    /// before the `artifact` that answers it, all carrying the call's id. The size the complete
+    /// call arrives with is written then, though the interval since the first has not passed.
+    #[tokio::test]
+    async fn a_started_tool_call_writes_its_start_and_size_before_its_artifact() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call_started("c1", "echo-tool"),
+            tool_call_progress("c1", 12),
+            tool_call_progress("c1", 40),
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            Event::TurnEnd(String::new()),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            [
+                "status:working:inference turn 1",
+                "tool-call-started",
+                "tool-call-progress",
+                "tool-call-progress",
+                "artifact",
+            ]
+        );
+        let frames = h.frames();
+        let started = data_of(&frames, "tool-call-started");
+        assert_eq!(
+            started[0],
+            serde_json::json!({"id": "tsk_test", "tool_call_id": "c1", "tool_name": "echo-tool"})
+        );
+        assert_eq!(progress_sizes(&frames), [12, 40]);
+        let progress = data_of(&frames, "tool-call-progress");
+        assert!(progress.iter().all(|data| data["tool_call_id"] == "c1"));
+        assert_eq!(
+            data_of(&frames, "artifact")[0]["artifact"]["tool_call_id"],
+            "c1"
+        );
+    }
+
+    /// A started call and its progress are not model actions: the same run with and without them
+    /// records the same turns.
+    #[tokio::test]
+    async fn a_started_tool_call_opens_no_turn() {
+        let run = |reported: bool| {
+            let mut events = vec![text("working on it")];
+            if reported {
+                events.push(tool_call_started("c1", "echo-tool"));
+                events.push(tool_call_progress("c1", 12));
+            }
+            events.extend([
+                tool_call("c1", "echo-tool"),
+                tool_result("c1", false),
+                text("done"),
+                Event::TurnEnd("done".into()),
+            ]);
+            events
+        };
+        let mut records = Vec::new();
+        for reported in [false, true] {
+            let mut h = Harness::new(10).await;
+            h.feed(run(reported)).await;
+            let inferences: Vec<Json> = h
+                .of_type("inference")
+                .await
+                .into_iter()
+                .map(|record| {
+                    serde_json::json!([record["turn"], record["decision"], record["tool_name"]])
+                })
+                .collect();
+            records.push((inferences, h.turn));
+        }
+        assert_eq!(records[0], records[1]);
+        assert_eq!(records[0].0.len(), 2, "{:?}", records[0]);
+    }
+
+    /// With the budget spent, a started call and its progress leave the run going; the complete
+    /// call is the model action, and it is what ends the run.
+    #[tokio::test]
+    async fn a_started_tool_call_does_not_spend_the_turn_budget() {
+        let spent = || vec![tool_call("c0", "t"), tool_result("c0", false)];
+
+        let mut h = Harness::new(1).await;
+        let mut events = spent();
+        events.extend([tool_call_started("c1", "t"), tool_call_progress("c1", 12)]);
+        assert!(matches!(h.feed(events).await, SinkOutcome::Continue));
+        assert_eq!(data_of(&h.frames(), "tool-call-started").len(), 1);
+
+        let mut h = Harness::new(1).await;
+        let mut events = spent();
+        events.extend([
+            tool_call_started("c1", "t"),
+            tool_call_progress("c1", 12),
+            tool_call("c1", "t"),
+        ]);
+        assert!(matches!(
+            h.feed(events).await,
+            SinkOutcome::TurnBudgetExceeded(_)
+        ));
+    }
+
+    /// What the stream cannot believe writes nothing: progress for a call never started, a second
+    /// start, a start after the call is complete or answered, a start with no id, and a size no
+    /// larger than one already reported.
+    #[tokio::test]
+    async fn a_tool_call_report_out_of_order_writes_no_frame() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![tool_call_progress("c1", 12)]).await;
+        assert!(h.frame_kinds().is_empty(), "{:?}", h.frame_kinds());
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call_started("c1", "echo-tool"),
+            tool_call_started("c1", "echo-tool"),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            ["status:working:inference turn 1", "tool-call-started"]
+        );
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call("c1", "echo-tool"),
+            tool_call_started("c1", "echo-tool"),
+            tool_call_progress("c1", 12),
+        ])
+        .await;
+        assert_eq!(h.frame_kinds(), ["status:working:inference turn 1"]);
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            tool_call_started("c1", "echo-tool"),
+            tool_call_progress("c1", 12),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            ["status:working:inference turn 1", "artifact"]
+        );
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call_started("", "echo-tool"),
+            tool_call_progress("", 12),
+        ])
+        .await;
+        assert!(h.frame_kinds().is_empty(), "{:?}", h.frame_kinds());
+
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call_started("c1", "echo-tool"),
+            tool_call_progress("c1", 40),
+            tool_call_progress("c1", 40),
+            tool_call_progress("c1", 12),
+            tool_call("c1", "echo-tool"),
+        ])
+        .await;
+        assert_eq!(progress_sizes(&h.frames()), [40]);
+    }
+
+    /// A start replaces none of the text the segment streamed, so it pays no cursor removal; the
+    /// result that closes the segment does.
+    #[tokio::test]
+    async fn a_started_tool_call_pays_no_cursor_removal() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            Event::TextDelta("let me write that".into()),
+            tool_call_started("c1", "echo-tool"),
+        ])
+        .await;
+        assert_eq!(
+            h.frame_kinds(),
+            [
+                "status:working:inference turn 1",
+                "text:chunk",
+                "tool-call-started",
+            ]
+        );
+    }
+
+    /// A complete call named differently from its start is recorded as the harness reported the
+    /// complete call, and the difference is noted.
+    #[tokio::test]
+    async fn a_call_completed_under_another_name_is_noted() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            tool_call_started("c1", "write_file"),
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+        ])
+        .await;
+        let notes = h.of_type("harness_note").await;
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        let note = notes[0]["text"].as_str().unwrap();
+        assert!(note.contains("c1"), "{note}");
+        assert!(note.contains("'write_file'"), "{note}");
+        assert!(note.contains("'echo-tool'"), "{note}");
+        assert_eq!(
+            data_of(&h.frames(), "artifact")[0]["artifact"]["tool_name"],
+            "echo-tool"
+        );
+    }
+
+    /// Hundreds of sizes in one batch write a handful of frames, so the task's first frames stay
+    /// in the replay buffer.
+    #[tokio::test]
+    async fn a_burst_of_progress_writes_a_bounded_number_of_frames() {
+        let mut h = Harness::new(10).await;
+        let mut events = vec![tool_call_started("c1", "echo-tool")];
+        events.extend((1..=350).map(|i| tool_call_progress("c1", i * 20)));
+        events.push(tool_call("c1", "echo-tool"));
+        h.feed(events).await;
+        let sizes = progress_sizes(&h.frames());
+        assert!(
+            (1..=2).contains(&sizes.len()),
+            "{} progress frames: {sizes:?}",
+            sizes.len()
+        );
+        assert_eq!(sizes.last(), Some(&7000));
+        let replay = h.frames.lock().unwrap().replay_from(0);
+        match replay {
+            crate::streaming::ReplayResult::Complete(frames) => {
+                assert!(frames[0].starts_with("id: 1\n"), "{}", frames[0]);
+            }
+            crate::streaming::ReplayResult::WithGap { .. } => {
+                panic!("the burst evicted the task's first frames")
+            }
+        }
+    }
+
     /// The event a run names its session with. Every session test below starts from one.
     fn session_started(id: &str) -> Event {
         Event::SessionStarted(SessionInfo {
@@ -1993,9 +2289,10 @@ mod tests {
         assert_eq!(h.map.get(CONTEXT), None);
     }
 
-    /// Each of the five events that is work, on its own, with no terminal event after it: the run
-    /// was interrupted past the window where the harness has a name and no conversation, and the
-    /// session it established is kept.
+    /// Each of the seven events that is work, on its own, with no terminal event after it: the
+    /// run was interrupted past the window where the harness has a name and no conversation, and
+    /// the session it established is kept. A call the model has only begun writing is model
+    /// output in that session, like a fragment.
     #[tokio::test]
     async fn harness_session_any_observable_work_commits_the_reported_id() {
         for work in [
@@ -2004,6 +2301,8 @@ mod tests {
             Event::Thinking("pondering".into()),
             Event::ThinkingDelta("pond".into()),
             tool_call("c1", "echo-tool"),
+            tool_call_started("c1", "echo-tool"),
+            tool_call_progress("c1", 12),
         ] {
             let mut h = Harness::new(10).await;
             h.feed(vec![session_started("worked"), work]).await;
