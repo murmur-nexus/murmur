@@ -26,6 +26,10 @@ Current versions:
 | `murmur:runtime-guest`   | `0.1.0`  |
 | `murmur:driver`          | `0.2.0`  |
 
+`SERVED_WIT_PACKAGES` in `capsule-runtime` (`src/wit_versions.rs`) must move with this table:
+`cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
+`wit/`, and `mur doctor` compares installed artifacts against it.
+
 `murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
 already reflected one prior additive evolution — the original 7-function baseline
 plus `on-task-start`/`on-task-end`. Versioning retroactively named that step

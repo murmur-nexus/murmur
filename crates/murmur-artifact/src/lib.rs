@@ -60,7 +60,7 @@ pub use registry::{
     LocalRegistry, Platform, PlatformMatch, PublishResult, Registry, RegistryError,
     ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
 };
-pub use registry_warnings::{registry_warning_link, W_REG_001, W_REG_002};
+pub use registry_warnings::{registry_warning_link, W_REG_001, W_REG_002, W_REG_003};
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
@@ -101,7 +101,8 @@ pub use unknown_manifest_keys::{
     warn_on_unknown_manifest_keys, UnknownManifestKey,
 };
 pub use wit_contract::{
-    extract_wit_contracts, wit_contracts_from_artifact_bytes, WitContractError, WitContracts,
+    extract_wit_contracts, wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader,
+    ContractDirection, UnservedInterface, WitContractError, WitContracts,
 };
 pub use zip_guard::{
     max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,
