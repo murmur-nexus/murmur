@@ -35,6 +35,7 @@ use crate::{
     protected_paths::ProtectedPathRefusal,
     runtime::CapsuleStoreState,
     spend::SpendRefusal,
+    stream_events::settle_started_calls,
     streaming::{
         emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamFrame,
         StreamStatus, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
@@ -711,6 +712,14 @@ pub(crate) async fn run_agent_loop(
         return Err(RuntimeError::DriverNotInstalled(driver_name.clone()));
     }
 
+    // A call id the driver settled on an earlier attempt of this task may start again on this
+    // one.
+    store_state
+        .a2a_tool_calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reset();
+
     let system_prompt_artifact = inference.system_prompt_artifact.as_deref();
     // Built once per attempt and held across its turns, for prompt caching: the serialized tool
     // array heads the prefix the provider matches its cache on, so every call sends the same
@@ -1091,6 +1100,13 @@ pub(crate) async fn run_agent_loop(
         store_state
             .a2a_chunks_emitted
             .store(false, Ordering::Relaxed);
+        // A call only this dispatch can start, report on or settle. Settled ids stay settled for
+        // the attempt.
+        store_state
+            .a2a_tool_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear_writing();
 
         // Admitted after the call is measured and before anything is sent. The guard is settled
         // once the response's output is counted; every other way out of this turn drops it, which
@@ -1150,7 +1166,8 @@ pub(crate) async fn run_agent_loop(
         };
         let Some(dispatched) = dispatched else {
             // Nothing from this turn is applied: no continuation id is adopted, no result file is
-            // written and no usage is recorded, because the call never returned one.
+            // written and no usage is recorded, because the call never returned one. The calls it
+            // started are not settled either: no progress frame is flushed for a canceled turn.
             return Ok(finish_canceled_turn(
                 store_state,
                 trace,
@@ -1165,6 +1182,14 @@ pub(crate) async fn run_agent_loop(
             )
             .await);
         };
+        // The driver is done writing every call it started, whatever it returned: write the size
+        // still held for each, ahead of the cursor removal and of anything else this turn writes.
+        let started_calls = settle_started_calls(
+            &sse,
+            task_id.as_deref(),
+            &store_state.a2a_tool_calls,
+            Instant::now(),
+        );
         let driver_result = match dispatched {
             Ok(r) => r,
             Err(e) => {
@@ -1463,6 +1488,18 @@ pub(crate) async fn run_agent_loop(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    // The call's frames keep the name it returned with; a start that named it
+                    // otherwise is the driver's mistake, reported and not repaired.
+                    if let Some((_, started_as)) = started_calls
+                        .iter()
+                        .find(|(id, started_as)| *id == tool_call_id && *started_as != tool_name)
+                    {
+                        crate::runtime_err!(
+                            "driver '{}' started tool call id {tool_call_id} as '{started_as}' and \
+                             returned it as '{tool_name}'",
+                            choice.driver
+                        );
+                    }
                     let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
                     let input_json =
                         serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());

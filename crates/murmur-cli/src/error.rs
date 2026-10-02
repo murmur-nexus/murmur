@@ -48,7 +48,7 @@ pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is 
 pub const E_RUN_025: &str = "E-RUN-025"; // an artifact with a gateway: declares no usable upstream_auth: block
 pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
 pub const E_RUN_028: &str = "E-RUN-028"; // the running-capsule record directory could not be read
-pub const E_RUN_029: &str = "E-RUN-029"; // the transport: process driver does not export the process driver interface
+pub const E_RUN_029: &str = "E-RUN-029"; // the inference driver does not speak the driver interface this host serves
 pub const E_RUN_030: &str = "E-RUN-030"; // the transport: http inference driver exports the process driver interface
 pub const E_RUN_032: &str = "E-RUN-032"; // a process driver could not be loaded with no grants, or described itself unusably
 
@@ -577,6 +577,19 @@ impl From<RuntimeError> for CliError {
                          {PROCESS_DRIVER_IFACE}"
                     )
                 };
+                CliError::with_hint(E_RUN_029, error.to_string(), hint)
+            }
+            RuntimeError::DriverStreamInterfaceNotServed {
+                ref name,
+                ref expected,
+                ..
+            } => {
+                // An http driver built before the stream interface it imports was retired: a
+                // release built against the served one fixes it.
+                let hint = format!(
+                    "pin a release of {name} built against {expected} in murmur.yaml and run \
+                     `mur install`, or rebuild it against that interface"
+                );
                 CliError::with_hint(E_RUN_029, error.to_string(), hint)
             }
             error @ RuntimeError::HttpDriverExportsProcessInterface { .. } => CliError::with_hint(

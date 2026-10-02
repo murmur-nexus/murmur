@@ -11,9 +11,9 @@ impl exports::murmur::tool::run::Guest for StreamingDriver {
         _input: exports::murmur::tool::run::ToolInput,
     ) -> exports::murmur::tool::run::ToolResult {
         // Emit three text chunks to exercise the emit-chunk host function.
-        murmur::text::chunks::emit_chunk("chunk_one ");
-        murmur::text::chunks::emit_chunk("chunk_two ");
-        murmur::text::chunks::emit_chunk("chunk_three");
+        murmur::stream::events::emit_chunk("chunk_one ");
+        murmur::stream::events::emit_chunk("chunk_two ");
+        murmur::stream::events::emit_chunk("chunk_three");
 
         // Return a valid end_turn driver response (matches the capsule runtime's expected format).
         let response = concat!(

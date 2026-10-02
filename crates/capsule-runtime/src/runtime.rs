@@ -75,7 +75,9 @@ use crate::{
     origin::{stamp_for_peer, TaskOrigin, TaskProvenance, TrustClass},
     otel::OtelEmitter,
     outgoing,
-    process_driver::{check_driver_interface, check_required_env, ProcessDriver},
+    process_driver::{
+        check_driver_interface, check_required_env, check_stream_interface, ProcessDriver,
+    },
     protected_paths::{ProtectedPathRefusal, ProtectedPaths},
     registration::SessionOutcome,
     resources, running, sandbox,
@@ -87,11 +89,12 @@ use crate::{
     spawn_credential::SpawnCredential,
     spend::{MachineLedger, SpendMeter},
     state_store::STATE_PREOPEN_NAME,
+    stream_events::{self, StreamEventsTarget},
     streaming::{
-        emit_chunk_sse, emit_sse, emit_thinking_chunk_sse, SseBroadcast, SseEventBuffer,
-        StreamFrame, StreamStatus, TaskStatusUpdateEvent,
+        emit_sse, SseBroadcast, SseEventBuffer, StreamFrame, StreamStatus, TaskStatusUpdateEvent,
     },
     tool_annotations::ToolAnnotationMap,
+    tool_call_progress::ToolCallProgress,
     trace::TraceWriter,
     types::{
         ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
@@ -114,7 +117,7 @@ pub(crate) const WIT_TOOL_IFACE_VERSIONED: &str = "murmur:tool/run@0.1.0";
 /// dual-accept runtime shipped; a guest importing only the
 /// unversioned name now fails to link. See `wit/VERSIONING.md`.
 pub(crate) const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.1.0";
-pub(crate) const WIT_TEXT_CHUNKS_IFACE: &str = "murmur:text/chunks@0.1.0";
+pub(crate) const WIT_STREAM_EVENTS_IFACE: &str = "murmur:stream/events@0.1.0";
 pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 
 /// How long an agent session's teardown may run after the first `SIGTERM` before the process
@@ -1365,12 +1368,15 @@ pub fn stage_session(
                 )?;
                 let tool_wasm =
                     extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
+                let contracts = murmur_artifact::extract_wit_contracts(&tool_wasm)
+                    .ok()
+                    .flatten();
+                // Every driver, not only the inference driver: a `switch_driver` target is
+                // dispatched through the same linker, which serves one stream interface.
+                check_stream_interface(&artifact.name, &resolved_version, contracts.as_ref())?;
                 if let Some((transport, _)) =
                     inference_driver.filter(|(_, name)| *name == artifact.name)
                 {
-                    let contracts = murmur_artifact::extract_wit_contracts(&tool_wasm)
-                        .ok()
-                        .flatten();
                     check_driver_interface(
                         transport,
                         &artifact.name,
@@ -2567,6 +2573,7 @@ fn launch(
                         a2a_task_id: None,
                         input_timeout_secs: effective_lifecycle.input_timeout_secs,
                         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
+                        a2a_tool_calls: Arc::default(),
                         registry: registry_for_pull,
                         compiled_forms: compiled_forms_for_pull,
                         lock_path: lock_path_for_pull,
@@ -3574,6 +3581,7 @@ fn launch(
         a2a_task_id: None,
         input_timeout_secs: None,
         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
+        a2a_tool_calls: Arc::default(),
         registry: Arc::clone(&staged.registry),
         lock_path: staged.manifest_dir.join("murmur.lock"),
         driver_continuation_id: None,
@@ -5436,6 +5444,10 @@ pub(crate) struct CapsuleStoreState {
     /// Set to true when any emit-chunk call is made during the current driver dispatch.
     /// Reset to false before each driver dispatch in run_agent_loop.
     pub(crate) a2a_chunks_emitted: Arc<AtomicBool>,
+    /// The tool calls the inference driver has reported starting through `murmur:stream/events`
+    /// during the current task attempt. Reset when an http attempt begins; only the driver turn's
+    /// dispatch carries it.
+    pub(crate) a2a_tool_calls: Arc<Mutex<ToolCallProgress>>,
     /// Registry used to resolve additional artifacts requested at runtime via `manage.pull()`.
     pub(crate) registry: Arc<dyn Registry>,
     /// Path to this session's `murmur.lock`, consulted and updated by `manage.pull()`.
@@ -6250,7 +6262,7 @@ pub(crate) struct ToolInvokeEnv<'a> {
 
 /// Per-session A2A wiring registered on a tool linker.
 ///
-/// The two host interfaces it backs (`murmur:text/chunks`, `murmur:task/task`)
+/// The two host interfaces it backs (`murmur:stream/events`, `murmur:task/task`)
 /// are always *defined* — a streaming driver imports them and would fail to
 /// instantiate otherwise — but each function is a no-op when its channel is
 /// absent. [`ToolA2aWiring::silent`] is that all-absent form, used for a
@@ -6261,6 +6273,9 @@ pub(crate) struct ToolA2aWiring {
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     task_id: Option<String>,
     chunks_emitted: Arc<AtomicBool>,
+    /// The calls the session's driver has started, present only on the agent loop's driver
+    /// turn: `murmur:stream/events`' tool-call functions do nothing without it.
+    tool_calls: Option<Arc<Mutex<ToolCallProgress>>>,
     task_registry: Option<Arc<Mutex<TaskRegistry>>>,
     input_timeout_secs: Option<u64>,
 }
@@ -6271,6 +6286,7 @@ impl ToolA2aWiring {
             sse: None,
             task_id: None,
             chunks_emitted: Arc::new(AtomicBool::new(false)),
+            tool_calls: None,
             task_registry: None,
             input_timeout_secs: None,
         }
@@ -6305,6 +6321,7 @@ pub(crate) async fn invoke_tool_component(
         sse: a2a_sse,
         task_id: a2a_task_id,
         chunks_emitted: a2a_chunks_emitted,
+        tool_calls: a2a_tool_calls,
         task_registry: a2a_task_registry,
         input_timeout_secs,
     } = a2a;
@@ -6315,50 +6332,66 @@ pub(crate) async fn invoke_tool_component(
     wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
         .map_err(|err| format!("failed to add HTTP linker for tool '{name}': {err}"))?;
 
-    // Register murmur:text/chunks host functions (synchronous).
-    // Components that do not import this interface ignore the registrations.
-    // Both functions must be defined in a single .instance() call — Wasmtime
-    // rejects a second .instance() for the same interface name. Registered
-    // under the versioned name only (see WIT_TEXT_CHUNKS_IFACE / wit/VERSIONING.md).
+    // Register the murmur:stream/events host functions (synchronous); their bodies are in
+    // `stream_events`. Components that do not import this interface ignore the registrations.
+    // All four functions must be defined in a single .instance() call — Wasmtime rejects a second
+    // .instance() for the same interface name. Registered under the versioned name only (see
+    // WIT_STREAM_EVENTS_IFACE / wit/VERSIONING.md).
     {
-        let chunks_iface = WIT_TEXT_CHUNKS_IFACE;
-        let sse_for_chunk = a2a_sse.clone();
-        let task_id_for_chunk = a2a_task_id.clone();
-        let chunks_emitted_flag = Arc::clone(&a2a_chunks_emitted);
-        let sse_for_thinking = a2a_sse.clone();
-        let task_id_for_thinking = a2a_task_id.clone();
-
-        let mut inst = linker.instance(chunks_iface).map_err(|err| {
-            format!("failed to define {chunks_iface} instance for '{name}': {err}")
+        let events_iface = WIT_STREAM_EVENTS_IFACE;
+        let target = StreamEventsTarget {
+            sse: a2a_sse.clone(),
+            task_id: a2a_task_id.clone(),
+            chunks_emitted: a2a_chunks_emitted,
+            tool_calls: a2a_tool_calls,
+        };
+        let mut inst = linker.instance(events_iface).map_err(|err| {
+            format!("failed to define {events_iface} instance for '{name}': {err}")
         })?;
 
+        let chunk_target = target.clone();
         inst.func_wrap(
             "emit-chunk",
             move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>, (chunk,): (String,)| {
-                chunks_emitted_flag.store(true, Ordering::Relaxed);
-                if let (Some((ref tx, ref buf)), Some(ref tid)) =
-                    (&sse_for_chunk, &task_id_for_chunk)
-                {
-                    emit_chunk_sse(tx, buf, tid, &chunk);
-                }
+                stream_events::emit_chunk(&chunk_target, &chunk);
                 Ok(())
             },
         )
         .map_err(|err| format!("failed to register emit-chunk for tool '{name}': {err}"))?;
 
+        let thinking_target = target.clone();
         inst.func_wrap(
             "emit-thinking-chunk",
             move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>, (chunk,): (String,)| {
-                if let (Some((ref tx, ref buf)), Some(ref tid)) =
-                    (&sse_for_thinking, &task_id_for_thinking)
-                {
-                    emit_thinking_chunk_sse(tx, buf, tid, &chunk);
-                }
+                stream_events::emit_thinking_chunk(&thinking_target, &chunk);
                 Ok(())
             },
         )
         .map_err(|err| {
             format!("failed to register emit-thinking-chunk for tool '{name}': {err}")
+        })?;
+
+        let started_target = target.clone();
+        inst.func_wrap(
+            "tool-call-started",
+            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
+                  (id, call_name): (String, String)| {
+                stream_events::tool_call_started(&started_target, &id, &call_name);
+                Ok(())
+            },
+        )
+        .map_err(|err| format!("failed to register tool-call-started for tool '{name}': {err}"))?;
+
+        inst.func_wrap(
+            "tool-call-input-bytes",
+            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
+                  (id, bytes): (String, u64)| {
+                stream_events::tool_call_input_bytes(&target, &id, bytes, Instant::now());
+                Ok(())
+            },
+        )
+        .map_err(|err| {
+            format!("failed to register tool-call-input-bytes for tool '{name}': {err}")
         })?;
     }
 
@@ -6586,7 +6619,9 @@ impl CapsuleStoreState {
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let gateway = self.gateways.inference_for(&choice.driver);
         let env = driver_choice_env(&self.inference_env, choice, gateway);
-        self.dispatch_component_with_env(&choice.driver, input, gateway, &env)
+        // The one dispatch whose `tool-call-started` and `tool-call-input-bytes` reach the stream.
+        let tool_calls = Some(Arc::clone(&self.a2a_tool_calls));
+        self.dispatch_component_with_env(&choice.driver, input, gateway, &env, tool_calls)
             .await
     }
 
@@ -6596,7 +6631,7 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         gateway: Option<&Arc<CredentialGateway>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
-        self.dispatch_component_with_env(name, input, gateway, &self.inference_env)
+        self.dispatch_component_with_env(name, input, gateway, &self.inference_env, None)
             .await
     }
 
@@ -6606,6 +6641,7 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         gateway: Option<&Arc<CredentialGateway>>,
         inference_env: &[(String, String)],
+        tool_calls: Option<Arc<Mutex<ToolCallProgress>>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
@@ -6627,6 +6663,7 @@ impl CapsuleStoreState {
                 sse: self.a2a_sse.clone(),
                 task_id: self.a2a_task_id.clone(),
                 chunks_emitted: Arc::clone(&self.a2a_chunks_emitted),
+                tool_calls,
                 task_registry: self.a2a_task_registry.clone(),
                 input_timeout_secs: self.input_timeout_secs,
             },
@@ -12196,6 +12233,7 @@ inference:
             a2a_task_id: None,
             input_timeout_secs: None,
             a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
+            a2a_tool_calls: Arc::default(),
             registry,
             lock_path,
             driver_continuation_id: None,

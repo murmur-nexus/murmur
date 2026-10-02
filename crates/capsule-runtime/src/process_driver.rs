@@ -69,6 +69,51 @@ pub fn check_driver_interface(
     }
 }
 
+/// Every instance of the retired `murmur:text` package starts with this. No version of it is
+/// served: `murmur:stream/events` replaced it.
+const RETIRED_TEXT_IFACE_PREFIX: &str = "murmur:text/";
+
+/// Every instance of the `murmur:stream` package starts with this.
+const STREAM_IFACE_PREFIX: &str = "murmur:stream/";
+
+/// Checks a `runtime: driver` artifact's imports against the stream interface this host serves.
+///
+/// Refuses a component importing any `murmur:text/*` instance, or any `murmur:stream/*` instance
+/// other than exactly [`WIT_STREAM_EVENTS_IFACE`]: the host serves neither, so the driver would
+/// fail to instantiate on its first turn. `contracts` is what
+/// [`murmur_artifact::extract_wit_contracts`] read out of the driver's wasm; `None`, and a
+/// component importing neither package, pass.
+///
+/// [`WIT_STREAM_EVENTS_IFACE`]: crate::runtime::WIT_STREAM_EVENTS_IFACE
+pub fn check_stream_interface(
+    name: &str,
+    version: &str,
+    contracts: Option<&WitContracts>,
+) -> Result<(), RuntimeError> {
+    let expected = crate::runtime::WIT_STREAM_EVENTS_IFACE;
+    let imported: Vec<String> = contracts
+        .map(|c| {
+            c.imports
+                .iter()
+                .filter(|import| {
+                    import.starts_with(RETIRED_TEXT_IFACE_PREFIX)
+                        || (import.starts_with(STREAM_IFACE_PREFIX) && *import != expected)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if imported.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeError::DriverStreamInterfaceNotServed {
+        name: name.to_string(),
+        version: version.to_string(),
+        imported,
+        expected: expected.to_string(),
+    })
+}
+
 /// Checks that every variable `description.required_env` names is declared in
 /// `capabilities.env.allow`, given as `env_allow`. Names match exactly.
 ///
@@ -397,6 +442,69 @@ mod tests {
         assert!(check_driver_interface("http", "d", "1.0.0", Some(&c)).is_ok());
     }
 
+    fn importing(imports: &[&str]) -> WitContracts {
+        WitContracts {
+            exports: vec!["murmur:tool/run@0.1.0".to_string()],
+            imports: imports.iter().map(|i| i.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn stream_interface_refuses_and_lists_a_murmur_text_import() {
+        let c = importing(&[
+            "wasi:cli/environment@0.2.12",
+            "murmur:text/chunks@0.1.0",
+            "murmur:task/task@0.1.0",
+        ]);
+        let err = check_stream_interface("d", "1.0.0", Some(&c)).unwrap_err();
+        match &err {
+            RuntimeError::DriverStreamInterfaceNotServed {
+                name,
+                version,
+                imported,
+                expected,
+            } => {
+                assert_eq!((name.as_str(), version.as_str()), ("d", "1.0.0"));
+                assert_eq!(imported, &vec!["murmur:text/chunks@0.1.0".to_string()]);
+                assert_eq!(expected, crate::runtime::WIT_STREAM_EVENTS_IFACE);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("'d@1.0.0'"), "{message}");
+        assert!(message.contains("murmur:text/chunks@0.1.0"), "{message}");
+        assert!(message.contains("murmur:stream/events@0.1.0"), "{message}");
+    }
+
+    #[test]
+    fn stream_interface_refuses_another_version_of_murmur_stream() {
+        let c = importing(&["murmur:stream/events@0.2.0"]);
+        let err = check_stream_interface("d", "1.0.0", Some(&c)).unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::DriverStreamInterfaceNotServed { ref imported, .. }
+                if imported == &vec!["murmur:stream/events@0.2.0".to_string()]
+        ));
+    }
+
+    #[test]
+    fn stream_interface_accepts_exactly_the_served_instance() {
+        let c = importing(&["murmur:stream/events@0.1.0", "wasi:http/types@0.2.12"]);
+        assert!(check_stream_interface("d", "1.0.0", Some(&c)).is_ok());
+    }
+
+    #[test]
+    fn stream_interface_accepts_a_component_with_no_murmur_import() {
+        let c = importing(&["wasi:cli/environment@0.2.12"]);
+        assert!(check_stream_interface("d", "1.0.0", Some(&c)).is_ok());
+        assert!(check_stream_interface("d", "1.0.0", Some(&importing(&[]))).is_ok());
+    }
+
+    #[test]
+    fn stream_interface_accepts_no_contracts() {
+        assert!(check_stream_interface("d", "1.0.0", None).is_ok());
+    }
+
     fn description(required_env: &[&str]) -> Description {
         Description {
             harness: "h".to_string(),
@@ -515,7 +623,7 @@ mod tests {
     #[test]
     fn process_driver_granted_nothing() {
         let wat = r#"(component
-            (import "murmur:text/chunks@0.1.0" (instance
+            (import "murmur:stream/events@0.1.0" (instance
                 (export "emit-chunk" (func (param "chunk" string)))
             ))
         )"#;
@@ -533,7 +641,7 @@ mod tests {
         match result {
             Err(RuntimeError::ProcessDriverLoad { name, message, .. }) => {
                 assert_eq!(name, "d");
-                assert!(message.contains("murmur:text/chunks@0.1.0"), "{message}");
+                assert!(message.contains("murmur:stream/events@0.1.0"), "{message}");
             }
             Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("a driver importing a Murmur interface instantiated"),

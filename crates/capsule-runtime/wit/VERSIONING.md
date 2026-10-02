@@ -20,7 +20,7 @@ Current versions:
 | `murmur:task`            | `0.1.0`  |
 | `murmur:task-io`         | `0.1.0`  |
 | `murmur:conversation`    | `0.2.0`  |
-| `murmur:text`            | `0.1.0`  |
+| `murmur:stream`          | `0.1.0`  |
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
@@ -260,6 +260,40 @@ Nothing else was bundled with it. `description` did not gain a field declaring
 that a driver sends the new cases: both are optional for a driver, so nothing
 needs to declare them.
 
+`murmur:stream` was created at `0.1.0` for the `events` interface, and
+`murmur:text` was **retired** in the same step, with no fallback. `events` is
+the one interface a tool or driver imports for everything it tells the host
+while a turn is still in flight: `emit-chunk` and `emit-thinking-chunk`, carried
+over unchanged from `murmur:text/chunks`, and two new functions,
+`tool-call-started(id, name)` and `tool-call-input-bytes(id, bytes)`, through
+which an http driver reports a tool call the model is writing. Its instance
+name is `murmur:stream/events@0.1.0`. `stream` is a WIT keyword, so the source
+spells the package `murmur:%stream`; the `%` is escaping and appears in no
+instance name.
+
+It is one package rather than a second one beside `murmur:text` because the
+process transport already carries every mid-turn signal on one channel — the
+single `variant event` of `murmur:driver/process` — and the http transport now
+does the same. Tool-call signals do not belong on an interface named `chunks`
+in a package named `text`, and leaving text where it was would have split one
+channel across two packages.
+
+It is a new package rather than a bump of `murmur:text` because the name
+stopped being true: the interface no longer carries only text. A bump would
+have cost the same rebuild — every driver importing `murmur:text/chunks@0.1.0`
+stops linking either way — and kept a name that misdescribes what it holds.
+
+The cost was paid knowingly. Every installed http driver importing any
+`murmur:text` interface is refused at staging with `E-RUN-029`, naming the
+imports the host does not serve and `murmur:stream/events@0.1.0`, with a hint to
+pin a release built against it and run `mur install`. The check covers every
+`runtime: driver` artifact a capsule declares, not only its inference driver,
+because a `switch_driver` target is dispatched through the same linker. This
+repository's own driver fixtures were rebuilt against `murmur:stream`. One
+`murmur:text` component stays committed under
+`crates/murmur-cli/tests/fixtures/streaming-driver-text/`, so the refusal stays
+testable.
+
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,
 no artifact is rebuilt, and this table simply gains a row. Bump an existing
@@ -356,7 +390,7 @@ only:
   `murmur:capsule/run@0.1.0` and `murmur:tool/run@0.1.0`.
 
 The host-provided *import* interfaces (`murmur:tool-registry/invoke@0.1.0`,
-`murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`,
+`murmur:stream/events@0.1.0`, `murmur:task/task@0.1.0`,
 `murmur:runtime/inference@0.4.0`, `murmur:runtime/tokens@0.4.0`,
 `murmur:task-io/read@0.1.0`, `murmur:conversation/read@0.2.0`) are likewise
 registered under the versioned name only.

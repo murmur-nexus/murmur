@@ -29,8 +29,10 @@ WIT_DIR="crates/capsule-runtime/wit"
 
 # The declaration this repo derives every version fact from, anchored at the
 # start of a line. Every murmur:* package carries an explicit @x.y.z — see
-# $WIT_DIR/VERSIONING.md for why, and for what a bump costs.
-WIT_PACKAGE_PATTERN='^package murmur:[a-z-]+@[0-9]+\.[0-9]+\.[0-9]+'
+# $WIT_DIR/VERSIONING.md for why, and for what a bump costs. A name that is a
+# WIT keyword is written with a leading `%` (`murmur:%stream`); the `%` is
+# escaping, not part of the name, so the pipeline below drops it.
+WIT_PACKAGE_PATTERN='^package murmur:%?[a-z-]+@[0-9]+\.[0-9]+\.[0-9]+'
 
 # Exit 2 with the shared message unless the caller is at the repository root.
 # Exits the sourcing script; it is a guard, not a predicate.
@@ -68,7 +70,7 @@ wit_packages() {
                     done |
                     grep -oE "$WIT_PACKAGE_PATTERN" || true
                 ;;
-        esac | sed 's/^package //' | sort -u
+        esac | sed -e 's/^package //' -e 's/^murmur:%/murmur:/' | sort -u
     )
     [ -n "$_wit_found" ] || return 1
     printf '%s\n' "$_wit_found"
@@ -81,5 +83,5 @@ wit_packages() {
 # Writes the paths of the working-tree .wit files declaring it, one per line,
 # for naming the offenders in a duplicate-version report.
 wit_files_declaring() {
-    grep -rlE "^package ${1}@" "$WIT_DIR" --include='*.wit'
+    grep -rlE "^package ${1%%:*}:%?${1#*:}@" "$WIT_DIR" --include='*.wit'
 }

@@ -48,7 +48,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
         "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
         "required": false,
         "params": {
-          "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+          "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
         }
       }
     ]
@@ -227,7 +227,7 @@ terminator in front of a door that is reached off the host.
         "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
         "required": false,
         "params": {
-          "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+          "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
         }
       }
     ]
@@ -293,7 +293,7 @@ authenticated door's v1.0 card with the capsule extension kept, converted to 0.3
       { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
         "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
       { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
-        "params": { "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
+        "params": { "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
     ]
   },
   "securitySchemes": {
