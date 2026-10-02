@@ -22,9 +22,9 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:runtime", "0.4.0"),
     ("murmur:runtime-guest", "0.1.0"),
     ("murmur:shell", "0.1.0"),
+    ("murmur:stream", "0.1.0"),
     ("murmur:task", "0.1.0"),
     ("murmur:task-io", "0.1.0"),
-    ("murmur:text", "0.1.0"),
     ("murmur:tool", "0.1.0"),
     ("murmur:tool-registry", "0.1.0"),
 ];
@@ -58,6 +58,8 @@ mod tests {
                 let (name, version) = declaration
                     .split_once('@')
                     .unwrap_or_else(|| panic!("unversioned package in {}", path.display()));
+                // A name that is a WIT keyword is written `%stream`; the `%` is not part of it.
+                let name = name.strip_prefix('%').unwrap_or(name);
                 into.insert((format!("murmur:{name}"), version.to_string()));
             }
         }
@@ -104,7 +106,7 @@ mod tests {
             crate::runtime::WIT_CAPSULE_IFACE_VERSIONED,
             crate::runtime::WIT_TOOL_IFACE_VERSIONED,
             crate::runtime::WIT_TOOL_REGISTRY_IFACE,
-            crate::runtime::WIT_TEXT_CHUNKS_IFACE,
+            crate::runtime::WIT_STREAM_EVENTS_IFACE,
             crate::runtime::WIT_TASK_IFACE,
             crate::conversation_import::CONVERSATION_IFACE_VERSIONED,
             crate::inference_import::INFERENCE_IFACE_VERSIONED,

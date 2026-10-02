@@ -1,0 +1,31 @@
+package murmur:%stream@0.1.0;
+
+/// The signals a component sends the host while a turn is still in flight. Nothing else belongs
+/// on this interface: what a component returns when it is done goes through its export.
+///
+/// Every function returns at once and never fails. Each does nothing outside an A2A task.
+///
+/// `tool-call-started` and `tool-call-input-bytes` take effect only when the session's inference
+/// driver calls them; from any other component they do nothing. The `id` and `name` a driver
+/// passes must be the ones it later returns in the call's `tool_call` content block. No function
+/// here carries any part of a call's input.
+interface events {
+    /// Emit one text chunk to the task's stream.
+    /// Called by a driver once per token while it streams the model's response.
+    emit-chunk: func(chunk: string);
+
+    /// Emit one thinking chunk to the task's stream.
+    /// Called by a driver for reasoning content: text inside <think>…</think> tags, or a
+    /// structured thinking block.
+    emit-thinking-chunk: func(chunk: string);
+
+    /// The model has begun writing tool call `id`, named `name`. Call it once per call, before
+    /// any `tool-call-input-bytes` for it. A second start for the same id, or a start with an
+    /// empty id, is ignored.
+    tool-call-started: func(id: string, name: string);
+
+    /// The model has written `bytes` bytes of started call `id`'s input JSON so far. `bytes` is
+    /// cumulative for the call, never the increment since the last report. A count no larger
+    /// than an earlier one, or a report for an id with no start, is ignored.
+    tool-call-input-bytes: func(id: string, bytes: u64);
+}

@@ -7,11 +7,11 @@ world capsule {
 
 world tool {
   import murmur:task/task@0.1.0;
-  import murmur:text/chunks@0.1.0;
+  import murmur:%stream/events@0.1.0;
   export murmur:tool/run@0.1.0;
 }
 
 world driver {
-  import murmur:text/chunks@0.1.0;
+  import murmur:%stream/events@0.1.0;
   export murmur:tool/run@0.1.0;
 }

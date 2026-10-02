@@ -422,6 +422,8 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
             "artifact",
             "text",
             "thinking",
+            "tool-call-started",
+            "tool-call-progress",
             "gap",
             "lagged",
             "connection-ack",

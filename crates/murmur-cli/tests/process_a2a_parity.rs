@@ -32,6 +32,7 @@ use zip::{
 const HTTP_DRIVER: &str = "murmur-driver-anthropic";
 const HTTP_DRIVER_VERSION: &str = "0.1.4";
 const STREAMING_DRIVER: &str = "streaming-driver";
+const TOOL_PROGRESS_DRIVER: &str = "tool-progress-driver";
 const PROCESS_DRIVER: &str = "fixture-process-driver";
 const VERSION: &str = "0.1.0";
 const TOOL: &str = "echo-tool";
@@ -57,28 +58,33 @@ fn create_tool_artifact(dir: &Path, wasm: &Path) -> PathBuf {
     path
 }
 
-fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
-    let path = dir.join(format!("{STREAMING_DRIVER}-{VERSION}.mur.zip"));
+/// A `runtime: driver` artifact named `name` holding the fixture component at `wasm`, relative to
+/// the fixtures directory.
+fn create_fixture_driver_artifact(dir: &Path, name: &str, wasm: &str) -> PathBuf {
+    let path = dir.join(format!("{name}-{VERSION}.mur.zip"));
     let mut zip = ZipWriter::new(fs::File::create(&path).unwrap());
     let options: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("murmur.yaml", options).unwrap();
-    writeln!(zip, "name: {STREAMING_DRIVER}").unwrap();
+    writeln!(zip, "name: {name}").unwrap();
     writeln!(zip, "version: {VERSION}").unwrap();
     writeln!(zip, "runtime: driver").unwrap();
     writeln!(zip, "upstream_auth:").unwrap();
     writeln!(zip, "  header: x-api-key").unwrap();
     writeln!(zip, "  value: \"{{key}}\"").unwrap();
     zip.start_file("tool.wasm", options).unwrap();
-    zip.write_all(
-        &fs::read(common::fixture_path(
-            "streaming-driver/tool/streaming-driver.wasm",
-        ))
-        .unwrap(),
-    )
-    .unwrap();
+    zip.write_all(&fs::read(common::fixture_path(wasm)).unwrap())
+        .unwrap();
     zip.finish().unwrap();
     path
+}
+
+fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
+    create_fixture_driver_artifact(
+        dir,
+        STREAMING_DRIVER,
+        "streaming-driver/tool/streaming-driver.wasm",
+    )
 }
 
 fn publish(home: &TempDir, artifact: &Path) {
@@ -294,6 +300,44 @@ fn streaming_http_capsule(name: &str, hook: Option<&DeclaredHook>) -> Capsule {
         format!(
             "name: {name}\nversion: 0.1.0\nartifacts:\n{entries}\
              {LIFECYCLE}inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {STREAMING_DRIVER}\n"
+        ),
+    )
+    .unwrap();
+    start(home, project, &manifest, &[])
+}
+
+/// An `http` capsule whose driver reports a tool call's start and size before returning it, in the
+/// way `mode` names, and which declares the echo tool the call names. Needs no provider.
+fn tool_progress_http_capsule(name: &str, mode: &str) -> Capsule {
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    publish(
+        &home,
+        &create_fixture_driver_artifact(
+            artifacts.path(),
+            TOOL_PROGRESS_DRIVER,
+            "tool-progress-driver/tool/tool-progress-driver.wasm",
+        ),
+    );
+    publish(
+        &home,
+        &create_tool_artifact(
+            artifacts.path(),
+            &common::fixture_path("run/components/echo-tool.wasm"),
+        ),
+    );
+    let entries = format!(
+        "  - name: {TOOL_PROGRESS_DRIVER}\n    version: {VERSION}\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:1\n      api_key: test-key\n\
+         \x20 - name: {TOOL}\n    version: {VERSION}\n    runtime: tool\n"
+    );
+    let manifest = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest,
+        format!(
+            "name: {name}\nversion: 0.1.0\nartifacts:\n{entries}\
+             {LIFECYCLE}inference:\n  transport: http\n  model: {mode}\n  driver:\n    artifact: {TOOL_PROGRESS_DRIVER}\n"
         ),
     )
     .unwrap();
@@ -636,9 +680,9 @@ fn frame_kinds(events: &[SseEvent]) -> Vec<String> {
                     ),
                     state => format!("status:{state}"),
                 },
-                "text" => match data["final"] == Value::Bool(true) {
-                    true => "text:final".to_string(),
-                    false => "text:chunk".to_string(),
+                "text" | "thinking" => match data["final"] == Value::Bool(true) {
+                    true => format!("{}:final", event.event_type),
+                    false => format!("{}:chunk", event.event_type),
                 },
                 other => other.to_string(),
             }
@@ -908,11 +952,13 @@ fn a_process_capsule_advertises_cancellation_and_streaming() {
 }
 
 /// The stream extension's `params.frames` of an http capsule that serves `message/stream`.
-const HTTP_FRAMES: [&str; 9] = [
+const HTTP_FRAMES: [&str; 11] = [
     "status",
     "artifact",
     "text",
     "thinking",
+    "tool-call-started",
+    "tool-call-progress",
     "gap",
     "lagged",
     "connection-ack",
@@ -1250,6 +1296,274 @@ fn no_frame_carries_any_part_of_a_started_call_s_input() {
             );
         }
     }
+}
+
+// ── A tool call being written, on http ────────────────────────────────────────
+
+/// What the `tool-progress-driver` fixture's call input carries, and nothing else in the run.
+const PROGRESS_MARKER: &str = "progress-marker-7f3a";
+
+/// The compact size of the fixture's call input, `{"msg":"progress-marker-7f3a"}`.
+const PROGRESS_INPUT_BYTES: u64 = 30;
+
+/// Assert no frame but an `artifact` carries any four-byte piece of the call's input marker. The
+/// echo tool's result repeats its input, so the `artifact` that answers the call carries it.
+fn assert_no_input_outside_the_artifact(events: &[SseEvent]) {
+    // A piece made only of hex digits can occur by chance in a task or context id.
+    let pieces: Vec<&str> = (0..=PROGRESS_MARKER.len() - 4)
+        .map(|at| &PROGRESS_MARKER[at..at + 4])
+        .filter(|piece| !piece.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    for event in events.iter().filter(|event| event.event_type != "artifact") {
+        for piece in &pieces {
+            assert!(
+                !event.data.contains(piece),
+                "a {} frame carries {piece:?} of the call's input: {}",
+                event.event_type,
+                event.data
+            );
+        }
+    }
+}
+
+/// The `input_bytes` of every `tool-call-progress` frame, in order.
+fn progress_sizes(events: &[SseEvent]) -> Vec<u64> {
+    frames_of(events, "tool-call-progress")
+        .iter()
+        .map(|frame| frame["input_bytes"].as_u64().unwrap())
+        .collect()
+}
+
+/// A tool call an http driver reports while its model writes it reaches the client as its
+/// start and its size, before the `artifact` that answers it — the frames a process capsule writes
+/// for the same work.
+#[test]
+fn a_started_tool_call_streams_its_start_and_size_on_http() {
+    if common::skip_without_host_support("a_started_tool_call_streams_its_start_and_size_on_http") {
+        return;
+    }
+    let http = tool_progress_http_capsule("progress-http", "tool-progress");
+    let http_events = collect_sse_events(&http.url(), STREAM_TIMEOUT);
+    let process = ProcessCapsule::new("progress-http-parity", "tool-progress")
+        .with_tool()
+        .start();
+    let process_events = collect_sse_events(&process.url(), STREAM_TIMEOUT);
+
+    assert_same_frames(
+        &http_events,
+        &process_events,
+        &[
+            "status:working:inference turn 1",
+            "tool-call-started",
+            "tool-call-progress",
+            "tool-call-progress",
+            "artifact",
+            "status:working:inference turn 2",
+            "text:final",
+            "status:completed",
+        ],
+    );
+
+    let artifact = &frames_of(&http_events, "artifact")[0]["artifact"];
+    let started = &frames_of(&http_events, "tool-call-started")[0];
+    assert_eq!(started["tool_call_id"], "c1", "{started}");
+    assert_eq!(
+        started["tool_call_id"], artifact["tool_call_id"],
+        "{artifact}"
+    );
+    assert_eq!(started["tool_name"], TOOL, "{started}");
+    assert_eq!(started["tool_name"], artifact["tool_name"], "{artifact}");
+    assert_eq!(
+        progress_sizes(&http_events),
+        [PROGRESS_INPUT_BYTES / 2, PROGRESS_INPUT_BYTES]
+    );
+    for frame in frames_of(&http_events, "tool-call-progress") {
+        assert_eq!(frame["tool_call_id"], "c1", "{frame}");
+    }
+    for event in &http_events {
+        match event.event_type.as_str() {
+            "tool-call-started" => {
+                assert_keys_in_order(&event.data, &["id", "tool_call_id", "tool_name"])
+            }
+            "tool-call-progress" => {
+                assert_keys_in_order(&event.data, &["id", "tool_call_id", "input_bytes"])
+            }
+            _ => {}
+        }
+    }
+    assert_no_input_outside_the_artifact(&http_events);
+    assert_no_input_outside_the_artifact(&watch_until_final(&http.url(), 0));
+}
+
+/// Text and thinking an http driver streams ahead of a started call still reach the client,
+/// and the turn's cursor removal follows the call's last progress frame.
+#[test]
+fn text_and_thinking_still_stream_beside_a_started_tool_call_on_http() {
+    if common::skip_without_host_support(
+        "text_and_thinking_still_stream_beside_a_started_tool_call_on_http",
+    ) {
+        return;
+    }
+    let http = tool_progress_http_capsule("progress-http-streaming", "tool-progress-streaming");
+    let events = collect_sse_events(&http.url(), STREAM_TIMEOUT);
+    let kinds = frame_kinds(&events);
+    println!("http: {kinds:?}");
+    assert_eq!(
+        kinds,
+        [
+            "status:working:inference turn 1",
+            "thinking:chunk",
+            "text:chunk",
+            "tool-call-started",
+            "tool-call-progress",
+            "tool-call-progress",
+            "text:final",
+            "artifact",
+            "status:working:inference turn 2",
+            "text:final",
+            "status:completed",
+        ]
+    );
+    let thinking = frames_of(&events, "thinking");
+    assert_eq!(thinking.len(), 1, "{thinking:#?}");
+    assert_eq!(thinking[0]["text"], "planning");
+    let texts = frames_of(&events, "text");
+    assert_eq!(texts[0]["text"], "Writing it. ");
+    assert_eq!(texts[0]["final"], false);
+    assert_eq!(texts[1]["text"], "", "the cursor removal: {}", texts[1]);
+    assert_eq!(texts[1]["final"], true);
+    assert_no_input_outside_the_artifact(&events);
+}
+
+/// A watcher that reconnects after an http task replays the started call's frames under the
+/// ids the live stream carried them with.
+#[test]
+fn a_reconnecting_watcher_replays_a_started_tool_call_on_http() {
+    if common::skip_without_host_support(
+        "a_reconnecting_watcher_replays_a_started_tool_call_on_http",
+    ) {
+        return;
+    }
+    let capsule = tool_progress_http_capsule("progress-http-replay", "tool-progress");
+    let live = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    assert!(live.iter().all(|event| event.id.is_some()), "{live:#?}");
+
+    let replayed = watch_until_final(&capsule.url(), 0);
+    println!("live:   {:?}", ids_and_kinds(&live));
+    println!("replay: {:?}", ids_and_kinds(&replayed));
+    assert_eq!(ids_and_kinds(&replayed), ids_and_kinds(&live));
+
+    let working = live[0].id.expect("the first working status is numbered");
+    let resumed = watch_until_final(&capsule.url(), working);
+    println!("resumed after {working}: {:?}", ids_and_kinds(&resumed));
+    assert_eq!(ids_and_kinds(&resumed), ids_and_kinds(&live[1..]));
+    assert_eq!(resumed[0].event_type, "tool-call-started");
+    for events in [&replayed, &resumed] {
+        assert!(events.iter().all(|event| event.event_type != "gap"));
+    }
+}
+
+/// A 7000-byte input an http driver reports in 350 steps writes a handful of progress frames:
+/// none of the task's frames is evicted from the replay buffer, and a watcher reading throughout is
+/// never lagged.
+#[test]
+fn a_large_tool_input_on_http_writes_a_bounded_number_of_progress_frames() {
+    if common::skip_without_host_support(
+        "a_large_tool_input_on_http_writes_a_bounded_number_of_progress_frames",
+    ) {
+        return;
+    }
+    let capsule = tool_progress_http_capsule("progress-http-large", "tool-progress-large");
+    let url = capsule.url();
+    let watching = {
+        let url = url.clone();
+        thread::spawn(move || watch_until_final(&url, 0))
+    };
+    // The watcher attaches, and has written its `connection-ack`, before the task is submitted.
+    thread::sleep(Duration::from_millis(500));
+    let events = collect_sse_events(&url, STREAM_TIMEOUT);
+    let watched = watching.join().expect("the watcher read to the end");
+
+    println!("http: {:?}", frame_kinds(&events));
+    let started: Vec<&SseEvent> = events
+        .iter()
+        .filter(|event| event.event_type == "tool-call-started")
+        .collect();
+    assert_eq!(started.len(), 1, "{events:#?}");
+    let artifact = events
+        .iter()
+        .find(|event| event.event_type == "artifact")
+        .expect("the call's artifact");
+    let elapsed_ms = artifact
+        .received
+        .duration_since(started[0].received)
+        .as_millis() as u64;
+    let sizes = progress_sizes(&events);
+    let ceiling = 2 + elapsed_ms.div_ceil(250);
+    println!(
+        "{} tool-call-progress frames over {elapsed_ms} ms (ceiling {ceiling}): {sizes:?}",
+        sizes.len()
+    );
+    assert!(
+        (1..=ceiling).contains(&(sizes.len() as u64)),
+        "{} progress frames over {elapsed_ms} ms",
+        sizes.len()
+    );
+    assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]), "{sizes:?}");
+    assert_eq!(sizes.last(), Some(&7000));
+
+    assert!(
+        watched.iter().all(|event| event.event_type != "lagged"),
+        "{:?}",
+        frame_kinds(&watched)
+    );
+    assert_eq!(ids_and_kinds(&watched), ids_and_kinds(&events));
+
+    let replayed = watch_until_final(&url, 0);
+    assert!(replayed.iter().all(|event| event.event_type != "gap"));
+    assert_eq!(replayed[0].id, events[0].id);
+    assert_eq!(
+        frame_kinds(&replayed[..1]),
+        ["status:working:inference turn 1"]
+    );
+}
+
+/// An http driver that reports progress for a call it never started, starts one with no id,
+/// starts the same call twice and reports a shrinking size gets one start and one progress frame
+/// for its one real call, and nothing for the rest.
+#[test]
+fn an_unruly_http_driver_writes_no_frame_that_breaks_the_contract() {
+    if common::skip_without_host_support(
+        "an_unruly_http_driver_writes_no_frame_that_breaks_the_contract",
+    ) {
+        return;
+    }
+    let capsule = tool_progress_http_capsule("progress-http-unruly", "tool-progress-unruly");
+    let events = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    let kinds = frame_kinds(&events);
+    println!("http: {kinds:?}");
+    assert_eq!(
+        kinds[..4],
+        [
+            "status:working:inference turn 1",
+            "tool-call-started",
+            "tool-call-progress",
+            "artifact",
+        ]
+    );
+    let started = frames_of(&events, "tool-call-started");
+    assert_eq!(started.len(), 1, "{started:#?}");
+    assert_eq!(started[0]["tool_call_id"], "c1");
+    assert_eq!(progress_sizes(&events), [PROGRESS_INPUT_BYTES]);
+    for event in &events {
+        let data = event.json();
+        assert!(!event.data.contains("ghost"), "{}", event.data);
+        if event.event_type.starts_with("tool-call-") {
+            assert_ne!(data["tool_call_id"], "", "{}", event.data);
+            assert_eq!(data["tool_call_id"], "c1", "{}", event.data);
+        }
+    }
+    assert_eq!(final_status(&events)["status"]["state"], "completed");
 }
 
 /// The `on-inference` hook the hook scenarios declare, and what it returns every turn.

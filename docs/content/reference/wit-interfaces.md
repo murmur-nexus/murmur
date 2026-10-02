@@ -18,7 +18,7 @@ version each one carries.
 | [`murmur:shell/execute`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/shell-execute.wit) | Implemented natively by the runtime | Run an allowlisted shell binary |
 | [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
 | [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | Imported by tool components | Pause the agent loop and wait for external input |
-| [`murmur:text/chunks`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-text/stream.wit) | Imported by tool and driver components | Emit response and thinking chunks to the session's SSE stream |
+| [`murmur:stream/events`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-stream/events.wit) | Imported by tool and driver components | Tell the session's stream what a turn is doing while it is still in flight: reply and thinking chunks, and a tool call being written |
 | [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | Exported by hook artifacts | The lifecycle handlers the runtime calls |
 | [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
 | [`murmur:runtime/tokens`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/tokens.wit) | Provided by the runtime to hook components | Count the tokens in a string the way the runtime counts them |
@@ -33,8 +33,8 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | World | Imports | Exports | Defined in |
 |---|---|---|---|
 | `capsule` | `tool-registry/invoke` | `capsule/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
-| `tool` | `task/task`, `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
-| `driver` | `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
+| `tool` | `task/task`, `stream/events` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
+| `driver` | `stream/events` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read`, `conversation/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
 | `process-driver` | — | `driver/process` | [`process-driver/process.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/process-driver/process.wit) |
@@ -339,16 +339,46 @@ optional `context-id`, and the `text` — and returns the peer's `task-id`, `con
 
 ---
 
-## `murmur:text/chunks` { #text-chunks }
+## `murmur:stream/events` { #stream-events }
 
-Streams a reply to the session's SSE stream while a tool or driver is still producing it.
+The signals a tool or driver sends the session's stream while a turn is still in flight. Each
+function returns at once and never fails.
 
-| Function | Emits | Call it with |
+| Function | Writes | Call it with |
 |---|---|---|
 | `emit-chunk: func(chunk: string)` | A [`text`](streaming-protocol.md#event-text) frame | The next piece of reply text |
 | `emit-thinking-chunk: func(chunk: string)` | A [`thinking`](streaming-protocol.md#event-thinking) frame | The next piece of reasoning |
+| `tool-call-started: func(id: string, name: string)` | A [`tool-call-started`](streaming-protocol.md#event-tool-call-started) frame | The id and name of a tool call the model has begun writing |
+| `tool-call-input-bytes: func(id: string, bytes: u64)` | A [`tool-call-progress`](streaming-protocol.md#event-tool-call-progress) frame, coalesced | The id of a started call, and how many bytes of its input JSON the model has written so far |
 
-Outside an A2A task there is no SSE stream, and both calls do nothing.
+| Caller | `emit-chunk`, `emit-thinking-chunk` | `tool-call-started`, `tool-call-input-bytes` |
+|---|---|---|
+| The capsule's inference driver, on an agent-loop turn | Write | Write |
+| A tool | Write | Do nothing |
+| A driver called by a hook's [`run-inference`](#murmurruntimeinference) | Do nothing | Do nothing |
+| Any component outside an A2A task | Do nothing | Do nothing |
+
+A driver reporting a tool call follows these rules:
+
+| Rule | What it means |
+|---|---|
+| Same id and name | `id` and `name` are the `id` and `name` of the `tool_call` content block the driver returns for the call. The `artifact` frame takes both from that block, so a start under another id is never matched to it. A block returned under another name keeps that name, and the runtime writes an error line naming the driver, the id and both names |
+| Cumulative, never delta | `bytes` is the UTF-8 length of the call's input JSON written so far, not the increment since the last report |
+| A count, never input | No function carries any of the input's content; the input reaches the runtime only in the returned `tool_call` block |
+| No id, no start | A driver that learns the provider's call id only once the call is complete calls neither tool-call function |
+
+The runtime writes nothing for:
+
+- a `tool-call-input-bytes` for a call with no `tool-call-started`;
+- a second `tool-call-started` for the same id, or one with an empty id;
+- a `bytes` no larger than one already reported for the call.
+
+Neither tool-call function opens an inference turn, counts toward `inference.max_turns` or is
+written to the trace.
+
+In WIT source the package is written `murmur:%stream`, because `stream` is a WIT keyword. The
+instance a component imports is `murmur:stream/events@0.1.0`, and Rust bindings name it
+`murmur::stream::events`.
 
 ---
 
@@ -813,7 +843,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:task` | `0.1.0` |
 | `murmur:task-io` | `0.1.0` |
 | `murmur:conversation` | `0.2.0` |
-| `murmur:text` | `0.1.0` |
+| `murmur:stream` | `0.1.0` |
 | `murmur:hook` | `0.9.0` |
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |

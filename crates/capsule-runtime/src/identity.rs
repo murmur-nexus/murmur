@@ -205,13 +205,10 @@ pub(crate) fn writes_frame(
             | StreamFrame::Artifact
             | StreamFrame::Text
             | StreamFrame::Thinking
+            | StreamFrame::ToolCallStarted
+            | StreamFrame::ToolCallProgress
             | StreamFrame::Gap
             | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
-            // An http driver returns a tool call only once its input is complete, so there is
-            // nothing earlier for it to report.
-            StreamFrame::ToolCallStarted | StreamFrame::ToolCallProgress => {
-                (true, true, &[TransportKind::Process])
-            }
             StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
                 (false, true, &TransportKind::ALL)
             }
@@ -1735,6 +1732,8 @@ mod tests {
                 "artifact",
                 "text",
                 "thinking",
+                "tool-call-started",
+                "tool-call-progress",
                 "gap",
                 "lagged",
                 "connection-ack",
@@ -1748,6 +1747,8 @@ mod tests {
                 "artifact",
                 "text",
                 "thinking",
+                "tool-call-started",
+                "tool-call-progress",
                 "gap",
                 "lagged",
                 "connection-ack",
@@ -1762,6 +1763,8 @@ mod tests {
                 "artifact",
                 "text",
                 "thinking",
+                "tool-call-started",
+                "tool-call-progress",
                 "gap",
                 "lagged",
                 "connection-ack",
@@ -1999,7 +2002,7 @@ mod tests {
                             "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
                             "required": false,
                             "params": {
-                                "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+                                "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
                             }
                         }
                     ]
@@ -2247,26 +2250,19 @@ mod tests {
 
     #[test]
     fn stream_frame_every_variant_is_listed() {
-        let listed: Vec<Vec<&str>> = TransportKind::ALL
-            .into_iter()
-            .map(|kind| {
-                served_frames(
-                    &TaskAcceptance::Single,
-                    TransportCapabilities {
-                        streams_text: true,
-                        kind,
-                    },
-                )
-            })
-            .collect();
-        for frame in StreamFrame::ALL {
-            assert!(
-                listed
-                    .iter()
-                    .any(|frames| frames.contains(&frame.wire_name())),
-                "{} is listed on no transport: {listed:?}",
-                frame.wire_name()
-            );
+        for kind in TransportKind::ALL {
+            let transport = TransportCapabilities {
+                streams_text: true,
+                kind,
+            };
+            let frames = served_frames(&TaskAcceptance::Single, transport);
+            for frame in StreamFrame::ALL {
+                assert!(
+                    frames.contains(&frame.wire_name()),
+                    "{} is never listed on {kind:?}: {frames:?}",
+                    frame.wire_name()
+                );
+            }
         }
     }
 
@@ -2498,7 +2494,7 @@ mod tests {
                             "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
                             "required": false,
                             "params": {
-                                "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+                                "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
                             }
                         }
                     ]
@@ -2555,7 +2551,7 @@ mod tests {
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
                           "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
                         { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
-                          "params": { "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
+                          "params": { "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
                     ]
                 },
                 "securitySchemes": {

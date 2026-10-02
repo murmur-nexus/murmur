@@ -83,7 +83,7 @@ section that explains it.
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
 | `E-RUN-028` | The running-capsule records under `~/.murmur/running/` could not be read | [E-RUN-028](#e-run-028) |
-| `E-RUN-029` | The `transport: process` driver does not export the process driver interface | [E-RUN-029](#e-run-029) |
+| `E-RUN-029` | A driver does not speak the driver interface this host serves | [E-RUN-029](#e-run-029) |
 | `E-RUN-030` | The `transport: http` inference driver exports the process driver interface | [E-RUN-030](#e-run-030) |
 | `E-RUN-032` | A process driver could not be loaded with no grants, or described itself unusably | [E-RUN-032](#e-run-032) |
 | `E-RUN-033` | A `transport: process` turn failed — the harness reported it, or the runtime ended it at the turn limit | [E-RUN-033](#e-run-033) |
@@ -559,12 +559,26 @@ The message ends with the path and the operating system's error.
 | `File exists` | A file is where the directory belongs |
 | `Permission denied` | The directory exists and this user may not list it |
 
-### E-RUN-029 — the process driver lacks the process interface { #e-run-029 }
+### E-RUN-029 — the driver does not speak the interface this host serves { #e-run-029 }
 
-A `transport: process` manifest names an artifact under `inference.driver` that does not export
-`murmur:driver/process@0.3.0`. `mur run` refuses at staging, before the driver runs. The runtime
-accepts one version of the interface, so a driver built against an earlier one — including one an
-older `murmur.lock` pins — is refused until a release built against `@0.3.0` is installed.
+`mur run` refuses at staging, before any driver runs. The runtime accepts one version of each
+driver interface, so a driver built against another one — including one an older `murmur.lock`
+pins — is refused until a release built against the served one is installed.
+
+| Driver | Refused when | Served interface |
+|---|---|---|
+| Every `runtime: driver` artifact the manifest declares, except a `transport: process` inference driver | It imports any `murmur:text` interface, or `murmur:stream/events` at another version | Imports [`murmur:stream/events@0.1.0`](wit-interfaces.md#stream-events) |
+| The `inference.driver` artifact of a `transport: process` capsule | It does not export the process interface | Exports `murmur:driver/process@0.3.0` |
+
+For a stream-interface refusal, the message names the artifact, every import the host does not
+serve and `murmur:stream/events@0.1.0`:
+
+```text
+error[E-RUN-029]: artifact 'my-http-driver@1.0.0' imports murmur:text/chunks@0.1.0, which this host does not serve; a driver must import murmur:stream/events@0.1.0 in its place
+  hint: pin a release of my-http-driver built against murmur:stream/events@0.1.0 in murmur.yaml and run `mur install`, or rebuild it against that interface
+```
+
+For a process driver:
 
 | The artifact exports | Message ends | Hint |
 |---|---|---|
@@ -598,7 +612,7 @@ no network and no Murmur host interface. `mur run` refuses at staging when the d
 The message ends with the reason; for an import, it names the interface.
 
 ```text
-error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:text/chunks@0.1.0`, but a matching implementation was not found in the linker
+error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:stream/events@0.1.0`, but a matching implementation was not found in the linker
   hint: the driver must export murmur:driver/process@0.3.0 and import nothing but WASI
 ```
 

@@ -655,6 +655,21 @@ pub enum RuntimeError {
         exported: Vec<String>,
     },
 
+    /// A `runtime: driver` artifact imports a stream interface this host does not serve: a
+    /// `murmur:text/*` instance, retired with no fallback, or a `murmur:stream/*` instance at
+    /// another version than `expected`. `imported` holds every such import.
+    #[error(
+        "artifact '{name}@{version}' imports {}, which this host does not serve; a driver must \
+         import {expected} in its place",
+        .imported.join(", ")
+    )]
+    DriverStreamInterfaceNotServed {
+        name: String,
+        version: String,
+        imported: Vec<String>,
+        expected: String,
+    },
+
     /// A process driver's `describe().required-env` names variables the manifest's
     /// `capabilities.env.allow` does not declare. `missing` is in the driver's order, each name
     /// once.

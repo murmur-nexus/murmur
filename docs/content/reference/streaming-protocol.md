@@ -156,8 +156,8 @@ in `capabilities.extensions` after the door and capsule extensions — see
 | [`artifact`](#event-artifact) | Always, on both transports | A2A `TaskArtifactUpdateEvent` |
 | [`text`](#event-text) | Always, on both transports | None — a murmur frame |
 | [`thinking`](#event-thinking) | Always, on both transports | None — a murmur frame |
-| [`tool-call-started`](#event-tool-call-started) | Only on `transport: process` | None — a murmur frame |
-| [`tool-call-progress`](#event-tool-call-progress) | Only on `transport: process` | None — a murmur frame |
+| [`tool-call-started`](#event-tool-call-started) | Always, on both transports | None — a murmur frame |
+| [`tool-call-progress`](#event-tool-call-progress) | Always, on both transports | None — a murmur frame |
 | [`gap`](#event-gap) | Always, on both transports | None — a murmur frame |
 | [`lagged`](#event-lagged) | Always, on both transports | None — a murmur frame |
 | [`connection-ack`](#event-connection-ack) | Always, on both transports | None — a murmur frame |
@@ -198,7 +198,9 @@ data: {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b
 
 A task writes the same frames whatever the capsule's [`inference.transport`](manifest.md#inference-config):
 the same types, the same keys and the same order for the same work, apart from the differences
-listed below. On a `transport: process`
+listed below. On a `transport: http` capsule, the `text`, `thinking`, `tool-call-started` and
+`tool-call-progress` frames come from the driver's
+[`murmur:stream/events`](wit-interfaces.md#stream-events) calls. On a `transport: process`
 capsule the frames come from the events its [process driver](manifest.md#process-driver) reads out
 of the harness:
 
@@ -218,7 +220,7 @@ A process task ends in the same [one final status](#one-final-status) as an http
 path out of its last attempt, including the ones a runtime diagnostic ends: the frame's
 `status.message` is that diagnostic, under the code [`mur` reports it as](diagnostics.md).
 
-The two transports' streams differ in four things, each because the harness, not this runtime,
+The two transports' streams differ in three things, each because the harness, not this runtime,
 ran the turn:
 
 | Difference | Why |
@@ -226,7 +228,6 @@ ran the turn:
 | `artifact.fence_source` is `null` on every frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
 | `artifact.exit_code` is `null` and `artifact.truncated` is `false` on every frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
 | A provider retry writes no frame on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
-| An http capsule writes no `tool-call-started` or `tool-call-progress` frame | An http driver returns a tool call only once its input is complete |
 
 ### Frame order within a task { #task-frame-order }
 
@@ -235,10 +236,11 @@ One attempt of a task writes its frames in this order:
 1. [`status`](#event-status) `working`, message `inference turn <n>`, at the start of each
    inference turn, before the driver is called.
 2. While the turn runs, [`thinking`](#event-thinking) and [`text`](#event-text) `"final":false`
-   frames, in the order they are produced. On a `transport: process` capsule, a
+   frames, in the order they are produced. A
    [`tool-call-started`](#event-tool-call-started) frame for each tool call the model begins
    writing, and that call's [`tool-call-progress`](#event-tool-call-progress) frames, come after
-   the turn's `working` status and before the call's `artifact`.
+   the turn's `working` status and before the call's `artifact`. On a `transport: http` capsule
+   they come before the turn's `"final":true` `text` frame of step 3.
 3. When the turn streamed text, one `text` `"final":true` frame with empty text once the driver
    returns.
 4. One [`artifact`](#event-artifact) per tool call, written when the call returns, in dispatch
@@ -393,7 +395,7 @@ A piece of the model's reply.
 
 | `final` | `text` | Written when |
 |---|---|---|
-| `false` | A chunk | A streaming driver, or a tool, emits a chunk through [`murmur:text/chunks`](wit-interfaces.md#text-chunks) |
+| `false` | A chunk | A streaming driver, or a tool, emits a chunk through [`murmur:stream/events`](wit-interfaces.md#stream-events) |
 | `true` | `""` | A streaming driver's inference call returned, or a [`transport: process`](#transports) harness reported the complete text of fragments it streamed. Marks the end of that turn's chunks |
 | `true` | The whole reply | An attempt completed with a non-empty reply and no chunk was emitted during its last inference turn |
 
@@ -408,7 +410,7 @@ A piece of the model's reply.
 ## `thinking` { #event-thinking }
 
 A piece of the model's reasoning, emitted by a streaming driver or a tool through
-[`murmur:text/chunks`](wit-interfaces.md#text-chunks).
+[`murmur:stream/events`](wit-interfaces.md#stream-events).
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|
@@ -425,8 +427,12 @@ A piece of the model's reasoning, emitted by a streaming driver or a tool throug
 ## `tool-call-started` { #event-tool-call-started }
 
 A tool call the model has begun writing, before its input is complete and before the tool runs.
-Written only by a [`transport: process`](#transports) capsule whose
-[process driver](wit-interfaces.md#process-tool-call-progress) reports calls as they are written.
+Written when the capsule's driver reports calls as they are written:
+
+| Transport | Source |
+|---|---|
+| `http` | The inference driver calls [`tool-call-started`](wit-interfaces.md#stream-events) |
+| `process` | The [process driver](wit-interfaces.md#process-tool-call-progress) sends the `tool-call-started` event |
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|
@@ -451,7 +457,10 @@ Written only by a [`transport: process`](#transports) capsule whose
 ## `tool-call-progress` { #event-tool-call-progress }
 
 How many bytes of a started call's input the model has written so far. Follows the call's
-[`tool-call-started`](#event-tool-call-started) frame.
+[`tool-call-started`](#event-tool-call-started) frame. On `transport: http` it comes from the
+driver's [`tool-call-input-bytes`](wit-interfaces.md#stream-events) calls; on `transport: process`,
+from the process driver's [`tool-call-progress`](wit-interfaces.md#process-tool-call-progress)
+events.
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|

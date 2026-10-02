@@ -41,6 +41,20 @@ fn previous_wasm() -> PathBuf {
     common::fixture_path("process-driver-v2/tool/process-driver-v2.wasm")
 }
 
+/// An http driver built against the retired `murmur:text@0.1.0`, frozen beside its README.
+fn text_stream_wasm() -> PathBuf {
+    common::fixture_path("streaming-driver-text/tool/streaming-driver.wasm")
+}
+
+/// An http driver built against `murmur:stream/events@0.1.0`.
+fn stream_events_wasm() -> PathBuf {
+    common::fixture_path("streaming-driver/tool/streaming-driver.wasm")
+}
+
+/// The manifest entry lines an http driver needs to stage without a credential.
+const KEYLESS_GATEWAY: &str =
+    "    gateway:\n      endpoint: \"http://127.0.0.1:9\"\n      keyless: true\n";
+
 /// The build whose `describe().reports-usage` is `false` and whose `parse` reads no `usage` line.
 fn no_usage_wasm() -> PathBuf {
     common::fixture_path("process-driver/tool/process-driver-no-usage.wasm")
@@ -265,6 +279,66 @@ fn process_driver_under_http_is_refused() {
     assert!(text.contains("E-RUN-030"), "{text}");
     assert!(text.contains("fixture-process-driver"), "{text}");
     assert!(!text.contains("E-RUN-025"), "{text}");
+}
+
+/// The `inference:` block of an http capsule whose driver is `name`.
+fn http_inference(name: &str) -> String {
+    format!("inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {name}\n")
+}
+
+/// An installed http driver built against `murmur:text`, which this host no longer serves, is
+/// refused at launch rather than failing on its first turn, and the hint names the fix.
+#[test]
+fn a_driver_built_against_murmur_text_is_refused_with_the_install_that_fixes_it() {
+    let name = "text-streaming-driver";
+    let capsule = Capsule::new(
+        name,
+        &text_stream_wasm(),
+        KEYLESS_GATEWAY,
+        "",
+        &http_inference(name),
+    );
+    let text = capsule.run_refused();
+    println!("{text}");
+    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains(&format!("{name}@{VERSION}")), "{text}");
+    assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
+    assert!(text.contains("murmur:stream/events@0.1.0"), "{text}");
+    assert!(text.contains("mur install"), "{text}");
+}
+
+/// Every declared driver is checked, not only the inference driver: a `switch_driver` target is
+/// dispatched through the same linker.
+#[test]
+fn a_declared_driver_that_is_not_the_inference_driver_is_refused_too() {
+    let inference_driver = "streaming-driver";
+    let second = "text-streaming-driver";
+    let capsule = Capsule::new(
+        inference_driver,
+        &stream_events_wasm(),
+        &format!(
+            "{KEYLESS_GATEWAY}  - name: {second}\n    version: {VERSION}\n    runtime: driver\n"
+        ),
+        "",
+        &http_inference(inference_driver),
+    );
+    let artifacts = TempDir::new().unwrap();
+    let artifact = common::create_driver_artifact_with_auth(
+        artifacts.path(),
+        second,
+        VERSION,
+        &text_stream_wasm(),
+        "",
+    );
+    common::publish_local(&capsule.home, &artifact).success();
+    let text = capsule.run_refused();
+    println!("{text}");
+    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains(&format!("{second}@{VERSION}")), "{text}");
+    assert!(!text.contains(&format!("'{inference_driver}@")), "{text}");
+    assert!(text.contains("murmur:text/chunks@0.1.0"), "{text}");
+    assert!(text.contains("murmur:stream/events@0.1.0"), "{text}");
+    assert!(text.contains("mur install"), "{text}");
 }
 
 /// `mur install` never reads `inference_auth:`, so a process driver, which declares none,
