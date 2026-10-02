@@ -192,10 +192,11 @@ A 200 response confirms the capsule is running:
     "extensions": [
       {
         "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+          "peerTasks": false
         }
       },
       {

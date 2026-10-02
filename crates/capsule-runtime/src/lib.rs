@@ -55,6 +55,7 @@ pub mod origin;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
 pub mod peer_handoff;
+pub(crate) mod peer_tasks;
 pub mod plan;
 pub mod precompile;
 pub mod process_driver;

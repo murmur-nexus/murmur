@@ -1025,6 +1025,44 @@ mod tests {
         }
     }
 
+    /// A delegated task carries no origin claim, so the child records it as `event` and a child
+    /// that does not consent to peer tasks still takes it — while the same door refuses a
+    /// peer-origin message. Delegation needs no `exports.peer_tasks`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delegated_task_reaches_a_child_that_refuses_peer_tasks() {
+        let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(false).await;
+        let url = format!("http://{addr}");
+        let delivered = tokio::task::spawn_blocking(move || {
+            deliver_task(&url, None, "dlg_0000000000000001", &request())
+        })
+        .await
+        .unwrap()
+        .expect("the child takes the delegated task");
+        assert!(delivered.starts_with("tsk_"), "{delivered}");
+        let incoming = task_rx
+            .recv()
+            .await
+            .expect("the task reached the child's loop");
+        assert_eq!(
+            incoming.provenance.origin(),
+            crate::origin::TaskOrigin::Event
+        );
+
+        let refused = crate::outgoing::send_a2a_message(
+            &addr,
+            crate::outgoing::OutgoingMessage {
+                message_id: "msg_peer".to_string(),
+                context_id: None,
+                text: "from a peer".to_string(),
+            },
+            None,
+            None,
+        )
+        .await
+        .expect_err("the same door refuses a peer message");
+        assert!(refused.contains("403 peer_not_accepted"), "{refused}");
+    }
+
     /// A plane that was never told this capsule's own address cannot start a delegation: the
     /// child would run and post its outcome nowhere. Refused before the daemon is asked, so no
     /// child directory and no `POST /spawn` exist to clean up.

@@ -1150,6 +1150,7 @@ mod tests {
                 &crate::types::CapabilityPolicy::default(),
                 &murmur_artifact::TaskAcceptance::Single,
                 crate::identity::DeclaredPlanes::default(),
+                false,
                 crate::identity::TransportCapabilities {
                     streams_text: true,
                     kind: crate::identity::TransportKind::Http,

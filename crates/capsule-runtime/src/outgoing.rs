@@ -70,6 +70,9 @@ pub(crate) async fn send_a2a_message(
         .map_err(|e| format!("failed to write request to {peer_url}: {e}"))?;
 
     let raw = read_raw_response(BufReader::new(stream), peer_url).await?;
+    if !(200..300).contains(&raw.status) {
+        return Err(refused_message(peer_url, &raw));
+    }
 
     let response: serde_json::Value = serde_json::from_slice(&raw.body)
         .map_err(|e| format!("failed to parse response from {peer_url}: {e}"))?;
@@ -84,6 +87,27 @@ pub(crate) async fn send_a2a_message(
 
     serde_json::from_value(result.clone())
         .map_err(|e| format!("failed to parse A2A task from {peer_url}: {e}"))
+}
+
+/// What a non-2xx answer to [`send_a2a_message`] is reported as: the status, and the receiver's
+/// own `error` code and `message` when its body is a JSON object carrying them, so a guest reads
+/// why the peer refused rather than a bare status.
+fn refused_message(peer_url: &str, raw: &RawHttpResponse) -> String {
+    let body: Option<serde_json::Value> = serde_json::from_slice(&raw.body).ok();
+    let field = |name: &str| {
+        body.as_ref()
+            .and_then(|body| body.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let status = match field("error") {
+        Some(code) => format!("{} {code}", raw.status),
+        None => raw.status.to_string(),
+    };
+    match field("message") {
+        Some(message) => format!("peer at {peer_url} refused the message ({status}): {message}"),
+        None => format!("peer at {peer_url} refused the message ({status})"),
+    }
 }
 
 pub(crate) fn parse_host_port(peer_url: &str) -> Result<String, String> {
@@ -306,6 +330,58 @@ mod tests {
             .await
             .expect("peer should answer with a task");
         server.await.expect("capture task should not panic")
+    }
+
+    fn hello() -> OutgoingMessage {
+        OutgoingMessage {
+            message_id: "msg_1".to_string(),
+            context_id: None,
+            text: "hello".to_string(),
+        }
+    }
+
+    /// A door that does not consent answers this runtime's peer message with `403`, and the
+    /// sender reports the status and the receiver's own reason rather than a bare code.
+    #[tokio::test]
+    async fn a_refused_peer_message_names_the_status_and_the_receivers_reason() {
+        let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(false).await;
+        let error = send_a2a_message(&addr, hello(), None, None)
+            .await
+            .expect_err("a door that does not consent refuses the message");
+        assert_eq!(
+            error,
+            format!(
+                "peer at {addr} refused the message (403 peer_not_accepted): this capsule does \
+                 not accept tasks from peers"
+            )
+        );
+        assert!(task_rx.try_recv().is_err(), "nothing reached the loop");
+    }
+
+    /// The same door, consenting, takes the message as a task.
+    #[tokio::test]
+    async fn a_consenting_door_takes_the_peer_message() {
+        let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(true).await;
+        let task = send_a2a_message(&addr, hello(), None, None)
+            .await
+            .expect("a consenting door takes the message");
+        assert_eq!(task.status.state, crate::a2a::TaskState::Submitted);
+        let incoming = task_rx.recv().await.expect("the task reached the loop");
+        assert_eq!(incoming.provenance.origin(), TaskOrigin::Peer);
+    }
+
+    /// A non-2xx answer whose body is not the JSON shape still names the status.
+    #[test]
+    fn a_refusal_without_a_json_reason_names_the_status_alone() {
+        let raw = RawHttpResponse {
+            status: 502,
+            headers: Vec::new(),
+            body: b"bad gateway".to_vec(),
+        };
+        assert_eq!(
+            refused_message("localhost:1", &raw),
+            "peer at localhost:1 refused the message (502)"
+        );
     }
 
     /// The sending runtime stamps the class of its own current task, and the guest has no say:

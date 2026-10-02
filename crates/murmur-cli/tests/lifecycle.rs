@@ -138,7 +138,7 @@ fn stage_agent(
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
-            exports: None,
+            exports: runtime_manifest.exports.clone(),
             control: None,
             door_authentication: None,
             spawn_grant: None,
@@ -419,6 +419,7 @@ fn lifecycle_queue_runs_the_peer_lane_before_the_background_lane() {
         std::time::Duration::from_secs(2),
     );
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    common::consent_to_peer_tasks(&manifest_path);
 
     let staged = stage_agent(
         &home,
@@ -874,6 +875,7 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
         std::time::Duration::from_secs(2),
     );
     let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+    common::consent_to_peer_tasks(&manifest_path);
 
     let staged = stage_agent(
         &home,
@@ -1474,6 +1476,7 @@ fn lifecycle_a_blank_untrusted_message_is_never_sent_to_the_model() {
     // One response is scripted so that a request would be recorded rather than refused.
     let server = end_turn_server("an answer to nothing");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    common::consent_to_peer_tasks(&manifest_path);
 
     let staged = stage_agent(&home, &manifest_path, None, None);
     let trace_path = staged.workdir.join("trace.jsonl");

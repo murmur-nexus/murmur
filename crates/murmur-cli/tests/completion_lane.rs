@@ -229,6 +229,7 @@ fn a_completion_waits_behind_everything_anyone_is_waiting_for() {
         Duration::from_secs(2),
     );
     let (home, manifest_path) = queue_sleep_project(&server.endpoint);
+    common::consent_to_peer_tasks(&manifest_path);
     let staged = stage(&home, &manifest_path);
     fs::write(staged.workdir.join("task.md"), "the person's task").unwrap();
     let running = launch(staged);
