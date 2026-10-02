@@ -112,6 +112,7 @@ section that explains it.
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
+| `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -1586,6 +1587,25 @@ holds. The primary's credential is what the launch needs, so the launch goes on:
 
 Set the credential and restart the capsule to make the choice available. A credential supplied at
 run time goes in [`control.secrets`](manifest.md#field-control) instead of the environment.
+
+### W-RUN-004 — a malformed `input_schema` { #w-run-004 }
+
+```text
+[capsule-runtime] warning[W-RUN-004]: the tool 'my-tool' declares an input_schema whose `required` is not an array of strings, so its calls are dispatched without the required-field check (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-004)
+```
+
+A tool's [`input_schema`](manifest.md#input-schema) cannot be read where the runtime checks a
+call's required fields. The tool stays callable and its calls run unchecked; the warning prints the
+first time the tool is called in a session, and not again.
+
+| The message says the schema's | Means |
+|---|---|
+| `root is not a JSON object` | The schema is an array, a string, a number or `null` rather than `{...}` |
+| `` `required` is not an array of strings `` | `required` is a string, an object or `null`, or one of its entries is not a string |
+
+Fix the schema in the tool's own `murmur.yaml`: `required` is a JSON array of property names. A
+field the tool supplies a default for belongs out of `required` — a listed field is refused when it
+is missing.
 
 ---
 

@@ -498,6 +498,18 @@ struct CallDeniedEvent {
     reason: String,
 }
 
+/// A tool call was refused before it ran because its input lacked a field the tool's
+/// `input_schema` requires. A `tool_call` line with `status: "error"` sits beside it on both
+/// transports; this record is the one that names the missing fields under every capture mode.
+///
+/// Only the fields its `steps` row reads; `turn`, `tool_call_id` and `reason` are on the record
+/// too, and the tree places the row under its turn by `parent_id`.
+#[derive(Debug, Deserialize)]
+struct ToolInputRefusedEvent {
+    tool_name: String,
+    missing: Vec<String>,
+}
+
 /// A spend ceiling refused a driver call before it was sent. There is no `inference` line for a
 /// refused call.
 #[derive(Debug, Deserialize)]
@@ -766,6 +778,7 @@ enum TraceEvent {
     TaskFailed(TaskFailedEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
+    ToolInputRefused(ToolInputRefusedEvent),
     HookDispatchError(HookDispatchErrorEvent),
     Retention(RetentionEvent),
     ResourceList(OutcomeEvent),
@@ -1873,6 +1886,9 @@ fn compute_metrics(
             // The dispatch line carries nothing the terminal line does not; it exists so
             // `mur trace steps` can show when a step was handed to a worker and what it waited on.
             TraceEvent::PlanStepStart(_) => {}
+            // Rendered by `mur trace steps` under its turn; the accompanying failed `tool_call`
+            // is what this summary counts.
+            TraceEvent::ToolInputRefused(_) => {}
             TraceEvent::PlanStep(e) => {
                 // A plan step's declared read shares the agent loop's resource history, on the
                 // same terms and through the same resolver. Only a step that succeeded took part:
@@ -3397,6 +3413,12 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.target,
             e.hook_name
         ),
+        TraceEvent::ToolInputRefused(e) => format!(
+            "{}{}  missing {}",
+            kind("tool_input_refused"),
+            e.tool_name,
+            e.missing.join(", ")
+        ),
         TraceEvent::SpendCeilingReached(e) => format!(
             "{}{}  used {} of {}  needs {}{}",
             kind("spend_ceiling_reached"),
@@ -4571,6 +4593,22 @@ mod tests {
         assert_eq!(
             row(line),
             "tools_refreshed compaction  +aaa-late-skill  -old-tool  turn 3"
+        );
+    }
+
+    /// A `tool_input_refused` line parses into its own variant, and its row names the tool and
+    /// every field the call lacked.
+    #[test]
+    fn tool_input_refused_renders_a_steps_row() {
+        let line = r#"{"event_type":"tool_input_refused","event_id":"evt_6","parent_id":"evt_2","session_id":"s","timestamp":6,"turn":1,"tool_name":"murmur-tool-editor","tool_call_id":null,"missing":["operation","dest_path"],"reason":"murmur-tool-editor: missing required fields \"operation\", \"dest_path\""}"#;
+        let TraceEvent::ToolInputRefused(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+        else {
+            panic!("a tool_input_refused line parses as ToolInputRefused");
+        };
+        assert_eq!(e.missing, ["operation", "dest_path"]);
+        assert_eq!(
+            row(line),
+            "tool_input_refused murmur-tool-editor  missing operation, dest_path"
         );
     }
 

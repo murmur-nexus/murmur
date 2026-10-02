@@ -93,6 +93,10 @@ struct Capsule<'a> {
     hooks: Vec<Hook<'a>>,
     /// `true` for the native [`TOOL`], which is published and declared when it is.
     marker_tool: bool,
+    /// The name the native marker tool is published under, [`TOOL`] unless a scenario names it.
+    tool_name: &'a str,
+    /// The native marker tool's `input_schema`, as single-line JSON.
+    tool_schema: Option<&'a str>,
     /// `true` for the prebuilt [`ECHO_TOOL`].
     echo_tool: bool,
     read_only: &'a [&'a str],
@@ -111,6 +115,8 @@ impl<'a> Capsule<'a> {
         Self {
             hooks: Vec::new(),
             marker_tool: true,
+            tool_name: TOOL,
+            tool_schema: None,
             echo_tool: false,
             read_only: &[],
             shell_allow: &[],
@@ -234,7 +240,8 @@ fn create_manifest(project: &Path, capsule: &Capsule<'_>, harness: &Path) -> Pat
     let mut tool_yaml = String::new();
     if capsule.marker_tool {
         tool_yaml.push_str(&format!(
-            "  - name: {TOOL}\n    version: 0.1.0\n    runtime: tool\n"
+            "  - name: {}\n    version: 0.1.0\n    runtime: tool\n",
+            capsule.tool_name
         ));
     }
     if capsule.echo_tool {
@@ -319,11 +326,11 @@ fn run_session(capsule: &Capsule<'_>) -> Session {
     if capsule.marker_tool {
         let artifact = common::create_native_artifact(
             artifact_dir.path(),
-            TOOL,
+            capsule.tool_name,
             "0.1.0",
             &marker_tool_script(),
             Some("Fixture marker tool"),
-            None,
+            capsule.tool_schema,
         );
         common::publish_local(&home, &artifact).success();
     }
@@ -501,7 +508,7 @@ fn an_allowing_hook_leaves_a_bridged_call_alone() {
 /// What the decision point costs a bridged call, as a per-call figure a build summary can name.
 ///
 /// The same harness, the same number of bridged calls, run once with a `commit_policy: deny`
-/// hook armed and once with nothing that can refuse a call at all. Nothing is asserted about the
+/// hook armed and once with only the required-field check, which every bridged call crosses. Nothing is asserted about the
 /// number: it is a measurement, and a machine under load would make an assertion on it a flake.
 #[test]
 fn the_gated_path_reports_its_per_call_cost() {
@@ -596,4 +603,110 @@ fn a_hook_that_never_returns_refuses_and_the_run_ends() {
         "the harness ended on its own terminal event:\n{}",
         session.trace_raw
     );
+}
+
+// ── The required-field check on the bridge ───────────────────────────────────
+
+/// The editor's schema: `operation` and `dest_path` are required, `content` is not.
+const EDITOR: &str = "murmur-tool-editor";
+const EDITOR_SCHEMA: &str = r#"{"type":"object","properties":{"operation":{"type":"string","enum":["write_file","replace_in_file"]},"dest_path":{"type":"string"},"content":{"type":"string"}},"required":["operation","dest_path"]}"#;
+
+/// A capsule with no hook and no `read_only` whose harness calls the editor fixture once.
+fn calling_the_editor(args: &str) -> Capsule<'_> {
+    Capsule {
+        tool_name: EDITOR,
+        tool_schema: Some(EDITOR_SCHEMA),
+        call_tool: Some(EDITOR),
+        call_args: Some(args),
+        ..Capsule::calling_the_marker_tool()
+    }
+}
+
+/// A bridged call missing `operation` is refused before the tool runs, in a capsule with neither
+/// a policy hook nor a `read_only` path: the harness is handed the refusal as a failed result,
+/// and the trace pairs one `tool_input_refused` with the harness's own failed `tool_call`.
+#[test]
+fn a_bridged_call_missing_a_required_field_is_refused() {
+    if common::skip_without_host_support("a_bridged_call_missing_a_required_field_is_refused") {
+        return;
+    }
+    let session = run_session(&calling_the_editor(
+        r#"{"dest_path":"notes.txt","content":"hello"}"#,
+    ));
+
+    assert!(
+        !session.marker_exists(),
+        "the tool never ran:\n{}",
+        session.trace_raw
+    );
+    assert!(!session.workdir.join("notes.txt").exists());
+    assert!(
+        !session.transcript().contains(TOOL_OUTPUT),
+        "the tool's own output appears nowhere in the run"
+    );
+
+    let answer = session.harness_answer();
+    assert!(
+        answer.contains("\"isError\":true"),
+        "the bridge answered with a failure: {answer}"
+    );
+    assert!(
+        answer.contains(r#"missing required field \"operation\""#),
+        "names the missing field: {answer}"
+    );
+
+    let refusals = session.events("tool_input_refused");
+    assert_eq!(refusals.len(), 1, "{}", session.trace_raw);
+    assert_eq!(refusals[0]["tool_name"], EDITOR);
+    assert!(
+        refusals[0]["tool_call_id"].is_null(),
+        "a bridged call carries no provider id: {}",
+        refusals[0]
+    );
+    assert_eq!(refusals[0]["missing"], serde_json::json!(["operation"]));
+    assert!(refusals[0]["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with(r#"murmur-tool-editor: missing required field "operation""#));
+
+    let calls: Vec<_> = session
+        .events("tool_call")
+        .into_iter()
+        .filter(|e| e["tool_name"] == EDITOR)
+        .collect();
+    assert_eq!(calls.len(), 1, "{}", session.trace_raw);
+    assert_eq!(calls[0]["status"], "error");
+
+    assert!(session.events("call_denied").is_empty());
+    let exits = session.events("harness_exit");
+    assert_eq!(exits.len(), 1, "{}", session.trace_raw);
+    assert_eq!(exits[0]["cause"], "terminal", "{}", session.trace_raw);
+}
+
+/// A bridged call carrying every required field runs exactly as before.
+#[test]
+fn a_bridged_call_with_every_required_field_runs() {
+    if common::skip_without_host_support("a_bridged_call_with_every_required_field_runs") {
+        return;
+    }
+    let session = run_session(&calling_the_editor(
+        r#"{"operation":"write_file","dest_path":"notes.txt","content":"hello"}"#,
+    ));
+
+    assert!(
+        session.marker_exists(),
+        "the tool ran:\n{}",
+        session.trace_raw
+    );
+    let answer = session.harness_answer();
+    assert!(answer.contains(TOOL_OUTPUT), "{answer}");
+    assert!(answer.contains("\"isError\":false"), "{answer}");
+    assert!(session.events("tool_input_refused").is_empty());
+    let calls: Vec<_> = session
+        .events("tool_call")
+        .into_iter()
+        .filter(|e| e["tool_name"] == EDITOR)
+        .collect();
+    assert_eq!(calls.len(), 1, "{}", session.trace_raw);
+    assert_eq!(calls[0]["status"], "ok");
 }

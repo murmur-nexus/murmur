@@ -18,6 +18,7 @@ The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publis
 | `implementation` | `wasm \| native` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. |
 | `execution` | `wasm \| native \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime` and `implementation`. Case-insensitive. An unrecognized value is a parse error. |
 | `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
+| `input_schema` | string (JSON) or map | no | A `runtime: tool` artifact's parameters, as a JSON Schema object. Offered to the model as the tool's input; every name in its top-level `required` must be present in a call's input or the call is refused before the tool runs. Default: an object with no properties, and no field required. `input` is an accepted older spelling. See [`input_schema`](#input-schema). |
 | `upstream_auth` | map | no | How the artifact's upstream takes its key: `header` and a `value` template with `{key}` exactly once. Read only when the capsule's entry for this artifact declares [`gateway:`](#artifact-gateway); absent or malformed then refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025). See [`upstream_auth:` block](#upstream-auth). |
 
 A hook artifact's own manifest carries three more fields — see
@@ -65,6 +66,57 @@ When the block is read and refused:
 | Capsule entry declares no `gateway:` | The block is never read |
 | Capsule entry declares `gateway:`, block absent or malformed | `mur run` refuses with [`E-RUN-025`](diagnostics.md#e-run-025) |
 | Artifact manifest declares `inference_auth:`, the block's former name, with or without `upstream_auth:` | `mur build` refuses with [`E-BLD-004`](diagnostics.md#e-bld-004); an artifact already packed refuses the launch with [`E-RUN-025`](diagnostics.md#e-run-025) when its entry declares `gateway:` |
+
+### `input_schema` { #input-schema }
+
+The JSON Schema object a tool offers the model as its parameters. Written as a YAML string holding
+JSON, or as a YAML mapping:
+
+```yaml
+input_schema: |
+  {"type":"object","properties":{"operation":{"type":"string","enum":["write_file","replace_in_file"]},"dest_path":{"type":"string"},"content":{"type":"string"}},"required":["operation","dest_path"]}
+```
+
+**Required fields are enforced.** Before a call to the tool runs, the runtime checks that every
+name in the schema's top-level `required` is a key of the call's input. A call missing one or more
+of them is refused without running the tool — on `transport: http`, on `transport: process` and in
+a [plan](#field-plan) `tool` step alike. The model is handed a failed tool result:
+
+```text
+murmur-tool-editor: missing required field "operation"
+
+This call did not run. murmur-tool-editor's input_schema requires: "operation", "dest_path". Call it again with every one of them present. Only the presence of required fields is checked before a call runs — not their types, allowed values or nested contents.
+```
+
+With several fields missing, the first line names all of them: `missing required fields
+"operation", "dest_path"`. The trace records a
+[`tool_input_refused`](observability-schemas.md#tool-input-refused) beside a `tool_call` with
+`status: "error"`; a plan step records the same text in its `plan_step` record's `error` instead. A
+refusal is an ordinary tool result: the turn continues, and every turn the model spends retrying
+counts against `inference.max_turns`.
+
+| Checked | Not checked |
+|---|---|
+| Each name in the top-level `required` is a key of the input object | Value types, `enum` values, nested objects, `$ref` |
+| An input that is not a JSON object is missing every required name | A `null` or empty value — the key is there, so the field is present |
+
+| Path | Order of the pre-dispatch checks |
+|---|---|
+| A direct call, either transport | Required fields, then [`capabilities.filesystem.read_only`](#read-only-paths), then an `on-tool-call` policy hook. A call missing a field never reaches the hook |
+| A plan `tool` step | `read_only` and the policy hook when the step is reached, then required fields when it is invoked |
+
+There is no opt-out. A field the tool supplies a default for belongs out of `required`.
+
+| Schema | Calls |
+|---|---|
+| No `input_schema`, no `required`, or `required: []` | Not checked |
+| A string that is not JSON | Not checked |
+| A `runtime: skill` artifact's schema | Not checked |
+| Root is not a JSON object | Not checked; [`W-RUN-004`](diagnostics.md#w-run-004) once per tool per session |
+| `required` is not an array of strings | Not checked; [`W-RUN-004`](diagnostics.md#w-run-004) once per tool per session |
+
+The schema is read when each call is made, so a tool pulled into the session at runtime is checked
+against its own schema from its first call.
 
 ---
 
@@ -1745,7 +1797,7 @@ readable. See [`protected_path_denied`](observability-schemas.md#protected-path-
 **What a tool declares about its own input.** A tool artifact says which of its inputs are
 filesystem destinations, which are payload it only stores, and which destinations it derives from
 an input rather than reading whole — with JSON Schema's `format` keyword on its own properties and
-one keyword at the root of its own `input_schema`:
+one keyword at the root of its own [`input_schema`](#input-schema):
 
 | Declaration | Written on | Effect |
 |---|---|---|

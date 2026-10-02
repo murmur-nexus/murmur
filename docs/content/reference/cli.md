@@ -1816,6 +1816,23 @@ What sits beside that row depends on the transport:
 | [`transport: http`](manifest.md#transport-http) | The `call_denied` row alone. Nothing ran, so there is no `tool_call` or `shell` row |
 | [`transport: process`](manifest.md#transport-process) | The `call_denied` row, and a `tool_call` row marked `✗`. The tool still did not run; the harness reports the refusal it was handed as its own failed call, and that report is recorded |
 
+A call refused because its input lacked a field the tool's
+[`input_schema`](manifest.md#input-schema) requires renders as a `tool_input_refused` row naming
+every missing field, followed by a `tool_call` row marked `✗` on both transports:
+
+```text
+  turn 0  tool_call  murmur-tool-editor
+    tool_input_refused murmur-tool-editor  missing operation
+    tool_call  murmur-tool-editor  0ms  ✗
+```
+
+| Transport | Where the `tool_call` row comes from |
+|---|---|
+| [`transport: http`](manifest.md#transport-http) | The runtime records the refused call as a failed tool call |
+| [`transport: process`](manifest.md#transport-process) | The harness reports the refusal it was handed as its own failed call |
+
+No `call_denied` row sits beside it: the policy hook is not asked about a call missing a field.
+
 A failed attempt renders as a `task_failed` row under its task, naming the
 [cause](observability-schemas.md#task-failed) and the first 120 characters of the reason:
 

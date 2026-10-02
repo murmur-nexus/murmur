@@ -1474,8 +1474,15 @@ pub(crate) async fn run_agent_loop(
                     // decided what this capsule may do, and immediately before the call is
                     // dispatched. The same gate is handed to the dispatch below, so a plan step
                     // this call submits reaches it too rather than entering underneath.
+                    //
+                    // The required-field check comes first. Its refusal takes the failed-dispatch
+                    // arm below, so the call is observed and traced as a failed `tool_call` like
+                    // any other dispatch failure, beside its own `tool_input_refused` record.
                     let mut gate = CallGate::new(hooks, trace, workdir, turn_u32);
-                    if gate.gates(store_state) {
+                    let refused = gate
+                        .check_required_fields(store_state, &tool_name, Some(&tool_call_id), &input)
+                        .await?;
+                    if refused.is_none() && gate.gates(store_state) {
                         // Resolved exactly once, for both checks.
                         let resolved = store_state.resolve_call(
                             &tool_name,
@@ -1501,17 +1508,22 @@ pub(crate) async fn run_agent_loop(
                     // than being derived at the push below: one push serves both arms, and only
                     // the arm knows whether what it produced is a fenced tool result, a skill
                     // result read off disk, or the runtime's own dispatch-failure message.
-                    let (is_error, text, fence_source) = match store_state
-                        .dispatch_agent_tool_async(
-                            &tool_name,
-                            ToolInput {
-                                data: Some(input_json.clone()),
-                                log_path: None,
-                            },
-                            Some(&mut gate),
-                        )
-                        .await
-                    {
+                    let dispatched = match refused {
+                        Some(refusal) => Err(refusal),
+                        None => {
+                            store_state
+                                .dispatch_agent_tool_async(
+                                    &tool_name,
+                                    ToolInput {
+                                        data: Some(input_json.clone()),
+                                        log_path: None,
+                                    },
+                                    Some(&mut gate),
+                                )
+                                .await
+                        }
+                    };
+                    let (is_error, text, fence_source) = match dispatched {
                         Ok(mut outcome) => {
                             // Taken before the result is consumed below; acted on at the end of
                             // this arm so the failed call is traced and hooked like any other
@@ -2252,12 +2264,21 @@ async fn flush_hook_inference_records(
 }
 
 /// The session's pre-dispatch decision point, in one place so every route to a call reaches the
-/// same two refusals in the same order.
+/// same three refusals in the same order.
 ///
-/// The manifest's `capabilities.filesystem.read_only` check is asked first and its refusal is
-/// final: a policy hook can only narrow further, so a call the manifest already refuses costs no
-/// hook dispatch. Neither check can grant anything — the one effect either has is that the call
-/// does not happen.
+/// 1. [`Self::check_required_fields`]: the call's input carries every name its tool's
+///    `input_schema` lists in `required`. Runs on every call, whether or not [`Self::gates`].
+/// 2. The manifest's `capabilities.filesystem.read_only` check, inside [`Self::check`].
+/// 3. An `on-tool-call` or `on-shell` policy hook, inside [`Self::check`].
+///
+/// Each refusal is final. A call missing a field will not run whatever the later checks say, so
+/// asking a hook about it would be a dispatch for nothing, and a policy denial in its place would
+/// hide the one message the model can act on; likewise a policy hook can only narrow what the
+/// manifest allows, so a call the manifest refuses costs no hook dispatch. None of the three can
+/// grant anything — the one effect any has is that the call does not happen.
+///
+/// A plan step runs its own `PlanRequest::Gate` before the step is invoked, so there the
+/// required-field check follows checks 2 and 3 rather than preceding them.
 ///
 /// Not private to the agent loop, because a plan step is the same call one indirection removed:
 /// `submit-plan` runs `tool` and `shell` steps through this session's own executors, so those
@@ -2284,13 +2305,45 @@ impl<'a> CallGate<'a> {
         }
     }
 
-    /// Whether anything here can refuse a call at all.
+    /// Whether [`Self::check`] can refuse a call at all.
     ///
     /// A single boolean pair, so a capsule with neither a policy hook nor a `read_only`
     /// declaration resolves no call and dispatches nothing extra — on the agent loop's path and
-    /// on a plan's alike.
+    /// on a plan's alike. [`Self::check_required_fields`] is outside it and runs regardless.
     pub(crate) fn gates(&self, store: &CapsuleStoreState) -> bool {
         self.hooks.gates_calls() || store.has_protected_paths()
+    }
+
+    /// The first check: `Some(text)` refuses a call whose `input` lacks a name the tool's
+    /// `input_schema` requires, and `text` is what the caller hands the model in place of the
+    /// call's result.
+    ///
+    /// Writes one `tool_input_refused` record on a refusal and nothing otherwise. Unlike
+    /// [`Self::check`], the caller still records the refused call as a failed `tool_call`, the
+    /// way it records any call whose dispatch failed. `tool_call_id` is the provider's id, `None`
+    /// for a call bridged from a harness, which carries none. `Err` is a trace write that failed,
+    /// fatal for the same reason as in [`Self::check`].
+    pub(crate) async fn check_required_fields(
+        &mut self,
+        store: &CapsuleStoreState,
+        tool_name: &str,
+        tool_call_id: Option<&str>,
+        input: &Value,
+    ) -> Result<Option<String>, RuntimeError> {
+        let Some(refusal) = store.check_required_fields(tool_name, input) else {
+            return Ok(None);
+        };
+        self.trace
+            .write_tool_input_refused(
+                self.turn,
+                tool_name,
+                tool_call_id,
+                &refusal.missing,
+                &refusal.text,
+            )
+            .await
+            .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+        Ok(Some(refusal.text))
     }
 
     /// `Some(text)` is a refusal, and `text` is what the caller hands the model — or writes into

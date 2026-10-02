@@ -1286,6 +1286,27 @@ struct CallDeniedEvent {
     reason: String,
 }
 
+/// A tool call was refused before it ran because its input lacked a name the tool's
+/// `input_schema` lists in `required`. Written in every capture mode: under the default `meta`
+/// the accompanying `tool_call` record carries no `output`, so this is where the reason lands.
+#[derive(Serialize)]
+struct ToolInputRefusedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    tool_name: String,
+    /// The provider's id for the call, or `null` where the call arrived without one — every
+    /// call bridged from a `transport: process` harness.
+    tool_call_id: Option<String>,
+    /// The required names the input lacked, in the schema's declared order.
+    missing: Vec<String>,
+    /// The refusal text the model was handed.
+    reason: String,
+}
+
 /// The manifest's own read-only rule refused a call before it ran. Distinct from
 /// [`CallDeniedEvent`] because it names a different authority and a different subject: no hook was
 /// asked, and what it carries is the path, the declared rule and the evidence that identified the
@@ -2685,6 +2706,33 @@ impl TraceWriter {
             event: event.to_string(),
             hook_name: hook_name.to_string(),
             target: target.to_string(),
+            reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that a call was refused because its input lacked a field its tool's `input_schema`
+    /// requires. A `tool_call` record with `status: "error"` follows it on both transports, so
+    /// unlike [`Self::write_call_denied`] this is not the only line the call leaves. An empty
+    /// `tool_call_id` records as `null`, as in [`Self::write_tool_call`].
+    pub(crate) async fn write_tool_input_refused(
+        &mut self,
+        turn: u32,
+        tool_name: &str,
+        tool_call_id: Option<&str>,
+        missing: &[String],
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = ToolInputRefusedEvent {
+            event_type: "tool_input_refused",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            tool_name: tool_name.to_string(),
+            tool_call_id: tool_call_id.filter(|id| !id.is_empty()).map(str::to_string),
+            missing: missing.to_vec(),
             reason: reason.to_string(),
         };
         self.write_event(&event).await
@@ -5943,6 +5991,49 @@ mod tests {
             match expected {
                 Some(id) => assert_eq!(e["tool_call_id"], id, "given={given:?}"),
                 None => assert!(e["tool_call_id"].is_null(), "given={given:?}"),
+            }
+        }
+    }
+
+    /// `tool_input_refused` carries the tool, its call id (`null` when absent or empty), the
+    /// missing names and the reason, and is written under every capture mode alike.
+    #[tokio::test]
+    async fn tool_input_refused_records_its_fields_in_every_capture_mode() {
+        for capture in [
+            TraceCapture::None,
+            TraceCapture::Meta,
+            TraceCapture::Content,
+        ] {
+            for (given, expected) in [
+                (Some("toolu_1"), Some("toolu_1")),
+                (Some(""), None),
+                (None, None),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut w = make_writer_with_opts(dir.path(), capture).await;
+                w.write_tool_input_refused(
+                    2,
+                    "murmur-tool-editor",
+                    given,
+                    &["operation".to_string(), "dest_path".to_string()],
+                    "murmur-tool-editor: missing required fields",
+                )
+                .await
+                .unwrap();
+                w.flush().await.unwrap();
+                let e = &read_events(dir.path())[0];
+                assert_eq!(e["event_type"], "tool_input_refused", "{capture:?}");
+                assert!(e["event_id"].is_string());
+                assert!(e["session_id"].is_string());
+                assert!(e["timestamp"].is_u64());
+                assert_eq!(e["turn"], 2);
+                assert_eq!(e["tool_name"], "murmur-tool-editor");
+                match expected {
+                    Some(id) => assert_eq!(e["tool_call_id"], id, "given={given:?}"),
+                    None => assert!(e["tool_call_id"].is_null(), "given={given:?}"),
+                }
+                assert_eq!(e["missing"], serde_json::json!(["operation", "dest_path"]));
+                assert_eq!(e["reason"], "murmur-tool-editor: missing required fields");
             }
         }
     }
