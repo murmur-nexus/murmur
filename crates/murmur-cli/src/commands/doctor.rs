@@ -30,13 +30,13 @@ use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
+use crate::env_requirements::{
+    env_requirements_report, EnvRequirementsReport, EnvironmentNames, RequiredVariable,
+    UninspectableReason,
+};
 use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
     E_RUN_019,
-};
-use crate::formation::{
-    formation_env_report, EnvironmentNames, FormationEnvReport, RequiredVariable,
-    UninspectableReason,
 };
 
 /// Whether an installed artifact's payload can run on the host doctor is checking for.
@@ -546,35 +546,36 @@ fn report_roost_daemon() {
     }
 }
 
-/// What `run_doctor` pushes into its two accumulators after the formation block has printed.
-struct FormationFindings {
+/// What `run_doctor` pushes into its two accumulators after the `Environment requirements` block
+/// has printed.
+struct EnvRequirementsFindings {
     /// Findings that make doctor exit non-zero.
     fixes: Vec<String>,
     /// Findings printed as a `Fix:` line that leave the exit code alone.
     warnings: Vec<String>,
 }
 
-/// Print the `Formation environment` block: every variable the `capabilities.spawn.allow` closure
-/// declares, every variable the project manifest references and this workspace does not hold,
-/// every declaration `mur-roost` will refuse, every capsule the walk could not read, and every
-/// edge that closes a cycle.
+/// Print the `Environment requirements` block: every variable the `capabilities.spawn.allow`
+/// closure declares, every variable the project manifest references and this workspace does not
+/// hold, every declaration `mur-roost` will refuse, every capsule the walk could not read, and
+/// every edge that closes a cycle.
 ///
 /// Names only. No value is read into the report or printed, and nothing is launched.
 ///
 /// The `.env` is read for its names alone, so the block reports set/unset against the same
 /// environment `mur run` starts a session with. An unparseable `.env` is reported and the walk
-/// still runs against the process environment: an operator asking what a formation needs should
-/// get the list even when one line of one file is malformed.
+/// still runs against the process environment: an operator asking what a spawn closure needs
+/// should get the list even when one line of one file is malformed.
 ///
 /// Prints nothing, and finds nothing, for a capsule that delegates to nobody and holds every
-/// variable it references — [`formation_env_report`] is what decides there is nothing to say.
-fn report_formation_env(
+/// variable it references — [`env_requirements_report`] is what decides there is nothing to say.
+fn report_env_requirements(
     runtime_manifest: &RuntimeManifest,
     root_manifest_yaml: &str,
     project_root: &Path,
     lock: Option<&MurmurLock>,
-) -> FormationFindings {
-    let mut findings = FormationFindings {
+) -> EnvRequirementsFindings {
+    let mut findings = EnvRequirementsFindings {
         fixes: Vec::new(),
         warnings: Vec::new(),
     };
@@ -582,7 +583,7 @@ fn report_formation_env(
     // The project root is the workspace root here: `find_project_root` returns the nearest
     // ancestor holding a `murmur.yaml`, which is the same directory a run reads its `.env` from.
     let (environment, dotenv_error) = EnvironmentNames::for_workspace(project_root);
-    let Some(report) = formation_env_report(
+    let Some(report) = env_requirements_report(
         runtime_manifest,
         root_manifest_yaml,
         project_root,
@@ -592,13 +593,13 @@ fn report_formation_env(
         return findings;
     };
 
-    println!("Formation environment");
+    println!("Environment requirements");
     println!(
         "  capsules: {}",
         report
             .inspected
             .iter()
-            .map(crate::formation::CapsuleCoordinate::reference)
+            .map(crate::env_requirements::CapsuleCoordinate::reference)
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -925,7 +926,7 @@ fn render_sources(variable: &RequiredVariable) -> String {
         .join(", ")
 }
 
-fn print_variables(report: &FormationEnvReport, findings: &mut FormationFindings) {
+fn print_variables(report: &EnvRequirementsReport, findings: &mut EnvRequirementsFindings) {
     if report.variables.is_empty() {
         return;
     }
@@ -983,7 +984,7 @@ fn print_variables(report: &FormationEnvReport, findings: &mut FormationFindings
     );
 }
 
-fn print_refusals(report: &FormationEnvReport, findings: &mut FormationFindings) {
+fn print_refusals(report: &EnvRequirementsReport, findings: &mut EnvRequirementsFindings) {
     if report.refusals.is_empty() {
         return;
     }
@@ -1007,7 +1008,7 @@ fn print_refusals(report: &FormationEnvReport, findings: &mut FormationFindings)
     }
 
     eprintln!(
-        "[mur doctor] error[{E_CAP_015}]: {count} declaration{s} in this formation exceed{verb} \
+        "[mur doctor] error[{E_CAP_015}]: {count} declaration{s} in the spawn closure exceed{verb} \
          the envelope the capsule spawning it holds, and mur-roost refuses a spawn that widens \
          one.\n  \
          A child may declare no more than its parent does on {axis}.",
@@ -1018,13 +1019,13 @@ fn print_refusals(report: &FormationEnvReport, findings: &mut FormationFindings)
     );
 }
 
-fn print_uninspectable(report: &FormationEnvReport, findings: &mut FormationFindings) {
+fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequirementsFindings) {
     if report.uninspectable.is_empty() {
         return;
     }
 
     println!(
-        "  could not inspect {} of {} capsules in this formation:",
+        "  could not inspect {} of {} capsules in the spawn closure:",
         report.uninspectable.len(),
         report.reached()
     );
@@ -1054,7 +1055,7 @@ fn print_uninspectable(report: &FormationEnvReport, findings: &mut FormationFind
     }
 
     eprintln!(
-        "[mur doctor] warning[{W_REG_002}]: {count} capsule{s} in this formation could not be \
+        "[mur doctor] warning[{W_REG_002}]: {count} capsule{s} in the spawn closure could not be \
          inspected, so what {pronoun} declares is absent from the report above: {names}\n  \
          The walk not being able to read a capsule is not evidence that a run fails, so this \
          does not change the exit code.\n  \
@@ -1319,7 +1320,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // exactly as before. A lockfile that exists but cannot be read is a hard failure
     // before any checklist line prints — same as a malformed murmur.yaml.
     //
-    // Read here rather than beside the stores below because the formation walk pins a child
+    // Read here rather than beside the stores below because the spawn-closure walk pins a child
     // capsule's version from it, and reading `murmur.lock` twice could report two answers.
     let lock = match read_lockfile(&project_root.join("murmur.lock")) {
         Ok(lock) => Some(lock),
@@ -1329,14 +1330,14 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
     // What the whole delegation closure needs from the operator's environment, and what the
     // project manifest itself references and this workspace does not hold. Ungated: a capsule
-    // that delegates to nobody has no formation, but it can still reference a variable nothing
-    // sets, and that is the one thing this block has to say about it.
+    // that delegates to nobody has no `spawn.allow` to walk, but it can still reference a
+    // variable nothing sets, and that is the one thing this block has to say about it.
     //
     // Unlike the E-CAP-004/005/006 blocks above, this one fails rather than warns. Those predict
     // a refusal of the root capsule, which a run surfaces within seconds; these predict one at
     // depth, after the parent has already run. Where the walk knows the run cannot succeed it
     // fails; where it does not know — a capsule it could not read — it warns.
-    let formation_findings = report_formation_env(
+    let env_requirements_findings = report_env_requirements(
         &runtime_manifest,
         &manifest_yaml,
         &project_root,
@@ -1374,8 +1375,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // the inventory adds no warning-tier `Fix:` for the same artifact.
     let mut interface_failed: HashSet<String> = HashSet::new();
 
-    fixes.extend(formation_findings.fixes);
-    warnings.extend(formation_findings.warnings);
+    fixes.extend(env_requirements_findings.fixes);
+    warnings.extend(env_requirements_findings.warnings);
 
     for artifact in &runtime_manifest.artifacts {
         let request = ArtifactRequest {

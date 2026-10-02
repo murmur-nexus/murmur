@@ -23,8 +23,9 @@ use tempfile::TempDir;
 /// A capsule declaring `capabilities.spawn.allow`, the one declaration that makes the daemon a
 /// dependency of the run and doctor's roost report fire.
 ///
-/// The capsule it names is installed, and declares nothing, so the formation block that fires on
-/// the same declaration finds nothing to report and the roost warning is the only finding.
+/// The capsule it names is installed, and declares nothing, so the `Environment requirements`
+/// block that fires on the same declaration finds nothing to report and the roost warning is the
+/// only finding.
 fn create_delegating_project(home: &TempDir, project_dir: &Path) {
     install_capsule(
         &global_store(home),
@@ -169,11 +170,11 @@ fn platform() -> &'static str {
     murmur_artifact::current_platform()
 }
 
-// ── Formation environment fixture helpers ────────────────────────────────────
+// ── Environment requirements fixture helpers ─────────────────────────────────
 
 /// Install a capsule into `store_root` whose packed `murmur.yaml` is exactly `manifest_yaml`.
 ///
-/// `mur doctor`'s formation walk reads that one file and nothing else, so no payload is needed.
+/// `mur doctor`'s spawn-closure walk reads that one file and nothing else, so no payload is needed.
 /// Returns the sha256 of the stored bytes, which a lockfile fixture has to pin.
 fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: &str) -> String {
     use std::io::Write;
@@ -238,9 +239,9 @@ fn mur_doctor_with_env(
     command.assert()
 }
 
-/// A three-level formation: a root declaring three variables and spawning `worker`, which
+/// A three-level spawn closure: a root declaring three variables and spawning `worker`, which
 /// declares two and spawns `deep-worker`, which declares one.
-fn create_three_level_formation(home: &TempDir, project_dir: &Path) {
+fn create_three_level_closure(home: &TempDir, project_dir: &Path) {
     let global = global_store(home);
     install_capsule(
         &global,
@@ -1117,13 +1118,13 @@ fn doctor_says_nothing_about_roost_for_a_capsule_that_cannot_delegate() {
     assert!(!stdout.contains("mur-roost"), "{stdout}");
 }
 
-// ── Formation environment ────────────────────────────────────────────────────
+// ── Environment requirements ─────────────────────────────────────────────────
 
 #[test]
-fn formation_env_reports_the_whole_closure_three_levels_deep() {
+fn env_requirements_reports_the_whole_closure_three_levels_deep() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    create_three_level_formation(&home, project.path());
+    create_three_level_closure(&home, project.path());
 
     mur_doctor_with_env(
         &home,
@@ -1135,7 +1136,7 @@ fn formation_env_reports_the_whole_closure_three_levels_deep() {
         ],
     )
     .success()
-    .stdout(predicate::str::contains("Formation environment"))
+    .stdout(predicate::str::contains("Environment requirements"))
     .stdout(predicate::str::contains(
         "capsules: root-capsule@0.0.1, worker@0.1.0, deep-worker@0.2.0",
     ))
@@ -1150,10 +1151,10 @@ fn formation_env_reports_the_whole_closure_three_levels_deep() {
 }
 
 #[test]
-fn formation_env_fails_on_a_variable_nothing_sets() {
+fn env_requirements_fails_on_a_variable_nothing_sets() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    create_three_level_formation(&home, project.path());
+    create_three_level_closure(&home, project.path());
 
     mur_doctor_with_env(
         &home,
@@ -1173,10 +1174,10 @@ fn formation_env_fails_on_a_variable_nothing_sets() {
 }
 
 #[test]
-fn formation_env_never_prints_a_variables_value() {
+fn env_requirements_never_prints_a_variables_value() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    create_three_level_formation(&home, project.path());
+    create_three_level_closure(&home, project.path());
 
     let output = mur_doctor_with_env(
         &home,
@@ -1204,7 +1205,7 @@ fn formation_env_never_prints_a_variables_value() {
 }
 
 #[test]
-fn formation_env_names_a_declaration_roost_will_refuse_on_both_sides() {
+fn env_requirements_names_a_declaration_roost_will_refuse_on_both_sides() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     install_capsule(
@@ -1235,11 +1236,14 @@ fn formation_env_names_a_declaration_roost_will_refuse_on_both_sides() {
     ))
     .stdout(predicate::str::contains("Fix: root-capsule@0.0.1"))
     .stdout(predicate::str::contains("worker@0.1.0"))
-    .stderr(predicate::str::contains("E-CAP-015"));
+    .stderr(predicate::str::contains(
+        "error[E-CAP-015]: 1 declaration in the spawn closure exceeds the envelope the capsule \
+         spawning it holds, and mur-roost refuses a spawn that widens one.",
+    ));
 }
 
 #[test]
-fn formation_env_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
+fn env_requirements_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let global = global_store(&home);
@@ -1282,7 +1286,7 @@ fn formation_env_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
 }
 
 #[test]
-fn formation_env_counts_and_names_a_capsule_it_could_not_inspect() {
+fn env_requirements_counts_and_names_a_capsule_it_could_not_inspect() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     install_capsule(
@@ -1301,18 +1305,129 @@ fn formation_env_counts_and_names_a_capsule_it_could_not_inspect() {
     mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
         .success()
         .stdout(predicate::str::contains(
-            "could not inspect 1 of 3 capsules in this formation",
+            "could not inspect 1 of 3 capsules in the spawn closure",
         ))
         .stdout(predicate::str::contains(
             "- ghost-worker (declared by root-capsule@0.0.1): not installed in the project or \
              global store",
         ))
         .stdout(predicate::str::contains("Fix: ghost-worker:"))
-        .stderr(predicate::str::contains("W-REG-002"));
+        .stderr(predicate::str::contains(
+            "warning[W-REG-002]: 1 capsule in the spawn closure could not be inspected, so what it \
+             declares is absent from the report above: ghost-worker",
+        ));
+}
+
+/// The word no line of the `Environment requirements` block may print: a group of capsules
+/// running together under one `formation_id` is a different thing from a closure nothing launches.
+const FORMATION_WORD: &str = "formation";
+
+/// Whether `text` holds [`FORMATION_WORD`] as a whole word, in any case. `mur doctor` prints
+/// "information", which is a different word.
+fn says_formation(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    lowered.match_indices(FORMATION_WORD).any(|(start, word)| {
+        let before = lowered[..start].chars().next_back();
+        let after = lowered[start + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// Checked across fixtures that between them light every line the block can print.
+#[test]
+fn env_requirements_output_never_says_formation() {
+    assert!(says_formation(&format!(
+        "in this {}:",
+        FORMATION_WORD.to_uppercase()
+    )));
+    assert!(!says_formation("For more information, try '--help'."));
+
+    // The three-level closure with one variable nothing sets: the capsules line, the variables
+    // list with both marks, E-CAP-014 and its `Fix:` line.
+    let unset_home = tempfile::tempdir().unwrap();
+    let unset_project = tempfile::tempdir().unwrap();
+    create_three_level_closure(&unset_home, unset_project.path());
+    let unset = mur_doctor_with_env(
+        &unset_home,
+        unset_project.path(),
+        &[
+            ("ROOT_KEY", Some("x")),
+            ("WORKER_KEY", Some("x")),
+            ("DEEP_KEY", None),
+        ],
+    )
+    .failure()
+    .get_output()
+    .clone();
+
+    // A child widening its parent's `env.allow` (E-CAP-015), a `spawn.allow` naming a capsule no
+    // store holds (W-REG-002), an edge back to the root (the cycle line) and a `.env` that does
+    // not parse (the unreadable-`.env` line).
+    let refused_home = tempfile::tempdir().unwrap();
+    let refused_project = tempfile::tempdir().unwrap();
+    let global = global_store(&refused_home);
+    install_capsule(
+        &global,
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY, WORKER_ONLY]\n  \
+         spawn:\n    allow: [root-capsule]\n",
+    );
+    install_capsule(
+        &global,
+        "root-capsule",
+        "0.0.1",
+        "name: root-capsule\nversion: 0.0.1\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  \
+         spawn:\n    allow: [worker]\n",
+    );
+    fs::write(
+        refused_project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker, ghost-worker]\n",
+    )
+    .unwrap();
+    fs::write(refused_project.path().join(".env"), "no-equals-here\n").unwrap();
+    let refused = mur_doctor_with_env(
+        &refused_home,
+        refused_project.path(),
+        &[("ROOT_KEY", Some("x")), ("WORKER_ONLY", Some("x"))],
+    )
+    .failure()
+    .get_output()
+    .clone();
+
+    let lit = format!("{}{}", streams(&unset), streams(&refused));
+    for line in [
+        "Environment requirements",
+        "capsules: root-capsule@0.0.1",
+        "\u{2713}  ROOT_KEY",
+        "\u{2717}  DEEP_KEY",
+        "error[E-CAP-014]",
+        "Fix: export DEEP_KEY",
+        "declarations mur-roost will refuse:",
+        "error[E-CAP-015]",
+        "could not inspect 1 of 3 capsules in the spawn closure:",
+        "- ghost-worker (declared by root-capsule@0.0.1)",
+        "warning[W-REG-002]",
+        "spawn.allow cycle: worker@0.1.0 \u{2192} root-capsule@0.0.1",
+        "/.env could not be read",
+    ] {
+        assert!(lit.contains(line), "{line} not printed in:\n{lit}");
+    }
+
+    for output in [&unset, &refused] {
+        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !says_formation(&text),
+                "{stream} says {FORMATION_WORD}:\n{text}"
+            );
+        }
+    }
 }
 
 #[test]
-fn a_capsule_declaring_no_spawn_allow_gets_no_formation_output_at_all() {
+fn a_capsule_declaring_no_spawn_allow_gets_no_env_requirements_output_at_all() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     fs::write(
@@ -1334,7 +1449,7 @@ fn a_capsule_declaring_no_spawn_allow_gets_no_formation_output_at_all() {
         String::from_utf8_lossy(&output.stderr)
     );
     for absent in [
-        "Formation environment",
+        "Environment requirements",
         "E-CAP-014",
         "E-CAP-015",
         "W-REG-002",
@@ -1347,7 +1462,7 @@ fn a_capsule_declaring_no_spawn_allow_gets_no_formation_output_at_all() {
 fn the_workspace_dotenv_counts_a_variable_as_set() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
-    create_three_level_formation(&home, project.path());
+    create_three_level_closure(&home, project.path());
     fs::write(project.path().join(".env"), "DEEP_KEY=from-dotenv\n").unwrap();
 
     let output = mur_doctor_with_env(
@@ -1400,7 +1515,7 @@ fn two_installed_versions_with_nothing_pinning_which_is_uninspectable() {
     mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
         .success()
         .stdout(predicate::str::contains(
-            "could not inspect 1 of 2 capsules in this formation",
+            "could not inspect 1 of 2 capsules in the spawn closure",
         ))
         .stdout(predicate::str::contains(
             "2 versions installed (0.1.0, 0.2.0) and nothing pins which one a run would get",
@@ -1500,7 +1615,7 @@ fn an_unresolvable_reference_in_the_project_manifest_is_reported_not_refused() {
 
     let output = mur_doctor_with_env(&home, project.path(), &[("SOLO_PROVIDER_KEY", None)])
         .failure()
-        .stdout(predicate::str::contains("Formation environment"))
+        .stdout(predicate::str::contains("Environment requirements"))
         .stdout(predicate::str::contains("capsules: solo@0.0.1"))
         .stdout(predicate::str::contains("\u{2717}  SOLO_PROVIDER_KEY"))
         .stdout(predicate::str::contains("unset"))
@@ -1626,7 +1741,7 @@ fn a_referenced_variables_value_is_never_printed() {
 
 /// One list, one heading, one error, however many manifest keys named the variables in it.
 #[test]
-fn the_roots_own_reference_joins_the_formations_variable_list() {
+fn the_roots_own_reference_joins_the_closures_variable_list() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     install_capsule(
@@ -1667,7 +1782,7 @@ fn the_roots_own_reference_joins_the_formations_variable_list() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert_eq!(
-        stdout.matches("Formation environment").count(),
+        stdout.matches("Environment requirements").count(),
         1,
         "one heading, got:\n{stdout}"
     );
@@ -1703,7 +1818,7 @@ fn a_literal_api_key_is_not_mistaken_for_a_reference() {
         .clone();
 
     let streams = streams(&output);
-    for absent in ["Formation environment", "E-CAP-014", "not-a-reference"] {
+    for absent in ["Environment requirements", "E-CAP-014", "not-a-reference"] {
         assert!(!streams.contains(absent), "{absent} in:\n{streams}");
     }
 }

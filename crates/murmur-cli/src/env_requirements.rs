@@ -1,4 +1,4 @@
-//! What a whole formation — a capsule and the transitive closure of its
+//! What a spawn closure — a capsule and the transitive closure of its
 //! `capabilities.spawn.allow` — needs from the operator's environment, computed offline from
 //! manifests alone.
 //!
@@ -18,7 +18,7 @@ use murmur_artifact::{
 use crate::registry_client::FallbackRegistry;
 
 /// Everything the walk found, ready to render.
-pub(crate) struct FormationEnvReport {
+pub(crate) struct EnvRequirementsReport {
     /// Every capsule whose declarations were read, root first, in first-visit order.
     pub(crate) inspected: Vec<CapsuleCoordinate>,
     /// Every variable this report names, sorted by name, one entry per name: what the closure
@@ -33,9 +33,9 @@ pub(crate) struct FormationEnvReport {
     pub(crate) cycles: Vec<CycleEdge>,
 }
 
-impl FormationEnvReport {
+impl EnvRequirementsReport {
     /// How many capsules the walk reached at all — the denominator of "could not inspect N of M
-    /// capsules in this formation". A capsule it could not open was still reached.
+    /// capsules in the spawn closure". A capsule it could not open was still reached.
     pub(crate) fn reached(&self) -> usize {
         self.inspected.len() + self.uninspectable.len()
     }
@@ -54,7 +54,7 @@ impl CapsuleCoordinate {
     }
 }
 
-/// One variable name the formation needs, and whether a run from this workspace would find it.
+/// One variable name the spawn closure needs, and whether a run from this workspace would find it.
 pub(crate) struct RequiredVariable {
     pub(crate) name: String,
     /// Every capsule that needs this name and the manifest key that names it, first-visit order,
@@ -212,18 +212,18 @@ impl EnvironmentNames {
 /// `None` when there is nothing to print: the root declares no `capabilities.spawn.allow` and
 /// every variable it references is already set. A root that delegates to nobody and references
 /// nothing gets no block at all, so its `capabilities.env.allow` names are never reported — the
-/// walk is what reports those, and a capsule with no formation has no walk.
+/// walk is what reports those, and a capsule with no `spawn.allow` has no walk.
 ///
 /// `root_manifest_yaml` is the text `root` was parsed from. References are read from the text
 /// rather than the parsed manifest because a parse that does not resolve secrets keeps no record
 /// of what was referenced.
-pub(crate) fn formation_env_report(
+pub(crate) fn env_requirements_report(
     root: &RuntimeManifest,
     root_manifest_yaml: &str,
     project_dir: &Path,
     lock: Option<&MurmurLock>,
     environment: &EnvironmentNames,
-) -> Option<FormationEnvReport> {
+) -> Option<EnvRequirementsReport> {
     // A set reference is already satisfied, so it contributes no line and no finding — which is
     // what keeps a fully-provisioned capsule's report to what the walk alone found.
     // A `control.secrets` name is supplied by a controller at run time and is never read from the
@@ -250,7 +250,7 @@ pub(crate) fn formation_env_report(
 
         let mut variables = Vec::new();
         merge_references(&mut variables, &unset_references, &root_ref);
-        return Some(FormationEnvReport {
+        return Some(EnvRequirementsReport {
             inspected: vec![CapsuleCoordinate {
                 name: root.name.clone(),
                 version: root.version.clone(),
@@ -262,7 +262,7 @@ pub(crate) fn formation_env_report(
         });
     }
 
-    let mut report = walk_formation_env(root, project_dir, lock, environment);
+    let mut report = walk_spawn_closure(root, project_dir, lock, environment);
     merge_references(&mut report.variables, &unset_references, &root_ref);
     Some(report)
 }
@@ -306,17 +306,17 @@ fn merge_references(
     variables.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
-/// Walk the `spawn.allow` closure from `root` and report what the whole formation declares.
+/// Walk the `spawn.allow` closure from `root` and report what every capsule in it declares.
 ///
 /// Depth-first, through the same stores and store precedence a run resolves an installed capsule
-/// from. Every failure is a finding rather than an error: a formation the walk cannot fully read
+/// from. Every failure is a finding rather than an error: a closure the walk cannot fully read
 /// is reported as partially read, never silently under-reported.
-pub(crate) fn walk_formation_env(
+pub(crate) fn walk_spawn_closure(
     root: &RuntimeManifest,
     project_dir: &Path,
     lock: Option<&MurmurLock>,
     environment: &EnvironmentNames,
-) -> FormationEnvReport {
+) -> EnvRequirementsReport {
     let mut walk = Walk {
         project_registry: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
         // Absent only on a host with no home directory, where nothing is installed globally
@@ -595,9 +595,9 @@ impl Walk<'_> {
         });
     }
 
-    fn finish(mut self) -> FormationEnvReport {
+    fn finish(mut self) -> EnvRequirementsReport {
         self.variables.sort_by(|a, b| a.name.cmp(&b.name));
-        FormationEnvReport {
+        EnvRequirementsReport {
             inspected: self.inspected,
             variables: self.variables,
             refusals: self.refusals,
@@ -698,7 +698,7 @@ mod tests {
             "name: fmt-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [A_KEY, B_KEY]\n  spawn:\n    allow: [fmt-worker]\n",
         );
         let environment = EnvironmentNames::from_names(["A_KEY", "B_KEY"]);
-        let report = walk_formation_env(&root, project.path(), None, &environment);
+        let report = walk_spawn_closure(&root, project.path(), None, &environment);
 
         let capsules: Vec<String> = report
             .inspected
@@ -751,7 +751,7 @@ mod tests {
         let root = root_manifest(
             "name: cyc-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [cyc-worker]\n",
         );
-        let report = walk_formation_env(
+        let report = walk_spawn_closure(
             &root,
             project.path(),
             None,
@@ -784,7 +784,7 @@ mod tests {
         let root = root_manifest(
             "name: ref-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [ref-worker]\n",
         );
-        let report = walk_formation_env(
+        let report = walk_spawn_closure(
             &root,
             project.path(),
             None,
@@ -819,7 +819,7 @@ mod tests {
         let root = root_manifest(
             "name: amb-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    allow: [amb-worker]\n",
         );
-        let report = walk_formation_env(
+        let report = walk_spawn_closure(
             &root,
             project.path(),
             None,
@@ -845,7 +845,7 @@ mod tests {
         let root = root_manifest(
             "name: ghost-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  spawn:\n    allow: [no-such-capsule-4c7e05b1]\n",
         );
-        let report = walk_formation_env(
+        let report = walk_spawn_closure(
             &root,
             project.path(),
             None,
@@ -888,7 +888,7 @@ mod tests {
         let root = root_manifest(
             "name: torn-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  spawn:\n    allow: [torn-worker]\n",
         );
-        let report = walk_formation_env(
+        let report = walk_spawn_closure(
             &root,
             project.path(),
             None,
@@ -915,7 +915,7 @@ mod tests {
         let root = root_manifest(
             "name: infer-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY_4C7E05B1]\n  spawn:\n    allow: [infer-worker]\n",
         );
-        let report = walk_formation_env(
+        let report = walk_spawn_closure(
             &root,
             project.path(),
             None,
@@ -940,7 +940,7 @@ mod tests {
         let project = TempDir::new().unwrap();
         let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      keyless: true\n  - name: card-api\n    version: 0.1.0\n    runtime: tool\n    gateway:\n      endpoint: https://cards.example.com\n      api_key: ${CARD_TOKEN}\ncontrol:\n  secrets: [CARD_TOKEN]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
-        assert!(formation_env_report(
+        assert!(env_requirements_report(
             &root,
             yaml,
             project.path(),
@@ -950,7 +950,7 @@ mod tests {
         .is_none());
     }
 
-    /// A capsule that delegates to nobody has no formation to walk, so the only thing this
+    /// A capsule that delegates to nobody has no `spawn.allow` to walk, so the only thing this
     /// report can say about it is which of its own references this workspace does not hold.
     #[test]
     fn a_solo_capsule_reports_its_unset_reference_and_nothing_else() {
@@ -958,7 +958,7 @@ mod tests {
         let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
-        let report = formation_env_report(
+        let report = env_requirements_report(
             &root,
             yaml,
             project.path(),
@@ -995,7 +995,7 @@ mod tests {
         let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
-        assert!(formation_env_report(
+        assert!(env_requirements_report(
             &root,
             yaml,
             project.path(),
@@ -1013,7 +1013,7 @@ mod tests {
         let yaml = "name: solo\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SOLO_REFERENCE_4C7E05B1}\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str(yaml).unwrap();
 
-        assert!(formation_env_report(
+        assert!(env_requirements_report(
             &root,
             yaml,
             project.path(),
@@ -1024,7 +1024,7 @@ mod tests {
         .is_none());
 
         // A credential under another name answers nothing.
-        let report = formation_env_report(
+        let report = env_requirements_report(
             &root,
             yaml,
             project.path(),
@@ -1049,7 +1049,7 @@ mod tests {
         let yaml = "name: src-root\nversion: 0.0.1\nartifacts:\n  - name: murmur-driver-anthropic\n    version: 0.1.0\n    runtime: driver\n    gateway:\n      endpoint: http://127.0.0.1:8080\n      api_key: ${SHARED_KEY_4C7E05B1}\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n  spawn:\n    allow: [src-worker]\ninference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
         let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
 
-        let report = formation_env_report(
+        let report = env_requirements_report(
             &root,
             yaml,
             project.path(),
