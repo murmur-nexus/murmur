@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -2547,6 +2547,7 @@ fn launch(
                         installed_generation: 0,
                         declared_artifacts,
                         removed_artifacts: HashSet::new(),
+                        required_schema_warned: Mutex::new(BTreeSet::new()),
                         session_id: session_id.clone(),
                         pending_a2a_events: Vec::new(),
                         pending_artifact_pulls: Vec::new(),
@@ -3550,6 +3551,7 @@ fn launch(
         installed_artifacts: staged.installed_artifacts,
         installed_generation: 0,
         removed_artifacts: HashSet::new(),
+        required_schema_warned: Mutex::new(BTreeSet::new()),
         session_id: staged.session_id.clone(),
         pending_a2a_events: Vec::new(),
         pending_artifact_pulls: Vec::new(),
@@ -5255,6 +5257,33 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     }
 }
 
+/// Whether `name` is entering `warned` now, so its `W-RUN-004` is due. A poisoned memo counts as
+/// already warned: a lost warning costs a line of stderr, a panic here would cost the session.
+fn first_malformed_schema_warning(warned: &Mutex<BTreeSet<String>>, name: &str) -> bool {
+    match warned.lock() {
+        Ok(mut warned) => warned.insert(name.to_string()),
+        Err(_) => false,
+    }
+}
+
+/// The `W-RUN-004` line for the tool `name`, whose schema is malformed for the reason `why`.
+fn malformed_schema_warning(name: &str, why: crate::required_fields::MalformedSchema) -> String {
+    format!(
+        "[capsule-runtime] warning[{code}]: the tool '{name}' declares an input_schema whose \
+         {why}, so its calls are dispatched without the required-field check ({link})",
+        code = murmur_artifact::W_RUN_004,
+        why = why.describe(),
+        link = murmur_artifact::runtime_warning_link(murmur_artifact::W_RUN_004),
+    )
+}
+
+/// A call [`CapsuleStoreState::check_required_fields`] refused: the required names its input
+/// lacks, in the schema's declared order, and the text the model is handed for it.
+pub(crate) struct RequiredFieldRefusal {
+    pub(crate) missing: Vec<String>,
+    pub(crate) text: String,
+}
+
 pub(crate) struct CapsuleStoreState {
     /// Resource limiter for this store, registered via `Store::limiter`. Also the record of
     /// any growth request it denied, which `classify_guest_failure` reads to tell a
@@ -5333,6 +5362,9 @@ pub(crate) struct CapsuleStoreState {
     /// reinstalled. `invoke()` and the agent-loop dispatch refuse a call to one with
     /// [`crate::artifact_removal::called_after_removal`].
     pub(crate) removed_artifacts: HashSet<String>,
+    /// The tool names whose malformed `input_schema` has already been named in `W-RUN-004` this
+    /// session, so [`Self::check_required_fields`] names each one once rather than on every call.
+    pub(crate) required_schema_warned: Mutex<BTreeSet<String>>,
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
     pub(crate) pending_a2a_events: Vec<PendingA2aSend>,
@@ -6687,6 +6719,75 @@ impl CapsuleStoreState {
             .check_call(&self.accessible_workdir, call, &self.tool_annotations)
     }
 
+    /// Whether `input` carries every name the called tool's `input_schema` lists in its
+    /// top-level `required`, read from `<workdir>/tools/<name>/murmur.yaml` at call time.
+    ///
+    /// `Some` is a refusal: the call must not be dispatched, and the refusal's `text` is what the
+    /// model — or a plan step's `error` — is handed instead. `None` means the call proceeds to the
+    /// session's other checks and to dispatch exactly as it would have without this one, which is
+    /// every case where the tool cannot be judged: a name that is not a plain directory name
+    /// (model-chosen, so it never steers a read outside `tools/`), a removed artifact, a missing
+    /// or unparsable manifest, a skill, driver or hook, a manifest with no schema, a schema with
+    /// no `required`, and a malformed schema — the last named once per tool in `W-RUN-004`.
+    ///
+    /// The schema is read per call rather than from staging, so a tool `manage.pull()` added or
+    /// replaced mid-session is judged by its staged schema from its next call — before
+    /// `inference.tool_refresh` has necessarily put that schema in the inventory the model sees.
+    pub(crate) fn check_required_fields(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Option<RequiredFieldRefusal> {
+        use crate::required_fields::{
+            missing_fields, refusal_text, required_declaration, RequiredDeclaration,
+        };
+
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || self.removed_artifacts.contains(name)
+        {
+            return None;
+        }
+        let manifest_path = self
+            .workdir
+            .join("tools")
+            .join(name)
+            .join(PACKED_MANIFEST_ENTRY);
+        let manifest: Value =
+            serde_yaml::from_str(&fs::read_to_string(manifest_path).ok()?).ok()?;
+        if !matches!(
+            crate::agent::inventory::staged_manifest_runtime(&manifest),
+            ArtifactRuntime::Tool
+        ) {
+            return None;
+        }
+        let schema = crate::tool_annotations::declared_input_schema(&manifest)?;
+        let required = match required_declaration(&schema) {
+            RequiredDeclaration::Nothing => return None,
+            RequiredDeclaration::Malformed(why) => {
+                self.warn_malformed_schema_once(name, why);
+                return None;
+            }
+            RequiredDeclaration::Fields(required) => required,
+        };
+        let missing = missing_fields(&required, input);
+        if missing.is_empty() {
+            return None;
+        }
+        let text = refusal_text(name, &missing, &required);
+        Some(RequiredFieldRefusal { missing, text })
+    }
+
+    /// Print `W-RUN-004` for `name` unless this session already has.
+    fn warn_malformed_schema_once(&self, name: &str, why: crate::required_fields::MalformedSchema) {
+        if first_malformed_schema_warning(&self.required_schema_warned, name) {
+            crate::runtime_err!("{}", malformed_schema_warning(name, why));
+        }
+    }
+
     /// Dispatch a tool call from the agent loop: native binary, shell, or WASM, and fence
     /// whatever comes back.
     ///
@@ -7516,6 +7617,17 @@ impl CapsuleStoreState {
                 let _ = reply.send(verdict);
             }
             PlanRequest::Invoke(name, input, reply) => {
+                // The step's `Err` lands in its `plan_step` record's `error`, written in every
+                // capture mode, so the refusal needs no `tool_input_refused` record of its own.
+                let fields = input
+                    .data
+                    .as_deref()
+                    .and_then(|data| serde_json::from_str(data).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(refusal) = self.check_required_fields(&name, &fields) {
+                    let _ = reply.send(Err(refusal.text));
+                    return;
+                }
                 // Unfenced deliberately: this result becomes one field of the plan report, and
                 // `dispatch_agent_tool_async` fences that report once on its way to the model.
                 // Fencing here would wrap every step's output a second time.
@@ -12064,6 +12176,7 @@ inference:
             installed_generation: 0,
             declared_artifacts: HashSet::new(),
             removed_artifacts: HashSet::new(),
+            required_schema_warned: Mutex::new(BTreeSet::new()),
             session_id: "ses_test".to_string(),
             pending_a2a_events: Vec::new(),
             pending_artifact_pulls: Vec::new(),
@@ -16983,5 +17096,310 @@ inference:
              Address the following feedback, then continue.\n\n## Reopen 1 — from hook \
              `first`\n\none\n\n## Reopen 2 — from hook `gatekeeper`\n\nfix the date\n"
         );
+    }
+
+    // ── Required-field check ──────────────────────────────────────────────
+
+    const EDITOR_SCHEMA: &str = r#"{"type":"object","properties":{"operation":{"type":"string","enum":["write_file","replace_in_file"]},"dest_path":{"type":"string"},"content":{"type":"string"}},"required":["operation","dest_path"]}"#;
+
+    fn required_fields_state() -> (tempfile::TempDir, CapsuleStoreState) {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        let state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+        (dir, state)
+    }
+
+    fn stage_tool_manifest(state: &CapsuleStoreState, name: &str, manifest: &str) {
+        let dir = state.workdir.join("tools").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(PACKED_MANIFEST_ENTRY), manifest).unwrap();
+    }
+
+    fn manifest_with_schema(runtime: Option<&str>, schema: &str) -> String {
+        let runtime = runtime
+            .map(|runtime| format!("runtime: {runtime}\n"))
+            .unwrap_or_default();
+        format!("name: t\nversion: 0.1.0\n{runtime}input_schema: |\n  {schema}\n")
+    }
+
+    fn refused(
+        state: &CapsuleStoreState,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Option<Vec<String>> {
+        state
+            .check_required_fields(name, &input)
+            .map(|refusal| refusal.missing)
+    }
+
+    #[test]
+    fn check_required_fields_refuses_a_call_missing_a_field() {
+        let (_dir, state) = required_fields_state();
+        stage_tool_manifest(
+            &state,
+            "murmur-tool-editor",
+            &manifest_with_schema(None, EDITOR_SCHEMA),
+        );
+        let refusal = state
+            .check_required_fields(
+                "murmur-tool-editor",
+                &serde_json::json!({"dest_path": "notes.txt", "content": "hello"}),
+            )
+            .expect("a call missing `operation` is refused");
+        assert_eq!(refusal.missing, ["operation"]);
+        assert!(refusal
+            .text
+            .starts_with("murmur-tool-editor: missing required field \"operation\"\n\n"));
+        assert_eq!(
+            refused(
+                &state,
+                "murmur-tool-editor",
+                serde_json::json!({"content": "hello"})
+            ),
+            Some(vec!["operation".to_string(), "dest_path".to_string()])
+        );
+    }
+
+    #[test]
+    fn check_required_fields_passes_a_complete_call_and_counts_null_as_present() {
+        let (_dir, state) = required_fields_state();
+        stage_tool_manifest(
+            &state,
+            "murmur-tool-editor",
+            &manifest_with_schema(None, EDITOR_SCHEMA),
+        );
+        for input in [
+            serde_json::json!({"operation": "write_file", "dest_path": "notes.txt", "content": "x"}),
+            serde_json::json!({"operation": null, "dest_path": ""}),
+        ] {
+            assert_eq!(refused(&state, "murmur-tool-editor", input), None);
+        }
+    }
+
+    #[test]
+    fn check_required_fields_a_non_object_input_misses_every_field() {
+        let (_dir, state) = required_fields_state();
+        stage_tool_manifest(
+            &state,
+            "murmur-tool-editor",
+            &manifest_with_schema(None, EDITOR_SCHEMA),
+        );
+        assert_eq!(
+            refused(&state, "murmur-tool-editor", serde_json::Value::Null),
+            Some(vec!["operation".to_string(), "dest_path".to_string()])
+        );
+    }
+
+    #[test]
+    fn check_required_fields_checks_every_tool_runtime_spelling_and_a_yaml_mapping_schema() {
+        let (_dir, state) = required_fields_state();
+        for runtime in ["tool", "wasm", "native"] {
+            let name = format!("t-{runtime}");
+            stage_tool_manifest(
+                &state,
+                &name,
+                &manifest_with_schema(Some(runtime), EDITOR_SCHEMA),
+            );
+            assert!(
+                refused(&state, &name, serde_json::json!({})).is_some(),
+                "{runtime}"
+            );
+        }
+        stage_tool_manifest(
+            &state,
+            "t-mapping",
+            "name: t\nversion: 0.1.0\ninput_schema:\n  type: object\n  required: [operation]\n",
+        );
+        assert_eq!(
+            refused(&state, "t-mapping", serde_json::json!({})),
+            Some(vec!["operation".to_string()])
+        );
+    }
+
+    /// The name is model-chosen: none of these may steer the manifest read outside `tools/`,
+    /// even where a requiring manifest sits at the path the name would reach.
+    #[test]
+    fn check_required_fields_skips_a_name_that_is_not_a_plain_directory_name() {
+        let (_dir, state) = required_fields_state();
+        let requiring = manifest_with_schema(None, EDITOR_SCHEMA);
+        fs::write(state.workdir.join(PACKED_MANIFEST_ENTRY), &requiring).unwrap();
+        stage_tool_manifest(&state, "nested", &requiring);
+        fs::create_dir_all(state.workdir.join("tools/nested/inner")).unwrap();
+        fs::write(
+            state
+                .workdir
+                .join("tools/nested/inner")
+                .join(PACKED_MANIFEST_ENTRY),
+            &requiring,
+        )
+        .unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "nested/inner",
+            "nested\\inner",
+            "../tools/nested",
+        ] {
+            assert_eq!(
+                refused(&state, name, serde_json::json!({})),
+                None,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_required_fields_skips_a_removed_artifact() {
+        let (_dir, mut state) = required_fields_state();
+        stage_tool_manifest(
+            &state,
+            "murmur-tool-editor",
+            &manifest_with_schema(None, EDITOR_SCHEMA),
+        );
+        state
+            .removed_artifacts
+            .insert("murmur-tool-editor".to_string());
+        assert_eq!(
+            refused(&state, "murmur-tool-editor", serde_json::json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn check_required_fields_skips_an_absent_or_unparsable_manifest() {
+        let (_dir, state) = required_fields_state();
+        assert_eq!(refused(&state, "absent", serde_json::json!({})), None);
+        fs::create_dir_all(state.workdir.join("tools/no-manifest")).unwrap();
+        assert_eq!(refused(&state, "no-manifest", serde_json::json!({})), None);
+        stage_tool_manifest(&state, "not-yaml", "input_schema: [unclosed\n  :::");
+        assert_eq!(refused(&state, "not-yaml", serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn check_required_fields_skips_skill_driver_and_hook_manifests() {
+        let (_dir, state) = required_fields_state();
+        for runtime in ["skill", "driver", "hook"] {
+            stage_tool_manifest(
+                &state,
+                runtime,
+                &manifest_with_schema(Some(runtime), EDITOR_SCHEMA),
+            );
+            assert_eq!(
+                refused(&state, runtime, serde_json::json!({})),
+                None,
+                "{runtime}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_required_fields_skips_a_tool_with_no_readable_schema_or_no_required() {
+        let (_dir, state) = required_fields_state();
+        stage_tool_manifest(&state, "no-schema", "name: t\nversion: 0.1.0\n");
+        stage_tool_manifest(
+            &state,
+            "not-json",
+            "name: t\nversion: 0.1.0\ninput_schema: \"required: operation\"\n",
+        );
+        stage_tool_manifest(
+            &state,
+            "no-required",
+            &manifest_with_schema(None, r#"{"type":"object","properties":{}}"#),
+        );
+        stage_tool_manifest(
+            &state,
+            "empty-required",
+            &manifest_with_schema(None, r#"{"type":"object","required":[]}"#),
+        );
+        for name in ["no-schema", "not-json", "no-required", "empty-required"] {
+            assert_eq!(refused(&state, name, serde_json::json!({})), None, "{name}");
+        }
+        assert!(state.required_schema_warned.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn check_required_fields_does_not_enforce_a_malformed_schema_and_warns_once_per_tool() {
+        let (_dir, state) = required_fields_state();
+        stage_tool_manifest(
+            &state,
+            "root-array",
+            &manifest_with_schema(None, r#"["operation"]"#),
+        );
+        stage_tool_manifest(
+            &state,
+            "required-string",
+            &manifest_with_schema(None, r#"{"type":"object","required":"operation"}"#),
+        );
+        stage_tool_manifest(
+            &state,
+            "required-mixed",
+            &manifest_with_schema(None, r#"{"type":"object","required":["operation",3]}"#),
+        );
+        for _ in 0..2 {
+            for name in ["root-array", "required-string", "required-mixed"] {
+                assert_eq!(refused(&state, name, serde_json::json!({})), None, "{name}");
+            }
+        }
+        let warned = state.required_schema_warned.lock().unwrap().clone();
+        assert_eq!(
+            warned.into_iter().collect::<Vec<_>>(),
+            ["required-mixed", "required-string", "root-array"]
+        );
+    }
+
+    #[test]
+    fn check_required_fields_warning_memo_fires_once_and_survives_poisoning() {
+        let memo = Mutex::new(BTreeSet::new());
+        assert!(first_malformed_schema_warning(&memo, "t"));
+        assert!(!first_malformed_schema_warning(&memo, "t"));
+        assert!(first_malformed_schema_warning(&memo, "u"));
+
+        let poisoned = Arc::new(Mutex::new(BTreeSet::new()));
+        let holder = Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _guard = holder.lock().unwrap();
+            panic!("poison the memo");
+        })
+        .join();
+        assert!(poisoned.is_poisoned());
+        assert!(!first_malformed_schema_warning(&poisoned, "t"));
+    }
+
+    #[test]
+    fn check_required_fields_warning_names_the_tool_and_the_defect() {
+        use crate::required_fields::MalformedSchema;
+
+        assert_eq!(
+            malformed_schema_warning("my-tool", MalformedSchema::RequiredNotStringArray),
+            "[capsule-runtime] warning[W-RUN-004]: the tool 'my-tool' declares an input_schema \
+             whose `required` is not an array of strings, so its calls are dispatched without \
+             the required-field check \
+             (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-004)"
+        );
+        assert!(
+            malformed_schema_warning("my-tool", MalformedSchema::RootNotObject).contains(
+                "the tool 'my-tool' declares an input_schema whose root is not a JSON object"
+            )
+        );
+    }
+
+    /// The schema is read per call, so a tool replaced mid-session is judged by its new schema
+    /// on its next call.
+    #[test]
+    fn check_required_fields_reads_the_schema_at_call_time() {
+        let (_dir, state) = required_fields_state();
+        stage_tool_manifest(
+            &state,
+            "t",
+            &manifest_with_schema(None, r#"{"type":"object"}"#),
+        );
+        assert_eq!(refused(&state, "t", serde_json::json!({})), None);
+        stage_tool_manifest(&state, "t", &manifest_with_schema(None, EDITOR_SCHEMA));
+        assert!(refused(&state, "t", serde_json::json!({})).is_some());
     }
 }

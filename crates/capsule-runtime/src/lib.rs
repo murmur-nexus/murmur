@@ -62,6 +62,7 @@ pub(crate) mod protected_paths;
 pub(crate) mod reachability;
 pub(crate) mod recipes;
 pub mod registration;
+pub(crate) mod required_fields;
 pub mod resource_plane;
 pub mod resources;
 pub mod retention;

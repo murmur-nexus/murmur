@@ -31,6 +31,14 @@ pub const W_RUN_002: &str = "W-RUN-002";
 /// the choice is staged unavailable, and a switch to it is refused when it is asked for.
 pub const W_RUN_003: &str = "W-RUN-003";
 
+/// A tool's `input_schema` is malformed where the required-field check reads it: the root is not
+/// a JSON object, or its `required` is not an array of strings.
+///
+/// A malformed schema is a bad tool rather than a bad call, so nothing is refused: the check is
+/// skipped for that tool, its calls are dispatched unchecked, the session continues, and the
+/// malformation is named once per tool per session.
+pub const W_RUN_004: &str = "W-RUN-004";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -47,7 +55,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_RUN_001, W_RUN_002, W_RUN_003];
+        let codes = [W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

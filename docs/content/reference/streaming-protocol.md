@@ -339,10 +339,12 @@ and ahead of the task's final status or the [reopen boundary](#reopened-tasks). 
 a tool forwards none, and neither does an attempt that is canceled, fails or stops at a spend
 ceiling.
 
-On [`transport: http`](manifest.md#transport-http) a call a policy hook refuses writes
-no frame. On [`transport: process`](manifest.md#transport-process) the harness reports the
-refusal it was handed as its own failed tool call, and that report writes a frame with
-`artifact.is_error` set to `true`.
+What a refused call writes depends on what refused it and on the transport:
+
+| Refused by | [`transport: http`](manifest.md#transport-http) | [`transport: process`](manifest.md#transport-process) |
+|---|---|---|
+| A policy hook or `capabilities.filesystem.read_only` | No frame | One frame with `artifact.is_error` `true`: the harness reports the refusal it was handed as its own failed tool call |
+| A missing [required field](manifest.md#input-schema) | One frame with `artifact.is_error` `true` and the refusal text as `content`, the same frame as for a call that never reached a tool | One frame with `artifact.is_error` `true`, from the harness's report |
 
 Every key is present on every frame, in this order. A key that does not apply to the frame is
 `null`, never absent.

@@ -141,8 +141,9 @@ Two kinds of entry reach the model this way:
 
 Every call the harness makes is checked before it runs, in the same order as on `transport: http`:
 
-1. [capabilities.filesystem.read_only](../reference/manifest.md#field-capabilities) — refused if the call writes a protected path.
-2. An [`on-tool-call`](../concepts/hooks.md) policy hook, where the capsule declares one — refused if the hook denies the call.
+1. The tool's [input_schema](../reference/manifest.md#input-schema) — refused if the call's input lacks a field the schema lists in `required`.
+2. [capabilities.filesystem.read_only](../reference/manifest.md#field-capabilities) — refused if the call writes a protected path.
+3. An [`on-tool-call`](../concepts/hooks.md) policy hook, where the capsule declares one — refused if the hook denies the call.
 
 A refused call never runs. The model is handed a failed tool result carrying the refusal's reason, and `trace.jsonl` records the refusal.
 
@@ -304,7 +305,7 @@ It declares no compaction hook and no `context.max_tokens`: both are inert under
 | `inference.command` | Overrides the executable the driver's `describe()` names |
 | `capabilities.env.allow` | The whole environment the harness sees; every variable the driver requires must appear, or the launch is refused with `E-CAP-019` |
 | `capabilities.shell.allow` | Each binary becomes one tool the model may call through Murmur |
-| `capabilities.filesystem.read_only`, an `on-tool-call` policy hook | Both govern every tool call the harness makes, the same way they govern one on `transport: http` |
+| A tool's `input_schema` `required` list, `capabilities.filesystem.read_only`, an `on-tool-call` policy hook | All three govern every tool call the harness makes, the same way they govern one on `transport: http` |
 | `lifecycle.conversation: threaded` | Each A2A context resumes one harness session; the harness holds the history |
 | `inference.max_session_tokens` | Enforced against the harness's own reported counts; the run stops at the first turn that reaches it |
 | `context.max_tokens`, `inference.compaction` | Parse but do nothing; the harness manages its own context |
