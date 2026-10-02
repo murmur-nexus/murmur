@@ -243,7 +243,7 @@ pub fn extract_declared_env_allow(
 /// The `capabilities.spawn.allow` a packed manifest declares, read on its own.
 ///
 /// The sibling of [`extract_declared_env_allow`], and narrow for the same reason: walking a
-/// formation's delegation graph means reading which capsules a child may in turn spawn, and a
+/// `spawn.allow` closure means reading which capsules a child may in turn spawn, and a
 /// whole-manifest parse would demand that child's own `${VAR}` references be resolvable first.
 ///
 /// A manifest with no `capabilities:` block, or none under `spawn:`, declares nothing and yields

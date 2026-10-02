@@ -108,7 +108,7 @@ section that explains it.
 | `W-DEPLOY-001` | A deploy's target compiled none, or not all, of the uploaded artifacts; those compile on the capsule's first launch | [W-DEPLOY-001](#w-deploy-001) |
 | `W-DEPLOY-002` | A deploy's target runs under a different `MURMUR_MAX_ARTIFACT_DECOMPRESSED_BYTES` from the deploying machine | [W-DEPLOY-002](#w-deploy-002) |
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
-| `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
+| `W-REG-002` | A capsule in the spawn closure could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-REG-003` | An installed artifact speaks an interface version this `mur` does not serve | [W-REG-003](#w-reg-003) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
@@ -1108,7 +1108,7 @@ Names only: no value is read into the report or printed. A name set to the empty
 set, because the runtime copies it through as-is. The matching stdout line is
 `✗ NAME   unset   — <capsule>@<version>`, naming every capsule that needs the name. A name reached
 through a field other than `capabilities.env.allow` carries that field in brackets, as
-`✗ NAME   unset   — solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)`. This is one of the two formation findings
+`✗ NAME   unset   — solo@0.0.1 (artifacts.murmur-driver-anthropic.gateway.api_key)`. This is one of the two `Environment requirements` findings
 that make `mur doctor` exit non-zero.
 
 ### E-CAP-015 — a declaration `mur-roost` will refuse { #e-cap-015 }
@@ -1116,7 +1116,7 @@ that make `mur doctor` exit non-zero.
 A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold:
 
 ```text
-error[E-CAP-015]: 1 declaration in this formation exceeds the envelope the capsule spawning it holds, and mur-roost refuses a spawn that widens one.
+error[E-CAP-015]: 1 declaration in the spawn closure exceeds the envelope the capsule spawning it holds, and mur-roost refuses a spawn that widens one.
   A child may declare no more than its parent does on capabilities.env.allow.
 ```
 
@@ -1498,21 +1498,21 @@ store in place — `mur install` overwrites what is there.
 warning rather than an error, so a store holding an untagged native payload does not fail a CI
 pre-flight check.
 
-### W-REG-002 — a capsule in a formation could not be inspected { #w-reg-002 }
+### W-REG-002 — a capsule in the spawn closure could not be inspected { #w-reg-002 }
 
 ```text
-warning[W-REG-002]: 1 capsule in this formation could not be inspected, so what it declares is absent from the report above: ghost-worker
+warning[W-REG-002]: 1 capsule in the spawn closure could not be inspected, so what it declares is absent from the report above: ghost-worker
   The walk not being able to read a capsule is not evidence that a run fails, so this does not change the exit code.
   (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-002)
 ```
 
 [`mur doctor`](cli.md#mur-doctor) walks a capsule's `capabilities.spawn.allow` closure to report
-what the whole formation needs from the operator's environment. A capsule it cannot open
+what every capsule in it needs from the operator's environment. A capsule it cannot open
 contributes nothing to that report, so the report is incomplete. The matching stdout block names
 each one and why:
 
 ```text
-  could not inspect 1 of 3 capsules in this formation:
+  could not inspect 1 of 3 capsules in the spawn closure:
     - ghost-worker (declared by root-capsule@0.0.1): not installed in the project or global store
 ```
 
