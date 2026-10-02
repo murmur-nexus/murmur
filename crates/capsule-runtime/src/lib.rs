@@ -71,6 +71,8 @@ pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
 pub(crate) mod shell;
+#[cfg(test)]
+mod source_scan;
 pub mod spawn_credential;
 pub mod spawn_envelope;
 pub(crate) mod spend;

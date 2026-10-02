@@ -259,27 +259,13 @@ mod tests {
     /// function by design.
     #[test]
     fn fence_is_applied_from_exactly_two_call_sites() {
-        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
         let mut found: Vec<(String, usize)> = Vec::new();
 
-        for path in rs_files(src) {
-            let name = path
-                .strip_prefix(src)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
+        for (name, text) in crate::source_scan::crate_sources() {
             if name == "fence.rs" {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).expect("readable source file");
-            // Cut at the trailing test module, not at the first `#[cfg(test)]`: several
-            // files in this crate carry a test-only item — a helper method, a `test_support`
-            // module — thousands of lines above their `mod tests`, and splitting on the bare
-            // attribute would leave most of those files unscanned.
-            let body = text
-                .split("\n#[cfg(test)]\nmod tests")
-                .next()
-                .unwrap_or_default();
+            let body = crate::source_scan::production_part(&text);
             let count = body
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
@@ -306,18 +292,5 @@ boundary in runtime.rs (`dispatch_agent_tool_async`) and the task-payload bounda
 (`fence_task_payload`). Found: {found:?}. Route new content through one of those two rather \
 than adding a third application site."
         );
-    }
-
-    fn rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir).expect("src/ is readable") {
-            let path = entry.expect("readable dir entry").path();
-            if path.is_dir() {
-                out.extend(rs_files(&path));
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
-        out
     }
 }
