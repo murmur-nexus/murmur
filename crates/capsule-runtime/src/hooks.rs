@@ -39,7 +39,7 @@ use crate::{
 /// `murmur:hook` version declared in `wit/`. The host keeps no compatibility
 /// fallback: a hook compiled against any other version does not resolve, so a
 /// WIT bump requires every hook artifact to be rebuilt (see `wit/VERSIONING.md`).
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.9.0";
+pub(crate) const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.9.0";
 
 /// Resolve the lifecycle instance export. `None` means the component does not
 /// export [`LIFECYCLE_IFACE`], which surfaces as a missing-export error at the

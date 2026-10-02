@@ -574,12 +574,13 @@ It walks up from the current directory to find `murmur.yaml` (same walk `mur ins
 | `✓ name@version   local source` | Declared with a `source:` path; resolved from the filesystem at stage time, never checked against a registry or a lockfile |
 | `✗ name@version   <platform>   — missing` | Resolved from neither store |
 | `✗ name@version   <platform>   — native binary is built for <binary-platform>, this host is <platform>` | The artifact holds a host executable this machine cannot run; `mur run` refuses it at staging with [`E-RUN-021`](diagnostics.md#e-run-021) |
+| `✗ name@version   — built against <interface>, this mur serves <package>@<version>` | The artifact names an interface version this `mur` does not serve, and `mur run` refuses it at launch. The line ends `this mur serves no version of <package>` when this `mur` has no such package, and `(+N more)` follows when the artifact names several. See [Interface versions](#doctor-interface-versions) |
 
 Every green line means the artifact resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below). The host platform appears on a green line only for an artifact whose binary was identified and matched.
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
-Ahead of the checklist it prints four blocks. None of them affects the exit code.
+Ahead of the checklist it prints these blocks. None of them affects the exit code.
 
 | Block | What it reports |
 |---|---|
@@ -587,6 +588,7 @@ Ahead of the checklist it prints four blocks. None of them affects the exit code
 | `Filesystem preopens` | One line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default). An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>`, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it |
 | `Read-only paths` | The subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects, and whether that protection is enforced for every call the runtime can read as a write or advisory against a named interpreter |
 | `Install grant` | The `install skill` and `install tool` entries of [`capabilities.install`](manifest.md#field-install) |
+| `Interface versions` | Installed artifacts built against an interface version this `mur` does not serve, printed only when there is something to report. See [Interface versions](#doctor-interface-versions) |
 
 `Read-only paths` and `Install grant` print the same lines, in the same words, as [`mur run --explain-scope`](#mur-run).
 
@@ -769,12 +771,70 @@ Each owner-only entry wider than expected, and each path listed beneath one, als
 exit code. When `HOME` cannot be resolved,
 the block is one `not reported` line.
 
+### Interface versions { #doctor-interface-versions }
+
+Just before the checklist, `mur doctor` checks every artifact installed in the project store
+(`.murmur/artifacts/`) and the global store (`~/.murmur/artifacts/`), declared or not. It names
+each one that speaks a Murmur interface at a version this `mur` does not serve. These are the
+interfaces in the `murmur:` namespace, in both directions: those the artifact provides and those
+it expects the host to provide. This `mur` serves exactly one version of each `murmur:` package
+and accepts no other, so `mur run` refuses such an artifact at launch.
+
+| Compared | Not compared |
+|---|---|
+| Every `murmur:` interface name, against the one version this `mur` serves of its package. A name with no version is a mismatch | `wasi:` interfaces, which load against any compatible `0.2.x` version this `mur` provides. Interfaces in any other namespace |
+
+The interface versions come from the store's record of the artifact, which is written from the
+artifact's own bytes every time it is installed or published. When the record carries no
+interface list, it is read from the installed payload. The check never writes to either store.
+
+**Output — a stale artifact this project does not declare:**
+
+```text
+Interface versions
+  ⚠  stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
+  ⚠  stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
+  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-003)
+
+Checking /path/to/murmur.yaml for linux-x86_64...
+
+0 checks passed, 0 errors found, 1 warning.
+
+Fix: mur install -g stale-hook@<a release built against murmur:hook@0.9.0, murmur:runtime@0.4.0>
+```
+
+| Line | Meaning |
+|---|---|
+| `⚠ name@version   <project\|global>   <exports\|imports> <interface> — this mur serves <package>@<version>` | The artifact in that store speaks `<interface>`; this `mur` serves `<package>` only at `<version>` |
+| `… — this mur serves no version of <package>` | This `mur` has no package of that name at all |
+| `… <interface> (unversioned) — …` | The interface name carries no version |
+| `not checked (<project\|global> store): <error>` | The store's index could not be read, so nothing in it was checked. The exit code is unchanged |
+
+Which tier a stale artifact lands in depends on whether the next `mur run` of this project
+launches it:
+
+| Artifact | Finding | Exit code |
+|---|---|---|
+| Not declared in `murmur.yaml` at that version | Warning: [`W-REG-003`](diagnostics.md#w-reg-003) and `Fix: mur install [-g] name@<a release built …>` | Unchanged |
+| Declared in `murmur.yaml` at that version | `✗` checklist line and `Fix: name: pin a release built against … in murmur.yaml, then run mur install` | `1` |
+
+The global store holds artifacts for every project on the machine, so an artifact nothing here
+launches is a warning. A declared one is an error because the next `mur run` refuses it. A
+declared artifact that already fails the [lock checks](#lock-integrity) shows only that failure,
+and an artifact declared with `source:` is not checked.
+
+The fix is always a release built against the versions this `mur` serves. Reinstalling the same
+version fetches the same build. The block prints nothing when every installed artifact speaks only
+served versions.
+
 ### Warnings
 
 A finding that is worth reporting but is not a failure prints on its own checklist line, marked
 `⚠`, and adds a `Fix:` line in the same block as the errors. The summary line counts warnings
 separately and the exit code ignores them, so a store that resolves everything it is asked for
 still exits `0`. [`W-REG-001`](diagnostics.md#w-reg-001) is the one warning the checklist reports.
+A stale artifact this project does not declare adds its `Fix:` line in the same way, from the
+[Interface versions](#doctor-interface-versions) block.
 
 **Output — a native artifact with no recorded platform:**
 
@@ -789,8 +849,8 @@ Fix: mur install murmur-tool-git@1.0.0
 
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform; and the formation block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
-- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, or hold a native binary this host cannot run (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
+- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, carries no binary built for another platform, and speaks only interface versions this `mur` serves; and the formation block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
+- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, have a runtime-pulled pin `mur run` would refuse with `E-RUN-043`, hold a native binary this host cannot run, or speak an interface version this `mur` does not serve (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -804,6 +864,7 @@ Fix: mur install murmur-tool-git@1.0.0
 | `E-CAP-014` | A variable the formation's `capabilities.env.allow` closure declares is unset in this environment |
 | `E-CAP-015` | A capsule in the formation declares a `capabilities.env.allow` entry the capsule that spawns it does not hold |
 | `W-REG-002` | A capsule in the formation could not be inspected, so what it declares is missing from the report — a warning; the exit code is unchanged |
+| `W-REG-003` | An installed artifact this project does not declare speaks an interface version this `mur` does not serve — a warning; the exit code is unchanged |
 
 A setup failure (no project found, the manifest fails to load, or the lockfile fails to parse) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest or lockfile couldn't be read.
 

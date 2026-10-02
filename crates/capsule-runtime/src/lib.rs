@@ -86,6 +86,7 @@ pub(crate) mod tool_annotations;
 pub(crate) mod trace;
 pub(crate) mod trace_blobs;
 pub mod types;
+pub(crate) mod wit_versions;
 pub mod workdir_writes;
 
 pub use artifact_config::{
@@ -221,3 +222,6 @@ pub use workdir_writes::{
     render_runtime_writes, RuntimeWriteCondition, RuntimeWriteKind, RuntimeWriteReport,
     RuntimeWriteScope, SESSION_ID_PLACEHOLDER,
 };
+// The served version of each `murmur:*` package, which `mur doctor` compares installed artifacts
+// against.
+pub use wit_versions::SERVED_WIT_PACKAGES;
