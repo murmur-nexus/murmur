@@ -556,9 +556,9 @@ struct EnvRequirementsFindings {
 }
 
 /// Print the `Environment requirements` block: every variable the `capabilities.spawn.allow`
-/// closure declares, every variable the project manifest references and this workspace does not hold,
-/// every declaration `mur-roost` will refuse, every capsule the walk could not read, and every
-/// edge that closes a cycle.
+/// closure declares, every variable the project manifest references and this workspace does not
+/// hold, every declaration `mur-roost` will refuse, every capsule the walk could not read, and
+/// every edge that closes a cycle.
 ///
 /// Names only. No value is read into the report or printed, and nothing is launched.
 ///

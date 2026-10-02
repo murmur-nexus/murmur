@@ -23,8 +23,9 @@ use tempfile::TempDir;
 /// A capsule declaring `capabilities.spawn.allow`, the one declaration that makes the daemon a
 /// dependency of the run and doctor's roost report fire.
 ///
-/// The capsule it names is installed, and declares nothing, so the `Environment requirements` block
-/// that fires on the same declaration finds nothing to report and the roost warning is the only finding.
+/// The capsule it names is installed, and declares nothing, so the `Environment requirements`
+/// block that fires on the same declaration finds nothing to report and the roost warning is the
+/// only finding.
 fn create_delegating_project(home: &TempDir, project_dir: &Path) {
     install_capsule(
         &global_store(home),
