@@ -207,6 +207,11 @@ pub(crate) fn writes_frame(
             | StreamFrame::Thinking
             | StreamFrame::Gap
             | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
+            // An http driver returns a tool call only once its input is complete, so there is
+            // nothing earlier for it to report.
+            StreamFrame::ToolCallStarted | StreamFrame::ToolCallProgress => {
+                (true, true, &[TransportKind::Process])
+            }
             StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
                 (false, true, &TransportKind::ALL)
             }
@@ -1774,6 +1779,8 @@ mod tests {
                 "artifact",
                 "text",
                 "thinking",
+                "tool-call-started",
+                "tool-call-progress",
                 "gap",
                 "lagged",
                 "connection-ack",
@@ -1787,6 +1794,8 @@ mod tests {
                 "artifact",
                 "text",
                 "thinking",
+                "tool-call-started",
+                "tool-call-progress",
                 "gap",
                 "lagged",
                 "connection-ack",
@@ -1801,6 +1810,8 @@ mod tests {
                 "artifact",
                 "text",
                 "thinking",
+                "tool-call-started",
+                "tool-call-progress",
                 "gap",
                 "lagged",
                 "connection-ack",
@@ -2236,19 +2247,26 @@ mod tests {
 
     #[test]
     fn stream_frame_every_variant_is_listed() {
-        for kind in TransportKind::ALL {
-            let transport = TransportCapabilities {
-                streams_text: true,
-                kind,
-            };
-            let frames = served_frames(&TaskAcceptance::Single, transport);
-            for frame in StreamFrame::ALL {
-                assert!(
-                    frames.contains(&frame.wire_name()),
-                    "{} is never listed on {kind:?}: {frames:?}",
-                    frame.wire_name()
-                );
-            }
+        let listed: Vec<Vec<&str>> = TransportKind::ALL
+            .into_iter()
+            .map(|kind| {
+                served_frames(
+                    &TaskAcceptance::Single,
+                    TransportCapabilities {
+                        streams_text: true,
+                        kind,
+                    },
+                )
+            })
+            .collect();
+        for frame in StreamFrame::ALL {
+            assert!(
+                listed
+                    .iter()
+                    .any(|frames| frames.contains(&frame.wire_name())),
+                "{} is listed on no transport: {listed:?}",
+                frame.wire_name()
+            );
         }
     }
 

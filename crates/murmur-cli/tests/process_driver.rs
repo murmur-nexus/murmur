@@ -36,6 +36,11 @@ fn retired_wasm() -> PathBuf {
     common::fixture_path("process-driver-v1/tool/process-driver-v1.wasm")
 }
 
+/// A driver built against the frozen `@0.2.0` WIT beside it.
+fn previous_wasm() -> PathBuf {
+    common::fixture_path("process-driver-v2/tool/process-driver-v2.wasm")
+}
+
 /// The build whose `describe().reports-usage` is `false` and whose `parse` reads no `usage` line.
 fn no_usage_wasm() -> PathBuf {
     common::fixture_path("process-driver/tool/process-driver-no-usage.wasm")
@@ -213,7 +218,7 @@ fn http_driver_under_process_is_refused() {
     let text = capsule.run_refused();
     assert!(text.contains("E-RUN-029"), "{text}");
     assert!(text.contains("murmur-driver-anthropic@0.1.0"), "{text}");
-    assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
+    assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
 }
 
 /// The host accepts exactly one version of the interface, so a driver built against the retired
@@ -225,9 +230,24 @@ fn a_driver_built_against_the_retired_version_is_refused() {
     let capsule = Capsule::process(name, &retired_wasm(), &["HOME"]);
     let text = capsule.run_refused();
     assert!(text.contains("E-RUN-029"), "{text}");
-    assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
+    assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
     assert!(text.contains("murmur:driver/process@0.1.0"), "{text}");
     assert!(text.contains("rebuild"), "{text}");
+}
+
+/// An installed driver built against `@0.2.0` is refused at launch, and the hint names the fix: a
+/// release built against the version the host accepts, installed with `mur install`.
+#[test]
+fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
+    let name = "previous-process-driver";
+    let capsule = Capsule::process(name, &previous_wasm(), &["HOME"]);
+    let text = capsule.run_refused();
+    println!("{text}");
+    assert!(text.contains("E-RUN-029"), "{text}");
+    assert!(text.contains(&format!("{name}@{VERSION}")), "{text}");
+    assert!(text.contains("murmur:driver/process@0.2.0"), "{text}");
+    assert!(text.contains("murmur:driver/process@0.3.0"), "{text}");
+    assert!(text.contains("mur install"), "{text}");
 }
 
 #[test]

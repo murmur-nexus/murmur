@@ -17,12 +17,12 @@ use crate::ExecutionLimits;
 
 pub use crate::bindings::process_driver::exports::murmur::driver::process::{
     Bridge, Description, DriverFile, Event, ExitStatus, FailureKind, InterruptMethod, LaunchPlan,
-    LaunchRequest, RetryInfo, Session, SessionInfo, SessionMode, ToolCallInfo, ToolResultInfo,
-    TurnFailure, Usage,
+    LaunchRequest, RetryInfo, Session, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress,
+    ToolCallStart, ToolResultInfo, TurnFailure, Usage,
 };
 
 /// The instance name every process driver exports.
-pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.2.0";
+pub const PROCESS_DRIVER_IFACE: &str = "murmur:driver/process@0.3.0";
 
 /// Every version of the process interface starts with this, so an export built against another
 /// version is still recognised as a process driver.

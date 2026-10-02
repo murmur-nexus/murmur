@@ -1,6 +1,8 @@
 use std::fmt;
 
-use capsule_runtime::{RuntimeError, MAX_ARTIFACT_CONFIG_BYTES};
+use capsule_runtime::{
+    process_driver::PROCESS_DRIVER_IFACE, RuntimeError, MAX_ARTIFACT_CONFIG_BYTES,
+};
 use murmur_artifact::{
     BuildError, ManifestError, RegistryError, MANIFEST_FILENAME, RETIRED_AUTH_BLOCK,
 };
@@ -555,11 +557,28 @@ impl From<RuntimeError> for CliError {
                      or remove gateway: from its entry",
                 )
             }
-            error @ RuntimeError::ProcessDriverInterfaceMissing { .. } => CliError::with_hint(
-                E_RUN_029,
-                error.to_string(),
-                "rebuild the driver against murmur:driver/process@0.2.0, or name a process driver",
-            ),
+            RuntimeError::ProcessDriverInterfaceMissing {
+                ref name,
+                ref found,
+                ..
+            } => {
+                // A driver that exports some other version of the interface is a process driver
+                // from before or after an interface bump: a release built against this one fixes
+                // it. One that exports none is not a process driver at all.
+                let hint = if found.is_empty() {
+                    format!(
+                        "rebuild the driver against {PROCESS_DRIVER_IFACE}, or name a process \
+                         driver"
+                    )
+                } else {
+                    format!(
+                        "pin a release of {name} built against {PROCESS_DRIVER_IFACE} in \
+                         murmur.yaml, then run `mur install` — or rebuild {name} against \
+                         {PROCESS_DRIVER_IFACE}"
+                    )
+                };
+                CliError::with_hint(E_RUN_029, error.to_string(), hint)
+            }
             error @ RuntimeError::HttpDriverExportsProcessInterface { .. } => CliError::with_hint(
                 E_RUN_030,
                 error.to_string(),
@@ -624,7 +643,7 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ProcessDriverLoad { .. } => CliError::with_hint(
                 E_RUN_032,
                 error.to_string(),
-                "the driver must export murmur:driver/process@0.2.0 and import nothing but WASI",
+                format!("the driver must export {PROCESS_DRIVER_IFACE} and import nothing but WASI"),
             ),
             error @ RuntimeError::GatewayWithoutCredential { .. } => CliError::with_hint(
                 E_CAP_018,

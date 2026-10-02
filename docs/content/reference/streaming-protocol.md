@@ -156,6 +156,8 @@ in `capabilities.extensions` after the door and capsule extensions — see
 | [`artifact`](#event-artifact) | Always, on both transports | A2A `TaskArtifactUpdateEvent` |
 | [`text`](#event-text) | Always, on both transports | None — a murmur frame |
 | [`thinking`](#event-thinking) | Always, on both transports | None — a murmur frame |
+| [`tool-call-started`](#event-tool-call-started) | Only on `transport: process` | None — a murmur frame |
+| [`tool-call-progress`](#event-tool-call-progress) | Only on `transport: process` | None — a murmur frame |
 | [`gap`](#event-gap) | Always, on both transports | None — a murmur frame |
 | [`lagged`](#event-lagged) | Always, on both transports | None — a murmur frame |
 | [`connection-ack`](#event-connection-ack) | Always, on both transports | None — a murmur frame |
@@ -175,7 +177,7 @@ A frame is a group of lines ending with a blank line (`\n\n`). Lines end with `\
 
 | Line | Form | On |
 |---|---|---|
-| Id | `id: <unsigned 64-bit integer>` | `status` except `rejected`, `artifact`, `text`, `thinking` — see [Event ids](#event-ids) |
+| Id | `id: <unsigned 64-bit integer>` | `status` except `rejected`, `artifact`, `text`, `thinking`, `tool-call-started`, `tool-call-progress` — see [Event ids](#event-ids) |
 | Event type | `event: <type>` | Every frame |
 | Data | `data: <JSON object>` | Every frame. Always exactly one line |
 | Comment | `:<text>` | The [heartbeat](#heartbeat). Stands alone between blank lines and is not a frame |
@@ -195,7 +197,8 @@ data: {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b
 ## Transports { #transports }
 
 A task writes the same frames whatever the capsule's [`inference.transport`](manifest.md#inference-config):
-the same types, the same keys and the same order for the same work. On a `transport: process`
+the same types, the same keys and the same order for the same work, apart from the differences
+listed below. On a `transport: process`
 capsule the frames come from the events its [process driver](manifest.md#process-driver) reads out
 of the harness:
 
@@ -205,6 +208,8 @@ of the harness:
 | Streams a fragment of text | [`text`](#event-text), `"final":false` |
 | Reports the complete text of what it streamed | [`text`](#event-text), `"final":true`, empty — the client keeps the fragments it was sent |
 | Streams a fragment of reasoning, or reports reasoning nothing streamed | [`thinking`](#event-thinking) |
+| Begins writing a tool call | [`tool-call-started`](#event-tool-call-started) |
+| Reports how much of it is written | [`tool-call-progress`](#event-tool-call-progress) |
 | Answers a tool call | [`artifact`](#event-artifact) |
 | Ends the turn | One [`artifact`](#event-artifact) frame for each artifact an `on-inference` hook returned for that turn, then the whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the task's final `status` `completed` |
 | Fails the turn | The task's final `status` `failed` |
@@ -213,7 +218,7 @@ A process task ends in the same [one final status](#one-final-status) as an http
 path out of its last attempt, including the ones a runtime diagnostic ends: the frame's
 `status.message` is that diagnostic, under the code [`mur` reports it as](diagnostics.md).
 
-The two transports' streams differ in three things, each because the harness, not this runtime,
+The two transports' streams differ in four things, each because the harness, not this runtime,
 ran the turn:
 
 | Difference | Why |
@@ -221,6 +226,7 @@ ran the turn:
 | `artifact.fence_source` is `null` on every frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
 | `artifact.exit_code` is `null` and `artifact.truncated` is `false` on every frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
 | A provider retry writes no frame on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
+| An http capsule writes no `tool-call-started` or `tool-call-progress` frame | An http driver returns a tool call only once its input is complete |
 
 ### Frame order within a task { #task-frame-order }
 
@@ -229,7 +235,10 @@ One attempt of a task writes its frames in this order:
 1. [`status`](#event-status) `working`, message `inference turn <n>`, at the start of each
    inference turn, before the driver is called.
 2. While the turn runs, [`thinking`](#event-thinking) and [`text`](#event-text) `"final":false`
-   frames, in the order they are produced.
+   frames, in the order they are produced. On a `transport: process` capsule, a
+   [`tool-call-started`](#event-tool-call-started) frame for each tool call the model begins
+   writing, and that call's [`tool-call-progress`](#event-tool-call-progress) frames, come after
+   the turn's `working` status and before the call's `artifact`.
 3. When the turn streamed text, one `text` `"final":true` frame with empty text once the driver
    returns.
 4. One [`artifact`](#event-artifact) per tool call, written when the call returns, in dispatch
@@ -413,6 +422,56 @@ A piece of the model's reasoning, emitted by a streaming driver or a tool throug
 
 ---
 
+## `tool-call-started` { #event-tool-call-started }
+
+A tool call the model has begun writing, before its input is complete and before the tool runs.
+Written only by a [`transport: process`](#transports) capsule whose
+[process driver](wit-interfaces.md#process-tool-call-progress) reports calls as they are written.
+
+| Key | Type | Absent when | Notes |
+|---|---|---|---|
+| `id` | string | Never | The task id |
+| `tool_call_id` | string | Never | The call's id: the `artifact.tool_call_id` of the [`artifact`](#event-artifact) that answers it |
+| `tool_name` | string | Never | The capsule's tool name, with no harness prefix: the `artifact.tool_name` of the answering `artifact` |
+
+| Property | Value |
+|---|---|
+| Once per call | At most one frame per `tool_call_id`, before any `tool-call-progress` for the call and before its `artifact` |
+| End of the call | The `artifact` with the same `tool_call_id` ends the call. A call no `artifact` answers ends with the task's final `status` |
+| Input | The frame carries none of the call's input |
+| Turns | Opens no inference turn and does not count toward `inference.max_turns` |
+| Optional | A call's `artifact` may arrive with no `tool-call-started` before it. A client treats the start as a hint, never as a prerequisite |
+
+```json
+{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","tool_call_id":"toolu_01","tool_name":"write_file"}
+```
+
+---
+
+## `tool-call-progress` { #event-tool-call-progress }
+
+How many bytes of a started call's input the model has written so far. Follows the call's
+[`tool-call-started`](#event-tool-call-started) frame.
+
+| Key | Type | Absent when | Notes |
+|---|---|---|---|
+| `id` | string | Never | The task id |
+| `tool_call_id` | string | Never | The call's id, as on its `tool-call-started` frame |
+| `input_bytes` | u64 | Never | Bytes of the call's input JSON written so far, cumulative for the call. Never smaller than an earlier frame's for the same `tool_call_id` |
+
+| Property | Value |
+|---|---|
+| Rate | At most one frame per call per 250 ms, plus one when the call's input is complete if the largest size reported has not been written yet |
+| Count | Any number, including none. A client works with `tool-call-started` alone |
+| Input | The frame carries a size and none of the call's input |
+| Turns | Opens no inference turn and does not count toward `inference.max_turns` |
+
+```json
+{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","tool_call_id":"toolu_01","input_bytes":3172}
+```
+
+---
+
 ## `gap` { #event-gap }
 
 Written before a [replay](#replay) when frames written after the client's `Last-Event-ID` are no
@@ -535,6 +594,7 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 | `status` `working` per turn, the reopen boundary, and each task's final status (`completed`, `failed`, `canceled`) | yes | The session's sequence |
 | `artifact` | yes | The session's sequence |
 | `text`, `thinking` | yes | The session's sequence |
+| `tool-call-started`, `tool-call-progress` | yes | The session's sequence |
 | `status` `input-required`, `working` `resumed` | yes | The session's sequence |
 | `status` `canceled` with message `task canceled before it started` | yes | The session's sequence |
 | `status` `rejected`, refused at the door | no | — |
@@ -617,6 +677,7 @@ client that follows them.
 | Reconnecting | Does not reconnect |
 | `status`, `artifact`, `text` | Printed to stdout, including a `rejected` status refused when the session ended |
 | `thinking` | Not shown |
+| `tool-call-started`, `tool-call-progress` | Not shown |
 | `connection-ack` | Read for `conversation_mode`, which sets how `status` lines are labelled |
 | Heartbeat | Read and discarded |
 | `error`, a `rejected` status refused at the door | Never delivered to this endpoint |

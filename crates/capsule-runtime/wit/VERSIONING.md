@@ -24,7 +24,7 @@ Current versions:
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.4.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
-| `murmur:driver`          | `0.2.0`  |
+| `murmur:driver`          | `0.3.0`  |
 
 `SERVED_WIT_PACKAGES` in `capsule-runtime` (`src/wit_versions.rs`) must move with this table:
 `cargo test -p capsule-runtime wit_versions` fails until it matches the `package` declarations under
@@ -225,6 +225,40 @@ nobody can finish paying for. `murmur:hook` did not move, and deliberately:
 no optional form, so a `process` turn whose driver reported nothing is handed
 `0`. Making those optional would break every published hook artifact to express
 a distinction the trace already carries, which this bump declined to do.
+
+`murmur:driver` then went to `0.3.0` when the `process` interface learned to
+report a tool call while the model is still writing it. Two new records —
+`tool-call-start` (`id`, `name`) and `tool-call-progress` (`id`,
+`input-bytes: u64`, cumulative for the call) — arrived with two new `event`
+cases, `tool-call-started(tool-call-start)` and
+`tool-call-progress(tool-call-progress)`, **appended** after `note` so the
+existing discriminants `0`–`11` keep their indices. Adding a case to a variant
+is a breaking change under the rule below. Its instance name is now
+`murmur:driver/process@0.3.0`.
+
+The progress case carries a byte count, not a fragment of the input, on
+purpose. The runtime turns both cases into stream frames, and `stream/watch`
+may be held by a watch-only credential or be public. Input streamed while the
+model writes it would reach that stream before a hook or the call gate had seen
+the complete call and had the chance to deny it, and would put on the ephemeral
+stream what the durable trace does not hold. Carrying only a count across the
+interface means the runtime never holds a call's input before the gate does.
+
+The cost was paid knowingly. Every installed `@0.2.0` driver is refused at
+launch with `E-RUN-029` the moment `mur` upgrades — including one pinned in a
+`murmur.lock` that launched the day before, and every third-party process
+driver. A pinned lock stops reproducing a launch it reproduced yesterday; that
+was spent for a one-time correction while the ecosystem is small enough to
+rebuild. Recovery is the refusal's hint: pin a release of the driver built
+against `@0.3.0` and run `mur install`, or rebuild the driver. One `@0.2.0`
+component stays committed under
+`crates/murmur-cli/tests/fixtures/process-driver-v2/`, beside the `@0.1.0` one
+and with its own frozen `.wit`, so the refusal of the version every published
+driver was built against stays testable.
+
+Nothing else was bundled with it. `description` did not gain a field declaring
+that a driver sends the new cases: both are optional for a driver, so nothing
+needs to declare them.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

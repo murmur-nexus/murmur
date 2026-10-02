@@ -13,8 +13,8 @@ use std::cell::RefCell;
 
 use exports::murmur::driver::process::{
     Description, DriverFile, Event, ExitStatus, FailureKind, Guest, InterruptMethod, LaunchPlan,
-    LaunchRequest, RetryInfo, SessionInfo, SessionMode, ToolCallInfo, ToolResultInfo, TurnFailure,
-    Usage,
+    LaunchRequest, RetryInfo, SessionInfo, SessionMode, ToolCallInfo, ToolCallProgress,
+    ToolCallStart, ToolResultInfo, TurnFailure, Usage,
 };
 
 thread_local! {
@@ -165,6 +165,23 @@ fn parse_line(line: String) -> Event {
         "tdelta" => Event::ThinkingDelta(rest.to_string()),
         "thinking" => Event::Thinking(rest.to_string()),
         "tool" => parse_tool_call(rest, &line),
+        "tstart" => match rest.split_once(' ') {
+            Some((id, name)) => Event::ToolCallStarted(ToolCallStart {
+                id: id.to_string(),
+                name: strip_tool_prefix(name),
+            }),
+            None => Event::Note(line),
+        },
+        "tprogress" => match rest.split_once(' ') {
+            Some((id, bytes)) => match bytes.parse::<u64>() {
+                Ok(input_bytes) => Event::ToolCallProgress(ToolCallProgress {
+                    id: id.to_string(),
+                    input_bytes,
+                }),
+                Err(_) => Event::Note(line),
+            },
+            None => Event::Note(line),
+        },
         "result" => parse_tool_result(rest, &line),
         "retry" => match rest.split_once(' ') {
             Some((attempt, reason)) => match attempt.parse::<u32>() {
@@ -236,14 +253,18 @@ fn parse_tool_call(rest: &str, line: &str) -> Event {
     let (Some(id), Some(name), Some(input)) = (parts.next(), parts.next(), parts.next()) else {
         return Event::Note(line.to_string());
     };
-    let bare = TOOL_PREFIX.with(|slot| match slot.borrow().as_deref() {
-        Some(prefix) => name.strip_prefix(prefix).unwrap_or(name).to_string(),
-        None => name.to_string(),
-    });
     Event::ToolCall(ToolCallInfo {
         id: id.to_string(),
-        name: bare,
+        name: strip_tool_prefix(name),
         input: input.to_string(),
+    })
+}
+
+/// A tool name as the harness spells it, with the prefix `launch` added taken back off.
+fn strip_tool_prefix(name: &str) -> String {
+    TOOL_PREFIX.with(|slot| match slot.borrow().as_deref() {
+        Some(prefix) => name.strip_prefix(prefix).unwrap_or(name).to_string(),
+        None => name.to_string(),
     })
 }
 

@@ -763,6 +763,38 @@ nothing could ever reach is not a ceiling.
 Where the reported numbers land in the trace, and how they differ from the `http` path's, is in
 [the `inference` record](observability-schemas.md#session-trace-tracejsonl).
 
+### A tool call being written { #process-tool-call-progress }
+
+A driver whose harness reports a tool call while the model is still writing it sends two events
+ahead of the complete `tool-call`:
+
+| Event | Record | Members |
+|---|---|---|
+| `tool-call-started` | `tool-call-start` | `id`, `name`: the same id and bare name the complete `tool-call` will carry, with any prefix the driver added in `launch` stripped |
+| `tool-call-progress` | `tool-call-progress` | `id` of the started call; `input-bytes: u64`, the bytes of the call's input JSON written so far |
+
+| Rule | What it means |
+|---|---|
+| Cumulative, never delta | `input-bytes` is the total for the call so far, not the increment since the last report |
+| Optional | A driver whose harness reports a call only once it is complete sends neither event, and `describe` declares nothing about them |
+| A count, never input | Neither event carries any of the input's content; the input reaches the runtime only in the complete `tool-call` |
+
+The runtime turns them into the [`tool-call-started`](streaming-protocol.md#event-tool-call-started)
+and [`tool-call-progress`](streaming-protocol.md#event-tool-call-progress) stream frames, which
+carry the name and a byte count and nothing of the input. Neither event opens an inference turn
+or is written to the trace; the call's turn opens, and counts toward `inference.max_turns`, when
+its complete `tool-call` arrives.
+
+The runtime writes nothing for:
+
+- a `tool-call-progress` for a call with no `tool-call-started`;
+- a second `tool-call-started` for the same id;
+- a `tool-call-started` after the call's `tool-call` or `tool-result`, or with an empty id;
+- an `input-bytes` no larger than one already reported for the call.
+
+A complete `tool-call` whose name differs from its start's is recorded under the `tool-call`'s
+name, and the difference is written to the trace as a `harness_note`.
+
 ---
 
 ## Package versioning
@@ -786,7 +818,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:runtime` | `0.4.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
-| `murmur:driver` | `0.2.0` |
+| `murmur:driver` | `0.3.0` |
 
 | Tier | When |
 |---|---|

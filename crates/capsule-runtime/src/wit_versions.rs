@@ -15,7 +15,7 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
     ("murmur:artifact-manager", "0.1.0"),
     ("murmur:capsule", "0.1.0"),
     ("murmur:conversation", "0.2.0"),
-    ("murmur:driver", "0.2.0"),
+    ("murmur:driver", "0.3.0"),
     ("murmur:hook", "0.9.0"),
     ("murmur:host", "0.1.0"),
     ("murmur:message", "0.1.0"),

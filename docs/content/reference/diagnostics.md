@@ -562,15 +562,19 @@ The message ends with the path and the operating system's error.
 ### E-RUN-029 — the process driver lacks the process interface { #e-run-029 }
 
 A `transport: process` manifest names an artifact under `inference.driver` that does not export
-`murmur:driver/process@0.2.0`. `mur run` refuses at staging, before the driver runs.
+`murmur:driver/process@0.3.0`. `mur run` refuses at staging, before the driver runs. The runtime
+accepts one version of the interface, so a driver built against an earlier one — including one an
+older `murmur.lock` pins — is refused until a release built against `@0.3.0` is installed.
+
+| The artifact exports | Message ends | Hint |
+|---|---|---|
+| Another version of the interface | `; it exports murmur:driver/process@<version>, built against another version — rebuild it` | `` pin a release of <name> built against murmur:driver/process@0.3.0 in murmur.yaml, then run `mur install` — or rebuild <name> against murmur:driver/process@0.3.0 `` |
+| No version of it | `; a process driver must be built against the process-driver world` | `rebuild the driver against murmur:driver/process@0.3.0, or name a process driver` |
 
 ```text
-error[E-RUN-029]: artifact 'my-http-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.2.0; a process driver must be built against the process-driver world
-  hint: rebuild the driver against murmur:driver/process@0.2.0, or name a process driver
+error[E-RUN-029]: artifact 'my-process-driver@1.0.0' is the transport: process driver but does not export murmur:driver/process@0.3.0; it exports murmur:driver/process@0.2.0, built against another version — rebuild it
+  hint: pin a release of my-process-driver built against murmur:driver/process@0.3.0 in murmur.yaml, then run `mur install` — or rebuild my-process-driver against murmur:driver/process@0.3.0
 ```
-
-A driver built against another version of the interface is told which one it exports instead:
-`; it exports murmur:driver/process@<version>, built against another version — rebuild it`.
 
 ### E-RUN-030 — the http driver is a process driver { #e-run-030 }
 
@@ -578,7 +582,7 @@ A `transport: http` manifest names an artifact under `inference.driver` that exp
 driver interface. `mur run` refuses at staging, before the driver runs.
 
 ```text
-error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.2.0, the process driver interface; name it under transport: process, or name an http driver
+error[E-RUN-030]: artifact 'my-process-driver@1.0.0' is the transport: http inference driver but exports murmur:driver/process@0.3.0, the process driver interface; name it under transport: process, or name an http driver
   hint: set inference.transport: process to use this driver, or name an http driver
 ```
 
@@ -595,7 +599,7 @@ The message ends with the reason; for an import, it names the interface.
 
 ```text
 error[E-RUN-032]: process driver 'my-process-driver@1.0.0' could not be loaded with no grants: component imports instance `murmur:text/chunks@0.1.0`, but a matching implementation was not found in the linker
-  hint: the driver must export murmur:driver/process@0.2.0 and import nothing but WASI
+  hint: the driver must export murmur:driver/process@0.3.0 and import nothing but WASI
 ```
 
 ### E-RUN-033 — a harness turn failed { #e-run-033 }
