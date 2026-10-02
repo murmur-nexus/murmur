@@ -171,12 +171,19 @@ by guessing from the note's wording. For a grouped note, the last-merged PR's la
 
 | PR label | Section |
 |---|---|
+| `type/security` | Security |
 | `type/feature` | Features |
 | `type/bug` | Bug Fixes |
 | `type/refactor`, `type/cleanup`, `type/docs` | Other |
 
 A `Breaking: ` prefix overrides the label and files the note at the top of **Other**. A PR carrying
 no `type/*` label falls back to a keyword guess, which is why the label matters.
+
+Label a PR `type/security` when it resolves a published advisory — a RUSTSEC or CVE fixed by a
+dependency upgrade, say — and name the advisory in its note. The label outranks any other `type/*`
+label on the PR, and the Security section leads the changelog whenever a release has one. A PR that
+never carried the label, such as a dependency bump with no card, is moved there by hand while
+reviewing the changelog.
 
 ### Tools for Aggregation
 
@@ -189,6 +196,9 @@ tag. See [`scripts/README.md`](scripts/README.md) for its options.
 # Changelog
 
 ## Changes since vX.Y.Z
+
+### Security
+- wasmtime moves to 48, which resolves RUSTSEC-2026-0313.
 
 ### Features
 - `mur run --system-prompt` overrides a capsule's system prompt for a single run.
@@ -203,8 +213,9 @@ tag. See [`scripts/README.md`](scripts/README.md) for its options.
 - Capsule subprocesses run under a default-deny syscall allowlist rather than an allow-by-default filter.
 ```
 
-Three sections, no more. Breaking changes lead Other rather than getting a section of their own —
-before 1.0 they are common enough that a dedicated section stops carrying information.
+Three sections, led by Security when a release resolves an advisory — no more. Breaking changes
+lead Other rather than getting a section of their own — before 1.0 they are common enough that a
+dedicated section stops carrying information.
 
 ## CI/CD Integration
 

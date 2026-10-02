@@ -282,6 +282,7 @@ class ReleaseNotes:
     # A card's `type/*` label is carried onto its PR by barkfactory, so the
     # category is recorded data rather than something to infer from wording.
     LABEL_CATEGORIES = {
+        "type/security": "Security",
         "type/feature": "Features",
         "type/bug": "Bug Fixes",
         "type/refactor": "Other",
@@ -299,17 +300,22 @@ class ReleaseNotes:
         of their own — but a reader scanning for what an upgrade costs must not
         find one filed under Features because the sentence also says "add".
 
-        Otherwise the PR's `type/*` label decides. The keyword heuristic below
-        is the fallback for a PR carrying no such label — it guesses from
-        wording, which is why "Capsules can now declare CPU, memory, process
-        and disk limits" once landed in Other.
+        Otherwise the PR's `type/*` label decides, and `type/security` outranks
+        any other it carries: a fix that resolves an advisory belongs where a
+        reader checking their exposure looks, not under Bug Fixes. The keyword
+        heuristic below is the fallback for a PR carrying no such label — it
+        guesses from wording, which is why "Capsules can now declare CPU,
+        memory, process and disk limits" once landed in Other.
         """
         lower = note.lower()
 
         if lower.startswith("breaking:"):
             return "Other"
 
-        for label in labels or []:
+        labels = labels or []
+        if "type/security" in labels:
+            return self.LABEL_CATEGORIES["type/security"]
+        for label in labels:
             if label in self.LABEL_CATEGORIES:
                 return self.LABEL_CATEGORIES[label]
 
@@ -445,10 +451,12 @@ class ReleaseNotes:
             lines.append("No changes in this release.\n")
             return "\n".join(lines)
 
-        # Three sections, matching CHANGELOG/v0.1.0.md. Anything that is neither
-        # a new capability nor a fix to a released one is Other, breaking
-        # changes included.
+        # Three sections, matching CHANGELOG/v0.1.0.md, led by Security when a
+        # release resolves an advisory. Anything that is neither a new
+        # capability nor a fix to a released one is Other, breaking changes
+        # included.
         category_order = [
+            "Security",
             "Features",
             "Bug Fixes",
             "Other",

@@ -52,9 +52,10 @@ demand.
    rather than silently falling back to every PR in the repo.
 2. Fetches those PRs and extracts each release-note block, dropping `NONE`.
 3. Collapses notes sharing a `key=` into one entry (see below).
-4. Files each entry under **Features**, **Bug Fixes** or **Other**, by the PR's
-   `type/*` label. A `Breaking:` prefix overrides the label, files under Other,
-   and floats to the top of the section.
+4. Files each entry under **Security**, **Features**, **Bug Fixes** or
+   **Other**, by the PR's `type/*` label; `type/security` outranks any other.
+   A `Breaking:` prefix overrides the label, files under Other, and floats to
+   the top of the section. Security leads the changelog when present.
 5. Writes `CHANGELOG/vX.Y.Z.md` with the downloads table.
 
 Output is a **draft**. Read it, edit it, commit it — that step is not
