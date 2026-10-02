@@ -464,9 +464,6 @@ How many bytes of a started call's input the model has written so far. Follows t
 | Input | The frame carries a size and none of the call's input |
 | Turns | Opens no inference turn and does not count toward `inference.max_turns` |
 
-The input is withheld because a hook or the call gate may still deny the call once it is complete,
-and a `stream/watch` connection may be held by a watch-only credential or be public.
-
 ```json
 {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","tool_call_id":"toolu_01","input_bytes":3172}
 ```

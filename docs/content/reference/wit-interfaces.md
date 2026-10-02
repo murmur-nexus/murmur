@@ -777,7 +777,7 @@ ahead of the complete `tool-call`:
 |---|---|
 | Cumulative, never delta | `input-bytes` is the total for the call so far, not the increment since the last report |
 | Optional | A driver whose harness reports a call only once it is complete sends neither event, and `describe` declares nothing about them |
-| A count, never input | No part of the call's input crosses the interface before the complete `tool-call`, which is what a hook or the call gate inspects |
+| A count, never input | Neither event carries any of the input's content; the input reaches the runtime only in the complete `tool-call` |
 
 The runtime turns them into the [`tool-call-started`](streaming-protocol.md#event-tool-call-started)
 and [`tool-call-progress`](streaming-protocol.md#event-tool-call-progress) stream frames, which

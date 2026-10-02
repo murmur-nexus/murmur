@@ -1206,6 +1206,52 @@ fn a_large_tool_input_writes_a_bounded_number_of_progress_frames() {
     );
 }
 
+/// The value the `tool-progress` profile's call carries as its input, and nothing else in the run.
+const STARTED_CALL_INPUT: &str = "QXZJ-WKVR-MPLT-YNGH";
+
+/// S10. A started call's input reaches the trace and no frame of the stream, live or replayed.
+/// Every four-byte piece of the input's value is looked for, so a fragment of it is caught as
+/// well as the whole.
+#[test]
+fn no_frame_carries_any_part_of_a_started_call_s_input() {
+    if common::skip_without_host_support("no_frame_carries_any_part_of_a_started_call_s_input") {
+        return;
+    }
+    let capsule = ProcessCapsule::new("progress-input", "tool-progress")
+        .with_tool()
+        .start();
+    let live = collect_sse_events(&capsule.url(), STREAM_TIMEOUT);
+    let replayed = watch_until_final(&capsule.url(), 0);
+    assert_eq!(
+        frame_kinds(&live)[1..5],
+        [
+            "tool-call-started",
+            "tool-call-progress",
+            "tool-call-progress",
+            "artifact"
+        ]
+    );
+
+    let trace = capsule.trace_after_task_end();
+    let calls = trace_events(&trace, "tool_call");
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert_eq!(calls[0]["input"]["msg"], STARTED_CALL_INPUT, "{}", calls[0]);
+
+    let pieces: Vec<&str> = (0..=STARTED_CALL_INPUT.len() - 4)
+        .map(|at| &STARTED_CALL_INPUT[at..at + 4])
+        .collect();
+    for event in live.iter().chain(&replayed) {
+        for piece in &pieces {
+            assert!(
+                !event.data.contains(piece),
+                "a {} frame carries {piece:?} of the call's input: {}",
+                event.event_type,
+                event.data
+            );
+        }
+    }
+}
+
 /// The `on-inference` hook the hook scenarios declare, and what it returns every turn.
 const HOOK: &str = "review-hook";
 const HOOK_PAYLOAD: &str = r#"{"reviewed":true}"#;

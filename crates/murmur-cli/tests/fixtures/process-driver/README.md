@@ -143,7 +143,7 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `interrupt-ignores` | Never reads stdin and sleeps 600 s, so the interrupt grace runs out and the runtime kills it |
 | `interrupt-signal` | Traps `INT`, then `fail canceled interrupted by SIGINT` and exit `0` |
 | `parity` | One `text`, one bridge tool call and its result, then the answer and `end PARITY-ANSWER` |
-| `tool-progress` | `parity`, with `tstart c1`, `tprogress c1 12` and `tprogress c1 40` before the `tool` line |
+| `tool-progress` | `parity`, with `tstart c1`, `tprogress c1 12` and `tprogress c1 40` before the `tool` line, whose input is `{"msg":"QXZJ-WKVR-MPLT-YNGH"}` while the bridge is called with the default ping, so the input appears nowhere but the call |
 | `tool-progress-large` | `tool-progress`, with 350 `tprogress c1` lines in steps of 20, ending at `7000`, printed back to back |
 | `stream` | Three `delta` fragments, the complete `text`, then `end` with the same words |
 | `think` | Two `tdelta` fragments, the complete `thinking`, then `text done` and `end DONE` |

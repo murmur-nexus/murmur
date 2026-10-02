@@ -356,13 +356,15 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     ;;
   tool-progress)
     # `parity`, with the tool call reported while it is being written: its start, then two
-    # cumulative sizes, then the complete call.
+    # cumulative sizes, then the complete call. The call's input holds a value nothing else in the
+    # run carries, and the bridge is called with the echo tool's default arguments rather than
+    # with it, so a test can tell the input apart from the tool's echoed output.
     echo "started s1 subscription"
     echo "text working on it"
     echo "tstart c1 ${FIXTURE_BRIDGE_TOOLS%%,*}"
     echo "tprogress c1 12"
     echo "tprogress c1 40"
-    echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"ping\"}"
+    echo "tool c1 ${FIXTURE_BRIDGE_TOOLS%%,*} {\"msg\":\"QXZJ-WKVR-MPLT-YNGH\"}"
     answer="$(call_bridge)"
     echo "result c1 ok $answer"
     echo "text PARITY-ANSWER"

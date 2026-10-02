@@ -36,8 +36,7 @@ fn retired_wasm() -> PathBuf {
     common::fixture_path("process-driver-v1/tool/process-driver-v1.wasm")
 }
 
-/// A driver built against the frozen `@0.2.0` WIT beside it: the version every process driver
-/// published before `@0.3.0` was built against.
+/// A driver built against the frozen `@0.2.0` WIT beside it.
 fn previous_wasm() -> PathBuf {
     common::fixture_path("process-driver-v2/tool/process-driver-v2.wasm")
 }
@@ -236,9 +235,8 @@ fn a_driver_built_against_the_retired_version_is_refused() {
     assert!(text.contains("rebuild"), "{text}");
 }
 
-/// An installed driver built against `@0.2.0` — every one published before `@0.3.0` — is refused
-/// at launch, and the hint names the fix: a release built against the version the host accepts,
-/// installed with `mur install`.
+/// An installed driver built against `@0.2.0` is refused at launch, and the hint names the fix: a
+/// release built against the version the host accepts, installed with `mur install`.
 #[test]
 fn a_driver_built_against_0_2_0_is_refused_with_the_install_that_fixes_it() {
     let name = "previous-process-driver";
