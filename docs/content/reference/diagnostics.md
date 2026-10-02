@@ -565,20 +565,20 @@ The message ends with the path and the operating system's error.
 driver interface, so a driver built against another one — including one an older `murmur.lock`
 pins — is refused until a release built against the served one is installed.
 
-| Transport | Refused artifact | Served interface |
+| Driver | Refused when | Served interface |
 |---|---|---|
-| `http` | Any `runtime: driver` artifact importing a `murmur:text` interface, or `murmur:stream/events` at another version | Imports [`murmur:stream/events@0.1.0`](wit-interfaces.md#stream-events) |
-| `process` | The `inference.driver` artifact, when it does not export the process interface | Exports `murmur:driver/process@0.3.0` |
+| Every `runtime: driver` artifact the manifest declares, except a `transport: process` inference driver | It imports any `murmur:text` interface, or `murmur:stream/events` at another version | Imports [`murmur:stream/events@0.1.0`](wit-interfaces.md#stream-events) |
+| The `inference.driver` artifact of a `transport: process` capsule | It does not export the process interface | Exports `murmur:driver/process@0.3.0` |
 
-On `http`, every declared driver is checked, not only the one `inference.driver` names. The message
-names the artifact, every import the host does not serve and `murmur:stream/events@0.1.0`:
+For a stream-interface refusal, the message names the artifact, every import the host does not
+serve and `murmur:stream/events@0.1.0`:
 
 ```text
 error[E-RUN-029]: artifact 'my-http-driver@1.0.0' imports murmur:text/chunks@0.1.0, which this host does not serve; a driver must import murmur:stream/events@0.1.0 in its place
   hint: pin a release of my-http-driver built against murmur:stream/events@0.1.0 in murmur.yaml and run `mur install`, or rebuild it against that interface
 ```
 
-On `process`:
+For a process driver:
 
 | The artifact exports | Message ends | Hint |
 |---|---|---|

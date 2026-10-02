@@ -1306,18 +1306,23 @@ const PROGRESS_MARKER: &str = "progress-marker-7f3a";
 /// The compact size of the fixture's call input, `{"msg":"progress-marker-7f3a"}`.
 const PROGRESS_INPUT_BYTES: u64 = 30;
 
-/// Assert no frame ahead of the first `artifact` carries the call's input marker.
-fn assert_no_input_before_the_artifact(events: &[SseEvent]) {
-    for event in events
-        .iter()
-        .take_while(|event| event.event_type != "artifact")
-    {
-        assert!(
-            !event.data.contains(PROGRESS_MARKER),
-            "a {} frame ahead of the artifact carries the call's input: {}",
-            event.event_type,
-            event.data
-        );
+/// Assert no frame but an `artifact` carries any four-byte piece of the call's input marker. The
+/// echo tool's result repeats its input, so the `artifact` that answers the call carries it.
+fn assert_no_input_outside_the_artifact(events: &[SseEvent]) {
+    // A piece made only of hex digits can occur by chance in a task or context id.
+    let pieces: Vec<&str> = (0..=PROGRESS_MARKER.len() - 4)
+        .map(|at| &PROGRESS_MARKER[at..at + 4])
+        .filter(|piece| !piece.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    for event in events.iter().filter(|event| event.event_type != "artifact") {
+        for piece in &pieces {
+            assert!(
+                !event.data.contains(piece),
+                "a {} frame carries {piece:?} of the call's input: {}",
+                event.event_type,
+                event.data
+            );
+        }
     }
 }
 
@@ -1329,7 +1334,7 @@ fn progress_sizes(events: &[SseEvent]) -> Vec<u64> {
         .collect()
 }
 
-/// S11. A tool call an http driver reports while its model writes it reaches the client as its
+/// A tool call an http driver reports while its model writes it reaches the client as its
 /// start and its size, before the `artifact` that answers it — the frames a process capsule writes
 /// for the same work.
 #[test]
@@ -1386,10 +1391,11 @@ fn a_started_tool_call_streams_its_start_and_size_on_http() {
             _ => {}
         }
     }
-    assert_no_input_before_the_artifact(&http_events);
+    assert_no_input_outside_the_artifact(&http_events);
+    assert_no_input_outside_the_artifact(&watch_until_final(&http.url(), 0));
 }
 
-/// S12. Text and thinking an http driver streams ahead of a started call still reach the client,
+/// Text and thinking an http driver streams ahead of a started call still reach the client,
 /// and the turn's cursor removal follows the call's last progress frame.
 #[test]
 fn text_and_thinking_still_stream_beside_a_started_tool_call_on_http() {
@@ -1426,10 +1432,10 @@ fn text_and_thinking_still_stream_beside_a_started_tool_call_on_http() {
     assert_eq!(texts[0]["final"], false);
     assert_eq!(texts[1]["text"], "", "the cursor removal: {}", texts[1]);
     assert_eq!(texts[1]["final"], true);
-    assert_no_input_before_the_artifact(&events);
+    assert_no_input_outside_the_artifact(&events);
 }
 
-/// S13. A watcher that reconnects after an http task replays the started call's frames under the
+/// A watcher that reconnects after an http task replays the started call's frames under the
 /// ids the live stream carried them with.
 #[test]
 fn a_reconnecting_watcher_replays_a_started_tool_call_on_http() {
@@ -1457,7 +1463,7 @@ fn a_reconnecting_watcher_replays_a_started_tool_call_on_http() {
     }
 }
 
-/// S14. A 7000-byte input an http driver reports in 350 steps writes a handful of progress frames:
+/// A 7000-byte input an http driver reports in 350 steps writes a handful of progress frames:
 /// none of the task's frames is evicted from the replay buffer, and a watcher reading throughout is
 /// never lagged.
 #[test]
@@ -1522,7 +1528,7 @@ fn a_large_tool_input_on_http_writes_a_bounded_number_of_progress_frames() {
     );
 }
 
-/// S15. An http driver that reports progress for a call it never started, starts one with no id,
+/// An http driver that reports progress for a call it never started, starts one with no id,
 /// starts the same call twice and reports a shrinking size gets one start and one progress frame
 /// for its one real call, and nothing for the rest.
 #[test]
