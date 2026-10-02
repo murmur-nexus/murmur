@@ -40,7 +40,7 @@ tiktoken-rs = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "macros", "time", "fs", "process", "signal"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "v7"] }
-wasmtime = { version = "48.0.3", default-features = false, features = [
+wasmtime = { version = "48.0.5", default-features = false, features = [
   "runtime",
   "cranelift",
   "component-model",
@@ -48,8 +48,8 @@ wasmtime = { version = "48.0.3", default-features = false, features = [
   "std",
   "parallel-compilation",
 ] }
-wasmtime-wasi = { version = "48.0.3", default-features = false, features = ["p2"] }
-wasmtime-wasi-http = { version = "48.0.3", features = ["default-send-request"] }
+wasmtime-wasi = { version = "48.0.5", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "48.0.5", features = ["default-send-request"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
