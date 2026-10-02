@@ -508,8 +508,9 @@ fn an_allowing_hook_leaves_a_bridged_call_alone() {
 /// What the decision point costs a bridged call, as a per-call figure a build summary can name.
 ///
 /// The same harness, the same number of bridged calls, run once with a `commit_policy: deny`
-/// hook armed and once with only the required-field check, which every bridged call crosses. Nothing is asserted about the
-/// number: it is a measurement, and a machine under load would make an assertion on it a flake.
+/// hook armed and once with only the required-field check, which every bridged call crosses.
+/// Nothing is asserted about the number: it is a measurement, and a machine under load would make
+/// an assertion on it a flake.
 #[test]
 fn the_gated_path_reports_its_per_call_cost() {
     if common::skip_without_host_support("the_gated_path_reports_its_per_call_cost") {

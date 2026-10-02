@@ -5266,6 +5266,17 @@ fn first_malformed_schema_warning(warned: &Mutex<BTreeSet<String>>, name: &str) 
     }
 }
 
+/// The `W-RUN-004` line for the tool `name`, whose schema is malformed for the reason `why`.
+fn malformed_schema_warning(name: &str, why: crate::required_fields::MalformedSchema) -> String {
+    format!(
+        "[capsule-runtime] warning[{code}]: the tool '{name}' declares an input_schema whose \
+         {why}, so its calls are dispatched without the required-field check ({link})",
+        code = murmur_artifact::W_RUN_004,
+        why = why.describe(),
+        link = murmur_artifact::runtime_warning_link(murmur_artifact::W_RUN_004),
+    )
+}
+
 /// A call [`CapsuleStoreState::check_required_fields`] refused: the required names its input
 /// lacks, in the schema's declared order, and the text the model is handed for it.
 pub(crate) struct RequiredFieldRefusal {
@@ -6720,7 +6731,8 @@ impl CapsuleStoreState {
     /// no `required`, and a malformed schema — the last named once per tool in `W-RUN-004`.
     ///
     /// The schema is read per call rather than from staging, so a tool `manage.pull()` added or
-    /// replaced mid-session is judged by the schema the model is offered for it now.
+    /// replaced mid-session is judged by its staged schema from its next call — before
+    /// `inference.tool_refresh` has necessarily put that schema in the inventory the model sees.
     pub(crate) fn check_required_fields(
         &self,
         name: &str,
@@ -6772,14 +6784,7 @@ impl CapsuleStoreState {
     /// Print `W-RUN-004` for `name` unless this session already has.
     fn warn_malformed_schema_once(&self, name: &str, why: crate::required_fields::MalformedSchema) {
         if first_malformed_schema_warning(&self.required_schema_warned, name) {
-            crate::runtime_err!(
-                "[capsule-runtime] warning[{code}]: the tool '{name}' declares an input_schema \
-                 whose {why}, so its calls are dispatched without the required-field check \
-                 ({link})",
-                code = murmur_artifact::W_RUN_004,
-                why = why.describe(),
-                link = murmur_artifact::runtime_warning_link(murmur_artifact::W_RUN_004),
-            );
+            crate::runtime_err!("{}", malformed_schema_warning(name, why));
         }
     }
 
@@ -17363,6 +17368,24 @@ inference:
         .join();
         assert!(poisoned.is_poisoned());
         assert!(!first_malformed_schema_warning(&poisoned, "t"));
+    }
+
+    #[test]
+    fn check_required_fields_warning_names_the_tool_and_the_defect() {
+        use crate::required_fields::MalformedSchema;
+
+        assert_eq!(
+            malformed_schema_warning("my-tool", MalformedSchema::RequiredNotStringArray),
+            "[capsule-runtime] warning[W-RUN-004]: the tool 'my-tool' declares an input_schema \
+             whose `required` is not an array of strings, so its calls are dispatched without \
+             the required-field check \
+             (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-004)"
+        );
+        assert!(
+            malformed_schema_warning("my-tool", MalformedSchema::RootNotObject).contains(
+                "the tool 'my-tool' declares an input_schema whose root is not a JSON object"
+            )
+        );
     }
 
     /// The schema is read per call, so a tool replaced mid-session is judged by its new schema
