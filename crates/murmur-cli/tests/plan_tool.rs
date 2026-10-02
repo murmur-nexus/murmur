@@ -658,8 +658,10 @@ fn a_failed_step_stops_the_plan_and_is_reported_as_a_failure() {
     assert_eq!(call["status"], "error", "{call}");
 }
 
-/// Malformed arguments are refused by the tool, naming itself and the argument it needs — no plan
-/// file is written and the scheduler never starts.
+/// Malformed arguments are refused, naming the tool and the argument it needs — no plan file is
+/// written and the scheduler never starts. A missing `plan` is refused by the required-field
+/// check against `submit-plan`'s own `input_schema`; a `plan` that is not an object is refused by
+/// the tool.
 #[test]
 fn malformed_input_is_refused_before_a_plan_file_exists() {
     let server = common::ScriptedServer::start(vec![
@@ -678,11 +680,15 @@ fn malformed_input_is_refused_before_a_plan_file_exists() {
     let workdir = workdir_from(&assert);
     let requests = server.requests();
 
-    for tool_id in ["toolu_empty", "toolu_string"] {
-        let refusal = tool_result_text(&requests, tool_id);
-        assert!(refusal.contains("submit-plan"), "{tool_id}: {refusal}");
-        assert!(refusal.contains("'plan'"), "{tool_id}: {refusal}");
-    }
+    let missing = tool_result_text(&requests, "toolu_empty");
+    assert!(
+        missing.starts_with(r#"submit-plan: missing required field "plan""#),
+        "{missing}"
+    );
+    let string = tool_result_text(&requests, "toolu_string");
+    assert!(string.contains("submit-plan"), "{string}");
+    assert!(string.contains("'plan'"), "{string}");
+    assert_eq!(trace_events(&workdir, "tool_input_refused").len(), 1);
     assert!(
         !workdir.join("plans").exists(),
         "a refused call writes no plan file"

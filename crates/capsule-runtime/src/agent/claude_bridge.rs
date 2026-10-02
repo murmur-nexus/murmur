@@ -26,10 +26,11 @@
 //!   token and the bare tool names, and is what writes them into whatever configuration its
 //!   harness reads: the runtime builds no harness configuration and no harness tool name.
 //! - Only the capsule's declared tools are advertised.
-//! - Every call crosses the session's decision point first — the manifest's
-//!   `capabilities.filesystem.read_only` check and then an `on-tool-call` policy hook — over the
-//!   gate channel, because the hook runtime and the trace writer belong to the task driving the
-//!   harness and this bridge holds only the store.
+//! - Every call crosses the session's decision point first, over the gate channel, because the
+//!   hook runtime and the trace writer belong to the task driving the harness and this bridge
+//!   holds only the store. The decision point runs the required-field check on every call and
+//!   then, only for a capsule with a policy hook or a `read_only` path, the manifest's
+//!   `capabilities.filesystem.read_only` check and an `on-tool-call` policy hook.
 //! - Request/response is plain JSON, so the transport is a minimal manual HTTP/1.1 handler
 //!   mirroring `identity.rs`, not a full server stack.
 
@@ -187,13 +188,13 @@ impl BridgeHandle {
     /// through a long tool call writes nothing to stdout, so this is the other half of the
     /// evidence that it is still alive — see the runner's inactivity clock.
     ///
-    /// `gate` is where a `tools/call` asks whether it may run. `None` is a capsule that declared
-    /// neither a policy hook that gates calls nor a `read_only` path, so nothing can refuse one
-    /// and no call is resolved or sent.
+    /// `gate` is where every `tools/call` asks whether it may run. The answering side runs the
+    /// required-field check on each call and then, only for a capsule with a policy hook or a
+    /// `read_only` path, the manifest's `read_only` check and the policy hook.
     pub(super) async fn serve(
         &self,
         store: &CapsuleStoreState,
-        gate: Option<&mpsc::UnboundedSender<GateRequest>>,
+        gate: &mpsc::UnboundedSender<GateRequest>,
         on_request: &dyn Fn(),
     ) {
         // Serve inline (not spawned): keeps the borrow of `store` non-'static and serializes
@@ -210,7 +211,7 @@ impl BridgeHandle {
         &self,
         stream: TcpStream,
         store: &CapsuleStoreState,
-        gate: Option<&mpsc::UnboundedSender<GateRequest>>,
+        gate: &mpsc::UnboundedSender<GateRequest>,
     ) {
         use tokio::io::AsyncBufReadExt;
 
@@ -331,7 +332,7 @@ impl BridgeHandle {
         &self,
         params: Option<&Value>,
         store: &CapsuleStoreState,
-        gate: Option<&mpsc::UnboundedSender<GateRequest>>,
+        gate: &mpsc::UnboundedSender<GateRequest>,
     ) -> Value {
         let name = params
             .and_then(|p| p.get("name"))
@@ -346,14 +347,12 @@ impl BridgeHandle {
             .unwrap_or_else(|| json!({}));
         let input_json = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
 
-        if let Some(gate) = gate {
-            // A refusal means nothing ran, and its trace line is written on the answering side.
-            // The harness still reports the failure as a tool result of its own, which the event
-            // sink records as a `tool_call` with `status: error`: this request carries no id
-            // tying it to that result, so suppressing the pair would mean guessing.
-            if let Some(refusal) = ask_gate(gate, &name, &input_json).await {
-                return error_result(refusal);
-            }
+        // A refusal means nothing ran, and its trace line is written on the answering side. The
+        // harness still reports the failure as a tool result of its own, which the event sink
+        // records as a `tool_call` with `status: error`: this request carries no id tying it to
+        // that result, so suppressing the pair would mean guessing.
+        if let Some(refusal) = ask_gate(gate, &name, &input_json).await {
+            return error_result(refusal);
         }
 
         match store

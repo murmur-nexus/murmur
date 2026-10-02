@@ -34,7 +34,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
-| `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
+| `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
@@ -671,6 +671,27 @@ hook](../concepts/hooks.md#policy-hooks), so a call refused here produces no `ca
 beside it. `mur trace show` reports the count as `protected-path refusals`.
 
 Distinct from `call_denied` above, which is a *hook's* refusal and names the hook.
+
+**`tool_input_refused`**{ #tool-input-refused } — written when a tool call's input lacks a name
+the tool's [`input_schema`](manifest.md#input-schema) lists in `required`, and the call is refused
+before the tool runs
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | The turn the refused call was requested in |
+| `tool_name` | string | The tool the model called |
+| `tool_call_id` | string \| null | The provider's id for the call. `null` under `transport: process`, whose bridged calls carry none |
+| `missing` | string[] | Every required name the input lacked, in the order the schema declares them |
+| `reason` | string | The text the model was handed, so the trace and the agent agree on why |
+
+Written whatever [`trace.capture`](manifest.md#field-trace) is. A `tool_call` record with
+`status: "error"` accompanies it on both transports — the call is reported as a failed tool call —
+and under the default `trace.capture: meta` that record carries no `output`, so this is the line
+that holds the reason. No `call_denied` or `protected_path_denied` sits beside it: this check runs
+first and the policy hook is not asked. A refusal is not a session failure and the turn continues.
+
+A plan `tool` step refused for the same reason writes no `tool_input_refused`; its
+[`plan_step`](#plan-events) record carries the same text in `error`.
 
 **`spend_ceiling_reached`**{ #spend-ceiling-reached } — written when a spend ceiling refuses a
 driver call before it is sent

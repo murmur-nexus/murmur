@@ -1023,19 +1023,14 @@ async fn drive_harness(
             }
         }
     };
-    // The same short-circuit the agent loop applies to its own calls: a capsule that declared
-    // neither a policy hook that gates calls nor a `read_only` path has nothing that can refuse
-    // one, so no channel exists, no call is resolved and nothing crosses a task boundary.
-    let gated = bridge.is_some()
-        && CallGate::new(hooks, trace, workdir, sink.current_turn()).gates(store_state);
-    let (gate_tx, mut gate_rx) = gated
-        .then(mpsc::unbounded_channel::<claude_bridge::GateRequest>)
-        .unzip();
+    // Every bridged call crosses the decision point, because the required-field check applies to
+    // every capsule. A run with no bridge never sends on the channel, and the receiver parks.
+    let (gate_tx, mut gate_rx) = mpsc::unbounded_channel::<claude_bridge::GateRequest>();
 
     // One long-lived future: re-creating it per iteration would drop a connection mid tool call.
     let bridge_future = async {
         match bridge {
-            Some(handle) => handle.serve(store_state, gate_tx.as_ref(), &bump).await,
+            Some(handle) => handle.serve(store_state, &gate_tx, &bump).await,
             None => std::future::pending::<()>().await,
         }
     };
@@ -1076,18 +1071,29 @@ async fn drive_harness(
             // is answered. The bridge waits for that answer in the arm below, and everything
             // this arm touches — the store, the hooks, the trace — is owned here, so neither
             // half waits on the other.
-            request = next_gate_request(gate_rx.as_mut()) => {
+            request = next_gate_request(&mut gate_rx) => {
                 let claude_bridge::GateRequest { tool_name, input_json, reply } = request;
-                // Resolved exactly once, for both checks, from the same values dispatch is about
-                // to be handed.
-                let resolved = store_state.resolve_call(&tool_name, &ToolInput {
-                    data: Some(input_json),
-                    log_path: None,
-                });
+                // Arguments that are not JSON have no keys, so they miss every required field.
+                let input = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
                 let mut gate = CallGate::new(hooks, trace, workdir, sink.current_turn());
                 // A refusal that could not be recorded refuses anyway: an unaudited call is the
                 // thing the decision point exists to prevent.
-                let verdict = match gate.check(store_state, &resolved).await {
+                let verdict = match gate
+                    .check_required_fields(store_state, &tool_name, None, &input)
+                    .await
+                {
+                    Ok(None) if gate.gates(store_state) => {
+                        // Resolved exactly once, for both remaining checks, from the same values
+                        // dispatch is about to be handed.
+                        let resolved = store_state.resolve_call(&tool_name, &ToolInput {
+                            data: Some(input_json),
+                            log_path: None,
+                        });
+                        match gate.check(store_state, &resolved).await {
+                            Ok(verdict) => verdict,
+                            Err(error) => Some(error.to_string()),
+                        }
+                    }
                     Ok(verdict) => verdict,
                     Err(error) => Some(error.to_string()),
                 };
@@ -1264,19 +1270,15 @@ async fn drive_harness(
     }
 }
 
-/// The gate arm's future: the next bridged call waiting on the decision point, or one that never
-/// resolves — for a capsule where nothing can refuse a call, and so has no channel.
+/// The gate arm's future: the next bridged call waiting on the decision point.
 async fn next_gate_request(
-    gate: Option<&mut mpsc::UnboundedReceiver<claude_bridge::GateRequest>>,
+    gate: &mut mpsc::UnboundedReceiver<claude_bridge::GateRequest>,
 ) -> claude_bridge::GateRequest {
-    match gate {
-        // The sender lives in the driving function's frame for as long as the loop runs, so the
-        // channel cannot close under it; parking rather than returning is what keeps the arm
-        // from spinning if it ever does.
-        Some(gate) => match gate.recv().await {
-            Some(request) => request,
-            None => std::future::pending().await,
-        },
+    // The sender lives in the driving function's frame for as long as the loop runs, so the
+    // channel cannot close under it; parking rather than returning is what keeps the arm from
+    // spinning if it ever does.
+    match gate.recv().await {
+        Some(request) => request,
         None => std::future::pending().await,
     }
 }
