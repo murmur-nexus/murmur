@@ -36,8 +36,8 @@ use crate::{
     runtime::CapsuleStoreState,
     spend::SpendRefusal,
     streaming::{
-        emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamStatus,
-        TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
+        emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamFrame,
+        StreamStatus, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
     },
     trace::{
         TraceWriter, WireCapture, TASK_FAILED_COMPACTION_HOOK, TASK_FAILED_CREDENTIAL_REJECTED,
@@ -1071,7 +1071,7 @@ pub(crate) async fn run_agent_loop(
         if task_id.is_some() {
             emit_sse(
                 &sse,
-                "status",
+                StreamFrame::Status,
                 &TaskStatusUpdateEvent {
                     id: task_id_str.clone(),
                     context_id: context_id.clone(),
@@ -1649,7 +1649,7 @@ pub(crate) async fn run_agent_loop(
                             if task_id.is_some() {
                                 emit_sse(
                                     &sse,
-                                    "artifact",
+                                    StreamFrame::Artifact,
                                     &TaskArtifactUpdateEvent {
                                         id: task_id_str.clone(),
                                         artifact: StreamArtifact::tool_call(
@@ -1732,7 +1732,7 @@ pub(crate) async fn run_agent_loop(
                             if task_id.is_some() {
                                 emit_sse(
                                     &sse,
-                                    "artifact",
+                                    StreamFrame::Artifact,
                                     &TaskArtifactUpdateEvent {
                                         id: task_id_str.clone(),
                                         // The runtime's own text about a call that never
@@ -2169,7 +2169,7 @@ async fn finish_completed_turn(
         for ha in hook_artifact {
             emit_sse(
                 sse,
-                "artifact",
+                StreamFrame::Artifact,
                 &TaskArtifactUpdateEvent {
                     id: task_id_str.to_string(),
                     // A hook artifact is the capsule operator's own declared hook speaking, not

@@ -209,6 +209,14 @@ A 200 response confirms the capsule is running:
           "network": false,
           "planes": []
         }
+      },
+      {
+        "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
+        "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "required": false,
+        "params": {
+          "frames": ["status", "artifact", "text", "thinking", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+        }
       }
     ]
   },

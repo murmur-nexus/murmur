@@ -806,7 +806,7 @@ mod tests {
         let json_key = format!(".get(\"{work_id}\")");
         let schema = concat!("input", "_schema");
 
-        let sources = crate_sources();
+        let sources = crate::source_scan::crate_sources();
         let mut offences = Vec::new();
         for (path, source) in &sources {
             for (number, line) in source.lines().enumerate() {
@@ -841,38 +841,6 @@ mod tests {
         }
 
         assert!(offences.is_empty(), "{RULE}\n{}", offences.join("\n"));
-    }
-
-    /// Every `.rs` file under this crate's `src`, as `(path relative to src, contents)`.
-    fn crate_sources() -> Vec<(String, String)> {
-        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-        let mut sources = Vec::new();
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).expect("the crate's src directory is readable") {
-                let entry = entry.expect("a readable directory entry");
-                let path = entry.path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let relative = path
-                        .strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned();
-                    sources.push((
-                        relative,
-                        std::fs::read_to_string(&path).expect("a readable source file"),
-                    ));
-                }
-            }
-        }
-        assert!(
-            sources.len() > 10,
-            "the source sweep found only {} files, so it is not sweeping the crate",
-            sources.len()
-        );
-        sources
     }
 
     // ── The operator's abandonment report ────────────────────────────────────

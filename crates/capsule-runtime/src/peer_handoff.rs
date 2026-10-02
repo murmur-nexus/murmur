@@ -1150,7 +1150,10 @@ mod tests {
                 &crate::types::CapabilityPolicy::default(),
                 &murmur_artifact::TaskAcceptance::Single,
                 crate::identity::DeclaredPlanes::default(),
-                crate::identity::TransportCapabilities { streams_text: true },
+                crate::identity::TransportCapabilities {
+                    streams_text: true,
+                    kind: crate::identity::TransportKind::Http,
+                },
             );
             assert_eq!(own_audience(&identity), audience_from_card(&card).unwrap());
         }

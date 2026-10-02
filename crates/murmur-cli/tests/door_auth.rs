@@ -209,11 +209,11 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         Ok(()),
         "{card:#}"
     );
-    assert_eq!(
-        card["capabilities"]["extensions"].as_array().unwrap().len(),
-        1,
-        "{card:#}"
-    );
+    let extensions = card["capabilities"]["extensions"].as_array().unwrap();
+    assert_eq!(extensions.len(), 2, "{card:#}");
+    assert_eq!(extensions[0]["uri"], common::DOOR_EXTENSION_URI);
+    assert_eq!(extensions[1]["uri"], common::STREAM_EXTENSION_URI);
+    assert!(!common::card_stream_frames(&card).is_empty(), "{card:#}");
     assert!(common::card_door_methods(&card).contains(&"agent/getAuthenticatedExtendedCard"));
     assert_eq!(card["capabilities"]["extendedAgentCard"], true);
     assert_eq!(
@@ -341,6 +341,24 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     assert_eq!(
         common::card_capsule_params(&extended)["planes"],
         json!(["files"])
+    );
+    let extended_uris: Vec<&Value> = extended["capabilities"]["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|extension| &extension["uri"])
+        .collect();
+    assert_eq!(
+        extended_uris,
+        [
+            common::DOOR_EXTENSION_URI,
+            common::CAPSULE_EXTENSION_URI,
+            common::STREAM_EXTENSION_URI
+        ]
+    );
+    assert_eq!(
+        common::card_stream_frames(&extended),
+        common::card_stream_frames(&card)
     );
 
     // The streaming methods are refused before any stream opens.

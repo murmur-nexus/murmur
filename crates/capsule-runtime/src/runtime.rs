@@ -89,7 +89,7 @@ use crate::{
     state_store::STATE_PREOPEN_NAME,
     streaming::{
         emit_chunk_sse, emit_sse, emit_thinking_chunk_sse, SseBroadcast, SseEventBuffer,
-        StreamStatus, TaskStatusUpdateEvent,
+        StreamFrame, StreamStatus, TaskStatusUpdateEvent,
     },
     tool_annotations::ToolAnnotationMap,
     trace::TraceWriter,
@@ -364,7 +364,7 @@ async fn run_task_with_reopens(
                     if let Some(task_id) = &agent_task_id {
                         emit_sse(
                             &sse,
-                            "status",
+                            StreamFrame::Status,
                             &TaskStatusUpdateEvent {
                                 id: task_id.clone(),
                                 context_id: context_id.clone(),
@@ -499,7 +499,7 @@ async fn end_task(
     };
     emit_sse(
         sse,
-        "status",
+        StreamFrame::Status,
         &TaskStatusUpdateEvent {
             id: task_id.to_string(),
             context_id,
@@ -803,16 +803,22 @@ fn check_forget_launchable(inference: Option<&InferenceConfig>) -> Result<(), Ru
     })
 }
 
-/// What this session's inference transport can do, for the streaming boolean on the agent card.
+/// What this session's inference transport can do, for the streaming boolean and the stream
+/// extension's frame list on the agent card.
 ///
-/// A `transport: process` session streams only what the harness its driver drives streams, which
-/// the driver's `describe().streams-text` answers. Every other transport runs inside this runtime,
-/// which streams. Cancellation is not here: a task is stopped the same way on every transport.
+/// A session is [`identity::TransportKind::Process`] exactly when it staged a process driver. It
+/// streams only what the harness its driver drives streams, which the driver's
+/// `describe().streams-text` answers. Every other transport runs inside this runtime, which
+/// streams. Cancellation is not here: a task is stopped the same way on every transport.
 fn transport_capabilities(staged: &StagedSession) -> identity::TransportCapabilities {
-    identity::TransportCapabilities {
-        streams_text: match staged.process_driver.as_ref() {
-            Some(driver) => driver.description.streams_text,
-            None => true,
+    match staged.process_driver.as_ref() {
+        Some(driver) => identity::TransportCapabilities {
+            streams_text: driver.description.streams_text,
+            kind: identity::TransportKind::Process,
+        },
+        None => identity::TransportCapabilities {
+            streams_text: true,
+            kind: identity::TransportKind::Http,
         },
     }
 }
@@ -5103,7 +5109,7 @@ pub(crate) async fn request_input_impl(
 
     emit_sse(
         &sse,
-        "status",
+        StreamFrame::Status,
         &TaskStatusUpdateEvent {
             id: task_id.clone(),
             context_id: None,
@@ -5143,7 +5149,7 @@ pub(crate) async fn request_input_impl(
         Ok(text) => {
             emit_sse(
                 &sse,
-                "status",
+                StreamFrame::Status,
                 &TaskStatusUpdateEvent {
                     id: task_id.clone(),
                     context_id: None,
@@ -9198,7 +9204,7 @@ async fn record_canceled_before_start(
     let _ = trace.flush().await;
     emit_sse(
         sse,
-        "status",
+        StreamFrame::Status,
         &crate::streaming::TaskStatusUpdateEvent {
             id: task.task_id.clone(),
             context_id: Some(task.context_id.clone()),
@@ -9289,7 +9295,7 @@ async fn refuse_undelivered_tasks(
             .await;
         emit_sse(
             sse,
-            "status",
+            StreamFrame::Status,
             &crate::streaming::TaskStatusUpdateEvent {
                 id: task_id,
                 context_id: Some(context_id),
