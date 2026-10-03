@@ -20,6 +20,8 @@
 //! what a launch would refuse while remaining a read-only diagnostic. The staging path is what
 //! puts the lowered JSON onto a grant.
 
+use murmur_artifact::describe_yaml_shape;
+
 use crate::errors::RuntimeError;
 
 /// The guest environment variable a configured artifact reads its block out of.
@@ -121,20 +123,6 @@ where
         names.push(name.to_string());
     }
     Ok(names)
-}
-
-/// What kind of YAML node this is, in the vocabulary a manifest author writes in, for a refusal
-/// that tells them what they wrote rather than what a deserializer expected.
-fn describe_yaml_shape(value: &serde_yaml::Value) -> &'static str {
-    match value {
-        serde_yaml::Value::Null => "an empty block",
-        serde_yaml::Value::Bool(_) => "a boolean",
-        serde_yaml::Value::Number(_) => "a number",
-        serde_yaml::Value::String(_) => "a string",
-        serde_yaml::Value::Sequence(_) => "a sequence",
-        serde_yaml::Value::Mapping(_) => "a mapping",
-        serde_yaml::Value::Tagged(_) => "a tagged value",
-    }
 }
 
 /// A scalar rendered the way it reads in the manifest, so a refusal can quote the offending key.

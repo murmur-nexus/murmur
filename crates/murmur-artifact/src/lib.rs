@@ -13,6 +13,7 @@ pub mod payload_shape;
 pub mod platform;
 pub mod registry;
 pub mod registry_warnings;
+pub mod roster;
 pub mod runtime_manifest;
 pub mod runtime_warnings;
 pub mod secrets;
@@ -42,8 +43,8 @@ pub use lockfile::{
     MurmurLock, LOCK_VERSION,
 };
 pub use manifest::{
-    load_manifest, parse_upstream_auth, refuse_retired_auth_block, Manifest, ManifestError,
-    UpstreamAuth, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
+    describe_yaml_shape, load_manifest, parse_upstream_auth, refuse_retired_auth_block, Manifest,
+    ManifestError, UpstreamAuth, RETIRED_AUTH_BLOCK, UPSTREAM_AUTH_KEY_PLACEHOLDER,
 };
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use payload_shape::{
@@ -61,6 +62,11 @@ pub use registry::{
     ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
 };
 pub use registry_warnings::{registry_warning_link, W_REG_001, W_REG_002, W_REG_003};
+pub use roster::{
+    load_roster, member_name_format_error, resolve_roster_path, ReachabilityRule, Roster,
+    RosterError, RosterMember, RosterReachability, MAX_MEMBER_NAME_LEN, REACHABILITY_ALL,
+    ROSTER_FILENAME, ROSTER_VERSION,
+};
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
