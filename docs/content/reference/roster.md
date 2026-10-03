@@ -149,14 +149,15 @@ Each member has 180 seconds from its own start to become ready. A peer refuses t
 with [`E-RUN-045`](diagnostics.md#e-run-045) when it:
 
 - exits before it reports;
+- prints a first line that is not a readiness line;
 - reports no door;
 - reports a formation other than the one it was launched with;
 - does not report within the deadline;
+- exits after it reports, before its door answers;
 - reports a door that does not answer as its session within the deadline.
 
-A refused launch stops every member already started, and never starts the entry member. A live
-process is not readiness: the door is probed every 100 ms until it answers as the reported
-session.
+A refused launch stops every member already started, and never starts the entry member. Readiness
+is the door: it is probed every 100 ms until it answers as the reported session.
 
 ### Stopping { #launch-stop }
 

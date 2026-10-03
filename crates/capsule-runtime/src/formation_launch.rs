@@ -392,24 +392,10 @@ impl FormationExit {
     /// or 128 plus the signal the launcher caught.
     pub fn exit_code(&self) -> i32 {
         match &self.ending {
-            FormationEnding::EntryExited(status) => exit_code_of(*status),
+            FormationEnding::EntryExited(status) => crate::shell::exit_code_of(status),
             FormationEnding::Signalled(signal) => 128 + signal,
         }
     }
-}
-
-fn exit_code_of(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-    1
 }
 
 /// `status N` or `signal N`, for a refusal.
@@ -486,9 +472,7 @@ const REGISTRY_SLOTS: usize = 1024;
 /// Every running member's pid: positive for a member leading its own process group, which the
 /// hook kills as a group; negative for the entry member, which shares the launcher's group and is
 /// killed alone; 0 for a free slot.
-#[allow(clippy::declare_interior_mutable_const)]
-const FREE_SLOT: AtomicI64 = AtomicI64::new(0);
-static MEMBER_REGISTRY: [AtomicI64; REGISTRY_SLOTS] = [FREE_SLOT; REGISTRY_SLOTS];
+static MEMBER_REGISTRY: [AtomicI64; REGISTRY_SLOTS] = [const { AtomicI64::new(0) }; REGISTRY_SLOTS];
 
 /// One registered member. Releasing it — on reap, or on drop — frees the slot.
 struct RegistrySlot(Option<usize>);

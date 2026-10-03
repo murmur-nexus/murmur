@@ -338,8 +338,8 @@ the child holds:
 
 Every other variable the parent holds is absent from the child, including
 [`MURMUR_FORMATION_PEERS`](roster.md#formation-peers): a child that declares it receives nothing. A
-name a child declares that its
-parent does not is refused at `POST /spawn` on the [`capabilities.env.allow` axis](#spawn-envelope).
+name a child declares that its parent does not is refused at `POST /spawn` on the
+[`capabilities.env.allow` axis](#spawn-envelope).
 The five names above are the runtime's, and a child that lists one of them under
 `capabilities.env.allow` does not displace the runtime's value.
 

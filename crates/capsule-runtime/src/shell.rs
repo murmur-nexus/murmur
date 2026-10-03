@@ -622,7 +622,7 @@ fn demote(
 /// unrelated crash into one indistinguishable `-1`. `128 + signal` is the long-standing shell
 /// convention for exactly this case and keeps the cause readable in the trace even where
 /// [`classify_resource_limit`] declines to name a limit.
-fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
     status
@@ -785,8 +785,9 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 ///
 /// [`ARTIFACT_CONFIG_ENV`] and [`FORMATION_PEERS_ENV`] are reserved and never resolved from the
 /// host, whatever a manifest allowlists: the names are runtime-owned, and their values come from
-/// the declaring artifact's own `config:` block and from the session, or from nowhere. Skipped here rather than relied on being overwritten later,
-/// so a host value cannot reach a guest whose entry declared no config at all.
+/// the declaring artifact's own `config:` block and from the session, or from nowhere. Skipped
+/// here rather than relied on being overwritten later, so a host value cannot reach a guest whose
+/// entry declared no config at all.
 pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 

@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::door_capsule::{driver_home, rpc, DRIVER_NAME, DRIVER_VERSION};
-use common::ScriptedServer;
+use common::{publish_to_store, tool_result_text, tool_use_response, ScriptedServer};
 use murmur_artifact::LocalRegistry;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -39,46 +39,6 @@ fn launch_lock() -> std::sync::MutexGuard<'static, ()> {
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
-/// Pack `murmur.yaml` (and `component` as `tool.wasm`) and publish it into `store`.
-fn publish(
-    store: &Path,
-    name: &str,
-    version: &str,
-    runtime: &str,
-    body: &str,
-    component: Option<&Path>,
-) {
-    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-    {
-        let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(format!("name: {name}\nversion: {version}\n{body}").as_bytes())
-            .unwrap();
-        if let Some(component) = component {
-            zip.start_file("tool.wasm", options).unwrap();
-            zip.write_all(&std::fs::read(component).unwrap()).unwrap();
-        }
-        zip.finish().unwrap();
-    }
-    murmur_artifact::Registry::publish(
-        &LocalRegistry::new(store),
-        murmur_artifact::ArtifactMeta {
-            name: name.to_string(),
-            version: version.to_string(),
-            runtime: murmur_artifact::RuntimeType::Wasm,
-            artifact_runtime: runtime.to_string(),
-            platforms: Vec::new(),
-            description: None,
-            tags: Vec::new(),
-            wit_contracts: None,
-        },
-        &cursor.into_inner(),
-    )
-    .unwrap();
-}
-
 /// An agent capsule's manifest body: its driver against `endpoint`, an authenticated door that
 /// serves peers, `lifecycle`, and `extra_artifacts` / `network_allow` for the entry member.
 fn member_manifest(
@@ -100,19 +60,6 @@ fn member_manifest(
 }
 
 const PEER_LIFECYCLE: &str = "task_acceptance: queue\n  after_task: sleep";
-
-fn tool_use_response(tool_id: &str, name: &str, input: Value) -> String {
-    json!({
-        "id": "msg_tool",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": input}],
-        "stop_reason": "tool_use",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()
-}
 
 fn end_turn_response(text: &str) -> String {
     common::door_capsule::end_turn(1, text)
@@ -138,47 +85,6 @@ fn probe_model() -> (ScriptedServer, mpsc::Sender<()>, Arc<AtomicUsize>) {
         }
     });
     (server, release, arrived)
-}
-
-/// The text of the tool result fed back for `tool_id`, with the untrusted-content fence stripped.
-fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
-    for request in requests {
-        for message in request.get("messages")?.as_array()? {
-            if message.get("role").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-                continue;
-            };
-            for block in blocks {
-                if block.get("type").and_then(Value::as_str) != Some("tool_result")
-                    || block.get("tool_use_id").and_then(Value::as_str) != Some(tool_id)
-                {
-                    continue;
-                }
-                let content = block.get("content")?;
-                let text = content.as_str().map(str::to_string).or_else(|| {
-                    content.as_array().and_then(|items| {
-                        items
-                            .iter()
-                            .find_map(|item| item.get("text").and_then(Value::as_str))
-                            .map(str::to_string)
-                    })
-                })?;
-                let inner = text
-                    .split_once('\n')
-                    .filter(|(open, _)| open.starts_with("<untrusted-content"))
-                    .map(|(_, rest)| {
-                        rest.strip_suffix("\n</untrusted-content>")
-                            .unwrap_or(rest)
-                            .to_string()
-                    })
-                    .unwrap_or(text);
-                return Some(inner);
-            }
-        }
-    }
-    None
 }
 
 // ── A project holding a roster ────────────────────────────────────────────────
@@ -248,14 +154,15 @@ impl Project {
         let (model, release, arrived) = probe_model();
         let peer_model = ScriptedServer::start(Vec::new());
         let store = dir.path().join(".murmur").join("artifacts");
-        publish(
+        publish_to_store(
             &store,
             PROBE_TOOL,
             PROBE_VERSION,
             "tool",
             "runtime: tool\n",
-            Some(&common::fixture_path(
-                "formation-probe/tool/formation-probe.wasm",
+            Some((
+                "tool.wasm",
+                &common::fixture_path("formation-probe/tool/formation-probe.wasm"),
             )),
         );
         let mut roster = String::from("roster_version: 1\nmembers:\n");
@@ -278,7 +185,7 @@ impl Project {
             } else {
                 member_manifest(&peer_model.endpoint, PEER_LIFECYCLE, "", "", driver_version)
             };
-            publish(&store, member.name, member.version, "capsule", &body, None);
+            publish_to_store(&store, member.name, member.version, "capsule", &body, None);
             roster.push_str(&format!(
                 "  - name: {name}\n    capsule: {name}\n    version: {version}\n{entry}",
                 name = member.name,
@@ -934,7 +841,7 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
     // A reinstall between admission and the member's spawn: a stand-in `mur` swaps coder's bytes
     // for a different build of the same version, then runs the real binary.
     let alternate = TempDir::new().unwrap();
-    publish(
+    publish_to_store(
         alternate.path(),
         "coder",
         "1.2.0",

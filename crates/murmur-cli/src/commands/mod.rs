@@ -33,7 +33,9 @@ pub(crate) mod watch;
 use std::path::Path;
 
 use capsule_runtime::ResolvedLockArtifact;
-use murmur_artifact::{LockedSha256, LockfileError, RuntimeManifestError, MANIFEST_FILENAME};
+use murmur_artifact::{
+    read_lockfile, LockedSha256, LockfileError, MurmurLock, RuntimeManifestError, MANIFEST_FILENAME,
+};
 
 use crate::error::{
     CliError, E_CAP_018, E_IO_001, E_IO_003, E_MAN_001, E_MAN_002, E_MAN_003, E_RUN_003,
@@ -144,6 +146,16 @@ pub(crate) fn lockfile_error_to_cli(error: LockfileError) -> CliError {
             E_IO_003,
             format!("failed to write murmur.lock at {path}: {source}"),
         ),
+    }
+}
+
+/// `<project_dir>/murmur.lock`, or `None` when the project has none. A lockfile that exists but
+/// cannot be read is an error, never treated as absent.
+pub(crate) fn read_optional_lockfile(project_dir: &Path) -> Result<Option<MurmurLock>, CliError> {
+    match read_lockfile(&project_dir.join("murmur.lock")) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(LockfileError::NotFound(_)) => Ok(None),
+        Err(error) => Err(lockfile_error_to_cli(error)),
     }
 }
 

@@ -16,14 +16,12 @@ use capsule_runtime::formation_launch::{
     MemberLaunchFailure, RunningFormation,
 };
 use capsule_runtime::{admit_roster_file, AdmittedRoster, FormationId};
-use murmur_artifact::{
-    read_lockfile, runtime_warning_link, LocalRegistry, LockfileError, ROSTER_FILENAME, W_RUN_005,
-};
+use murmur_artifact::{runtime_warning_link, LocalRegistry, ROSTER_FILENAME, W_RUN_005};
 
 use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046};
 use crate::registry_client::FallbackRegistry;
 
-use super::lockfile_error_to_cli;
+use super::read_optional_lockfile;
 
 /// What `mur run --roster` was given: the roster, and the flags it passes through.
 pub(crate) struct RosterLaunch<'a> {
@@ -47,11 +45,7 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
         primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
         secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
     };
-    let lock = match read_lockfile(&project_dir.join("murmur.lock")) {
-        Ok(lock) => Some(lock),
-        Err(LockfileError::NotFound(_)) => None,
-        Err(error) => return Err(lockfile_error_to_cli(error)),
-    };
+    let lock = read_optional_lockfile(&project_dir)?;
     let roster =
         admit_roster_file(&project_dir, &registry, lock.as_ref()).map_err(CliError::from)?;
     warn_on_unaddressed_edges(&roster);

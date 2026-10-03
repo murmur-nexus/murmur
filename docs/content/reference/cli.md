@@ -1142,8 +1142,8 @@ launcher's process group, so `^C` at a terminal reaches it as it reaches a hand-
 | A refusal before the entry member started — admission ([`E-ROS-*`](diagnostics.md#e-ros-001), `E-REG-005`), [`E-RUN-045`](diagnostics.md#e-run-045), [`E-RUN-046`](diagnostics.md#e-run-046) | 1 |
 | The launcher received `SIGINT`, `SIGTERM` or `SIGHUP` | 130, 143 or 129 |
 
-By the time the launcher exits, every member it started has been stopped and reaped. The one
-exception is a `SIGKILL` of the launcher itself, which no code in it can answer.
+By the time the launcher exits, every member it started has been stopped and reaped, except after
+a `SIGKILL` of the launcher itself, which leaves the members running.
 
 ---
 
