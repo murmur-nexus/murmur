@@ -116,7 +116,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
-            exports: None,
+            exports: runtime_manifest.exports.clone(),
             control: None,
             door_authentication: None,
             spawn_grant: None,
@@ -344,9 +344,13 @@ fn task_start_line(workdir: &Path) -> Value {
 }
 
 /// Launch a capsule, POST one `message/send` carrying `headers`, and return its `task_start`.
+///
+/// The capsule consents to peer tasks, so that a `peer` claim reaches classification rather than
+/// the door's consent refusal: `peer_tasks.rs` covers a capsule that does not.
 fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
     let server = end_turn_server("provenance probe done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    common::consent_to_peer_tasks(&manifest_path);
     let staged = stage_agent(&home, &manifest_path);
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();

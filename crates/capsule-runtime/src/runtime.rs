@@ -960,6 +960,10 @@ pub fn stage_session(
         .exports
         .as_ref()
         .and_then(|exports| exports.peer_files.clone());
+    let accepts_peer_tasks = request
+        .exports
+        .as_ref()
+        .is_some_and(murmur_artifact::Exports::accepts_peer_tasks);
     // Resolved before the report and before any per-artifact staging, so a malformed store name
     // refuses the launch on the same terms as an unmeetable containment floor: nothing pulled,
     // nothing created, nothing instantiated. Resolution only — `stage_artifact_grant` below is
@@ -1812,6 +1816,7 @@ pub fn stage_session(
         scope_report,
         exports_files,
         exports_peer_files,
+        accepts_peer_tasks,
         registry,
         _epoch_ticker: epoch_ticker,
         // Minted by the daemon at registration, which `launch_session` performs — it names a
@@ -2137,12 +2142,14 @@ fn launch(
                 files: staged.exports_files.is_some(),
                 peer_files: staged.exports_peer_files.is_some(),
             },
+            staged.accepts_peer_tasks,
             transport_capabilities(&staged),
             staged.door_authentication.as_ref(),
         );
         // Read here, where the staged transport is still in hand, for the door to answer the
         // forget header with.
         let forgettable_session = keeps_a_harness_session(staged.inference.as_ref());
+        let accepts_peer_tasks = staged.accepts_peer_tasks;
         let agent_card_json = agent_cards.public.to_string();
         let door_gate =
             staged
@@ -2492,6 +2499,7 @@ fn launch(
                             Some(Arc::clone(&detached)),
                             Arc::clone(&live_delegations),
                             forgettable_session,
+                            accepts_peer_tasks,
                             door_gate,
                         ));
 

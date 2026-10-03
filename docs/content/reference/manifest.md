@@ -268,6 +268,8 @@ exports:
     root: out/handoff/    # required; relative to the accessible workdir
     max_ttl: 15m          # optional when after_task: exit (default 1h); required, max 15m, when sleep
     max_bytes: 10Mi       # optional; per-file ceiling on a redeemed read, default 10Mi
+  peer_tasks:
+    accept: true          # required; whether the door serves tasks from other capsules
 
 control:                  # optional: what a controller may change while the capsule runs
   settings: [inference.max_tokens]
@@ -1169,15 +1171,23 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 
 #### `exports` { #field-exports }
 
-Opens read-only views onto parts of the accessible workdir, served over the capsule's HTTP listener
-without an inference turn — see [Resource plane](resource-plane.md). The two blocks are separate
-authorisers over separate subtrees: declaring one grants nothing about the other, and a capsule may
-declare either, both or neither.
+Opens surfaces of the capsule to processes outside it, on the capsule's HTTP listener:
+
+| Block | Opens |
+|---|---|
+| `exports.files` | A read-only view of one workdir subtree for the operator, addressed by path — see [Resource plane](resource-plane.md) |
+| `exports.peer_files` | A read-only view of one workdir subtree for other capsules, addressed by handle — see [`exports.peer_files`](#field-exports-peer-files) |
+| `exports.peer_tasks` | The A2A door to tasks sent by other capsules — see [`exports.peer_tasks`](#field-exports-peer-tasks) |
+
+Each block is its own authoriser: declaring one grants nothing about another, and a capsule may
+declare any of them or none.
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `exports.files` | block | no | The operator-facing file surface, addressed by path. Absent means every request to it is refused with `no_resource_plane`. |
 | `exports.peer_files` | block | no | The peer-facing file surface, addressed by handle — see [`exports.peer_files`](#field-exports-peer-files). Absent means the capsule mints nothing and every redeem is refused with `no_peer_plane`. |
+| `exports.peer_tasks` | block | no | Whether the door serves tasks from other capsules — see [`exports.peer_tasks`](#field-exports-peer-tasks). Absent means it does not. |
+| `exports.peer_tasks.accept` | boolean | yes | `true` serves peer tasks; `false` refuses them, the same as an absent block. Omitting it inside the block is `E-MAN-003`. |
 | `exports.files.root` | string | yes | Subtree of the [accessible workdir](workdir.md) the export opens — the directory the agent's tools see as `.`. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir — because it already exists as a symlink pointing out of it — refuses the launch with `E-CAP-007`. |
 | `exports.files.mode` | `read-only` | yes | `read-only` is the only accepted value. |
 | `exports.files.max_bytes` | integer or suffixed string | no | Default: `10Mi` (10485760). Per-file read ceiling: a file above it is still listed, with its real size, and refused on read with `too_large`. Accepts a bare byte count or one suffixed `Ki`, `Mi` or `Gi`. Must be greater than zero. |
@@ -1200,6 +1210,59 @@ gives the agent one [runtime-provided tool](runtime-provided-tools.md), `share-f
 
 There is no `list` verb and no path addressing on this plane. `share-file` clamps a requested `ttl`
 down to `max_ttl` and never up.
+
+#### `exports.peer_tasks` { #field-exports-peer-tasks }
+
+States whether the capsule's A2A door serves a task another capsule sends it.
+
+```yaml
+exports:
+  peer_tasks:
+    accept: true
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `exports.peer_tasks.accept` | boolean | yes | `true` serves peer tasks. `false` refuses them. Default when the block is absent: refuse. `peer_tasks: {}` is `E-MAN-003` naming `exports.peer_tasks.accept`; a value that is not a boolean, or a `peer_tasks` that is not a block, is `E-MAN-002` naming the field. |
+
+A peer task is a request whose `x-murmur-task-origin` header is `peer`. The sending capsule's
+runtime stamps it on every message sent through
+[`murmur:message/send`](wit-interfaces.md#message-send), and the sending agent cannot set it. A
+capsule that does not accept peer tasks answers every such request on its door with:
+
+```http
+HTTP/1.1 403 Forbidden
+content-type: application/json
+
+{"error":"peer_not_accepted","message":"this capsule does not accept tasks from peers"}
+```
+
+The response carries no `www-authenticate` header and is the same for every method, path, task id
+and body. The [agent card](agent-card.md#murmur-door-v1) states the setting as `peerTasks`, so a
+caller can read it before sending.
+
+| Request | Governed by `exports.peer_tasks` |
+|---|---|
+| `x-murmur-task-origin: peer`, any method or path on the door | yes |
+| No origin header, or any origin but `peer` and `completion` | no — classified `event` and governed by [`network.authentication`](#field-network-authentication) alone |
+| A completion a [delegated child](roost-api.md#the-delegation-tool) posts back to this session | no |
+| A task delivered to this capsule as a delegated child | no — it carries no origin header |
+| `/resources/peer/` | no — governed by [`exports.peer_files`](#field-exports-peer-files) and the handle |
+| The [control surface](control-surface.md) | no — governed by the control token |
+| `GET /.well-known/agent-card.json` | no — always served |
+
+The origin header is the caller's claim: a caller that does not identify as a peer is not refused
+by this setting. On a door declaring `network.authentication` the token is checked first, so a
+caller without one is answered `401` before this setting is read.
+
+`exports.peer_tasks` is independent of `network.authentication`: accepting peer tasks neither
+requires nor implies a token, and leaves the door's `securitySchemes` and its achieved containment
+class unchanged. `murmur:message/send` presents no token, so a door that declares
+`network.authentication` answers a message sent through it `401`, whatever `accept` says.
+
+Only the capsule's own `murmur.yaml` sets it: there is no `mur run` flag, environment variable or
+[`control.settings`](#field-control) entry for it. It names no peer, so `accept: true` serves every
+caller that identifies as a peer.
 
 #### `control` { #field-control }
 

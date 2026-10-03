@@ -195,8 +195,12 @@ The class is recorded, not enforced: no task is refused, delayed or reordered be
 `untrusted`. An `untrusted` payload reaches the model inside the
 [untrusted fence](#threat-model), marked as data. Treat the class as the answer to "why did this
 run", and keep authoring manifests on the assumption that any task's text may be hostile. The
-origin does more than the class: it also picks the [queue lane](session-loop.md#queue-lanes) a
-task waits in, so two tasks that are both `untrusted` can still run in a different order.
+origin does more than the class:
+
+- It picks the [queue lane](session-loop.md#queue-lanes) a task waits in, so two tasks that are
+  both `untrusted` can still run in a different order.
+- A `peer` origin is refused with `403` by a capsule that does not declare
+  [`exports.peer_tasks.accept: true`](../reference/manifest.md#field-exports-peer-tasks).
 
 Both values are recorded on the [`task_start`](../reference/observability-schemas.md#session-trace-tracejsonl)
 trace event and shown on the task row of `mur trace steps <session>`, alongside the lane:

@@ -182,6 +182,19 @@ pub fn system_text(system: &serde_json::Value) -> Option<String> {
     )
 }
 
+/// Appends `exports.peer_tasks.accept: true` to the manifest at `manifest_path`, for a test that
+/// posts a peer-origin request and needs it to reach the task path rather than the door's consent
+/// refusal. The manifest must declare no `exports:` block of its own.
+pub fn consent_to_peer_tasks(manifest_path: &Path) {
+    let mut manifest = fs::read_to_string(manifest_path).unwrap();
+    assert!(!manifest.contains("\nexports:"), "{manifest}");
+    if !manifest.ends_with('\n') {
+        manifest.push('\n');
+    }
+    manifest.push_str("exports:\n  peer_tasks:\n    accept: true\n");
+    fs::write(manifest_path, manifest).unwrap();
+}
+
 pub fn fixture_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -416,7 +429,7 @@ fn stage_agent_session_inner(
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
-            exports: None,
+            exports: runtime_manifest.exports.clone(),
             control: None,
             door_authentication: None,
             spawn_grant: None,

@@ -18,6 +18,7 @@ The relevant manifest options are:
 |---|---|
 | [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
 | [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What the capsule does after a task completes |
+| [exports.peer_tasks.accept](../reference/manifest.md#field-exports-peer-tasks) | Whether the worker capsule takes tasks that other capsules send it |
 | [network.internal_port](../reference/manifest.md#field-capabilities) | Pins the worker capsule to a fixed port so the orchestrator capsule allow list stays stable |
 | [capabilities.network.allow](../reference/manifest.md#field-capabilities) | Host/URL patterns the capsule may connect to — must include peer capsule URLs |
 
@@ -62,6 +63,10 @@ Create `worker/murmur.yaml`:
       task_acceptance: queue
       after_task: sleep
       queue_depth: 2
+
+    exports:
+      peer_tasks:
+        accept: true
     ```
 
 === "OpenAI"
@@ -91,6 +96,10 @@ Create `worker/murmur.yaml`:
       task_acceptance: queue
       after_task: sleep
       queue_depth: 2
+
+    exports:
+      peer_tasks:
+        accept: true
     ```
 
 === "DeepSeek"
@@ -120,7 +129,13 @@ Create `worker/murmur.yaml`:
       task_acceptance: queue
       after_task: sleep
       queue_depth: 2
+
+    exports:
+      peer_tasks:
+        accept: true
     ```
+
+`exports.peer_tasks.accept: true` lets the worker capsule take tasks from other capsules. Without it, the worker answers every message an orchestrator capsule sends it `403 peer_not_accepted`, and the orchestrator's send fails with that reason. A message from `curl` or any client that does not identify as a capsule is served either way.
 
 `network.internal_port` pins the worker capsule to a fixed port on every run. Without it the runtime picks an OS-assigned port at startup, which changes between runs and would invalidate the orchestrator capsule's allow list entry. `task_acceptance: queue` and `after_task: sleep` keep the capsule alive between tasks so the orchestrator capsule can send multiple messages to the same session.
 
@@ -511,6 +526,7 @@ When OTel tracing is configured, the `traceparent` header links the worker capsu
 |---|---|
 | Worker capsule stays alive | `lifecycle.task_acceptance: queue` + `lifecycle.after_task: sleep` |
 | Fixed worker capsule port | `network.internal_port` in the worker capsule manifest; errors if port is already in use |
+| Worker capsule takes tasks from other capsules | `exports.peer_tasks.accept: true` in the worker capsule manifest |
 | Orchestrator capsule can reach worker capsule | `capabilities.network.allow` must include the worker capsule's URL |
 | Network policy enforcement | Any peer URL not in `network.allow` is rejected before TCP connection |
 | Task ID | Returned by the message call; use it with `tasks/get` to poll status and `tasks/cancel` to stop it |

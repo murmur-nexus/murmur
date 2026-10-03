@@ -324,7 +324,7 @@ the component is aborted and the attempt ends; the task ends `failed` with messa
 
 ---
 
-## `murmur:message/send`
+## `murmur:message/send` { #message-send }
 
 Sends a task to a peer capsule. `send` takes the peer URL and a message — a `message-id`, an
 optional `context-id`, and the `text` — and returns the peer's `task-id`, `context-id`, and
@@ -335,6 +335,7 @@ optional `context-id`, and the `text` — and returns the peer's `task-id`, `con
 | Allowlist | The peer URL must appear in the sender's `capabilities.network.allow`. Otherwise the call returns `Err("network policy: '...' not in capabilities.network.allow")` and no connection is made. |
 | Tracing | With OTel configured, the runtime injects a W3C `traceparent` header so the peer's session span nests under the sender's. |
 | Origin | The runtime stamps `x-murmur-task-origin: peer` and the sending task's own `x-murmur-task-trust` on every request, so the receiving capsule inherits the sender's trust class. The `message` record has no field for either, so a capsule cannot set them. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class). |
+| Refusal | A peer that answers with a non-`2xx` status fails the call with `Err("peer at <url> refused the message (<status> <error>): <message>")`, carrying the peer's own `error` code and `message` when its body has them. A peer that does not declare [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) answers `403 peer_not_accepted`. |
 | Result state | `task-result.state` is the peer's response to the send: `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, or `canceled`. Poll the peer's `tasks/get` endpoint for the final state. |
 
 ---

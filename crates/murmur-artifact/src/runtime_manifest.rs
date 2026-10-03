@@ -577,6 +577,18 @@ impl RuntimeManifest {
     pub fn effective_lifecycle(&self) -> LifecycleConfig {
         self.lifecycle.clone().unwrap_or_default()
     }
+
+    /// Whether this capsule's door serves tasks a peer capsule's runtime sends it: `true` only
+    /// when the manifest declares `exports.peer_tasks.accept: true`. See
+    /// [`Exports::accepts_peer_tasks`].
+    ///
+    /// The capsule's own manifest is the only input. Nothing a launcher, an operator or a
+    /// formation passes can change the answer.
+    pub fn accepts_peer_tasks(&self) -> bool {
+        self.exports
+            .as_ref()
+            .is_some_and(Exports::accepts_peer_tasks)
+    }
 }
 
 /// A setting of a running session that a controller may change over the control surface, when
@@ -750,6 +762,37 @@ pub struct Exports {
     /// either, both or neither. `None` means the capsule mints no handles and its peer plane
     /// answers `no_peer_plane`.
     pub peer_files: Option<PeerFilesExport>,
+    /// The declared willingness to take tasks from other capsules. `None` — no `peer_tasks:` —
+    /// refuses them exactly as `accept: false` does; read it through
+    /// [`Self::accepts_peer_tasks`] rather than matching on it.
+    pub peer_tasks: Option<PeerTasksExport>,
+}
+
+impl Exports {
+    /// Whether this capsule consents to tasks from peer capsules: `true` only for an explicit
+    /// `exports.peer_tasks.accept: true`. Absent and `false` are the same answer.
+    ///
+    /// The one reading rule. [`RuntimeManifest::accepts_peer_tasks`] delegates here, so a caller
+    /// holding only the lowered `exports:` block decides exactly as one holding the manifest.
+    pub fn accepts_peer_tasks(&self) -> bool {
+        self.peer_tasks.is_some_and(|peer_tasks| peer_tasks.accept)
+    }
+}
+
+/// The `exports.peer_tasks` block: whether the capsule's A2A door serves a task another capsule's
+/// runtime sends it.
+///
+/// An export rather than a capability: tasks already arrive through the door, so consenting gives
+/// the agent nothing it did not have and opens the door to one more class of caller. It names no
+/// peer, and has no field to name one — it is a posture of this capsule, not a grant to anyone.
+/// It is independent of `network.authentication`: consenting neither requires nor implies a
+/// token.
+///
+/// A block rather than a bare boolean so that it can gain fields without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTasksExport {
+    /// Required, never inferred. `false` is the same posture as declaring no block at all.
+    pub accept: bool,
 }
 
 /// The `exports.files` block: one subtree of the workdir, readable and nothing else.
@@ -1811,6 +1854,18 @@ struct RawExports {
     files: Option<RawFileExport>,
     #[serde(default)]
     peer_files: Option<RawPeerFilesExport>,
+    #[serde(default)]
+    peer_tasks: Option<RawPeerTasksExport>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPeerTasksExport {
+    // `Option` so an omitted `accept` is distinguishable from an explicit `false`: the omission
+    // is refused rather than defaulted, because consent is never inferred.
+    #[serde(default)]
+    accept: Option<bool>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2435,7 +2490,7 @@ impl RawBlock for RawControl {
 }
 
 impl RawBlock for RawExports {
-    const KNOWN_KEYS: &'static [&'static str] = &["files", "peer_files"];
+    const KNOWN_KEYS: &'static [&'static str] = &["files", "peer_files", "peer_tasks"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -2447,6 +2502,16 @@ impl RawBlock for RawExports {
         if let Some(peer_files) = &self.peer_files {
             collect_block(peer_files, &child_path(path, "peer_files"), out);
         }
+        if let Some(peer_tasks) = &self.peer_tasks {
+            collect_block(peer_tasks, &child_path(path, "peer_tasks"), out);
+        }
+    }
+}
+
+impl RawBlock for RawPeerTasksExport {
+    const KNOWN_KEYS: &'static [&'static str] = &["accept"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
     }
 }
 
@@ -3854,7 +3919,24 @@ fn parse_exports(raw: Option<RawExports>) -> Result<Option<Exports>, RuntimeMani
         .peer_files
         .map(parse_peer_files_export)
         .transpose()?;
-    Ok(Some(Exports { files, peer_files }))
+    let peer_tasks = raw_exports
+        .peer_tasks
+        .map(|raw| {
+            raw.accept
+                .map(|accept| PeerTasksExport { accept })
+                .ok_or_else(|| RuntimeManifestError::InvalidExports {
+                    field: "exports.peer_tasks.accept".to_string(),
+                    message: "must be set explicitly to true or false — consent to peer tasks is \
+                              never inferred"
+                        .to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(Some(Exports {
+        files,
+        peer_files,
+        peer_tasks,
+    }))
 }
 
 /// Lowers `exports.peer_files`, on exactly the same terms as [`parse_file_export`]: a root that
@@ -11425,6 +11507,106 @@ capabilities:
             export_error("exports:\n  peer_files:\n    root: out/\n    max_bytes: 0\n");
         assert_eq!(field, "exports.peer_files.max_bytes");
         assert!(message.contains("greater than zero"));
+    }
+
+    // ── exports.peer_tasks ───────────────────────────────────────────────────
+
+    /// Absent and `accept: false` are the same posture; only an explicit `true` consents.
+    #[test]
+    fn peer_tasks_consents_only_on_an_explicit_true() {
+        let absent = exports_manifest("artifacts: []\n").expect("no exports block parses");
+        assert!(absent.exports.is_none());
+        assert!(!absent.accepts_peer_tasks());
+
+        let refused = exports_manifest("exports:\n  peer_tasks:\n    accept: false\n")
+            .expect("an explicit refusal parses");
+        assert_eq!(
+            refused.exports.as_ref().unwrap().peer_tasks,
+            Some(PeerTasksExport { accept: false })
+        );
+        assert!(!refused.accepts_peer_tasks());
+        assert!(!refused.exports.as_ref().unwrap().accepts_peer_tasks());
+
+        let accepted = exports_manifest("exports:\n  peer_tasks:\n    accept: true\n")
+            .expect("consent parses");
+        assert_eq!(
+            accepted.exports.as_ref().unwrap().peer_tasks,
+            Some(PeerTasksExport { accept: true })
+        );
+        assert!(accepted.accepts_peer_tasks());
+        assert!(accepted.exports.as_ref().unwrap().accepts_peer_tasks());
+    }
+
+    /// An `exports:` block declaring only `peer_tasks` opens neither file plane.
+    #[test]
+    fn peer_tasks_alone_declares_no_file_plane() {
+        let manifest = exports_manifest("exports:\n  peer_tasks:\n    accept: true\n")
+            .expect("a peer_tasks-only exports block parses");
+        let exports = manifest.exports.unwrap();
+        assert_eq!(exports.files, None);
+        assert_eq!(exports.peer_files, None);
+    }
+
+    /// A file export says nothing about peer tasks.
+    #[test]
+    fn a_file_export_does_not_consent_to_peer_tasks() {
+        let manifest =
+            exports_manifest("exports:\n  files:\n    root: out/\n    mode: read-only\n")
+                .expect("a files export parses");
+        assert_eq!(manifest.exports.as_ref().unwrap().peer_tasks, None);
+        assert!(!manifest.accepts_peer_tasks());
+    }
+
+    /// Consent is never inferred: a `peer_tasks:` block without `accept:` is refused naming the
+    /// key, as `capabilities.plan` without `submit:` is.
+    #[test]
+    fn peer_tasks_without_accept_is_refused() {
+        let (field, message) = export_error("exports:\n  peer_tasks: {}\n");
+        assert_eq!(field, "exports.peer_tasks.accept");
+        assert_eq!(
+            message,
+            "must be set explicitly to true or false — consent to peer tasks is never inferred"
+        );
+    }
+
+    /// A value of the wrong type is refused at parse, and the refusal names where it is.
+    #[test]
+    fn peer_tasks_of_the_wrong_type_is_refused_naming_the_field() {
+        for (block, field) in [
+            (
+                "exports:\n  peer_tasks:\n    accept: \"yes\"\n",
+                "exports.peer_tasks.accept",
+            ),
+            (
+                "exports:\n  peer_tasks:\n    accept: 1\n",
+                "exports.peer_tasks.accept",
+            ),
+            ("exports:\n  peer_tasks: true\n", "exports.peer_tasks"),
+            ("exports:\n  peer_tasks: [peer-a]\n", "exports.peer_tasks"),
+        ] {
+            let message = exports_manifest(block)
+                .expect_err(&format!("{block:?} must not parse"))
+                .to_string();
+            assert!(message.contains(field), "{block:?}: {message}");
+        }
+    }
+
+    /// An unknown key under the block is a warning reported by path, not a refusal — and naming
+    /// a peer there grants nothing.
+    #[test]
+    fn an_unknown_peer_tasks_key_is_reported_by_path() {
+        let manifest =
+            exports_manifest("exports:\n  peer_tasks:\n    accept: false\n    allow: [peer-a]\n")
+                .expect("an unknown key is a warning, not a parse error");
+        assert!(
+            manifest
+                .unknown_keys
+                .iter()
+                .any(|key| key.block_path == "exports.peer_tasks" && key.key == "allow"),
+            "{:?}",
+            manifest.unknown_keys
+        );
+        assert!(!manifest.accepts_peer_tasks());
     }
 
     // ── capabilities.peer_fetch ──────────────────────────────────────────────

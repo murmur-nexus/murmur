@@ -16,6 +16,7 @@ use crate::detached::DetachedRegistry;
 use crate::errors::RuntimeError;
 use crate::origin::{self, TaskOrigin, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 use crate::peer_handoff::{handle_peer_request, is_peer_path, PeerPlane, AUDIENCE_HEADER};
+use crate::peer_tasks;
 use crate::resource_plane::{
     handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
 };
@@ -293,6 +294,9 @@ pub(crate) const CAPSULE_EXTENSION_URI: &str =
 pub(crate) const STREAM_EXTENSION_URI: &str =
     "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
 
+/// What the door extension says about itself.
+const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.";
+
 /// What the stream extension says about itself.
 const STREAM_EXTENSION_DESCRIPTION: &str = "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.";
 
@@ -322,7 +326,9 @@ const TEXT_MODE: &str = "text/plain";
 /// `capabilities.extensions` holds three murmur extensions, in this order:
 ///
 /// - [`DOOR_EXTENSION_URI`], whose `params.methods` is [`served_methods`] for the acceptance the
-///   door is given, so the card cannot list a method the dispatcher refuses or omit one it serves.
+///   door is given, so the card cannot list a method the dispatcher refuses or omit one it serves,
+///   and whose `params.peerTasks` is `accepts_peer_tasks`, always present, so a peer capsule
+///   learns whether the door serves it before it sends a task.
 /// - [`CAPSULE_EXTENSION_URI`], whose `params` are `sessionId`, `tools`, `shell`, `network` and
 ///   `planes`. This object is all of the card's extended-card material and none of it appears
 ///   anywhere else, so it can move to an extended card whole; the card conforms without it.
@@ -345,6 +351,7 @@ pub(crate) fn build_agent_card(
     capability_policy: &CapabilityPolicy,
     task_acceptance: &TaskAcceptance,
     planes: DeclaredPlanes,
+    accepts_peer_tasks: bool,
     transport: TransportCapabilities,
 ) -> serde_json::Value {
     let tools: Vec<&str> = installed_artifacts
@@ -390,9 +397,9 @@ pub(crate) fn build_agent_card(
             "extensions": [
                 {
                     "uri": DOOR_EXTENSION_URI,
-                    "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+                    "description": DOOR_EXTENSION_DESCRIPTION,
                     "required": false,
-                    "params": { "methods": methods },
+                    "params": { "methods": methods, "peerTasks": accepts_peer_tasks },
                 },
                 {
                     "uri": CAPSULE_EXTENSION_URI,
@@ -462,12 +469,16 @@ pub(crate) struct AgentCards {
 /// [`TASK_SKILL_ID`] skill. The public card is that card without the capsule extension, so it
 /// carries the door and stream extensions; the extended card is that card, whole, in 0.3 shape
 /// through [`v03_agent_card`].
+// Each argument feeds its own part of the card, and all but `authentication` pass straight through
+// to `build_agent_card`; a wrapper struct would name the argument count rather than a concept.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_agent_cards(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
     capability_policy: &CapabilityPolicy,
     task_acceptance: &TaskAcceptance,
     planes: DeclaredPlanes,
+    accepts_peer_tasks: bool,
     transport: TransportCapabilities,
     authentication: Option<&NetworkAuthentication>,
 ) -> AgentCards {
@@ -477,6 +488,7 @@ pub(crate) fn build_agent_cards(
         capability_policy,
         task_acceptance,
         planes,
+        accepts_peer_tasks,
         transport,
     );
     if authentication.is_none() {
@@ -705,6 +717,9 @@ pub(crate) async fn serve_http(
     // Whether this capsule has a harness session to forget, which is the one thing
     // `FORGET_SESSION_HEADER` needs to know about the transport behind the door.
     forgettable_session: bool,
+    // The manifest's own `exports.peer_tasks.accept`. `false` refuses every peer-origin request
+    // past the token check with `peer_tasks::refusal`.
+    accepts_peer_tasks: bool,
     // `Some` when the manifest declares `network.authentication`: every request but the public
     // card and the two planes with their own authorisers must present one of its tokens.
     gate: Option<Arc<DoorGate>>,
@@ -739,7 +754,7 @@ pub(crate) async fn serve_http(
                         let closing = closing_rx.clone();
                         let gate_for_conn = gate.clone();
                         connections.spawn(async move {
-                            handle_connection(stream, peer_addr, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, control, session, detached_for_conn, live, forgettable_session, gate_for_conn, closing).await;
+                            handle_connection(stream, peer_addr, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, control, session, detached_for_conn, live, forgettable_session, accepts_peer_tasks, gate_for_conn, closing).await;
                         });
                     }
                     Err(e) => {
@@ -760,6 +775,61 @@ pub(crate) async fn serve_http(
     let drained = async { while connections.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(CONNECTION_DRAIN_GRACE, drained).await;
     connections.shutdown().await;
+}
+
+/// A real door for in-crate tests, served through [`serve_http`] with `accepts_peer_tasks` as
+/// given, no authentication and no planes declared, on an ephemeral loopback port. Returns its
+/// `host:port`, the sender whose drop closes it, and the receiving end of its task channel.
+#[cfg(test)]
+pub(crate) async fn serve_test_door(
+    accepts_peer_tasks: bool,
+) -> (String, oneshot::Sender<()>, mpsc::Receiver<IncomingTask>) {
+    use std::sync::atomic::AtomicU64;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind an ephemeral port");
+    let addr = listener.local_addr().unwrap().to_string();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (task_tx, task_rx) = mpsc::channel(4);
+    let (sse_tx, _) = tokio::sync::broadcast::channel(4);
+    let session_id = "ses_door".to_string();
+    let containment = murmur_artifact::ContainmentClass::Advisory;
+    let nowhere = std::path::Path::new("/nonexistent");
+    tokio::spawn(serve_http(
+        listener,
+        shutdown_rx,
+        "{}".to_string(),
+        Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue))),
+        task_tx,
+        TaskAcceptance::Queue,
+        sse_tx,
+        Arc::new(Mutex::new(SseEventBuffer::new(8))),
+        ConversationMode::Stateless,
+        Arc::new(ResourcePlane::new(
+            nowhere,
+            None,
+            containment,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        )),
+        Arc::new(PeerPlane::new(
+            nowhere,
+            None,
+            session_id.clone(),
+            containment,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        )),
+        Arc::new(ControlPlane::undeclared(session_id.clone())),
+        session_id,
+        None,
+        Arc::new(LiveDelegations::new()),
+        false,
+        accepts_peer_tasks,
+        None,
+    ));
+    (addr, shutdown_tx, task_rx)
 }
 
 /// How long a closing door waits for its open connections to finish before ending them.
@@ -797,6 +867,7 @@ async fn handle_connection(
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
     forgettable_session: bool,
+    accepts_peer_tasks: bool,
     gate: Option<Arc<DoorGate>>,
     closing: watch::Receiver<bool>,
 ) {
@@ -946,6 +1017,17 @@ async fn handle_connection(
             }
         }
     };
+
+    // A capsule that does not consent to peer tasks refuses a peer-origin request here: after the
+    // token, so an unauthenticated caller learns nothing the public card does not say, and before
+    // the scope, the path, the method or the body, so the refusal is the same bytes whatever was
+    // asked for. A completion is not a peer task and passes; the peer plane, the control plane
+    // and the card were routed above and never reach this.
+    if peer_tasks::refuses(provenance, accepts_peer_tasks) {
+        write_refusal(writer_half, reader, &framed_bytes(&peer_tasks::refusal())).await;
+        return;
+    }
+
     let refuse_scope = |scope: &str| -> Option<Vec<u8>> {
         let (gate, grant) = gate.as_deref().zip(grant.as_ref())?;
         let refusal = grant.require(scope).err()?;
@@ -1855,6 +1937,7 @@ mod tests {
             &CapabilityPolicy::default(),
             acceptance,
             planes,
+            false,
             transport,
         )
     }
@@ -1895,6 +1978,7 @@ mod tests {
                 files: true,
                 peer_files: false,
             },
+            false,
             HTTP_TRANSPORT,
         )
     }
@@ -1942,21 +2026,25 @@ mod tests {
             for transport in every_transport() {
                 for (files, peer_files) in plane_sets {
                     for tools in tool_sets {
-                        let card = build_agent_card(
-                            &identity(),
-                            tools,
-                            &CapabilityPolicy::default(),
-                            acceptance,
-                            DeclaredPlanes { files, peer_files },
-                            transport,
-                        );
-                        assert_conforms(&card);
-                        checked += 1;
+                        for accepts_peer_tasks in [false, true] {
+                            let card = build_agent_card(
+                                &identity(),
+                                tools,
+                                &CapabilityPolicy::default(),
+                                acceptance,
+                                DeclaredPlanes { files, peer_files },
+                                accepts_peer_tasks,
+                                transport,
+                            );
+                            assert_conforms(&card);
+                            assert_eq!(door_params(&card)["peerTasks"], accepts_peer_tasks);
+                            checked += 1;
+                        }
                     }
                 }
             }
         }
-        assert_eq!(checked, 3 * 2 * 2 * 4 * 2);
+        assert_eq!(checked, 3 * 2 * 2 * 4 * 2 * 2);
     }
 
     #[test]
@@ -1979,10 +2067,11 @@ mod tests {
                     "extensions": [
                         {
                             "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
                             "required": false,
                             "params": {
-                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+                                "peerTasks": false
                             }
                         },
                         {
@@ -2103,6 +2192,7 @@ mod tests {
                 &CapabilityPolicy::default(),
                 &TaskAcceptance::Single,
                 DeclaredPlanes::default(),
+                false,
                 HTTP_TRANSPORT,
             );
             assert_eq!(
@@ -2239,6 +2329,7 @@ mod tests {
                     &CapabilityPolicy::default(),
                     acceptance,
                     DeclaredPlanes::default(),
+                    false,
                     transport,
                     Some(&authentication),
                 );
@@ -2329,6 +2420,7 @@ mod tests {
             &CapabilityPolicy::default(),
             &TaskAcceptance::Single,
             DeclaredPlanes::default(),
+            false,
             HTTP_TRANSPORT,
         );
         assert_eq!(
@@ -2357,6 +2449,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `peerTasks` is on the door extension, which every card carries, and is always present: a
+    /// capsule that never mentions peer tasks says `false` rather than nothing.
+    #[test]
+    fn a2a_card_door_extension_states_the_peer_task_posture() {
+        for accepts_peer_tasks in [false, true] {
+            let card = build_agent_card(
+                &identity(),
+                &[],
+                &CapabilityPolicy::default(),
+                &TaskAcceptance::Single,
+                DeclaredPlanes::default(),
+                accepts_peer_tasks,
+                HTTP_TRANSPORT,
+            );
+            assert_eq!(
+                keys(&Value::Object(door_params(&card).clone())),
+                ["methods", "peerTasks"]
+            );
+            assert_eq!(door_params(&card)["peerTasks"], accepts_peer_tasks);
+            assert_eq!(
+                capsule_params(&card).get("peerTasks"),
+                None,
+                "the posture is public, so it is not capsule-extension material"
+            );
+            assert_eq!(card["securitySchemes"], serde_json::json!({}));
+        }
+    }
+
+    /// `authenticated_card` rewrites only `params.methods`, so the posture reaches both cards of
+    /// an authenticated door unchanged, and declaring it changes nothing about the door's
+    /// security schemes.
+    #[test]
+    fn a2a_card_peer_task_posture_survives_onto_both_cards_of_an_authenticated_door() {
+        let authentication = bearer_authentication();
+        let cards_for = |accepts_peer_tasks: bool| {
+            build_agent_cards(
+                &identity(),
+                &[],
+                &CapabilityPolicy::default(),
+                &TaskAcceptance::Single,
+                DeclaredPlanes::default(),
+                accepts_peer_tasks,
+                HTTP_TRANSPORT,
+                Some(&authentication),
+            )
+        };
+        for accepts_peer_tasks in [false, true] {
+            let cards = cards_for(accepts_peer_tasks);
+            assert_eq!(door_params(&cards.public)["peerTasks"], accepts_peer_tasks);
+            let extended = cards
+                .extended
+                .as_ref()
+                .expect("an authenticated door has one");
+            assert_eq!(door_params(extended)["peerTasks"], accepts_peer_tasks);
+            assert!(door_methods(&cards.public).contains(&"agent/getAuthenticatedExtendedCard"));
+        }
+        let (refusing, accepting) = (cards_for(false), cards_for(true));
+        assert_eq!(
+            refusing.public["securitySchemes"],
+            accepting.public["securitySchemes"]
+        );
+        assert_eq!(
+            refusing.public["securityRequirements"],
+            accepting.public["securityRequirements"]
+        );
     }
 
     fn bearer_authentication() -> NetworkAuthentication {
@@ -2389,6 +2548,7 @@ mod tests {
                 files: true,
                 peer_files: false,
             },
+            false,
             HTTP_TRANSPORT,
             authentication,
         )
@@ -2414,53 +2574,57 @@ mod tests {
                     for (files, peer_files) in plane_sets {
                         for tools in tool_sets {
                             for policy in &policies {
-                                let planes = DeclaredPlanes { files, peer_files };
-                                let cards = build_agent_cards(
-                                    &identity(),
-                                    tools,
-                                    policy,
-                                    acceptance,
-                                    planes,
-                                    transport,
-                                    authenticated,
-                                );
-                                assert_conforms(&cards.public);
-                                let base = build_agent_card(
-                                    &identity(),
-                                    tools,
-                                    policy,
-                                    acceptance,
-                                    planes,
-                                    transport,
-                                );
-                                match authenticated {
-                                    None => {
-                                        assert_eq!(cards.public, base);
-                                        assert_eq!(cards.extended, None);
+                                for accepts_peer_tasks in [false, true] {
+                                    let planes = DeclaredPlanes { files, peer_files };
+                                    let cards = build_agent_cards(
+                                        &identity(),
+                                        tools,
+                                        policy,
+                                        acceptance,
+                                        planes,
+                                        accepts_peer_tasks,
+                                        transport,
+                                        authenticated,
+                                    );
+                                    assert_conforms(&cards.public);
+                                    let base = build_agent_card(
+                                        &identity(),
+                                        tools,
+                                        policy,
+                                        acceptance,
+                                        planes,
+                                        accepts_peer_tasks,
+                                        transport,
+                                    );
+                                    match authenticated {
+                                        None => {
+                                            assert_eq!(cards.public, base);
+                                            assert_eq!(cards.extended, None);
+                                        }
+                                        Some(_) => {
+                                            let extended_v1 = authenticated_card(base, acceptance);
+                                            assert_conforms(&extended_v1);
+                                            assert_eq!(
+                                                cards.extended,
+                                                Some(v03_agent_card(&extended_v1))
+                                            );
+                                            let mut stripped = extended_v1.clone();
+                                            stripped["capabilities"]["extensions"]
+                                                .as_array_mut()
+                                                .unwrap()
+                                                .retain(|e| e["uri"] != CAPSULE_EXTENSION_URI);
+                                            assert_eq!(cards.public, stripped);
+                                        }
                                     }
-                                    Some(_) => {
-                                        let extended_v1 = authenticated_card(base, acceptance);
-                                        assert_conforms(&extended_v1);
-                                        assert_eq!(
-                                            cards.extended,
-                                            Some(v03_agent_card(&extended_v1))
-                                        );
-                                        let mut stripped = extended_v1.clone();
-                                        stripped["capabilities"]["extensions"]
-                                            .as_array_mut()
-                                            .unwrap()
-                                            .retain(|e| e["uri"] != CAPSULE_EXTENSION_URI);
-                                        assert_eq!(cards.public, stripped);
-                                    }
+                                    checked += 1;
                                 }
-                                checked += 1;
                             }
                         }
                     }
                 }
             }
         }
-        assert_eq!(checked, 2 * 3 * 2 * 2 * 4 * 2 * 2);
+        assert_eq!(checked, 2 * 3 * 2 * 2 * 4 * 2 * 2 * 2);
     }
 
     #[test]
@@ -2483,10 +2647,11 @@ mod tests {
                     "extensions": [
                         {
                             "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
                             "required": false,
                             "params": {
-                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"]
+                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"],
+                                "peerTasks": false
                             }
                         },
                         {
@@ -2546,8 +2711,8 @@ mod tests {
                     "streaming": true,
                     "pushNotifications": false,
                     "extensions": [
-                        { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.", "required": false,
-                          "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"] } },
+                        { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.", "required": false,
+                          "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"], "peerTasks": false } },
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
                           "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
                         { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,

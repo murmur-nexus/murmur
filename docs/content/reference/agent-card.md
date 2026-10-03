@@ -25,10 +25,11 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
     "extensions": [
       {
         "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+          "peerTasks": false
         }
       },
       {
@@ -72,7 +73,7 @@ What murmur adds to the standard card sits in three [extensions](#extensions):
 
 | Extension | Answers | Derived from |
 |---|---|---|
-| [Door](#murmur-door-v1) | What does this listener answer? | The methods `POST /` dispatches |
+| [Door](#murmur-door-v1) | What does this listener answer, and does it serve other capsules? | The methods `POST /` dispatches, and [`exports.peer_tasks`](manifest.md#field-exports-peer-tasks) |
 | [Capsule](#murmur-capsule-v1) | Which session is this, and what may the capsule do? | The session, the installed artifacts, `capabilities.*` and the declared `exports` |
 | [Stream](#stream-extension) | Which frames can its stream send? | The streaming methods the door serves and the inference transport |
 
@@ -172,26 +173,33 @@ every task on the session.
 
 ### What the door answers { #door-authentication }
 
-An authenticated door checks, in this order, on every request:
+The door checks, in this order, on every request:
 
-1. `GET /.well-known/agent-card.json` and the [peer plane](resource-plane.md#peer-plane) under
-   `/resources/peer/` are served without a door token.
-2. The token, before the path, the body or the method is read. A refusal here says nothing about
-   whether a task, a file or a path exists.
-3. The scope of a method the door serves, or of the operator plane.
-4. The request itself, whose errors — `-32001 Task not found`, `-32601`, `-32602`, `-32004`, HTTP
-   `404` — reach an authenticated, in-scope caller unchanged.
+1. `GET /.well-known/agent-card.json`, the [peer plane](resource-plane.md#peer-plane) under
+   `/resources/peer/` and the [control surface](control-surface.md), which takes its own token,
+   are served without a door token.
+2. The token, on a door declaring `network.authentication`, before the path, the body or the
+   method is read. A refusal here says nothing about whether a task, a file or a path exists.
+3. Peer consent: a request carrying `x-murmur-task-origin: peer` is refused unless the capsule
+   declares [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks). Checked on
+   every door, before the path, the body or the method is read.
+4. The scope of a method the door serves, or of the operator plane, on a door declaring
+   `network.authentication`.
+5. The request itself, whose errors — `-32001 Task not found`, `-32601`, `-32602`, `-32004`, HTTP
+   `404` — reach an admitted caller unchanged.
 
-A refusal at steps 2 and 3 is an HTTP status and a JSON body, never a JSON-RPC envelope:
+A refusal at steps 2 to 4 is an HTTP status and a JSON body, never a JSON-RPC envelope:
 
 | Case | Status | `www-authenticate` | Body `error` |
 |---|---|---|---|
 | No `Authorization` header | `401` | `Bearer realm="<capsule name>"` | `unauthenticated` |
 | An `Authorization` header that is not `Bearer <token>`, a token this session did not mint, or more than one `Authorization` header | `401` | `Bearer realm="<capsule name>", error="invalid_token"` | `invalid_token` |
+| A peer-origin request to a capsule that does not accept peer tasks | `403` | None | `peer_not_accepted` |
 | A valid token whose credential lacks the scope | `403` | `Bearer realm="<capsule name>", error="insufficient_scope", scope="<scope>"` | `insufficient_scope` |
 
-The body is `{"error": "<code>", "message": "<sentence>"}`. The `403` message names the credential
-and the scope it lacks: `credential 'watcher' does not reach message/send`. The scheme name
+The body is `{"error": "<code>", "message": "<sentence>"}`. The `insufficient_scope` message names
+the credential and the scope it lacks: `credential 'watcher' does not reach message/send`. The
+`peer_not_accepted` response is byte-identical for every request it refuses. The scheme name
 `Bearer` matches in any case; the token matches exactly.
 
 The door speaks plain HTTP, so a token sent across a network travels in clear text. Put a TLS
@@ -216,10 +224,11 @@ terminator in front of a door that is reached off the host.
     "extensions": [
       {
         "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.",
+        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"]
+          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"],
+          "peerTasks": false
         }
       },
       {
@@ -288,8 +297,8 @@ authenticated door's v1.0 card with the capsule extension kept, converted to 0.3
     "streaming": true,
     "pushNotifications": false,
     "extensions": [
-      { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods.", "required": false,
-        "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"] } },
+      { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.", "required": false,
+        "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"], "peerTasks": false } },
       { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
         "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
       { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
@@ -367,6 +376,7 @@ URI: `https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1`
 | Key | Type | Value |
 |---|---|---|
 | `params.methods` | array of strings | The JSON-RPC methods `POST /` answers, standard and murmur alike |
+| `params.peerTasks` | boolean | Whether the door serves a request another capsule's runtime sends, stamped `x-murmur-task-origin: peer`: the capsule's [`exports.peer_tasks.accept`](manifest.md#field-exports-peer-tasks), `false` when the block is absent. Always present, on the public and the extended card. When `false`, every such request is answered `403` [`peer_not_accepted`](#door-authentication) |
 
 A method is listed exactly when `POST /` answers it with something other than `-32601 Method not
 found`. Method names match exactly: case and surrounding whitespace are significant. `stream/watch`

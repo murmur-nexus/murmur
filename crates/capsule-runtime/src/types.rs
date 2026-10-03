@@ -586,6 +586,10 @@ pub struct StagedSession {
     /// `stage_session`. `None` means no peer plane: nothing mints, and `/resources/peer/` answers
     /// `no_peer_plane`.
     pub(crate) exports_peer_files: Option<murmur_artifact::PeerFilesExport>,
+    /// Whether the door serves a task a peer capsule's runtime sends, read from the manifest's
+    /// own `exports.peer_tasks` by [`murmur_artifact::Exports::accepts_peer_tasks`]. `false`
+    /// answers every peer-origin request on the door with `403 peer_not_accepted`.
+    pub(crate) accepts_peer_tasks: bool,
     /// Registry used to resolve this session's artifacts, retained so `manage.pull()` can
     /// resolve additional artifacts at runtime after staging has completed.
     pub(crate) registry: Arc<dyn Registry>,

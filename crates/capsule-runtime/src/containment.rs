@@ -571,6 +571,12 @@ pub struct ScopeReport {
     /// is a disclosure rather than a grant, and declaring it cannot change
     /// [`Self::achieved_containment`], [`Self::enforcement_tier`] or [`Self::floor_met`].
     pub peer_files: Option<PeerFilesReport>,
+    /// Whether the door serves tasks from peer capsules: `exports.peer_tasks.accept`, with an
+    /// absent block reported as `false`. Always serialized.
+    ///
+    /// Like every export it opens a surface rather than granting the guest anything, and it cannot
+    /// change [`Self::achieved_containment`], [`Self::enforcement_tier`] or [`Self::floor_met`].
+    pub peer_tasks: bool,
     /// `capabilities.peer_fetch.allow`, verbatim — the peers this capsule may redeem a handle
     /// against. Empty when the block is absent, which is deny.
     ///
@@ -771,6 +777,11 @@ impl ScopeReport {
                 ));
             }
         }
+        out.push_str(if self.peer_tasks {
+            "  exports.peer_tasks: accept\n"
+        } else {
+            "  exports.peer_tasks: refuse\n"
+        });
         push_list(&mut out, "peer_fetch allow", &self.peer_fetch_allow);
 
         out.push_str("\nRuntime writes\n");
@@ -956,6 +967,7 @@ pub(crate) fn scope_report_for_tier(
         peer_files: exports
             .and_then(|exports| exports.peer_files.as_ref())
             .map(PeerFilesReport::from),
+        peer_tasks: exports.is_some_and(Exports::accepts_peer_tasks),
         peer_fetch_allow: policy.peer_fetch_allow.clone(),
         // Resolved by `state_store::state_store_reports` before this call and copied through on
         // the same terms as the export reports above: a grant that opens a path outside the
@@ -1860,6 +1872,7 @@ mod tests {
                     Some(&Exports {
                         files: Some(export.clone()),
                         peer_files: None,
+                        peer_tasks: None,
                     }),
                     Vec::new(),
                     Vec::new(),
@@ -1935,6 +1948,7 @@ mod tests {
                     Some(&Exports {
                         files: None,
                         peer_files: Some(peer_files.clone()),
+                        peer_tasks: None,
                     }),
                     Vec::new(),
                     Vec::new(),
@@ -2010,6 +2024,7 @@ mod tests {
                     max_ttl_secs: None,
                     max_bytes: 10 * 1024 * 1024,
                 }),
+                peer_tasks: None,
             }),
             Vec::new(),
             Vec::new(),
@@ -2062,6 +2077,7 @@ mod tests {
                     max_ttl_secs: Some(900),
                     max_bytes: 4096,
                 }),
+                peer_tasks: None,
             }),
             Vec::new(),
             Vec::new(),
@@ -2073,6 +2089,83 @@ mod tests {
         assert!(declared.contains("max handle ttl:          900s"));
         assert!(declared.contains("max bytes:               4096 (per file)"));
         assert!(declared.contains("- localhost:41234"));
+    }
+
+    fn report_with_peer_tasks(tier: EnforcementTier, peer_tasks: Option<bool>) -> ScopeReport {
+        scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            tier,
+            None,
+            None,
+            peer_tasks
+                .map(|accept| Exports {
+                    files: None,
+                    peer_files: None,
+                    peer_tasks: Some(murmur_artifact::PeerTasksExport { accept }),
+                })
+                .as_ref(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            IoMaxReport::default(),
+        )
+    }
+
+    /// Consenting to peer tasks is an export like the others: it moves no containment field and
+    /// no other field of the report but its own. Absent and `accept: false` are one report.
+    #[test]
+    fn peer_tasks_is_reported_and_moves_no_other_field() {
+        for tier in ALL_TIERS {
+            let absent = report_with_peer_tasks(*tier, None);
+            let refused = report_with_peer_tasks(*tier, Some(false));
+            let accepted = report_with_peer_tasks(*tier, Some(true));
+            assert!(!absent.peer_tasks);
+            assert_eq!(refused, absent, "tier {tier:?}");
+            assert!(accepted.peer_tasks);
+            assert_eq!(accepted.achieved_containment, absent.achieved_containment);
+            assert_eq!(accepted.enforcement_tier, absent.enforcement_tier);
+            assert_eq!(accepted.floor_met, absent.floor_met);
+            assert_eq!(
+                ScopeReport {
+                    peer_tasks: false,
+                    ..accepted.clone()
+                },
+                absent
+            );
+        }
+    }
+
+    /// `peer_tasks` is always written, as a boolean, so an absent key identifies an older runtime.
+    #[test]
+    fn peer_tasks_is_always_serialized() {
+        let tier = EnforcementTier::KernelFull;
+        let absent = serde_json::to_value(report_with_peer_tasks(tier, None)).unwrap();
+        assert_eq!(absent["peer_tasks"], serde_json::json!(false));
+        let accepted = serde_json::to_value(report_with_peer_tasks(tier, Some(true))).unwrap();
+        assert_eq!(accepted["peer_tasks"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn render_names_the_peer_task_posture_under_peer_handoff() {
+        let tier = EnforcementTier::KernelFull;
+        for (declared, line) in [
+            (None, "  exports.peer_tasks: refuse\n"),
+            (Some(false), "  exports.peer_tasks: refuse\n"),
+            (Some(true), "  exports.peer_tasks: accept\n"),
+        ] {
+            let rendered = report_with_peer_tasks(tier, declared).render();
+            let section = rendered
+                .split("\nPeer handoff\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n\n").next())
+                .unwrap_or_else(|| panic!("no Peer handoff section:\n{rendered}"));
+            assert!(
+                section.contains(line.trim_start_matches(' ').trim_end()),
+                "{declared:?}:\n{section}"
+            );
+            assert!(rendered.contains(line), "{declared:?}:\n{rendered}");
+        }
     }
 
     /// A declared state store is reported, and moves nothing else. Same discipline the export
@@ -2289,6 +2382,7 @@ mod tests {
                     max_bytes: 10_485_760,
                 }),
                 peer_files: None,
+                peer_tasks: None,
             }),
             Vec::new(),
             Vec::new(),
@@ -2335,6 +2429,7 @@ mod tests {
                     max_bytes: 10_485_760,
                 }),
                 peer_files: None,
+                peer_tasks: None,
             }),
             Vec::new(),
             Vec::new(),
