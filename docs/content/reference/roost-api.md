@@ -333,11 +333,12 @@ the child holds:
 | `HOME` | Always, from the parent's own value |
 | `MURMUR_ROOST_URL` | Always, so the child registers at the same daemon its parent asked |
 | `MURMUR_SPAWNER` | The child was given a spawner handle — see [The completion path](#the-completion-path) |
+| `MURMUR_FORMATION_ID` | The parent session belongs to a formation. The child joins it, whether or not it was given a spawner handle |
 | Any other name | The name appears in both the child's and the parent's `capabilities.env.allow`, and the parent's own process environment holds it |
 
 Every other variable the parent holds is absent from the child. A name a child declares that its
 parent does not is refused at `POST /spawn` on the [`capabilities.env.allow` axis](#spawn-envelope).
-The four names above are the runtime's, and a child that lists one of them under
+The five names above are the runtime's, and a child that lists one of them under
 `capabilities.env.allow` does not displace the runtime's value.
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself
@@ -813,6 +814,7 @@ ends gives its slot back — a total would only ever grow.
 | `MURMUR_ROOST_URL` | The environment of the process that runs the capsule; set on a child by its parent's runtime | Base URL the runtime registers at, and the base URL a plan's `capsule` step asks permission at. When it is unset or blank, a capsule that declares `capabilities.spawn.allow` refuses to launch with [`E-RUN-019`](diagnostics.md#e-run-019), and a `capsule` step fails with `MURMUR_ROOST_URL is not set; capsule steps require mur-roost` |
 | `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which its traces carry and which `mur run` prints |
 | `MURMUR_SPAWNER` | The parent capsule's runtime, on a delegated child only | Where the child reports its outcome, and under which delegation id — see [The completion path](#the-completion-path). A value that is not a spawner handle refuses the launch with [`E-RUN-020`](diagnostics.md#e-run-020) |
+| `MURMUR_FORMATION_ID` | Whatever launches a formation's members, in each member's `mur run` environment; set on a member's children by the member's runtime | The formation the session belongs to: `frm_` followed by 32 lowercase hex digits. Shown on the [readiness line](cli.md#mur-run-formation) and handed to every hook. Unset or blank is a session in no formation. A value that is not a formation id refuses the launch with [`E-RUN-044`](diagnostics.md#e-run-044). It grants nothing: no door, spawn or peer decision reads it |
 | `MURMUR_MUR_BINARY` | The environment of the process that runs the capsule | The `mur` binary a parent starts its children from. Defaults to the running executable, which in production is `mur` itself |
 | `MURMUR_DELEGATION_TIMEOUT_SECS` | The environment of the process that runs the capsule | The single delegation bound, in whole seconds: how long a started sub-capsule is watched, and how long a plan `capsule` step waits for its answer. Sets [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) for the whole process. Default 600. A value that is not a positive integer is ignored |
 

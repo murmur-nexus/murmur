@@ -606,6 +606,17 @@ pub enum RuntimeError {
     )]
     SpawnerHandleUnreadable { reason: String },
 
+    /// `MURMUR_FORMATION_ID` was set to something that is not a formation id.
+    ///
+    /// `reason` names what about the value is wrong — its prefix, its length, or a character
+    /// outside lowercase hex — and never carries the value itself.
+    #[error(
+        "MURMUR_FORMATION_ID does not carry a formation id: {reason}; a session that cannot tell \
+         which formation it belongs to would be grouped with the wrong one, so the launch is \
+         refused"
+    )]
+    FormationIdUnreadable { reason: String },
+
     /// A native tool's `bin/<name>` payload was built for another operating system or CPU
     /// architecture than this host.
     ///

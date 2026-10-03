@@ -12,6 +12,7 @@ use wasmtime::{component::Component, Engine};
 
 use crate::{
     bindings::host::murmur::tool::run::ToolResult,
+    formation::FormationId,
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
     network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
@@ -448,6 +449,13 @@ pub struct StageRequest {
     /// and refuse when it cannot; `None` — every launch that does not read the operator config —
     /// keeps no ledger and is not counted.
     pub machine_tokens_per_day: Option<u64>,
+    /// The formation this session is a member of.
+    ///
+    /// `None` is the ordinary case: a session nobody placed in a formation, including a
+    /// standalone capsule that delegates and every child it spawns. `mur run` sets it from
+    /// [`crate::formation::FormationId::from_env`], which reads what the launcher of a formation's
+    /// members, or a member's runtime for its child, put in the environment.
+    pub formation_id: Option<FormationId>,
 }
 
 /// The `transport: process` driver this session runs its harness through, compiled and described
@@ -616,6 +624,9 @@ pub struct StagedSession {
     /// posts to. Read here rather than at each of those two points so one process reads
     /// `MURMUR_SPAWNER` once and both readers see the same value.
     pub(crate) spawner: Option<crate::delegation::SpawnerHandle>,
+    /// Copied from [`StageRequest::formation_id`]. Hooks see it as `MURMUR_FORMATION_ID` and the
+    /// delegation plane hands it to every child this session spawns.
+    pub(crate) formation_id: Option<FormationId>,
 }
 
 impl StagedSession {
@@ -641,6 +652,11 @@ impl StagedSession {
             .as_ref()
             .map(|auth| auth.tokens().to_vec())
             .unwrap_or_default()
+    }
+
+    /// The formation this session is a member of, or `None` for a session nobody placed in one.
+    pub fn formation_id(&self) -> Option<&FormationId> {
+        self.formation_id.as_ref()
     }
 }
 

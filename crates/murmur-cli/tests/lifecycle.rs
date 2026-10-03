@@ -143,6 +143,7 @@ fn stage_agent(
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()

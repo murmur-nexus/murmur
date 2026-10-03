@@ -132,6 +132,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()
@@ -914,5 +915,194 @@ fn door_tokens_are_absent_from_a_public_capsule_readiness_line() {
     assert_eq!(
         keys,
         ["name", "pid", "session_id", "url", "version", "workdir"]
+    );
+}
+
+// ── Formation membership ──────────────────────────────────────────────────────
+
+/// The `ses_*` directories `mur run --manifest <project>/murmur.yaml` has left under
+/// `<project>/workdir/`, where a launch without `--workdir` stages its sessions.
+fn session_dirs(project: &Path) -> Vec<String> {
+    fs::read_dir(project.join("workdir"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("ses_"))
+        .collect()
+}
+
+/// Two members launched with one minted id both report it on their readiness lines, each under
+/// its own session id; a launch without the variable reports no `formation_id` key at all.
+#[test]
+fn formation_members_report_the_id_they_were_launched_with() {
+    use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(&server.endpoint, CAPSULE_NAME, "", QUEUE_SLEEP_YAML);
+    let manifest = project.path().join("murmur.yaml");
+
+    let formation = capsule_runtime::FormationId::mint();
+    let (name, value) = formation.env_pair();
+    let first = MurRun::start(home.path(), &manifest, true, &[], &[(name, &value)]);
+    let second = MurRun::start(home.path(), &manifest, true, &[], &[(name, &value)]);
+    for member in [&first, &second] {
+        assert_eq!(
+            member.startup["formation_id"].as_str(),
+            Some(formation.as_str()),
+            "{}",
+            member.startup
+        );
+    }
+    assert_ne!(first.startup["session_id"], second.startup["session_id"]);
+
+    let standalone = MurRun::start(home.path(), &manifest, true, &[], &[]);
+    assert!(
+        standalone.startup.get("formation_id").is_none(),
+        "{}",
+        standalone.startup
+    );
+    assert!(standalone.startup["session_id"].as_str().is_some());
+}
+
+/// A value that is not a formation id refuses the launch before a session directory exists, and
+/// the refusal does not print the value back.
+#[test]
+fn a_malformed_formation_id_refuses_the_launch_with_e_run_044() {
+    let server = end_turn_server("never reached");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let project = manifest_path.parent().unwrap();
+    let before = session_dirs(project);
+
+    for value in ["not-a-formation", "frm_ABC"] {
+        let output = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", home.path())
+            .env_remove("NEXUS_API_KEY")
+            .env(capsule_runtime::formation::FORMATION_ID_ENV, value)
+            .args(["run", "--manifest", manifest_path.to_str().unwrap()])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("error[E-RUN-044]"), "{value}: {stderr}");
+        assert!(!stderr.contains(value), "{value} was echoed: {stderr}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(value),
+            "{value} was echoed on stdout"
+        );
+        assert_eq!(
+            session_dirs(project),
+            before,
+            "{value} left a session directory"
+        );
+    }
+}
+
+/// A blank variable is no formation: the session launches standalone, staged where
+/// [`session_dirs`] looks.
+#[test]
+fn a_blank_formation_id_launches_a_standalone_session() {
+    use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(&server.endpoint, CAPSULE_NAME, "", QUEUE_SLEEP_YAML);
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        true,
+        &[],
+        &[(capsule_runtime::formation::FORMATION_ID_ENV, "   ")],
+    );
+    assert!(run.startup.get("formation_id").is_none(), "{}", run.startup);
+    let session_id = run.startup["session_id"].as_str().unwrap().to_string();
+    assert_eq!(session_dirs(project.path()), vec![session_id]);
+}
+
+/// The workspace `.env` is loaded after the formation id is read, so a project file cannot place
+/// a session in a formation.
+#[test]
+fn a_formation_id_in_the_workspace_env_file_is_not_read() {
+    use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(&server.endpoint, CAPSULE_NAME, "", QUEUE_SLEEP_YAML);
+    let formation = capsule_runtime::FormationId::mint();
+    fs::write(
+        project.path().join(".env"),
+        format!(
+            "{}={}\n",
+            capsule_runtime::formation::FORMATION_ID_ENV,
+            formation
+        ),
+    )
+    .unwrap();
+
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        true,
+        &[],
+        &[],
+    );
+    assert!(run.startup.get("formation_id").is_none(), "{}", run.startup);
+}
+
+/// `--verbose` names a member's formation, and prints no `formation:` line for a standalone run.
+#[test]
+fn verbose_launch_prints_the_formation_of_a_member_only() {
+    let reply = serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "verbose formation test done"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string();
+    // One answer per launch: the member's, then the standalone run's.
+    let server = common::ScriptedServer::start(vec![reply.clone(), reply]);
+    let inputs = tempfile::tempdir().unwrap();
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let input_file = inputs.path().join("task.md");
+    fs::write(&input_file, "verbose formation test").unwrap();
+    let formation = capsule_runtime::FormationId::mint();
+
+    let run = |formation: Option<&capsule_runtime::FormationId>| -> String {
+        let mut command = Command::cargo_bin("mur").unwrap();
+        command
+            .env("HOME", home.path())
+            .env_remove("NEXUS_API_KEY")
+            .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
+            .args([
+                "run",
+                "--manifest",
+                manifest_path.to_str().unwrap(),
+                "--task",
+                input_file.to_str().unwrap(),
+                "--verbose",
+            ]);
+        if let Some(formation) = formation {
+            let (name, value) = formation.env_pair();
+            command.env(name, value);
+        }
+        String::from_utf8(command.assert().success().get_output().stdout.clone()).unwrap()
+    };
+
+    let member = run(Some(&formation));
+    assert!(
+        member
+            .lines()
+            .any(|line| line == format!("formation: {formation}")),
+        "{member}"
+    );
+    let standalone = run(None);
+    assert!(
+        !standalone
+            .lines()
+            .any(|line| line.starts_with("formation:")),
+        "{standalone}"
     );
 }

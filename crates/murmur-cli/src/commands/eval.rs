@@ -684,6 +684,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {

@@ -71,6 +71,7 @@ fn ctx_gated<'a>(
         current_context_id: Some(TEST_CONTEXT.to_string()),
         registry: worker_registry(),
         spawn_credential: Some(SpawnCredential::new(TEST_CREDENTIAL.to_string())),
+        formation_id: None,
         trace: None,
         gate_step,
         invoke_tool,

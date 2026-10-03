@@ -114,6 +114,7 @@ fn local_source_file_path_installs_skill_md() {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap();
@@ -182,6 +183,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap();
@@ -261,6 +263,7 @@ fn local_source_coexists_with_registry_skill() {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap();

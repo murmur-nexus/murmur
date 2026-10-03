@@ -194,7 +194,7 @@ nothing from the host is inherited.
 | `MURMUR_GATEWAY_ENDPOINT` | This hook's entry in the operator's manifest declares [`gateway:`](manifest.md#artifact-gateway) | `http://127.0.0.1:9` followed by the path of `gateway.endpoint` |
 | `MURMUR_DATASET_ID` | `mur eval run` is driving a dataset and `observability.eval.dataset_id` is set | `observability.eval.dataset_id` |
 | `MURMUR_CASE_ID` | `mur eval run` is driving a dataset | The `case_id` of the case being run |
-| `MURMUR_FORMATION_ID` | `MURMUR_FORMATION_ID` is set in the host environment | Forwarded unchanged |
+| `MURMUR_FORMATION_ID` | The session belongs to a [formation](cli.md#mur-run-formation) | The session's formation id |
 
 ## Driver and tool environment { #driver-environment }
 

@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 use crate::child_launch::{launch_child_capsule, workdir_relative_to, ChildLaunchRequest};
 use crate::delegation::{CompletionAddress, Spawner};
 use crate::errors::RuntimeError;
+use crate::formation::FormationId;
 use crate::http_client::http_json;
 use crate::origin::TrustClass;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
@@ -297,6 +298,10 @@ pub struct DelegationPlane {
     /// that never names one cannot [`DelegationPlane::start`] anything: a delegation whose outcome
     /// has nowhere to arrive is a way to lose work.
     own_url: String,
+    /// The delegating session's formation, handed to every child as `MURMUR_FORMATION_ID` so the
+    /// child joins it. `None` for a session nobody placed in a formation, whose children carry
+    /// none either.
+    formation_id: Option<FormationId>,
 }
 
 impl DelegationPlane {
@@ -307,7 +312,10 @@ impl DelegationPlane {
     /// `lifecycle.delegation_deadline_secs`; [`DELEGATION_TIMEOUT_ENV`] overrides it where it
     /// names a positive number of seconds. `registry` is the store a child's manifest is read
     /// from and `parent_env_allow` the delegating capsule's own `capabilities.env.allow`, which
-    /// together decide the host variables a child is handed.
+    /// together decide the host variables a child is handed. `formation_id` is the session's own
+    /// [`crate::StagedSession::formation_id`], inherited by every child whether or not it is also
+    /// handed a spawner.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         roost_url: String,
         credential: SpawnCredential,
@@ -316,6 +324,7 @@ impl DelegationPlane {
         declared_deadline: Duration,
         registry: std::sync::Arc<dyn murmur_artifact::Registry>,
         parent_env_allow: Vec<String>,
+        formation_id: Option<FormationId>,
     ) -> Self {
         Self {
             roost_url: roost_url.trim_end_matches('/').to_string(),
@@ -326,6 +335,7 @@ impl DelegationPlane {
             registry,
             parent_env_allow,
             own_url: String::new(),
+            formation_id,
         }
     }
 
@@ -339,6 +349,11 @@ impl DelegationPlane {
     pub fn reporting_to(mut self, own_url: String) -> Self {
         self.own_url = own_url;
         self
+    }
+
+    /// The formation every child this plane launches joins, or `None` for a session in none.
+    pub fn formation_id(&self) -> Option<&FormationId> {
+        self.formation_id.as_ref()
     }
 
     /// This plane's bound on the wait for a child's answer.
@@ -467,6 +482,8 @@ impl DelegationPlane {
                 }
             }),
             completion_deadline,
+            // Independent of `spawner`: a launch that names no lineage still joins the formation.
+            formation_id: self.formation_id.clone(),
         })
     }
 
@@ -1014,6 +1031,7 @@ mod tests {
             DELEGATION_RESULT_TIMEOUT,
             std::sync::Arc::new(murmur_artifact::LocalRegistry::new("/tmp")),
             Vec::new(),
+            None,
         )
     }
 
@@ -1277,6 +1295,15 @@ mod tests {
 
     /// A plane over the given store, holding the given `capabilities.env.allow` of its own.
     fn plane_over(store: &tempfile::TempDir, parent_env_allow: &[&str]) -> DelegationPlane {
+        plane_in_formation(store, parent_env_allow, None)
+    }
+
+    /// [`plane_over`] for a session in the given formation.
+    fn plane_in_formation(
+        store: &tempfile::TempDir,
+        parent_env_allow: &[&str],
+        formation_id: Option<FormationId>,
+    ) -> DelegationPlane {
         DelegationPlane::new(
             "http://127.0.0.1:1".to_string(),
             SpawnCredential::new("msc1.test".to_string()),
@@ -1285,6 +1312,7 @@ mod tests {
             DELEGATION_RESULT_TIMEOUT,
             std::sync::Arc::new(murmur_artifact::LocalRegistry::new(store.path())),
             parent_env_allow.iter().map(|n| n.to_string()).collect(),
+            formation_id,
         )
         .reporting_to("http://127.0.0.1:7000".to_string())
     }
@@ -1451,6 +1479,39 @@ through that constructor rather than composing a second request literal."
         assert_eq!(started_spawner.context_id, stepped_spawner.context_id);
     }
 
+    /// Every launch joins the delegating session's formation, on both paths and whether or not
+    /// the launch names a lineage; a session in no formation hands its children none.
+    #[test]
+    fn every_launch_carries_the_sessions_formation_id() {
+        let store = store_with_worker();
+        let member = FormationId::mint();
+        for formation_id in [Some(member), None] {
+            let plane = plane_in_formation(&store, &["B"], formation_id.clone());
+            assert_eq!(plane.formation_id(), formation_id.as_ref());
+            let unnamed = DelegationOrigin::default();
+            for (origin, report_to) in [
+                (origin(), Some(completion_address())),
+                (origin(), None),
+                (unnamed, None),
+            ] {
+                let launch = plane
+                    .launch_request(
+                        &request(),
+                        &origin,
+                        SpawnApproval::new("approved".to_string()),
+                        report_to,
+                    )
+                    .expect("the store holds the child's declaration");
+                assert_eq!(
+                    launch.formation_id,
+                    formation_id,
+                    "spawner present: {}",
+                    launch.spawner.is_some()
+                );
+            }
+        }
+    }
+
     /// The trailing slash is taken off once, so no request is built against `//spawn`.
     #[test]
     fn a_trailing_slash_on_the_daemon_url_is_trimmed_once() {
@@ -1462,6 +1523,7 @@ through that constructor rather than composing a second request literal."
             DELEGATION_RESULT_TIMEOUT,
             std::sync::Arc::new(murmur_artifact::LocalRegistry::new("/tmp")),
             Vec::new(),
+            None,
         );
         assert_eq!(plane.roost_url, "http://127.0.0.1:7700");
     }
