@@ -337,7 +337,9 @@ fn a_bound_that_cannot_be_evaluated_refuses() {
 #[test]
 fn there_is_no_total_cap_to_set() {
     let registry = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_mur-roost"))
+        .env("HOME", home.path())
         .args([
             "--max-total",
             "10",
@@ -355,8 +357,10 @@ fn there_is_no_total_cap_to_set() {
 #[test]
 fn the_bound_flags_reject_a_value_that_is_not_a_number() {
     let registry = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
     for flag in ["--max-depth", "--max-concurrent"] {
         let output = Command::new(env!("CARGO_BIN_EXE_mur-roost"))
+            .env("HOME", home.path())
             .args([
                 flag,
                 "deep",

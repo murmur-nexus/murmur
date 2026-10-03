@@ -41,7 +41,7 @@ mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 | `--spawn-allow` | *(empty)* | One capsule name that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
 | `--max-depth` | `3` | Levels of delegation allowed below a top-level capsule — see [Delegation bounds](#delegation-bounds) |
 | `--max-concurrent` | `4` | Children one session may hold live at once |
-| `--max-live-capsules` | Derived from the host's core count | Capsules this daemon may hold live at once across every formation — see [The machine ceiling](#the-machine-ceiling) |
+| `--max-live-capsules` | Derived from the host's core count | Capsules live on the host at once across every formation, counting those already running when the daemon started — see [The machine ceiling](#the-machine-ceiling) |
 | `--version` | — | Print the daemon's version and exit without binding a port |
 
 `--spawn-allow` takes a single name per occurrence, not a comma-separated list. It gates the
@@ -53,17 +53,32 @@ a value meaning unlimited: `0` refuses every delegation.
 
 The default for `--max-live-capsules` is derived at startup: the daemon multiplies the host's core
 count by 8 and clamps the result to between 16 and 256, so a laptop and a build VM run under
-different numbers. It prints the figure it arrived at:
+different numbers. It prints the figure it arrived at, after a line counting the capsules already
+running on the host — see [Capsules running at startup](#capsules-running-at-startup):
 
 ```
+mur-roost: 0 live capsules already running on this host, counted from /home/you/.murmur/running (0 records read in 0.1 ms; 0 stale and 0 unreadable not counted)
 mur-roost: listening on 127.0.0.1:7700
 mur-roost: machine ceiling 64 live capsules (--max-live-capsules)
 ```
 
+The count is taken before the daemon listens, so no request is answered from a count that has not
+seen the host. A missing `~/.murmur/running` is a host running nothing. The daemon refuses to start,
+exits with status `1` and binds no port when it cannot take the count:
+
+| Cause | Reason printed |
+|---|---|
+| `~/.murmur/running` exists and cannot be listed — a file where the directory belongs, or a directory this user may not read | The path and the OS error |
+| `HOME` is unset, or not an absolute path | `the home directory could not be resolved: …` |
+
+```
+mur-roost: cannot count the capsules already running on this host: /home/you/.murmur/running: Not a directory (os error 20)
+```
+
 !!! note "One daemon per host"
     The ceiling is one daemon's. Two `mur-roost` processes on one host each enforce their own and
-    together exceed it, because roost coordinates nothing across processes and holds no state
-    outside its own memory. Run one daemon per host.
+    together exceed it, because roost coordinates nothing across processes. Run one daemon per
+    host.
 
 Any other flag is rejected and the daemon exits. There is no `--max-total` — see
 [No total cap](#no-total-cap).
@@ -276,7 +291,7 @@ Poll a registered session.
 | `status` | string | `running` — registered and not yet retired; `complete` or `failed` — the session deregistered reporting that outcome |
 | `depth_remaining` | number | Levels of delegation still available below this session, against `--max-depth` |
 | `live_children` | number | Children this session holds right now, counting one it has been approved to launch and has not launched yet |
-| `live_capsules` | number | Capsules this daemon holds live across every formation at the moment of the read, against `--max-live-capsules`. The same figure whichever session is polled |
+| `live_capsules` | number | Capsules live on the host across every formation at the moment of the read, against `--max-live-capsules`: those this daemon admitted, plus those it [found running at startup](#capsules-running-at-startup) that are still running. The same figure whichever session is polled |
 
 **Error — `404 Not Found`**
 
@@ -676,13 +691,14 @@ The name-list refusals are their own, and name the list an operator has to edit:
 
 ## Delegation bounds
 
-Three bounds on delegation, all the operator's and all decided from the daemon's own records rather
-than from anything a capsule says about itself.
+Three bounds on delegation, all the operator's and all decided from the daemon's own records — and,
+for the machine ceiling, from the host's running-capsule records — rather than from anything a
+capsule sends the daemon.
 
 | Bound | Flag | Default | What it counts |
 |---|---|---|---|
 | Depth | `--max-depth` | `3` | Levels of delegation below a capsule that registered with no approval |
-| Machine ceiling | `--max-live-capsules` | Derived from the host's core count | Capsules this daemon holds live at once, across every formation |
+| Machine ceiling | `--max-live-capsules` | Derived from the host's core count | Capsules live on the host at once, across every formation |
 | Concurrency | `--max-concurrent` | `4` | Children one session holds live at once |
 
 All three are checked at `POST /spawn`, after the name check and before the registry is read, and a
@@ -751,9 +767,14 @@ A session's current figures are readable at [`GET /status/{session_id}`](#get-st
 
 ### The machine ceiling
 
-`--max-live-capsules` bounds what this daemon holds live on the host as a whole: every running
-session across every unrelated formation, plus every approval it has granted that nobody has
-redeemed yet. A parent comfortably inside its own `--max-concurrent` is refused when the host is
+`--max-live-capsules` bounds what is live on the host as a whole:
+
+- every running session this daemon tracks, across every unrelated formation
+- every approval it has granted that nobody has redeemed yet
+- every capsule it [found running at startup](#capsules-running-at-startup) whose process is still
+  there
+
+A parent comfortably inside its own `--max-concurrent` is refused when the host is
 full, and the refusal says so — it names a different flag from the concurrency one, because a
 caller acts differently on the two:
 
@@ -782,9 +803,46 @@ machine the operator has just chosen to use, and this daemon referees delegation
 admitting the operator's own launches. An operator who starts more roots by hand than the ceiling
 allows exceeds it, and the next delegated spawn is refused until the census falls back under.
 
-**One daemon per host.** The ceiling counts what *this* daemon has admitted. Two `mur-roost`
-processes on one host each enforce their own ceiling and together exceed it; roost holds no state
-outside its own memory and coordinates with no other process. Run one daemon per host.
+**One daemon per host.** The ceiling counts what *this* daemon has admitted, plus what it found
+running when it started. Two `mur-roost` processes on one host each enforce their own ceiling and
+together exceed it, because roost coordinates with no other process. Run one daemon per host.
+
+#### Capsules running at startup { #capsules-running-at-startup }
+
+Before it listens, the daemon reads `~/.murmur/running` — the
+[running-capsule records](cli.md#running-capsule-records) `mur ps` lists — and counts every capsule
+whose process is still there. A restarted daemon therefore resumes the census rather than starting
+it from zero.
+
+The count errs toward refusing. A capsule stops counting only once the daemon has evidence that it
+is gone, the same evidence `mur ps` prunes a record on. The check is repeated on every census read,
+at `POST /spawn` and `GET /status/{session_id}`, with no sweep and no timer, and a capsule found gone
+is never counted again. A session that also registers with the daemon is counted once.
+
+| Found at startup | Counted |
+|---|---|
+| A record whose process is running and started when the record says | Yes, until the process is gone |
+| A record whose process id is held but whose start time cannot be read | Yes — the holder may be the capsule |
+| A record whose process is running and whose door does not answer | Yes — the process still holds memory, and the daemon never contacts a door |
+| A root started by hand before the restart that never registered | Yes — the daemon cannot tell which capsules its predecessor admitted, so it counts every one. The count falls as they exit |
+| A record whose process id nothing holds, or is held by a process that started at another time | No — stale |
+| A `.json` file that does not parse | No — unreadable, and under-counted if its capsule is running |
+| A session that runs on with no record after [`W-SEC-023`](diagnostics.md#w-sec-023) | No — under-counted |
+| A script capsule | No — under-counted: it opens no door and writes no record |
+| A capsule running under another user's `HOME` | No — under-counted: the daemon reads its own `HOME` only |
+
+The startup line reports the count, and every record read that it left out:
+
+| Part of the line | Meaning |
+|---|---|
+| `N live capsules already running on this host` | Records counted |
+| `counted from <dir>` | The running directory that was read |
+| `N records read in T ms` | Every `.json` file read, parseable or not, and how long the count took |
+| `N stale` | Records whose capsule is gone |
+| `N unreadable` | Files that did not parse |
+
+The daemon writes nothing in `~/.murmur/running`: it creates no directory, changes no mode, and
+leaves every record where it found it, stale and unreadable ones included. `mur ps` prunes those.
 
 ### A bound that cannot be evaluated refuses
 
@@ -800,9 +858,10 @@ There is no cap on the total number of delegations, and no `--max-total` flag. A
 tries to set one gets `unknown argument: --max-total` and the daemon exits.
 
 The job store is held in memory, so restarting the daemon discards every registration and every
-count a total would be kept in. The three bounds above are unaffected: each is decided from the
-sessions the daemon is currently tracking, and a restart that discards those sessions also discards
-every credential and approval that could delegate under them.
+count a total would be kept in. After a restart, depth and concurrency start fresh: each is decided
+from the sessions the daemon tracks, and the restart discards every credential and approval that
+could delegate under them, so no surviving session can delegate. The machine ceiling resumes from
+the running directory — see [Capsules running at startup](#capsules-running-at-startup).
 
 `--max-live-capsules` is not a total. It is a census of what is live right now, so a capsule that
 ends gives its slot back — a total would only ever grow.

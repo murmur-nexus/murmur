@@ -148,6 +148,7 @@ impl Daemon {
             max_depth,
             max_concurrent,
             max_live_capsules,
+            inherited: Default::default(),
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         Self {

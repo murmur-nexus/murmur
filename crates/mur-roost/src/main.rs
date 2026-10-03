@@ -126,6 +126,24 @@ fn main() {
         }
     };
 
+    // Counted before the bind, so no request is ever answered from a census missing the capsules a
+    // previous daemon left running. A directory that exists and cannot be listed stops the daemon:
+    // starting from zero would over-admit a host it cannot see.
+    let inherited = match capsule_runtime::running::running_dir_location()
+        .and_then(|dir| mur_roost::census::inherit(&dir))
+    {
+        Ok((inherited, report)) => {
+            eprintln!("{}", report.startup_line());
+            inherited
+        }
+        Err(reason) => {
+            eprintln!(
+                "mur-roost: cannot count the capsules already running on this host: {reason}"
+            );
+            std::process::exit(1);
+        }
+    };
+
     // One authority per process. Its key never reaches disk, so every credential and approval this
     // daemon issues dies with it — restarting is a complete revocation with no revocation list.
     let authority = match SpawnAuthority::generate() {
@@ -143,6 +161,7 @@ fn main() {
         max_depth: args.max_depth,
         max_concurrent: args.max_concurrent,
         max_live_capsules: args.max_live_capsules,
+        inherited: Arc::new(Mutex::new(inherited)),
         authority,
     });
 

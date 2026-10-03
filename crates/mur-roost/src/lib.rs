@@ -18,6 +18,7 @@
 
 pub mod authority;
 pub mod bounds;
+pub mod census;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -100,11 +101,17 @@ pub struct State {
     /// delegation.
     pub max_concurrent: u32,
     /// Capsules this daemon may hold live on the host at once across every formation, from
-    /// `--max-live-capsules`. `0` refuses every delegation.
+    /// `--max-live-capsules`: every capsule it has admitted, plus every capsule [`State::inherited`]
+    /// still holds from the running directory read at startup. `0` refuses every delegation.
     ///
     /// One daemon's ceiling: two `mur-roost` processes on one host each enforce their own and
     /// together exceed it, because nothing coordinates across processes.
     pub max_live_capsules: u32,
+    /// The capsules found running on the host when the daemon started, counted toward
+    /// `max_live_capsules` until each one's process is gone. Only shrinks; see [`census`].
+    ///
+    /// Locked after `jobs`, never before it.
+    pub inherited: Arc<Mutex<census::Inherited>>,
     /// Mints and verifies every credential and approval this daemon issues. Generated once in
     /// `main` and dropped when the process exits, so a token from a previous daemon verifies
     /// against nothing.
@@ -455,7 +462,9 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     // The machine ceiling ahead of the per-parent one: when both apply the caller hears the more
     // fundamental restriction, the only one of the three whose answer does not depend on who is
     // asking, and the only one where waiting helps and narrowing the formation does not.
-    let live = live_capsules(&state.jobs.lock().unwrap(), now_ms());
+    let jobs = state.jobs.lock().unwrap();
+    let live = machine_live(state, &jobs, now_ms());
+    drop(jobs);
     if live >= state.max_live_capsules {
         return err(
             403,
@@ -523,7 +532,7 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     // sessions from crossing the machine ceiling together.
     {
         let mut jobs = state.jobs.lock().unwrap();
-        let live = live_capsules(&jobs, now_ms());
+        let live = machine_live(state, &jobs, now_ms());
         if live >= state.max_live_capsules {
             return err(
                 403,
@@ -768,6 +777,14 @@ fn handle_deregister(headers: &RequestHeaders, body: &str, state: &Arc<State>) -
 
 // ── GET /status/:session_id ───────────────────────────────────────────────────
 
+/// Every capsule the machine ceiling counts: those this daemon admitted, and those still live from
+/// the startup census that it does not already track.
+///
+/// Takes the `jobs` guard from the caller, so `inherited` is always locked second.
+fn machine_live(state: &State, jobs: &HashMap<String, JobRecord>, now: u64) -> u32 {
+    live_capsules(jobs, now) + state.inherited.lock().unwrap().live(jobs)
+}
+
 fn handle_status(session_id: &str, state: &Arc<State>) -> String {
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(session_id) {
@@ -784,7 +801,7 @@ fn handle_status(session_id: &str, state: &Arc<State>) -> String {
                 status,
                 depth_remaining: job.depth_remaining,
                 live_children: live_children(&jobs, session_id, now),
-                live_capsules: live_capsules(&jobs, now),
+                live_capsules: machine_live(state, &jobs, now),
             })
         }
         None => err(404, "Not Found", "session not found"),

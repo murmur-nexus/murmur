@@ -5,7 +5,9 @@
 //! chain terminates after `--max-depth` links whatever the manifests say. Concurrency is a census:
 //! how many children of one session are live right now, counted against `--max-concurrent`. The
 //! machine ceiling is the same census without the parent filter: every live capsule this daemon
-//! has admitted, across every formation, counted against `--max-live-capsules`.
+//! has admitted, across every formation, plus every capsule found running on the host at startup
+//! that is still live, counted against `--max-live-capsules`. The second half is
+//! [`crate::census`].
 //!
 //! Depth and concurrency ask about the asking session; the machine ceiling asks about the host, so
 //! a parent comfortably inside its own `--max-concurrent` is refused when the machine is full. The
@@ -120,7 +122,7 @@ pub fn live_children(jobs: &HashMap<String, JobRecord>, session_id: &str, now_ms
     (registered + reserved) as u32
 }
 
-/// How many capsules this daemon holds live on the host right now, across every formation.
+/// How many of the capsules this daemon admitted are live right now, across every formation.
 ///
 /// [`live_children`] without the parent filter. Every running session counts however it got there:
 /// a root that registered with no approval and delegates nothing occupies a machine slot, because
@@ -130,6 +132,9 @@ pub fn live_children(jobs: &HashMap<String, JobRecord>, session_id: &str, now_ms
 /// Records the daemon has deregistered do not count, which is what gives a slot back — the map
 /// itself only grows, so a count of its length would refuse forever after the first hundred
 /// formations.
+///
+/// The job store's half of the host census. The machine ceiling adds the capsules found running at
+/// startup that are still live and not in `jobs`, from [`crate::census::Inherited::live`].
 pub fn live_capsules(jobs: &HashMap<String, JobRecord>, now_ms: u64) -> u32 {
     let registered = jobs
         .values()

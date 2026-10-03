@@ -187,6 +187,7 @@ impl Roost {
             // And every case's sessions accumulate in one store, so the host census is the suite's
             // total rather than one formation's.
             max_live_capsules: u32::MAX,
+            inherited: Default::default(),
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
 
