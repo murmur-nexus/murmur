@@ -109,6 +109,11 @@ Each record carries the session id, the capsule address, the process id and its 
 capsule name and version, the session workdir, whether the session outlives its launcher, and the
 time it started. It carries nothing from the environment: no API key, no granted variable.
 
+A session that is a [member of a formation](#mur-run-formation) also records its formation id, as
+`formation_id`. A session in no formation writes no such key. The id groups records; it grants
+nothing. A record whose `formation_id` is not a formation id is unreadable, and is removed on the
+next read like any other unreadable record.
+
 A session whose manifest declares [`network.authentication`](manifest.md#field-network-authentication)
 also records its operator token, as `door_token`. [`mur ps`](#mur-ps), [`mur stop`](#mur-stop),
 [`mur watch`](#mur-watch) and [`mur cancel`](#mur-cancel) present it to the door when they name the
@@ -1050,6 +1055,7 @@ machine's `mur ps` that lists it.
 | `STATUS` | 12 | `running` or `unreachable` |
 | `DETACHED` | 8 | `yes` when the capsule outlives the window that launched it, `no` when it dies with it |
 | `UPTIME` | 9 | `HH:MM:SS` since the session started, prefixed `Nd ` past a day |
+| `FORMATION` | 36 | The full formation id of a [member](#mur-run-formation), `-` for a session in no formation. Present only when [a formation is listed](#mur-ps-formations) |
 | `URL` | — | The `host:port` the capsule's A2A door is bound to |
 
 ```text
@@ -1074,6 +1080,12 @@ file in the directory that is not a readable record is removed without a line.
 
 ```text
 pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce2 — no process holds pid 48213
+```
+
+A pruned record of a formation member names its formation at the end of the line:
+
+```text
+pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce2 — no process holds pid 48213 (formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61)
 ```
 
 Exit codes:
@@ -1105,7 +1117,51 @@ A capsule whose process is alive reads `unreachable` when:
 - the capsule's runtime has every thread it serves requests on occupied
 
 Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
-so the first row is what `@1` names.
+so the first row is what `@1` names. When a formation is listed, its members are kept together, so
+past the first row count `@N` by session id, not by row.
+
+### Formations { #mur-ps-formations }
+
+When any record `mur ps` lists or prunes carries a formation id, the listing changes in three ways.
+When none does, the output is the plain listing above.
+
+1. The `FORMATION` column appears between `UPTIME` and `URL`.
+2. Rows are grouped. A formation's listed members form one group, and a session in no formation
+   is a group of one. Groups are ordered by their newest session, newest first, and rows within a
+   group by session id descending. The first row is still the newest session.
+3. After the table — or after `no running capsules` — come a blank line and one summary line per
+   formation: listed formations in row order, then formations known only from records pruned in
+   this read.
+
+```text
+SESSION                               CAPSULE                   STATUS        DETACHED  UPTIME     FORMATION                             URL
+ses_019f01a9b1d27c3e8f0a4b5c6d7e8f90  researcher@0.1.0          running       yes       00:02:11   frm_019f01a93ff27c1e9a3b5d0c4e8f2a61  localhost:41873
+ses_019f01a940ce7761854e768ecbe3d399  writer@0.1.0              unreachable   yes       00:02:14   frm_019f01a93ff27c1e9a3b5d0c4e8f2a61  localhost:41235
+ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0  my-agent@0.2.0            running       no        00:02:13   -                                     localhost:41102
+
+formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61: 2 listed (1 running, 1 unreachable), 1 pruned now; not listed: 1 ended
+```
+
+A summary line never says a formation is whole. It reads:
+
+```text
+formation <id>: <L> listed (<statuses>)[, <P> pruned now][; <not-listed>][; <U> session root(s) could not be read]
+```
+
+| Part | Says |
+|---|---|
+| `<L> listed (<statuses>)` | How many of the formation's members have a row, as `<n> running` and `<n> unreachable`, each only when non-zero. With no row, `0 listed` and no parentheses |
+| `, <P> pruned now` | Member records this read removed. Only when non-zero |
+| `; not listed: <n> ended, <n> with no record` | Members found in the [session roots](#mur-ps-session-roots) that had no record in this read. `ended` traces hold a `session_end`; `with no record` traces do not — a member killed outright, or one whose record was never written. Each count appears only when non-zero |
+| `; no other member found in <k> session root(s)` | Replaces `not listed` when the session roots hold no member beyond the ones with a record |
+| `; <U> session root(s) could not be read` | Session roots that exist and could not be listed. Only when non-zero |
+
+<span id="mur-ps-session-roots"></span>The session roots searched are the directories holding a
+listed or pruned member's session directory. In each, `mur ps` reads only the first line of the
+`trace.jsonl` of sessions started after the formation id was minted, and reads a whole trace only
+for a member, to find its `session_end`. A session root that cannot be read is counted on the
+summary line and never fails `mur ps`. [`mur trace show <formation-id>`](#mur-trace-show) lists
+the members of one root by name.
 
 ---
 
@@ -1692,16 +1748,17 @@ See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-trace
 
 ### `mur trace show`
 
-Print a human-readable summary of a single session, or the recorded body behind one of its
-content hashes.
+Print a human-readable summary of a single session, the recorded body behind one of its
+content hashes, or the members of a formation.
 
 ```bash
 mur trace show [<session>] [--workdir <dir>] [--body <selector> --turn <n>]
+mur trace show <formation-id> [--workdir <dir>]
 ```
 
 | Argument / Flag | Default | Description |
 |---|---|---|
-| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses) |
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), or a formation id (`frm_…`), which prints only the [Formation section](#mur-trace-show-formation) |
 | `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
 | `--body` | — | Print the body behind one hash and nothing else. Selectors below |
 | `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name. Required with those four, invalid without `--body` |
@@ -1710,7 +1767,7 @@ Output sections, in the order they are printed:
 
 | Section | Printed | Contents |
 |---|---|---|
-| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session`. For a session that staged a [runtime pin](workdir.md#lock-origin), a `runtime pins: <name>@<version> (pulled by <session>), …` line follows `tools` |
+| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session`. For a [formation member](#mur-run-formation), a `formation:  <formation-id>` line follows those. For a session that staged a [runtime pin](workdir.md#lock-origin), a `runtime pins: <name>@<version> (pulled by <session>), …` line follows `tools` |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
@@ -1733,6 +1790,47 @@ Output sections, in the order they are printed:
 | Plan | one or more [`plan_start`](observability-schemas.md#plan-events)/`plan_step`/`plan_end` records | Per plan run: its id, outcome, duration and step totals by status, the step that ended it, and one row per step in the order the plan declared them — kind, status, duration, attempt count when it retried more than once, what it waited on, and its error. A step the run never reached reads `not run` |
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown |
+| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in |
+
+#### Listing a formation { #mur-trace-show-formation }
+
+`mur trace show <formation-id>` lists every session under `--workdir` whose trace names that
+formation, oldest first, with how each ended. A member's own `mur trace show` prints the same
+section for the session root it is in.
+
+```text
+── Formation ────────────────────────────────────
+formation:  frm_019f01a93ff27c1e9a3b5d0c4e8f2a61
+searched:   /home/me/project/workdir
+ses_019f01a940ce7761854e768ecbe3d399  researcher@0.1.0          ok
+ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0  writer@0.1.0              no session_end
+ses_019f01a9b1d27c3e8f0a4b5c6d7e8f90  checker@0.1.0             ok  spawned by ses_019f01a940ce7761854e768ecbe3d399
+delegated children not under this root: 1 — `mur trace show <member>` names each child trace
+```
+
+| Row | Carries |
+|---|---|
+| `formation:` | The formation id |
+| `searched:` | The session root that was searched |
+| One per member | Session id, `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to |
+| `delegated children not under this root` | Members' delegated children whose traces are in another session root. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
+
+Only the one session root is searched. A member that ran from another project, or with another
+`--workdir`, is listed by running the command against that root.
+
+| Situation | Exit |
+|---|---|
+| `<formation-id>` is not `frm_` followed by 32 lowercase hex digits | [`E-TRC-002`](diagnostics.md) `'<arg>' is not a formation id` |
+| No session under the root names the formation | [`E-TRC-002`](diagnostics.md) `no session under <root> belongs to formation <formation-id>` |
+| `--body` or `--turn` with a formation id | [`E-TRC-001`](diagnostics.md) |
+
+A member killed before it wrote `session_end` cannot be summarized on its own. Its
+`mur trace show` fails with [`E-TRC-001`](diagnostics.md), and the message names its
+formation and the command that lists it:
+
+```text
+error[E-TRC-001]: /home/me/project/workdir/ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0/trace.jsonl: no session_end event found; this session is a member of formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61 — `mur trace show frm_019f01a93ff27c1e9a3b5d0c4e8f2a61` lists the formation
+```
 
 #### Printing one recorded body { #mur-trace-show-body }
 

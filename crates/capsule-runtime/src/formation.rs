@@ -26,6 +26,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::errors::RuntimeError;
 
 /// The variable a launcher sets in a member's environment, and a member's runtime sets in each
@@ -101,6 +103,17 @@ impl FormationId {
         &self.0
     }
 
+    /// When this id was minted, in milliseconds since the Unix epoch: the first 12 hex digits of
+    /// its UUIDv7, read the same way `retention::session_id_timestamp_ms` reads a `ses_` id.
+    ///
+    /// A member's session is minted after the formation it joins, so a reader looking for members
+    /// can pass over every session older than this.
+    pub fn minted_at_ms(&self) -> u64 {
+        let digits = &self.0[FORMATION_ID_PREFIX.len()..FORMATION_ID_PREFIX.len() + 12];
+        // `parse` and `mint` admit only lowercase hex, so these 12 digits always read.
+        u64::from_str_radix(digits, 16).unwrap_or(0)
+    }
+
     /// The `(name, value)` pair a launcher writes into a member's or a child's environment.
     pub fn env_pair(&self) -> (&'static str, String) {
         (FORMATION_ID_ENV, self.0.clone())
@@ -110,6 +123,27 @@ impl FormationId {
 impl fmt::Display for FormationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// A bare string, `"frm_…"`.
+impl Serialize for FormationId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Only through [`FormationId::parse`], so a file carrying anything but a formation id does not
+/// deserialize at all. The error names what is wrong and never contains the value.
+impl<'de> Deserialize<'de> for FormationId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(|error| match error {
+            RuntimeError::FormationIdUnreadable { reason } => {
+                serde::de::Error::custom(format!("not a formation id: {reason}"))
+            }
+            _ => serde::de::Error::custom("not a formation id"),
+        })
     }
 }
 
@@ -218,6 +252,57 @@ mod tests {
             result,
             Err(RuntimeError::FormationIdUnreadable { .. })
         ));
+    }
+
+    #[test]
+    fn a_formation_id_serializes_as_a_bare_string_and_round_trips() {
+        let id = FormationId::mint();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{}\"", id.as_str()));
+        let back: FormationId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn a_malformed_formation_id_does_not_deserialize_and_is_not_echoed() {
+        let minted = FormationId::mint();
+        let digits = &minted.as_str()[FORMATION_ID_PREFIX.len()..];
+        for value in [
+            "frm_ABC".to_string(),
+            format!("frm_{}", digits.to_uppercase()),
+            format!("ses_{digits}"),
+        ] {
+            let json = serde_json::to_string(&value).unwrap();
+            let error = serde_json::from_str::<FormationId>(&json)
+                .expect_err("a malformed id deserializes")
+                .to_string();
+            assert!(
+                !error.contains(&value),
+                "the error echoes {value:?}: {error}"
+            );
+            assert!(!error.contains(&digits[..16]), "{error}");
+            assert!(!error.contains(&digits[..16].to_uppercase()), "{error}");
+            assert!(error.contains("not a formation id"), "{error}");
+        }
+        assert!(serde_json::from_str::<FormationId>("42").is_err());
+    }
+
+    #[test]
+    fn a_formation_id_was_minted_when_its_uuid_says() {
+        let id = FormationId::mint();
+        let tail = &id.as_str()[FORMATION_ID_PREFIX.len()..];
+        assert_eq!(
+            Some(id.minted_at_ms()),
+            crate::retention::session_id_timestamp_ms(&format!("ses_{tail}"))
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(id.minted_at_ms() <= now_ms);
+        assert!(now_ms - id.minted_at_ms() < 60_000);
+        let fixed = FormationId::parse("frm_00000000000a0000000000000000000f").unwrap();
+        assert_eq!(fixed.minted_at_ms(), 10);
     }
 
     /// Every `.rs` file under the named workspace crate's `src`, as `(crate/src/path, contents)`.

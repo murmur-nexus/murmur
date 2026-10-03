@@ -60,7 +60,7 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field but `door_token` is required. There is no version field: a record that does not
+/// Every field but `door_token` and `formation_id` is required. There is no version field: a record that does not
 /// deserialize names no process that could be checked, and is pruned, which is what "the record
 /// is a hint" already means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +91,12 @@ pub struct RunningRecord {
         with = "door_token_field"
     )]
     pub door_token: Option<crate::door_auth::DoorToken>,
+    /// The formation this session is a member of, so a reader can tell a formation's records from
+    /// unrelated sessions on the machine. Absent for a session in no formation, and in a record an
+    /// older runtime wrote. It groups records and grants nothing. A value that is not a formation
+    /// id makes the whole record unreadable, which [`list`] prunes like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formation_id: Option<crate::formation::FormationId>,
 }
 
 /// The one place a [`crate::door_auth::DoorToken`] is serialized: the running record.
@@ -637,6 +643,7 @@ mod tests {
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            formation_id: None,
         };
         let token = ControlTokenGuard::write(&record.session_id, "ctl1.token.mac").unwrap();
         let record_guard = RunningGuard::write(&record).unwrap();
@@ -676,6 +683,7 @@ mod tests {
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            formation_id: None,
         }
     }
 
@@ -739,6 +747,73 @@ mod tests {
         assert!(value.get("door_token").is_none());
         let parsed: RunningRecord = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.door_token, None);
+    }
+
+    #[test]
+    fn a_member_record_serializes_its_formation_beside_the_nine_fields() {
+        let formation = crate::formation::FormationId::mint();
+        let mut member = record(1, "42");
+        member.formation_id = Some(formation.clone());
+        let value = serde_json::to_value(&member).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 10);
+        assert_eq!(object["formation_id"], formation.as_str());
+        let back: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back, member);
+    }
+
+    /// A standalone session's record is what it was before records could name a formation.
+    #[test]
+    fn a_standalone_record_has_no_formation_key() {
+        let body = serde_json::to_string_pretty(&record(1, "42")).unwrap();
+        assert!(!body.contains("formation"), "{body}");
+        let parsed: RunningRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.formation_id, None);
+    }
+
+    #[test]
+    fn a_record_with_a_malformed_formation_id_does_not_parse() {
+        let mut value = serde_json::to_value(record(1, "42")).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("formation_id".to_string(), "frm_ABC".into());
+        assert!(serde_json::from_value::<RunningRecord>(value).is_err());
+    }
+
+    #[test]
+    fn list_prunes_a_record_with_a_malformed_formation_id() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "running::tests::inner_list_prunes_a_record_with_a_malformed_formation_id",
+            home.path(),
+        );
+    }
+
+    #[test]
+    #[ignore = "run by list_prunes_a_record_with_a_malformed_formation_id"]
+    fn inner_list_prunes_a_record_with_a_malformed_formation_id() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let dir = running_dir().unwrap();
+        let mut member = record(1, "42");
+        member.formation_id = Some(crate::formation::FormationId::mint());
+        let mut malformed = serde_json::to_value(record(2, "42")).unwrap();
+        malformed["session_id"] = "ses_0199c4e2f1b7712a9d3e4f5061728395".into();
+        malformed["formation_id"] = "frm_ABC".into();
+        let member_path = record_path(&dir, &member.session_id);
+        let malformed_path = dir.join("ses_0199c4e2f1b7712a9d3e4f5061728395.json");
+        std::fs::write(&member_path, serde_json::to_vec_pretty(&member).unwrap()).unwrap();
+        std::fs::write(
+            &malformed_path,
+            serde_json::to_vec_pretty(&malformed).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(list().unwrap(), vec![member]);
+        assert!(member_path.exists());
+        assert!(!malformed_path.exists());
     }
 
     /// Every field is required, so a record missing one is unverifiable rather than partly
