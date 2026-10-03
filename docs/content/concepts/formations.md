@@ -13,3 +13,10 @@ interface, so other capsules and standard A2A clients can discover the capsule a
 Whether an incoming message is accepted depends on the capsule's `lifecycle.task_acceptance`
 setting (see [Capsule lifecycle](session-loop.md#capsule-lifecycle)). See [Connect two capsules
 with A2A messaging](../how-to/capsules-a2a-messaging.md) for the full protocol and examples.
+
+## Rosters
+
+A formation is declared in a `roster.yaml` beside the project's `murmur.yaml`: its members, each a
+capsule at an exact version, the entry member that receives the formation's task, and which
+members may call which. [`mur doctor`](../reference/cli.md#doctor-roster) checks a roster against
+the installed capsules; nothing launches one. See the [Roster Schema](../reference/roster.md).

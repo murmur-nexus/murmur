@@ -771,6 +771,53 @@ Each owner-only entry wider than expected, and each path listed beneath one, als
 exit code. When `HOME` cannot be resolved,
 the block is one `not reported` line.
 
+### Roster { #doctor-roster }
+
+When a [`roster.yaml`](roster.md) sits beside the project's `murmur.yaml`, `mur doctor` admits it
+and prints a `Roster` block ahead of the checklist. It resolves every member from the project
+store and then the global store, and checks each one against `murmur.lock`, as described in
+[Admission order](roster.md#admission). Nothing is launched and no file is written. Without a
+`roster.yaml` there is no block.
+
+| Line | Meaning |
+|---|---|
+| `file: <path>` | The roster admitted |
+| `<name>   <capsule>@<version>   [entry]   <serves peers\|refuses peers>   <authenticated door\|public door>` | One line per member, in roster order. `entry` marks the entry member. The last two columns read the member's [`exports.peer_tasks.accept`](manifest.md#field-exports-peer-tasks) and [`network.authentication`](manifest.md#field-network-authentication) |
+| `reachability: none` | No member may call another |
+| `reachability: a → b, …` | The edges the rules declare, ordered by the members' order in the roster |
+| `reachability (all): a → b, …` | The edges `reachability: all` expands to |
+| `✗  <message>` | The roster is refused. The member lines are not printed |
+
+A refused roster is an error: its code goes to stderr with a hint, the hint is added as a `Fix:`
+entry, and the exit code is `1`. The codes are [`E-ROS-001`](diagnostics.md#e-ros-001) to
+[`E-ROS-007`](diagnostics.md#e-ros-007), and [`E-REG-005`](diagnostics.md#index) for a member
+`murmur.lock` pins at another version or hash.
+
+**Output — an admitted roster:**
+
+```text
+Roster
+  file: /path/to/roster.yaml
+  planner    planner@0.3.0    entry   serves peers    authenticated door
+  coder      coder@1.2.0              serves peers    authenticated door
+  reviewer   reviewer@0.9.0           serves peers    authenticated door
+  reachability: planner → coder, planner → reviewer, reviewer → coder
+```
+
+**Output — a refused roster:**
+
+```text
+Roster
+  file: /path/to/roster.yaml
+  ✗  roster.yaml: member 'coder' declares no `network.authentication`, and this roster declares peer traffic, so every member's door must require authentication
+
+Checking /path/to/murmur.yaml for linux-x86_64...
+
+0 checks passed, 1 error found.
+
+Fix: declare `network.authentication` in the murmur.yaml of the capsule 'coder' runs and rebuild it, or remove the peer traffic from roster.yaml. A capsule that declares network.authentication cannot also declare capabilities.spawn.allow (E-MAN-003)
+```
+
 ### Interface versions { #doctor-interface-versions }
 
 Just before the checklist, `mur doctor` checks every artifact installed in the project store

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use capsule_runtime::{
-    process_driver::PROCESS_DRIVER_IFACE, RuntimeError, MAX_ARTIFACT_CONFIG_BYTES,
+    process_driver::PROCESS_DRIVER_IFACE, RosterRefusal, RuntimeError, MAX_ARTIFACT_CONFIG_BYTES,
 };
 use murmur_artifact::{
     BuildError, ManifestError, RegistryError, MANIFEST_FILENAME, RETIRED_AUTH_BLOCK,
@@ -19,6 +19,15 @@ pub const E_REG_003: &str = "E-REG-003"; // artifact already exists (conflict)
 pub const E_REG_004: &str = "E-REG-004"; // reserved version string
 pub const E_REG_005: &str = "E-REG-005"; // registry-resolved artifact conflicts with murmur.lock
 pub const E_REG_006: &str = "E-REG-006"; // a source did not answer an artifact lookup (rate limited, refused, unreachable, or misconfigured)
+
+// Formation rosters
+pub const E_ROS_001: &str = "E-ROS-001"; // roster.yaml is missing, unreadable or malformed
+pub const E_ROS_002: &str = "E-ROS-002"; // a roster designates no entry member, or more than one
+pub const E_ROS_003: &str = "E-ROS-003"; // two roster members share one name
+pub const E_ROS_004: &str = "E-ROS-004"; // a reachability rule names no member of the roster
+pub const E_ROS_005: &str = "E-ROS-005"; // a reachability rule calls a member that does not serve peers
+pub const E_ROS_006: &str = "E-ROS-006"; // a roster declares peer traffic and a member's door is public
+pub const E_ROS_007: &str = "E-ROS-007"; // a roster member is not installed at its version, or its manifest is unreadable
 
 // Capsule execution
 pub const E_RUN_001: &str = "E-RUN-001"; // capsule trap
@@ -884,6 +893,79 @@ impl From<BuildError> for CliError {
                 ),
             ),
         }
+    }
+}
+
+impl From<RosterRefusal> for CliError {
+    fn from(refusal: RosterRefusal) -> Self {
+        let message = refusal.to_string();
+        let (code, hint) = match &refusal {
+            RosterRefusal::Malformed { .. } => (
+                E_ROS_001,
+                "correct the key named above in roster.yaml — see docs/content/reference/roster.md \
+                 for every key, its type and whether it is required"
+                    .to_string(),
+            ),
+            RosterRefusal::DuplicateMember { member } => (
+                E_ROS_003,
+                format!(
+                    "give each member in roster.yaml its own name and rename one '{member}'; two \
+                     members may run the same capsule under different names"
+                ),
+            ),
+            RosterRefusal::EntryNotDesignated => (
+                E_ROS_002,
+                "mark the member that receives the formation's task with `entry: true` in \
+                 roster.yaml"
+                    .to_string(),
+            ),
+            RosterRefusal::EntryDesignatedMoreThanOnce { .. } => (
+                E_ROS_002,
+                "keep `entry: true` in roster.yaml on the one member that receives the \
+                 formation's task, and remove it from the others"
+                    .to_string(),
+            ),
+            RosterRefusal::UnknownMemberInRule { unknown, .. } => (
+                E_ROS_004,
+                format!(
+                    "add '{unknown}' to roster.yaml's members, or correct the name in the \
+                     reachability rule"
+                ),
+            ),
+            RosterRefusal::MemberUnresolvable { coordinate, .. } => (
+                E_ROS_007,
+                format!(
+                    "install {coordinate} into the project or global store — `mur install \
+                     {coordinate}` — or change the member's version in roster.yaml to one `mur \
+                     list` shows"
+                ),
+            ),
+            RosterRefusal::MemberLockConflict { .. } => (
+                E_REG_005,
+                "change the member's version in roster.yaml to the one murmur.lock pins; if this \
+                 is an intentional upgrade, remove the stale entry from murmur.lock and run mur \
+                 install"
+                    .to_string(),
+            ),
+            RosterRefusal::CalleeDoesNotServePeers { member } => (
+                E_ROS_005,
+                format!(
+                    "declare `exports.peer_tasks.accept: true` in the murmur.yaml of the capsule \
+                     '{member}' runs and rebuild it, or remove '{member}' from every rule's `to` \
+                     in roster.yaml"
+                ),
+            ),
+            RosterRefusal::MemberNotAuthenticated { member } => (
+                E_ROS_006,
+                format!(
+                    "declare `network.authentication` in the murmur.yaml of the capsule '{member}' \
+                     runs and rebuild it, or remove the peer traffic from roster.yaml. A capsule \
+                     that declares network.authentication cannot also declare \
+                     capabilities.spawn.allow (E-MAN-003)"
+                ),
+            ),
+        };
+        CliError::with_hint(code, message, hint)
     }
 }
 

@@ -53,8 +53,15 @@ section that explains it.
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`) | [`mur publish`](cli.md#mur-publish) |
-| `E-REG-005` | A registry-resolved artifact's version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-REG-005` | A registry-resolved artifact's version or hash, or a [roster member's](roster.md#murmur-lock), disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-006` | A source did not answer an artifact lookup — rate limited, refused, unreachable, or misconfigured — so whether it publishes the artifact is not known | [E-REG-006](#e-reg-006) |
+| `E-ROS-001` | `roster.yaml` is missing, unreadable, or does not have the roster shape | [E-ROS-001](#e-ros-001) |
+| `E-ROS-002` | A roster marks no member `entry: true`, or more than one | [E-ROS-002](#e-ros-002) |
+| `E-ROS-003` | Two roster members share one `name` | [E-ROS-003](#e-ros-003) |
+| `E-ROS-004` | A `reachability` rule names a member the roster does not have | [E-ROS-004](#e-ros-004) |
+| `E-ROS-005` | A `reachability` rule calls a member that does not declare `exports.peer_tasks.accept: true` | [E-ROS-005](#e-ros-005) |
+| `E-ROS-006` | A roster with peer traffic has a member with no `network.authentication` | [E-ROS-006](#e-ros-006) |
+| `E-ROS-007` | A roster member is not installed at its version, or its packed `murmur.yaml` cannot be read | [E-ROS-007](#e-ros-007) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
 | `E-RUN-003` | Unsupported `lock_version`, missing lock entry, a lock entry with no hash for this host's platform, or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
@@ -1546,6 +1553,75 @@ against the version this `mur` serves, and pin it in `murmur.yaml` if the projec
 [`mur doctor`](cli.md#doctor-interface-versions) prints this warning for every stale artifact in
 the project and global stores that this project does not declare. A stale artifact the project
 does declare fails the checklist instead, because the next `mur run` refuses it.
+
+---
+
+## Roster errors
+
+A [`roster.yaml`](roster.md) is admitted whole or refused with one of these codes. Every message
+names `roster.yaml`, and every code except `E-ROS-001` names the member at fault. The order
+admission checks them in is in [Admission order](roster.md#admission).
+
+### E-ROS-001 — the roster is missing or malformed { #e-ros-001 }
+
+The message names the key path, such as `members[1].version`, and the member's name when the fault
+is inside a member entry:
+
+```text
+error[E-ROS-001]: roster.yaml: members[1].version (member 'coder'): 'latest' is a reserved alias, not an exact version; pin the version the member runs
+```
+
+| Fault | Fix |
+|---|---|
+| YAML syntax error | Fix the YAML at the line and column shown |
+| `unknown key` | Remove or correct the key. A misspelt `reachability` is refused rather than read as no reachability |
+| `is required`, or a wrong type | Write the field with the type in [Fields](roster.md#fields) |
+| `roster_version` other than `1` | Write `roster_version: 1` |
+| `members` empty | List at least one member |
+| A `name` that does not match `^[a-z][a-z0-9-]{0,31}$` | Use lowercase letters, digits and `-`, starting with a letter, at most 32 characters |
+| A `capsule` that is not a valid artifact name | Name the capsule as `mur list` shows it |
+| A `version` that is blank, `latest`, `stable` or `edge` | Write the exact installed version |
+| A `reachability` string other than `all` | Write `all` or a list of rules |
+| A rule with an empty `to`, or one listing its own `from` | List at least one other member |
+
+### E-ROS-002 — no entry member, or several { #e-ros-002 }
+
+Exactly one member has `entry: true`. With none, the message says so; with several, it names
+every member that claims it. Mark the member that receives the formation's task, and only that
+one. See [The entry member](roster.md#entry-member).
+
+### E-ROS-003 — two members share a name { #e-ros-003 }
+
+Give each member its own `name`. Two members may run the same `capsule` under different names.
+This is checked before the entry member, so a roster with a duplicate is refused with `E-ROS-003`
+whatever its `entry` lines say.
+
+### E-ROS-004 — a rule names no member { #e-ros-004 }
+
+The message names the rule's `from` and the name that matches no member, which is `from` itself
+when the rule's `from` is unknown. Add the member to `members`, or correct the name in the rule.
+
+### E-ROS-005 — a rule calls a member that does not serve peers { #e-ros-005 }
+
+Every member in a rule's `to` must declare
+[`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) in its own `murmur.yaml`.
+Declare it and rebuild and reinstall the capsule, or remove the member from every rule's `to`.
+`reachability: all` never pairs a member that does not serve peers, so it never raises this code.
+
+### E-ROS-006 — a public door in a roster with peer traffic { #e-ros-006 }
+
+When the roster has at least one edge, every member declares
+[`network.authentication`](manifest.md#field-network-authentication), including members on no
+edge. Declare it in the member's `murmur.yaml` and rebuild and reinstall the capsule, or remove the
+roster's reachability. A capsule that declares `network.authentication` cannot also declare
+`capabilities.spawn.allow` (`E-MAN-003`). See [Authentication](roster.md#authentication).
+
+### E-ROS-007 — a member cannot be resolved { #e-ros-007 }
+
+The message names the member and its `capsule@version`. The capsule is in neither the project
+store nor the global store at that version, its bytes do not match the hash the store recorded for
+them, or its packed `murmur.yaml` cannot be read or parsed. Install the capsule at that version
+with `mur install <capsule>@<version>`, or change the member's `version` to one `mur list` shows.
 
 ---
 

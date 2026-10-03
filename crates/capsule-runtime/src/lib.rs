@@ -67,6 +67,7 @@ pub(crate) mod required_fields;
 pub mod resource_plane;
 pub mod resources;
 pub mod retention;
+pub mod roster;
 pub mod running;
 pub mod runtime;
 pub(crate) mod sandbox;
@@ -183,6 +184,9 @@ pub use retention::{
     list_records, locate_message, prune_records, prune_sessions, remove_record, truncate_record,
     MessageLocation, MessageStatus, PrunedRecord, PrunedSession, RecordHeader, RecordSummary,
     RemovedRecord, TruncationMarker, TruncationOutcome,
+};
+pub use roster::{
+    admit_roster, admit_roster_file, AdmittedMember, AdmittedRoster, RosterEdge, RosterRefusal,
 };
 // The running-capsule vocabulary a reader of a record needs. The verbs stay module-qualified —
 // `running::list`, `running::verify`, `running::prune`, `running::running_dir` — on the same terms
