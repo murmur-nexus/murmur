@@ -48,7 +48,10 @@ section that explains it.
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication) or one declared beside a non-empty `capabilities.spawn.allow`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
-| `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
+| `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
+| `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
+| `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
+| `E-NEW-004` | `inference.provider` in `~/.murmur/config.yaml` names a provider `mur new --roster` has no driver for | [`mur new --roster`](cli.md#mur-new-roster-provider) |
 | `E-REG-001` | Every source asked answered that it has no such artifact, or no asset of it for the host platform | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |

@@ -2,8 +2,10 @@
 
 !!! warning "Beta feature"
 
-    `mur new` is a beta feature and is hidden by default. Enable it first with
-    `mur beta enable mur-new`. Behavior and flags may change in future releases.
+    `mur new "<task description>"` is a beta feature: it exists only in a `mur` built with the
+    `beta-mur-new` feature, and runs only after `mur beta enable mur-new`. Behavior and flags may
+    change in future releases. To scaffold a formation instead, use
+    [`mur new --roster`](../reference/cli.md#mur-new-roster), which is in every build.
 
 `mur new` takes a plain-language task description and writes a ready-to-refine `murmur.yaml`
 to the current directory. It cold-boots a short-lived generator capsule backed by Claude Haiku,

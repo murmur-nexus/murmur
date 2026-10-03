@@ -39,6 +39,7 @@ use commands::{
     eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
     install::run_install,
     list::run_list,
+    new_roster::run_new_roster,
     precompile::run_precompile,
     ps::run_ps,
     publish::run_publish,
@@ -93,11 +94,30 @@ enum Commands {
         #[arg(long, value_name = "PREFIX")]
         contract: Option<String>,
     },
-    #[cfg(feature = "beta-mur-new")]
-    /// Generate a murmur.yaml from a plain-language task description
+    #[cfg(not(feature = "beta-mur-new"))]
+    /// Scaffold a formation: ./<NAME>/ holding a roster.yaml and one capsule per member
     New {
-        /// Plain-language task description for the capsule to generate
-        task: String,
+        /// Write ./<NAME>/: roster.yaml, lead/murmur.yaml and worker/murmur.yaml. NAME is an
+        /// artifact name, and prefixes each member's capsule name
+        #[arg(long, value_name = "NAME")]
+        roster: String,
+    },
+    #[cfg(feature = "beta-mur-new")]
+    /// Scaffold a formation with --roster, or generate a murmur.yaml from a plain-language task
+    /// description
+    New {
+        /// Write ./<NAME>/: roster.yaml, lead/murmur.yaml and worker/murmur.yaml. NAME is an
+        /// artifact name, and prefixes each member's capsule name
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["task", "registry"],
+            required_unless_present = "task"
+        )]
+        roster: Option<String>,
+
+        /// Plain-language task description for the capsule to generate (beta: mur-new)
+        task: Option<String>,
 
         /// Registry to search for artifacts: "local" scans ~/.murmur/artifacts/; a URL fetches
         /// that index. Defaults to the configured public index URL.
@@ -521,9 +541,13 @@ fn main() {
     )))]
     let cmd = Cli::command();
 
+    // `mur new --roster` is in every build; only the task form is beta.
     #[cfg(feature = "beta-mur-new")]
     if !beta_config.is_enabled("mur-new") {
-        cmd = cmd.mut_subcommand("new", |sc| sc.hide(true));
+        cmd = cmd.mut_subcommand("new", |sc| {
+            sc.mut_arg("task", |arg| arg.hide(true))
+                .mut_arg("registry", |arg| arg.hide(true))
+        });
     }
     #[cfg(feature = "beta-mur-deploy")]
     if !beta_config.is_enabled("mur-deploy") {
@@ -539,16 +563,29 @@ fn main() {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     let result = match cli.command {
+        #[cfg(not(feature = "beta-mur-new"))]
+        Commands::New { roster } => run_new_roster(&roster),
         #[cfg(feature = "beta-mur-new")]
-        Commands::New { task, registry } => {
+        Commands::New {
+            roster: Some(roster),
+            ..
+        } => run_new_roster(&roster),
+        #[cfg(feature = "beta-mur-new")]
+        Commands::New {
+            roster: None,
+            task,
+            registry,
+        } => {
             if !beta_config.is_enabled("mur-new") {
                 eprintln!(
-                    "error: unrecognized subcommand 'new'\n\n\
-                     For more information, try '--help'."
+                    "error: `mur new <task>` is a beta feature, and it is not enabled\n  \
+                     hint: run `mur beta enable mur-new` to enable it; \
+                     `mur new --roster <NAME>` scaffolds a formation without it"
                 );
                 std::process::exit(1);
             }
-            run_new(&task, registry.as_deref())
+            // clap requires --roster or <task>, so a task is present here.
+            run_new(&task.unwrap_or_default(), registry.as_deref())
         }
         Commands::List {
             global,
