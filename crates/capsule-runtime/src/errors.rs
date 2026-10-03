@@ -617,16 +617,26 @@ pub enum RuntimeError {
     )]
     FormationIdUnreadable { reason: String },
 
-    /// `MURMUR_FORMATION_PEERS` was set to something that is not a list of peer addresses, or was
-    /// set in a process that carries no formation id.
+    /// `MURMUR_FORMATION_PEERS` is set in `mur run`'s own process environment, where nothing
+    /// legitimately puts it, or a list of peers is not one a guest could be handed.
     ///
-    /// `reason` names the pair at fault by its position and what is wrong with it.
-    #[error(
-        "MURMUR_FORMATION_PEERS does not carry a formation's peer addresses: {reason}; a member \
-         handed addresses it cannot read would call the wrong peer or none, so the launch is \
-         refused"
-    )]
+    /// `reason` says where the variable was found, or names the pair at fault by its position and
+    /// what is wrong with it. It never carries the value.
+    #[error("MURMUR_FORMATION_PEERS cannot be used: {reason}, so the launch is refused")]
     FormationPeersUnreadable { reason: String },
+
+    /// The formation channel `MURMUR_FORMATION_CHANNEL` names could not be read: the descriptor is
+    /// not open, its first line did not arrive in time or is not a member's bundle, or it names
+    /// another formation.
+    ///
+    /// `reason` names the problem and never quotes the line: the line carries the member's
+    /// formation tokens.
+    #[error(
+        "MURMUR_FORMATION_CHANNEL does not carry this member's formation credentials: {reason}; a \
+         member that cannot read what its launcher handed it could neither prove who it is nor \
+         call anyone, so the launch is refused"
+    )]
+    FormationChannelUnreadable { reason: String },
 
     /// A native tool's `bin/<name>` payload was built for another operating system or CPU
     /// architecture than this host.

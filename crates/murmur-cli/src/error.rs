@@ -77,7 +77,7 @@ pub const E_RUN_042: &str = "E-RUN-042"; // a session has no control surface, or
 pub const E_RUN_043: &str = "E-RUN-043"; // a runtime-pulled lock pin is declared as a hook, a driver, with gateway:, or bound as inference.system_prompt_artifact
 pub const E_RUN_044: &str = "E-RUN-044"; // MURMUR_FORMATION_ID is set to something that is not a formation id
 pub const E_RUN_045: &str = "E-RUN-045"; // a formation member did not come up, so the formation was not launched
-pub const E_RUN_046: &str = "E-RUN-046"; // a formation member tried to launch a formation, or MURMUR_FORMATION_PEERS is unreadable
+pub const E_RUN_046: &str = "E-RUN-046"; // a formation member tried to launch a formation, its formation channel is unreadable, or MURMUR_FORMATION_PEERS is in the process environment
 pub const E_RUN_047: &str = "E-RUN-047"; // the capsule's bytes hash differently from the sha256 admission bound it to
 
 // Capability enforcement
@@ -749,9 +749,15 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::FormationPeersUnreadable { .. } => CliError::with_hint(
                 E_RUN_046,
                 error.to_string(),
-                "MURMUR_FORMATION_PEERS is set by `mur run --roster` in its entry member's \
-                 environment only, beside MURMUR_FORMATION_ID; unset it to run this capsule on its \
-                 own",
+                "MURMUR_FORMATION_PEERS is set by a formation member's runtime inside its own WASM \
+                 components, never in a process environment; unset it to run this capsule",
+            ),
+            error @ RuntimeError::FormationChannelUnreadable { .. } => CliError::with_hint(
+                E_RUN_046,
+                error.to_string(),
+                "MURMUR_FORMATION_CHANNEL is set by `mur run --roster` alone, for each member it \
+                 starts, beside MURMUR_FORMATION_ID; launch the formation with `mur run --roster`, \
+                 or unset both to run this capsule on its own",
             ),
             RuntimeError::PortInUse { port } => CliError::with_hint(
                 E_RUN_010,
@@ -1071,17 +1077,34 @@ mod tests {
 
     #[test]
     fn unreadable_formation_peers_map_to_e_run_046() {
-        let error = capsule_runtime::FormationPeers::parse("coder").unwrap_err();
-        let cli = CliError::from(error);
+        let cli = CliError::from(RuntimeError::FormationPeersUnreadable {
+            reason: "it is set in this process's environment".to_string(),
+        });
         assert_eq!(cli.code, E_RUN_046);
         assert!(
-            cli.message.contains("MURMUR_FORMATION_PEERS"),
+            cli.message.contains("MURMUR_FORMATION_PEERS")
+                && cli.message.contains("set in this process's environment"),
             "{}",
             cli.message
         );
-        assert!(cli.message.contains("pair 1 has no '='"), "{}", cli.message);
         let hint = cli.hint.as_deref().unwrap_or_default();
         assert!(hint.contains("unset it"), "{hint}");
+    }
+
+    #[test]
+    fn an_unreadable_formation_channel_maps_to_e_run_046() {
+        let cli = CliError::from(RuntimeError::FormationChannelUnreadable {
+            reason: "descriptor 9 is not open".to_string(),
+        });
+        assert_eq!(cli.code, E_RUN_046);
+        assert!(
+            cli.message.contains("MURMUR_FORMATION_CHANNEL")
+                && cli.message.contains("descriptor 9 is not open"),
+            "{}",
+            cli.message
+        );
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("mur run --roster"), "{hint}");
     }
 
     #[test]

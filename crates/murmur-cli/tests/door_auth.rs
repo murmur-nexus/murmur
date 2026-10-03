@@ -8,115 +8,20 @@ mod common;
 use std::{
     fs,
     path::Path,
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
-use capsule_runtime::{
-    capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
-    StageRequest, StagedSession,
-};
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, request, rpc, wait_completed, MurRun,
-    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    agent_project, bearer, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
+    trace_events, wait_completed, MurRun, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
-use murmur_artifact::{load_runtime_manifest, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
-use tempfile::TempDir;
 
 const CAPSULE_NAME: &str = "door-agent";
 
 const EXPORTS_YAML: &str = "exports:\n  files:\n    root: out\n    mode: read-only\n";
 
 // ── In-process launch ─────────────────────────────────────────────────────────
-
-/// Stages the capsule `manifest` describes from `home`'s store, declaring what its
-/// `network.authentication` block declares.
-fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
-    let runtime_manifest = load_runtime_manifest(manifest).unwrap();
-    let artifacts = runtime_manifest
-        .artifacts
-        .iter()
-        .map(|artifact| ArtifactRequest {
-            name: artifact.name.clone(),
-            version: artifact.version.clone(),
-            runtime: artifact.runtime.clone(),
-            source: artifact.source.clone(),
-            on_overflow: artifact.on_overflow,
-            config: artifact.config.clone(),
-            gateway: artifact.gateway.clone(),
-            capabilities: artifact.capabilities.clone(),
-        })
-        .collect();
-    stage_session(
-        std::sync::Arc::new(LocalRegistry::new(
-            home.path().join(".murmur").join("artifacts"),
-        )),
-        StageRequest {
-            credentials_file: None,
-            manifest_dir: manifest.parent().unwrap().to_path_buf(),
-            capsule_name: runtime_manifest.name.clone(),
-            capsule_version: runtime_manifest.version.clone(),
-            capsule_component_bytes: Vec::new(),
-            artifacts,
-            allowlisted_tools: Default::default(),
-            lock_expectations: None,
-            capability_policy: capability_policy_from_runtime_manifest(&runtime_manifest),
-            inference: runtime_manifest.inference.clone(),
-            system_prompt_overridden: false,
-            context: None,
-            context_id: None,
-            resume: None,
-            forget_session: false,
-            otel_endpoint: None,
-            eval_config_json: None,
-            case_id: None,
-            dataset_id: None,
-            lifecycle: runtime_manifest.lifecycle.clone(),
-            lifecycle_override: None,
-            trace: None,
-            workdir: None,
-            bind_addr: "127.0.0.1".to_string(),
-            internal_port: None,
-            declared_containment_floor: ContainmentClass::Advisory,
-            exports: runtime_manifest.exports.clone(),
-            control: None,
-            door_authentication: runtime_manifest
-                .network
-                .as_ref()
-                .and_then(|network| network.authentication.clone()),
-            spawn_grant: None,
-            machine_tokens_per_day: None,
-            formation_id: None,
-            formation_peers: None,
-            ignore_task_file: false,
-        },
-    )
-    .unwrap()
-}
-
-/// Launches `staged` on a thread of its own and returns its `host:port`. A queue+sleep capsule
-/// never exits, so the thread is left behind.
-fn launch(staged: StagedSession) -> String {
-    let (url_tx, url_rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        launch_session(staged, move |url| {
-            let _ = url_tx.send(url.to_string());
-        })
-        .expect("launch should succeed")
-    });
-    url_rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("timed out waiting for the door")
-}
-
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    fs::read_to_string(workdir.join("trace.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
-}
 
 fn event_count(workdir: &Path, event: &str) -> usize {
     trace_events(workdir)
@@ -151,10 +56,6 @@ fn assert_refused(
     );
 }
 
-fn bearer(token: &str) -> String {
-    format!("Bearer {token}")
-}
-
 #[test]
 fn authenticated_door_gates_every_request_but_the_public_card() {
     if common::skip_without_host_support(
@@ -171,7 +72,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         &format!("{QUEUE_SLEEP_YAML}{EXPORTS_YAML}{AUTHENTICATION_YAML}"),
     );
     let manifest = project.path().join("murmur.yaml");
-    let staged = stage(&home, &manifest);
+    let staged = stage_door(&home, &manifest, None);
     let session_id = staged.session_id.clone();
     let workdir = staged.workdir.clone();
     fs::create_dir_all(workdir.join("out")).unwrap();
@@ -195,11 +96,11 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
 
     // A second session's operator token: minted under another key.
     let other_project = agent_project(&server.endpoint, CAPSULE_NAME, "", AUTHENTICATION_YAML);
-    let other = stage(&home, &other_project.path().join("murmur.yaml"));
+    let other = stage_door(&home, &other_project.path().join("murmur.yaml"), None);
     let foreign = other.door_tokens()[0].1.expose().to_string();
     drop(other);
 
-    let addr = launch(staged);
+    let addr = launch_door(staged);
     let realm = format!("Bearer realm=\"{CAPSULE_NAME}\"");
     let invalid = format!("Bearer realm=\"{CAPSULE_NAME}\", error=\"invalid_token\"");
 
@@ -431,9 +332,9 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
     let server = common::ScriptedServer::start(vec![end_turn(1, "one"), end_turn(2, "two")]);
     let home = driver_home();
     let project = agent_project(&server.endpoint, CAPSULE_NAME, "", QUEUE_SLEEP_YAML);
-    let staged = stage(&home, &project.path().join("murmur.yaml"));
+    let staged = stage_door(&home, &project.path().join("murmur.yaml"), None);
     assert!(staged.door_tokens().is_empty());
-    let addr = launch(staged);
+    let addr = launch_door(staged);
 
     let card = request(&addr, "GET", "/.well-known/agent-card.json", &[], "").json();
     assert_eq!(card["securitySchemes"], json!({}));

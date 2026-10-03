@@ -23,7 +23,14 @@ the installed capsules. See the [Roster Schema](../reference/roster.md).
 
 `mur run --roster` launches a roster for one task. Every member runs as its own `mur run` process
 under one formation id: the peers start first, each counted ready only once its door answers as the
-session it reported, and the entry member starts last, handed the address of every member it may
-call. When the entry member's task ends, every member is stopped. See
-[Launching a formation](../reference/roster.md#launch) and the
+session it reported, and the entry member starts last. When the entry member's task ends, every
+member is stopped. See [Launching a formation](../reference/roster.md#launch) and the
 [`mur run --roster` flags and output](../reference/cli.md#mur-run-roster).
+
+The roster is enforced. The launcher is the one authority that issues credentials: it
+signs a token for each edge the roster allows, hands each member only the tokens for the members it
+may call, and keeps the signing key in its own memory. A member's components call another member by
+name; the runtime attaches the token, so no model ever sees it. Every member's door lets in only a
+token issued for that door, answers any other caller `401` or `403`, and the whole set of
+credentials ends with the formation. See
+[How reachability is enforced](../reference/roster.md#enforcement).

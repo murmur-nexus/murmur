@@ -39,12 +39,13 @@ pub const W_RUN_003: &str = "W-RUN-003";
 /// malformation is named once per tool per session.
 pub const W_RUN_004: &str = "W-RUN-004";
 
-/// A roster edge between two members neither of which is the entry member.
+/// A roster edge into the entry member.
 ///
-/// Only the entry member is handed the addresses of the members it may call, so such an edge is
-/// admitted and both members are launched, but the call it allows has no address to travel on.
-/// Nothing is refused; the edge is named once per launch.
-pub const W_RUN_005: &str = "W-RUN-005";
+/// The entry member runs `task_acceptance: single` and is busy with the formation's own task from
+/// launch until it exits, so it can never accept a peer's task. Such an edge is admitted and every
+/// member is launched, but the calling member is handed no credential or address for it. Nothing
+/// is refused; the edge is named once per launch.
+pub const W_RUN_006: &str = "W-RUN-006";
 
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
@@ -62,7 +63,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_005];
+        let codes = [W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

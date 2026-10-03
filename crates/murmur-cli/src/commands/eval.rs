@@ -685,7 +685,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         };
 

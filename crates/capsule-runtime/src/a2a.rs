@@ -582,6 +582,9 @@ pub(crate) struct IncomingTask {
     /// before the turn, under [`crate::identity::FORGET_SESSION_HEADER`]. `false` for every task
     /// that did not carry the header, and for every task the runtime enqueued for itself.
     pub forget_session: bool,
+    /// The formation member that called, when the door let this task in on a formation token.
+    /// Recorded as `a2a_task_received.caller_member`; `None` for every other task.
+    pub caller_member: Option<String>,
 }
 
 /// The `source` of a task that arrived over the A2A door.

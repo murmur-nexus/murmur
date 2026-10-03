@@ -58,6 +58,7 @@ use crate::{
     diagnostic,
     errors::RuntimeError,
     formation::{FormationId, FormationPeers},
+    formation_credentials::{is_formation_host, virtual_member, FormationMember, FormationToken},
     gateway_credential::{config_holds_credential, CredentialEvent, GatewayCredential},
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -1544,13 +1545,18 @@ pub fn stage_session(
         .filter(|_| request.inference.is_some())
         .map(|control| Arc::new(crate::control_plane::InjectedSecrets::new(&control.secrets)));
     // Minted at staging so the launcher can hand the tokens out before the door opens. The key is
-    // generated here for this session alone and is never written.
+    // generated here for this session alone and is never written. A formation member's door also
+    // takes the formation tokens issued to it, checked against the key its launcher handed it.
     let door_auth = request
         .door_authentication
         .as_ref()
         .map(crate::door_auth::DoorAuth::mint)
         .transpose()
         .map_err(RuntimeError::Runtime)?
+        .map(|auth| match &request.formation_member {
+            Some(member) => auth.with_formation(member.verifier().clone()),
+            None => auth,
+        })
         .map(Arc::new);
     let (gateways, unresolved_credentials) = stage_gateways(
         request.inference.as_ref(),
@@ -1714,10 +1720,9 @@ pub fn stage_session(
     };
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
-    let stage_peers = request.formation_peers.as_ref().map(FormationPeers::render);
     let stage_env = HookEnvVars {
         formation_id: request.formation_id.as_ref().map(FormationId::as_str),
-        formation_peers: stage_peers.as_deref(),
+        formation_member: request.formation_member.as_ref(),
         ..HookEnvVars::default()
     };
     dispatch_stage(
@@ -1835,7 +1840,7 @@ pub fn stage_session(
         // directory exists; this is where the value itself enters the session.
         spawner: SpawnerHandle::from_env()?,
         formation_id: request.formation_id,
-        formation_peers: request.formation_peers,
+        formation_member: request.formation_member,
         ignore_task_file: request.ignore_task_file,
     })
 }
@@ -1943,7 +1948,11 @@ fn launch(
     let inference_env = session_guest_env(
         staged.inference.as_ref(),
         staged.gateways.inference(),
-        staged.formation_peers.as_ref(),
+        staged
+            .formation_member
+            .as_ref()
+            .and_then(|member| member.guest_peers())
+            .as_ref(),
     );
     let gateways = staged.gateways.clone();
     let control_for_state = staged.control.clone();
@@ -2307,7 +2316,7 @@ fn launch(
         let case_id = staged.case_id;
         let dataset_id = staged.dataset_id;
         let formation_id = staged.formation_id;
-        let formation_peers = staged.formation_peers.as_ref().map(FormationPeers::render);
+        let formation_member = staged.formation_member.clone();
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
         // The driver artifact the manifest names, under either transport. Only a
@@ -2406,6 +2415,7 @@ fn launch(
             );
             trace.set_runtime_artifacts(&installed_artifacts);
             trace.set_formation_id(formation_id.as_ref());
+            trace.set_formation_member(formation_member.as_deref());
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -2556,6 +2566,8 @@ fn launch(
                         http_hooks: NetworkPolicyHooks {
                             network_allow_rules: network_allow_rules.clone(),
                             gateway: None,
+                            formation: formation_member.clone(),
+                            task_provenance: None,
                         },
                         network_allow_rules,
                         peer_fetch_rules,
@@ -2646,6 +2658,7 @@ fn launch(
                                     network_allow_rules: state.network_allow_rules.clone(),
                                     driver_grant,
                                     gateway,
+                                    formation: state.http_hooks.formation.clone(),
                                     spend: Arc::clone(&state.spend),
                                     records: std::sync::Mutex::new(Vec::new()),
                                     spend_refusals: std::sync::Mutex::new(Vec::new()),
@@ -2673,7 +2686,7 @@ fn launch(
                             case_id: case_id.as_deref(),
                             dataset_id: dataset_id.as_deref(),
                             formation_id: formation_id.as_ref().map(FormationId::as_str),
-                            formation_peers: formation_peers.as_deref(),
+                            formation_member: formation_member.as_ref(),
                         },
                         hook_limits,
                         hook_inference,
@@ -3223,6 +3236,7 @@ fn launch(
                                     &incoming.context_id,
                                     &incoming.message_id,
                                     incoming.traceparent.as_deref(),
+                                    incoming.caller_member.as_deref(),
                                 )
                                 .await;
                         }
@@ -3551,6 +3565,8 @@ fn launch(
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: network_allow_rules.clone(),
             gateway: None,
+            formation: staged.formation_member.clone(),
+            task_provenance: None,
         },
         network_allow_rules,
         // A script capsule has no peer-handoff surface: `share-file` and `fetch-peer-file` are
@@ -5061,14 +5077,15 @@ pub(crate) fn gateway_env_pair(gateway: &CredentialGateway) -> (String, String) 
 }
 
 /// The runtime-owned variables every guest of this session sees: the `MURMUR_INFERENCE_*` set for
-/// an inference session, then [`crate::formation::FORMATION_PEERS_ENV`] for a formation's entry
-/// member with callees.
+/// an inference session, then [`crate::formation::FORMATION_PEERS_ENV`] — each callee at its
+/// virtual address — for a formation member with callees.
 ///
-/// One list, read by the agent or script root's store, by every tool and driver store, by a hook's
-/// `run-inference` driver, and by the shell tool; a native tool and a process-driver harness take
-/// the formation entry from it through [`formation_env`]. `build_wasi_ctx` applies it after the
-/// manifest's allowlist, and neither the allowlist nor a shell baseline resolves the peers name
-/// from the host, so no declaration supplies or displaces it.
+/// One list, read by the agent or script root's store, by every tool and driver store and by a
+/// hook's `run-inference` driver. The shell tool takes it through [`native_env`], which drops the
+/// formation entry, as a native tool and a process-driver harness are never handed it.
+/// `build_wasi_ctx` applies it after the manifest's allowlist, and neither the allowlist nor a
+/// shell baseline resolves the peers name from the host, so no declaration supplies or displaces
+/// it.
 fn session_guest_env(
     inference: Option<&murmur_artifact::InferenceConfig>,
     gateway: Option<&Arc<CredentialGateway>>,
@@ -5259,15 +5276,32 @@ pub(crate) struct NetworkPolicyHooks {
     /// artifact's per-artifact narrowing is consulted for it. Every other request from the same
     /// store is checked exactly as it is without a gateway.
     pub(crate) gateway: Option<Arc<CredentialGateway>>,
+    /// This session's formation membership. A request to a callee's virtual address
+    /// (`http://<name>.formation.invalid`) is resolved to the callee's real door, checked against
+    /// `network_allow_rules` there, and sent with the callee's token by the runtime. Every other
+    /// request under `formation.invalid` is denied, and with `None` every one is.
+    pub(crate) formation: Option<Arc<FormationMember>>,
+    /// The task in scope on this store, whose trust class a formation call is stamped with. `None`
+    /// — no task in scope — stamps `untrusted`.
+    pub(crate) task_provenance: Option<TaskProvenance>,
+}
+
+/// Where [`NetworkPolicyHooks::admit`] lets a request go.
+pub(crate) enum Admission {
+    /// To the gateway's one operator-pinned upstream, keyed by the runtime.
+    Gateway(Arc<CredentialGateway>),
+    /// Straight to the address the guest named.
+    Direct,
 }
 
 impl NetworkPolicyHooks {
-    /// Where this store may send a request for `uri`: through its gateway (`Ok(Some)`), straight to
-    /// `uri` (`Ok(None)`), or nowhere. Decided before any connection exists.
-    pub(crate) fn admit(
-        &self,
-        uri: &http::Uri,
-    ) -> Result<Option<Arc<CredentialGateway>>, WasiHttpError> {
+    /// Where this store may send a request for `uri`, or nowhere. Decided before any connection
+    /// exists.
+    ///
+    /// Every host under `formation.invalid` is denied here: a formation call may wait for its
+    /// callee's address, so only `send_request` routes one, through [`resolve_formation_call`] off
+    /// the guest's thread. Admitting one here as `Direct` would send it as the guest wrote it.
+    pub(crate) fn admit(&self, uri: &http::Uri) -> Result<Admission, WasiHttpError> {
         if let Some(gateway) = self.gateway.as_ref() {
             if CredentialGateway::is_addressed_to_gateway(uri) {
                 // The inference gateway's request is refused before the key is attached unless
@@ -5280,8 +5314,12 @@ impl NetworkPolicyHooks {
                         return Err(WasiHttpError::HttpRequestDenied);
                     }
                 }
-                return Ok(Some(Arc::clone(gateway)));
+                return Ok(Admission::Gateway(Arc::clone(gateway)));
             }
+        }
+
+        if uri.host().is_some_and(is_formation_host) {
+            return Err(WasiHttpError::HttpRequestDenied);
         }
 
         let target = RequestTarget::from_request(uri, uri.scheme_str() == Some("https"))
@@ -5295,8 +5333,81 @@ impl NetworkPolicyHooks {
             return Err(WasiHttpError::HttpRequestDenied);
         }
 
-        Ok(None)
+        Ok(Admission::Direct)
     }
+}
+
+/// The real door and the token for a request to the virtual address `uri`, or the same denial a
+/// destination outside `network_allow_rules` gets.
+///
+/// Denied, alike: a session in no formation; a scheme other than `http`; an authority that is not
+/// exactly `<name>.formation.invalid` (a port or user info included); a name this member may not
+/// call, whether or not such a member exists; a callee whose address does not arrive within the
+/// member's address wait; and a real door URL that `network_allow_rules` do not reach. The roster
+/// grants a credential and a name, never egress.
+pub(crate) fn resolve_formation_call(
+    formation: Option<&FormationMember>,
+    network_allow_rules: &[NetworkAllowRule],
+    uri: &http::Uri,
+) -> Result<(http::Uri, FormationToken), WasiHttpError> {
+    let denied = || WasiHttpError::HttpRequestDenied;
+    let member = formation.ok_or_else(denied)?;
+    if uri.scheme_str() != Some("http") {
+        return Err(denied());
+    }
+    let name = uri
+        .authority()
+        .and_then(|authority| virtual_member(authority.as_str()))
+        .ok_or_else(denied)?;
+    let (url, token) = member
+        .resolve(name, member.address_wait())
+        .ok_or_else(denied)?;
+    let url: http::Uri = url.parse().map_err(|_| denied())?;
+    let target = RequestTarget::from_request(&url, false).ok_or_else(denied)?;
+    if !network_allow_rules.iter().any(|rule| rule.matches(&target)) {
+        return Err(denied());
+    }
+    Ok((url, token))
+}
+
+/// `request`, readdressed at the callee's real door `url` and presenting `token`.
+///
+/// The URI keeps the guest's path and query and takes the door's scheme and authority, and `host`
+/// is set to match. Every `authorization`, origin and trust header the guest set is removed: the
+/// runtime is the one presenting the credential, so it attaches exactly one `Bearer` header of its
+/// own and stamps the provenance itself, from `stamped`.
+pub(crate) fn readdress_formation_call(
+    request: http::Request<WasiBody>,
+    url: &http::Uri,
+    token: &FormationToken,
+    stamped: TaskProvenance,
+) -> Result<http::Request<WasiBody>, WasiHttpError> {
+    use http::header::{HeaderValue, AUTHORIZATION};
+    let (mut parts, body) = request.into_parts();
+    parts.headers.remove(AUTHORIZATION);
+    parts.headers.remove(crate::origin::PEER_ORIGIN_HEADER);
+    parts.headers.remove(crate::origin::PEER_TRUST_HEADER);
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+        .map_err(|_| WasiHttpError::InternalError(None))?;
+    bearer.set_sensitive(true);
+    parts.headers.insert(AUTHORIZATION, bearer);
+    parts.headers.insert(
+        crate::origin::PEER_ORIGIN_HEADER,
+        HeaderValue::from_static(stamped.origin().as_str()),
+    );
+    parts.headers.insert(
+        crate::origin::PEER_TRUST_HEADER,
+        HeaderValue::from_static(stamped.trust().as_str()),
+    );
+    let authority = url
+        .authority()
+        .ok_or(WasiHttpError::HttpRequestUriInvalid)?;
+    crate::credential_gateway::readdress(
+        &mut parts,
+        url.scheme_str().unwrap_or("http"),
+        authority.as_str(),
+    )?;
+    Ok(http::Request::from_parts(parts, body))
 }
 
 impl WasiHttpHooks for NetworkPolicyHooks {
@@ -5308,12 +5419,32 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     ) -> Box<
         dyn Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>> + Send,
     > {
+        // A formation call may wait for its callee's address, so it is resolved off this thread,
+        // inside the response future, and still before any connection is opened.
+        if request.uri().host().is_some_and(is_formation_host) {
+            let stamped = stamp_for_peer(self.task_provenance);
+            let formation = self.formation.clone();
+            let rules = self.network_allow_rules.clone();
+            let uri = request.uri().clone();
+            return Box::new(async move {
+                let (url, token) = tokio::task::spawn_blocking(move || {
+                    resolve_formation_call(formation.as_deref(), &rules, &uri)
+                })
+                .await
+                .map_err(|_| WasiHttpError::HttpRequestDenied)??;
+                send_direct(
+                    readdress_formation_call(request, &url, &token, stamped)?,
+                    options,
+                )
+                .await
+            });
+        }
         // A refused request gets a future that has already failed, so no connection is opened
         // for it. The guest reads the refusal from its response future.
         match self.admit(request.uri()) {
             Err(refused) => Box::new(std::future::ready(Err(refused))),
-            Ok(Some(gateway)) => Box::new(gateway.send(request, options)),
-            Ok(None) => Box::new(send_direct(request, options)),
+            Ok(Admission::Gateway(gateway)) => Box::new(gateway.send(request, options)),
+            Ok(Admission::Direct) => Box::new(send_direct(request, options)),
         }
     }
 }
@@ -5619,6 +5750,9 @@ impl WasiView for CapsuleStoreState {
 
 impl WasiHttpView for CapsuleStoreState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
+        // The task loop moves the task in scope on this store; a formation call stamps whichever
+        // task is in scope when the guest sends it.
+        self.http_hooks.task_provenance = self.current_task_provenance;
         WasiHttpCtxView {
             ctx: &mut self.http,
             table: &mut self.table,
@@ -5653,11 +5787,36 @@ impl send::Host for CapsuleStoreState {
         peer_url: String,
         message: send::Message,
     ) -> Result<send::TaskResult, String> {
-        check_destination_allowed(
-            &self.network_allow_rules,
-            &peer_url,
-            "capabilities.network.allow",
-        )?;
+        // A formation callee's virtual address is resolved and authorized exactly as the egress
+        // hook does it: the real door must be reachable under `capabilities.network.allow`, and
+        // the runtime presents the callee's token. The guest learns neither the door nor the
+        // token, and the trace records the address the guest named.
+        let (connect_url, authorization) = match formation_send_target(&peer_url) {
+            Some(uri) => {
+                // The callee's address may still be on its way; wait for it without holding up
+                // the runtime worker this host call runs on.
+                let (url, token) = tokio::task::block_in_place(|| {
+                    resolve_formation_call(
+                        self.http_hooks.formation.as_deref(),
+                        &self.network_allow_rules,
+                        &uri,
+                    )
+                })
+                .map_err(|_| {
+                    format!("network policy: '{peer_url}' not in capabilities.network.allow")
+                })?;
+                let authority = url.authority().map(|a| a.to_string()).unwrap_or_default();
+                (format!("http://{authority}"), Some(token))
+            }
+            None => {
+                check_destination_allowed(
+                    &self.network_allow_rules,
+                    &peer_url,
+                    "capabilities.network.allow",
+                )?;
+                (peer_url.clone(), None)
+            }
+        };
 
         let message_id = message.message_id.clone();
         let outgoing_msg = outgoing::OutgoingMessage {
@@ -5675,12 +5834,14 @@ impl send::Host for CapsuleStoreState {
         let sender_task = self.current_task_provenance;
         let task = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(outgoing::send_a2a_message(
-                &peer_url,
+                &connect_url,
                 outgoing_msg,
                 traceparent.clone(),
                 sender_task,
+                authorization.as_ref(),
             ))
-        })?;
+        })
+        .map_err(|error| error.replace(&connect_url, &peer_url))?;
 
         self.pending_a2a_events.push((
             peer_url.clone(),
@@ -6306,6 +6467,11 @@ pub(crate) struct ToolInvokeEnv<'a> {
     /// The gateway the caller chose for this dispatch, attached to the store only when it is
     /// `name`'s own. The store's guest then also sees `MURMUR_GATEWAY_ENDPOINT`.
     pub(crate) gateway: Option<&'a Arc<CredentialGateway>>,
+    /// The session's formation membership, through which the store's guest reaches its callees'
+    /// virtual addresses. `None` for a session in no formation.
+    pub(crate) formation: Option<&'a Arc<FormationMember>>,
+    /// The task this dispatch runs for, whose trust a formation call is stamped with.
+    pub(crate) task_provenance: Option<TaskProvenance>,
 }
 
 /// Per-session A2A wiring registered on a tool linker.
@@ -6364,6 +6530,8 @@ pub(crate) async fn invoke_tool_component(
         network_allow_rules,
         artifact_grant,
         gateway,
+        formation,
+        task_provenance,
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
@@ -6520,6 +6688,8 @@ pub(crate) async fn invoke_tool_component(
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: effective_network_rules.to_vec(),
             gateway,
+            formation: formation.cloned(),
+            task_provenance,
         },
     };
 
@@ -6706,6 +6876,8 @@ impl CapsuleStoreState {
                 // manifest entry to narrow from) — both keep the full ceiling.
                 artifact_grant: self.artifact_grants.get(name),
                 gateway,
+                formation: self.http_hooks.formation.as_ref(),
+                task_provenance: self.current_task_provenance,
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -6958,7 +7130,6 @@ impl CapsuleStoreState {
                     &self.workdir,
                     &self.capability_policy,
                     &self.shell_enforcement,
-                    &formation_env(&self.inference_env),
                 )
             })
             .map(DispatchOutcome::tool);
@@ -6975,7 +7146,7 @@ impl CapsuleStoreState {
             let name = name.to_string();
             let accessible_workdir = self.accessible_workdir.clone();
             let session_workdir = self.workdir.clone();
-            let env_overrides = self.inference_env.clone();
+            let env_overrides = native_env(&self.inference_env);
             let policy = self.capability_policy.clone();
             let enforcement = self.shell_enforcement.clone();
             // Both halves are required. Without a registry there is no task loop to deliver a
@@ -7964,20 +8135,29 @@ fn check_destination_allowed(
     peer_url: &str,
     field: &str,
 ) -> Result<(), String> {
-    let for_parse = if peer_url.contains("://") {
-        peer_url.to_string()
-    } else {
-        format!("http://{peer_url}")
-    };
-    let uri: http::Uri = for_parse
-        .parse()
-        .map_err(|e| format!("invalid peer URL '{peer_url}': {e}"))?;
+    let uri = peer_uri(peer_url).map_err(|e| format!("invalid peer URL '{peer_url}': {e}"))?;
     let target = RequestTarget::from_request(&uri, false)
         .ok_or_else(|| format!("invalid peer URL '{peer_url}'"))?;
     if rules.iter().any(|rule| rule.matches(&target)) {
         return Ok(());
     }
     Err(format!("network policy: '{peer_url}' not in {field}"))
+}
+
+/// `peer_url` as a URI when it names a host under the formation peer domain, which only
+/// [`resolve_formation_call`] may route; `None` for every other address.
+fn formation_send_target(peer_url: &str) -> Option<http::Uri> {
+    let uri = peer_uri(peer_url).ok()?;
+    uri.host().is_some_and(is_formation_host).then_some(uri)
+}
+
+/// `peer_url` as a URI, `http://` assumed when it names no scheme.
+fn peer_uri(peer_url: &str) -> Result<http::Uri, http::uri::InvalidUri> {
+    if peer_url.contains("://") {
+        peer_url.parse()
+    } else {
+        format!("http://{peer_url}").parse()
+    }
 }
 
 /// One tool call's `data` field, parsed as a JSON object.
@@ -8794,13 +8974,13 @@ fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<
     Ok(())
 }
 
-/// The runtime-owned formation entries of a session's guest environment: what a native process
-/// that is not handed the whole guest environment — a native tool, a process-driver harness —
-/// still receives. Empty for every session but a formation's entry member with callees.
-pub(crate) fn formation_env(guest_env: &[(String, String)]) -> Vec<(String, String)> {
+/// A session's guest environment as a native process gets it: without
+/// [`crate::formation::FORMATION_PEERS_ENV`]. A virtual callee address works only through the
+/// runtime's own egress, so the variable would name members a native process cannot reach.
+pub(crate) fn native_env(guest_env: &[(String, String)]) -> Vec<(String, String)> {
     guest_env
         .iter()
-        .filter(|(name, _)| name == crate::formation::FORMATION_PEERS_ENV)
+        .filter(|(name, _)| name != crate::formation::FORMATION_PEERS_ENV)
         .cloned()
         .collect()
 }
@@ -8809,9 +8989,6 @@ pub(crate) fn formation_env(guest_env: &[(String, String)]) -> Vec<(String, Stri
 ///
 /// The binary receives the serialized ToolInput JSON on stdin and must write a valid
 /// ToolResult JSON object to stdout. The binary's working directory is the capsule workdir.
-/// `runtime_env` is applied over the shell baseline, where no manifest-declared name can shadow
-/// it.
-#[allow(clippy::too_many_arguments)]
 fn dispatch_native_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
@@ -8820,7 +8997,6 @@ fn dispatch_native_tool(
     session_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
-    runtime_env: &[(String, String)],
 ) -> Result<murmur::tool::run::ToolResult, String> {
     use std::{
         io::Write,
@@ -8835,7 +9011,7 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, runtime_env, session_workdir)?;
+    let env = build_shell_env(policy, &[], session_workdir)?;
 
     // Bound to a local before spawning (rather than chained straight into `.spawn()`) so a
     // `pre_exec` step can be attached to it, mirroring `execute_shell`'s shape.
@@ -9576,6 +9752,7 @@ async fn enqueue_detached_report(
                 // Nobody asked for anything to be forgotten: the runtime enqueued this task for
                 // itself.
                 forget_session: false,
+                caller_member: None,
             };
             let _ = trace
                 .write_shell_completed(
@@ -9606,6 +9783,7 @@ async fn enqueue_detached_report(
             source: crate::a2a::SOURCE_DETACHED_LOST,
             delegation_id: None,
             forget_session: false,
+            caller_member: None,
         },
     };
 
@@ -10987,7 +11165,7 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         };
 
@@ -11090,7 +11268,7 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         };
 
@@ -11179,7 +11357,7 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         };
 
@@ -11267,7 +11445,7 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         };
 
@@ -11407,7 +11585,7 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         };
 
@@ -11513,7 +11691,7 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         }
     }
@@ -12278,6 +12456,8 @@ inference:
             http_hooks: NetworkPolicyHooks {
                 network_allow_rules: Vec::new(),
                 gateway: None,
+                formation: None,
+                task_provenance: None,
             },
             network_allow_rules: Vec::new(),
             peer_fetch_rules: Vec::new(),
@@ -13991,22 +14171,28 @@ inference:
         script_path
     }
 
-    /// An entry member's session hands its formation peers to every guest and native process it
-    /// starts for itself, and no `capabilities.env.allow` or `shell.baseline_env` entry naming the
-    /// variable supplies or displaces it.
+    /// A member's session hands its callees, at their virtual addresses, to every WASM guest and
+    /// to no native process — not the shell tool, not a native tool — and no
+    /// `capabilities.env.allow` or `shell.baseline_env` entry naming the variable supplies it.
     #[test]
-    fn formation_peers_reach_every_guest_and_no_declaration_displaces_them() {
+    fn formation_peers_reach_every_guest_and_no_native_process() {
         let _guard = crate::formation::FORMATION_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let name = crate::formation::FORMATION_PEERS_ENV;
-        let peers =
-            FormationPeers::parse("coder=http://localhost:41873 reviewer=http://localhost:41874")
-                .unwrap();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = FormationMember::from_bundle(
+            authority.member_bundle("planner", &["coder", "reviewer"]),
+        );
+        let peers = member.guest_peers().unwrap();
         let value = peers.render();
+        assert_eq!(
+            value,
+            "coder=http://coder.formation.invalid reviewer=http://reviewer.formation.invalid"
+        );
         let pair = (name.to_string(), value.clone());
 
-        // The list the agent or script root, every tool and driver store, and the shell tool are
+        // The list the agent or script root, every tool and driver store, and a hook's driver are
         // built from — for an agent session and for a script session alike.
         let agent = session_guest_env(Some(&http_inference()), None, Some(&peers));
         assert_eq!(agent.last(), Some(&pair), "{agent:?}");
@@ -14016,7 +14202,10 @@ inference:
         assert!(session_guest_env(Some(&http_inference()), None, None)
             .iter()
             .all(|(key, _)| key != name));
-        assert_eq!(formation_env(&agent), vec![pair.clone()]);
+        assert!(native_env(&agent).iter().all(|(key, _)| key != name));
+        assert!(native_env(&agent)
+            .iter()
+            .any(|(key, _)| key == "MURMUR_INFERENCE_MODEL"));
 
         std::env::set_var(name, "decoy=http://localhost:1");
         let declaring = CapabilityPolicy {
@@ -14024,11 +14213,11 @@ inference:
             shell_baseline_env: vec![name.to_string()],
             ..CapabilityPolicy::default()
         };
-        // A WASI guest's declared environment never resolves the name from the host, so the
-        // session's value, applied after it, is the only one a guest sees.
+        // Neither a WASI guest's declared environment nor a shell baseline resolves the name from
+        // the host, and the shell tool and a native tool are not handed the session's value.
         let declared = build_declared_env(&declaring);
         let tmp = TempDir::new().unwrap();
-        let shell = build_shell_env(&declaring, &agent, tmp.path()).unwrap();
+        let shell = build_shell_env(&declaring, &native_env(&agent), tmp.path()).unwrap();
         let binary = write_env_echo_native_tool(tmp.path(), "echo-peers", &[name]);
         let native = dispatch_native_tool(
             "echo-peers",
@@ -14041,14 +14230,13 @@ inference:
             tmp.path(),
             &declaring,
             &sandbox::ShellEnforcement::environment_only(),
-            &formation_env(&agent),
         );
         std::env::remove_var(name);
 
         assert!(!declared.contains_key(name), "{declared:?}");
-        assert_eq!(shell.get(name), Some(&value), "{shell:?}");
+        assert!(!shell.contains_key(name), "{shell:?}");
         let data = native.unwrap().data.unwrap_or_default();
-        assert!(data.contains(&format!("{name}={value}")), "{data}");
+        assert!(!data.contains("formation.invalid"), "{data}");
         assert!(!data.contains("decoy"), "{data}");
     }
 
@@ -14713,7 +14901,6 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
-            &[],
         )
         .unwrap();
 
@@ -14744,7 +14931,6 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
-            &[],
         )
         .unwrap();
         std::env::remove_var("GITHUB_TOKEN");
@@ -14774,7 +14960,6 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
-            &[],
         )
         .unwrap();
         std::env::remove_var("STRIPE_API_KEY");
@@ -14804,7 +14989,6 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
-            &[],
         )
         .unwrap();
         std::env::remove_var("CARGO_HOME");
@@ -14838,7 +15022,6 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
-            &[],
         )
         .unwrap();
         std::env::remove_var("MYCOMPANY_SECRET");
@@ -14896,6 +15079,8 @@ inference:
         let hooks = NetworkPolicyHooks {
             network_allow_rules: rules.to_vec(),
             gateway: None,
+            formation: None,
+            task_provenance: None,
         };
         hooks.admit(&uri.parse().expect("uri parses")).is_ok()
     }
@@ -14981,6 +15166,8 @@ inference:
         let mut hooks = NetworkPolicyHooks {
             network_allow_rules: Vec::new(),
             gateway: gateway_for_store(table.for_artifact("other-tool"), "other-tool"),
+            formation: None,
+            task_provenance: None,
         };
         let request = http::Request::builder()
             .uri("http://127.0.0.1:9/")
@@ -15257,6 +15444,8 @@ inference:
                     network_allow_rules: &ceiling,
                     artifact_grant: Some(&grant),
                     gateway: None,
+                    formation: None,
+                    task_provenance: None,
                 },
                 ToolA2aWiring::silent(),
                 "scoped-tool",
@@ -15300,6 +15489,8 @@ inference:
                     network_allow_rules: &ceiling,
                     artifact_grant: None,
                     gateway: None,
+                    formation: None,
+                    task_provenance: None,
                 },
                 ToolA2aWiring::silent(),
                 "plain-tool",
@@ -17594,5 +17785,374 @@ inference:
         assert_eq!(refused(&state, "t", serde_json::json!({})), None);
         stage_tool_manifest(&state, "t", &manifest_with_schema(None, EDITOR_SCHEMA));
         assert!(refused(&state, "t", serde_json::json!({})).is_some());
+    }
+
+    // ── Formation egress ─────────────────────────────────────────────────────────
+
+    /// A door that records every request it is sent — head and body, lowercased — and answers
+    /// each with a JSON-RPC task, so both the egress hook and `send_a2a_message` read a success.
+    struct RecordingDoor {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingDoor {
+        fn start() -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|rest| rest.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; length];
+                    let _ = stream.read_exact(&mut body);
+                    seen.lock()
+                        .unwrap()
+                        .push(format!("{head}{}", String::from_utf8_lossy(&body)));
+                    let answer = r#"{"jsonrpc":"2.0","id":"x","result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"submitted"}}}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                }
+            });
+            Self { url, requests }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// `coder` of a formation in which it may call `reviewer`, with `reviewer`'s door at `door`
+    /// once `address` is true.
+    fn coder_member(
+        authority: &crate::formation_credentials::FormationAuthority,
+        door: &str,
+        address: bool,
+    ) -> Arc<FormationMember> {
+        let member = FormationMember::from_bundle(authority.member_bundle("coder", &["reviewer"]))
+            .with_address_wait(std::time::Duration::from_millis(500));
+        if address {
+            member.install_addresses(vec![crate::formation::FormationPeer {
+                name: "reviewer".to_string(),
+                url: door.to_string(),
+            }]);
+        }
+        Arc::new(member)
+    }
+
+    fn egress_hooks(
+        member: Option<Arc<FormationMember>>,
+        allow: &[&str],
+        task: Option<TaskProvenance>,
+    ) -> NetworkPolicyHooks {
+        NetworkPolicyHooks {
+            network_allow_rules: parse_network_allow_rules(
+                &allow
+                    .iter()
+                    .map(|rule| rule.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            gateway: None,
+            formation: member,
+            task_provenance: task,
+        }
+    }
+
+    /// A guest request as wasi-http hands it to the hook, `host` set to what the guest addressed.
+    fn guest_request(uri: &str, headers: &[(&str, &str)]) -> http::Request<WasiBody> {
+        use http_body_util::{BodyExt, Empty};
+        let mut builder = http::Request::builder().method("GET").uri(uri);
+        if let Some(authority) = uri.parse::<http::Uri>().unwrap().authority() {
+            builder = builder.header(http::header::HOST, authority.as_str());
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(
+                Empty::<bytes::Bytes>::new()
+                    .map_err(|err| match err {})
+                    .boxed_unsync(),
+            )
+            .unwrap()
+    }
+
+    /// Send `request` through `hooks`, returning the status or the refusal.
+    fn send_through(
+        hooks: &mut NetworkPolicyHooks,
+        request: http::Request<WasiBody>,
+    ) -> Result<u16, WasiHttpError> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let sent = hooks.send_request(request, None, Box::new(async { Ok(()) }));
+        rt.block_on(Box::into_pin(sent))
+            .map(|(response, _io)| response.status().as_u16())
+    }
+
+    /// A request to a callee's virtual address reaches its real door with the door's
+    /// `host`, exactly one `Bearer` of the runtime's, and the provenance of the sending task —
+    /// whatever the guest set itself.
+    #[test]
+    fn a_formation_call_reaches_the_real_door_with_the_runtimes_credential_and_stamp() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let authority_of_door = door.url.trim_start_matches("http://").to_string();
+        for (task, trust) in [
+            (
+                Some(TaskProvenance::derive(TaskOrigin::Event, None)),
+                "untrusted",
+            ),
+            (
+                Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                "trusted",
+            ),
+            (None, "untrusted"),
+        ] {
+            let mut hooks = egress_hooks(Some(Arc::clone(&member)), &["127.0.0.1"], task);
+            let status = send_through(
+                &mut hooks,
+                guest_request(
+                    "http://reviewer.formation.invalid/.well-known/agent-card.json?x=1",
+                    &[
+                        ("authorization", "Bearer guest-made"),
+                        ("Authorization", "Basic also-guest"),
+                        (crate::origin::PEER_ORIGIN_HEADER, "user"),
+                        (crate::origin::PEER_TRUST_HEADER, "trusted"),
+                    ],
+                ),
+            )
+            .expect("the callee is reached");
+            assert_eq!(status, 200);
+            let head = door.requests().pop().unwrap();
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.starts_with("get /.well-known/agent-card.json?x=1 http/1.1"),
+                "{head}"
+            );
+            assert!(
+                lower.contains(&format!("host: {authority_of_door}\r\n")),
+                "{head}"
+            );
+            assert_eq!(lower.matches("authorization:").count(), 1, "{head}");
+            let token = authority.mint("coder", "reviewer");
+            // Ed25519 signing is deterministic, so the authority mints the very token the
+            // member was handed.
+            assert!(
+                head.contains(&format!("Bearer {}", token.expose())),
+                "{head}"
+            );
+            assert!(
+                !lower.contains("guest-made") && !lower.contains("also-guest"),
+                "{head}"
+            );
+            assert_eq!(lower.matches("x-murmur-task-origin:").count(), 1, "{head}");
+            assert!(lower.contains("x-murmur-task-origin: peer\r\n"), "{head}");
+            assert!(
+                lower.contains(&format!("x-murmur-task-trust: {trust}\r\n")),
+                "{head}"
+            );
+            assert!(!lower.contains("formation.invalid"), "{head}");
+        }
+    }
+
+    /// A non-callee, an unknown name, `https`, an explicit port, a session in no
+    /// formation, a real door outside the allow rules and an address that never arrives are all
+    /// the one denial, and none opens a connection.
+    #[test]
+    fn every_formation_request_it_cannot_route_is_the_one_denial() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        for uri in [
+            "http://planner.formation.invalid/",
+            "http://nosuch.formation.invalid/",
+            "https://reviewer.formation.invalid/",
+            "http://reviewer.formation.invalid:80/",
+            "http://a.reviewer.formation.invalid/",
+            "http://formation.invalid/",
+        ] {
+            let mut hooks = egress_hooks(Some(Arc::clone(&member)), &["127.0.0.1", "*"], None);
+            assert!(
+                matches!(
+                    send_through(&mut hooks, guest_request(uri, &[])),
+                    Err(WasiHttpError::HttpRequestDenied)
+                ),
+                "{uri}"
+            );
+            assert!(matches!(
+                hooks.admit(&uri.parse().unwrap()),
+                Err(WasiHttpError::HttpRequestDenied)
+            ));
+        }
+        // No formation at all.
+        let mut outside = egress_hooks(None, &["127.0.0.1"], None);
+        assert!(matches!(
+            send_through(
+                &mut outside,
+                guest_request("http://reviewer.formation.invalid/", &[])
+            ),
+            Err(WasiHttpError::HttpRequestDenied)
+        ));
+        // The roster grants no egress: a store whose rules do not reach the real door is denied.
+        let mut narrowed = egress_hooks(Some(Arc::clone(&member)), &["api.example.com"], None);
+        assert!(matches!(
+            send_through(
+                &mut narrowed,
+                guest_request("http://reviewer.formation.invalid/", &[])
+            ),
+            Err(WasiHttpError::HttpRequestDenied)
+        ));
+        // An address that never arrives is denied at the member's wait bound.
+        let addressless = coder_member(&authority, &door.url, false);
+        let mut waiting = egress_hooks(Some(addressless), &["127.0.0.1"], None);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            send_through(
+                &mut waiting,
+                guest_request("http://reviewer.formation.invalid/", &[])
+            ),
+            Err(WasiHttpError::HttpRequestDenied)
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(450)
+                && waited < std::time::Duration::from_secs(5),
+            "{waited:?}"
+        );
+        assert!(door.requests().is_empty(), "{:?}", door.requests());
+    }
+
+    /// An address that arrives late, within the wait, is reached.
+    #[test]
+    fn a_late_address_within_the_wait_is_reached() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = Arc::new(
+            FormationMember::from_bundle(authority.member_bundle("coder", &["reviewer"]))
+                .with_address_wait(std::time::Duration::from_secs(10)),
+        );
+        let late = Arc::clone(&member);
+        let url = door.url.clone();
+        let installer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            late.install_addresses(vec![crate::formation::FormationPeer {
+                name: "reviewer".to_string(),
+                url,
+            }]);
+        });
+        let mut hooks = egress_hooks(Some(member), &["127.0.0.1"], None);
+        let started = std::time::Instant::now();
+        let status = send_through(
+            &mut hooks,
+            guest_request("http://reviewer.formation.invalid/", &[]),
+        )
+        .expect("the late address is reached");
+        installer.join().unwrap();
+        assert_eq!(status, 200);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1900));
+        assert_eq!(door.requests().len(), 1);
+    }
+
+    /// The callee's real door, addressed directly, is an ordinary request: the runtime
+    /// attaches nothing to it.
+    #[test]
+    fn a_request_to_the_real_door_carries_no_credential() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let mut hooks = egress_hooks(Some(member), &["127.0.0.1"], None);
+        let status = send_through(&mut hooks, guest_request(&format!("{}/", door.url), &[]))
+            .expect("the real door is allowlisted");
+        assert_eq!(status, 200);
+        let head = door.requests().pop().unwrap().to_ascii_lowercase();
+        assert!(!head.contains("authorization"), "{head}");
+        assert!(!head.contains("x-murmur-task-origin"), "{head}");
+    }
+
+    /// `murmur:message/send` to a virtual address is resolved and authorized as the egress
+    /// hook does it, and the trace records the address the guest named.
+    #[test]
+    fn message_send_to_a_virtual_address_is_resolved_and_authorized_the_same_way() {
+        let door = RecordingDoor::start();
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = coder_member(&authority, &door.url, true);
+        let mut state = continuation_test_state();
+        state.network_allow_rules = parse_network_allow_rules(&["127.0.0.1".to_string()]).unwrap();
+        state.http_hooks.formation = Some(member);
+        state.current_task_provenance = Some(TaskProvenance::derive(TaskOrigin::User, None));
+        let message = |id: &str| send::Message {
+            message_id: id.to_string(),
+            context_id: None,
+            text: "review this".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (sent, refused_planner, refused_unknown) = rt.block_on(async {
+            (
+                send::Host::send(
+                    &mut state,
+                    "http://reviewer.formation.invalid".to_string(),
+                    message("msg_1"),
+                ),
+                send::Host::send(
+                    &mut state,
+                    "http://planner.formation.invalid".to_string(),
+                    message("msg_2"),
+                ),
+                send::Host::send(
+                    &mut state,
+                    "http://nosuch.formation.invalid".to_string(),
+                    message("msg_3"),
+                ),
+            )
+        });
+        let sent = sent.expect("the callee takes the message");
+        assert_eq!(sent.task_id, "tsk_1");
+        let head = door.requests().pop().unwrap();
+        let lower = head.to_ascii_lowercase();
+        assert_eq!(
+            lower.matches("authorization: bearer mft1.").count(),
+            1,
+            "{head}"
+        );
+        assert!(lower.contains("x-murmur-task-origin: peer\r\n"), "{head}");
+        assert!(lower.contains("x-murmur-task-trust: trusted\r\n"), "{head}");
+        assert_eq!(state.pending_a2a_events.len(), 1);
+        assert_eq!(
+            state.pending_a2a_events[0].0,
+            "http://reviewer.formation.invalid"
+        );
+        let refused_planner = refused_planner.unwrap_err();
+        let refused_unknown = refused_unknown.unwrap_err();
+        assert_eq!(
+            refused_planner.replace("planner", "<name>"),
+            refused_unknown.replace("nosuch", "<name>"),
+            "a refusal does not say whether the member exists"
+        );
+        assert!(!refused_planner.contains("127.0.0.1"), "{refused_planner}");
+        assert_eq!(door.requests().len(), 1);
     }
 }

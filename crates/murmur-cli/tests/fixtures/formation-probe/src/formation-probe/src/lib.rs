@@ -1,16 +1,17 @@
-// Test-only tool that reports, from inside a formation's entry member, which peers it was handed
-// and whether each one's door answers. It holds no token: every request it makes is
-// unauthenticated, so an authenticated peer's door answers its public agent card with 200 and a
-// JSON-RPC `message/send` with 401.
+// Test-only tool that reports, from inside a formation member, which callees its runtime handed
+// it and whether each one answers through the runtime's formation egress. It holds no token: the
+// runtime resolves each virtual address to the callee's real door and presents the callee's token
+// itself.
 //
-// It reads `MURMUR_FORMATION_PEERS` — `name=url` pairs separated by single spaces — and for each
-// pair sends `GET <url>/.well-known/agent-card.json` and one `POST <url>/` carrying a JSON-RPC
-// `message/send`. Its summary is one line per peer, in the order the variable names them:
+// Its input is optional `{"names": ["coder", "reviewer"]}`; without it, the names are the ones
+// `MURMUR_FORMATION_PEERS` lists. For each name, in order, it sends
+// `GET http://<name>.formation.invalid/.well-known/agent-card.json` and one JSON-RPC `message/send`
+// as `POST http://<name>.formation.invalid/`. Its summary is one line per name:
 //
-//   <name> card=<status> card_name=<card's "name"> send=<status>
+//   <name> card=<status|refused:<error>> send=<status|refused:<error>>
 //
-// with `error=<what>` in place of a status when a request did not complete, and the single line
-// `peers=absent` when the variable is not set.
+// where `refused:<error>` is the request's failure as wasi-http reported it, and then the line
+// `peers=<MURMUR_FORMATION_PEERS, or absent>`.
 
 wit_bindgen::generate!({
     path: "../../../../../../capsule-runtime/wit/guest",
@@ -23,16 +24,13 @@ use wasip2::http::types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme}
 use wasip2::io::streams::StreamError;
 
 const FORMATION_PEERS: &str = "MURMUR_FORMATION_PEERS";
-const SEND_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"formation-probe","parts":[{"kind":"text","text":"hello from the entry member"}]}}}"#;
+const PEER_DOMAIN: &str = "formation.invalid";
+const SEND_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"formation-probe","parts":[{"kind":"text","text":"hello from a formation member"}]}}}"#;
 
 struct FormationProbe;
 
-/// Sends one request and returns the response status and body.
-fn request(method: Method, url: &str, path: &str, body: Option<&str>) -> Result<(u16, Vec<u8>), String> {
-    let authority = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("unsupported url '{url}'"))?
-        .trim_end_matches('/');
+/// Sends one request to `authority` and returns the response status.
+fn request(method: Method, authority: &str, path: &str, body: Option<&str>) -> Result<u16, String> {
     let fields = Fields::new();
     let mut headers = vec![("accept", b"application/json".to_vec())];
     if let Some(body) = body {
@@ -66,11 +64,11 @@ fn request(method: Method, url: &str, path: &str, body: Option<&str>) -> Result<
     OutgoingBody::finish(outgoing_body, None).map_err(|e| format!("finish: {e:?}"))?;
 
     let future = wasip2::http::outgoing_handler::handle(outgoing, None)
-        .map_err(|e| format!("handle: {e:?}"))?;
+        .map_err(|e| format!("{e:?}"))?;
     let response = loop {
         match future.get() {
             Some(Ok(Ok(response))) => break response,
-            Some(Ok(Err(e))) => return Err(format!("transport: {e:?}")),
+            Some(Ok(Err(e))) => return Err(format!("{e:?}")),
             Some(Err(())) => return Err("response future consumed".to_string()),
             None => future.subscribe().block(),
         }
@@ -78,54 +76,67 @@ fn request(method: Method, url: &str, path: &str, body: Option<&str>) -> Result<
     let status = response.status();
     let incoming = response.consume().map_err(|()| "consume")?;
     let stream = incoming.stream().map_err(|()| "incoming stream")?;
-    let mut bytes = Vec::new();
     loop {
         match stream.blocking_read(64 * 1024) {
-            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Ok(_) => {}
             Err(StreamError::Closed) => break,
             Err(e) => return Err(format!("read: {e:?}")),
         }
     }
-    Ok((status, bytes))
+    Ok(status)
 }
 
-fn probe(name: &str, url: &str) -> String {
-    let card = match request(Method::Get, url, "/.well-known/agent-card.json", None) {
-        Ok((status, body)) => {
-            let card_name = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|card| card["name"].as_str().map(str::to_string))
-                .unwrap_or_default();
-            format!("card={status} card_name={card_name}")
-        }
-        Err(error) => format!("card_error={error}"),
-    };
-    let send = match request(Method::Post, url, "/", Some(SEND_BODY)) {
-        Ok((status, _)) => format!("send={status}"),
-        Err(error) => format!("send_error={error}"),
-    };
-    format!("{name} {card} {send}")
+fn outcome(result: Result<u16, String>) -> String {
+    match result {
+        Ok(status) => status.to_string(),
+        Err(error) => format!("refused:{error}"),
+    }
 }
 
-fn report() -> String {
-    let Ok(peers) = std::env::var(FORMATION_PEERS) else {
-        return "peers=absent".to_string();
-    };
-    peers
-        .split(' ')
-        .map(|pair| match pair.split_once('=') {
-            Some((name, url)) => probe(name, url),
-            None => format!("error=unreadable pair '{pair}'"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn probe(name: &str) -> String {
+    let authority = format!("{name}.{PEER_DOMAIN}");
+    let card = outcome(request(
+        Method::Get,
+        &authority,
+        "/.well-known/agent-card.json",
+        None,
+    ));
+    let send = outcome(request(Method::Post, &authority, "/", Some(SEND_BODY)));
+    format!("{name} card={card} send={send}")
+}
+
+fn report(input: &ToolInput) -> String {
+    let peers = std::env::var(FORMATION_PEERS).ok();
+    let asked: Option<Vec<String>> = input
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|value| {
+            value["names"].as_array().map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect()
+            })
+        });
+    let names = asked.unwrap_or_else(|| {
+        peers
+            .as_deref()
+            .unwrap_or_default()
+            .split(' ')
+            .filter_map(|pair| pair.split_once('=').map(|(name, _)| name.to_string()))
+            .collect()
+    });
+    let mut lines: Vec<String> = names.iter().map(|name| probe(name)).collect();
+    lines.push(format!("peers={}", peers.as_deref().unwrap_or("absent")));
+    lines.join("\n")
 }
 
 impl Guest for FormationProbe {
-    fn run(_input: ToolInput) -> ToolResult {
+    fn run(input: ToolInput) -> ToolResult {
         ToolResult {
             status: Status::Passed,
-            summary: Some(report()),
+            summary: Some(report(&input)),
             data: None,
             data_path: None,
             truncated: false,

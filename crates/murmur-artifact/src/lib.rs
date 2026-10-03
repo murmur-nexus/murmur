@@ -89,7 +89,7 @@ pub use runtime_manifest::{
     PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS, PRIMARY_DRIVER_CHOICE,
 };
 pub use runtime_warnings::{
-    runtime_warning_link, W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_005,
+    runtime_warning_link, W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006,
 };
 pub use secrets::{
     is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,

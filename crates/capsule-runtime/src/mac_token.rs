@@ -193,8 +193,8 @@ fn mac_input(domain: &[u8], payload_b64: &str, bound_to: &[&str]) -> Vec<u8> {
 
 /// The token's three segments, checked for shape alone. Nothing here looks at what the payload
 /// *says*. The payload segment is returned both as base64 text, which is what the MAC covers, and
-/// decoded.
-fn split_token<'a>(
+/// decoded. Shared with the formation token, which has the same three-segment shape.
+pub(crate) fn split_token<'a>(
     expected_tag: &str,
     token: &'a str,
 ) -> Result<(&'a str, Vec<u8>, Vec<u8>), MacTokenError> {

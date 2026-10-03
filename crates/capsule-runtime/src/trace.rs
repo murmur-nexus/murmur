@@ -84,6 +84,9 @@ pub(crate) struct TraceWriter {
     /// The formation this session is a member of. Set by [`Self::set_formation_id`] before
     /// `session_start` is written; `None` for a session in no formation.
     formation_id: Option<FormationId>,
+    /// This session's roster name and callees, set by [`Self::set_formation_member`] for a
+    /// formation member.
+    formation_member: Option<(String, Vec<String>)>,
     session_start_time: Instant,
     /// The session node of the event tree: the `event_id` `session_start` carries, and the
     /// `parent_id` every launch-scoped event names. Minted in [`TraceWriter::open`] rather than
@@ -334,6 +337,14 @@ struct SessionStartEvent {
     /// on the trace's first line, which is the only line a reader grouping sessions reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     formation_id: Option<FormationId>,
+    /// This session's roster name, for a session its formation launcher handed credentials to.
+    /// Omitted for every other session, a delegated child of a member included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formation_member: Option<String>,
+    /// The members this one may call, in roster order: `[]` for a member that may call nobody.
+    /// Present exactly when `formation_member` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formation_callees: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -821,6 +832,10 @@ struct A2aTaskReceivedEvent {
     context_id: String,
     message_id: String,
     traceparent_from_caller: Option<String>,
+    /// The formation member that called, when the door let the task in on a formation token.
+    /// Omitted for every other task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_member: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1662,6 +1677,7 @@ impl TraceWriter {
             spawned_by,
             spawn_delegation_id,
             formation_id: None,
+            formation_member: None,
             session_start_time: Instant::now(),
             session_event_id: new_event_id(),
             session_started: false,
@@ -1805,6 +1821,20 @@ impl TraceWriter {
         self.formation_id = formation_id.cloned();
     }
 
+    /// Records `session_start.formation_member` and `session_start.formation_callees` for a
+    /// session its formation launcher handed credentials to.
+    pub(crate) fn set_formation_member(
+        &mut self,
+        member: Option<&crate::formation_credentials::FormationMember>,
+    ) {
+        self.formation_member = member.map(|member| {
+            (
+                member.name().to_string(),
+                member.callees().map(str::to_string).collect(),
+            )
+        });
+    }
+
     /// Records `inference.tool_refresh` for `session_start.tool_refresh`: the wire name under
     /// `transport: http`, `None` under `transport: process`.
     pub(crate) fn set_tool_refresh(&mut self, tool_refresh: Option<&'static str>) {
@@ -1878,6 +1908,11 @@ impl TraceWriter {
             spawned_by: self.spawned_by.clone(),
             delegation_id: self.spawn_delegation_id.clone(),
             formation_id: self.formation_id.clone(),
+            formation_member: self.formation_member.as_ref().map(|(name, _)| name.clone()),
+            formation_callees: self
+                .formation_member
+                .as_ref()
+                .map(|(_, callees)| callees.clone()),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -2317,6 +2352,7 @@ impl TraceWriter {
         context_id: &str,
         message_id: &str,
         traceparent_from_caller: Option<&str>,
+        caller_member: Option<&str>,
     ) -> std::io::Result<()> {
         let event = A2aTaskReceivedEvent {
             event_type: "a2a_task_received",
@@ -2328,6 +2364,7 @@ impl TraceWriter {
             context_id: context_id.to_string(),
             message_id: message_id.to_string(),
             traceparent_from_caller: traceparent_from_caller.map(str::to_string),
+            caller_member: caller_member.map(str::to_string),
         };
         self.write_event(&event).await
     }
@@ -4363,6 +4400,62 @@ mod tests {
                 content.matches("formation_id").count(),
                 usize::from(member.is_some())
             );
+        }
+    }
+
+    /// A member's `session_start` names it and its callees, `[]` for none, and only a member's
+    /// does; `a2a_task_received.caller_member` is present only for a task a formation token let
+    /// in.
+    #[tokio::test]
+    async fn a_members_trace_names_it_its_callees_and_its_callers() {
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let cases = [
+            (Some(("coder", vec!["reviewer"])), Some("planner")),
+            (Some(("reviewer", vec![])), None),
+            (None, None),
+        ];
+        for (member, caller) in cases {
+            let member = member.map(|(name, callees)| {
+                crate::formation_credentials::FormationMember::from_bundle(
+                    authority.member_bundle(name, &callees),
+                )
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.set_formation_member(member.as_ref());
+            w.write_session_start(10, Vec::new()).await.unwrap();
+            w.write_a2a_task_received("tsk_1", "ctx_1", "msg_1", None, caller)
+                .await
+                .unwrap();
+            w.flush().await.unwrap();
+            let content = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+            let lines: Vec<Value> = content
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let start = &lines[0];
+            let received = lines
+                .iter()
+                .find(|line| line["event_type"] == "a2a_task_received")
+                .unwrap();
+            match &member {
+                Some(member) => {
+                    assert_eq!(start["formation_member"], member.name());
+                    assert_eq!(
+                        start["formation_callees"],
+                        serde_json::json!(member.callees().collect::<Vec<_>>())
+                    );
+                }
+                None => {
+                    assert!(start.get("formation_member").is_none(), "{start}");
+                    assert!(start.get("formation_callees").is_none(), "{start}");
+                }
+            }
+            match caller {
+                Some(caller) => assert_eq!(received["caller_member"], caller),
+                None => assert!(received.get("caller_member").is_none(), "{received}"),
+            }
+            assert!(!content.contains("mft1."), "{content}");
         }
     }
 

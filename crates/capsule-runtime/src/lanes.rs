@@ -126,6 +126,7 @@ mod tests {
             source: crate::a2a::SOURCE_A2A,
             delegation_id: None,
             forget_session: false,
+            caller_member: None,
         }
     }
 

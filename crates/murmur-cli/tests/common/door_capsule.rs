@@ -24,6 +24,106 @@ pub const AUTHENTICATION_YAML: &str = "network:\n  authentication:\n    scheme: 
      credentials:\n      watcher:\n        scopes: [tasks/get, stream/watch]\n      \
      reader:\n        scopes: [resources/files]\n";
 
+/// Stages the capsule `manifest` describes from `home`'s store, in process, declaring what its
+/// `network.authentication` block declares — as the formation member `member`, or as none.
+pub fn stage_door(
+    home: &TempDir,
+    manifest: &Path,
+    member: Option<Arc<capsule_runtime::FormationMember>>,
+) -> capsule_runtime::StagedSession {
+    let runtime_manifest = murmur_artifact::load_runtime_manifest(manifest).unwrap();
+    let artifacts = runtime_manifest
+        .artifacts
+        .iter()
+        .map(|artifact| capsule_runtime::ArtifactRequest {
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
+            runtime: artifact.runtime.clone(),
+            source: artifact.source.clone(),
+            on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
+            gateway: artifact.gateway.clone(),
+            capabilities: artifact.capabilities.clone(),
+        })
+        .collect();
+    capsule_runtime::stage_session(
+        Arc::new(murmur_artifact::LocalRegistry::new(
+            home.path().join(".murmur").join("artifacts"),
+        )),
+        capsule_runtime::StageRequest {
+            credentials_file: None,
+            manifest_dir: manifest.parent().unwrap().to_path_buf(),
+            capsule_name: runtime_manifest.name.clone(),
+            capsule_version: runtime_manifest.version.clone(),
+            capsule_component_bytes: Vec::new(),
+            artifacts,
+            allowlisted_tools: Default::default(),
+            lock_expectations: None,
+            capability_policy: capsule_runtime::capability_policy_from_runtime_manifest(
+                &runtime_manifest,
+            ),
+            inference: runtime_manifest.inference.clone(),
+            system_prompt_overridden: false,
+            context: None,
+            context_id: None,
+            resume: None,
+            forget_session: false,
+            otel_endpoint: None,
+            eval_config_json: None,
+            case_id: None,
+            dataset_id: None,
+            lifecycle: runtime_manifest.lifecycle.clone(),
+            lifecycle_override: None,
+            trace: None,
+            workdir: None,
+            bind_addr: "127.0.0.1".to_string(),
+            internal_port: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: runtime_manifest.exports.clone(),
+            control: None,
+            door_authentication: runtime_manifest
+                .network
+                .as_ref()
+                .and_then(|network| network.authentication.clone()),
+            spawn_grant: None,
+            machine_tokens_per_day: None,
+            formation_id: member.as_ref().map(|member| member.formation_id().clone()),
+            formation_member: member,
+            ignore_task_file: false,
+        },
+    )
+    .unwrap()
+}
+
+/// Launches `staged` on a thread of its own and returns its `host:port`. A queue+sleep capsule
+/// never exits, so the thread is left behind.
+pub fn launch_door(staged: capsule_runtime::StagedSession) -> String {
+    let (url_tx, url_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        capsule_runtime::launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+        .expect("launch should succeed")
+    });
+    url_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("timed out waiting for the door")
+}
+
+/// Every event in the session's `trace.jsonl` so far.
+pub fn trace_events(workdir: &Path) -> Vec<Value> {
+    fs::read_to_string(workdir.join("trace.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The `Authorization` header value that presents `token`.
+pub fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
 /// An anthropic `end_turn` reply numbered `n`, saying `text`.
 pub fn end_turn(n: usize, text: &str) -> String {
     json!({
@@ -107,6 +207,7 @@ impl MurRun {
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_PEERS_ENV)
+            .env_remove(capsule_runtime::FORMATION_CHANNEL_ENV)
             .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

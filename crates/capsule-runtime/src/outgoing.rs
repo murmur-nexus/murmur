@@ -20,11 +20,16 @@ pub(crate) struct OutgoingMessage {
 /// the message as fresh — that is what keeps untrust from evaporating at the first hop. `None`
 /// stamps `untrusted`, the safe class. The origin stamped is always `peer`; the guest supplies
 /// neither header and has no field in `murmur:message/send` to supply one from.
+///
+/// `authorization` is the formation token the runtime presents for a call to a formation callee,
+/// sent as `Authorization: Bearer <token>`. It is read only at the write, and `None` sends no
+/// `Authorization` at all.
 pub(crate) async fn send_a2a_message(
     peer_url: &str,
     message: OutgoingMessage,
     traceparent: Option<String>,
     sender_task: Option<TaskProvenance>,
+    authorization: Option<&crate::formation_credentials::FormationToken>,
 ) -> Result<A2aTask, String> {
     let addr = parse_host_port(peer_url)?;
 
@@ -54,6 +59,9 @@ pub(crate) async fn send_a2a_message(
     );
     if let Some(ref tp) = traceparent {
         request.push_str(&format!("traceparent: {tp}\r\n"));
+    }
+    if let Some(token) = authorization {
+        request.push_str(&format!("Authorization: Bearer {}\r\n", token.expose()));
     }
     let stamped = stamp_for_peer(sender_task);
     request.push_str(&format!(
@@ -326,7 +334,7 @@ mod tests {
             context_id: None,
             text: "hello".to_string(),
         };
-        send_a2a_message(&addr, message, None, sender_task)
+        send_a2a_message(&addr, message, None, sender_task, None)
             .await
             .expect("peer should answer with a task");
         server.await.expect("capture task should not panic")
@@ -345,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_peer_message_names_the_status_and_the_receivers_reason() {
         let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(false).await;
-        let error = send_a2a_message(&addr, hello(), None, None)
+        let error = send_a2a_message(&addr, hello(), None, None, None)
             .await
             .expect_err("a door that does not consent refuses the message");
         assert_eq!(
@@ -362,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn a_consenting_door_takes_the_peer_message() {
         let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(true).await;
-        let task = send_a2a_message(&addr, hello(), None, None)
+        let task = send_a2a_message(&addr, hello(), None, None, None)
             .await
             .expect("a consenting door takes the message");
         assert_eq!(task.status.state, crate::a2a::TaskState::Submitted);

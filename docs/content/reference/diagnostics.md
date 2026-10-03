@@ -106,7 +106,7 @@ section that explains it.
 | `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, with `gateway:`, or bound as `inference.system_prompt_artifact` | [E-RUN-043](#e-run-043) |
 | `E-RUN-044` | `MURMUR_FORMATION_ID` is set to something that is not a formation id | [E-RUN-044](#e-run-044) |
 | `E-RUN-045` | A formation member did not come up, so `mur run --roster` launched nothing and stopped every member it had started | [E-RUN-045](#e-run-045) |
-| `E-RUN-046` | `mur run --roster` was run inside a formation member, or `MURMUR_FORMATION_PEERS` is malformed or set without `MURMUR_FORMATION_ID` | [E-RUN-046](#e-run-046) |
+| `E-RUN-046` | `mur run --roster` was run inside a formation member, a member's formation channel cannot be read, or `MURMUR_FORMATION_PEERS` is set in `mur run`'s environment | [E-RUN-046](#e-run-046) |
 | `E-RUN-047` | An installed capsule's bytes no longer hash to the sha256 roster admission bound its member to | [E-RUN-047](#e-run-047) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
@@ -125,7 +125,7 @@ section that explains it.
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
 | `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
-| `W-RUN-005` | A roster edge between two members neither of which is the entry member has no address to travel on | [W-RUN-005](#w-run-005) |
+| `W-RUN-006` | A roster edge into the entry member is not served | [W-RUN-006](#w-run-006) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -891,7 +891,7 @@ Each failed member is named as `'<name>' (<capsule>@<version>)`, in roster order
 `stopped:` lists the members that were running when the launch was refused, as `name (pid N)`, or
 `none`. Every one of them has been stopped and reaped.
 
-### E-RUN-046 — not a formation's launcher, or unreadable peers { #e-run-046 }
+### E-RUN-046 — not a formation's launcher, or an unreadable formation channel { #e-run-046 }
 
 A process that already carries `MURMUR_FORMATION_ID` is a formation member, and a member cannot
 launch a formation:
@@ -901,24 +901,38 @@ error[E-RUN-046]: MURMUR_FORMATION_ID is set, so this process is already a membe
   hint: a member joins the formation it was launched into and never starts one; unset MURMUR_FORMATION_ID to launch this roster as a formation of its own
 ```
 
-The same code refuses a `mur run` whose
-[`MURMUR_FORMATION_PEERS`](roster.md#formation-peers) cannot be read, before a session directory
-exists:
+The same code refuses a member whose [formation channel](roster.md#formation-channel) cannot be
+read, before a session directory exists. The reason names the problem and never quotes the line:
 
 ```text
-error[E-RUN-046]: MURMUR_FORMATION_PEERS does not carry a formation's peer addresses: pair 2 is empty; pairs are separated by exactly one space; a member handed addresses it cannot read would call the wrong peer or none, so the launch is refused
-  hint: MURMUR_FORMATION_PEERS is set by `mur run --roster` in its entry member's environment only, beside MURMUR_FORMATION_ID; unset it to run this capsule on its own
+error[E-RUN-046]: MURMUR_FORMATION_CHANNEL does not carry this member's formation credentials: descriptor 987 is not open; a member that cannot read what its launcher handed it could neither prove who it is nor call anyone, so the launch is refused
+  hint: MURMUR_FORMATION_CHANNEL is set by `mur run --roster` alone, for each member it starts, beside MURMUR_FORMATION_ID; launch the formation with `mur run --roster`, or unset both to run this capsule on its own
 ```
 
 | The reason says | Means |
 |---|---|
-| `it is set, but MURMUR_FORMATION_ID is not` | Only a formation's entry member is handed peers |
-| `it is blank` | The variable is set and empty; a launcher leaves it unset instead |
-| `pair N is empty` | Two spaces in a row, or a leading or trailing space |
-| `pair N has no '='` | A pair is not `name=url` |
-| `pair N names a member whose name …` | The name does not match `^[a-z][a-z0-9-]{0,31}$` |
-| `pair N names '<name>' a second time` | A member is named twice |
-| `pair N ('<name>') has a URL …` | The URL is not `http://<host>:<port>` |
+| `it is set, but MURMUR_FORMATION_ID is not` | `MURMUR_FORMATION_CHANNEL` without a formation id |
+| `it does not name a file descriptor by number` | The variable is not a descriptor number |
+| `descriptor N is standard input, output or error, never a channel` | The variable names 0, 1 or 2 |
+| `descriptor N is not open` | Nothing is open at that descriptor |
+| `descriptor N is neither a pipe nor a file` | The descriptor is a socket, a terminal or a directory |
+| `the channel ended before its first line arrived` | The channel was closed empty |
+| `no first line arrived within 10s` | The channel stayed open and silent for 10 seconds |
+| `its first line is not JSON`, `… is not a JSON object`, `… has no string <field>`, `… has no calls array` | The first line is not a member's credentials |
+| `its first line's formation_id is not a formation id: …` | As [`E-RUN-044`](#e-run-044) for the id |
+| `its first line's member is not a member name: …` | The name does not match `^[a-z][a-z0-9-]{0,31}$` |
+| `its first line's verify_key is not a formation key: …` | The key is not 32 bytes of base64url |
+| `its first line's calls[N].name …`, `calls[N] names a member a second time` | A callee name is not a member name, or is listed twice |
+| `its first line's calls[N].token was not issued to this member for that callee under the line's own key` | A token does not verify as this member's for that callee |
+| `its first line names another formation than MURMUR_FORMATION_ID` | The channel belongs to another formation |
+
+`MURMUR_FORMATION_PEERS` in `mur run`'s own environment is refused the same way. The runtime sets
+it inside a member's components, never in a process environment:
+
+```text
+error[E-RUN-046]: MURMUR_FORMATION_PEERS cannot be used: it is set in this process's environment, so the launch is refused
+  hint: MURMUR_FORMATION_PEERS is set by a formation member's runtime inside its own WASM components, never in a process environment; unset it to run this capsule
+```
 
 ### E-RUN-047 — the capsule changed since admission { #e-run-047 }
 
@@ -1820,17 +1834,18 @@ Fix the schema in the tool's own `murmur.yaml`: `required` is a JSON array of pr
 field the tool supplies a default for belongs out of `required` — a listed field is refused when it
 is missing.
 
-### W-RUN-005 — a peer edge with no address { #w-run-005 }
+### W-RUN-006 — an edge into the entry member { #w-run-006 }
 
 ```text
-warning[W-RUN-005]: roster.yaml lets 'reviewer' call 'coder' (reviewer → coder), but only the entry member 'planner' is handed peer addresses, so this call has none to travel on; both members are launched (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-005)
+warning[W-RUN-006]: roster edge 'coder → planner' is not served: the entry member accepts only the formation's own task, so 'coder' is handed no credential or address for it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-006)
 ```
 
-[`mur run --roster`](cli.md#mur-run-roster) hands addresses to the entry member only, as
-[`MURMUR_FORMATION_PEERS`](roster.md#formation-peers). A `reachability` edge from any other member
-is admitted and both members are launched, but the member it names as the caller is told no
-address to call. The warning prints once per such edge, before any member starts. Nothing is
-refused.
+[`mur run --roster`](cli.md#mur-run-roster) starts the entry member with
+`task_acceptance: single`, busy with the formation's own task from launch until it exits, so it
+never accepts a task from a peer. A `reachability` edge into it is admitted and every member is
+launched, but the calling member is handed no [formation token](roster.md#formation-token) and no
+address for it, and its call is refused as a call to any member it may not call is. The warning
+prints once per such edge, before any member starts. Nothing is refused.
 
 ---
 

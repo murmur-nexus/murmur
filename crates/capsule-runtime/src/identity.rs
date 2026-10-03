@@ -1018,6 +1018,13 @@ async fn handle_connection(
         }
     };
 
+    // Who the roster says is calling, when the door let a formation token in. It is recorded on
+    // the task this request starts, and decides nothing.
+    let caller_member = grant
+        .as_ref()
+        .and_then(|grant| grant.formation_caller())
+        .map(str::to_string);
+
     // A capsule that does not consent to peer tasks refuses a peer-origin request here: after the
     // token, so an unauthenticated caller learns nothing the public card does not say, and before
     // the scope, the path, the method or the body, so the refusal is the same bytes whatever was
@@ -1131,6 +1138,7 @@ async fn handle_connection(
                     provenance,
                     delegation_id,
                     forget_session,
+                    caller_member,
                     last_event_id,
                     sse_tx,
                     sse_buffer,
@@ -1166,6 +1174,7 @@ async fn handle_connection(
                 provenance,
                 delegation_id,
                 forget_session,
+                caller_member,
                 detached.as_ref(),
                 &live_delegations,
                 &session_id,
@@ -1255,6 +1264,7 @@ async fn handle_message_stream(
     provenance: TaskProvenance,
     delegation_id: Option<String>,
     forget_session: bool,
+    caller_member: Option<String>,
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
@@ -1343,6 +1353,7 @@ async fn handle_message_stream(
         source: crate::a2a::SOURCE_A2A,
         delegation_id,
         forget_session,
+        caller_member,
     };
     if task_tx.try_send(incoming).is_err() {
         {
@@ -1549,6 +1560,7 @@ fn handle_jsonrpc(
     provenance: TaskProvenance,
     delegation_id: Option<String>,
     forget_session: bool,
+    caller_member: Option<String>,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
     session_id: &str,
@@ -1564,6 +1576,7 @@ fn handle_jsonrpc(
             provenance,
             delegation_id,
             forget_session,
+            caller_member,
         ),
         DoorMethod::TasksGet => handle_tasks_get(id, &req.params, task_registry),
         DoorMethod::TasksCancel => {
@@ -1590,6 +1603,7 @@ fn handle_message_send(
     provenance: TaskProvenance,
     delegation_id: Option<String>,
     forget_session: bool,
+    caller_member: Option<String>,
 ) -> String {
     let msg_value = params.get("message").unwrap_or(params);
     let message: A2aMessage = match serde_json::from_value(msg_value.clone()) {
@@ -1648,6 +1662,7 @@ fn handle_message_send(
         source: crate::a2a::SOURCE_A2A,
         delegation_id,
         forget_session,
+        caller_member,
     };
     if task_tx.try_send(incoming).is_err() {
         // Unexpected path — roll back pending count
@@ -2943,6 +2958,7 @@ mod tests {
             TaskProvenance::derive(TaskOrigin::User, None),
             None,
             false,
+            None,
         ));
 
         assert_eq!(
@@ -3024,6 +3040,7 @@ mod tests {
                 TaskProvenance::derive(TaskOrigin::User, None),
                 None,
                 false,
+                None,
                 None,
                 sse_tx,
                 Arc::clone(&sse_buffer),
@@ -3560,6 +3577,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
                 sse,
                 buffer,
                 closing,
@@ -3656,6 +3674,7 @@ mod tests {
                 TaskProvenance::derive(TaskOrigin::User, None),
                 None,
                 false,
+                None,
                 None,
                 sse,
                 buffer,

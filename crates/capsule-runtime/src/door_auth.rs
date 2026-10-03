@@ -15,6 +15,12 @@
 //! **Verification order is fixed: header → MAC → payload.** A refusal never says why a token was
 //! not accepted, so the door cannot be used as an oracle.
 //!
+//! **A formation member's door also takes formation tokens.** A door built with a
+//! [`FormationVerifier`] lets in a [`crate::formation_credentials`] token issued to it as the
+//! credential `member:<caller>`, with exactly [`FORMATION_CALL_SCOPES`]. A genuine token issued for
+//! another member's door is `403 not_permitted`; any other token of that family is the same `401`
+//! as any other invalid token. A door with no verifier refuses every formation token as invalid.
+//!
 //! **A scope limits methods, not tasks.** Every authenticated caller shares the session's one task
 //! and context space, as every caller shares it on a public door.
 //!
@@ -28,6 +34,10 @@ use murmur_artifact::{
 };
 use serde_json::{json, Value};
 
+use crate::formation_credentials::{
+    FormationRefusal, FormationVerifier, FORMATION_CALL_SCOPES, FORMATION_CREDENTIAL_PREFIX,
+    FORMATION_TOKEN_TAG,
+};
 use crate::mac_token::{self, MintKey};
 use crate::resource_plane::ResourceResponse;
 
@@ -93,11 +103,13 @@ pub(crate) fn bearer_token(authorization: &str) -> Option<&str> {
 
 // ── Minting and verifying ─────────────────────────────────────────────────────
 
-/// One session's door key and the tokens minted with it.
+/// One session's door key and the tokens minted with it, and — for a formation member — what its
+/// door checks a formation token with.
 pub struct DoorAuth {
     key: MintKey,
     /// Operator first, then the declared credentials in name order.
     tokens: Vec<(String, DoorToken)>,
+    formation: Option<FormationVerifier>,
 }
 
 impl std::fmt::Debug for DoorAuth {
@@ -111,6 +123,7 @@ impl std::fmt::Debug for DoorAuth {
                     .map(|(name, _)| name.as_str())
                     .collect::<Vec<_>>(),
             )
+            .field("formation", &self.formation)
             .finish_non_exhaustive()
     }
 }
@@ -133,7 +146,17 @@ impl DoorAuth {
                 seal(&key, &credential.name, &credential.scopes),
             ));
         }
-        Ok(Self { key, tokens })
+        Ok(Self {
+            key,
+            tokens,
+            formation: None,
+        })
+    }
+
+    /// This door, also taking formation tokens issued to the member `verifier` names.
+    pub fn with_formation(mut self, verifier: FormationVerifier) -> Self {
+        self.formation = Some(verifier);
+        self
     }
 
     /// The token holding every scope.
@@ -151,7 +174,9 @@ impl DoorAuth {
     ///
     /// No header is [`AuthRefusal::Missing`]. More than one, a scheme other than `Bearer`, a token
     /// this key did not seal, and a payload naming a scope outside [`DOOR_SCOPES`] are all
-    /// [`AuthRefusal::Invalid`], indistinguishably.
+    /// [`AuthRefusal::Invalid`], indistinguishably. So is a formation token that does not verify,
+    /// and every formation token at a door with no verifier. A genuine formation token issued for
+    /// another door is [`AuthRefusal::NotPermitted`].
     pub fn verify(&self, authorization_headers: &[&str]) -> Result<DoorGrant, AuthRefusal> {
         let header = match authorization_headers {
             [] => return Err(AuthRefusal::Missing),
@@ -159,6 +184,9 @@ impl DoorAuth {
             _ => return Err(AuthRefusal::Invalid),
         };
         let token = bearer_token(header).ok_or(AuthRefusal::Invalid)?;
+        if token.split('.').next() == Some(FORMATION_TOKEN_TAG) {
+            return self.verify_formation(token);
+        }
         let payload = mac_token::open(&self.key, DOOR_TOKEN_TAG, DOOR_TOKEN_DOMAIN, token, &[])
             .map_err(|_| AuthRefusal::Invalid)?;
         let payload: Value = serde_json::from_slice(&payload).map_err(|_| AuthRefusal::Invalid)?;
@@ -178,7 +206,29 @@ impl DoorAuth {
                     .ok_or(AuthRefusal::Invalid)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(DoorGrant { credential, scopes })
+        Ok(DoorGrant {
+            credential,
+            scopes,
+            formation_caller: None,
+        })
+    }
+
+    fn verify_formation(&self, token: &str) -> Result<DoorGrant, AuthRefusal> {
+        let verifier = self.formation.as_ref().ok_or(AuthRefusal::Invalid)?;
+        match verifier.verify(token) {
+            Ok(caller) => Ok(DoorGrant {
+                credential: format!("{FORMATION_CREDENTIAL_PREFIX}{}", caller.from()),
+                scopes: FORMATION_CALL_SCOPES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                formation_caller: Some(caller.from().to_string()),
+            }),
+            Err(FormationRefusal::Invalid) => Err(AuthRefusal::Invalid),
+            Err(FormationRefusal::NotPermitted { caller }) => {
+                Err(AuthRefusal::NotPermitted { caller })
+            }
+        }
     }
 }
 
@@ -198,12 +248,21 @@ fn seal(key: &MintKey, credential: &str, scopes: &[String]) -> DoorToken {
 pub struct DoorGrant {
     credential: String,
     scopes: Vec<String>,
+    /// The member a formation token was issued to, for a grant from one.
+    formation_caller: Option<String>,
 }
 
 impl DoorGrant {
-    /// The credential the token was minted for: `operator` or a declared name.
+    /// The credential the token was minted for: `operator`, a declared name, or `member:<name>`
+    /// for a formation token.
     pub fn credential(&self) -> &str {
         &self.credential
+    }
+
+    /// The calling member's roster name when this grant came from a formation token, and `None`
+    /// for every door token.
+    pub fn formation_caller(&self) -> Option<&str> {
+        self.formation_caller.as_deref()
     }
 
     /// Whether the token carries `scope`.
@@ -234,13 +293,16 @@ pub enum AuthRefusal {
     Invalid,
     /// A valid token whose credential does not carry the scope the request needs.
     InsufficientScope { credential: String, scope: String },
+    /// A genuine formation token issued for another member's door: `caller` is a member of this
+    /// formation that the roster does not let call this one.
+    NotPermitted { caller: String },
 }
 
 impl AuthRefusal {
     pub fn status(&self) -> u16 {
         match self {
             AuthRefusal::Missing | AuthRefusal::Invalid => 401,
-            AuthRefusal::InsufficientScope { .. } => 403,
+            AuthRefusal::InsufficientScope { .. } | AuthRefusal::NotPermitted { .. } => 403,
         }
     }
 
@@ -250,6 +312,7 @@ impl AuthRefusal {
             AuthRefusal::Missing => "unauthenticated",
             AuthRefusal::Invalid => "invalid_token",
             AuthRefusal::InsufficientScope { .. } => "insufficient_scope",
+            AuthRefusal::NotPermitted { .. } => "not_permitted",
         }
     }
 
@@ -261,11 +324,15 @@ impl AuthRefusal {
             AuthRefusal::InsufficientScope { scope, .. } => {
                 format!("Bearer realm=\"{realm}\", error=\"insufficient_scope\", scope=\"{scope}\"")
             }
+            AuthRefusal::NotPermitted { .. } => {
+                format!("Bearer realm=\"{realm}\", error=\"insufficient_scope\"")
+            }
         }
     }
 
-    /// The body's `message`. The `403` names the credential and the scope it lacks, and goes only
-    /// to that credential's holder; neither `401` says why.
+    /// The body's `message`. The `403`s name the credential or the member that presented the
+    /// token, and go only to its holder; neither `401` says why. `not_permitted` names nothing
+    /// else — not this member, not the one the token was issued for.
     pub fn message(&self) -> String {
         match self {
             AuthRefusal::Missing => "this door takes a token this capsule's runtime minted, as \
@@ -276,6 +343,9 @@ impl AuthRefusal {
             }
             AuthRefusal::InsufficientScope { credential, scope } => {
                 format!("credential '{credential}' does not reach {scope}")
+            }
+            AuthRefusal::NotPermitted { caller } => {
+                format!("member '{caller}' may not call this capsule")
             }
         }
     }
@@ -658,6 +728,102 @@ mod tests {
             body["message"],
             "credential 'watcher' does not reach message/send"
         );
+    }
+
+    fn formation_door(
+        authority: &crate::formation_credentials::FormationAuthority,
+        member: &str,
+    ) -> DoorAuth {
+        DoorAuth::mint(&authentication())
+            .unwrap()
+            .with_formation(authority.verifier_for(member))
+    }
+
+    #[test]
+    fn door_auth_formation_tokens_reach_their_audience_with_three_scopes() {
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let coder = formation_door(&authority, "coder");
+        let token = authority.mint("planner", "coder");
+        let grant = coder
+            .verify(&[&format!("Bearer {}", token.expose())])
+            .unwrap();
+        assert_eq!(grant.credential(), "member:planner");
+        assert_eq!(grant.formation_caller(), Some("planner"));
+        for scope in DOOR_SCOPES {
+            assert_eq!(
+                grant.allows(scope),
+                FORMATION_CALL_SCOPES.contains(scope),
+                "{scope}"
+            );
+        }
+        assert_eq!(
+            grant.require("session/stop"),
+            Err(AuthRefusal::InsufficientScope {
+                credential: "member:planner".to_string(),
+                scope: "session/stop".to_string(),
+            })
+        );
+        let operator = coder.verify(&[&header(coder.operator_token())]).unwrap();
+        assert_eq!(operator.formation_caller(), None);
+
+        let reviewer = formation_door(&authority, "reviewer");
+        let refused = reviewer
+            .verify(&[&format!("Bearer {}", token.expose())])
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            AuthRefusal::NotPermitted {
+                caller: "planner".to_string()
+            }
+        );
+        let response = refused.response("reviewer-capsule");
+        assert_eq!(response.status, 403);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "not_permitted");
+        assert_eq!(
+            body["message"],
+            "member 'planner' may not call this capsule"
+        );
+        assert!(response.headers.contains(&(
+            "www-authenticate".to_string(),
+            "Bearer realm=\"reviewer-capsule\", error=\"insufficient_scope\"".to_string()
+        )));
+    }
+
+    /// A forged, foreign or tampered formation token, and any formation token at a door with no
+    /// verifier, is the same `401` as a garbage token.
+    #[test]
+    fn door_auth_formation_forgeries_are_the_ordinary_invalid() {
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let other = crate::formation_credentials::FormationAuthority::for_test();
+        let coder = formation_door(&authority, "coder");
+        let garbage = coder.verify(&["Bearer garbage"]).unwrap_err();
+        assert_eq!(garbage, AuthRefusal::Invalid);
+        let genuine = authority.mint("planner", "coder");
+        for header in [
+            format!("Bearer {}", other.mint("planner", "coder").expose()),
+            format!("Bearer {}x", genuine.expose()),
+            "Bearer mft1.x.y".to_string(),
+        ] {
+            assert_eq!(
+                coder.verify(&[&header]),
+                Err(AuthRefusal::Invalid),
+                "{header}"
+            );
+        }
+        let plain = DoorAuth::mint(&authentication()).unwrap();
+        assert_eq!(
+            plain.verify(&[&format!("Bearer {}", genuine.expose())]),
+            Err(AuthRefusal::Invalid)
+        );
+        assert_eq!(
+            AuthRefusal::Invalid.response("r").body,
+            garbage.response("r").body
+        );
+        let debug = format!("{coder:?}");
+        assert!(!debug.contains("mft1."), "{debug}");
+        assert!(!debug.contains(&authority.verify_key().render()), "{debug}");
+        assert!(debug.contains("coder"), "{debug}");
     }
 
     /// The manifest's scope list and the door's method table cannot drift: every gated method is a

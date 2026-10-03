@@ -19,6 +19,18 @@
 //! started is stopped and reaped before the refusal is returned, and the entry member is never
 //! started.
 //!
+//! **The launcher is the formation's one principal.** It generates the formation's signing key
+//! ([`FormationAuthority`]) after the id and holds it in memory alone. Each member gets a pipe of
+//! its own, whose read end only that member's `mur run` inherits, named by
+//! [`FORMATION_CHANNEL_ENV`]. Its first line — written before the member is spawned — carries the
+//! formation id, the member's name, the verification key and one token per member it may call.
+//! Once every peer's door answers, each peer that calls other peers is written one address line
+//! naming their doors; the entry member's first line and address line are both written before it is
+//! spawned. Nothing here writes a token to stdout, stderr, a file, argv or an environment
+//! variable. Callees never include the entry member, which runs `task_acceptance: single` busy
+//! with the formation's own task and so can serve no peer; such an edge is reported by
+//! [`unserved_edges`]. The key and the write ends are dropped once every member is reaped.
+//!
 //! **Teardown.**
 //!
 //! * One owner holds every started member, and every return path stops and reaps them. Its `Drop`
@@ -34,6 +46,7 @@
 //! * [`catch_launcher_signals`] turns `SIGINT`, `SIGTERM` and `SIGHUP` into a flag every wait here
 //!   polls, so a signalled launcher stops its members before it exits.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
@@ -43,8 +56,11 @@ use std::time::{Duration, Instant};
 use crate::child_launch::{self, AfterReadiness, ProcessEnv, ProcessLaunch, StartedProcess};
 use crate::delegation::SPAWNER_ENV;
 use crate::door_auth::DoorToken;
-use crate::formation::{FormationId, FormationPeer, FormationPeers, FORMATION_PEERS_ENV};
-use crate::roster::AdmittedRoster;
+use crate::formation::{FormationId, FormationPeer, FORMATION_PEERS_ENV};
+use crate::formation_credentials::{
+    render_address_line, FormationAuthority, FORMATION_CHANNEL_ENV,
+};
+use crate::roster::{AdmittedRoster, RosterEdge};
 
 /// How long a member has, from its spawn, to report itself and have its door answer.
 ///
@@ -131,13 +147,15 @@ pub(crate) struct PlannedMember {
     pub(crate) sha256: String,
 }
 
-/// What a launch starts: the peers in roster order, the entry member, and the names of the members
-/// the entry member may call.
+/// What a launch starts: the peers in roster order, the entry member, and the members each member
+/// may call.
 #[derive(Debug, Clone)]
 pub(crate) struct FormationPlan {
     pub(crate) peers: Vec<PlannedMember>,
     pub(crate) entry: PlannedMember,
-    pub(crate) entry_callees: Vec<String>,
+    /// Every member's callees in roster order, the entry member never among them. A member with
+    /// none is absent.
+    pub(crate) callees: Vec<(String, Vec<String>)>,
 }
 
 impl FormationPlan {
@@ -157,12 +175,49 @@ impl FormationPlan {
                 .map(planned)
                 .collect(),
             entry: planned(entry),
-            entry_callees: roster
-                .callees(&entry.name)
-                .map(|member| member.name.clone())
+            callees: roster
+                .members()
+                .iter()
+                .map(|member| {
+                    let callees: Vec<String> = roster
+                        .callees(&member.name)
+                        .filter(|callee| !callee.entry)
+                        .map(|callee| callee.name.clone())
+                        .collect();
+                    (member.name.clone(), callees)
+                })
+                .filter(|(_, callees)| !callees.is_empty())
                 .collect(),
         }
     }
+
+    /// The members `member` may call, in roster order.
+    pub(crate) fn callees_of(&self, member: &str) -> &[String] {
+        self.callees
+            .iter()
+            .find(|(name, _)| name == member)
+            .map(|(_, callees)| callees.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// `member`'s channel first line, signed by `authority`.
+    fn first_line(&self, authority: &FormationAuthority, member: &str) -> String {
+        let callees: Vec<&str> = self.callees_of(member).iter().map(String::as_str).collect();
+        authority.member_bundle(member, &callees).render_line()
+    }
+}
+
+/// Every roster edge into the entry member, in roster order: none is served. The entry member runs
+/// `task_acceptance: single` and is busy with the formation's own task from launch until it exits,
+/// so it can never accept a peer's task, and the member at the edge's other end is handed no
+/// credential or address for it.
+pub fn unserved_edges(roster: &AdmittedRoster) -> Vec<&RosterEdge> {
+    let entry = &roster.entry().name;
+    roster
+        .edges()
+        .iter()
+        .filter(|edge| &edge.to == entry)
+        .collect()
 }
 
 /// A peer whose door answered as the session its readiness line named.
@@ -583,10 +638,19 @@ struct MemberProcess {
     status: Option<ExitStatus>,
     slot: RegistrySlot,
     grace: Duration,
+    /// The write end of the member's formation channel, kept open while the member runs so an
+    /// address line can follow its first line, and closed once it is reaped.
+    channel: Option<std::io::PipeWriter>,
 }
 
 impl MemberProcess {
-    fn new(name: &str, child: Child, own_group: bool, grace: Duration) -> Self {
+    fn new(
+        name: &str,
+        child: Child,
+        own_group: bool,
+        grace: Duration,
+        channel: std::io::PipeWriter,
+    ) -> Self {
         let pid = child.id();
         Self {
             name: name.to_string(),
@@ -597,6 +661,15 @@ impl MemberProcess {
             status: None,
             slot: RegistrySlot::register(pid, own_group),
             grace,
+            channel: Some(channel),
+        }
+    }
+
+    /// Write one line to the member's channel. A member that has already gone has closed its end;
+    /// the line then reaches nobody, which is what it is for.
+    fn send_line(&mut self, line: &str) {
+        if let Some(channel) = self.channel.as_mut() {
+            let _ = channel.write_all(format!("{line}\n").as_bytes());
         }
     }
 
@@ -631,6 +704,7 @@ impl MemberProcess {
             self.status = Some(ExitStatus::default());
         }
         self.slot.release();
+        self.channel = None;
     }
 
     fn terminate(&mut self) {
@@ -768,6 +842,48 @@ enum PeerOutcome {
     Abandoned,
 }
 
+/// A member's formation channel: the write end the launcher keeps, already holding the member's
+/// first line, and the read end the member's process inherits.
+struct Channel {
+    writer: std::io::PipeWriter,
+    reader: std::io::PipeReader,
+}
+
+impl Channel {
+    /// A fresh pipe with `first_line` already written into it. Both ends are close-on-exec, so no
+    /// process inherits either unless [`ProcessLaunch::inherit_fd`] names it.
+    fn open(first_line: &str) -> Result<Self, MemberFailureReason> {
+        let (reader, mut writer) = std::io::pipe().map_err(|error| {
+            not_started(&format!(
+                "its formation channel could not be created: {error}"
+            ))
+        })?;
+        writer
+            .write_all(format!("{first_line}\n").as_bytes())
+            .map_err(|error| {
+                not_started(&format!(
+                    "its formation channel could not be written: {error}"
+                ))
+            })?;
+        Ok(Self { writer, reader })
+    }
+
+    /// The descriptor number the member reads its channel from.
+    fn fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.reader.as_raw_fd()
+    }
+
+    /// The environment every member is started with: its formation id and its channel.
+    fn member_env(&self, formation_id: &FormationId) -> Vec<(String, String)> {
+        let (id_name, id_value) = formation_id.env_pair();
+        vec![
+            (id_name.to_string(), id_value),
+            (FORMATION_CHANNEL_ENV.to_string(), self.fd().to_string()),
+        ]
+    }
+}
+
 /// Start one peer and wait until its door answers, it fails, or `abort` is raised.
 ///
 /// The process, when one was started, is returned whatever the outcome, so the caller owns
@@ -775,12 +891,17 @@ enum PeerOutcome {
 fn start_peer(
     binary: &Path,
     member: &PlannedMember,
+    first_line: &str,
     options: &FormationLaunchOptions,
     abort: &AtomicBool,
 ) -> (Option<MemberProcess>, PeerOutcome) {
     let args = peer_args(member, options);
     let prefix = format!("[{}] ", member.name);
-    let set = [options.formation_id.env_pair()].map(|(name, value)| (name.to_string(), value));
+    let channel = match Channel::open(first_line) {
+        Ok(channel) => channel,
+        Err(reason) => return (None, PeerOutcome::Failed(reason)),
+    };
+    let set = channel.member_env(&options.formation_id);
     let spawned_at = Instant::now();
     let deadline = spawned_at + options.ready_timeout;
     let started = child_launch::start_process(&ProcessLaunch {
@@ -795,7 +916,11 @@ fn start_peer(
         stderr_prefix: Some(&prefix),
         inherit_output: false,
         own_process_group: true,
+        inherit_fd: Some(channel.fd()),
     });
+    // The member holds its own copy of the read end now, or never will.
+    let Channel { writer, reader } = channel;
+    drop(reader);
     let StartedProcess {
         mut child,
         stderr_tail,
@@ -812,7 +937,7 @@ fn start_peer(
         }
     };
     let stdout = child.stdout.take();
-    let mut process = MemberProcess::new(&member.name, child, true, options.stop_grace);
+    let mut process = MemberProcess::new(&member.name, child, true, options.stop_grace, writer);
     let Some(stdout) = stdout else {
         return (
             Some(process),
@@ -999,6 +1124,27 @@ pub(crate) fn launch_plan(
         }
     };
 
+    let authority = match FormationAuthority::generate(&options.formation_id) {
+        Ok(authority) => authority,
+        Err(error) => {
+            return Err(MemberLaunchFailure {
+                failed: plan
+                    .peers
+                    .iter()
+                    .chain([&plan.entry])
+                    .map(|member| failure(member, not_started(&error)))
+                    .collect(),
+                stopped: Vec::new(),
+                interrupted_by: None,
+            })
+        }
+    };
+    let first_lines: Vec<String> = plan
+        .peers
+        .iter()
+        .map(|member| plan.first_line(&authority, &member.name))
+        .collect();
+
     let abort = AtomicBool::new(false);
     let mut outcomes: Vec<Option<(Option<MemberProcess>, PeerOutcome)>> =
         plan.peers.iter().map(|_| None).collect();
@@ -1011,8 +1157,12 @@ pub(crate) fn launch_plan(
         for (index, member) in plan.peers.iter().enumerate() {
             let tx = tx.clone();
             let (binary, options, abort) = (&binary, &options, &abort);
+            let first_line = first_lines[index].as_str();
             scope.spawn(move || {
-                let _ = tx.send((index, start_peer(binary, member, options, abort)));
+                let _ = tx.send((
+                    index,
+                    start_peer(binary, member, first_line, options, abort),
+                ));
             });
         }
         drop(tx);
@@ -1060,17 +1210,38 @@ pub(crate) fn launch_plan(
         });
     }
 
-    let entry_peers = entry_peers(&plan, &peers);
+    // Every peer's door answers, so every address is known: each peer that calls other peers is
+    // told where they are.
+    for member in &mut members.0 {
+        let addresses = addresses_of(&peers, plan.callees_of(&member.name));
+        if !addresses.is_empty() {
+            member.send_line(&render_address_line(&addresses));
+        }
+    }
+
     Ok(RunningFormation {
         formation_id: options.formation_id.clone(),
-        entry: plan.entry,
-        entry_peers,
+        entry: plan.entry.clone(),
+        plan,
         peers,
         members,
         entry_index: None,
         binary,
         options,
+        authority,
     })
+}
+
+/// The door of each of `callees` among the ready peers, in roster order.
+fn addresses_of(ready: &[ReadyPeer], callees: &[String]) -> Vec<FormationPeer> {
+    ready
+        .iter()
+        .filter(|peer| callees.contains(&peer.name))
+        .map(|peer| FormationPeer {
+            name: peer.name.clone(),
+            url: peer.url.clone(),
+        })
+        .collect()
 }
 
 fn failure(member: &PlannedMember, reason: MemberFailureReason) -> MemberFailure {
@@ -1088,38 +1259,24 @@ fn not_started(error: &str) -> MemberFailureReason {
     }
 }
 
-/// The value of [`FORMATION_PEERS_ENV`] for the entry member: the url of every ready peer the
-/// entry member may call, in roster order. `None` when it may call nobody.
-fn entry_peers(plan: &FormationPlan, ready: &[ReadyPeer]) -> Option<FormationPeers> {
-    let peers: Vec<FormationPeer> = ready
-        .iter()
-        .filter(|peer| plan.entry_callees.contains(&peer.name))
-        .map(|peer| FormationPeer {
-            name: peer.name.clone(),
-            url: peer.url.clone(),
-        })
-        .collect();
-    if peers.is_empty() {
-        return None;
-    }
-    // Every name is a roster member name and every url `http://host:port` a door answered on, so
-    // a refusal here is a launcher bug; the variable is then left out rather than handed broken.
-    FormationPeers::new(peers).ok()
-}
-
-/// A formation whose peers are ready: the one owner of every member it started.
+/// A formation whose peers are ready: the one owner of every member it started, and of the
+/// formation's signing key.
 ///
-/// Dropping it stops and reaps every member.
+/// Dropping it stops and reaps every member, then drops the key: nothing can mint for this
+/// formation again.
 pub struct RunningFormation {
     formation_id: FormationId,
     entry: PlannedMember,
-    entry_peers: Option<FormationPeers>,
+    plan: FormationPlan,
     peers: Vec<ReadyPeer>,
+    /// Declared before `authority`, so the members are stopped and reaped before the key is
+    /// dropped.
     members: MemberSet,
     /// The entry member's position in `members`, once started.
     entry_index: Option<usize>,
     binary: PathBuf,
     options: FormationLaunchOptions,
+    authority: FormationAuthority,
 }
 
 impl std::fmt::Debug for RunningFormation {
@@ -1147,10 +1304,10 @@ impl RunningFormation {
         &self.peers
     }
 
-    /// What the entry member is handed as [`FORMATION_PEERS_ENV`], or `None` when it is handed
-    /// nothing.
-    pub fn entry_peers(&self) -> Option<&FormationPeers> {
-        self.entry_peers.as_ref()
+    /// The members `member` is handed a credential and an address for, in roster order: its
+    /// roster callees, less the entry member.
+    pub fn callees_of(&self, member: &str) -> &[String] {
+        self.plan.callees_of(member)
     }
 
     /// The entry member's pid, once started.
@@ -1163,29 +1320,50 @@ impl RunningFormation {
     /// On failure every peer has been stopped and reaped.
     pub fn start_entry(&mut self) -> Result<u32, MemberLaunchFailure> {
         let args = entry_args(&self.entry, &self.options);
-        let mut set = vec![self.formation_id.env_pair()];
-        if let Some(peers) = &self.entry_peers {
-            set.push(peers.env_pair());
-        }
-        let set: Vec<(String, String)> = set
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect();
-        let remove: &[&str] = if self.entry_peers.is_some() {
-            &[SPAWNER_ENV]
-        } else {
-            &[SPAWNER_ENV, FORMATION_PEERS_ENV]
+        // Its whole channel is written before it starts: every address it may need is known.
+        let channel = Channel::open(&self.plan.first_line(&self.authority, &self.entry.name))
+            .and_then(|mut channel| {
+                let addresses = addresses_of(&self.peers, self.plan.callees_of(&self.entry.name));
+                if !addresses.is_empty() {
+                    channel
+                        .writer
+                        .write_all(format!("{}\n", render_address_line(&addresses)).as_bytes())
+                        .map_err(|error| {
+                            not_started(&format!(
+                                "its formation channel could not be written: {error}"
+                            ))
+                        })?;
+                }
+                Ok(channel)
+            });
+        let channel = match channel {
+            Ok(channel) => channel,
+            Err(reason) => {
+                let stopped = self.members.stop_all();
+                return Err(MemberLaunchFailure {
+                    failed: vec![failure(&self.entry, reason)],
+                    stopped,
+                    interrupted_by: None,
+                });
+            }
         };
+        let set = channel.member_env(&self.formation_id);
         let started = child_launch::start_process(&ProcessLaunch {
             binary: &self.binary,
             args: &args,
             cwd: None,
-            env: ProcessEnv::Inherited { set: &set, remove },
+            env: ProcessEnv::Inherited {
+                set: &set,
+                remove: &[SPAWNER_ENV, FORMATION_PEERS_ENV],
+            },
             stdin_line: None,
             stderr_prefix: None,
             inherit_output: true,
             own_process_group: false,
+            inherit_fd: Some(channel.fd()),
         });
+        let Channel { writer, reader } = channel;
+        drop(reader);
         match started {
             Ok(started) => {
                 let process = MemberProcess::new(
@@ -1193,6 +1371,7 @@ impl RunningFormation {
                     started.child,
                     false,
                     self.options.stop_grace,
+                    writer,
                 );
                 let pid = process.pid;
                 self.members.0.push(process);
@@ -1358,7 +1537,7 @@ mod tests {
         FormationPlan {
             peers: vec![member(peer)],
             entry: member("planner"),
-            entry_callees: vec![peer.to_string()],
+            callees: vec![("planner".to_string(), vec![peer.to_string()])],
         }
     }
 
@@ -1571,10 +1750,8 @@ mod tests {
         let peer = &formation.peers()[0];
         assert_eq!(peer.session_id, "ses_standin");
         assert_eq!(peer.url, format!("http://localhost:{port}"));
-        assert_eq!(
-            formation.entry_peers().map(FormationPeers::render),
-            Some(format!("coder=http://localhost:{port}"))
-        );
+        assert_eq!(formation.callees_of("planner"), ["coder"]);
+        assert!(formation.callees_of("coder").is_empty());
         let pid = peer.pid;
         assert!(crate::running::pid_is_alive(pid));
         drop(formation);
@@ -1582,6 +1759,137 @@ mod tests {
             !crate::running::pid_is_alive(pid),
             "dropping the owner stops the peer"
         );
+    }
+
+    /// Every member reads exactly its own bundle on the descriptor `MURMUR_FORMATION_CHANNEL`
+    /// names: a token per callee and nothing about anyone else, then — once every peer is ready —
+    /// its callees' doors. The entry member gets both lines before it starts, and an edge into it
+    /// is served to nobody. No token is in any member's argv or environment.
+    #[test]
+    fn each_member_reads_only_its_own_credentials_and_callees_on_its_channel() {
+        use crate::formation_credentials::{parse_address_line, FormationBundle};
+        let _guard = binary_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let coder_port = door("ses_coder", Duration::ZERO);
+        let reviewer_port = door("ses_reviewer", Duration::ZERO);
+        let options = options(Duration::from_secs(20));
+        let id = options.formation_id.clone();
+        let line = |session: &str, port: u16| {
+            format!(
+                r#"{{"formation_id":"{id}","session_id":"{session}","url":"localhost:{port}"}}"#
+            )
+        };
+        let out = dir.path().display().to_string();
+        let script = dir.path().join("mur");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 case \" $* \" in\n\
+                 *' --capsule coder '*) name=coder; line='{coder}';;\n\
+                 *' --capsule reviewer '*) name=reviewer; line='{reviewer}';;\n\
+                 *) name=planner; line='';;\n\
+                 esac\n\
+                 env > '{out}/'$name.env\n\
+                 printf '%s\\n' \"$*\" > '{out}/'$name.argv\n\
+                 cat /dev/fd/$MURMUR_FORMATION_CHANNEL >> '{out}/'$name.channel &\n\
+                 [ -n \"$line\" ] && printf '%s\\n' \"$line\"\n\
+                 exec sleep 600\n",
+                coder = line("ses_coder", coder_port),
+                reviewer = line("ses_reviewer", reviewer_port),
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(child_launch::MUR_BINARY_ENV, &script);
+        let plan = FormationPlan {
+            peers: vec![member("coder"), member("reviewer")],
+            entry: member("planner"),
+            // `reviewer → planner` is an edge into the entry member: `from_roster` leaves it out.
+            callees: vec![
+                ("planner".to_string(), vec!["coder".to_string()]),
+                ("coder".to_string(), vec!["reviewer".to_string()]),
+            ],
+        };
+        let result = launch_plan(plan, options);
+        let mut formation = result.expect("both stand-ins came up");
+        formation.start_entry().expect("the entry stand-in starts");
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+
+        let read_lines = |name: &str, count: usize| -> Vec<String> {
+            let path = dir.path().join(format!("{name}.channel"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let lines: Vec<String> = std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                if lines.len() >= count || Instant::now() >= deadline {
+                    return lines;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        };
+        let coder = read_lines("coder", 2);
+        let planner = read_lines("planner", 2);
+        let reviewer = read_lines("reviewer", 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(read_lines("reviewer", 1).len(), 1, "reviewer calls nobody");
+
+        let bundle = |line: &str| FormationBundle::parse_line(line).expect("a member's bundle");
+        let names = |bundle: &FormationBundle| -> Vec<String> {
+            bundle.calls.iter().map(|(name, _)| name.clone()).collect()
+        };
+        let (coder_bundle, planner_bundle, reviewer_bundle) =
+            (bundle(&coder[0]), bundle(&planner[0]), bundle(&reviewer[0]));
+        assert_eq!(coder_bundle.member, "coder");
+        assert_eq!(names(&coder_bundle), ["reviewer"]);
+        assert_eq!(names(&planner_bundle), ["coder"]);
+        assert!(names(&reviewer_bundle).is_empty());
+        for bundle in [&coder_bundle, &planner_bundle, &reviewer_bundle] {
+            assert_eq!(bundle.formation_id, id);
+            assert_eq!(bundle.verify_key, coder_bundle.verify_key);
+        }
+        assert!(!planner.join("\n").contains("reviewer"), "{planner:?}");
+        let addresses = |line: &str| -> Vec<(String, String)> {
+            parse_address_line(line)
+                .unwrap()
+                .into_iter()
+                .map(|peer| (peer.name, peer.url))
+                .collect()
+        };
+        assert_eq!(
+            addresses(&coder[1]),
+            [(
+                "reviewer".to_string(),
+                format!("http://localhost:{reviewer_port}")
+            )]
+        );
+        assert_eq!(
+            addresses(&planner[1]),
+            [(
+                "coder".to_string(),
+                format!("http://localhost:{coder_port}")
+            )]
+        );
+
+        for name in ["coder", "reviewer", "planner"] {
+            let env = std::fs::read_to_string(dir.path().join(format!("{name}.env"))).unwrap();
+            let argv = std::fs::read_to_string(dir.path().join(format!("{name}.argv"))).unwrap();
+            assert!(!env.contains("mft1.") && !argv.contains("mft1."), "{name}");
+            assert!(!env.contains(FORMATION_PEERS_ENV), "{name}: {env}");
+            assert!(
+                env.contains(&format!("{FORMATION_CHANNEL_ENV}=")),
+                "{name}: {env}"
+            );
+        }
+        let pids: Vec<u32> = formation.peers().iter().map(|peer| peer.pid).collect();
+        drop(formation);
+        for pid in pids {
+            assert!(!crate::running::pid_is_alive(pid), "{pid}");
+        }
     }
 
     #[test]
