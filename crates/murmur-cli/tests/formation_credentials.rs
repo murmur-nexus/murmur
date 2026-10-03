@@ -2,112 +2,27 @@
 //! issued for, what it is refused at every other door, and what a token that does not verify gets.
 //!
 //! Each member is an in-process authenticated session staged with the `FormationMember` one
-//! `FormationAuthority` built for it over S1's roster — `planner` may call `coder`, and `coder`
+//! `FormationAuthority` built for it over one roster — `planner` may call `coder`, and `coder`
 //! may call `reviewer` — exactly as `mur run` builds it from the bundle on its channel.
 
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{path::Path, sync::mpsc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use base64::Engine as _;
-use capsule_runtime::{
-    capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
-    FormationAuthority, FormationId, FormationMember, StageRequest, StagedSession,
-};
+use capsule_runtime::mac_token::B64;
+use capsule_runtime::{FormationAuthority, FormationId, FormationMember};
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, request, rpc, Response, QUEUE_SLEEP_YAML,
+    agent_project, bearer, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
+    trace_events, Response, QUEUE_SLEEP_YAML,
 };
-use murmur_artifact::{load_runtime_manifest, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
 const AUTHENTICATED: &str = "network:\n  authentication:\n    scheme: bearer\n";
 const CONSENTS: &str =
     "exports:\n  peer_tasks:\n    accept: true\n  files:\n    root: out\n    mode: read-only\n";
-
-const B64: base64::engine::general_purpose::GeneralPurpose =
-    base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-/// Stages the capsule `manifest` describes from `home`'s store as the formation member `member`,
-/// or as no member at all.
-fn stage(home: &TempDir, manifest: &Path, member: Option<Arc<FormationMember>>) -> StagedSession {
-    let runtime_manifest = load_runtime_manifest(manifest).unwrap();
-    let artifacts = runtime_manifest
-        .artifacts
-        .iter()
-        .map(|artifact| ArtifactRequest {
-            name: artifact.name.clone(),
-            version: artifact.version.clone(),
-            runtime: artifact.runtime.clone(),
-            source: artifact.source.clone(),
-            on_overflow: artifact.on_overflow,
-            config: artifact.config.clone(),
-            gateway: artifact.gateway.clone(),
-            capabilities: artifact.capabilities.clone(),
-        })
-        .collect();
-    stage_session(
-        Arc::new(LocalRegistry::new(
-            home.path().join(".murmur").join("artifacts"),
-        )),
-        StageRequest {
-            credentials_file: None,
-            manifest_dir: manifest.parent().unwrap().to_path_buf(),
-            capsule_name: runtime_manifest.name.clone(),
-            capsule_version: runtime_manifest.version.clone(),
-            capsule_component_bytes: Vec::new(),
-            artifacts,
-            allowlisted_tools: Default::default(),
-            lock_expectations: None,
-            capability_policy: capability_policy_from_runtime_manifest(&runtime_manifest),
-            inference: runtime_manifest.inference.clone(),
-            system_prompt_overridden: false,
-            context: None,
-            context_id: None,
-            resume: None,
-            forget_session: false,
-            otel_endpoint: None,
-            eval_config_json: None,
-            case_id: None,
-            dataset_id: None,
-            lifecycle: runtime_manifest.lifecycle.clone(),
-            lifecycle_override: None,
-            trace: None,
-            workdir: None,
-            bind_addr: "127.0.0.1".to_string(),
-            internal_port: None,
-            declared_containment_floor: ContainmentClass::Advisory,
-            exports: runtime_manifest.exports.clone(),
-            control: None,
-            door_authentication: runtime_manifest
-                .network
-                .as_ref()
-                .and_then(|network| network.authentication.clone()),
-            spawn_grant: None,
-            machine_tokens_per_day: None,
-            formation_id: member.as_ref().map(|member| member.formation_id().clone()),
-            formation_member: member,
-            ignore_task_file: false,
-        },
-    )
-    .unwrap()
-}
-
-/// Launches `staged` on a thread of its own and returns its `host:port`. A queue+sleep capsule
-/// never exits, so the thread is left behind.
-fn launch(staged: StagedSession) -> String {
-    let (url_tx, url_rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        launch_session(staged, move |url| {
-            let _ = url_tx.send(url.to_string());
-        })
-        .expect("launch should succeed")
-    });
-    url_rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("timed out waiting for the door")
-}
 
 /// One running member: its door, its session directory and its operator token.
 struct Door {
@@ -133,11 +48,11 @@ fn door(
         "",
         &format!("{QUEUE_SLEEP_YAML}{exports}{AUTHENTICATED}"),
     );
-    let staged = stage(home, &project.path().join("murmur.yaml"), member);
+    let staged = stage_door(home, &project.path().join("murmur.yaml"), member);
     let workdir = staged.workdir.clone();
     let operator = staged.door_tokens()[0].1.expose().to_string();
     Door {
-        addr: launch(staged),
+        addr: launch_door(staged),
         workdir,
         operator,
         _project: project,
@@ -163,19 +78,7 @@ fn send_with(addr: &str, authorization: &str, headers: &[(&str, &str)]) -> Respo
     )
 }
 
-fn bearer(token: &str) -> String {
-    format!("Bearer {token}")
-}
-
-fn trace_events(workdir: &Path) -> Vec<Value> {
-    std::fs::read_to_string(workdir.join("trace.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
-}
-
-/// S3: the 401 / 403 matrix of formation tokens at formation members' doors.
+/// The 401 / 403 matrix of formation tokens at formation members' doors.
 #[test]
 fn a_formation_token_reaches_its_audience_and_nothing_else() {
     if common::skip_without_host_support("a_formation_token_reaches_its_audience_and_nothing_else")

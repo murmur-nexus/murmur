@@ -617,16 +617,12 @@ pub enum RuntimeError {
     )]
     FormationIdUnreadable { reason: String },
 
-    /// `MURMUR_FORMATION_PEERS` is not a list of peer addresses, or is set in `mur run`'s own
-    /// process environment, where nothing legitimately puts it.
+    /// `MURMUR_FORMATION_PEERS` is set in `mur run`'s own process environment, where nothing
+    /// legitimately puts it, or a list of peers is not one a guest could be handed.
     ///
-    /// `reason` names the pair at fault by its position and what is wrong with it, or says where
-    /// the variable was found. It never carries the value.
-    #[error(
-        "MURMUR_FORMATION_PEERS does not carry a formation's peer addresses: {reason}; a member \
-         handed addresses it cannot read would call the wrong peer or none, so the launch is \
-         refused"
-    )]
+    /// `reason` says where the variable was found, or names the pair at fault by its position and
+    /// what is wrong with it. It never carries the value.
+    #[error("MURMUR_FORMATION_PEERS cannot be used: {reason}, so the launch is refused")]
     FormationPeersUnreadable { reason: String },
 
     /// The formation channel `MURMUR_FORMATION_CHANNEL` names could not be read: the descriptor is

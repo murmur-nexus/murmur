@@ -603,13 +603,13 @@ const FULL_REACH: &str = "reachability:\n  - from: planner\n    to: [coder, revi
 
 // ── Scenarios ─────────────────────────────────────────────────────────────────
 
-/// S1's roster: `planner` may call `coder`, and `coder` may call `reviewer`.
-const S1_REACH: &str =
+/// A chain: `planner` may call `coder`, and `coder` may call `reviewer`.
+const CHAIN_REACH: &str =
     "reachability:\n  - from: planner\n    to: [coder]\n  - from: coder\n    to: [reviewer]\n";
 
-/// S1's probes: `planner` tries a callee, a member it may not call and a name that is no member;
+/// The chain's probes: `planner` tries a callee, a member it may not call and a name that is no member;
 /// `coder`, on the task `planner` sends it, tries its callee and the entry member.
-fn s1_probes() -> [(&'static str, Value); 2] {
+fn chain_probes() -> [(&'static str, Value); 2] {
     [
         ("planner", json!({"names": ["coder", "reviewer", "nosuch"]})),
         ("coder", json!({"names": ["reviewer", "planner"]})),
@@ -647,14 +647,14 @@ fn files_holding(root: &Path, needle: &str) -> Vec<PathBuf> {
     common::door_capsule::files_containing(root, needle)
 }
 
-/// S1, S2, S5 and S10: the roster's reachability is enforced end to end. `planner` reaches
+/// The roster's reachability is enforced end to end. `planner` reaches
 /// `coder` and cannot address `reviewer`; `coder` reaches `reviewer` and cannot address the entry
 /// member; every door answers an unauthenticated or forged call `401`; no token appears in
 /// anything the run produced; and once the launcher exits, every door is gone.
 #[test]
 fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     let _lock = launch_lock();
-    let project = Project::with_probes(&[CODER, REVIEWER, PLANNER], S1_REACH, &s1_probes());
+    let project = Project::with_probes(&[CODER, REVIEWER, PLANNER], CHAIN_REACH, &chain_probes());
     let mut launcher = project.launch(&[], &[]);
 
     let (_, formation) = launcher.next_json();
@@ -666,7 +666,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     );
     assert_eq!(planner["name"], "planner");
 
-    // S2, while up: every door refuses a caller with no credential, and one presenting a formation
+    // While up, every door refuses a caller with no credential, and one presenting a formation
     // token that does not verify, with the ordinary bodies.
     let mut doors: Vec<String> = formation["peers"]
         .as_array()
@@ -681,15 +681,22 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
         })
         .collect();
     doors.push(planner["url"].as_str().unwrap().to_string());
-    for door in &doors {
-        for (token, code) in [
-            (None, "unauthenticated"),
-            (Some("mft1.x.y"), "invalid_token"),
-        ] {
+    for (token, code) in [
+        (None, "unauthenticated"),
+        (Some("mft1.x.y"), "invalid_token"),
+    ] {
+        let mut bodies = Vec::new();
+        for door in &doors {
             let refused = rpc(door, token, "message/send", message("msg_s2", "hello"));
             assert_eq!(refused.status, 401, "{door} {token:?}: {}", refused.body);
             assert_eq!(refused.json()["error"], code, "{door}: {}", refused.body);
+            bodies.push(refused.body);
         }
+        // Only the challenge's realm names the member; the body is the same at every door.
+        assert!(
+            bodies.windows(2).all(|pair| pair[0] == pair[1]),
+            "{bodies:?}"
+        );
     }
 
     // Each peer's door answers as the session the formation line names, to its operator token.
@@ -763,7 +770,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     assert!(!stderr.contains("W-RUN-005"), "{stderr}");
     assert!(!stderr.contains("W-RUN-006"), "{stderr}");
 
-    // S5: no formation token anywhere the run wrote, and no door token but the entry member's own
+    // No formation token anywhere the run wrote, and no door token but the entry member's own
     // readiness-line tokens.
     let stdout = launcher.stdout();
     assert_eq!(stdout.len(), 2, "{stdout:?}");
@@ -775,7 +782,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
         Duration::from_secs(30),
     );
 
-    // S10: once the launcher has exited, no reported door answers.
+    // Once the launcher has exited, no reported door answers.
     for door in &doors {
         assert!(
             std::net::TcpStream::connect(door).is_err(),
@@ -785,7 +792,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     // A second launch of the same roster is a new formation.
     let again = Project::with_probes(
         &[CODER, REVIEWER, PLANNER],
-        S1_REACH,
+        CHAIN_REACH,
         &[("planner", json!({"names": []}))],
     );
     let mut relaunched = again.launch(&[], &[]);
@@ -800,7 +807,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     );
 }
 
-/// S5: `mft1.` appears nowhere the run produced — the launcher's two streams, any file under the
+/// `mft1.` appears nowhere the run produced — the launcher's two streams, any file under the
 /// project or the scratch `HOME` (every session directory and running record among them), or any
 /// request any member's model was sent.
 fn assert_no_formation_token(project: &Project, stdout: &[String], stderr: &str) {
@@ -988,7 +995,7 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
     }
 }
 
-/// Scenario 6, at the binary: `MURMUR_FORMATION_PEERS` without a formation id, or unreadable, is
+/// `MURMUR_FORMATION_PEERS` in `mur run`'s own environment, with or without a formation id, is
 /// refused before any session exists.
 #[test]
 fn an_unreadable_or_orphaned_peers_variable_refuses_with_e_run_046() {
@@ -1204,9 +1211,9 @@ fn refusals_before_anything_starts() {
     project.assert_no_member_remains(&[], Duration::from_secs(1));
 }
 
-/// S9: an edge into the entry member is named once, `W-RUN-006`, and served to nobody: `coder` is
+/// An edge into the entry member is named once, `W-RUN-006`, and served to nobody: `coder` is
 /// refused `planner` exactly as it is refused a name that is no member, and is handed no
-/// credential for it. Everything else is as in S1.
+/// credential for it. Everything else is as in the chain.
 #[test]
 fn an_edge_into_the_entry_member_warns_once_and_is_not_served() {
     let _lock = launch_lock();

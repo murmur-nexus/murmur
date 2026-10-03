@@ -173,7 +173,7 @@ fn line(text: &str) -> Vec<u8> {
     format!("{text}\n").into_bytes()
 }
 
-/// S8: every channel `mur run` cannot read as this member's credentials is `E-RUN-046` before any
+/// Every channel `mur run` cannot read as this member's credentials is `E-RUN-046` before any
 /// session exists, and the refusal never quotes what the channel carried.
 #[test]
 fn an_unreadable_formation_channel_refuses_the_launch() {
@@ -234,7 +234,10 @@ fn an_unreadable_formation_channel_refuses_the_launch() {
         ),
         (
             "(h) peers in the process environment",
-            vec![(FORMATION_PEERS_ENV, "coder=http://localhost:1")],
+            vec![
+                (FORMATION_ID_ENV, id.as_str()),
+                (FORMATION_PEERS_ENV, "coder=http://localhost:1"),
+            ],
             Channel::Absent,
             "set in this process's environment",
         ),
@@ -264,7 +267,7 @@ fn an_unreadable_formation_channel_refuses_the_launch() {
     assert!(started.elapsed() >= Duration::from_secs(10));
 }
 
-/// S8: a valid first line launches the member, and its trace names it. (That the descriptor is
+/// A valid first line launches the member, and its trace names it. (That the descriptor is
 /// then close-on-exec is `capsule-runtime`'s unit test: `mur` makes itself non-dumpable, so its
 /// `/proc/<pid>/fdinfo` is not readable from here.)
 #[test]

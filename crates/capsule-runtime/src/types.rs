@@ -680,12 +680,6 @@ impl StagedSession {
     pub fn formation_id(&self) -> Option<&FormationId> {
         self.formation_id.as_ref()
     }
-
-    /// What this session's formation launcher handed it, or `None` for every session but a
-    /// formation member's.
-    pub fn formation_member(&self) -> Option<&Arc<FormationMember>> {
-        self.formation_member.as_ref()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

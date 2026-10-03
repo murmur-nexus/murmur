@@ -331,10 +331,7 @@ impl CredentialGateway {
     /// Every header named like `auth.header` is removed and, when a key is given, exactly one is
     /// inserted, marked sensitive. The URI keeps the request's own path and query and takes the
     /// upstream's scheme and authority, so the upstream scheme decides TLS. The body is moved
-    /// through untouched.
-    ///
-    /// `host` must be replaced, not left alone: wasi-http sets it from the authority the guest
-    /// addressed, which is the gateway's, and nothing downstream corrects it.
+    /// through untouched. `host` is replaced too: the guest addressed the gateway's authority.
     fn rewrite(
         &self,
         request: http::Request<WasiBody>,
@@ -352,23 +349,32 @@ impl CredentialGateway {
             parts.headers.insert(header, value);
         }
 
-        let mut uri = Uri::builder()
-            .scheme(self.upstream.scheme())
-            .authority(self.upstream_authority.as_str());
-        if let Some(path_and_query) = parts.uri.path_and_query() {
-            uri = uri.path_and_query(path_and_query.clone());
-        }
-        parts.uri = uri
-            .build()
-            .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?;
-        parts.headers.insert(
-            header::HOST,
-            HeaderValue::from_str(&self.upstream_authority)
-                .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?,
-        );
-
+        readdress(&mut parts, self.upstream.scheme(), &self.upstream_authority)?;
         Ok(http::Request::from_parts(parts, body))
     }
+}
+
+/// Point a guest request at `scheme://authority`, keeping the guest's own path and query.
+///
+/// `host` must be replaced, not left alone: wasi-http sets it from the authority the guest
+/// addressed, and nothing downstream corrects it.
+pub(crate) fn readdress(
+    parts: &mut http::request::Parts,
+    scheme: &str,
+    authority: &str,
+) -> Result<(), WasiHttpError> {
+    let mut uri = Uri::builder().scheme(scheme).authority(authority);
+    if let Some(path_and_query) = parts.uri.path_and_query() {
+        uri = uri.path_and_query(path_and_query.clone());
+    }
+    parts.uri = uri
+        .build()
+        .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?;
+    parts.headers.insert(
+        header::HOST,
+        HeaderValue::from_str(authority).map_err(|_| WasiHttpError::HttpRequestUriInvalid)?,
+    );
+    Ok(())
 }
 
 #[cfg(test)]

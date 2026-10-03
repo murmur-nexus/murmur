@@ -257,7 +257,7 @@ inherits. `MURMUR_FORMATION_CHANNEL` names the pipe's file descriptor. It is set
 No token is put in an environment variable, a command line, a file, the trace, a log line or
 stdout.
 
-### What a member's guests are handed { #formation-peers }
+### What a member's components are handed { #formation-peers }
 
 Every WASM component a member runs — its capsule, its tools, a `transport: http` driver and its
 hooks — is handed `MURMUR_FORMATION_PEERS`, naming each member it may call at a virtual address,

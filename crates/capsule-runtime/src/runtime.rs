@@ -5292,17 +5292,15 @@ pub(crate) enum Admission {
     Gateway(Arc<CredentialGateway>),
     /// Straight to the address the guest named.
     Direct,
-    /// To a formation callee's real door `url`, presenting `token`.
-    Formation {
-        url: http::Uri,
-        token: FormationToken,
-    },
 }
 
 impl NetworkPolicyHooks {
     /// Where this store may send a request for `uri`, or nowhere. Decided before any connection
-    /// exists. A request to a formation callee may wait up to the member's address wait for the
-    /// callee's address to arrive.
+    /// exists.
+    ///
+    /// Every host under `formation.invalid` is denied here: a formation call may wait for its
+    /// callee's address, so only `send_request` routes one, through [`resolve_formation_call`] off
+    /// the guest's thread. Admitting one here as `Direct` would send it as the guest wrote it.
     pub(crate) fn admit(&self, uri: &http::Uri) -> Result<Admission, WasiHttpError> {
         if let Some(gateway) = self.gateway.as_ref() {
             if CredentialGateway::is_addressed_to_gateway(uri) {
@@ -5321,9 +5319,7 @@ impl NetworkPolicyHooks {
         }
 
         if uri.host().is_some_and(is_formation_host) {
-            let (url, token) =
-                resolve_formation_call(self.formation.as_deref(), &self.network_allow_rules, uri)?;
-            return Ok(Admission::Formation { url, token });
+            return Err(WasiHttpError::HttpRequestDenied);
         }
 
         let target = RequestTarget::from_request(uri, uri.scheme_str() == Some("https"))
@@ -5386,7 +5382,7 @@ pub(crate) fn readdress_formation_call(
     token: &FormationToken,
     stamped: TaskProvenance,
 ) -> Result<http::Request<WasiBody>, WasiHttpError> {
-    use http::header::{HeaderValue, AUTHORIZATION, HOST};
+    use http::header::{HeaderValue, AUTHORIZATION};
     let (mut parts, body) = request.into_parts();
     parts.headers.remove(AUTHORIZATION);
     parts.headers.remove(crate::origin::PEER_ORIGIN_HEADER);
@@ -5406,20 +5402,11 @@ pub(crate) fn readdress_formation_call(
     let authority = url
         .authority()
         .ok_or(WasiHttpError::HttpRequestUriInvalid)?;
-    let mut builder = http::Uri::builder()
-        .scheme(url.scheme_str().unwrap_or("http"))
-        .authority(authority.as_str());
-    if let Some(path_and_query) = parts.uri.path_and_query() {
-        builder = builder.path_and_query(path_and_query.clone());
-    }
-    parts.uri = builder
-        .build()
-        .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?;
-    parts.headers.insert(
-        HOST,
-        HeaderValue::from_str(authority.as_str())
-            .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?,
-    );
+    crate::credential_gateway::readdress(
+        &mut parts,
+        url.scheme_str().unwrap_or("http"),
+        authority.as_str(),
+    )?;
     Ok(http::Request::from_parts(parts, body))
 }
 
@@ -5432,10 +5419,10 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     ) -> Box<
         dyn Future<Output = Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError>> + Send,
     > {
-        let stamped = stamp_for_peer(self.task_provenance);
         // A formation call may wait for its callee's address, so it is resolved off this thread,
         // inside the response future, and still before any connection is opened.
         if request.uri().host().is_some_and(is_formation_host) {
+            let stamped = stamp_for_peer(self.task_provenance);
             let formation = self.formation.clone();
             let rules = self.network_allow_rules.clone();
             let uri = request.uri().clone();
@@ -5458,12 +5445,6 @@ impl WasiHttpHooks for NetworkPolicyHooks {
             Err(refused) => Box::new(std::future::ready(Err(refused))),
             Ok(Admission::Gateway(gateway)) => Box::new(gateway.send(request, options)),
             Ok(Admission::Direct) => Box::new(send_direct(request, options)),
-            Ok(Admission::Formation { url, token }) => {
-                match readdress_formation_call(request, &url, &token, stamped) {
-                    Ok(request) => Box::new(send_direct(request, options)),
-                    Err(refused) => Box::new(std::future::ready(Err(refused))),
-                }
-            }
         }
     }
 }
@@ -5812,11 +5793,15 @@ impl send::Host for CapsuleStoreState {
         // token, and the trace records the address the guest named.
         let (connect_url, authorization) = match formation_send_target(&peer_url) {
             Some(uri) => {
-                let (url, token) = resolve_formation_call(
-                    self.http_hooks.formation.as_deref(),
-                    &self.network_allow_rules,
-                    &uri,
-                )
+                // The callee's address may still be on its way; wait for it without holding up
+                // the runtime worker this host call runs on.
+                let (url, token) = tokio::task::block_in_place(|| {
+                    resolve_formation_call(
+                        self.http_hooks.formation.as_deref(),
+                        &self.network_allow_rules,
+                        &uri,
+                    )
+                })
                 .map_err(|_| {
                     format!("network policy: '{peer_url}' not in capabilities.network.allow")
                 })?;
@@ -8150,14 +8135,7 @@ fn check_destination_allowed(
     peer_url: &str,
     field: &str,
 ) -> Result<(), String> {
-    let for_parse = if peer_url.contains("://") {
-        peer_url.to_string()
-    } else {
-        format!("http://{peer_url}")
-    };
-    let uri: http::Uri = for_parse
-        .parse()
-        .map_err(|e| format!("invalid peer URL '{peer_url}': {e}"))?;
+    let uri = peer_uri(peer_url).map_err(|e| format!("invalid peer URL '{peer_url}': {e}"))?;
     let target = RequestTarget::from_request(&uri, false)
         .ok_or_else(|| format!("invalid peer URL '{peer_url}'"))?;
     if rules.iter().any(|rule| rule.matches(&target)) {
@@ -8169,13 +8147,17 @@ fn check_destination_allowed(
 /// `peer_url` as a URI when it names a host under the formation peer domain, which only
 /// [`resolve_formation_call`] may route; `None` for every other address.
 fn formation_send_target(peer_url: &str) -> Option<http::Uri> {
-    let for_parse = if peer_url.contains("://") {
-        peer_url.to_string()
-    } else {
-        format!("http://{peer_url}")
-    };
-    let uri: http::Uri = for_parse.parse().ok()?;
+    let uri = peer_uri(peer_url).ok()?;
     uri.host().is_some_and(is_formation_host).then_some(uri)
+}
+
+/// `peer_url` as a URI, `http://` assumed when it names no scheme.
+fn peer_uri(peer_url: &str) -> Result<http::Uri, http::uri::InvalidUri> {
+    if peer_url.contains("://") {
+        peer_url.parse()
+    } else {
+        format!("http://{peer_url}").parse()
+    }
 }
 
 /// One tool call's `data` field, parsed as a JSON object.
@@ -17930,7 +17912,7 @@ inference:
             .map(|(response, _io)| response.status().as_u16())
     }
 
-    /// S6 (a), (b): a request to a callee's virtual address reaches its real door with the door's
+    /// A request to a callee's virtual address reaches its real door with the door's
     /// `host`, exactly one `Bearer` of the runtime's, and the provenance of the sending task —
     /// whatever the guest set itself.
     #[test]
@@ -17997,7 +17979,7 @@ inference:
         }
     }
 
-    /// S6 (c), (d), (f): a non-callee, an unknown name, `https`, an explicit port, a session in no
+    /// A non-callee, an unknown name, `https`, an explicit port, a session in no
     /// formation, a real door outside the allow rules and an address that never arrives are all
     /// the one denial, and none opens a connection.
     #[test]
@@ -18064,7 +18046,7 @@ inference:
         assert!(door.requests().is_empty(), "{:?}", door.requests());
     }
 
-    /// S6 (e): an address that arrives late, within the wait, is reached.
+    /// An address that arrives late, within the wait, is reached.
     #[test]
     fn a_late_address_within_the_wait_is_reached() {
         let door = RecordingDoor::start();
@@ -18095,7 +18077,7 @@ inference:
         assert_eq!(door.requests().len(), 1);
     }
 
-    /// S6 (h): the callee's real door, addressed directly, is an ordinary request: the runtime
+    /// The callee's real door, addressed directly, is an ordinary request: the runtime
     /// attaches nothing to it.
     #[test]
     fn a_request_to_the_real_door_carries_no_credential() {
@@ -18111,7 +18093,7 @@ inference:
         assert!(!head.contains("x-murmur-task-origin"), "{head}");
     }
 
-    /// S6 (g): `murmur:message/send` to a virtual address is resolved and authorized as the egress
+    /// `murmur:message/send` to a virtual address is resolved and authorized as the egress
     /// hook does it, and the trace records the address the guest named.
     #[test]
     fn message_send_to_a_virtual_address_is_resolved_and_authorized_the_same_way() {

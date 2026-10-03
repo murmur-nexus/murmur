@@ -930,8 +930,8 @@ error[E-RUN-046]: MURMUR_FORMATION_CHANNEL does not carry this member's formatio
 it inside a member's components, never in a process environment:
 
 ```text
-error[E-RUN-046]: MURMUR_FORMATION_PEERS does not carry a formation's peer addresses: it is set in this process's environment, and only a member's runtime sets it, inside its own WASM guests; a member handed addresses it cannot read would call the wrong peer or none, so the launch is refused
-  hint: MURMUR_FORMATION_PEERS is set by a formation member's runtime inside its own WASM guests, never in a process environment; unset it to run this capsule
+error[E-RUN-046]: MURMUR_FORMATION_PEERS cannot be used: it is set in this process's environment, so the launch is refused
+  hint: MURMUR_FORMATION_PEERS is set by a formation member's runtime inside its own WASM components, never in a process environment; unset it to run this capsule
 ```
 
 ### E-RUN-047 — the capsule changed since admission { #e-run-047 }

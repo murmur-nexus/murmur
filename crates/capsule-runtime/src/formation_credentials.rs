@@ -38,7 +38,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use crate::errors::RuntimeError;
 use crate::formation::{peer_url_format_error, FormationId, FormationPeer, FormationPeers};
-use crate::mac_token::{zeroize, B64};
+use crate::mac_token::{split_token, zeroize, B64};
 
 /// The version tag of a formation token.
 pub const FORMATION_TOKEN_TAG: &str = "mft1";
@@ -133,19 +133,14 @@ struct Claims {
 
 /// Tag, then signature, then payload. `None` for any failure, indistinguishably.
 fn open(key: &FormationVerifyKey, token: &str) -> Option<Claims> {
-    let mut segments = token.split('.');
-    let (tag, payload_b64, signature_b64) = (segments.next()?, segments.next()?, segments.next()?);
-    if segments.next().is_some() || tag != FORMATION_TOKEN_TAG {
-        return None;
-    }
-    let signature = B64.decode(signature_b64).ok()?;
+    let (payload_b64, payload, signature) = split_token(FORMATION_TOKEN_TAG, token).ok()?;
     if signature.len() != SIGNATURE_BYTES {
         return None;
     }
     UnparsedPublicKey::new(&ED25519, &key.0)
         .verify(&signed_input(payload_b64), &signature)
         .ok()?;
-    let payload: Value = serde_json::from_slice(&B64.decode(payload_b64).ok()?).ok()?;
+    let payload: Value = serde_json::from_slice(&payload).ok()?;
     let object = payload.as_object()?;
     if object.len() != 3 {
         return None;
@@ -336,11 +331,6 @@ impl FormationVerifier {
             member,
             key,
         }
-    }
-
-    /// This door's member name.
-    pub fn member(&self) -> &str {
-        &self.member
     }
 
     /// Check `token` in the fixed order tag → signature → payload → formation id, then its
@@ -769,22 +759,14 @@ impl FormationMember {
             .iter()
             .find(|(callee, _)| callee == name)
             .map(|(_, token)| token.clone())?;
-        let deadline = Instant::now() + wait;
-        let mut book = self.book.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if let Some(url) = book.urls.get(name) {
-                return Some((url.clone(), token));
-            }
-            let now = Instant::now();
-            if book.closed || now >= deadline {
-                return None;
-            }
-            book = self
-                .arrived
-                .wait_timeout(book, deadline - now)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
+        let book = self.book.lock().unwrap_or_else(PoisonError::into_inner);
+        let (book, _) = self
+            .arrived
+            .wait_timeout_while(book, wait, |book| {
+                !book.closed && !book.urls.contains_key(name)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        book.urls.get(name).map(|url| (url.clone(), token))
     }
 
     /// Install each address in `addresses` whose name is a callee; every other name is ignored, so
@@ -845,12 +827,13 @@ fn read_channel_line(reader: &mut impl BufRead) -> Result<Option<String>, &'stat
 }
 
 /// Take ownership of the inherited descriptor `fd` as the channel: it must be open and a pipe or
-/// a file, and is marked close-on-exec before it is returned, so no process this one starts can
+/// a file, and is marked close-on-exec before anything else, so no process this one starts can
 /// inherit it.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn adopt_channel_fd(fd: i32) -> Result<std::fs::File, RuntimeError> {
     use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileTypeExt;
 
     if fd <= 2 {
         return Err(channel_unreadable(format!(
@@ -862,30 +845,26 @@ fn adopt_channel_fd(fd: i32) -> Result<std::fs::File, RuntimeError> {
     if flags == -1 {
         return Err(channel_unreadable(format!("descriptor {fd} is not open")));
     }
-    // SAFETY: `stat` is a zeroed plain-data struct that `fstat` fills for an open descriptor.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` is open (checked above) and `stat` is a valid, exclusively borrowed struct.
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return Err(channel_unreadable(format!(
-            "descriptor {fd} could not be examined"
-        )));
-    }
-    let kind = stat.st_mode & libc::S_IFMT;
-    if kind != libc::S_IFIFO && kind != libc::S_IFREG {
-        return Err(channel_unreadable(format!(
-            "descriptor {fd} is neither a pipe nor a file"
-        )));
-    }
     // SAFETY: as for `F_GETFD`; `F_SETFD` takes the flag word by value.
     if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
         return Err(channel_unreadable(format!(
             "descriptor {fd} could not be marked close-on-exec"
         )));
     }
-    // SAFETY: `fd` is open, was inherited for exactly this purpose and is named by the launcher
-    // alone, so nothing else in this process owns it; the `File` takes sole ownership and closes
-    // it on drop.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    // SAFETY: `fd` is open (checked above), was inherited for exactly this purpose and is named by
+    // the launcher alone, so nothing else in this process owns it; the `File` takes sole ownership
+    // and closes it on drop.
+    let channel = unsafe { std::fs::File::from_raw_fd(fd) };
+    let kind = channel
+        .metadata()
+        .map_err(|_| channel_unreadable(format!("descriptor {fd} could not be examined")))?
+        .file_type();
+    if !kind.is_fifo() && !kind.is_file() {
+        return Err(channel_unreadable(format!(
+            "descriptor {fd} is neither a pipe nor a file"
+        )));
+    }
+    Ok(channel)
 }
 
 #[cfg(not(unix))]
@@ -898,9 +877,10 @@ fn adopt_channel_fd(_fd: i32) -> Result<std::fs::File, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
-    /// The S1 roster: `planner` (entry) may call `coder`, and `coder` may call `reviewer`.
-    fn s1() -> (FormationAuthority, Vec<(&'static str, Vec<&'static str>)>) {
+    /// A roster in which `planner` (entry) may call `coder`, and `coder` may call `reviewer`.
+    fn chain_roster() -> (FormationAuthority, Vec<(&'static str, Vec<&'static str>)>) {
         let authority = FormationAuthority::generate(&FormationId::mint()).unwrap();
         (
             authority,
@@ -912,14 +892,6 @@ mod tests {
         )
     }
 
-    fn verifier(authority: &FormationAuthority, member: &str) -> FormationVerifier {
-        FormationVerifier::new(
-            authority.formation_id().clone(),
-            member.to_string(),
-            authority.verify_key(),
-        )
-    }
-
     fn payload_of(token: &FormationToken) -> Value {
         let payload = token.expose().split('.').nth(1).unwrap();
         serde_json::from_slice(&B64.decode(payload).unwrap()).unwrap()
@@ -927,7 +899,7 @@ mod tests {
 
     #[test]
     fn a_token_is_mft1_over_exactly_the_three_claims() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let token = authority.mint("planner", "coder");
         assert!(token.expose().starts_with("mft1."));
         assert_eq!(token.expose().split('.').count(), 3);
@@ -945,10 +917,11 @@ mod tests {
 
     #[test]
     fn a_token_verifies_at_its_audience_and_is_not_permitted_anywhere_else() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let token = authority.mint("planner", "coder");
         assert_eq!(
-            verifier(&authority, "coder")
+            authority
+                .verifier_for("coder")
                 .verify(token.expose())
                 .unwrap()
                 .from(),
@@ -956,7 +929,7 @@ mod tests {
         );
         for door in ["reviewer", "planner"] {
             assert_eq!(
-                verifier(&authority, door).verify(token.expose()),
+                authority.verifier_for(door).verify(token.expose()),
                 Err(FormationRefusal::NotPermitted {
                     caller: "planner".to_string()
                 }),
@@ -967,8 +940,8 @@ mod tests {
 
     #[test]
     fn every_forgery_is_the_one_invalid() {
-        let (authority, _) = s1();
-        let coder = verifier(&authority, "coder");
+        let (authority, _) = chain_roster();
+        let coder = authority.verifier_for("coder");
         let token = authority.mint("planner", "coder");
         let (_, payload, signature) = {
             let mut parts = token.expose().split('.');
@@ -1047,18 +1020,19 @@ mod tests {
         );
     }
 
-    /// S4: each bundle holds one token per callee in roster order, each verifying as
+    /// Each bundle holds one token per callee in roster order, each verifying as
     /// `member → callee`, and nothing about a member it may not call.
     #[test]
     fn a_bundle_holds_exactly_its_callees_tokens_in_roster_order() {
-        let (authority, roster) = s1();
+        let (authority, roster) = chain_roster();
         for (member, callees) in &roster {
             let bundle = authority.member_bundle(member, callees);
             let names: Vec<&str> = bundle.calls.iter().map(|(name, _)| name.as_str()).collect();
             assert_eq!(&names, callees, "{member}");
             for (callee, token) in &bundle.calls {
                 assert_eq!(
-                    verifier(&authority, callee)
+                    authority
+                        .verifier_for(callee)
                         .verify(token.expose())
                         .unwrap()
                         .from(),
@@ -1079,7 +1053,7 @@ mod tests {
 
     #[test]
     fn a_first_line_round_trips_and_its_field_order_is_fixed() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let bundle = authority.member_bundle("coder", &["reviewer"]);
         let line = bundle.render_line();
         assert!(
@@ -1114,7 +1088,7 @@ mod tests {
     /// Every malformed first line is refused naming its field, and no refusal quotes the line.
     #[test]
     fn a_first_line_refusal_names_the_problem_and_never_quotes_the_line() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let good: Value = serde_json::from_str(
             &authority
                 .member_bundle("coder", &["reviewer"])
@@ -1232,10 +1206,10 @@ mod tests {
         assert!(!is_formation_host("notformation.invalid"));
     }
 
-    /// S4: `guest_peers` holds virtual URLs only, with no port, for the callees only.
+    /// `guest_peers` holds virtual URLs only, with no port, for the callees only.
     #[test]
     fn a_members_guests_see_its_callees_at_virtual_addresses_only() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let planner = FormationMember::from_bundle(authority.member_bundle("planner", &["coder"]));
         let peers = planner.guest_peers().unwrap();
         assert_eq!(peers.render(), "coder=http://coder.formation.invalid");
@@ -1245,7 +1219,7 @@ mod tests {
 
     #[test]
     fn an_address_resolves_only_for_a_callee_and_waits_for_a_late_one() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let member = Arc::new(FormationMember::from_bundle(
             authority.member_bundle("coder", &["reviewer"]),
         ));
@@ -1272,7 +1246,8 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(url, "http://127.0.0.1:41873");
         assert_eq!(
-            verifier(&authority, "reviewer")
+            authority
+                .verifier_for("reviewer")
                 .verify(token.expose())
                 .unwrap()
                 .from(),
@@ -1283,7 +1258,7 @@ mod tests {
 
     #[test]
     fn a_channel_delivers_the_first_line_then_addresses_until_it_ends() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let (reader, mut writer) = std::io::pipe().unwrap();
         use std::io::Write;
         writeln!(
@@ -1334,7 +1309,7 @@ mod tests {
 
     #[test]
     fn a_channel_refuses_a_late_empty_or_foreign_first_line() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let (reader, _writer) = std::io::pipe().unwrap();
         let late = FormationMember::from_channel(
             reader,
@@ -1366,7 +1341,7 @@ mod tests {
         assert!(foreign.contains("another formation"), "{foreign}");
     }
 
-    /// S7: once read, the channel's descriptor is close-on-exec.
+    /// Once read, the channel's descriptor is close-on-exec.
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
@@ -1391,10 +1366,10 @@ mod tests {
             .contains("never a channel"));
     }
 
-    /// S5: no new type's `Debug` carries a token, a key or a signature.
+    /// No formation type's `Debug` carries a token, a key or a signature.
     #[test]
     fn no_debug_output_carries_a_token_or_key() {
-        let (authority, _) = s1();
+        let (authority, _) = chain_roster();
         let bundle = authority.member_bundle("coder", &["reviewer"]);
         let token = bundle.calls[0].1.clone();
         let signature = token.expose().split('.').nth(2).unwrap().to_string();

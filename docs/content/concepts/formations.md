@@ -27,7 +27,7 @@ session it reported, and the entry member starts last. When the entry member's t
 member is stopped. See [Launching a formation](../reference/roster.md#launch) and the
 [`mur run --roster` flags and output](../reference/cli.md#mur-run-roster).
 
-The roster is enforced, not advisory. The launcher is the one authority that issues credentials: it
+The roster is enforced. The launcher is the one authority that issues credentials: it
 signs a token for each edge the roster allows, hands each member only the tokens for the members it
 may call, and keeps the signing key in its own memory. A member's components call another member by
 name; the runtime attaches the token, so no model ever sees it. Every member's door lets in only a

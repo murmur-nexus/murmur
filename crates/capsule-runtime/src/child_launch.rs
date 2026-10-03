@@ -37,8 +37,7 @@ use crate::delegation::{
     SPAWNER_ENV,
 };
 use crate::errors::RuntimeError;
-use crate::formation::{FormationId, FORMATION_ID_ENV, FORMATION_PEERS_ENV};
-use crate::formation_credentials::FORMATION_CHANNEL_ENV;
+use crate::formation::{FormationId, FORMATION_ID_ENV};
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 
@@ -655,9 +654,9 @@ fn watch_for_completion(
 /// launch and [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last,
 /// so a child cannot displace the daemon URL it is required to register with, the handle it
 /// reports its outcome to, or the formation it joins, by allowlisting the name.
-/// [`FORMATION_PEERS_ENV`] and [`FORMATION_CHANNEL_ENV`] are never handed on at all: inheriting a
-/// formation is not a grant, so a member's child holds no channel, no token and no callee, and a
-/// child that allowlists either name receives nothing.
+/// A formation member's names ([`crate::formation::is_member_grant_env`]) are never handed on at
+/// all: inheriting a formation is not a grant, so a member's child holds no channel, no token and
+/// no callee, and a child that allowlists either name receives nothing.
 pub(crate) fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
@@ -672,8 +671,7 @@ pub(crate) fn child_environment(
         !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL")
             && key != SPAWNER_ENV
             && key != FORMATION_ID_ENV
-            && key != FORMATION_PEERS_ENV
-            && key != FORMATION_CHANNEL_ENV
+            && !crate::formation::is_member_grant_env(key)
     });
 
     if let Ok(path) = std::env::var("PATH") {

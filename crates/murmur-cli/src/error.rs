@@ -750,7 +750,7 @@ impl From<RuntimeError> for CliError {
                 E_RUN_046,
                 error.to_string(),
                 "MURMUR_FORMATION_PEERS is set by a formation member's runtime inside its own WASM \
-                 guests, never in a process environment; unset it to run this capsule",
+                 components, never in a process environment; unset it to run this capsule",
             ),
             error @ RuntimeError::FormationChannelUnreadable { .. } => CliError::with_hint(
                 E_RUN_046,
@@ -1077,15 +1077,16 @@ mod tests {
 
     #[test]
     fn unreadable_formation_peers_map_to_e_run_046() {
-        let error = capsule_runtime::FormationPeers::parse("coder").unwrap_err();
-        let cli = CliError::from(error);
+        let cli = CliError::from(RuntimeError::FormationPeersUnreadable {
+            reason: "it is set in this process's environment".to_string(),
+        });
         assert_eq!(cli.code, E_RUN_046);
         assert!(
-            cli.message.contains("MURMUR_FORMATION_PEERS"),
+            cli.message.contains("MURMUR_FORMATION_PEERS")
+                && cli.message.contains("set in this process's environment"),
             "{}",
             cli.message
         );
-        assert!(cli.message.contains("pair 1 has no '='"), "{}", cli.message);
         let hint = cli.hint.as_deref().unwrap_or_default();
         assert!(hint.contains("unset it"), "{hint}");
     }

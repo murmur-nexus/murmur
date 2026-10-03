@@ -22,7 +22,7 @@ peers=<value of MURMUR_FORMATION_PEERS, or absent>
 ```
 
 `refused:<error>` is the request's failure as wasi-http reported it, for example
-`refused:HttpRequestDenied` for a name the member may not call.
+`refused:ErrorCode::HttpRequestDenied` for a name the member may not call.
 
 ## Rebuild
 

@@ -9,8 +9,6 @@ use std::{
 use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
     detached::{DetachPolicy, DetachedDispatchInfo},
-    formation::FORMATION_PEERS_ENV,
-    formation_credentials::FORMATION_CHANNEL_ENV,
     types::CapabilityPolicy,
 };
 
@@ -693,7 +691,7 @@ pub(crate) fn build_shell_env(
     for key in &policy.shell_baseline_env {
         // Formation names are never a native process's: a baseline entry naming one supplies
         // nothing from the host.
-        if key == FORMATION_PEERS_ENV || key == FORMATION_CHANNEL_ENV {
+        if crate::formation::is_member_grant_env(key) {
             continue;
         }
         if let Ok(value) = std::env::var(key) {
@@ -784,17 +782,16 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 /// run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`, built by
 /// [`build_shell_env`].
 ///
-/// [`ARTIFACT_CONFIG_ENV`], [`FORMATION_PEERS_ENV`] and [`FORMATION_CHANNEL_ENV`] are reserved
-/// and never resolved from the host, whatever a manifest allowlists: the names are runtime-owned,
-/// and their values come from the declaring artifact's own `config:` block and from the session,
-/// or from nowhere. Skipped here rather than relied on being overwritten later, so a host value
+/// [`ARTIFACT_CONFIG_ENV`] and a formation member's names
+/// ([`crate::formation::is_member_grant_env`]) are reserved and never resolved from the host,
+/// whatever a manifest allowlists: the names are runtime-owned, and their values come from the
+/// declaring artifact's own `config:` block and from the session, or from nowhere. Skipped here rather than relied on being overwritten later, so a host value
 /// cannot reach a guest whose entry declared no config at all.
 pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
     for key in &policy.env_allow {
-        if key == ARTIFACT_CONFIG_ENV || key == FORMATION_PEERS_ENV || key == FORMATION_CHANNEL_ENV
-        {
+        if key == ARTIFACT_CONFIG_ENV || crate::formation::is_member_grant_env(key) {
             continue;
         }
         if let Ok(value) = std::env::var(key) {

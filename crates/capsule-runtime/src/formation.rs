@@ -184,7 +184,8 @@ pub struct FormationPeer {
 pub struct FormationPeers(Vec<FormationPeer>);
 
 impl FormationPeers {
-    /// The peers in the order given, refused on the same terms [`Self::parse`] refuses a value.
+    /// The peers in the order given: one or more, each a member name at most once, each at an
+    /// `http://host[:port]` URL with no path.
     pub fn new(peers: Vec<FormationPeer>) -> Result<Self, RuntimeError> {
         if peers.is_empty() {
             return Err(peers_unreadable(
@@ -215,33 +216,6 @@ impl FormationPeers {
         Ok(Self(peers))
     }
 
-    /// Accept `value` only if it is exactly one or more `name=url` pairs joined by single spaces.
-    /// Nothing is trimmed.
-    pub fn parse(value: &str) -> Result<Self, RuntimeError> {
-        if value.trim().is_empty() {
-            return Err(peers_unreadable("it is blank"));
-        }
-        let mut peers = Vec::new();
-        for (index, pair) in value.split(' ').enumerate() {
-            let position = index + 1;
-            if pair.is_empty() {
-                return Err(peers_unreadable(&format!(
-                    "pair {position} is empty; pairs are separated by exactly one space"
-                )));
-            }
-            let Some((name, url)) = pair.split_once('=') else {
-                return Err(peers_unreadable(&format!(
-                    "pair {position} has no '='; each pair is name=url"
-                )));
-            };
-            peers.push(FormationPeer {
-                name: name.to_string(),
-                url: url.to_string(),
-            });
-        }
-        Self::new(peers)
-    }
-
     /// The variable's value: `name=url` pairs joined by single spaces, in order.
     pub fn render(&self) -> String {
         self.0
@@ -262,18 +236,22 @@ impl FormationPeers {
     }
 }
 
+/// Whether `name` is one of the variables that carry what a formation member was handed —
+/// [`FORMATION_PEERS_ENV`] or [`crate::formation_credentials::FORMATION_CHANNEL_ENV`]. Neither is
+/// ever resolved from the host for a native process or handed to a delegated child.
+pub(crate) fn is_member_grant_env(name: &str) -> bool {
+    name == FORMATION_PEERS_ENV || name == crate::formation_credentials::FORMATION_CHANNEL_ENV
+}
+
 /// `Err` when [`FORMATION_PEERS_ENV`] is set in this process's environment.
 ///
 /// Only a member's runtime sets the variable, and only inside its own guests, from what the
 /// formation channel delivered. A value in `mur run`'s own environment came from somewhere else —
-/// an older launcher, a shell, a parent that should not have passed it on — and is refused rather
-/// than ignored, so nobody is led to believe it was read. The value is never read or quoted.
+/// a shell, a parent that should not have passed it on — and is refused rather than ignored, so
+/// nobody is led to believe it was read. The value is never read or quoted.
 pub fn refuse_formation_peers_in_process_env() -> Result<(), RuntimeError> {
     if std::env::var_os(FORMATION_PEERS_ENV).is_some() {
-        return Err(peers_unreadable(
-            "it is set in this process's environment, and only a member's runtime sets it, inside \
-             its own WASM guests",
-        ));
+        return Err(peers_unreadable("it is set in this process's environment"));
     }
     Ok(())
 }
@@ -571,85 +549,74 @@ mod tests {
         assert_eq!(reads_here, 1, "FormationId::from_env is the one reader");
     }
 
-    fn peers_refusal(value: &str) -> String {
-        match FormationPeers::parse(value) {
-            Err(error @ RuntimeError::FormationPeersUnreadable { .. }) => error.to_string(),
-            other => panic!("expected FormationPeersUnreadable for {value:?}, got {other:?}"),
-        }
-    }
-
     #[test]
-    fn formation_peers_render_and_parse_round_trip() {
-        let value = "coder=http://localhost:41873 reviewer=http://127.0.0.1:41874";
-        let peers = FormationPeers::parse(value).unwrap();
-        assert_eq!(
-            peers.peers(),
-            &[
-                FormationPeer {
-                    name: "coder".to_string(),
-                    url: "http://localhost:41873".to_string(),
-                },
-                FormationPeer {
-                    name: "reviewer".to_string(),
-                    url: "http://127.0.0.1:41874".to_string(),
-                },
-            ]
-        );
+    fn formation_peers_render_in_order() {
+        let peers = FormationPeers::new(vec![
+            FormationPeer {
+                name: "coder".to_string(),
+                url: "http://localhost:41873".to_string(),
+            },
+            FormationPeer {
+                name: "reviewer".to_string(),
+                url: "http://reviewer.formation.invalid".to_string(),
+            },
+        ])
+        .unwrap();
+        let value = "coder=http://localhost:41873 reviewer=http://reviewer.formation.invalid";
         assert_eq!(peers.render(), value);
         assert_eq!(peers.env_pair(), (FORMATION_PEERS_ENV, value.to_string()));
-        assert_eq!(
-            FormationPeers::new(peers.peers().to_vec()).unwrap(),
-            peers,
-            "new and parse agree"
-        );
-        let single = FormationPeers::parse("a=http://[::1]:9").unwrap();
-        assert_eq!(single.render(), "a=http://[::1]:9");
     }
 
     #[test]
-    fn formation_peers_parse_refuses_every_malformed_value() {
-        for (value, wording) in [
+    fn formation_peers_refuse_every_malformed_peer() {
+        let refusal = |peers: &[(&str, &str)]| {
+            let peers = peers
+                .iter()
+                .map(|(name, url)| FormationPeer {
+                    name: name.to_string(),
+                    url: url.to_string(),
+                })
+                .collect();
+            match FormationPeers::new(peers) {
+                Err(error @ RuntimeError::FormationPeersUnreadable { .. }) => error.to_string(),
+                other => panic!("expected FormationPeersUnreadable, got {other:?}"),
+            }
+        };
+        for (peers, wording) in [
             (
-                "Coder=http://localhost:1",
+                &[("Coder", "http://localhost:1")][..],
                 "must start with a lowercase letter",
             ),
             (
-                "co_der=http://localhost:1",
+                &[("co_der", "http://localhost:1")],
                 "pair 1 names a member whose name",
             ),
             (
-                "coder=http://localhost:1 coder=http://localhost:2",
+                &[
+                    ("coder", "http://localhost:1"),
+                    ("coder", "http://localhost:2"),
+                ],
                 "pair 2 names 'coder' a second time",
             ),
-            ("coder", "pair 1 has no '='"),
-            ("coder=http://localhost:1 reviewer", "pair 2 has no '='"),
-            ("coder=https://localhost:1", "does not start with 'http://'"),
-            ("coder=localhost:1", "does not start with 'http://'"),
-            ("coder=http://localhost:0", "port is not a number"),
-            ("coder=http://localhost:99999", "port is not a number"),
-            ("coder=http://localhost:1/x", "port is not a number"),
-            ("coder=http://:1", "host is not"),
             (
-                "coder=http://localhost:1  reviewer=http://localhost:2",
-                "pair 2 is empty",
+                &[("coder", "https://localhost:1")],
+                "does not start with 'http://'",
             ),
-            (" coder=http://localhost:1", "pair 1 is empty"),
-            ("coder=http://localhost:1 ", "pair 2 is empty"),
-            ("", "it is blank"),
-            ("   ", "it is blank"),
+            (&[("coder", "localhost:1")], "does not start with 'http://'"),
+            (&[("coder", "http://localhost:0")], "port is not a number"),
+            (
+                &[("coder", "http://localhost:99999")],
+                "port is not a number",
+            ),
+            (&[("coder", "http://localhost:1/x")], "port is not a number"),
+            (&[("coder", "http://:1")], "host is not"),
         ] {
-            let message = peers_refusal(value);
-            assert!(message.contains(wording), "{value:?}: {message}");
+            let message = refusal(peers);
+            assert!(message.contains(wording), "{peers:?}: {message}");
             assert!(message.contains(FORMATION_PEERS_ENV), "{message}");
         }
         assert!(FormationPeers::new(Vec::new()).is_err());
         // A guest's peers are virtual addresses with no port; a real door always has one.
-        assert_eq!(
-            FormationPeers::parse("coder=http://coder.formation.invalid")
-                .unwrap()
-                .render(),
-            "coder=http://coder.formation.invalid"
-        );
         assert_eq!(
             peer_url_format_error("http://localhost").as_deref(),
             Some("has a URL with no port")
