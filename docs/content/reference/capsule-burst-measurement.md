@@ -268,10 +268,10 @@ Derived on the host above.
 
 ## What this does not settle
 
-- **The census does not survive a restart.** `mur-roost` counts live capsules in the in-memory
-  `HashMap` created in `crates/mur-roost/src/main.rs`. A restarted daemon counts zero while the
-  host still runs every capsule it admitted, so no ceiling, this one included, is enforced across a
-  restart until that is fixed. This card does not fix it.
+- **A restarted daemon counts only capsules that left a running-capsule record.** It resumes the
+  census from `~/.murmur/running`, so a script capsule, or a session whose record could not be
+  written, is under-counted after a restart. See
+  [Capsules running at startup](roost-api.md#capsules-running-at-startup).
 - **It is one daemon's ceiling.** Two daemons on one host each enforce their own.
 - **The stub task is a memory floor.** A real task grows its conversation and runs compilers and
   test suites in its shell. The plateau is read before any capsule has started its shell.

@@ -286,6 +286,52 @@ fn a_restarted_daemon_counts_the_capsules_still_running() {
     roost.stop();
 }
 
+// ── S3. A stale record is not counted ─────────────────────────────────────────
+
+/// Each way a record goes stale, read from the real process table: a pid nothing holds, a pid
+/// held by a process that started at another time, and the empty start token a writer that could
+/// not read its own start time records.
+#[test]
+fn a_stale_record_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sleepers = Sleepers::default();
+    let freed = sleepers.start();
+    let token = process_start_token(freed).unwrap();
+    sleepers.kill(freed);
+    let held = std::process::id();
+    write_record(
+        dir.path(),
+        "ses_0199freedpid0000000000000000001",
+        freed,
+        &token,
+        "127.0.0.1:1",
+    );
+    write_record(
+        dir.path(),
+        "ses_0199othertime000000000000000002",
+        held,
+        "0",
+        "127.0.0.1:1",
+    );
+    write_record(
+        dir.path(),
+        "ses_0199emptytoken00000000000000003",
+        held,
+        "",
+        "127.0.0.1:1",
+    );
+
+    let (mut inherited, report) = census::inherit(dir.path()).unwrap();
+
+    assert_eq!(
+        (report.records_read, report.counted, report.stale),
+        (3, 0, 3),
+        "{report:?}"
+    );
+    assert!(inherited.is_empty());
+    assert_eq!(inherited.live(&HashMap::new()), 0);
+}
+
 // ── S6. The daemon writes nothing ─────────────────────────────────────────────
 
 /// Name, size, mtime and mode of a directory and of every entry in it.

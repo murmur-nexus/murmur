@@ -41,7 +41,7 @@ mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 | `--spawn-allow` | *(empty)* | One capsule name that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
 | `--max-depth` | `3` | Levels of delegation allowed below a top-level capsule — see [Delegation bounds](#delegation-bounds) |
 | `--max-concurrent` | `4` | Children one session may hold live at once |
-| `--max-live-capsules` | Derived from the host's core count | Capsules this daemon may hold live at once across every formation — see [The machine ceiling](#the-machine-ceiling) |
+| `--max-live-capsules` | Derived from the host's core count | Capsules live on the host at once across every formation, counting those already running when the daemon started — see [The machine ceiling](#the-machine-ceiling) |
 | `--version` | — | Print the daemon's version and exit without binding a port |
 
 `--spawn-allow` takes a single name per occurrence, not a comma-separated list. It gates the
@@ -77,8 +77,7 @@ mur-roost: cannot count the capsules already running on this host: /home/you/.mu
 
 !!! note "One daemon per host"
     The ceiling is one daemon's. Two `mur-roost` processes on one host each enforce their own and
-    together exceed it, because roost coordinates nothing across processes. It reads
-    `~/.murmur/running` at startup and writes nothing, there or anywhere else. Run one daemon per
+    together exceed it, because roost coordinates nothing across processes. Run one daemon per
     host.
 
 Any other flag is rejected and the daemon exits. There is no `--max-total` — see
@@ -804,8 +803,7 @@ allows exceeds it, and the next delegated spawn is refused until the census fall
 
 **One daemon per host.** The ceiling counts what *this* daemon has admitted, plus what it found
 running when it started. Two `mur-roost` processes on one host each enforce their own ceiling and
-together exceed it; roost reads `~/.murmur/running` at startup, writes nothing, and coordinates with
-no other process. Run one daemon per host.
+together exceed it, because roost coordinates with no other process. Run one daemon per host.
 
 #### Capsules running at startup { #capsules-running-at-startup }
 

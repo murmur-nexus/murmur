@@ -181,19 +181,11 @@ mod tests {
             "started_at": "2026-01-01T00:00:00Z",
             "door_token": "operator-door-token",
         });
-        fixture(
-            &dir.join(format!("{session_id}.json")),
-            &serde_json::to_vec_pretty(&record).unwrap(),
-        );
-    }
-
-    /// Writes a fixture file into a test's own tempdir.
-    fn fixture(path: &Path, contents: &[u8]) {
-        use std::io::Write;
-        std::fs::File::create(path)
-            .unwrap()
-            .write_all(contents)
-            .unwrap();
+        std::fs::write(
+            dir.join(format!("{session_id}.json")),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
     }
 
     fn running_job() -> JobRecord {
@@ -213,7 +205,7 @@ mod tests {
         write_record(dir.path(), "ses_b", UNVERIFIED);
         write_record(dir.path(), "ses_c", GONE);
         let broken = dir.path().join("ses_d.json");
-        fixture(&broken, b"{");
+        std::fs::write(&broken, "{").unwrap();
 
         let (mut inherited, report) = inherit_with(dir.path(), by_pid).unwrap();
 
