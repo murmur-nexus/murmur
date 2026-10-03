@@ -237,10 +237,14 @@ impl FormationPeers {
 }
 
 /// Whether `name` is one of the variables that carry what a formation member was handed —
-/// [`FORMATION_PEERS_ENV`] or [`crate::formation_credentials::FORMATION_CHANNEL_ENV`]. Neither is
-/// ever resolved from the host for a native process or handed to a delegated child.
+/// [`FORMATION_PEERS_ENV`], [`crate::formation_credentials::FORMATION_CHANNEL_ENV`] or
+/// [`crate::lifeline::FORMATION_LIFELINE_ENV`]. None is ever resolved from the host for a guest or
+/// a native process, or handed to a delegated child: the channel and the lifeline name
+/// descriptors of the member's own process.
 pub(crate) fn is_member_grant_env(name: &str) -> bool {
-    name == FORMATION_PEERS_ENV || name == crate::formation_credentials::FORMATION_CHANNEL_ENV
+    name == FORMATION_PEERS_ENV
+        || name == crate::formation_credentials::FORMATION_CHANNEL_ENV
+        || name == crate::lifeline::FORMATION_LIFELINE_ENV
 }
 
 /// `Err` when [`FORMATION_PEERS_ENV`] is set in this process's environment.
@@ -671,6 +675,35 @@ mod tests {
         assert_eq!(
             reads_here, 1,
             "refuse_formation_peers_in_process_env is the one place that looks"
+        );
+    }
+
+    #[test]
+    fn the_formation_lifeline_is_read_from_the_process_environment_in_one_place() {
+        let mut sources = sources_of("capsule-runtime");
+        sources.extend(sources_of("murmur-cli"));
+        let names_the_variable = |args: &&str| {
+            args.contains("MURMUR_FORMATION_LIFELINE") || args.contains("FORMATION_LIFELINE_ENV")
+        };
+        let mut reads_here = 0;
+        for (path, text) in sources {
+            let reads = env_reads(crate::source_scan::production_part(&text))
+                .into_iter()
+                .filter(names_the_variable)
+                .count();
+            if path == "capsule-runtime/src/lifeline.rs" {
+                reads_here = reads;
+            } else {
+                assert_eq!(
+                    reads, 0,
+                    "{path} reads the formation lifeline from the process environment; only \
+                     FormationLifeline::from_env does"
+                );
+            }
+        }
+        assert_eq!(
+            reads_here, 1,
+            "FormationLifeline::from_env is the one reader"
         );
     }
 }

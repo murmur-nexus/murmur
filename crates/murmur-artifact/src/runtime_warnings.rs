@@ -47,6 +47,13 @@ pub const W_RUN_004: &str = "W-RUN-004";
 /// is refused; the edge is named once per launch.
 pub const W_RUN_006: &str = "W-RUN-006";
 
+/// A `mur run` that carries a formation id but was handed no lifeline, and is no delegated child.
+///
+/// Such a session is a formation member someone started by hand, usually to debug it. It runs as
+/// any other `mur run` does, but nothing will wind it down when its formation ends; the warning
+/// names the formation and `mur stop` as the way to end it. Printed once, at launch.
+pub const W_RUN_007: &str = "W-RUN-007";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -63,7 +70,9 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006];
+        let codes = [
+            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006, W_RUN_007,
+        ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");

@@ -23,6 +23,7 @@ use murmur_artifact::{
     ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError,
     MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
+use murmur_artifact::{runtime_warning_link, W_RUN_007};
 
 use crate::{
     commands::trace::{first_task_context_id, resolve_session_dir},
@@ -259,6 +260,39 @@ pub(crate) fn run_run(
     // also what marks the channel close-on-exec before any process could inherit it.
     let formation_member = capsule_runtime::FormationMember::from_env(formation_id.as_ref())
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    // And the lifeline its launcher holds the other end of, read once per process: a descriptor
+    // belongs to the process, so it is attached to the staged session rather than carried on the
+    // stage request. Read before anything is started, which is also what marks it close-on-exec.
+    #[cfg(unix)]
+    let formation_lifeline = capsule_runtime::FormationLifeline::from_env()
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    #[cfg(unix)]
+    if formation_lifeline.is_some() && formation_id.is_none() {
+        return Err(fail(
+            &session_id,
+            &workdir,
+            CliError::from(RuntimeError::FormationLifelineUnreadable {
+                reason: "it is set, but MURMUR_FORMATION_ID is not, and a lifeline is a \
+                         formation's"
+                    .to_string(),
+            }),
+            json,
+        ));
+    }
+    #[cfg(unix)]
+    let has_lifeline = formation_lifeline.is_some();
+    #[cfg(not(unix))]
+    let has_lifeline = false;
+    let started_by_hand =
+        started_by_hand_in_a_formation(formation_id.is_some(), has_lifeline, spawn_grant_stdin);
+    if let (true, Some(id)) = (started_by_hand, &formation_id) {
+        capsule_runtime::runtime_err!(
+            "warning[{W_RUN_007}]: this session is a member of formation {id} but was handed no \
+             lifeline, so it will not wind down when that formation ends; end it with `mur stop` \
+             ({})",
+            runtime_warning_link(W_RUN_007)
+        );
+    }
 
     // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
     // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
@@ -768,6 +802,12 @@ pub(crate) fn run_run(
         stage_request,
     )
     .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    #[cfg(unix)]
+    let mut staged = staged;
+    #[cfg(unix)]
+    if let Some(lifeline) = formation_lifeline {
+        staged.attach_formation_lifeline(lifeline);
+    }
 
     session_id = staged.session_id.clone();
     workdir = staged.workdir.clone();
@@ -911,6 +951,17 @@ pub(crate) fn run_run(
             }
         }
     }
+}
+
+/// Whether a `mur run` is a formation member nothing will wind down when its formation ends: it
+/// carries a formation id, was handed no lifeline, and is no delegated child — a delegated child
+/// carries its parent's formation id without a lifeline, and its parent session contains it.
+fn started_by_hand_in_a_formation(
+    has_formation_id: bool,
+    has_lifeline: bool,
+    spawn_grant_stdin: bool,
+) -> bool {
+    has_formation_id && !has_lifeline && !spawn_grant_stdin
 }
 
 /// The `status:` line `mur run` prints for a launch that returned `error`.
@@ -1263,6 +1314,17 @@ fn write_input_to_workdir(value: &str, dst: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// `W-RUN-007` is for a formation member nothing contains: a formation id, no lifeline, and
+    /// no spawn grant on stdin.
+    #[test]
+    fn only_a_hand_started_formation_member_is_warned() {
+        assert!(started_by_hand_in_a_formation(true, false, false));
+        assert!(!started_by_hand_in_a_formation(true, true, false));
+        assert!(!started_by_hand_in_a_formation(true, false, true));
+        assert!(!started_by_hand_in_a_formation(false, false, false));
+        assert!(!started_by_hand_in_a_formation(false, true, true));
+    }
 
     #[test]
     fn write_input_file_path_copies_contents() {

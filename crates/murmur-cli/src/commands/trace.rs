@@ -423,6 +423,13 @@ struct TaskRejectedEvent {
     cause: String,
 }
 
+/// A formation member's lifeline closed: its formation ended, and that began this session's
+/// wind-down.
+#[derive(Debug, Deserialize)]
+struct FormationEndedEvent {
+    formation_id: String,
+}
+
 /// A task attempt failed, and why.
 #[derive(Debug, Deserialize)]
 struct TaskFailedEvent {
@@ -782,6 +789,7 @@ enum TraceEvent {
     TaskCanceled(TaskCanceledEvent),
     TaskRejected(TaskRejectedEvent),
     TaskFailed(TaskFailedEvent),
+    FormationEnded(FormationEndedEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
     ToolInputRefused(ToolInputRefusedEvent),
@@ -1065,6 +1073,8 @@ struct TraceMetrics {
     cancels: Vec<CancelRecord>,
     /// Every `task_rejected` record, in file order — one per queued task the session refused.
     rejections: Vec<TaskRejectedEvent>,
+    /// `formation_ended.formation_id`, when the session wound down because its formation ended.
+    formation_ended: Option<String>,
     /// Every `task_failed` record, in file order — one per failing attempt.
     failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
@@ -1194,6 +1204,11 @@ fn rejected_show_row(r: &TaskRejectedEvent) -> String {
         r.cause,
         r.source.as_deref().unwrap_or("unknown")
     )
+}
+
+/// The `formation_ended` record's row under `mur trace show`'s `Formation ended` section.
+fn formation_ended_show_row(formation_id: &str) -> String {
+    format!("formation_ended  {formation_id}  the formation ended; this session wound down")
 }
 
 /// The Session block's line naming every runtime-origin artifact and the session that pulled
@@ -1598,6 +1613,7 @@ fn compute_metrics(
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut cancels: Vec<CancelRecord> = Vec::new();
     let mut rejections: Vec<TaskRejectedEvent> = Vec::new();
+    let mut formation_ended: Option<String> = None;
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
@@ -1764,6 +1780,7 @@ fn compute_metrics(
                 });
             }
             TraceEvent::TaskRejected(e) => rejections.push(e),
+            TraceEvent::FormationEnded(e) => formation_ended = Some(e.formation_id),
             TraceEvent::TaskFailed(e) => failures.push(e),
             TraceEvent::TaskReopened(e) => {
                 reopens.push(ReopenRecord {
@@ -2036,6 +2053,7 @@ fn compute_metrics(
             tool_refreshes,
             cancels,
             rejections,
+            formation_ended,
             failures,
             reopens,
             context_seeds,
@@ -2575,6 +2593,12 @@ fn print_show(m: &TraceMetrics) {
             fmt_thousands(d.tokens),
             d.reason
         );
+    }
+
+    if let Some(formation) = &m.formation_ended {
+        println!();
+        println!("── Formation ended ──────────────────────────────");
+        println!("{}", formation_ended_show_row(formation));
     }
 
     if !m.cancels.is_empty() {
@@ -3501,6 +3525,7 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.cause,
             fmt_id_short(&e.task_id, 12)
         ),
+        TraceEvent::FormationEnded(e) => format!("{}{}", kind("formation_ended"), e.formation_id),
         TraceEvent::TaskFailed(e) => {
             let reason: String = e.reason.chars().take(120).collect();
             format!("{}{}  {reason}", kind("task_failed"), e.cause)
@@ -4675,6 +4700,25 @@ mod tests {
         assert_eq!(
             rejected_show_row(&e),
             "task_rejected  tsk_1  session_stopped  source unknown"
+        );
+    }
+
+    /// A `formation_ended` record's `steps` row and `show` row both name the formation.
+    #[test]
+    fn formation_ended_renders_a_steps_row_and_a_show_row() {
+        let line = r#"{"event_type":"formation_ended","event_id":"evt_8","parent_id":"evt_1","session_id":"s","timestamp":8,"formation_id":"frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b"}"#;
+        assert_eq!(
+            row(line),
+            "formation_ended frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b"
+        );
+        let TraceEvent::FormationEnded(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+        else {
+            panic!("a formation_ended line parses as FormationEnded");
+        };
+        assert_eq!(
+            formation_ended_show_row(&e.formation_id),
+            "formation_ended  frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b  the formation ended; this \
+             session wound down"
         );
     }
 

@@ -34,3 +34,9 @@ name; the runtime attaches the token, so no model ever sees it. Every member's d
 token issued for that door, answers any other caller `401` or `403`, and the whole set of
 credentials ends with the formation. See
 [How reachability is enforced](../reference/roster.md#enforcement).
+
+A formation's members end with it, however it ends. Each member holds one end of a lifeline whose
+other end only the launcher holds; when the launcher ends the formation, or dies — even by
+`SIGKILL` — every member's lifeline closes. A member whose lifeline closes records
+`formation_ended` in its trace, cancels the work it had in flight, since nothing remains to receive
+the result, and ends its session in order. See [How a formation ends](../reference/roster.md#launch-stop).

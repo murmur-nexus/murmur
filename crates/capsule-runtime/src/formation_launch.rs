@@ -5,9 +5,13 @@
 //! **The launcher supervises; it runs no session.** Each member, the entry member included, is a
 //! `mur run --capsule <capsule> --capsule-version <version>` process this module starts and owns.
 //! The launcher waits on the entry member's process, so the peers are stopped however the entry
-//! member ends — its task finishing, its own `SIGTERM` handler's `exit(143)`, or a `SIGKILL` of its
-//! process. What no code here can cover is the launcher's own `SIGKILL`, or the kernel's OOM kill
-//! of it.
+//! member ends — its task finishing, its own `exit(143)`, or a `SIGKILL` of its process.
+//!
+//! **Every member holds a lifeline.** Each member is handed the read end of a pipe of its own
+//! ([`crate::lifeline`]), whose write end only the launcher holds and never writes to. A member
+//! that reads EOF winds down as a first `SIGTERM` would wind it down. The launcher ends a
+//! formation by closing lifelines; when the launcher itself dies — `SIGKILL` and the OOM killer
+//! included — the kernel closes them, so no member outlives its formation.
 //!
 //! **Ready means the door answers as the session that reported it.** A peer is ready when the door
 //! at the URL its readiness line reported serves an agent card naming the session id that line
@@ -35,8 +39,11 @@
 //!
 //! * One owner holds every started member, and every return path stops and reaps them. Its `Drop`
 //!   does the same, so an early return or an unwinding panic leaves nothing running.
-//! * Stopping a member is `SIGTERM`, up to [`MEMBER_STOP_GRACE`] for it to end in order, `SIGKILL`
-//!   to its process group, and a reap. Members are stopped concurrently.
+//! * Stopping the members is closing every lifeline, up to [`MEMBER_STOP_GRACE`] for each to end
+//!   in order, `SIGKILL` to the process group of any still running, and a reap. The launcher sends
+//!   no member `SIGTERM`. Members are waited on concurrently.
+//! * Every lifeline is created before the first member is spawned, and the launcher spawns
+//!   nothing but members, so no process but the launcher ever holds a write end.
 //! * Peers lead process groups of their own, so a terminal's `^C` reaches only the launcher and
 //!   the entry member, and the launcher stops the peers in order. The entry member stays in the
 //!   launcher's group and behaves at a terminal as a hand-run `mur run` does.
@@ -44,7 +51,8 @@
 //!   `SIGKILL`s every registered member's process group before the abort. It reads a lock-free
 //!   registry of member pids, never a mutex a panicking thread might hold.
 //! * [`catch_launcher_signals`] turns `SIGINT`, `SIGTERM` and `SIGHUP` into a flag every wait here
-//!   polls, so a signalled launcher stops its members before it exits.
+//!   polls, so a signalled launcher stops its members — the entry member through its lifeline,
+//!   like every other — before it exits.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -69,7 +77,8 @@ use crate::roster::{AdmittedRoster, RosterEdge};
 /// component is the slowest step.
 pub const MEMBER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// How long a member has, after `SIGTERM`, to end in order before its process group is killed.
+/// How long a member has, after its lifeline is closed, to end in order before its process group
+/// is killed.
 ///
 /// Longer than the runtime's own teardown deadline, so a member whose session is ending in order
 /// finishes before it is killed and its trace stays readable.
@@ -116,7 +125,8 @@ pub struct FormationLaunchOptions {
     /// Each member's deadline to become ready, from its spawn. [`MEMBER_READY_TIMEOUT`] in
     /// production.
     pub ready_timeout: Duration,
-    /// How long a stopped member has after `SIGTERM`. [`MEMBER_STOP_GRACE`] in production.
+    /// How long a stopped member has after its lifeline is closed. [`MEMBER_STOP_GRACE`] in
+    /// production.
     pub stop_grace: Duration,
 }
 
@@ -429,8 +439,7 @@ pub fn signal_name(signal: i32) -> String {
 pub enum FormationEnding {
     /// The entry member's process ended on its own, or by a signal the launcher did not send.
     EntryExited(ExitStatus),
-    /// The launcher caught this signal, forwarded `SIGTERM` to the entry member, and stopped the
-    /// formation.
+    /// The launcher caught this signal and stopped the formation, the entry member included.
     Signalled(i32),
 }
 
@@ -630,9 +639,10 @@ struct MemberProcess {
     pid: u32,
     child: Child,
     own_group: bool,
-    /// `SIGTERM` has already been sent, so stopping does not send a second: the runtime reads a
-    /// second `SIGTERM` as "exit now" and would cut its own teardown short.
-    terminated: bool,
+    /// The launcher's side of the member's lifeline: the write end, open until the member is
+    /// stopped.
+    #[cfg(unix)]
+    lifeline: Option<crate::lifeline::MemberLifeline>,
     /// The exit status, once reaped. A reaped pid may already belong to another process, so
     /// nothing signals or probes it after this is set.
     status: Option<ExitStatus>,
@@ -650,6 +660,7 @@ impl MemberProcess {
         own_group: bool,
         grace: Duration,
         channel: std::io::PipeWriter,
+        #[cfg(unix)] lifeline: Option<crate::lifeline::MemberLifeline>,
     ) -> Self {
         let pid = child.id();
         Self {
@@ -657,7 +668,8 @@ impl MemberProcess {
             pid,
             child,
             own_group,
-            terminated: false,
+            #[cfg(unix)]
+            lifeline,
             status: None,
             slot: RegistrySlot::register(pid, own_group),
             grace,
@@ -707,22 +719,34 @@ impl MemberProcess {
         self.channel = None;
     }
 
-    fn terminate(&mut self) {
-        if self.status.is_none() && !self.terminated {
-            signal_pid(i64::from(self.pid), libc::SIGTERM);
-            self.terminated = true;
+    /// Close the member's lifeline: it reads EOF and winds down. Idempotent.
+    fn close_lifeline(&mut self) {
+        #[cfg(unix)]
+        if let Some(lifeline) = &mut self.lifeline {
+            lifeline.close();
         }
     }
 
-    /// `SIGTERM`, up to the grace for it to end, `SIGKILL` to its group, and a reap. Idempotent.
-    /// `Some` when the process was still running when the stop began.
+    /// Whether the process is running and not yet reaped.
+    fn is_running(&self) -> bool {
+        self.status.is_none() && !self.has_exited()
+    }
+
+    /// Close its lifeline, up to the grace for it to end, `SIGKILL` to its group, and a reap.
+    /// Idempotent. `Some` when the process was still running when the stop began.
     fn stop(&mut self) -> Option<StoppedMember> {
+        let was_running = self.is_running();
+        self.stop_from(was_running)
+    }
+
+    /// [`Self::stop`], with whether the process was running when the stop began read by the
+    /// caller: a member can end on its lifeline's EOF the moment that lifeline closes.
+    fn stop_from(&mut self, was_running: bool) -> Option<StoppedMember> {
         if self.status.is_some() {
             return None;
         }
-        let was_running = !self.has_exited();
+        self.close_lifeline();
         if was_running {
-            self.terminate();
             let deadline = Instant::now() + self.grace;
             while !self.has_exited() && Instant::now() < deadline {
                 std::thread::sleep(POLL_INTERVAL);
@@ -746,13 +770,21 @@ impl Drop for MemberProcess {
 struct MemberSet(Vec<MemberProcess>);
 
 impl MemberSet {
-    /// Stop every member concurrently and reap them all. Idempotent.
+    /// Close every member's lifeline, then wait on, kill if need be, and reap every member
+    /// concurrently. Idempotent.
     fn stop_all(&mut self) -> Vec<StoppedMember> {
+        // Read before any lifeline closes: a member that ends on its EOF while another lifeline is
+        // still being closed was running when the stop began, and is reported as stopped.
+        let running: Vec<bool> = self.0.iter().map(MemberProcess::is_running).collect();
+        for member in &mut self.0 {
+            member.close_lifeline();
+        }
         std::thread::scope(|scope| {
             let stopping: Vec<_> = self
                 .0
                 .iter_mut()
-                .map(|member| scope.spawn(move || member.stop()))
+                .zip(running)
+                .map(|(member, was_running)| scope.spawn(move || member.stop_from(was_running)))
                 .collect();
             stopping
                 .into_iter()
@@ -894,6 +926,7 @@ fn start_peer(
     first_line: &str,
     options: &FormationLaunchOptions,
     abort: &AtomicBool,
+    #[cfg(unix)] mut lifeline: crate::lifeline::MemberLifeline,
 ) -> (Option<MemberProcess>, PeerOutcome) {
     let args = peer_args(member, options);
     let prefix = format!("[{}] ", member.name);
@@ -917,6 +950,8 @@ fn start_peer(
         inherit_output: false,
         own_process_group: true,
         inherit_fd: Some(channel.fd()),
+        #[cfg(unix)]
+        lifeline: Some(&lifeline),
     });
     // The member holds its own copy of the read end now, or never will.
     let Channel { writer, reader } = channel;
@@ -936,8 +971,18 @@ fn start_peer(
             )
         }
     };
+    #[cfg(unix)]
+    lifeline.spawned();
     let stdout = child.stdout.take();
-    let mut process = MemberProcess::new(&member.name, child, true, options.stop_grace, writer);
+    let mut process = MemberProcess::new(
+        &member.name,
+        child,
+        true,
+        options.stop_grace,
+        writer,
+        #[cfg(unix)]
+        Some(lifeline),
+    );
     let Some(stdout) = stdout else {
         return (
             Some(process),
@@ -1139,6 +1184,33 @@ pub(crate) fn launch_plan(
             })
         }
     };
+    // One per peer and one for the entry member, all before the first spawn: where the
+    // close-on-exec flag is set after `pipe` returns, a member forked in between would inherit
+    // another member's write end and keep that member's formation alive.
+    #[cfg(unix)]
+    let (peer_lifelines, entry_lifeline) = match member_lifelines(plan.peers.len() + 1) {
+        Ok(mut lifelines) => {
+            let entry = lifelines.pop();
+            (lifelines, entry)
+        }
+        Err(error) => {
+            return Err(MemberLaunchFailure {
+                failed: plan
+                    .peers
+                    .iter()
+                    .chain([&plan.entry])
+                    .map(|member| {
+                        failure(
+                            member,
+                            not_started(&format!("its lifeline could not be created: {error}")),
+                        )
+                    })
+                    .collect(),
+                stopped: Vec::new(),
+                interrupted_by: None,
+            })
+        }
+    };
     let first_lines: Vec<String> = plan
         .peers
         .iter()
@@ -1154,15 +1226,27 @@ pub(crate) fn launch_plan(
     }
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
+        #[cfg(unix)]
+        let mut peer_lifelines = peer_lifelines.into_iter();
         for (index, member) in plan.peers.iter().enumerate() {
             let tx = tx.clone();
             let (binary, options, abort) = (&binary, &options, &abort);
             let first_line = first_lines[index].as_str();
+            #[cfg(unix)]
+            let lifeline = peer_lifelines
+                .next()
+                .expect("member_lifelines made one lifeline per peer");
             scope.spawn(move || {
-                let _ = tx.send((
-                    index,
-                    start_peer(binary, member, first_line, options, abort),
-                ));
+                let started = start_peer(
+                    binary,
+                    member,
+                    first_line,
+                    options,
+                    abort,
+                    #[cfg(unix)]
+                    lifeline,
+                );
+                let _ = tx.send((index, started));
             });
         }
         drop(tx);
@@ -1226,6 +1310,8 @@ pub(crate) fn launch_plan(
         peers,
         members,
         entry_index: None,
+        #[cfg(unix)]
+        entry_lifeline,
         binary,
         options,
         authority,
@@ -1241,6 +1327,14 @@ fn addresses_of(ready: &[ReadyPeer], callees: &[String]) -> Vec<FormationPeer> {
             name: peer.name.clone(),
             url: peer.url.clone(),
         })
+        .collect()
+}
+
+/// `count` new lifelines, or the first error creating one.
+#[cfg(unix)]
+fn member_lifelines(count: usize) -> std::io::Result<Vec<crate::lifeline::MemberLifeline>> {
+    (0..count)
+        .map(|_| crate::lifeline::MemberLifeline::new())
         .collect()
 }
 
@@ -1274,6 +1368,10 @@ pub struct RunningFormation {
     members: MemberSet,
     /// The entry member's position in `members`, once started.
     entry_index: Option<usize>,
+    /// The entry member's lifeline, created with the peers' and held here until the entry
+    /// member is started with it.
+    #[cfg(unix)]
+    entry_lifeline: Option<crate::lifeline::MemberLifeline>,
     binary: PathBuf,
     options: FormationLaunchOptions,
     authority: FormationAuthority,
@@ -1361,17 +1459,26 @@ impl RunningFormation {
             inherit_output: true,
             own_process_group: false,
             inherit_fd: Some(channel.fd()),
+            #[cfg(unix)]
+            lifeline: self.entry_lifeline.as_ref(),
         });
         let Channel { writer, reader } = channel;
         drop(reader);
         match started {
             Ok(started) => {
+                #[cfg(unix)]
+                let lifeline = self.entry_lifeline.take().map(|mut lifeline| {
+                    lifeline.spawned();
+                    lifeline
+                });
                 let process = MemberProcess::new(
                     &self.entry.name,
                     started.child,
                     false,
                     self.options.stop_grace,
                     writer,
+                    #[cfg(unix)]
+                    lifeline,
                 );
                 let pid = process.pid;
                 self.members.0.push(process);
@@ -1392,8 +1499,8 @@ impl RunningFormation {
         }
     }
 
-    /// Wait for the entry member's process to end — or for the launcher to be signalled, in which
-    /// case the entry member is sent `SIGTERM` — then stop and reap every member.
+    /// Wait for the entry member's process to end, or for the launcher to be signalled, then stop
+    /// and reap every member: every lifeline closed, the entry member's included.
     pub fn wait(mut self) -> FormationExit {
         let ending = match self.entry_index {
             None => caught_signal()
@@ -1404,7 +1511,6 @@ impl RunningFormation {
                     break FormationEnding::EntryExited(status);
                 }
                 if let Some(signal) = caught_signal() {
-                    self.members.0[index].terminate();
                     break FormationEnding::Signalled(signal);
                 }
                 std::thread::sleep(POLL_INTERVAL);
@@ -1514,19 +1620,24 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// A stand-in `mur` that prints `line` (when given) and then sleeps, whatever it is asked to run.
+    /// A stand-in `mur` that prints `line` (when given), records any `SIGTERM` it is sent in
+    /// `dir/sigterm`, and runs until its lifeline reads EOF, whatever it is asked to run.
     fn stand_in(dir: &Path, line: Option<&str>) -> PathBuf {
         let script = dir.join("mur");
-        let body = match line {
+        let print = match line {
             Some(line) => {
                 std::fs::write(dir.join("line"), format!("{line}\n")).unwrap();
-                format!(
-                    "#!/bin/sh\ncat '{}'\nexec sleep 600\n",
-                    dir.join("line").display()
-                )
+                format!("cat '{}'\n", dir.join("line").display())
             }
-            None => "#!/bin/sh\nexec sleep 600\n".to_string(),
+            None => String::new(),
         };
+        // Through `/dev/fd`: a POSIX shell's `<&` takes a single-digit descriptor only, and a
+        // lifeline is numbered wherever `pipe` put it.
+        let body = format!(
+            "#!/bin/sh\ntrap 'echo TERM >> \"{dir}/sigterm\"' TERM\n{print}\
+             cat \"/dev/fd/$MURMUR_FORMATION_LIFELINE\" >/dev/null\n",
+            dir = dir.display()
+        );
         std::fs::write(&script, body).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1754,11 +1865,56 @@ mod tests {
         assert!(formation.callees_of("coder").is_empty());
         let pid = peer.pid;
         assert!(crate::running::pid_is_alive(pid));
+        let dropped = Instant::now();
         drop(formation);
         assert!(
             !crate::running::pid_is_alive(pid),
             "dropping the owner stops the peer"
         );
+        assert!(
+            dropped.elapsed() < Duration::from_secs(2),
+            "the peer ended on its lifeline's EOF, inside the grace: {:?}",
+            dropped.elapsed()
+        );
+        assert!(
+            !dir.path().join("sigterm").exists(),
+            "the launcher sent the peer SIGTERM"
+        );
+    }
+
+    /// A member that does not end on EOF is killed with its process group once the grace has run.
+    #[test]
+    fn a_member_deaf_to_its_lifeline_is_killed_after_the_grace() {
+        let _guard = binary_guard();
+        let port = door("ses_standin", Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = options(Duration::from_secs(20));
+        options.stop_grace = Duration::from_millis(600);
+        let line = format!(
+            r#"{{"formation_id":"{}","session_id":"ses_standin","url":"localhost:{port}"}}"#,
+            options.formation_id
+        );
+        let script = dir.path().join("mur");
+        std::fs::write(dir.path().join("line"), format!("{line}\n")).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat '{}'\nexec sleep 600\n",
+                dir.path().join("line").display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var(child_launch::MUR_BINARY_ENV, &script);
+        let result = launch_plan(plan_of("coder"), options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        let formation = result.expect("the door answers");
+        let pid = formation.peers()[0].pid;
+        let dropped = Instant::now();
+        drop(formation);
+        assert!(dropped.elapsed() >= Duration::from_millis(600));
+        assert!(!crate::running::pid_is_alive(pid));
     }
 
     /// Every member reads exactly its own bundle on the descriptor `MURMUR_FORMATION_CHANNEL`

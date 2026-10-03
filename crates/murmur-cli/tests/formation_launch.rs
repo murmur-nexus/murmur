@@ -4,6 +4,10 @@
 //! Every member carries the test's unique project path on its command line through `--workdir`,
 //! which is how "no member process remains" is checked: no process on the host has that path on
 //! its `/proc/<pid>/cmdline`, and every pid the launcher reported is dead.
+//!
+//! Every member holds a lifeline whose write end only the launcher holds, so however the
+//! launcher ends — its own `SIGKILL` included — every member reads EOF, writes `formation_ended`
+//! and winds down.
 
 mod common;
 
@@ -16,7 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::door_capsule::{driver_home, message, rpc, DRIVER_NAME, DRIVER_VERSION};
-use common::{publish_to_store, tool_result_text, tool_use_response, ScriptedServer};
+use common::{
+    assert_wound_down_by_formation as assert_wound_down, event_kinds, publish_to_store,
+    read_whole_trace as read_trace, tool_result_text, tool_use_response, ScriptedServer,
+};
 use murmur_artifact::LocalRegistry;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -298,6 +305,12 @@ impl Project {
 
     /// `mur run --roster --json --task probe <extra>`, started and read as it runs.
     fn launch(&self, extra: &[&str], env: &[(&str, &str)]) -> Launcher {
+        self.launch_with(extra, env, false)
+    }
+
+    /// [`Project::launch`], with the launcher leading a process group of its own when
+    /// `own_group`, so the group can be killed without killing this test.
+    fn launch_with(&self, extra: &[&str], env: &[(&str, &str)], own_group: bool) -> Launcher {
         let mut args = vec!["run", "--roster", "--json", "--task", "probe"];
         args.extend_from_slice(extra);
         let mut command = self.command(&args);
@@ -305,6 +318,10 @@ impl Project {
             .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if own_group {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let started = Instant::now();
         let mut child = command.spawn().unwrap();
         let (line_tx, lines) = mpsc::channel::<(Instant, String)>();
@@ -365,6 +382,24 @@ impl Project {
                     .is_some_and(|start| start["capsule_name"] == capsule)
             })
             .collect()
+    }
+
+    /// The one session `capsule` ran in this project.
+    fn session_of(&self, capsule: &str) -> PathBuf {
+        let sessions = self.sessions_of(capsule);
+        assert_eq!(sessions.len(), 1, "{capsule}: {sessions:?}");
+        sessions.into_iter().next().unwrap()
+    }
+
+    /// Every record of `capsule`'s `trace.jsonl`, each line of which parses, ending in a newline.
+    fn trace_of(&self, capsule: &str) -> Vec<Value> {
+        read_trace(&self.session_of(capsule).join("trace.jsonl"))
+    }
+
+    /// `capsule`'s `logs/bootstrap.log`, where a diagnostic lands once its stderr is a broken pipe.
+    fn bootstrap_log_of(&self, capsule: &str) -> String {
+        std::fs::read_to_string(self.session_of(capsule).join("logs").join("bootstrap.log"))
+            .unwrap_or_default()
     }
 
     /// The operator token the running record of `session_id` holds.
@@ -601,6 +636,30 @@ fn assert_traces_intact(project: &Project, entry_session: &str) {
 
 const FULL_REACH: &str = "reachability:\n  - from: planner\n    to: [coder, reviewer]\n";
 
+/// What a member logs when its lifeline reads EOF.
+const LIFELINE_CLOSED: &str = "[capsule-runtime] formation lifeline closed";
+
+/// The entry member's in-flight task ended cancelled.
+fn assert_task_canceled(events: &[Value]) {
+    let kinds = event_kinds(events);
+    assert!(kinds.contains(&"task_canceled"), "{kinds:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event_type"] == "task_end" && event["exit_status"] == "canceled"),
+        "{kinds:?}"
+    );
+}
+
+#[allow(unsafe_code)]
+fn signal_group(pgid: u32, signal: i32) {
+    // SAFETY: `kill` takes two integers and dereferences nothing; `pgid` is the group of a child
+    // this test started in a group of its own.
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), signal);
+    }
+}
+
 // ── Scenarios ─────────────────────────────────────────────────────────────────
 
 /// A chain: `planner` may call `coder`, and `coder` may call `reviewer`.
@@ -782,6 +841,21 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
         Duration::from_secs(30),
     );
 
+    // The entry member ended on its own; its exit is what closed the peers' lifelines.
+    let id = formation["formation_id"].as_str().unwrap();
+    for peer in ["coder", "reviewer"] {
+        assert_wound_down(&project.trace_of(peer), id);
+    }
+    let planner_kinds = event_kinds(&project.trace_of("planner")).join(" ");
+    assert!(
+        !planner_kinds.contains("formation_ended"),
+        "{planner_kinds}"
+    );
+    assert!(
+        !stderr.contains("SIGTERM received"),
+        "the launcher signalled a member: {stderr}"
+    );
+
     // Once the launcher has exited, no reported door answers.
     for door in &doors {
         assert!(
@@ -956,6 +1030,20 @@ fn a_peer_that_cannot_start_refuses_the_launch_and_leaves_nothing_running() {
         );
         project.assert_no_member_remains(&pids, Duration::from_secs(30));
         assert!(!stderr.contains("mdt1."), "{stderr}");
+
+        // Every peer that got as far as a session heard its lifeline close, whether or not it had
+        // become ready by the time the launch was refused. Peers start alongside `broken`, so the
+        // refusal can land before either has staged one.
+        let started: Vec<PathBuf> = ["coder", "reviewer"]
+            .iter()
+            .flat_map(|peer| project.sessions_of(peer))
+            .collect();
+        for session in started {
+            let events = read_trace(&session.join("trace.jsonl"));
+            let id = events[0]["formation_id"].as_str().unwrap().to_string();
+            assert_wound_down(&events, &id);
+        }
+        assert!(!stderr.contains("SIGTERM received"), "{stderr}");
     }
 }
 
@@ -992,7 +1080,272 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
             Duration::from_secs(30),
         );
         assert_traces_intact(&project, planner["session_id"].as_str().unwrap());
+
+        let id = formation["formation_id"].as_str().unwrap();
+        let stderr = launcher.stderr();
+        for peer in ["coder", "reviewer"] {
+            assert_wound_down(&project.trace_of(peer), id);
+        }
+        if kill_launcher {
+            // The entry member's lifeline is closed rather than a `SIGTERM` forwarded to it.
+            let planner_trace = project.trace_of("planner");
+            assert_wound_down(&planner_trace, id);
+            assert_task_canceled(&planner_trace);
+        } else {
+            for peer in ["coder", "reviewer"] {
+                assert!(
+                    stderr.contains(&format!("[{peer}] {LIFELINE_CLOSED}")),
+                    "{stderr}"
+                );
+            }
+        }
+        assert!(!stderr.contains("SIGTERM received"), "{stderr}");
     }
+}
+
+/// The kill path: `SIGKILL` of the launcher leaves nothing to stop the members, and every member
+/// — the entry member mid-task included — reads EOF on its lifeline and winds down in order.
+#[test]
+fn a_killed_launcher_winds_down_every_member() {
+    let _lock = launch_lock();
+    let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+
+    let killed = Instant::now();
+    launcher.signal(libc::SIGKILL);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(launcher.wait().signal(), Some(libc::SIGKILL));
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    eprintln!(
+        "[measure] launcher SIGKILL to the last member's exit: {} ms",
+        killed.elapsed().as_millis()
+    );
+
+    let id = formation["formation_id"].as_str().unwrap();
+    for capsule in ["coder", "reviewer", "planner"] {
+        assert_wound_down(&project.trace_of(capsule), id);
+    }
+    assert_task_canceled(&project.trace_of("planner"));
+
+    // A peer's stderr was the dead launcher's pipe, so its diagnostics fell back to its
+    // bootstrap log. The entry member inherited the launcher's stderr, which this test still reads.
+    for peer in ["coder", "reviewer"] {
+        let log = project.bootstrap_log_of(peer);
+        assert!(log.contains(LIFELINE_CLOSED), "{peer}: {log}");
+        assert!(!log.contains("SIGTERM received"), "{peer}: {log}");
+    }
+    let planner_said = format!(
+        "{}{}",
+        project.bootstrap_log_of("planner"),
+        launcher.stderr()
+    );
+    assert!(planner_said.contains(LIFELINE_CLOSED), "{planner_said}");
+    assert!(!planner_said.contains("SIGTERM received"), "{planner_said}");
+}
+
+/// `SIGKILL` of the launcher's whole process group takes the launcher and the entry member at once;
+/// both peers wind down on their lifelines.
+#[test]
+fn a_killed_launcher_group_winds_down_both_peers() {
+    let _lock = launch_lock();
+    let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+    let mut launcher = project.launch_with(&[], &[], true);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+
+    signal_group(launcher.child.id(), libc::SIGKILL);
+    launcher.wait();
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    let id = formation["formation_id"].as_str().unwrap();
+    for peer in ["coder", "reviewer"] {
+        assert_wound_down(&project.trace_of(peer), id);
+        let log = project.bootstrap_log_of(peer);
+        assert!(log.contains(LIFELINE_CLOSED), "{peer}: {log}");
+    }
+}
+
+/// One descriptor on `/proc/<pid>/fd`: its number, what it points at, and its open flags.
+#[cfg(target_os = "linux")]
+struct OpenFd {
+    fd: u32,
+    target: String,
+    flags: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl OpenFd {
+    /// The inode of the pipe this descriptor is an end of.
+    fn pipe_inode(&self) -> Option<u64> {
+        self.target
+            .strip_prefix("pipe:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .and_then(|inode| inode.parse().ok())
+    }
+
+    fn access_mode(&self) -> u32 {
+        self.flags & libc::O_ACCMODE as u32
+    }
+
+    fn close_on_exec(&self) -> bool {
+        self.flags & libc::O_CLOEXEC as u32 != 0
+    }
+}
+
+/// Every descriptor `pid` holds, read from `/proc/<pid>/fd` and `/proc/<pid>/fdinfo`.
+#[cfg(target_os = "linux")]
+fn open_fds(pid: u32) -> Vec<OpenFd> {
+    let mut fds = Vec::new();
+    let dir = format!("/proc/{pid}/fd");
+    for entry in std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("{dir}: {error}"))
+        .flatten()
+    {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Ok(info) = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")) else {
+            continue;
+        };
+        let flags = info
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok())
+            .unwrap();
+        fds.push(OpenFd {
+            fd,
+            target: target.to_string_lossy().into_owned(),
+            flags,
+        });
+    }
+    fds
+}
+
+/// The value of `name` in `pid`'s initial environment.
+#[cfg(target_os = "linux")]
+fn environ_value(pid: u32, name: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    raw.split(|byte| *byte == 0).find_map(|pair| {
+        let pair = String::from_utf8_lossy(pair);
+        pair.strip_prefix(&format!("{name}=")).map(str::to_string)
+    })
+}
+
+/// While a formation is up, the launcher holds exactly one write end of each member's lifeline and
+/// no read end; each member holds exactly its own read end, close-on-exec, at the number its
+/// environment names; and no member or descendant holds any other end.
+#[cfg(target_os = "linux")]
+#[test]
+fn lifeline_ends_are_held_once() {
+    let _lock = launch_lock();
+    // `mur` makes itself non-dumpable, which hands `/proc/<pid>/fd` and `environ` to root.
+    let shim_dir = TempDir::new().unwrap();
+    let shim = build_dumpable_shim(shim_dir.path());
+    let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+    let mut launcher = project.launch(&[], &[("LD_PRELOAD", shim.to_str().unwrap())]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+
+    let mut members: Vec<(String, u32)> = formation["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|peer| {
+            (
+                peer["name"].as_str().unwrap().to_string(),
+                peer["pid"].as_u64().unwrap() as u32,
+            )
+        })
+        .collect();
+    members.push((
+        "planner".to_string(),
+        planner["pid"].as_u64().unwrap() as u32,
+    ));
+
+    // Each member's own read end.
+    let mut lifelines: std::collections::HashMap<u64, (String, u32)> = Default::default();
+    for (name, pid) in &members {
+        let named: u32 = environ_value(*pid, capsule_runtime::FORMATION_LIFELINE_ENV)
+            .unwrap_or_else(|| panic!("{name} was handed no lifeline"))
+            .parse()
+            .unwrap();
+        let fds = open_fds(*pid);
+        let own = fds
+            .iter()
+            .find(|fd| fd.fd == named)
+            .unwrap_or_else(|| panic!("{name} does not hold descriptor {named}"));
+        let inode = own
+            .pipe_inode()
+            .unwrap_or_else(|| panic!("{name}'s lifeline is {}", own.target));
+        assert_eq!(own.access_mode(), libc::O_RDONLY as u32, "{name}");
+        assert!(
+            own.close_on_exec(),
+            "{name}'s read end is inherited by what it spawns"
+        );
+        assert_eq!(
+            fds.iter()
+                .filter(|fd| fd.pipe_inode() == Some(inode))
+                .count(),
+            1,
+            "{name} holds its lifeline twice"
+        );
+        assert!(
+            lifelines.insert(inode, (name.clone(), named)).is_none(),
+            "two members share a lifeline"
+        );
+    }
+
+    // The launcher: one write end per lifeline, and no read end.
+    let launcher_fds = open_fds(launcher.child.id());
+    for (inode, (name, _)) in &lifelines {
+        let held: Vec<&OpenFd> = launcher_fds
+            .iter()
+            .filter(|fd| fd.pipe_inode() == Some(*inode))
+            .collect();
+        assert_eq!(held.len(), 1, "the launcher's ends of {name}'s lifeline");
+        assert_eq!(held[0].access_mode(), libc::O_WRONLY as u32, "{name}");
+    }
+
+    // No member, nor anything a member started, holds any other end of any lifeline.
+    for (name, pid) in &members {
+        for process in process_tree(*pid) {
+            for fd in open_fds(process) {
+                let Some((owner, number)) = fd.pipe_inode().and_then(|inode| lifelines.get(&inode))
+                else {
+                    continue;
+                };
+                assert!(
+                    process == *pid && owner == name && fd.fd == *number,
+                    "process {process} under {name} holds descriptor {} of {owner}'s lifeline",
+                    fd.fd
+                );
+            }
+        }
+    }
+
+    project.release.send(()).unwrap();
+    assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
 }
 
 /// `MURMUR_FORMATION_PEERS` in `mur run`'s own environment, with or without a formation id, is

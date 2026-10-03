@@ -36,7 +36,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -598,6 +598,23 @@ Written when the session stops taking work, before `session_end` and whatever
 cancelled while still queued keeps its [`task_canceled`](#task-canceled) line and has no
 `task_rejected`.
 
+**`formation_ended`**{ #formation-ended } — written once by a formation member whose
+[lifeline](roster.md#launch-stop) closed: its formation ended, and the session is winding down
+because of it
+
+| Field | Type | Notes |
+|---|---|---|
+| `formation_id` | string | The formation that ended, as `session_start.formation_id` names it |
+
+Written at the moment the member sees its lifeline close, before every `task_canceled`, `task_end`,
+`task_rejected` and `session_end` its wind-down writes. A member already ending because of
+`SIGTERM` or [`mur stop`](cli.md#mur-stop) when its lifeline closes writes none, and neither does a
+session in no formation.
+
+```json
+{"event_type":"formation_ended","event_id":"evt_0192a5b3c4d97c1e9a3b5d0c4e8f2a61","parent_id":"evt_0192a5b3c4a17b2c8d4e6f0a1b3c5d7e","session_id":"ses_0192a5b3c4a07e6f8a9b0c1d2e3f4a5b","timestamp":1767225600123,"formation_id":"frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b"}
+```
+
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's
 terminal `task_end`
 
@@ -1019,6 +1036,9 @@ searches only the root it is given and does not follow `delegation_start` lines 
 counts a member's children found elsewhere, and the member's own `mur trace show` names each child's
 trace. [`mur ps`](cli.md#mur-ps-formations) reads the same lines to account for members it does not
 list.
+
+A member that wound down because its formation ended carries one
+[`formation_ended`](#formation-ended) line, ahead of its `session_end`.
 
 A session resumed with `mur run --resume` is a member only when its own launch names a formation;
 its `resumed_from` names the member it continues.
