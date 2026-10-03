@@ -16,6 +16,11 @@
 //! * A child that declares the `sealed` containment floor enters a mount namespace of its own,
 //!   because the containment machinery installs per process and the child *is* a process.
 //!
+//! **A child joins its parent's formation; it never starts one.** A parent session that belongs to
+//! a formation hands its id to every child as [`FORMATION_ID_ENV`], beside the spawner handle and
+//! independent of it, so a launch that names no lineage still carries it. A parent in no
+//! formation hands none.
+//!
 //! **The approval travels on the child's standard input.** Not on the argument vector and not in
 //! the environment: both are readable from `/proc/<pid>` by any process running as the same user,
 //! which is exactly what a sibling capsule's shell tool is.
@@ -31,6 +36,7 @@ use crate::delegation::{
     SPAWNER_ENV,
 };
 use crate::errors::RuntimeError;
+use crate::formation::{FormationId, FORMATION_ID_ENV};
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 
@@ -112,6 +118,10 @@ pub struct ChildLaunchRequest {
     /// posts a [`DelegationStatus::Terminated`] outcome naming the bound, which is the only thing
     /// that tells a parent about a child that never ends.
     pub completion_deadline: Option<Duration>,
+    /// The parent session's formation, which the child joins: injected as [`FORMATION_ID_ENV`]
+    /// when `Some`, whether or not [`Self::spawner`] is. Inherited from the parent and never
+    /// minted here; `None` — a parent in no formation — injects nothing.
+    pub formation_id: Option<FormationId>,
 }
 
 /// How a child's process ended, as the watcher sees it.
@@ -208,6 +218,9 @@ pub struct LaunchedChild {
     /// `tokens.operator` on its readiness line. The parent presents it on every call to the
     /// child's door. Never printed by `Debug`.
     pub door_token: Option<crate::door_auth::DoorToken>,
+    /// The formation the child reports it joined, read from `formation_id` on its readiness
+    /// line. `None` when the line carries no such key, or a value that is not a formation id.
+    pub formation_id: Option<FormationId>,
     process: Arc<Mutex<ChildProcess>>,
     /// The child's last [`CHILD_STDERR_TAIL_LINES`] lines, retained so a crash can say why.
     stderr_tail: Arc<StderrTail>,
@@ -225,6 +238,7 @@ impl std::fmt::Debug for LaunchedChild {
             .field("session_id", &self.session_id)
             .field("capsule_url", &self.capsule_url)
             .field("delegation_id", &self.delegation_id)
+            .field("formation_id", &self.formation_id)
             .field(
                 "door_token",
                 &self.door_token.as_ref().map(|_| "<redacted>"),
@@ -408,6 +422,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         env,
         delegation_id: handle.as_ref().map(|handle| handle.delegation_id.clone()),
         door_token: None,
+        formation_id: None,
         process: Arc::new(Mutex::new(ChildProcess {
             child: Some(child),
             deliberate: false,
@@ -442,6 +457,10 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
 
     launched.session_id = session_id.to_string();
     launched.door_token = readiness_door_token(&report);
+    launched.formation_id = report
+        .get("formation_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| FormationId::parse(id).ok());
     // A script capsule binds no port and reports an empty url; promoting that to `http://` would
     // manufacture an address nothing answers on.
     launched.capsule_url = if url.is_empty() {
@@ -633,9 +652,10 @@ fn watch_for_completion(
 ///
 /// `capabilities.env.allow` is the child's own, not the parent's: a sibling's declaration reaches
 /// nothing here, and a variable the parent holds but the child did not declare is simply absent.
-/// The runtime-owned names — `PATH`, `HOME`, `MURMUR_ROOST_URL`, and [`SPAWNER_ENV`] on a
-/// delegated launch — are applied last, so a child cannot displace the daemon URL it is required
-/// to register with, or the handle it reports its outcome to, by allowlisting the name.
+/// The runtime-owned names — `PATH`, `HOME`, `MURMUR_ROOST_URL`, [`SPAWNER_ENV`] on a delegated
+/// launch and [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last,
+/// so a child cannot displace the daemon URL it is required to register with, the handle it
+/// reports its outcome to, or the formation it joins, by allowlisting the name.
 fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
@@ -647,7 +667,9 @@ fn child_environment(
         }
     }
     env.retain(|(key, _)| {
-        !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL") && key != SPAWNER_ENV
+        !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL")
+            && key != SPAWNER_ENV
+            && key != FORMATION_ID_ENV
     });
 
     if let Ok(path) = std::env::var("PATH") {
@@ -662,6 +684,11 @@ fn child_environment(
     // and whatever the child declared.
     if let Some(handle) = handle {
         env.push((SPAWNER_ENV.to_string(), handle.to_env_value()));
+    }
+    // A parent in no formation hands none on, whatever this process's own environment carries.
+    if let Some(formation_id) = &request.formation_id {
+        let (name, value) = formation_id.env_pair();
+        env.push((name.to_string(), value));
     }
     env
 }
@@ -876,6 +903,7 @@ mod tests {
             roost_url: "http://127.0.0.1:7700".to_string(),
             spawner,
             completion_deadline: None,
+            formation_id: None,
         }
     }
 
@@ -972,6 +1000,41 @@ mod tests {
         std::env::remove_var(SPAWNER_ENV);
     }
 
+    /// A child's formation is the one the parent's request names, applied after the spawner
+    /// handle, whatever this process's own environment holds and whatever the child declared.
+    #[test]
+    fn the_formation_id_is_injected_last_and_cannot_be_displaced() {
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let decoy = FormationId::mint();
+        std::env::set_var(FORMATION_ID_ENV, decoy.as_str());
+        let injected = |env: &[(String, String)]| -> Vec<String> {
+            env.iter()
+                .filter(|(key, _)| key == FORMATION_ID_ENV)
+                .map(|(_, value)| value.clone())
+                .collect()
+        };
+
+        let outside = child_environment(&request(&[FORMATION_ID_ENV], None), None);
+        assert!(injected(&outside).is_empty(), "{outside:?}");
+
+        let other = FormationId::mint();
+        let handle = SpawnerHandle::for_delegation(&spawner(), "dlg_0001".to_string());
+        for (spawner, handle) in [(Some(spawner()), Some(&handle)), (None, None)] {
+            let mut member = request(&[FORMATION_ID_ENV], spawner);
+            member.formation_id = Some(other.clone());
+            let env = child_environment(&member, handle);
+            assert_eq!(injected(&env), vec![other.as_str().to_string()], "{env:?}");
+            assert_eq!(
+                env.last(),
+                Some(&(FORMATION_ID_ENV.to_string(), other.as_str().to_string())),
+                "the formation id is the last runtime-owned name: {env:?}"
+            );
+        }
+        std::env::remove_var(FORMATION_ID_ENV);
+    }
+
     /// A child's exit closes its stdout and its stderr together, so the reader that reports the
     /// ending can reach the tail before the drain has appended to it. The post-mortem read is the
     /// one that must not: an empty tail is a refusal that names no reason.
@@ -1040,6 +1103,7 @@ mod tests {
             argv: Vec::new(),
             env: Vec::new(),
             delegation_id: None,
+            formation_id: None,
             door_token: Some(crate::door_auth::DoorToken::new(
                 "mdt1.secretpayload.secretmac".to_string(),
             )),

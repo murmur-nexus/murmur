@@ -666,6 +666,10 @@ pub(crate) struct HookEnvVars<'a> {
     pub eval_config_json: Option<&'a str>,
     pub case_id: Option<&'a str>,
     pub dataset_id: Option<&'a str>,
+    /// The session's [`crate::formation::FormationId`], injected as
+    /// [`crate::formation::FORMATION_ID_ENV`]. Taken from the session and never from the process
+    /// environment, so two sessions staged in one process each hand their hooks their own.
+    pub formation_id: Option<&'a str>,
 }
 
 /// Dispatch `on-stage` for all blocking hooks with a matching binding.
@@ -2078,8 +2082,8 @@ fn build_wasi_ctx(
         let (name, value) = crate::runtime::gateway_env_pair(gateway);
         builder.env(name, value);
     }
-    if let Ok(formation_id) = std::env::var("MURMUR_FORMATION_ID") {
-        builder.env("MURMUR_FORMATION_ID", &formation_id);
+    if let Some(id) = env.formation_id {
+        builder.env(crate::formation::FORMATION_ID_ENV, id);
     }
     if let Some(config_json) = env.eval_config_json {
         builder.env("MURMUR_EVAL_CONFIG", config_json);
@@ -6678,6 +6682,36 @@ artifacts:
             r#"{"who":"hook"}"#,
             "the config must precede MURMUR_OTEL_ENDPOINT in the guest environment"
         );
+    }
+
+    /// A member session's hooks see its formation id as `MURMUR_FORMATION_ID`, from the session.
+    #[test]
+    fn a_member_sessions_hook_sees_its_formation_id() {
+        let id = crate::formation::FormationId::mint();
+        assert_eq!(
+            first_hook_env_entry(
+                HookCapabilityGrant::default(),
+                HookEnvVars {
+                    formation_id: Some(id.as_str()),
+                    ..HookEnvVars::default()
+                },
+            ),
+            id.as_str()
+        );
+    }
+
+    /// The formation id comes from the session and never from the process environment, so a
+    /// session in no formation hands its hooks none even when the process carries the variable.
+    #[test]
+    fn a_hook_never_sees_a_formation_id_from_the_process_environment() {
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = crate::formation::FormationId::mint();
+        std::env::set_var(crate::formation::FORMATION_ID_ENV, id.as_str());
+        let seen = first_hook_env_entry(HookCapabilityGrant::default(), HookEnvVars::default());
+        std::env::remove_var(crate::formation::FORMATION_ID_ENV);
+        assert_eq!(seen, "no-env");
     }
 
     /// Invariant: work queued by the last `emit` of a session finishes *before* the

@@ -998,7 +998,7 @@ The `delegation` line carries neither the task text nor the child's answer — b
 own conversation, which the `tool_call` line for the same call already records under the session's
 [`trace.capture`](manifest.md#field-trace) setting.
 
-### Reading a formation { #delegation-lineage }
+### Reading a delegation tree { #delegation-lineage }
 
 The relationship between a parent and a child is recorded once, from both ends, and joined by the
 `dlg_` id:
@@ -1012,7 +1012,7 @@ The relationship between a parent and a child is recorded once, from both ends, 
 [`mur trace show`](cli.md#mur-trace-show) renders both ends within the one file it is given: a child's
 header names the session that spawned it and the delegation that created it, and a parent grows a
 Delegations section listing each delegation, the child session it launched, how it ended and why.
-No command walks a formation across files.
+No command walks a delegation tree across files.
 
 **A resumed child's lineage is one hop back.** `spawned_by` is written at spawn and never
 rewritten, so resuming a *parent* keeps the child reachable: the resumed session's `resumed_from`
@@ -1213,5 +1213,6 @@ by task, not by session.
   endpoint slows the session down.
 - `trace.jsonl` is written whether or not `observability.otel_endpoint` is set, and whether or not
   the endpoint is reachable.
-- The `MURMUR_FORMATION_ID` host environment variable, when set, is forwarded into every hook's
-  WASI environment and added as `murmur.formation_id` to the root span by `murmur-hook-grafana`.
+- A session that belongs to a [formation](cli.md#mur-run-formation) hands its formation id to every
+  hook as `MURMUR_FORMATION_ID`, and `murmur-hook-grafana` adds it to the root span as
+  `murmur.formation_id`. A session in no formation hands none.

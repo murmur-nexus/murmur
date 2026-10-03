@@ -168,6 +168,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
         door_authentication: None,
         spawn_grant: None,
         machine_tokens_per_day: None,
+        formation_id: None,
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).

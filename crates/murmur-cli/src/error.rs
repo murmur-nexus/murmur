@@ -75,6 +75,7 @@ pub const E_RUN_040: &str = "E-RUN-040"; // the session ran and its task did not
 pub const E_RUN_041: &str = "E-RUN-041"; // a capsule declaring control: could not write its control token
 pub const E_RUN_042: &str = "E-RUN-042"; // a session has no control surface, or its control surface refused the request
 pub const E_RUN_043: &str = "E-RUN-043"; // a runtime-pulled lock pin is declared as a hook, a driver, with gateway:, or bound as inference.system_prompt_artifact
+pub const E_RUN_044: &str = "E-RUN-044"; // MURMUR_FORMATION_ID is set to something that is not a formation id
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -735,6 +736,13 @@ impl From<RuntimeError> for CliError {
                 "MURMUR_SPAWNER is injected by a parent capsule's runtime at launch; unset it to \
                  run this capsule directly",
             ),
+            error @ RuntimeError::FormationIdUnreadable { .. } => CliError::with_hint(
+                E_RUN_044,
+                error.to_string(),
+                "MURMUR_FORMATION_ID is set by the runtime that launches a formation's members and \
+                 by a member's runtime for the children it spawns; unset it to run this capsule on \
+                 its own",
+            ),
             RuntimeError::PortInUse { port } => CliError::with_hint(
                 E_RUN_010,
                 format!("internal_port {port} is already bound"),
@@ -1049,6 +1057,21 @@ mod tests {
         let hint = cli.hint.as_deref().unwrap_or_default();
         assert!(hint.contains("mur install pulled-tool@1.2.3"), "{hint}");
         assert!(hint.contains("gateway:"), "{hint}");
+    }
+
+    #[test]
+    fn an_unreadable_formation_id_maps_to_e_run_044() {
+        let error = capsule_runtime::FormationId::parse("frm_ABC").unwrap_err();
+        let cli = CliError::from(error);
+        assert_eq!(cli.code, E_RUN_044);
+        assert!(
+            cli.message.contains("MURMUR_FORMATION_ID"),
+            "{}",
+            cli.message
+        );
+        assert!(!cli.message.contains("frm_ABC"), "{}", cli.message);
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("unset it"), "{hint}");
     }
 
     #[test]

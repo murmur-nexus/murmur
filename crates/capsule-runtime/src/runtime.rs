@@ -57,6 +57,7 @@ use crate::{
     },
     diagnostic,
     errors::RuntimeError,
+    formation::FormationId,
     gateway_credential::{config_holds_credential, CredentialEvent, GatewayCredential},
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -1712,7 +1713,10 @@ pub fn stage_session(
     };
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
-    let stage_env = HookEnvVars::default();
+    let stage_env = HookEnvVars {
+        formation_id: request.formation_id.as_ref().map(FormationId::as_str),
+        ..HookEnvVars::default()
+    };
     dispatch_stage(
         &engine,
         &workdir,
@@ -1827,6 +1831,7 @@ pub fn stage_session(
         // discards the value, so a handle that cannot be read refuses the launch before a session
         // directory exists; this is where the value itself enters the session.
         spawner: SpawnerHandle::from_env()?,
+        formation_id: request.formation_id,
     })
 }
 
@@ -2271,6 +2276,7 @@ fn launch(
                     std::time::Duration::from_secs(effective_lifecycle.delegation_deadline_secs),
                     Arc::clone(&staged.registry),
                     staged.capability_policy.env_allow.clone(),
+                    staged.formation_id.clone(),
                 )
                 // This capsule's own A2A door, bound just above: where a started delegation's
                 // completion is posted, and what makes `DelegationPlane::start` available at all.
@@ -2295,6 +2301,7 @@ fn launch(
         let eval_config_json = staged.eval_config_json;
         let case_id = staged.case_id;
         let dataset_id = staged.dataset_id;
+        let formation_id = staged.formation_id;
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
         // The driver artifact the manifest names, under either transport. Only a
@@ -2654,6 +2661,7 @@ fn launch(
                             eval_config_json: eval_config_json.as_deref(),
                             case_id: case_id.as_deref(),
                             dataset_id: dataset_id.as_deref(),
+                            formation_id: formation_id.as_ref().map(FormationId::as_str),
                         },
                         hook_limits,
                         hook_inference,
@@ -7512,6 +7520,12 @@ impl CapsuleStoreState {
         // Cloned off the plane rather than held a second time on this state: one registration's
         // authority stays in one place.
         let spawn_credential = self.delegation.as_ref().map(|plane| plane.credential());
+        // The plane was built from the staged session's formation, which every `capsule` step's
+        // child joins; a session with no plane launches no child.
+        let formation_id = self
+            .delegation
+            .as_ref()
+            .and_then(|plane| plane.formation_id().cloned());
         let plan_trace = self.plan_trace.clone();
         let registry = Arc::clone(&self.registry);
         let gate_tx = request_tx.clone();
@@ -7558,6 +7572,7 @@ impl CapsuleStoreState {
                 current_context_id,
                 registry,
                 spawn_credential,
+                formation_id,
                 trace: plan_trace.as_deref(),
                 gate_step: &gate_step,
                 invoke_tool: &invoke_tool,
@@ -10918,6 +10933,7 @@ inference:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11018,6 +11034,7 @@ inference:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11104,6 +11121,7 @@ inference:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11189,6 +11207,7 @@ inference:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11326,6 +11345,7 @@ inference:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         };
 
         match stage_session(Arc::new(PanicRegistry), request) {
@@ -11429,6 +11449,7 @@ inference:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         }
     }
 

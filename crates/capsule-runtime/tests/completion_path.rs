@@ -438,6 +438,7 @@ fn launch_bounded(
         roost_url: suite.roost.url.clone(),
         spawner,
         completion_deadline,
+        formation_id: None,
     })
     .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
 }

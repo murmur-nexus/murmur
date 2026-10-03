@@ -16,8 +16,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use capsule_runtime::{
-    child_workdir_for, delegation::SPAWNER_ENV, launch_child_capsule, ChildLaunchRequest,
-    LaunchedChild, SpawnApproval, Spawner,
+    child_workdir_for, delegation::SPAWNER_ENV, formation::FORMATION_ID_ENV, launch_child_capsule,
+    ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner,
 };
 use common::{component, files_under, find_in_files, mur_binary, Roost, ScriptedServer};
 use serde_json::{json, Value};
@@ -243,6 +243,7 @@ impl Parent {
             // Nothing in this suite delegates: no handle is injected and no watcher runs.
             spawner: None,
             completion_deadline: None,
+            formation_id: None,
         })
     }
 }
@@ -439,12 +440,59 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
             report_to: None,
         }),
         completion_deadline: None,
+        formation_id: None,
     })
     .expect("a child that declares no variables launches");
     assert_eq!(
         keys(&delegated),
         ["PATH", "HOME", "MURMUR_ROOST_URL", SPAWNER_ENV]
     );
+}
+
+/// A parent in a formation hands its id to the child, which joins it and says so on its readiness
+/// line — with a lineage and without one, since the formation is not part of the spawner handle.
+/// A parent in no formation hands none, and the child reports none.
+#[test]
+fn a_child_joins_its_parents_formation_with_or_without_a_spawner() {
+    let parent = Parent::new();
+    let formation = FormationId::mint();
+    let lineage = Spawner {
+        session_id: PARENT_SESSION.to_string(),
+        context_id: "ctx_formation".to_string(),
+        report_to: None,
+    };
+
+    for (name, spawner) in [("child-a", Some(lineage)), ("child-b", None)] {
+        let (grant, _) = parent.approve(name);
+        let child = launch_child_capsule(ChildLaunchRequest {
+            parent_accessible_workdir: parent.dir().to_path_buf(),
+            capsule_name: name.to_string(),
+            capsule_version: "0.1.0".to_string(),
+            grant,
+            child_env_allow: Vec::new(),
+            roost_url: suite().roost.url.clone(),
+            spawner,
+            completion_deadline: None,
+            formation_id: Some(formation.clone()),
+        })
+        .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"));
+
+        assert_eq!(
+            child.env.last(),
+            Some(&(FORMATION_ID_ENV.to_string(), formation.as_str().to_string())),
+            "{name}: the formation id is the last runtime-owned name: {:?}",
+            child.env
+        );
+        assert_eq!(child.formation_id, Some(formation.clone()), "{name}");
+    }
+
+    let outside = parent.launch("child-a", &[]);
+    assert!(
+        !outside.env.iter().any(|(key, _)| key == FORMATION_ID_ENV),
+        "{:?}",
+        outside.env
+    );
+    assert_eq!(outside.formation_id, None);
 }
 
 // ── 3. A child cannot reach out of its own directory ──────────────────────────
@@ -643,6 +691,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         roost_url: suite.roost.url.clone(),
         spawner: None,
         completion_deadline: None,
+        formation_id: None,
     })
     .expect("the leak fixture launches");
 
@@ -697,6 +746,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         roost_url: "http://127.0.0.1:1".to_string(),
         spawner: None,
         completion_deadline: None,
+        formation_id: None,
     })
     .expect_err("a child cannot register with a daemon that is not listening");
     let message = error.to_string();

@@ -192,6 +192,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()
@@ -692,6 +693,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()

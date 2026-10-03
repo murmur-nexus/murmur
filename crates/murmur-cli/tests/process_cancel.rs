@@ -314,6 +314,7 @@ fn stage(home: &TempDir, manifest_path: &Path, sleeps: bool) -> capsule_runtime:
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()

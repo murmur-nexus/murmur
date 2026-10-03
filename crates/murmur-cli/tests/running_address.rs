@@ -1142,6 +1142,7 @@ fn stage_in_process(
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()
