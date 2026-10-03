@@ -189,6 +189,23 @@ impl Capsule {
         }
     }
 
+    /// Blocks until the trace holds a `task_end` for `task_id`.
+    fn task_end(&self, task_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self
+            .events("task_end")
+            .iter()
+            .any(|event| event["task_id"] == task_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "no task_end for {task_id}; trace:\n{}",
+                fs::read_to_string(self.workdir.join("trace.jsonl")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn card(&self) -> Value {
         let card = request(&self.addr, "GET", "/.well-known/agent-card.json", &PEER, "");
         assert_eq!(card.status, 200, "{card:?}");
@@ -276,6 +293,7 @@ fn a_consenting_capsule_takes_a_peer_task_and_records_it_as_peer() {
     let start = capsule.task_start(&task_id);
     assert_eq!(start["origin"], "peer", "{start}");
     assert_eq!(start["trust"], "trusted", "{start}");
+    capsule.task_end(&task_id);
     assert_eq!(peer_tasks_param(&capsule.card()), &json!(true));
 }
 
@@ -387,6 +405,24 @@ fn the_refusal_is_the_same_bytes_for_every_method_path_and_body() {
             "{label} must be answered with the same bytes"
         );
     }
+
+    // A declared body that never arrives: the refusal comes back without the door waiting for it.
+    let mut stream = TcpStream::connect(&capsule.addr).expect("should connect to the door");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    write!(
+        stream,
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+         Content-Length: 10000000\r\n{}: peer\r\n{}: trusted\r\n\r\n",
+        capsule.addr, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER
+    )
+    .unwrap();
+    let mut unread = Vec::new();
+    let _ = stream.read_to_end(&mut unread);
+    assert_eq!(
+        String::from_utf8_lossy(&unread),
+        text,
+        "the refusal must not wait for the body"
+    );
 
     // The real task is untouched by the refused cancel.
     let task = rpc(&capsule.addr, None, "tasks/get", json!({"id": real_id}));
@@ -677,7 +713,7 @@ fn a_peer_tasks_value_of_the_wrong_type_is_refused_naming_it() {
 fn an_unknown_peer_tasks_key_is_warned_by_run_and_doctor() {
     let home = tempfile::tempdir().unwrap();
     let project =
-        manifest_only_project("exports:\n  peer_tasks:\n    accept: false\n    peers: [a]\n");
+        manifest_only_project("exports:\n  peer_tasks:\n    accept: true\n    peers: [a]\n");
     for args in [
         &["run", "--manifest", "murmur.yaml", "--explain-scope"][..],
         &["doctor"][..],
@@ -691,6 +727,12 @@ fn an_unknown_peer_tasks_key_is_warned_by_run_and_doctor() {
             warning.contains("'peers' in exports.peer_tasks"),
             "{args:?}: {warning}"
         );
+        if args[0] == "run" {
+            assert!(
+                text.contains("  exports.peer_tasks: accept\n"),
+                "the block still consents: {text}"
+            );
+        }
     }
 }
 

@@ -1225,10 +1225,10 @@ exports:
 |---|---|---:|---|
 | `exports.peer_tasks.accept` | boolean | yes | `true` serves peer tasks. `false` refuses them. Default when the block is absent: refuse. `peer_tasks: {}` is `E-MAN-003` naming `exports.peer_tasks.accept`; a value that is not a boolean, or a `peer_tasks` that is not a block, is `E-MAN-002` naming the field. |
 
-A peer task is a request whose `x-murmur-task-origin` header is `peer`, which the sending capsule's
-runtime stamps on every message sent through [`murmur:message/send`](wit-interfaces.md) and which the
-sending agent cannot set. A capsule
-that does not accept peer tasks answers every such request on its door with:
+A peer task is a request whose `x-murmur-task-origin` header is `peer`. The sending capsule's
+runtime stamps it on every message sent through
+[`murmur:message/send`](wit-interfaces.md#message-send), and the sending agent cannot set it. A
+capsule that does not accept peer tasks answers every such request on its door with:
 
 ```http
 HTTP/1.1 403 Forbidden
@@ -1257,12 +1257,12 @@ caller without one is answered `401` before this setting is read.
 
 `exports.peer_tasks` is independent of `network.authentication`: accepting peer tasks neither
 requires nor implies a token, and leaves the door's `securitySchemes` and its achieved containment
-class unchanged. Requiring authentication of a capsule that serves peers is the job of the
-formation's roster, which knows the capsule's peers.
+class unchanged. `murmur:message/send` presents no token, so a door that declares
+`network.authentication` answers a message sent through it `401`, whatever `accept` says.
 
-The setting is read only from the capsule's own `murmur.yaml`. No `mur run` flag, environment
-variable, [`control.settings`](#field-control) entry or launcher argument changes it, and it names
-no peer.
+Only the capsule's own `murmur.yaml` sets it: there is no `mur run` flag, environment variable or
+[`control.settings`](#field-control) entry for it. It names no peer, so `accept: true` serves every
+caller that identifies as a peer.
 
 #### `control` { #field-control }
 

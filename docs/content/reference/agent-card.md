@@ -175,8 +175,9 @@ every task on the session.
 
 The door checks, in this order, on every request:
 
-1. `GET /.well-known/agent-card.json` and the [peer plane](resource-plane.md#peer-plane) under
-   `/resources/peer/` are served without a door token.
+1. `GET /.well-known/agent-card.json`, the [peer plane](resource-plane.md#peer-plane) under
+   `/resources/peer/` and the [control surface](control-surface.md), which takes its own token,
+   are served without a door token.
 2. The token, on a door declaring `network.authentication`, before the path, the body or the
    method is read. A refusal here says nothing about whether a task, a file or a path exists.
 3. Peer consent: a request carrying `x-murmur-task-origin: peer` is refused unless the capsule
@@ -198,8 +199,7 @@ A refusal at steps 2 to 4 is an HTTP status and a JSON body, never a JSON-RPC en
 
 The body is `{"error": "<code>", "message": "<sentence>"}`. The `insufficient_scope` message names
 the credential and the scope it lacks: `credential 'watcher' does not reach message/send`. The
-`peer_not_accepted` body is the same for every request it refuses:
-`{"error":"peer_not_accepted","message":"this capsule does not accept tasks from peers"}`. The scheme name
+`peer_not_accepted` response is byte-identical for every request it refuses. The scheme name
 `Bearer` matches in any case; the token matches exactly.
 
 The door speaks plain HTTP, so a token sent across a network travels in clear text. Put a TLS
