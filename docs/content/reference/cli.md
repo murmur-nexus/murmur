@@ -928,11 +928,13 @@ Run capsule component and resolve declared artifacts.
 
 ```bash
 mur run [--manifest <path>] [--task <path-or-text>] [--json]
+mur run --roster [<path>] [--task <path-or-text>] [--json]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
+| `--roster` | `./roster.yaml` when the flag is given with no value | Launch the formation a [roster](roster.md) declares, for one task. Takes the project directory or the `roster.yaml` inside it; any other file name refuses with [`E-ROS-001`](diagnostics.md#e-ros-001). Passes `--task`, `--json`, `--verbose`, `--no-env-file` and `--containment` through to its members, and cannot be combined with any other flag. See [Launching a formation](#mur-run-roster) |
 | `--capsule` | — | Run an installed registry artifact by name instead of a project directory. Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
 | `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
@@ -980,8 +982,9 @@ dropped, never written to `logs/bootstrap.log`. What each token reaches is in
 <span id="mur-run-formation"></span>**Formation membership.** A session launched with
 [`MURMUR_FORMATION_ID`](roost-api.md#environment-variables) set to a formation id is a member of
 that formation, and every child it delegates to joins the same one. A formation id is `frm_`
-followed by 32 lowercase hex digits; launch every member of one formation with the same value. A
-session launched without it belongs to no formation and prints neither of these:
+followed by 32 lowercase hex digits; [`mur run --roster`](#mur-run-roster) mints one and hands it
+to every member it starts. A session launched without it belongs to no formation and prints neither
+of these:
 
 | Mode | Output |
 |---|---|
@@ -1080,6 +1083,67 @@ ends `status:  canceled` and exits `1`; one that was waiting for a task ends `st
 A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule,
 and every session that `mur eval run` or `mur new` runs, has no `SIGTERM` handling: the process
 ends at once.
+
+### Launching a formation (`--roster`) { #mur-run-roster }
+
+`mur run --roster` launches every member of the formation a project's
+[`roster.yaml`](roster.md) declares, runs the entry member's one task, and then stops every member.
+Each member is a `mur run --capsule <capsule> --capsule-version <version>` process of its own; the
+launcher runs no session itself. The order and the rules are in
+[Launching a formation](roster.md#launch).
+
+| Flag | Passed to |
+|---|---|
+| `--task` | The entry member |
+| `--json` | The entry member. Peers always run with `--json` |
+| `--verbose` | The entry member |
+| `--no-env-file` | Every member. The launcher itself never loads `.env` |
+| `--containment` | Every member |
+
+`--roster` cannot be combined with `--manifest`, `--capsule`, `--capsule-version`,
+`--spawn-grant-stdin`, `--system-prompt`, `--context`, `--resume`, `--resume-mode`,
+`--forget-session`, `--lifecycle-task-acceptance`, `--lifecycle-after-task`, `--workdir`, `--bind`
+or `--explain-scope`.
+
+Standard output under `--json` carries exactly two lines:
+
+1. The **formation line**, printed once every peer's door answers and before the entry member
+   starts.
+2. The entry member's own [readiness line](#mur-run-formation), unchanged, from the entry member's
+   output.
+
+```json
+{"entry":"planner","formation_id":"frm_01a101c433ee79b3aa76aa4e23a030e7","peers":[{"name":"coder","pid":527640,"session_id":"ses_01a101c453e173e1997accf070c406f6","url":"http://localhost:35769"},{"name":"reviewer","pid":527642,"session_id":"ses_01a101c455747101b6858f9ff1dac495","url":"http://localhost:36999"}]}
+```
+
+| Formation line key | Value |
+|---|---|
+| `entry` | The entry member's roster name |
+| `formation_id` | The id every member was launched with, `frm_` followed by 32 lowercase hex digits |
+| `peers` | One object per non-entry member, in roster order: `name`, `pid`, `session_id`, and `url` as `http://host:port` |
+
+The formation line carries no door token. Without `--json`, the launcher writes the same
+information to stderr as a `formation:` block, and the entry member writes its usual startup lines
+to stdout.
+
+Every line a peer writes to stderr, and every stdout line after its readiness line, goes to the
+launcher's stderr behind a `[<member>] ` prefix:
+
+```text
+[coder] [capsule-runtime] SIGTERM received — cancelling live tasks and ending the session
+```
+
+The entry member writes to the launcher's own stdout and stderr, unprefixed, and stays in the
+launcher's process group, so `^C` at a terminal reaches it as it reaches a hand-run `mur run`.
+
+| The launcher | Exits with |
+|---|---|
+| The entry member's process ended | The entry member's exit code, or 128 plus the signal that ended it |
+| A refusal before the entry member started — admission ([`E-ROS-*`](diagnostics.md#e-ros-001), `E-REG-005`), [`E-RUN-045`](diagnostics.md#e-run-045), [`E-RUN-046`](diagnostics.md#e-run-046) | 1 |
+| The launcher received `SIGINT`, `SIGTERM` or `SIGHUP` | 130, 143 or 129 |
+
+By the time the launcher exits, every member it started has been stopped and reaped, except after
+a `SIGKILL` of the launcher itself, which leaves the members running.
 
 ---
 

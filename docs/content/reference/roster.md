@@ -24,8 +24,9 @@ reachability:
     to: [coder]
 ```
 
-Nothing launches a roster. [`mur doctor`](cli.md#mur-doctor) admits it and reports the result, and
-`mur run` does not read `roster.yaml`.
+[`mur run --roster`](cli.md#mur-run-roster) admits a roster and launches it — see
+[Launching a formation](#launch). [`mur doctor`](cli.md#mur-doctor) admits it and reports the
+result. `mur run` without `--roster` does not read `roster.yaml`.
 
 ## Fields { #fields }
 
@@ -117,3 +118,97 @@ at the first failure. Within a check, members are taken in roster order.
 
 Checks 1–4 read no store, so a roster with a structural fault is refused even when no member is
 installed. Check 5 takes each member in turn through both rows before the next.
+
+## Launching a formation { #launch }
+
+[`mur run --roster`](cli.md#mur-run-roster) launches the admitted roster for one task:
+
+1. **Admit.** The roster is admitted as above. A refusal starts nothing.
+2. **Mint.** One formation id is minted for this launch.
+3. **Start the peers.** Every member except the entry member starts at once, as its own
+   `mur run --capsule <capsule> --capsule-version <version> --json` process, bound to `127.0.0.1`.
+   A peer takes work only at its door: it never runs a `task.md` in the project directory, where
+   the entry member's task is written.
+4. **Wait for each door.** A peer is ready when the door at the URL its readiness line reported
+   serves an agent card naming the session id that line reported.
+5. **Start the entry member.** The entry member starts last, with
+   `--lifecycle-task-acceptance single --lifecycle-after-task exit`, and with
+   [`MURMUR_FORMATION_PEERS`](#formation-peers) naming the members it may call.
+6. **Stop.** When the entry member's process ends, for any reason, every peer is stopped.
+
+| Every member | Value |
+|---|---|
+| `MURMUR_FORMATION_ID` | The formation id minted in step 2 |
+| `--workdir` | The roster's project directory, so every member resolves from the stores admission read, and sessions land under `<project>/.murmur/` |
+| Current directory | The launcher's, so a relative `--task` path names the same file |
+| The installed artifact | Exactly the bytes admission bound it to. A member whose installed artifact changed since admission refuses with [`E-RUN-047`](diagnostics.md#e-run-047) |
+
+### Readiness { #launch-readiness }
+
+Each member has 180 seconds from its own start to become ready. A peer refuses the whole launch
+with [`E-RUN-045`](diagnostics.md#e-run-045) when it:
+
+- exits before it reports;
+- prints a first line that is not a readiness line;
+- reports no door;
+- reports a formation other than the one it was launched with;
+- does not report within the deadline;
+- exits after it reports, before its door answers;
+- reports a door that does not answer as its session within the deadline.
+
+A refused launch stops every member already started, and never starts the entry member. Readiness
+is the door: it is probed every 100 ms until it answers as the reported session.
+
+### Stopping { #launch-stop }
+
+A member is stopped with `SIGTERM`, then 25 seconds for its session to end in order, then `SIGKILL`
+to its process group. Members are stopped at the same time. 25 seconds outlasts a member's own
+[`SIGTERM` teardown bound](cli.md#mur-run-sigterm), so a member ending in order finishes before it
+is killed and its `trace.jsonl` stays whole.
+
+| The launcher ends because | It first |
+|---|---|
+| The entry member's process ended | Stops every peer |
+| It received `SIGINT`, `SIGTERM` or `SIGHUP` | Sends `SIGTERM` to the entry member, then stops every member |
+| A peer did not come up | Stops every member already started |
+
+Each peer runs in a process group of its own; the entry member stays in the launcher's. A
+`SIGKILL` of the launcher itself leaves the members running.
+
+### What the entry member is handed { #formation-peers }
+
+The entry member is the only member handed addresses. `MURMUR_FORMATION_PEERS` names the door of
+every member the roster lets it call, as `name=url` pairs separated by single spaces, in roster
+order:
+
+```text
+MURMUR_FORMATION_PEERS=coder=http://localhost:41873 reviewer=http://localhost:41874
+```
+
+| Property | Value |
+|---|---|
+| Pair | `<member name>=http://<host>:<port>` |
+| Absent | When the entry member may call nobody. The variable is never set empty |
+| Reaches | The entry member's capsule, its tools, a `transport: http` driver, its hooks, its shell commands, its native tools and a `transport: process` harness |
+| Runtime-owned | `capabilities.env.allow` and `capabilities.shell.baseline_env` neither supply nor replace it |
+| Delegated children | Do not receive it |
+| Malformed, or set without `MURMUR_FORMATION_ID` | The launch is refused with [`E-RUN-046`](diagnostics.md#e-run-046) |
+
+A shell reads it without a parser:
+
+```sh
+for peer in $MURMUR_FORMATION_PEERS; do
+  echo "${peer%%=*} answers at ${peer#*=}"
+done
+```
+
+A peer's door that requires authentication answers its public agent card to anyone, and answers
+`message/send` from the entry member with `401`: no member is handed another's token.
+
+A roster edge between two members neither of which is the entry member is admitted and both members
+are launched, but no address is handed for it, and the launch prints
+[`W-RUN-005`](diagnostics.md#w-run-005) once per such edge.
+
+A process that already carries `MURMUR_FORMATION_ID` is a formation member, and refuses
+`mur run --roster` with [`E-RUN-046`](diagnostics.md#e-run-046).
+

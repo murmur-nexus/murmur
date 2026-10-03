@@ -38,6 +38,7 @@ pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod fence;
 pub mod formation;
+pub mod formation_launch;
 pub(crate) mod gateway_credential;
 pub(crate) mod harness_session;
 pub(crate) mod hooks;
@@ -156,7 +157,7 @@ pub use door_auth::{
     PublicDoorDisclosure, DOOR_TOKEN_ENV,
 };
 pub use errors::{RuntimeError, UnreachableEntrypoint};
-pub use formation::FormationId;
+pub use formation::{FormationId, FormationPeer, FormationPeers};
 pub use lanes::TaskLane;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};

@@ -18,18 +18,17 @@ use capsule_runtime::{
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
-    parse_tool_implementation_from_yaml, read_lockfile, read_runtime_manifest_text,
-    registry_warning_link, resolve_manifest_path, resolve_roster_path, sha256_hex,
-    warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes,
-    wit_contracts_from_artifact_reader, ArtifactImplementation, ArtifactMeta, ArtifactRuntime,
-    ContractDirection, LocalRegistry, LockOrigin, LockfileError, MurmurLock, NativeBinaryVerdict,
-    PlatformMatch, Registry, ResolvedArtifact, RosterReachability, RuntimeManifest,
-    UnservedInterface, WitContracts, W_REG_001, W_REG_002, W_REG_003,
+    parse_tool_implementation_from_yaml, read_runtime_manifest_text, registry_warning_link,
+    resolve_manifest_path, resolve_roster_path, sha256_hex, warn_on_unknown_manifest_keys,
+    wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader, ArtifactImplementation,
+    ArtifactMeta, ArtifactRuntime, ContractDirection, LocalRegistry, LockOrigin, MurmurLock,
+    NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RosterReachability,
+    RuntimeManifest, UnservedInterface, WitContracts, W_REG_001, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
-use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
+use crate::commands::{read_optional_lockfile, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
 use crate::env_requirements::{
     env_requirements_report, EnvRequirementsReport, EnvironmentNames, RequiredVariable,
@@ -1403,11 +1402,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     //
     // Read here rather than beside the stores below because the spawn-closure walk pins a child
     // capsule's version from it, and reading `murmur.lock` twice could report two answers.
-    let lock = match read_lockfile(&project_root.join("murmur.lock")) {
-        Ok(lock) => Some(lock),
-        Err(LockfileError::NotFound(_)) => None,
-        Err(error) => return Err(lockfile_error_to_cli(error)),
-    };
+    let lock = read_optional_lockfile(&project_root)?;
 
     // What the whole delegation closure needs from the operator's environment, and what the
     // project manifest itself references and this workspace does not hold. Ungated: a capsule

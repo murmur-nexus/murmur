@@ -16,6 +16,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use common::{tool_result_text, tool_use_response};
+
 use std::{
     collections::{HashSet, VecDeque},
     fs,
@@ -253,19 +255,6 @@ fn read_http_body(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&body).to_string()
 }
 
-fn tool_use_response(tool_id: &str, name: &str, input: Value) -> String {
-    json!({
-        "id": "msg_tool",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": input}],
-        "stop_reason": "tool_use",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()
-}
-
 fn end_turn_response(text: &str) -> String {
     json!({
         "id": "msg_end",
@@ -277,63 +266,6 @@ fn end_turn_response(text: &str) -> String {
         "usage": {"input_tokens": 1, "output_tokens": 1}
     })
     .to_string()
-}
-
-/// The text of the tool result the runtime fed back for `tool_id`, with the untrusted fence
-/// stripped — so for both peer tools this is the JSON object they returned.
-///
-/// Every tool result reaches the model inside the fence, the peer tools included; these tests
-/// are about what the peer plane answered, so the markers are checked and removed in one place
-/// here rather than at each caller. The fence itself is covered in `untrusted_fence.rs`.
-fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
-    for request in requests {
-        for message in request.get("messages")?.as_array()? {
-            if message.get("role").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-                continue;
-            };
-            for block in blocks {
-                if block.get("type").and_then(Value::as_str) != Some("tool_result")
-                    || block.get("tool_use_id").and_then(Value::as_str) != Some(tool_id)
-                {
-                    continue;
-                }
-                let content = block.get("content")?;
-                if let Some(text) = content.as_str() {
-                    return Some(unfence(text));
-                }
-                if let Some(items) = content.as_array() {
-                    for item in items {
-                        if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            return Some(unfence(text));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Return what the fence wrapped, for a result that carries one.
-///
-/// A tool that ran carries a fence. A dispatch that never reached a tool — a refused handle, a
-/// peer outside `capabilities.peer_fetch.allow` — comes back as the runtime's own failure text
-/// and carries none, so that shape is passed through unchanged.
-fn unfence(text: &str) -> String {
-    let Some((open, rest)) = text.split_once('\n') else {
-        return text.to_string();
-    };
-    if !open.starts_with("<untrusted-content source=tool:") || !open.ends_with('>') {
-        return text.to_string();
-    }
-    rest.strip_suffix("\n</untrusted-content>")
-        .unwrap_or_else(|| {
-            panic!("a fenced tool result must end at the closing marker; got:\n{text}")
-        })
-        .to_string()
 }
 
 // ── Capsules ──────────────────────────────────────────────────────────────────
@@ -555,6 +487,8 @@ fn stage_request(
         spawn_grant: None,
         machine_tokens_per_day: None,
         formation_id: None,
+        formation_peers: None,
+        ignore_task_file: false,
     }
 }
 

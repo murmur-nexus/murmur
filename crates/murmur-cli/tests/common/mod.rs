@@ -435,6 +435,8 @@ fn stage_agent_session_inner(
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         },
     )
     .unwrap()
@@ -926,6 +928,87 @@ pub fn extract_result_text(tool_result: &Value) -> String {
             })
         })
         .unwrap_or_default()
+}
+
+/// An anthropic `tool_use` reply calling `name` with `input` under `tool_id`.
+pub fn tool_use_response(tool_id: &str, name: &str, input: Value) -> String {
+    json!({
+        "id": "msg_tool",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": input}],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
+/// The text of the tool result the runtime fed back for `tool_id`, with the untrusted fence
+/// stripped by [`unfence`].
+pub fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
+    find_tool_result(requests, tool_id).map(|block| unfence(&extract_result_text(&block)))
+}
+
+/// What the untrusted fence wrapped, for a result that carries one.
+///
+/// A tool that ran carries a fence. A dispatch that never reached a tool — a refused handle, a
+/// referee's refusal, a peer outside `capabilities.peer_fetch.allow` — comes back as the runtime's
+/// own failure text and carries none, so that shape is passed through unchanged. The fence itself
+/// is covered in `untrusted_fence.rs`.
+pub fn unfence(text: &str) -> String {
+    let Some((open, rest)) = text.split_once('\n') else {
+        return text.to_string();
+    };
+    if !open.starts_with("<untrusted-content source=tool:") || !open.ends_with('>') {
+        return text.to_string();
+    }
+    rest.strip_suffix("\n</untrusted-content>")
+        .unwrap_or_else(|| {
+            panic!("a fenced tool result must end at the closing marker; got:\n{text}")
+        })
+        .to_string()
+}
+
+/// Pack a `murmur.yaml` of `name`, `version` and `manifest_body`, plus `component` as a
+/// `(entry name, file)` pair, and publish it into the local registry rooted at `store` as an
+/// `artifact_runtime` artifact.
+pub fn publish_to_store(
+    store: &Path,
+    name: &str,
+    version: &str,
+    artifact_runtime: &str,
+    manifest_body: &str,
+    component: Option<(&str, &Path)>,
+) {
+    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zip.start_file("murmur.yaml", options).unwrap();
+        zip.write_all(format!("name: {name}\nversion: {version}\n{manifest_body}").as_bytes())
+            .unwrap();
+        if let Some((entry, path)) = component {
+            zip.start_file(entry, options).unwrap();
+            zip.write_all(&fs::read(path).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    murmur_artifact::Registry::publish(
+        &LocalRegistry::new(store),
+        murmur_artifact::ArtifactMeta {
+            name: name.to_string(),
+            version: version.to_string(),
+            runtime: murmur_artifact::RuntimeType::Wasm,
+            artifact_runtime: artifact_runtime.to_string(),
+            platforms: Vec::new(),
+            description: None,
+            tags: Vec::new(),
+            wit_contracts: None,
+        },
+        &cursor.into_inner(),
+    )
+    .unwrap();
 }
 
 /// `mur run --explain-scope --json`, which resolves the capability scope and creates nothing.

@@ -12,7 +12,7 @@ use wasmtime::{component::Component, Engine};
 
 use crate::{
     bindings::host::murmur::tool::run::ToolResult,
-    formation::FormationId,
+    formation::{FormationId, FormationPeers},
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
     network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
@@ -456,6 +456,22 @@ pub struct StageRequest {
     /// [`crate::formation::FormationId::from_env`], which reads what the launcher of a formation's
     /// members, or a member's runtime for its child, put in the environment.
     pub formation_id: Option<FormationId>,
+    /// The doors of the formation members this session may call, as its launcher handed them.
+    ///
+    /// `Some` only for a formation's entry member whose roster lets it call someone: `mur run`
+    /// sets it from [`crate::formation::FormationPeers::from_env`], and refuses the launch when it
+    /// is set without [`Self::formation_id`]. The session injects it as
+    /// [`crate::formation::FORMATION_PEERS_ENV`] into every guest and native process it starts for
+    /// itself, and into no delegated child.
+    pub formation_peers: Option<FormationPeers>,
+    /// Never run a `task.md` found in the accessible workdir at launch: this session takes work
+    /// only at its door.
+    ///
+    /// Set by `mur run --ignore-task-file`, which a formation launcher passes to every peer. A
+    /// formation's members share the roster's project directory as their workdir, and the entry
+    /// member's task is written there; a peer that adopted it would run the entry member's task,
+    /// or a stale one from an earlier launch. `false` everywhere else.
+    pub ignore_task_file: bool,
 }
 
 /// The `transport: process` driver this session runs its harness through, compiled and described
@@ -627,6 +643,10 @@ pub struct StagedSession {
     /// Copied from [`StageRequest::formation_id`]. Hooks see it as `MURMUR_FORMATION_ID` and the
     /// delegation plane hands it to every child this session spawns.
     pub(crate) formation_id: Option<FormationId>,
+    /// Copied from [`StageRequest::formation_peers`].
+    pub(crate) formation_peers: Option<FormationPeers>,
+    /// Copied from [`StageRequest::ignore_task_file`].
+    pub(crate) ignore_task_file: bool,
 }
 
 impl StagedSession {
@@ -657,6 +677,12 @@ impl StagedSession {
     /// The formation this session is a member of, or `None` for a session nobody placed in one.
     pub fn formation_id(&self) -> Option<&FormationId> {
         self.formation_id.as_ref()
+    }
+
+    /// The doors this session may call in its formation, or `None` for every session but an
+    /// entry member with callees.
+    pub fn formation_peers(&self) -> Option<&FormationPeers> {
+        self.formation_peers.as_ref()
     }
 }
 

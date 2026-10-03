@@ -476,7 +476,7 @@ fn read_record(path: &Path) -> Option<RunningRecord> {
 /// process group and a negative `pid_t` as a process group or every process, so either would
 /// otherwise answer for processes the record never named.
 #[allow(unsafe_code)]
-fn pid_is_alive(pid: u32) -> bool {
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
     let Ok(target) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -612,11 +612,22 @@ mod platform {
 /// public card. A card with no capsule extension naming a session — one served by a runtime that
 /// predates the A2A card, among others — names no session, so its capsule reads as unreachable.
 fn probe_session_id(record: &RunningRecord) -> Result<String, String> {
-    let addr = record
-        .url
+    probe_door_session_id(&record.url, record.door_token.as_ref())
+}
+
+/// The session id the door at `url` — `host:port`, with or without `http://` — names on its agent
+/// card: the extended card read with `token` when one is given, else the public card.
+///
+/// The one door probe: [`verify`]'s layer 3 and a formation launcher's readiness check both ask
+/// it, so "this door answers as that session" means the same thing to both.
+pub(crate) fn probe_door_session_id(
+    url: &str,
+    token: Option<&crate::door_auth::DoorToken>,
+) -> Result<String, String> {
+    let addr = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let card = match &record.door_token {
+    let card = match token {
         Some(token) => {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",

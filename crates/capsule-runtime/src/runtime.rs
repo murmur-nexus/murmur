@@ -57,7 +57,7 @@ use crate::{
     },
     diagnostic,
     errors::RuntimeError,
-    formation::FormationId,
+    formation::{FormationId, FormationPeers},
     gateway_credential::{config_holds_credential, CredentialEvent, GatewayCredential},
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -127,7 +127,8 @@ pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 /// Longer than the async-hook drain budget (`ASYNC_HOOK_DRAIN_TIMEOUT` in `hooks.rs`, 15 s), so a
 /// drain that stays inside its own bound is never cut short by this one. A second `SIGTERM`
 /// exits at once without waiting for either.
-const TERMINATE_TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const TERMINATE_TEARDOWN_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(20);
 
 /// Resolve a guest interface instance export by its versioned name. Returns
 /// `None` when the versioned name is absent, so a component that exports only
@@ -1713,8 +1714,10 @@ pub fn stage_session(
     };
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
+    let stage_peers = request.formation_peers.as_ref().map(FormationPeers::render);
     let stage_env = HookEnvVars {
         formation_id: request.formation_id.as_ref().map(FormationId::as_str),
+        formation_peers: stage_peers.as_deref(),
         ..HookEnvVars::default()
     };
     dispatch_stage(
@@ -1832,6 +1835,8 @@ pub fn stage_session(
         // directory exists; this is where the value itself enters the session.
         spawner: SpawnerHandle::from_env()?,
         formation_id: request.formation_id,
+        formation_peers: request.formation_peers,
+        ignore_task_file: request.ignore_task_file,
     })
 }
 
@@ -1935,11 +1940,11 @@ fn launch(
     )
     .map_err(RuntimeError::Runtime)?
     .with_host_bounding(cgroup_scope, workdir_guard);
-    let inference_env = staged
-        .inference
-        .as_ref()
-        .map(|inference| inference_env_pairs(inference, staged.gateways.inference()))
-        .unwrap_or_default();
+    let inference_env = session_guest_env(
+        staged.inference.as_ref(),
+        staged.gateways.inference(),
+        staged.formation_peers.as_ref(),
+    );
     let gateways = staged.gateways.clone();
     let control_for_state = staged.control.clone();
     let spend = Arc::clone(&staged.spend);
@@ -2302,6 +2307,7 @@ fn launch(
         let case_id = staged.case_id;
         let dataset_id = staged.dataset_id;
         let formation_id = staged.formation_id;
+        let formation_peers = staged.formation_peers.as_ref().map(FormationPeers::render);
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
         // The driver artifact the manifest names, under either transport. Only a
@@ -2333,6 +2339,10 @@ fn launch(
         // pre-seed check misses a `--task`-written file and the agent's own read of task.md
         // 404s even after a task was delivered.
         let workdir_task_md = accessible_workdir.join("task.md");
+        // Whether a `task.md` in the accessible workdir is this launch's task. A session told to
+        // ignore it — a formation peer, which shares that directory with the entry member — never
+        // runs one, and waits for work at its door.
+        let adopts_task_file = !staged.ignore_task_file;
 
         // Extra copies retained for the LaunchResult returned after block_on consumes the others.
         let session_id_ret = session_id.clone();
@@ -2663,6 +2673,7 @@ fn launch(
                             case_id: case_id.as_deref(),
                             dataset_id: dataset_id.as_deref(),
                             formation_id: formation_id.as_ref().map(FormationId::as_str),
+                            formation_peers: formation_peers.as_deref(),
                         },
                         hook_limits,
                         hook_inference,
@@ -2800,7 +2811,7 @@ fn launch(
                             match effective_lifecycle.task_acceptance {
                                 TaskAcceptance::None => {
                                     // Does not accept incoming tasks; run from task.md if present
-                                    if workdir_task_md.exists() {
+                                    if adopts_task_file && workdir_task_md.exists() {
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
                                         let bytes = tokio::fs::metadata(&workdir_task_md)
@@ -2885,7 +2896,7 @@ fn launch(
                                     }
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
-                                    if workdir_task_md.exists() {
+                                    if adopts_task_file && workdir_task_md.exists() {
                                         // A `task.md` runs before any A2A message is waited for.
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
@@ -5049,6 +5060,30 @@ pub(crate) fn gateway_env_pair(gateway: &CredentialGateway) -> (String, String) 
     (GATEWAY_ENDPOINT_ENV.to_string(), gateway.guest_endpoint())
 }
 
+/// The runtime-owned variables every guest of this session sees: the `MURMUR_INFERENCE_*` set for
+/// an inference session, then [`crate::formation::FORMATION_PEERS_ENV`] for a formation's entry
+/// member with callees.
+///
+/// One list, read by the agent or script root's store, by every tool and driver store, by a hook's
+/// `run-inference` driver, and by the shell tool; a native tool and a process-driver harness take
+/// the formation entry from it through [`formation_env`]. `build_wasi_ctx` applies it after the
+/// manifest's allowlist, and neither the allowlist nor a shell baseline resolves the peers name
+/// from the host, so no declaration supplies or displaces it.
+fn session_guest_env(
+    inference: Option<&murmur_artifact::InferenceConfig>,
+    gateway: Option<&Arc<CredentialGateway>>,
+    formation_peers: Option<&FormationPeers>,
+) -> Vec<(String, String)> {
+    let mut env = inference
+        .map(|inference| inference_env_pairs(inference, gateway))
+        .unwrap_or_default();
+    if let Some(peers) = formation_peers {
+        let (name, value) = peers.env_pair();
+        env.push((name.to_string(), value));
+    }
+    env
+}
+
 /// The `MURMUR_INFERENCE_*` variables every guest of an inference session sees.
 ///
 /// Never the key: under `transport: http` the endpoint is the inference gateway's, and the runtime
@@ -6923,6 +6958,7 @@ impl CapsuleStoreState {
                     &self.workdir,
                     &self.capability_policy,
                     &self.shell_enforcement,
+                    &formation_env(&self.inference_env),
                 )
             })
             .map(DispatchOutcome::tool);
@@ -8758,10 +8794,24 @@ fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<
     Ok(())
 }
 
+/// The runtime-owned formation entries of a session's guest environment: what a native process
+/// that is not handed the whole guest environment — a native tool, a process-driver harness —
+/// still receives. Empty for every session but a formation's entry member with callees.
+pub(crate) fn formation_env(guest_env: &[(String, String)]) -> Vec<(String, String)> {
+    guest_env
+        .iter()
+        .filter(|(name, _)| name == crate::formation::FORMATION_PEERS_ENV)
+        .cloned()
+        .collect()
+}
+
 /// Execute a native artifact binary.
 ///
 /// The binary receives the serialized ToolInput JSON on stdin and must write a valid
 /// ToolResult JSON object to stdout. The binary's working directory is the capsule workdir.
+/// `runtime_env` is applied over the shell baseline, where no manifest-declared name can shadow
+/// it.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_native_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
@@ -8770,6 +8820,7 @@ fn dispatch_native_tool(
     session_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
+    runtime_env: &[(String, String)],
 ) -> Result<murmur::tool::run::ToolResult, String> {
     use std::{
         io::Write,
@@ -8784,7 +8835,7 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, &[], session_workdir)?;
+    let env = build_shell_env(policy, runtime_env, session_workdir)?;
 
     // Bound to a local before spawning (rather than chained straight into `.spawn()`) so a
     // `pre_exec` step can be attached to it, mirroring `execute_shell`'s shape.
@@ -10936,6 +10987,8 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11037,6 +11090,8 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11124,6 +11179,8 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11210,6 +11267,8 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11348,6 +11407,8 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         };
 
         match stage_session(Arc::new(PanicRegistry), request) {
@@ -11452,6 +11513,8 @@ inference:
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         }
     }
 
@@ -13928,6 +13991,67 @@ inference:
         script_path
     }
 
+    /// An entry member's session hands its formation peers to every guest and native process it
+    /// starts for itself, and no `capabilities.env.allow` or `shell.baseline_env` entry naming the
+    /// variable supplies or displaces it.
+    #[test]
+    fn formation_peers_reach_every_guest_and_no_declaration_displaces_them() {
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = crate::formation::FORMATION_PEERS_ENV;
+        let peers =
+            FormationPeers::parse("coder=http://localhost:41873 reviewer=http://localhost:41874")
+                .unwrap();
+        let value = peers.render();
+        let pair = (name.to_string(), value.clone());
+
+        // The list the agent or script root, every tool and driver store, and the shell tool are
+        // built from — for an agent session and for a script session alike.
+        let agent = session_guest_env(Some(&http_inference()), None, Some(&peers));
+        assert_eq!(agent.last(), Some(&pair), "{agent:?}");
+        assert!(agent.iter().any(|(key, _)| key == "MURMUR_INFERENCE_MODEL"));
+        let script = session_guest_env(None, None, Some(&peers));
+        assert_eq!(script, vec![pair.clone()]);
+        assert!(session_guest_env(Some(&http_inference()), None, None)
+            .iter()
+            .all(|(key, _)| key != name));
+        assert_eq!(formation_env(&agent), vec![pair.clone()]);
+
+        std::env::set_var(name, "decoy=http://localhost:1");
+        let declaring = CapabilityPolicy {
+            env_allow: vec![name.to_string()],
+            shell_baseline_env: vec![name.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        // A WASI guest's declared environment never resolves the name from the host, so the
+        // session's value, applied after it, is the only one a guest sees.
+        let declared = build_declared_env(&declaring);
+        let tmp = TempDir::new().unwrap();
+        let shell = build_shell_env(&declaring, &agent, tmp.path()).unwrap();
+        let binary = write_env_echo_native_tool(tmp.path(), "echo-peers", &[name]);
+        let native = dispatch_native_tool(
+            "echo-peers",
+            murmur::tool::run::ToolInput {
+                data: None,
+                log_path: None,
+            },
+            &binary,
+            tmp.path(),
+            tmp.path(),
+            &declaring,
+            &sandbox::ShellEnforcement::environment_only(),
+            &formation_env(&agent),
+        );
+        std::env::remove_var(name);
+
+        assert!(!declared.contains_key(name), "{declared:?}");
+        assert_eq!(shell.get(name), Some(&value), "{shell:?}");
+        let data = native.unwrap().data.unwrap_or_default();
+        assert!(data.contains(&format!("{name}={value}")), "{data}");
+        assert!(!data.contains("decoy"), "{data}");
+    }
+
     /// A plan `shell` step and the equivalent direct shell tool call are shown the decision
     /// point the same way, so a command refused as one is refused as the other.
     ///
@@ -14589,6 +14713,7 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
+            &[],
         )
         .unwrap();
 
@@ -14619,6 +14744,7 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
+            &[],
         )
         .unwrap();
         std::env::remove_var("GITHUB_TOKEN");
@@ -14648,6 +14774,7 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
+            &[],
         )
         .unwrap();
         std::env::remove_var("STRIPE_API_KEY");
@@ -14677,6 +14804,7 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
+            &[],
         )
         .unwrap();
         std::env::remove_var("CARGO_HOME");
@@ -14710,6 +14838,7 @@ inference:
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
+            &[],
         )
         .unwrap();
         std::env::remove_var("MYCOMPANY_SECRET");

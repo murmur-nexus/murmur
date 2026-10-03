@@ -195,6 +195,7 @@ nothing from the host is inherited.
 | `MURMUR_DATASET_ID` | `mur eval run` is driving a dataset and `observability.eval.dataset_id` is set | `observability.eval.dataset_id` |
 | `MURMUR_CASE_ID` | `mur eval run` is driving a dataset | The `case_id` of the case being run |
 | `MURMUR_FORMATION_ID` | The session belongs to a [formation](cli.md#mur-run-formation) | The session's formation id |
+| `MURMUR_FORMATION_PEERS` | The session is a formation's entry member and may call at least one member | The [peer addresses](roster.md#formation-peers) its launcher handed it |
 
 ## Driver and tool environment { #driver-environment }
 
@@ -212,6 +213,10 @@ into every tool artifact.
 | `MURMUR_CAPSULE_VERSION` | `version` from the manifest | Same |
 | `MURMUR_SESSION_ID` | The session ID | Same |
 | `MURMUR_CAPSULE_URL` | `localhost:<port>`, the address the capsule's HTTP server bound | Same |
+
+A formation's entry member that may call at least one member also hands every tool, and a
+`transport: http` driver, [`MURMUR_FORMATION_PEERS`](roster.md#formation-peers), whether or not
+`inference:` is configured.
 
 Two further variables are injected per artifact rather than per session:
 
