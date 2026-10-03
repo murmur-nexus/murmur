@@ -670,6 +670,10 @@ pub(crate) struct HookEnvVars<'a> {
     /// [`crate::formation::FORMATION_ID_ENV`]. Taken from the session and never from the process
     /// environment, so two sessions staged in one process each hand their hooks their own.
     pub formation_id: Option<&'a str>,
+    /// The session's [`crate::formation::FormationPeers`], rendered, injected as
+    /// [`crate::formation::FORMATION_PEERS_ENV`] right after the formation id. `Some` only for a
+    /// formation's entry member with callees; taken from the session, never from the process.
+    pub formation_peers: Option<&'a str>,
 }
 
 /// Dispatch `on-stage` for all blocking hooks with a matching binding.
@@ -2067,7 +2071,7 @@ fn build_wasi_ctx(
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
 
-    // First, so the five runtime-owned `MURMUR_*` variables below are applied after it and keep
+    // First, so the runtime-owned `MURMUR_*` variables below are applied after it and keep
     // precedence: a `config:` block can carry any key an operator writes, and none of them may
     // shadow a value the runtime owns.
     if let Some(config_json) = grant.config_json.as_deref() {
@@ -2084,6 +2088,9 @@ fn build_wasi_ctx(
     }
     if let Some(id) = env.formation_id {
         builder.env(crate::formation::FORMATION_ID_ENV, id);
+    }
+    if let Some(peers) = env.formation_peers {
+        builder.env(crate::formation::FORMATION_PEERS_ENV, peers);
     }
     if let Some(config_json) = env.eval_config_json {
         builder.env("MURMUR_EVAL_CONFIG", config_json);
@@ -6712,6 +6719,32 @@ artifacts:
         let seen = first_hook_env_entry(HookCapabilityGrant::default(), HookEnvVars::default());
         std::env::remove_var(crate::formation::FORMATION_ID_ENV);
         assert_eq!(seen, "no-env");
+    }
+
+    /// An entry member's hooks see the doors it may call as `MURMUR_FORMATION_PEERS`, from the
+    /// session, and never from the process environment.
+    #[test]
+    fn an_entry_members_hook_sees_its_formation_peers_and_only_from_the_session() {
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let peers = "coder=http://localhost:41873 reviewer=http://localhost:41874";
+        let seen = first_hook_env_entry(
+            HookCapabilityGrant::default(),
+            HookEnvVars {
+                formation_peers: Some(peers),
+                ..HookEnvVars::default()
+            },
+        );
+        assert_eq!(seen, peers);
+
+        std::env::set_var(
+            crate::formation::FORMATION_PEERS_ENV,
+            "decoy=http://localhost:1",
+        );
+        let outside = first_hook_env_entry(HookCapabilityGrant::default(), HookEnvVars::default());
+        std::env::remove_var(crate::formation::FORMATION_PEERS_ENV);
+        assert_eq!(outside, "no-env");
     }
 
     /// Invariant: work queued by the last `emit` of a session finishes *before* the

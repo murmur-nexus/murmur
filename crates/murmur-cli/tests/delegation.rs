@@ -18,6 +18,8 @@
 #[path = "common/mod.rs"]
 mod common;
 
+use common::{tool_result_text, tool_use_response};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -202,7 +204,14 @@ impl RecordingRoost {
     }
 
     fn publish(&self, name: &str, version: &str, body: &str, component: Option<&Path>) {
-        publish_capsule(&self.state.registry_path, name, version, body, component);
+        common::publish_to_store(
+            &self.state.registry_path,
+            name,
+            version,
+            "capsule",
+            body,
+            component.map(|path| ("capsule.wasm", path)),
+        );
     }
 }
 
@@ -308,45 +317,6 @@ fn extract_json_string(text: &str, key: &str) -> Option<String> {
 }
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
-
-fn publish_capsule(
-    registry_root: &Path,
-    name: &str,
-    version: &str,
-    manifest_body: &str,
-    component_path: Option<&Path>,
-) {
-    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-    {
-        let mut zip = zip::ZipWriter::new(&mut cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(format!("name: {name}\nversion: {version}\n{manifest_body}").as_bytes())
-            .unwrap();
-        if let Some(component_path) = component_path {
-            zip.start_file("capsule.wasm", options).unwrap();
-            zip.write_all(&std::fs::read(component_path).unwrap())
-                .unwrap();
-        }
-        zip.finish().unwrap();
-    }
-    murmur_artifact::Registry::publish(
-        &LocalRegistry::new(registry_root),
-        murmur_artifact::ArtifactMeta {
-            name: name.to_string(),
-            version: version.to_string(),
-            runtime: murmur_artifact::RuntimeType::Wasm,
-            artifact_runtime: "capsule".to_string(),
-            platforms: Vec::new(),
-            description: None,
-            tags: Vec::new(),
-            wit_contracts: None,
-        },
-        &cursor.into_inner(),
-    )
-    .unwrap();
-}
 
 fn publish_driver(registry_root: &Path) {
     let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
@@ -527,19 +497,6 @@ impl QueuedServer {
         }
         names
     }
-}
-
-fn tool_use_response(tool_id: &str, name: &str, input: Value) -> String {
-    json!({
-        "id": "msg_tool",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": input}],
-        "stop_reason": "tool_use",
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()
 }
 
 fn end_turn_response(text: &str) -> String {
@@ -1036,6 +993,8 @@ fn stage_request(
         spawn_grant: None,
         machine_tokens_per_day: None,
         formation_id: None,
+        formation_peers: None,
+        ignore_task_file: false,
     }
 }
 
@@ -1071,53 +1030,6 @@ fn agent_card_status(url: &str) -> u16 {
         .nth(1)
         .and_then(|code| code.parse().ok())
         .unwrap_or_else(|| panic!("unparseable status line: {raw}"))
-}
-
-/// The text of the tool result the runtime fed back for `tool_id`, with the fence stripped.
-fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
-    for request in requests {
-        for message in request.get("messages")?.as_array()? {
-            if message.get("role").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-                continue;
-            };
-            for block in blocks {
-                if block.get("type").and_then(Value::as_str) != Some("tool_result")
-                    || block.get("tool_use_id").and_then(Value::as_str) != Some(tool_id)
-                {
-                    continue;
-                }
-                let content = block.get("content")?;
-                if let Some(text) = content.as_str() {
-                    return Some(unfence(text));
-                }
-                if let Some(items) = content.as_array() {
-                    for item in items {
-                        if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            return Some(unfence(text));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Return what the fence wrapped, for a result that carries one. A dispatch that never reached
-/// the tool — a referee's refusal — comes back as the runtime's own text and carries none.
-fn unfence(text: &str) -> String {
-    let Some((open, rest)) = text.split_once('\n') else {
-        return text.to_string();
-    };
-    if !open.starts_with("<untrusted-content source=tool:") || !open.ends_with('>') {
-        return text.to_string();
-    }
-    rest.strip_suffix("\n</untrusted-content>")
-        .unwrap_or_else(|| panic!("a fenced tool result must end at the closing marker: {text}"))
-        .to_string()
 }
 
 /// Every JSON line of one trace file, in file order.

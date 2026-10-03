@@ -9,6 +9,7 @@ use std::{
 use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
     detached::{DetachPolicy, DetachedDispatchInfo},
+    formation::FORMATION_PEERS_ENV,
     types::CapabilityPolicy,
 };
 
@@ -621,7 +622,7 @@ fn demote(
 /// unrelated crash into one indistinguishable `-1`. `128 + signal` is the long-standing shell
 /// convention for exactly this case and keeps the cause readable in the trace even where
 /// [`classify_resource_limit`] declines to name a limit.
-fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
     status
@@ -689,6 +690,11 @@ pub(crate) fn build_shell_env(
     }
 
     for key in &policy.shell_baseline_env {
+        // Runtime-owned: its value is the session's, carried in `env_overrides`, and a baseline
+        // entry naming it must neither replace that value nor supply one from the host.
+        if key == FORMATION_PEERS_ENV {
+            continue;
+        }
         if let Ok(value) = std::env::var(key) {
             env.insert(key.clone(), value);
         }
@@ -777,15 +783,16 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 /// run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`, built by
 /// [`build_shell_env`].
 ///
-/// [`ARTIFACT_CONFIG_ENV`] is reserved and never resolved from the host, whatever a manifest
-/// allowlists: the name is runtime-owned, and its value comes from the declaring artifact's own
-/// `config:` block or from nowhere. Skipped here rather than relied on being overwritten later,
-/// so a host value cannot reach a guest whose entry declared no config at all.
+/// [`ARTIFACT_CONFIG_ENV`] and [`FORMATION_PEERS_ENV`] are reserved and never resolved from the
+/// host, whatever a manifest allowlists: the names are runtime-owned, and their values come from
+/// the declaring artifact's own `config:` block and from the session, or from nowhere. Skipped
+/// here rather than relied on being overwritten later, so a host value cannot reach a guest whose
+/// entry declared no config at all.
 pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
     for key in &policy.env_allow {
-        if key == ARTIFACT_CONFIG_ENV {
+        if key == ARTIFACT_CONFIG_ENV || key == FORMATION_PEERS_ENV {
             continue;
         }
         if let Ok(value) = std::env::var(key) {

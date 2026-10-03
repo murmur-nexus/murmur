@@ -43,6 +43,7 @@ use commands::{
     ps::run_ps,
     publish::run_publish,
     run::run_run,
+    run_roster::{run_roster, RosterLaunch},
     search::run_search,
     stop::run_stop,
     trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
@@ -75,6 +76,8 @@ struct Cli {
     command: Commands,
 }
 
+// Parsed once per process and matched once: `Run`'s flag set making the enum large costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// List installed artifacts
@@ -220,6 +223,48 @@ enum Commands {
         /// Version of the --capsule artifact to run. Required with --capsule.
         #[arg(long, value_name = "VERSION", requires = "capsule")]
         capsule_version: Option<String>,
+
+        /// The sha256 the --capsule artifact's bytes must hash to. Set by `mur run --roster` on
+        /// every member it starts, so a member runs the bytes roster admission validated.
+        #[arg(long, value_name = "SHA256", requires = "capsule", hide = true)]
+        capsule_sha256: Option<String>,
+
+        /// Never run a task.md found in the workdir at launch; take work only at the door. Set by
+        /// `mur run --roster` on every peer, which shares the roster's project directory with the
+        /// entry member and its task.
+        #[arg(long, hide = true, conflicts_with = "task")]
+        ignore_task_file: bool,
+
+        /// Launch the formation a roster declares, one task, then stop every member.
+        /// Takes the roster's project directory or its roster.yaml; given with no value it means
+        /// ./roster.yaml. Every member runs as its own `mur run` process: the peers first, each
+        /// ready once its door answers, then the entry member with --task. --task, --json,
+        /// --verbose, --no-env-file and --containment are passed through.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "roster.yaml",
+            value_name = "PATH",
+            conflicts_with_all = [
+                "manifest",
+                "capsule",
+                "capsule_version",
+                "capsule_sha256",
+                "ignore_task_file",
+                "spawn_grant_stdin",
+                "system_prompt",
+                "context",
+                "resume",
+                "resume_mode",
+                "forget_session",
+                "lifecycle_task_acceptance",
+                "lifecycle_after_task",
+                "workdir",
+                "bind",
+                "explain_scope",
+            ]
+        )]
+        roster: Option<PathBuf>,
 
         /// Read one line from standard input as this launch's spawn approval.
         /// Set by a parent capsule's runtime when it launches a delegated child; the approval is
@@ -557,9 +602,34 @@ fn main() {
             json,
         } => run_precompile(&files, workdir.as_deref(), json),
         Commands::Run {
+            roster: Some(roster),
+            task,
+            json,
+            verbose,
+            no_env_file,
+            containment,
+            ..
+        } => match run_roster(RosterLaunch {
+            roster: &roster,
+            task: task.as_deref(),
+            json,
+            verbose,
+            no_env_file,
+            containment: containment.as_deref(),
+        }) {
+            // Every member has been stopped and reaped by the time a status comes back, so this
+            // exit leaves nothing running.
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(error) => Err(error),
+        },
+        Commands::Run {
             manifest,
             capsule,
             capsule_version,
+            capsule_sha256,
+            ignore_task_file,
+            roster: None,
             spawn_grant_stdin,
             task,
             system_prompt,
@@ -580,6 +650,8 @@ fn main() {
             &manifest,
             capsule.as_deref(),
             capsule_version.as_deref(),
+            capsule_sha256.as_deref(),
+            ignore_task_file,
             spawn_grant_stdin,
             task.as_deref(),
             system_prompt.as_deref(),

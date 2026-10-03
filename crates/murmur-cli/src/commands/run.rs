@@ -19,15 +19,18 @@ use capsule_runtime::{
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
-    read_lockfile, registry_warning_link, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
-    InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError, MurmurLock,
-    PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
+    read_lockfile, registry_warning_link, sha256_hex, write_lockfile_atomic, ArtifactRuntime,
+    ContainmentClass, InferenceConfig, LocalRegistry, LockOrigin, LockedArtifact, LockfileError,
+    MurmurLock, PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
 
 use crate::{
     commands::trace::{first_task_context_id, resolve_session_dir},
     config::load_effective_mur_config_if_any_exists,
-    error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019},
+    error::{
+        CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_008, E_RUN_015, E_RUN_016, E_RUN_019,
+        E_RUN_047,
+    },
     registry_client::FallbackRegistry,
 };
 
@@ -141,6 +144,8 @@ pub(crate) fn run_run(
     manifest_arg: &Path,
     capsule_arg: Option<&str>,
     capsule_version_arg: Option<&str>,
+    capsule_sha256_arg: Option<&str>,
+    ignore_task_file: bool,
     spawn_grant_stdin: bool,
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
@@ -244,6 +249,22 @@ pub(crate) fn run_run(
     // staging, as an unreadable spawner handle does.
     let formation_id = capsule_runtime::FormationId::from_env()
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    // Beside it and on the same terms: the doors a formation's entry member may call, handed only
+    // to an entry member, and so meaningless — and refused — without a formation id.
+    let formation_peers = capsule_runtime::FormationPeers::from_env()
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    if formation_peers.is_some() && formation_id.is_none() {
+        return Err(fail(
+            &session_id,
+            &workdir,
+            CliError::from(RuntimeError::FormationPeersUnreadable {
+                reason: "it is set, but MURMUR_FORMATION_ID is not, and only a formation's \
+                         entry member is handed peers"
+                    .to_string(),
+            }),
+            json,
+        ));
+    }
 
     // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
     // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
@@ -294,6 +315,27 @@ pub(crate) fn run_run(
         Some((name, version)) => {
             let resolved = resolve_installed_capsule(&project_dir, name, version)
                 .map_err(|error| fail(&session_id, &workdir, error, json))?;
+            // A formation member runs the bytes roster admission validated, or nothing: a
+            // reinstall between admission and launch is a refusal, never a silent swap.
+            if let Some(admitted) = capsule_sha256_arg {
+                let resolved_sha256 = sha256_hex(&resolved.bytes);
+                if resolved_sha256 != admitted {
+                    return Err(fail(
+                        &session_id,
+                        &workdir,
+                        CliError::with_hint(
+                            E_RUN_047,
+                            format!(
+                                "capsule '{name}@{version}' resolved to bytes with sha256 \
+                                 {resolved_sha256}, but it was admitted with sha256 {admitted}"
+                            ),
+                            "the installed artifact changed after the roster was admitted; \
+                             launch the formation again so admission reads what is installed now",
+                        ),
+                        json,
+                    ));
+                }
+            }
             let manifest_yaml =
                 capsule_runtime::artifact::extract_manifest_yaml(name, version, &resolved.bytes)
                     .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
@@ -716,6 +758,8 @@ pub(crate) fn run_run(
         spawn_grant,
         machine_tokens_per_day,
         formation_id,
+        formation_peers,
+        ignore_task_file,
     };
 
     // Stage against project-then-global, the same order `check_artifacts_installed` just

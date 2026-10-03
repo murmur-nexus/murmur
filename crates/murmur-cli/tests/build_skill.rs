@@ -365,6 +365,8 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         },
     )
     .unwrap();

@@ -23,6 +23,12 @@
 //! derived from nothing about the formation, its members or the host, and time-ordered so ids sort
 //! by launch. A value that sessions are grouped on admits no near-misses, so anything else in the
 //! variable — other than nothing at all — refuses the launch.
+//!
+//! **The entry member is also handed addresses.** A formation launcher sets
+//! [`FORMATION_PEERS_ENV`] in its entry member's environment, naming the door of each member the
+//! roster lets the entry member call. Like the id it is read once, by [`FormationPeers::from_env`],
+//! and travels on the session ([`crate::StageRequest::formation_peers`]). Unlike the id it is not
+//! handed to a delegated child.
 
 use std::fmt;
 
@@ -146,8 +152,157 @@ impl<'de> Deserialize<'de> for FormationId {
     }
 }
 
-/// Serializes the unit tests that set or remove [`FORMATION_ID_ENV`] in this test binary's
-/// process environment, which every test thread shares.
+/// The variable a formation launcher sets in its entry member's environment only, naming the
+/// door of every member the roster lets the entry member call.
+///
+/// The entry member's runtime reads it once, through [`FormationPeers::from_env`], and hands it on
+/// as a runtime-owned name to every guest and native process its session starts for itself. A
+/// delegated child is never handed it: an address is not inherited along with the formation id.
+pub const FORMATION_PEERS_ENV: &str = "MURMUR_FORMATION_PEERS";
+
+/// The only scheme a peer address may carry. Members of one formation share a host.
+const PEER_URL_SCHEME: &str = "http://";
+
+/// One member the entry member may call, and the door it answers at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormationPeer {
+    /// The member's roster name, matching `^[a-z][a-z0-9-]{0,31}$`.
+    pub name: String,
+    /// `http://host:port`, with no path.
+    pub url: String,
+}
+
+/// The value of [`FORMATION_PEERS_ENV`]: `name=url` pairs separated by single spaces, in roster
+/// order, with at least one pair.
+///
+/// Space-separated rather than JSON so a shell guest reads it with
+/// `for p in $MURMUR_FORMATION_PEERS` and no parser. Unambiguous, because neither a member name
+/// nor an `http://host:port` URL can contain a space or an `=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormationPeers(Vec<FormationPeer>);
+
+impl FormationPeers {
+    /// The peers in the order given, refused on the same terms [`Self::parse`] refuses a value.
+    pub fn new(peers: Vec<FormationPeer>) -> Result<Self, RuntimeError> {
+        if peers.is_empty() {
+            return Err(peers_unreadable(
+                "it names no peer; a member that may call nobody is handed no variable at all",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (index, peer) in peers.iter().enumerate() {
+            let position = index + 1;
+            if let Some(problem) = murmur_artifact::member_name_format_error(&peer.name) {
+                return Err(peers_unreadable(&format!(
+                    "pair {position} names a member whose name {problem}"
+                )));
+            }
+            if !seen.insert(peer.name.as_str()) {
+                return Err(peers_unreadable(&format!(
+                    "pair {position} names '{}' a second time",
+                    peer.name
+                )));
+            }
+            if let Some(problem) = peer_url_format_error(&peer.url) {
+                return Err(peers_unreadable(&format!(
+                    "pair {position} ('{}') {problem}",
+                    peer.name
+                )));
+            }
+        }
+        Ok(Self(peers))
+    }
+
+    /// Accept `value` only if it is exactly one or more `name=url` pairs joined by single spaces.
+    /// Nothing is trimmed.
+    pub fn parse(value: &str) -> Result<Self, RuntimeError> {
+        if value.trim().is_empty() {
+            return Err(peers_unreadable("it is blank"));
+        }
+        let mut peers = Vec::new();
+        for (index, pair) in value.split(' ').enumerate() {
+            let position = index + 1;
+            if pair.is_empty() {
+                return Err(peers_unreadable(&format!(
+                    "pair {position} is empty; pairs are separated by exactly one space"
+                )));
+            }
+            let Some((name, url)) = pair.split_once('=') else {
+                return Err(peers_unreadable(&format!(
+                    "pair {position} has no '='; each pair is name=url"
+                )));
+            };
+            peers.push(FormationPeer {
+                name: name.to_string(),
+                url: url.to_string(),
+            });
+        }
+        Self::new(peers)
+    }
+
+    /// The peers this session's launcher handed it, read from [`FORMATION_PEERS_ENV`].
+    ///
+    /// `Ok(None)` when the variable is absent, which is every session but a formation's entry
+    /// member, and an entry member that may call nobody. A variable that is present is parsed,
+    /// blank included: a launcher never sets an empty one.
+    pub fn from_env() -> Result<Option<Self>, RuntimeError> {
+        let Some(raw) = std::env::var_os(FORMATION_PEERS_ENV) else {
+            return Ok(None);
+        };
+        Self::parse(&raw.to_string_lossy()).map(Some)
+    }
+
+    /// The variable's value: `name=url` pairs joined by single spaces, in order.
+    pub fn render(&self) -> String {
+        self.0
+            .iter()
+            .map(|peer| format!("{}={}", peer.name, peer.url))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The `(name, value)` pair a launcher writes into the entry member's environment, and the
+    /// entry member's runtime into each of its guests'.
+    pub fn env_pair(&self) -> (&'static str, String) {
+        (FORMATION_PEERS_ENV, self.render())
+    }
+
+    pub fn peers(&self) -> &[FormationPeer] {
+        &self.0
+    }
+}
+
+fn peers_unreadable(reason: &str) -> RuntimeError {
+    RuntimeError::FormationPeersUnreadable {
+        reason: reason.to_string(),
+    }
+}
+
+/// Why `url` is not `http://host:port`, or `None` when it is.
+fn peer_url_format_error(url: &str) -> Option<String> {
+    let Some(authority) = url.strip_prefix(PEER_URL_SCHEME) else {
+        return Some("has a URL that does not start with 'http://'".to_string());
+    };
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Some("has a URL with no port".to_string());
+    };
+    let bracketed_ip = host.len() > 2 && host.starts_with('[') && host.ends_with(']');
+    let plain_host = !host.is_empty()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'));
+    if !(bracketed_ip || plain_host) {
+        return Some("has a URL whose host is not a hostname or an IP address".to_string());
+    }
+    let digits_only = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+    match port.parse::<u16>() {
+        Ok(port) if digits_only && port > 0 => None,
+        _ => Some("has a URL whose port is not a number from 1 to 65535".to_string()),
+    }
+}
+
+/// Serializes the unit tests that set or remove [`FORMATION_ID_ENV`] or [`FORMATION_PEERS_ENV`] in
+/// this test binary's process environment, which every test thread shares.
 #[cfg(test)]
 pub(crate) static FORMATION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -396,5 +551,125 @@ mod tests {
             }
         }
         assert_eq!(reads_here, 1, "FormationId::from_env is the one reader");
+    }
+
+    fn peers_refusal(value: &str) -> String {
+        match FormationPeers::parse(value) {
+            Err(error @ RuntimeError::FormationPeersUnreadable { .. }) => error.to_string(),
+            other => panic!("expected FormationPeersUnreadable for {value:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formation_peers_render_and_parse_round_trip() {
+        let value = "coder=http://localhost:41873 reviewer=http://127.0.0.1:41874";
+        let peers = FormationPeers::parse(value).unwrap();
+        assert_eq!(
+            peers.peers(),
+            &[
+                FormationPeer {
+                    name: "coder".to_string(),
+                    url: "http://localhost:41873".to_string(),
+                },
+                FormationPeer {
+                    name: "reviewer".to_string(),
+                    url: "http://127.0.0.1:41874".to_string(),
+                },
+            ]
+        );
+        assert_eq!(peers.render(), value);
+        assert_eq!(peers.env_pair(), (FORMATION_PEERS_ENV, value.to_string()));
+        assert_eq!(
+            FormationPeers::new(peers.peers().to_vec()).unwrap(),
+            peers,
+            "new and parse agree"
+        );
+        let single = FormationPeers::parse("a=http://[::1]:9").unwrap();
+        assert_eq!(single.render(), "a=http://[::1]:9");
+    }
+
+    #[test]
+    fn formation_peers_parse_refuses_every_malformed_value() {
+        for (value, wording) in [
+            (
+                "Coder=http://localhost:1",
+                "must start with a lowercase letter",
+            ),
+            (
+                "co_der=http://localhost:1",
+                "pair 1 names a member whose name",
+            ),
+            (
+                "coder=http://localhost:1 coder=http://localhost:2",
+                "pair 2 names 'coder' a second time",
+            ),
+            ("coder", "pair 1 has no '='"),
+            ("coder=http://localhost:1 reviewer", "pair 2 has no '='"),
+            ("coder=https://localhost:1", "does not start with 'http://'"),
+            ("coder=localhost:1", "does not start with 'http://'"),
+            ("coder=http://localhost", "no port"),
+            ("coder=http://localhost:0", "port is not a number"),
+            ("coder=http://localhost:99999", "port is not a number"),
+            ("coder=http://localhost:1/x", "port is not a number"),
+            ("coder=http://:1", "host is not"),
+            (
+                "coder=http://localhost:1  reviewer=http://localhost:2",
+                "pair 2 is empty",
+            ),
+            (" coder=http://localhost:1", "pair 1 is empty"),
+            ("coder=http://localhost:1 ", "pair 2 is empty"),
+            ("", "it is blank"),
+            ("   ", "it is blank"),
+        ] {
+            let message = peers_refusal(value);
+            assert!(message.contains(wording), "{value:?}: {message}");
+            assert!(message.contains(FORMATION_PEERS_ENV), "{message}");
+        }
+        assert!(FormationPeers::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn formation_peers_are_read_from_the_process_environment_only_when_present() {
+        let _guard = env_guard();
+        std::env::remove_var(FORMATION_PEERS_ENV);
+        assert_eq!(FormationPeers::from_env().unwrap(), None);
+
+        std::env::set_var(FORMATION_PEERS_ENV, "coder=http://localhost:7");
+        let read = FormationPeers::from_env();
+        std::env::set_var(FORMATION_PEERS_ENV, "");
+        let blank = FormationPeers::from_env();
+        std::env::remove_var(FORMATION_PEERS_ENV);
+
+        assert_eq!(read.unwrap().unwrap().render(), "coder=http://localhost:7");
+        assert!(matches!(
+            blank,
+            Err(RuntimeError::FormationPeersUnreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn the_formation_peers_are_read_from_the_process_environment_in_one_place() {
+        let mut sources = sources_of("capsule-runtime");
+        sources.extend(sources_of("murmur-cli"));
+        let names_the_variable = |args: &&str| {
+            args.contains("MURMUR_FORMATION_PEERS") || args.contains("FORMATION_PEERS_ENV")
+        };
+        let mut reads_here = 0;
+        for (path, text) in sources {
+            let reads = env_reads(crate::source_scan::production_part(&text))
+                .into_iter()
+                .filter(names_the_variable)
+                .count();
+            if path == "capsule-runtime/src/formation.rs" {
+                reads_here = reads;
+            } else {
+                assert_eq!(
+                    reads, 0,
+                    "{path} reads the formation's peers from the process environment; only \
+                     FormationPeers::from_env does"
+                );
+            }
+        }
+        assert_eq!(reads_here, 1, "FormationPeers::from_env is the one reader");
     }
 }
