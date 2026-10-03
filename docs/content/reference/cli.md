@@ -892,7 +892,7 @@ mur run [--manifest <path>] [--task <path-or-text>] [--json]
 | `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
 | `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines. An address off loopback on a capsule declaring no [`network.authentication`](manifest.md#field-network-authentication) prints [`W-SEC-032`](diagnostics.md#w-sec-032) on stderr |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |
-| `--verbose`, `-v` | off | Add `workdir:`, `manifest:`, `driver:` and `skills:` to the startup lines |
+| `--verbose`, `-v` | off | Add `workdir:`, `manifest:`, `driver:` and `skills:` to the startup lines, and `formation:` for a [formation member](#mur-run-formation) |
 | `--lifecycle-task-acceptance` | — | Override `lifecycle.task_acceptance` (`none`\|`single`\|`queue`) |
 | `--lifecycle-after-task` | — | Override `lifecycle.after_task` (`exit`\|`sleep`). The resolved value is the one [`W-SEC-024`](diagnostics.md#w-sec-024) reports, so `--explain-scope` previews the warning this override produces; a value outside the two is refused there as on a real run |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
@@ -924,6 +924,25 @@ session: ses_019f01a940ce7761854e768ecbe3d399
 A token is valid until the session ends. A line carrying a token that standard output refuses is
 dropped, never written to `logs/bootstrap.log`. What each token reaches is in
 [Agent Card: Security](agent-card.md#tokens).
+
+<span id="mur-run-formation"></span>**Formation membership.** A session launched with
+[`MURMUR_FORMATION_ID`](roost-api.md#environment-variables) set to a formation id is a member of
+that formation, and every child it delegates to joins the same one. A session launched without it
+belongs to no formation and prints neither of these:
+
+| Mode | Output |
+|---|---|
+| Human | `--verbose` adds `formation: <formation-id>` after the other startup lines |
+| `--json` | The readiness line gains `"formation_id": "<formation-id>"` |
+
+```json
+{"formation_id":"frm_019f01a93ff27c1e9a3b5d0c4e8f2a61","name":"researcher","pid":48213,"session_id":"ses_019f01a940ce7761854e768ecbe3d399","url":"localhost:41873","version":"0.1.0","workdir":"/home/me/project/.murmur/ses_019f01a940ce7761854e768ecbe3d399"}
+```
+
+The variable is read before the workspace `.env` is loaded, so a `.env` line naming it has no
+effect. A value that is not a formation id refuses the launch with
+[`E-RUN-044`](diagnostics.md#e-run-044). `mur run --resume` joins a formation only when its own
+environment names one.
 
 **Registration.** A capsule whose manifest declares `capabilities.spawn.allow`, and any capsule
 launched with `--spawn-grant-stdin`, registers with the daemon named by `MURMUR_ROOST_URL` at

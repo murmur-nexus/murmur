@@ -173,4 +173,4 @@ line up against the step's own `plan_step` line, are described in the
 
 The child is launched knowing which session and conversation started it, so its own
 `session_start` carries `spawned_by` and `delegation_id`. Joining a parent to its children is
-described under [Reading a formation](observability-schemas.md#delegation-lineage).
+described under [Reading a delegation tree](observability-schemas.md#delegation-lineage).

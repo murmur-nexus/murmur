@@ -97,6 +97,7 @@ section that explains it.
 | `E-RUN-041` | A capsule declaring `control:` could not write its control token beside its running record, and did not launch | [E-RUN-041](#e-run-041) |
 | `E-RUN-042` | `mur control` named a session with no control surface, or the control surface refused the request | [E-RUN-042](#e-run-042) |
 | `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, with `gateway:`, or bound as `inference.system_prompt_artifact` | [E-RUN-043](#e-run-043) |
+| `E-RUN-044` | `MURMUR_FORMATION_ID` is set to something that is not a formation id | [E-RUN-044](#e-run-044) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -828,6 +829,24 @@ message.
 
 `mur install <name>@<version>` rewrites the entry as `origin: operator` and the next launch stages
 it. [`mur doctor`](cli.md#mur-doctor) reports the same refusal ahead of a run.
+
+### E-RUN-044 — the formation id could not be read { #e-run-044 }
+
+A session launched as a member of a formation is handed
+[`MURMUR_FORMATION_ID`](roost-api.md#environment-variables), and it hands the same value to every
+child it delegates to. A formation id is `frm_` followed by 32 lowercase hex digits. Any other
+value refuses the launch before a session directory exists:
+
+```text
+error[E-RUN-044]: MURMUR_FORMATION_ID does not carry a formation id: it does not start with 'frm_'; a session that cannot tell which formation it belongs to would be grouped with the wrong one, so the launch is refused
+  hint: MURMUR_FORMATION_ID is set by the runtime that launches a formation's members and by a member's runtime for the children it spawns; unset it to run this capsule on its own
+```
+
+The reason names what is wrong — the prefix, the number of digits, or a character outside
+lowercase hex — and never the value itself.
+
+An unset or blank `MURMUR_FORMATION_ID` is not this error: it is the ordinary case of a session in
+no formation, which runs exactly as it would have.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

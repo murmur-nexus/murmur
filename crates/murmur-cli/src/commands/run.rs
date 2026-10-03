@@ -238,6 +238,12 @@ pub(crate) fn run_run(
     if let Err(error) = capsule_runtime::SpawnerHandle::from_env() {
         return Err(fail(&session_id, &workdir, CliError::from(error), json));
     }
+    // The formation this session is a member of, read once and carried on the session from here.
+    // Ahead of the workspace `.env` load, so only the launcher — never a file in the project —
+    // can place a session in a formation; a value that is not a formation id refuses before
+    // staging, as an unreadable spawner handle does.
+    let formation_id = capsule_runtime::FormationId::from_env()
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
 
     // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
     // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
@@ -709,6 +715,7 @@ pub(crate) fn run_run(
             .and_then(|network| network.authentication.clone()),
         spawn_grant,
         machine_tokens_per_day,
+        formation_id,
     };
 
     // Stage against project-then-global, the same order `check_artifacts_installed` just
@@ -768,6 +775,7 @@ pub(crate) fn run_run(
     // Read before `staged` moves into the launch. Printed only to stdout, and only once the door
     // is bound: a token is the credential for a door that exists.
     let door_tokens = staged.door_tokens();
+    let formation_id = staged.formation_id().cloned();
 
     if json {
         let session_id_for_closure = session_id.clone();
@@ -788,6 +796,10 @@ pub(crate) fn run_run(
                 "version": capsule_version,
                 "workdir": accessible_workdir_for_json.to_string_lossy(),
             });
+            // Present only for a formation member: a session in no formation has no id to name.
+            if let Some(id) = &formation_id {
+                ready["formation_id"] = serde_json::Value::from(id.as_str());
+            }
             if door_tokens.is_empty() || url.is_empty() {
                 capsule_runtime::runtime_out!("{ready}");
             } else {
@@ -846,7 +858,9 @@ pub(crate) fn run_run(
                 if skill_count > 0 {
                     capsule_runtime::runtime_out!("skills: {skill_count} installed");
                 }
-                // TODO(formation): print formation_id here once formation IDs are assigned at mur run time
+                if let Some(ref id) = formation_id {
+                    capsule_runtime::runtime_out!("formation: {id}");
+                }
             }
         }) {
             Ok(launched) => {

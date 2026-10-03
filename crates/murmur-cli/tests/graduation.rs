@@ -235,6 +235,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap();

@@ -87,6 +87,7 @@ fn stage(home: &TempDir, manifest: &Path) -> StagedSession {
                 .and_then(|network| network.authentication.clone()),
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .unwrap()

@@ -116,6 +116,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .expect("stage_session should succeed");
@@ -224,6 +225,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .expect("stage_session should succeed without shell-desc driver");
@@ -337,6 +339,7 @@ fn shell_desc_driver_respects_custom_manifest() {
             door_authentication: None,
             spawn_grant: None,
             machine_tokens_per_day: None,
+            formation_id: None,
         },
     )
     .expect("stage_session should succeed");

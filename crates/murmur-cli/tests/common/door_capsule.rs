@@ -105,6 +105,7 @@ impl MurRun {
             .env("HOME", home)
             .env_remove("NEXUS_API_KEY")
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
+            .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

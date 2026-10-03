@@ -195,6 +195,7 @@ fn stage_request(project_dir: &Path, manifest: &RuntimeManifest) -> StageRequest
         door_authentication: None,
         spawn_grant: None,
         machine_tokens_per_day: None,
+        formation_id: None,
     }
 }
 
