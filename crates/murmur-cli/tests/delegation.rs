@@ -124,6 +124,7 @@ impl RecordingRoost {
             max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             // One daemon serves every case in this suite, so its host census is the suite's total.
             max_live_capsules: u32::MAX,
+            inherited: Default::default(),
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
 

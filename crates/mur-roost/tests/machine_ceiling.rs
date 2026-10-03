@@ -189,7 +189,9 @@ fn depth_still_outranks_the_machine_ceiling() {
 #[test]
 fn the_daemon_reports_the_ceiling_it_derived() {
     let registry = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_mur-roost"))
+        .env("HOME", home.path())
         .args([
             "--port",
             "0",
@@ -223,7 +225,9 @@ fn the_daemon_reports_the_ceiling_it_derived() {
 #[test]
 fn the_ceiling_flag_rejects_a_value_that_is_not_a_number() {
     let registry = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_mur-roost"))
+        .env("HOME", home.path())
         .args([
             "--max-live-capsules",
             "notanumber",

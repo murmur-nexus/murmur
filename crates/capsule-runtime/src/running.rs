@@ -134,34 +134,73 @@ pub fn running_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Every record that parses, most recent session first.
+/// `~/.murmur/running`, resolved from `HOME` without creating or re-moding anything.
 ///
-/// Session ids are time-ordered, so a lexical sort descending is chronological. A file that does
-/// not parse is unlinked on the way past: nothing can verify it, and leaving it would mean
-/// carrying a permanent unreadable entry in a directory whose whole purpose is to be read.
+/// For a reader that must leave the directory exactly as it found it — a missing directory stays
+/// missing. [`running_dir`] is the resolver for anything that writes.
 ///
-/// The `Err` is the directory being unusable — `~/.murmur/running` cannot be created, held at
-/// `0700`, or listed — and names the path and the OS error. An empty machine is `Ok` with no
-/// records, so a caller can tell the two apart.
-pub fn list() -> Result<Vec<RunningRecord>, String> {
-    let dir = running_dir()?;
-    let entries = std::fs::read_dir(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+/// The `Err` is `HOME` being unset or not absolute.
+pub fn running_dir_location() -> Result<PathBuf, String> {
+    Ok(crate::state_store::murmur_home_dir()?.join(RUNNING_DIR))
+}
 
-    let mut records = Vec::new();
+/// What one pass over a running directory found.
+#[derive(Debug, Default)]
+pub struct RecordScan {
+    /// Every record that parses, most recent session first.
+    pub records: Vec<RunningRecord>,
+    /// Every `.json` file that could not be read or did not parse, left where it is.
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// Every `.json` entry of `dir`, read and parsed, with nothing created, re-moded or removed.
+///
+/// Session ids are time-ordered, so a lexical sort descending is chronological. Only the `json`
+/// extension is read: the staging file [`RunningGuard::write`] renames into place ends in `.tmp`,
+/// so a record mid-write is neither a record nor unreadable.
+///
+/// A `dir` that does not exist is an empty machine. The `Err` is any other failure to list it —
+/// a path that is a regular file, or one this user may not read — and names the path and the OS
+/// error.
+pub fn scan(dir: &Path) -> Result<RecordScan, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(RecordScan::default()),
+        Err(err) => return Err(format!("{}: {err}", dir.display())),
+    };
+
+    let mut scan = RecordScan::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
         match read_record(&path) {
-            Some(record) => records.push(record),
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+            Some(record) => scan.records.push(record),
+            None => scan.unreadable.push(path),
         }
     }
-    records.sort_by(|left, right| right.session_id.cmp(&left.session_id));
-    Ok(records)
+    scan.records
+        .sort_by(|left, right| right.session_id.cmp(&left.session_id));
+    Ok(scan)
+}
+
+/// Every record that parses, most recent session first.
+///
+/// A file that does not parse is unlinked on the way past: nothing can verify it, and leaving it
+/// would mean carrying a permanent unreadable entry in a directory whose whole purpose is to be
+/// read.
+///
+/// The `Err` is the directory being unusable — `~/.murmur/running` cannot be created, held at
+/// `0700`, or listed — and names the path and the OS error. An empty machine is `Ok` with no
+/// records, so a caller can tell the two apart.
+pub fn list() -> Result<Vec<RunningRecord>, String> {
+    let dir = running_dir()?;
+    let scan = scan(&dir)?;
+    for path in &scan.unreadable {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(scan.records)
 }
 
 /// What layers 1 and 2 say about the process a record names.
@@ -1075,5 +1114,96 @@ mod home_tests {
             return;
         }
         running_dir().unwrap();
+    }
+
+    #[test]
+    fn running_dir_location_creates_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::run_with_home(
+            "running::home_tests::inner_running_dir_location_creates_nothing",
+            home.path(),
+        );
+        assert!(!home.path().join(".murmur").exists());
+    }
+
+    #[test]
+    #[ignore = "run by running_dir_location_creates_nothing"]
+    fn inner_running_dir_location_creates_nothing() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            running_dir_location().unwrap(),
+            home.join(".murmur").join(RUNNING_DIR)
+        );
+        assert!(!home.join(".murmur").exists());
+    }
+
+    fn record(session_id: &str) -> RunningRecord {
+        RunningRecord {
+            session_id: session_id.to_string(),
+            url: "127.0.0.1:1".to_string(),
+            pid: 1,
+            process_start: "42".to_string(),
+            capsule_name: "demo".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            workdir: PathBuf::from("/tmp/demo"),
+            outlives_launcher: true,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            door_token: None,
+            formation_id: None,
+        }
+    }
+
+    #[test]
+    fn scan_reports_an_unparseable_file_and_leaves_it_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = record("ses_0199c4e2f1b7712a9d3e4f5061728390");
+        let newer = record("ses_0199c4e2f1b7712a9d3e4f5061728391");
+        for record in [&older, &newer] {
+            std::fs::write(
+                record_path(dir.path(), &record.session_id),
+                serde_json::to_vec(record).unwrap(),
+            )
+            .unwrap();
+        }
+        let broken = dir.path().join("ses_broken.json");
+        std::fs::write(&broken, "{").unwrap();
+        let staging = dir.path().join(".ses_x.json.1.2.tmp");
+        std::fs::write(&staging, "{").unwrap();
+        let control = token_path(dir.path(), &older.session_id);
+        std::fs::write(&control, "ctl1.token.mac").unwrap();
+
+        let scan = scan(dir.path()).unwrap();
+
+        assert_eq!(scan.records, vec![newer, older]);
+        assert_eq!(scan.unreadable, vec![broken.clone()]);
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{");
+        assert!(staging.exists());
+        assert!(control.exists());
+    }
+
+    #[test]
+    fn scan_of_a_missing_directory_is_empty_and_creates_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join(".murmur").join(RUNNING_DIR);
+
+        let scan = scan(&dir).unwrap();
+
+        assert!(scan.records.is_empty());
+        assert!(scan.unreadable.is_empty());
+        assert!(!parent.path().join(".murmur").exists());
+    }
+
+    #[test]
+    fn scan_of_a_regular_file_errs_naming_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let file = parent.path().join(RUNNING_DIR);
+        std::fs::write(&file, "").unwrap();
+
+        let err = scan(&file).unwrap_err();
+
+        assert!(err.starts_with(&format!("{}: ", file.display())), "{err}");
     }
 }
