@@ -130,11 +130,7 @@ pub(crate) fn parse_header(line: &str) -> Option<RecordHeader> {
 /// time — which is what lets a dropped id be placed against a truncation marker without the
 /// messages themselves.
 pub(crate) fn message_id_timestamp_ms(id: &str) -> Option<u64> {
-    let hex = id.strip_prefix("msg_")?;
-    if hex.len() < 12 {
-        return None;
-    }
-    u64::from_str_radix(&hex[..12], 16).ok()
+    crate::retention::uuid_v7_timestamp_ms(id, "msg_")
 }
 
 /// Whether `value` is usable as one directory segment of a record path.

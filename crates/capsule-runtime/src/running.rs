@@ -60,9 +60,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field but `door_token` and `formation_id` is required. There is no version field: a record that does not
-/// deserialize names no process that could be checked, and is pruned, which is what "the record
-/// is a hint" already means.
+/// Every field but `door_token` and `formation_id` is required. There is no version field: a
+/// record that does not deserialize names no process that could be checked, and is pruned, which
+/// is what "the record is a hint" already means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningRecord {
     /// The session this door answers for, compared against the agent card by layer 3.
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(back, member);
     }
 
-    /// A standalone session's record is what it was before records could name a formation.
+    /// A standalone session's record carries no formation key at all, not a null one.
     #[test]
     fn a_standalone_record_has_no_formation_key() {
         let body = serde_json::to_string_pretty(&record(1, "42")).unwrap();

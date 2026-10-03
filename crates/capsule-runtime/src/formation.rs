@@ -109,9 +109,8 @@ impl FormationId {
     /// A member's session is minted after the formation it joins, so a reader looking for members
     /// can pass over every session older than this.
     pub fn minted_at_ms(&self) -> u64 {
-        let digits = &self.0[FORMATION_ID_PREFIX.len()..FORMATION_ID_PREFIX.len() + 12];
-        // `parse` and `mint` admit only lowercase hex, so these 12 digits always read.
-        u64::from_str_radix(digits, 16).unwrap_or(0)
+        // `parse` and `mint` admit only 32 lowercase hex digits, so this always reads.
+        crate::retention::uuid_v7_timestamp_ms(&self.0, FORMATION_ID_PREFIX).unwrap_or(0)
     }
 
     /// The `(name, value)` pair a launcher writes into a member's or a child's environment.

@@ -1142,7 +1142,7 @@ ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0  my-agent@0.2.0            running       no
 formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61: 2 listed (1 running, 1 unreachable), 1 pruned now; not listed: 1 ended
 ```
 
-A summary line never says a formation is whole. It reads:
+A summary line counts what it found and never reports a formation as complete. It reads:
 
 ```text
 formation <id>: <L> listed (<statuses>)[, <P> pruned now][; <not-listed>][; <U> session root(s) could not be read]
@@ -1157,11 +1157,9 @@ formation <id>: <L> listed (<statuses>)[, <P> pruned now][; <not-listed>][; <U> 
 | `; <U> session root(s) could not be read` | Session roots that exist and could not be listed. Only when non-zero |
 
 <span id="mur-ps-session-roots"></span>The session roots searched are the directories holding a
-listed or pruned member's session directory. In each, `mur ps` reads only the first line of the
-`trace.jsonl` of sessions started after the formation id was minted, and reads a whole trace only
-for a member, to find its `session_end`. A session root that cannot be read is counted on the
-summary line and never fails `mur ps`. [`mur trace show <formation-id>`](#mur-trace-show) lists
-the members of one root by name.
+listed or pruned member's session directory — the `workdir/` of each project a member was launched
+from. A member that ran under another root and has no record is not counted.
+[`mur trace show <formation-id>`](#mur-trace-show-formation) lists the members of one root by name.
 
 ---
 

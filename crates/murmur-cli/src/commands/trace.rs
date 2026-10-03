@@ -3178,6 +3178,7 @@ pub(crate) fn run_trace_show(
         // Written by a runtime, so it parses; a value that does not names no formation to list.
         if let (Ok(formation), Some(root)) = (FormationId::parse(formation), session_root(&path)) {
             let found = recorded_members(&root, &formation)?;
+            println!();
             print_formation(&formation, &root, &found);
         }
     }

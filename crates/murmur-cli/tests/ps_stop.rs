@@ -2164,6 +2164,17 @@ fn ps_counts_a_formations_pruned_and_unreachable_members() {
             "formation {formation}: 2 listed (1 running, 1 unreachable), 1 pruned now; no other member found in 1 session root"
         )]
     );
+
+    // The dead record went with the first read: a second neither lists nor prunes it.
+    let (stdout, stderr) = ps_output(home.path());
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    assert!(!stdout.contains(&dead), "{stdout}");
+    assert_eq!(
+        summary_lines(&stdout),
+        [format!(
+            "formation {formation}: 2 listed (1 running, 1 unreachable); no other member found in 1 session root"
+        )]
+    );
 }
 
 const STATUS_UNREACHABLE_CELL: &str = " unreachable ";
@@ -2239,8 +2250,9 @@ fn a_formation_is_accounted_for_after_its_members_end() {
         assert!(row.contains("member@0.1.0"), "{shown}");
     }
     assert!(member_rows[0].ends_with("  no session_end"), "{shown}");
-    assert!(!member_rows[1].contains("no session_end"), "{shown}");
-    assert!(!member_rows[2].contains("no session_end"), "{shown}");
+    // `mur stop` ends a member cleanly, and its row carries that `session_end.exit_status`.
+    assert!(member_rows[1].ends_with("  ok"), "{shown}");
+    assert!(member_rows[2].ends_with("  ok"), "{shown}");
 
     let shown = mur(home.path())
         .args(["trace", "show", &survivor.session_id(), "--workdir"])
@@ -2258,7 +2270,7 @@ fn a_formation_is_accounted_for_after_its_members_end() {
         )),
         "{shown}"
     );
-    assert!(shown.contains("── Formation "), "{shown}");
+    assert!(shown.contains("\n\n── Formation "), "{shown}");
     assert_eq!(
         shown.lines().filter(|l| l.starts_with("ses_")).count(),
         3,
@@ -2298,6 +2310,10 @@ fn trace_show_refuses_a_formation_it_cannot_find() {
         .failure()
         .get_output()
         .clone();
+    assert!(
+        output.stdout.is_empty(),
+        "a refusal prints no Formation section"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(stderr.contains("E-TRC-002"), "{stderr}");
     assert!(
@@ -2315,6 +2331,10 @@ fn trace_show_refuses_a_formation_it_cannot_find() {
         .failure()
         .get_output()
         .clone();
+    assert!(
+        output.stdout.is_empty(),
+        "a refusal prints no Formation section"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(stderr.contains("E-TRC-002"), "{stderr}");
     assert!(

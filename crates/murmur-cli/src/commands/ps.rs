@@ -42,8 +42,8 @@ const STATUS_UNREACHABLE: &str = "unreachable";
 /// capsule, and unlinking it would throw away the only handle to something still running.
 ///
 /// When any listed or pruned record names a formation, the table gains a `FORMATION` column, a
-/// formation's rows are kept together, and one summary line per formation follows the table. A
-/// machine with no member prints exactly what it printed before formations existed.
+/// formation's rows are kept together, and one summary line per formation follows the table. With
+/// no member, there is neither the column nor a summary line.
 ///
 /// A record directory that cannot be read fails with `E-RUN-028` and prints nothing on stdout.
 /// Nothing a formation summary reads can fail the command.
