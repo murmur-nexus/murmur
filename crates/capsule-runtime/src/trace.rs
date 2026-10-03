@@ -1371,6 +1371,19 @@ struct HookDispatchErrorEvent {
     arm: String,
 }
 
+/// A formation member's lifeline read EOF: the formation it belongs to has ended, and this
+/// session is winding down because of it. Written only when the lifeline is what began the
+/// session's termination.
+#[derive(Serialize)]
+struct FormationEndedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    formation_id: String,
+}
+
 #[derive(Serialize)]
 struct ResourceListEvent {
     event_type: &'static str,
@@ -3426,6 +3439,20 @@ impl ResourceTraceAppender {
             generation,
             containment_achieved,
             reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records `formation_ended`, hung off the session node. Failures are swallowed: a member
+    /// whose trace cannot be written still winds down.
+    pub(crate) async fn write_formation_ended(&self, formation_id: &crate::FormationId) {
+        let event = FormationEndedEvent {
+            event_type: "formation_ended",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            formation_id: formation_id.as_str().to_string(),
         };
         self.append(&event).await;
     }

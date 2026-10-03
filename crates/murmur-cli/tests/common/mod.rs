@@ -1101,3 +1101,63 @@ pub fn assert_a2a_agent_card(card: &Value) {
         panic!("the served card is not an A2A v1.0 AgentCard: {errors:#?}\n{card:#}");
     }
 }
+
+/// Every record of the `trace.jsonl` at `path`, asserting that the file ends in a newline and that
+/// every line parses: a trace with a torn tail is not a readable one.
+pub fn read_whole_trace(path: &Path) -> Vec<Value> {
+    let trace = fs::read_to_string(path).unwrap();
+    assert!(trace.ends_with('\n'), "{}: a torn tail", path.display());
+    trace
+        .lines()
+        .enumerate()
+        .map(|(number, line)| {
+            serde_json::from_str(line).unwrap_or_else(|_| {
+                panic!(
+                    "{}: line {} does not parse: {line}",
+                    path.display(),
+                    number + 1
+                )
+            })
+        })
+        .collect()
+}
+
+/// Each record's `event_type`, in file order.
+pub fn event_kinds(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .map(|event| event["event_type"].as_str().unwrap_or_default())
+        .collect()
+}
+
+/// A formation member wound down because its formation ended: exactly one `formation_ended`
+/// naming `formation_id` and carrying its own ids and timestamp, ahead of every record the
+/// wind-down writes — each `task_canceled`, `task_rejected` and cancelled `task_end` — and
+/// `session_end` last. A task the member finished before its formation ended keeps its earlier
+/// `task_end`.
+pub fn assert_wound_down_by_formation(events: &[Value], formation_id: &str) {
+    let kinds = event_kinds(events);
+    let ended: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == "formation_ended")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(ended.len(), 1, "{kinds:?}");
+    let record = &events[ended[0]];
+    assert_eq!(record["formation_id"], formation_id, "{kinds:?}");
+    assert!(record["event_id"].as_str().is_some(), "{record}");
+    assert!(record["parent_id"].as_str().is_some(), "{record}");
+    assert!(record["timestamp"].as_u64().is_some(), "{record}");
+    for (index, event) in events.iter().enumerate() {
+        let wound_down = match kinds[index] {
+            "task_canceled" | "task_rejected" => true,
+            "task_end" => event["exit_status"] == "canceled",
+            _ => false,
+        };
+        if wound_down {
+            assert!(index > ended[0], "{kinds:?}");
+        }
+    }
+    assert_eq!(kinds.last(), Some(&"session_end"), "{kinds:?}");
+}

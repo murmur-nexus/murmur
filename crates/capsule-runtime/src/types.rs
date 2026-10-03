@@ -649,6 +649,11 @@ pub struct StagedSession {
     pub(crate) formation_member: Option<Arc<FormationMember>>,
     /// Copied from [`StageRequest::ignore_task_file`].
     pub(crate) ignore_task_file: bool,
+    /// This member's formation lifeline, attached after staging by
+    /// [`StagedSession::attach_formation_lifeline`]. A process property rather than a staged
+    /// one, so it never travels on [`StageRequest`].
+    #[cfg(unix)]
+    pub(crate) formation_lifeline: Option<crate::lifeline::FormationLifeline>,
 }
 
 impl StagedSession {
@@ -679,6 +684,15 @@ impl StagedSession {
     /// The formation this session is a member of, or `None` for a session nobody placed in one.
     pub fn formation_id(&self) -> Option<&FormationId> {
         self.formation_id.as_ref()
+    }
+
+    /// Hand this session the lifeline its process was launched with. Honoured only by
+    /// [`crate::launch_session_handling_sigterm`] on an agent capsule: every other launch of a
+    /// session holding one is refused with [`crate::RuntimeError::FormationLifelineUnreadable`]
+    /// before anything is instantiated.
+    #[cfg(unix)]
+    pub fn attach_formation_lifeline(&mut self, lifeline: crate::lifeline::FormationLifeline) {
+        self.formation_lifeline = Some(lifeline);
     }
 }
 

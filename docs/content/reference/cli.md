@@ -1000,6 +1000,11 @@ effect. A value that is not a formation id refuses the launch with
 [`E-RUN-044`](diagnostics.md#e-run-044). `mur run --resume` joins a formation only when its own
 environment names one.
 
+[`MURMUR_FORMATION_LIFELINE`](roost-api.md#environment-variables) is set beside it by
+`mur run --roster` and is not for operators. A member launched by hand without it prints
+[`W-RUN-007`](diagnostics.md#w-run-007) — see
+[A member started by hand](roster.md#launch-stop).
+
 **Registration.** A capsule whose manifest declares `capabilities.spawn.allow`, and any capsule
 launched with `--spawn-grant-stdin`, registers with the daemon named by `MURMUR_ROOST_URL` at
 launch and is retired from it when the session ends. A registration that cannot be completed
@@ -1130,7 +1135,7 @@ Every line a peer writes to stderr, and every stdout line after its readiness li
 launcher's stderr behind a `[<member>] ` prefix:
 
 ```text
-[coder] [capsule-runtime] SIGTERM received — cancelling live tasks and ending the session
+[coder] [capsule-runtime] formation lifeline closed — the formation has ended; cancelling live tasks and ending the session
 ```
 
 The entry member writes to the launcher's own stdout and stderr, unprefixed, and stays in the
@@ -1142,8 +1147,9 @@ launcher's process group, so `^C` at a terminal reaches it as it reaches a hand-
 | A refusal before the entry member started — admission ([`E-ROS-*`](diagnostics.md#e-ros-001), `E-REG-005`), [`E-RUN-045`](diagnostics.md#e-run-045), [`E-RUN-046`](diagnostics.md#e-run-046) | 1 |
 | The launcher received `SIGINT`, `SIGTERM` or `SIGHUP` | 130, 143 or 129 |
 
-By the time the launcher exits, every member it started has been stopped and reaped, except after
-a `SIGKILL` of the launcher itself, which leaves the members running.
+By the time the launcher exits, every member it started has been stopped and reaped. A launcher
+killed with `SIGKILL`, or by the OOM killer, stops none itself; each member then winds down on its
+own lifeline. See [How a formation ends](roster.md#launch-stop).
 
 ---
 

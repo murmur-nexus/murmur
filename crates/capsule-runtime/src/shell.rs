@@ -1210,6 +1210,31 @@ mod tests {
         assert!(env.is_empty());
     }
 
+    /// The lifeline variable names a descriptor of the member's own process: neither an
+    /// `env.allow` nor a `shell.baseline_env` declaration resolves it from the host.
+    #[test]
+    fn declared_and_shell_env_never_carry_the_formation_lifeline() {
+        use crate::lifeline::FORMATION_LIFELINE_ENV;
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempdir().unwrap();
+        std::env::set_var(FORMATION_LIFELINE_ENV, "7");
+        let policy = CapabilityPolicy {
+            env_allow: vec![FORMATION_LIFELINE_ENV.to_string()],
+            shell_baseline_env: vec![FORMATION_LIFELINE_ENV.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let declared = build_declared_env(&policy);
+        let shell = build_shell_env(&policy, &[], temp.path()).unwrap();
+        std::env::remove_var(FORMATION_LIFELINE_ENV);
+        assert!(
+            !declared.contains_key(FORMATION_LIFELINE_ENV),
+            "{declared:?}"
+        );
+        assert!(!shell.contains_key(FORMATION_LIFELINE_ENV), "{shell:?}");
+    }
+
     #[test]
     fn declared_env_passes_through_declared_host_var() {
         std::env::set_var("MURMUR_TEST_WASI_ALLOWED", "host-value");

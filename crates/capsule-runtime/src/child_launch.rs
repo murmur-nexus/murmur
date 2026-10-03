@@ -401,6 +401,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         inherit_output: false,
         own_process_group: false,
         inherit_fd: None,
+        #[cfg(unix)]
+        lifeline: None,
     })
     .map_err(|error| {
         RuntimeError::Runtime(format!(
@@ -655,8 +657,9 @@ fn watch_for_completion(
 /// so a child cannot displace the daemon URL it is required to register with, the handle it
 /// reports its outcome to, or the formation it joins, by allowlisting the name.
 /// A formation member's names ([`crate::formation::is_member_grant_env`]) are never handed on at
-/// all: inheriting a formation is not a grant, so a member's child holds no channel, no token and
-/// no callee, and a child that allowlists either name receives nothing.
+/// all: inheriting a formation is not a grant, so a member's child holds no channel, no token, no
+/// callee and no lifeline (its parent session contains it), and a child that allowlists any of the
+/// names receives nothing.
 pub(crate) fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
@@ -894,6 +897,10 @@ pub(crate) struct ProcessLaunch<'a> {
     /// member's channel. It is close-on-exec here, so no other process this one starts inherits
     /// it, and the flag is cleared in the started process alone, just before it execs.
     pub(crate) inherit_fd: Option<i32>,
+    /// A formation member's lifeline, whose read end the process is handed. Every lifeline end is
+    /// created close-on-exec, and this is the one the member's spawn clears it on.
+    #[cfg(unix)]
+    pub(crate) lifeline: Option<&'a crate::lifeline::MemberLifeline>,
 }
 
 /// A process [`start_process`] started, with its stderr already being drained.
@@ -953,6 +960,12 @@ pub(crate) fn start_process(launch: &ProcessLaunch<'_>) -> std::io::Result<Start
     #[cfg(unix)]
     if let Some(fd) = launch.inherit_fd {
         keep_across_exec(&mut command, fd);
+    }
+    // No `apply_fd_hygiene` here: it fails the spawn outright on a kernel without
+    // `CLOSE_RANGE_CLOEXEC`, and a lifeline needs none, since both ends are created close-on-exec.
+    #[cfg(unix)]
+    if let Some(lifeline) = launch.lifeline {
+        lifeline.hand_to(&mut command);
     }
 
     let mut child = command.spawn()?;

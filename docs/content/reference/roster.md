@@ -140,13 +140,14 @@ installed. Check 5 takes each member in turn through both rows before the next.
 6. **Start the entry member.** The entry member starts last, with
    `--lifecycle-task-acceptance single --lifecycle-after-task exit`. Its channel holds its
    credentials and its callees' door URLs before it starts.
-7. **Stop.** When the entry member's process ends, for any reason, every peer is stopped and the
-   signing key is dropped.
+7. **End.** When the entry member's process ends, for any reason, the formation ends: every peer
+   is stopped and the signing key is dropped. See [How a formation ends](#launch-stop).
 
 | Every member | Value |
 |---|---|
 | `MURMUR_FORMATION_ID` | The formation id minted in step 2 |
 | `MURMUR_FORMATION_CHANNEL` | The number of the inherited file descriptor its [formation channel](#formation-channel) is read from |
+| `MURMUR_FORMATION_LIFELINE` | The descriptor of the member's own [lifeline](#launch-stop). Set by the launcher; not for operators |
 | `--workdir` | The roster's project directory, so every member resolves from the stores admission read, and sessions land under `<project>/.murmur/` |
 | Current directory | The launcher's, so a relative `--task` path names the same file |
 | The installed artifact | Exactly the bytes admission bound it to. A member whose installed artifact changed since admission refuses with [`E-RUN-047`](diagnostics.md#e-run-047) |
@@ -167,21 +168,55 @@ with [`E-RUN-045`](diagnostics.md#e-run-045) when it:
 A refused launch stops every member already started, and never starts the entry member. Readiness
 is the door: it is probed every 100 ms until it answers as the reported session.
 
-### Stopping { #launch-stop }
+### How a formation ends { #launch-stop }
 
-A member is stopped with `SIGTERM`, then 25 seconds for its session to end in order, then `SIGKILL`
-to its process group. Members are stopped at the same time. 25 seconds outlasts a member's own
-[`SIGTERM` teardown bound](cli.md#mur-run-sigterm), so a member ending in order finishes before it
-is killed and its `trace.jsonl` stays whole.
+Every member, the entry member included, is handed a **lifeline**: the read end of a pipe of its
+own, whose other end only the launcher holds. Nothing is ever written to it. The member reads end
+of file on it in exactly one case: the formation has ended. That happens when the launcher closes
+it, or when the launcher's process dies by any means, `SIGKILL` and the OOM killer included.
 
-| The launcher ends because | It first |
+| The formation ends because | The launcher |
 |---|---|
-| The entry member's process ended | Stops every peer |
-| It received `SIGINT`, `SIGTERM` or `SIGHUP` | Sends `SIGTERM` to the entry member, then stops every member |
-| A peer did not come up | Stops every member already started |
+| The entry member's process ended | Closes every peer's lifeline |
+| The launcher received `SIGINT`, `SIGTERM` or `SIGHUP` | Closes every lifeline, the entry member's included |
+| A peer did not come up | Closes the lifeline of every member already started |
+| The launcher was killed | Is gone; the kernel closes every lifeline |
 
-Each peer runs in a process group of its own; the entry member stays in the launcher's. A
-`SIGKILL` of the launcher itself leaves the members running.
+The launcher sends no member `SIGTERM`. A member whose lifeline closes winds down:
+
+1. It appends one [`formation_ended`](observability-schemas.md#formation-ended) record to its
+   `trace.jsonl`, naming the formation id, before anything else its wind-down writes.
+2. It ends the way a first [`SIGTERM`](cli.md#mur-run-sigterm) ends it: every live task is
+   cancelled, queued tasks are refused, live delegations are cancelled, asynchronous hooks are
+   drained, and `session_end` is written.
+3. 20 seconds after its lifeline closed, it exits with status 143 wherever its teardown is.
+
+Work in flight is cancelled, not finished: the formation's task is over, and nothing remains to
+receive a result.
+
+| When | What happens |
+|---|---|
+| 20 seconds after the lifeline closed | The member exits with status 143 |
+| 25 seconds after the launcher closed the lifeline | A launcher still running sends `SIGKILL` to the member's process group, then reaps it |
+| A `SIGTERM` after the lifeline closed | Changes nothing; the wind-down is already under way |
+| A second `SIGTERM` | The member exits at once, with status 143 |
+| The lifeline closes after a `SIGTERM` | Changes nothing, and no `formation_ended` is written |
+
+`kill -KILL` of the launcher, of the entry member, or of the launcher's whole process group leaves
+no member of that formation running within 30 seconds. Every member that was not itself killed
+winds down as above, and its trace ends in `session_end`. Each peer runs in a process group of its
+own; the entry member stays in the launcher's, so a `kill -KILL` of that group takes the entry
+member with it.
+
+A peer's diagnostics go to the launcher's stderr behind its `[<member>] ` prefix while the launcher
+runs, and to the peer's own `logs/bootstrap.log` once the launcher is gone. The entry member writes
+to the stderr it shares with the launcher.
+
+**A member started by hand.** A `mur run` whose environment carries `MURMUR_FORMATION_ID` but no
+lifeline, and which is not a delegated child, runs as any other `mur run` does: nothing winds it
+down when its formation ends. It prints [`W-RUN-007`](diagnostics.md#w-run-007) once at launch.
+End it with [`mur stop`](cli.md#mur-stop). A delegated child carries its parent's formation id and
+no lifeline; its parent session ends it, and it prints nothing.
 
 A roster edge into the entry member is admitted and every member is launched, but the edge is not
 served: the entry member is busy with the formation's own task from launch until it exits, so it

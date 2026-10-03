@@ -106,7 +106,7 @@ section that explains it.
 | `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, with `gateway:`, or bound as `inference.system_prompt_artifact` | [E-RUN-043](#e-run-043) |
 | `E-RUN-044` | `MURMUR_FORMATION_ID` is set to something that is not a formation id | [E-RUN-044](#e-run-044) |
 | `E-RUN-045` | A formation member did not come up, so `mur run --roster` launched nothing and stopped every member it had started | [E-RUN-045](#e-run-045) |
-| `E-RUN-046` | `mur run --roster` was run inside a formation member, a member's formation channel cannot be read, or `MURMUR_FORMATION_PEERS` is set in `mur run`'s environment | [E-RUN-046](#e-run-046) |
+| `E-RUN-046` | `mur run --roster` was run inside a formation member, a member's formation channel cannot be read, `MURMUR_FORMATION_PEERS` is set in `mur run`'s environment, or `MURMUR_FORMATION_LIFELINE` does not name this member's lifeline | [E-RUN-046](#e-run-046) |
 | `E-RUN-047` | An installed capsule's bytes no longer hash to the sha256 roster admission bound its member to | [E-RUN-047](#e-run-047) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
@@ -126,6 +126,7 @@ section that explains it.
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
 | `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
 | `W-RUN-006` | A roster edge into the entry member is not served | [W-RUN-006](#w-run-006) |
+| `W-RUN-007` | A session carries a formation id but no lifeline, so it does not wind down when its formation ends | [W-RUN-007](#w-run-007) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -891,7 +892,7 @@ Each failed member is named as `'<name>' (<capsule>@<version>)`, in roster order
 `stopped:` lists the members that were running when the launch was refused, as `name (pid N)`, or
 `none`. Every one of them has been stopped and reaped.
 
-### E-RUN-046 — not a formation's launcher, or an unreadable formation channel { #e-run-046 }
+### E-RUN-046 — not a formation's launcher, or an unreadable formation channel or lifeline { #e-run-046 }
 
 A process that already carries `MURMUR_FORMATION_ID` is a formation member, and a member cannot
 launch a formation:
@@ -933,6 +934,27 @@ it inside a member's components, never in a process environment:
 error[E-RUN-046]: MURMUR_FORMATION_PEERS cannot be used: it is set in this process's environment, so the launch is refused
   hint: MURMUR_FORMATION_PEERS is set by a formation member's runtime inside its own WASM components, never in a process environment; unset it to run this capsule
 ```
+
+It also refuses a `mur run` whose [`MURMUR_FORMATION_LIFELINE`](roster.md#launch-stop) does not
+name the member's end of its lifeline, before a session directory exists:
+
+```text
+error[E-RUN-046]: MURMUR_FORMATION_LIFELINE does not carry this member's formation lifeline: descriptor 9 is a character device, and a lifeline is a pipe's read end; a member that cannot hear its lifeline would keep running after its formation ends, so the launch is refused
+  hint: MURMUR_FORMATION_LIFELINE is set by `mur run --roster` for each member it launches, beside MURMUR_FORMATION_ID, and is not for operators; unset it to run this capsule on its own
+```
+
+| The reason says | Means |
+|---|---|
+| `it is not a decimal descriptor number` | The value is not digits only. A blank value is absent, not refused |
+| `descriptor N is a standard stream` | The value is 0, 1 or 2 |
+| `descriptor N is not open` | The process holds no descriptor N |
+| `descriptor N is a character device`, `a regular file`, `a directory`, `a socket` | Descriptor N is not a pipe |
+| `descriptor N is open for writing` | Descriptor N is a pipe's write end |
+| `it is set, but MURMUR_FORMATION_ID is not` | A lifeline belongs to a formation member |
+| `it was already read by this process` | The lifeline is read once per process |
+| `a script capsule opens no door` | Only an agent capsule can be a formation member |
+
+Unset the variable to run the capsule on its own.
 
 ### E-RUN-047 — the capsule changed since admission { #e-run-047 }
 
@@ -1846,6 +1868,18 @@ never accepts a task from a peer. A `reachability` edge into it is admitted and 
 launched, but the calling member is handed no [formation token](roster.md#formation-token) and no
 address for it, and its call is refused as a call to any member it may not call is. The warning
 prints once per such edge, before any member starts. Nothing is refused.
+
+### W-RUN-007 — a formation member with no lifeline { #w-run-007 }
+
+```text
+warning[W-RUN-007]: this session is a member of formation frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b but was handed no lifeline, so it will not wind down when that formation ends; end it with `mur stop` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-007)
+```
+
+A `mur run` launched with `MURMUR_FORMATION_ID` set and no `MURMUR_FORMATION_LIFELINE`, other than
+a delegated child, is a formation member started by hand. It runs as any other `mur run` does, for
+as long as its lifecycle keeps it, and appears in [`mur ps`](cli.md#mur-ps). Nothing ends it when
+its formation ends; end it with [`mur stop`](cli.md#mur-stop). The warning prints once, at launch.
+Nothing is refused. See [How a formation ends](roster.md#launch-stop).
 
 ---
 

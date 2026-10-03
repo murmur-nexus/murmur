@@ -638,6 +638,18 @@ pub enum RuntimeError {
     )]
     FormationChannelUnreadable { reason: String },
 
+    /// `MURMUR_FORMATION_LIFELINE` does not name a lifeline this session can hold: the value is
+    /// not a pipe's read end, it was read twice, it came without a formation id, or the session
+    /// cannot honour one (a script capsule, or a caller that does not own its process).
+    ///
+    /// `reason` names what is wrong, by descriptor number where there is one.
+    #[error(
+        "MURMUR_FORMATION_LIFELINE does not carry this member's formation lifeline: {reason}; a \
+         member that cannot hear its lifeline would keep running after its formation ends, so \
+         the launch is refused"
+    )]
+    FormationLifelineUnreadable { reason: String },
+
     /// A native tool's `bin/<name>` payload was built for another operating system or CPU
     /// architecture than this host.
     ///
