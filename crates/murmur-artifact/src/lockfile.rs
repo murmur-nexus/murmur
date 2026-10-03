@@ -9,6 +9,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::registry::{ResolvedArtifact, RuntimeType};
+
 /// The only `lock_version` this build reads or writes.
 ///
 /// Version 2 pins a hash per platform; version 1 pinned one `sha256.wasm` per artifact and is
@@ -164,6 +166,17 @@ impl LockedSha256 {
         Self {
             any: None,
             platforms,
+        }
+    }
+
+    /// The pin for `resolved`, fetched for `platform`: a native binary is pinned under that
+    /// platform, everything else under `any`.
+    #[must_use]
+    pub fn for_resolved(resolved: &ResolvedArtifact, platform: &str) -> Self {
+        if resolved.meta.runtime == RuntimeType::Native {
+            Self::for_one_platform(platform, resolved.sha256.clone())
+        } else {
+            Self::any(resolved.sha256.clone())
         }
     }
 

@@ -175,6 +175,7 @@ nav:
   - Reference:
       - CLI Commands: reference/cli.md
       - Manifest Schema: reference/manifest.md
+      - Roster Schema: reference/roster.md
       - Configuration: reference/config.md
       - Containment: reference/containment.md
       - Resource Limits: reference/resource-limits.md

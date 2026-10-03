@@ -19,10 +19,11 @@ use capsule_runtime::{
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
     parse_tool_implementation_from_yaml, read_lockfile, read_runtime_manifest_text,
-    registry_warning_link, resolve_manifest_path, sha256_hex, warn_on_unknown_manifest_keys,
-    wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader, ArtifactImplementation,
-    ArtifactMeta, ArtifactRuntime, ContractDirection, LocalRegistry, LockOrigin, LockfileError,
-    MurmurLock, NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RuntimeManifest,
+    registry_warning_link, resolve_manifest_path, resolve_roster_path, sha256_hex,
+    warn_on_unknown_manifest_keys, wit_contracts_from_artifact_bytes,
+    wit_contracts_from_artifact_reader, ArtifactImplementation, ArtifactMeta, ArtifactRuntime,
+    ContractDirection, LocalRegistry, LockOrigin, LockfileError, MurmurLock, NativeBinaryVerdict,
+    PlatformMatch, Registry, ResolvedArtifact, RosterReachability, RuntimeManifest,
     UnservedInterface, WitContracts, W_REG_001, W_REG_002, W_REG_003,
 };
 
@@ -38,6 +39,7 @@ use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
     E_RUN_019,
 };
+use crate::registry_client::FallbackRegistry;
 
 /// Whether an installed artifact's payload can run on the host doctor is checking for.
 ///
@@ -1081,6 +1083,85 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
     );
 }
 
+/// Print the `Roster` block when `roster.yaml` sits beside the project's `murmur.yaml`: the roster
+/// admitted through [`capsule_runtime::admit_roster_file`], with each member's peer posture and the
+/// expanded reachability. Returns the `Fix:` entries; a refusal is
+/// one, and it fails the exit code.
+///
+/// Prints nothing, and finds nothing, when there is no `roster.yaml`.
+fn report_roster(
+    project_root: &Path,
+    registry: &dyn Registry,
+    lock: Option<&MurmurLock>,
+) -> Vec<String> {
+    let path = resolve_roster_path(project_root);
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    println!("Roster");
+    println!("  file: {}", path.display());
+    let admitted = match capsule_runtime::admit_roster_file(project_root, registry, lock) {
+        Ok(admitted) => admitted,
+        Err(refusal) => {
+            let error = CliError::from(refusal);
+            println!("  \u{2717}  {}", error.message);
+            println!();
+            let hint = error.hint.unwrap_or_default();
+            eprintln!(
+                "[mur doctor] error[{code}]: {message}\n  hint: {hint}",
+                code = error.code,
+                message = error.message
+            );
+            return vec![hint];
+        }
+    };
+
+    let coordinates: Vec<String> = admitted
+        .members()
+        .iter()
+        .map(|member| format!("{}@{}", member.capsule, member.version))
+        .collect();
+    let name_width = admitted
+        .members()
+        .iter()
+        .map(|member| member.name.len())
+        .max()
+        .unwrap_or(0);
+    let coordinate_width = coordinates.iter().map(String::len).max().unwrap_or(0);
+    for (member, coordinate) in admitted.members().iter().zip(&coordinates) {
+        let entry = if member.entry { "entry" } else { "" };
+        let peers = if member.manifest.accepts_peer_tasks() {
+            "serves peers"
+        } else {
+            "refuses peers"
+        };
+        let door = if member.requires_authentication() {
+            "authenticated door"
+        } else {
+            "public door"
+        };
+        println!(
+            "  {name:<name_width$}   {coordinate:<coordinate_width$}   {entry:<5}   {peers:<13}   {door}",
+            name = member.name
+        );
+    }
+
+    let edges = admitted
+        .edges()
+        .iter()
+        .map(|edge| format!("{} \u{2192} {}", edge.from, edge.to))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match admitted.reachability() {
+        _ if edges.is_empty() => println!("  reachability: none"),
+        RosterReachability::All => println!("  reachability (all): {edges}"),
+        _ => println!("  reachability: {edges}"),
+    }
+    println!();
+    Vec::new()
+}
+
 /// Who may call the capsule's door: the posture line, always, and `W-SEC-032` when `bind_addr`
 /// exposes a door that declares no `network.authentication`. The warning is rendered from the
 /// manifest by the same function `mur run --bind` uses, so the two lines are byte-identical.
@@ -1349,6 +1430,16 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let platform = current_platform();
 
+    // Members resolve from the stores `mur run --capsule` resolves from, in the same order.
+    let roster_fixes = report_roster(
+        &project_root,
+        &FallbackRegistry {
+            primary: project_registry.clone(),
+            secondary: global_registry.clone(),
+        },
+        lock.as_ref(),
+    );
+
     // Every installed artifact in either store, declared or not: the global store serves every
     // project on the machine, and an operator upgrading `mur` needs the whole list of what the
     // new host refuses.
@@ -1376,6 +1467,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let mut interface_failed: HashSet<String> = HashSet::new();
 
     fixes.extend(env_requirements_findings.fixes);
+    fixes.extend(roster_fixes);
     warnings.extend(env_requirements_findings.warnings);
 
     for artifact in &runtime_manifest.artifacts {

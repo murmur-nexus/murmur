@@ -5771,14 +5771,9 @@ impl manage::Host for CapsuleStoreState {
             Err(err) => return Err(format!("failed to read murmur.lock: {err}")),
         };
 
-        // Which shape the pin takes follows the payload: a native binary is pinned under this
-        // host's platform, everything else under `any`. An entry that has no key for this
-        // platform yet is not a conflict — it is a platform nobody has installed on before.
-        let incoming_sha256 = if resolved.meta.runtime == RuntimeType::Native {
-            LockedSha256::for_one_platform(current_platform(), resolved.sha256.clone())
-        } else {
-            LockedSha256::any(resolved.sha256.clone())
-        };
+        // An entry that has no key for this platform yet is not a conflict — it is a platform
+        // nobody has installed on before.
+        let incoming_sha256 = LockedSha256::for_resolved(&resolved, current_platform());
 
         if let Some(existing) = lock.artifact_for(&name) {
             if let Some(conflict) = existing.conflict_with(&version, &incoming_sha256) {
