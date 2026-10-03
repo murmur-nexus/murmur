@@ -2,7 +2,6 @@
 //! the host, and the check that no member outlives the launcher.
 
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -10,8 +9,8 @@ use std::time::{Duration, Instant};
 
 /// Held while a test launches a formation. Each launch starts several `mur run` processes, and
 /// several launches at once on one host turn a readiness deadline into a measure of contention.
-/// Exclusive across the threads of one test binary and, through an `flock` on a file in the
-/// temp directory, across test binaries.
+/// Exclusive across the threads of one test binary and, through an exclusive lock on a file in
+/// the temp directory, across test binaries.
 pub struct LaunchLock {
     _thread: MutexGuard<'static, ()>,
     _host: File,
@@ -29,10 +28,9 @@ pub fn launch_lock() -> LaunchLock {
         .write(true)
         .open(std::env::temp_dir().join("murmur-cli-formation-launch.lock"))
         .unwrap();
-    // SAFETY: `flock` takes the descriptor `host` owns, which stays open until the returned guard
-    // is dropped; it dereferences no memory. Closing the descriptor releases the lock.
-    let locked = unsafe { libc::flock(host.as_raw_fd(), libc::LOCK_EX) };
-    assert_eq!(locked, 0, "flock: {}", std::io::Error::last_os_error());
+    // Released when `host` is closed, which is when the returned guard drops.
+    host.lock()
+        .unwrap_or_else(|error| panic!("locking the formation launch lock: {error}"));
     LaunchLock {
         _thread: thread,
         _host: host,

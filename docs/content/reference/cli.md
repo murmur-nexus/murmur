@@ -213,7 +213,7 @@ mur new --roster <NAME>
 | Member sources | `<NAME>/<member>/murmur.yaml`: one subdirectory per member, named after the member |
 | Capsule names | `<NAME>-<member>`, so two scaffolded formations never share a capsule name |
 | Versions | `0.1.0` for every capsule |
-| Install scope | The global store, `mur install -g`. The directory has no top-level `murmur.yaml`, so it has no project store |
+| Install scope | The global store, `mur install -g`. The directory has no top-level `murmur.yaml`, so `mur install` without `-g` refuses there |
 
 #### Generated files { #mur-new-roster-files }
 

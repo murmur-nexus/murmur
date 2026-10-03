@@ -545,8 +545,11 @@ fn main() {
     #[cfg(feature = "beta-mur-new")]
     if !beta_config.is_enabled("mur-new") {
         cmd = cmd.mut_subcommand("new", |sc| {
-            sc.mut_arg("task", |arg| arg.hide(true))
-                .mut_arg("registry", |arg| arg.hide(true))
+            sc.about(
+                "Scaffold a formation: ./<NAME>/ holding a roster.yaml and one capsule per member",
+            )
+            .mut_arg("task", |arg| arg.hide(true))
+            .mut_arg("registry", |arg| arg.hide(true))
         });
     }
     #[cfg(feature = "beta-mur-deploy")]

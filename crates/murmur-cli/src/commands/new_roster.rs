@@ -584,13 +584,13 @@ fn render_roster(name: &str) -> String {
             0,
             &format!(
                 "Which members may call which: each rule lets `from` call every member in `to`.
-             A member named in `to` must serve peers: exports.peer_tasks.accept: true in its
-             {MANIFEST_FILENAME}. With any rule here, every member's door must require a token:
-             network.authentication in its {MANIFEST_FILENAME}.
+                 A member named in `to` must serve peers: exports.peer_tasks.accept: true in its
+                 {MANIFEST_FILENAME}. With any rule here, every member's door must require a
+                 token: network.authentication in its {MANIFEST_FILENAME}.
 
-
-             `all` is shorthand for every ordered pair of members that both serve peers. Here
-             `all` would grant nothing: {entry} does not serve peers, so no two members both do.",
+                 `all` is shorthand for every ordered pair of members that both serve peers. Here
+                 `all` would grant nothing: {entry} does not serve peers, so no two members both
+                 do.",
             ),
         )
         .see(0, "roster/#reachability")

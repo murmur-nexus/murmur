@@ -570,6 +570,7 @@ fn with_the_beta_flag_off_the_task_form_names_the_flag_and_the_roster_form_works
     let help = scratch.run(&["new", "--help"]);
     assert!(help.stdout.contains("--roster <NAME>"), "{}", help.stdout);
     assert!(!help.stdout.contains("<TASK>"), "{}", help.stdout);
+    assert!(!help.stdout.contains("task description"), "{}", help.stdout);
 
     scratch.run(&["new", "--roster", "crew"]).assert_code(0);
 }
