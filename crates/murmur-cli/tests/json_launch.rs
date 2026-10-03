@@ -920,9 +920,10 @@ fn door_tokens_are_absent_from_a_public_capsule_readiness_line() {
 
 // ── Formation membership ──────────────────────────────────────────────────────
 
-/// The `ses_*` directories a launch from `project` has left under its `.murmur/`.
+/// The `ses_*` directories `mur run --manifest <project>/murmur.yaml` has left under
+/// `<project>/workdir/`, where a launch without `--workdir` stages its sessions.
 fn session_dirs(project: &Path) -> Vec<String> {
-    fs::read_dir(project.join(".murmur"))
+    fs::read_dir(project.join("workdir"))
         .into_iter()
         .flatten()
         .flatten()
@@ -999,7 +1000,8 @@ fn a_malformed_formation_id_refuses_the_launch_with_e_run_044() {
     }
 }
 
-/// A blank variable is no formation: the session launches standalone.
+/// A blank variable is no formation: the session launches standalone, staged where
+/// [`session_dirs`] looks.
 #[test]
 fn a_blank_formation_id_launches_a_standalone_session() {
     use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
@@ -1014,6 +1016,8 @@ fn a_blank_formation_id_launches_a_standalone_session() {
         &[(capsule_runtime::formation::FORMATION_ID_ENV, "   ")],
     );
     assert!(run.startup.get("formation_id").is_none(), "{}", run.startup);
+    let session_id = run.startup["session_id"].as_str().unwrap().to_string();
+    assert_eq!(session_dirs(project.path()), vec![session_id]);
 }
 
 /// The workspace `.env` is loaded after the formation id is read, so a project file cannot place

@@ -927,8 +927,9 @@ dropped, never written to `logs/bootstrap.log`. What each token reaches is in
 
 <span id="mur-run-formation"></span>**Formation membership.** A session launched with
 [`MURMUR_FORMATION_ID`](roost-api.md#environment-variables) set to a formation id is a member of
-that formation, and every child it delegates to joins the same one. A session launched without it
-belongs to no formation and prints neither of these:
+that formation, and every child it delegates to joins the same one. A formation id is `frm_`
+followed by 32 lowercase hex digits; launch every member of one formation with the same value. A
+session launched without it belongs to no formation and prints neither of these:
 
 | Mode | Output |
 |---|---|
@@ -936,7 +937,7 @@ belongs to no formation and prints neither of these:
 | `--json` | The readiness line gains `"formation_id": "<formation-id>"` |
 
 ```json
-{"formation_id":"frm_019f01a93ff27c1e9a3b5d0c4e8f2a61","name":"researcher","pid":48213,"session_id":"ses_019f01a940ce7761854e768ecbe3d399","url":"localhost:41873","version":"0.1.0","workdir":"/home/me/project/.murmur/ses_019f01a940ce7761854e768ecbe3d399"}
+{"formation_id":"frm_019f01a93ff27c1e9a3b5d0c4e8f2a61","name":"researcher","pid":48213,"session_id":"ses_019f01a940ce7761854e768ecbe3d399","url":"localhost:41873","version":"0.1.0","workdir":"/home/me/project/workdir/ses_019f01a940ce7761854e768ecbe3d399"}
 ```
 
 The variable is read before the workspace `.env` is loaded, so a `.env` line naming it has no

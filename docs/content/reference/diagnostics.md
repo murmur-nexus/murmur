@@ -87,7 +87,7 @@ section that explains it.
 | `E-RUN-030` | The `transport: http` inference driver exports the process driver interface | [E-RUN-030](#e-run-030) |
 | `E-RUN-032` | A process driver could not be loaded with no grants, or described itself unusably | [E-RUN-032](#e-run-032) |
 | `E-RUN-033` | A `transport: process` turn failed — the harness reported it, or the runtime ended it at the turn limit | [E-RUN-033](#e-run-033) |
-| `E-RUN-034` | A call into the process driver refused, trapped or ran out of time | [E-RUN-034](#e-run-034) |
+| `E-RUN-034` | A call into the process driver refused, crashed or ran out of time | [E-RUN-034](#e-run-034) |
 | `E-RUN-035` | A `transport: process` harness went silent and was killed | [E-RUN-035](#e-run-035) |
 | `E-RUN-036` | The harness could not find the session it was asked to continue | [E-RUN-036](#e-run-036) |
 | `E-RUN-037` | `--resume-mode compact` under `inference.transport: process` | [E-RUN-037](#e-run-037) |
@@ -642,7 +642,7 @@ turn past `inference.max_turns` is). `mur trace show` prints it as one line.
 
 ### E-RUN-034 — a process driver call failed { #e-run-034 }
 
-A call into the [process driver](manifest.md#process-driver) refused, trapped, or ran out of time.
+A call into the [process driver](manifest.md#process-driver) refused, crashed, or ran out of time.
 The message names the WIT function and what came back.
 
 ```text
@@ -846,7 +846,7 @@ The reason names what is wrong — the prefix, the number of digits, or a charac
 lowercase hex — and never the value itself.
 
 An unset or blank `MURMUR_FORMATION_ID` is not this error: it is the ordinary case of a session in
-no formation, which runs exactly as it would have.
+no formation.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1744,7 +1744,7 @@ cannot reach the `scoped` containment class.
 connections *are* constrained by the same allowlist, so this warning does not fire there.
 
 **Why it matters:** `capabilities.network.allow` constrains requests the runtime itself makes
-(WASI HTTP calls from tool/driver components). It does not constrain a `bash` subprocess's own
+(outbound HTTP from tool and driver components). It does not constrain a `bash` subprocess's own
 outbound connections on this tier — `bash` can reach any host regardless of what
 `network.allow` declares.
 
@@ -1873,8 +1873,8 @@ ceiling entry it should sit under, or delete it if the drop was what you actuall
   `filesystem` and `state` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where
   `task_io` is honored as well); or
 - a `runtime: tool` entry with a **native** (non-WASM) implementation declares `capabilities:` at
-  all. A native tool runs as a host subprocess under the capsule-wide shell/sandbox machinery, not
-  through the WASI tool path narrowing is applied on, so the whole block is inert.
+  all. A native tool runs as a host subprocess under the capsule-wide shell sandbox, and
+  per-artifact narrowing applies only to WASM tools, so the whole block is inert.
 
 **Why it matters:** a declared-but-unenforced grant reads like a scoped artifact. In the native
 case in particular, the tool keeps the full capsule ceiling despite an entry that looks like it

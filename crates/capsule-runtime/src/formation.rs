@@ -1,7 +1,7 @@
 //! The formation a session belongs to, and the one id that names it.
 //!
 //! A formation is the set of sessions launched together to carry out one task. Its id is minted
-//! once, by whatever launches a roster's members, and handed to each member through
+//! once, by whatever launches the formation's members, and handed to each member through
 //! [`FORMATION_ID_ENV`]. A member's own delegation plane hands the same id to every child it
 //! spawns, so a child joins its parent's formation and never mints one. Nothing else mints: a
 //! standalone `mur run` that delegates grows a delegation tree, not a formation, and that tree's
@@ -10,8 +10,8 @@
 //!
 //! **The id groups; it grants nothing.** No authorization decision reads it — not the door's
 //! Bearer check, not task-origin classification, not peer handoff, not the spawn referee.
-//! Reachability between sessions comes from the manifest's peer-service declaration and the
-//! roster's rule, never from sharing a formation.
+//! Reachability between sessions comes from the manifest's peer-service declaration, never from
+//! sharing a formation.
 //!
 //! **It belongs to the session, not the process.** [`FormationId::from_env`] is the one read of
 //! [`FORMATION_ID_ENV`] from a process environment, and only `mur run` — whose process is one
@@ -20,7 +20,7 @@
 //! delegation plane read, so an in-process caller staging two sessions gives each its own.
 //!
 //! **The shape is strict.** `frm_` followed by the 32 lowercase hex digits of a UUIDv7: opaque,
-//! derived from nothing about the roster, its members or the host, and time-ordered so ids sort
+//! derived from nothing about the formation, its members or the host, and time-ordered so ids sort
 //! by launch. A value that sessions are grouped on admits no near-misses, so anything else in the
 //! variable — other than nothing at all — refuses the launch.
 
@@ -44,7 +44,7 @@ const FORMATION_ID_DIGITS: usize = 32;
 pub struct FormationId(String);
 
 impl FormationId {
-    /// A fresh formation id, for a launcher starting a roster's members.
+    /// A fresh formation id, for a launcher starting a formation's members.
     ///
     /// Two launches of the same formation get two different ids.
     pub fn mint() -> Self {
@@ -120,8 +120,6 @@ pub(crate) static FORMATION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
     use super::*;
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -222,28 +220,12 @@ mod tests {
         ));
     }
 
-    fn crates_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("capsule-runtime sits under crates/")
-            .to_path_buf()
-    }
-
-    fn rust_sources(dir: &Path) -> Vec<PathBuf> {
-        let mut found = Vec::new();
-        let mut pending = vec![dir.to_path_buf()];
-        while let Some(next) = pending.pop() {
-            for entry in std::fs::read_dir(&next).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    found.push(path);
-                }
-            }
-        }
-        assert!(!found.is_empty(), "no Rust sources under {}", dir.display());
-        found
+    /// Every `.rs` file under the named workspace crate's `src`, as `(crate/src/path, contents)`.
+    fn sources_of(crate_dir: &str) -> Vec<(String, String)> {
+        crate::source_scan::sources_under(&crate::source_scan::sibling_crate_src(crate_dir))
+            .into_iter()
+            .map(|(path, text)| (format!("{crate_dir}/src/{path}"), text))
+            .collect()
     }
 
     const FORMATION_TOKENS: [&str; 4] = [
@@ -255,8 +237,8 @@ mod tests {
 
     #[test]
     fn no_authorization_path_reads_a_formation_id() {
-        let crates = crates_dir();
-        let mut guarded = rust_sources(&crates.join("mur-roost/src"));
+        let own = sources_of("capsule-runtime");
+        let mut guarded = sources_of("mur-roost");
         for file in [
             "door_auth.rs",
             "origin.rs",
@@ -264,17 +246,18 @@ mod tests {
             "spawn_credential.rs",
             "spawn_envelope.rs",
         ] {
-            let path = crates.join("capsule-runtime/src").join(file);
-            assert!(path.is_file(), "{} is gone", path.display());
-            guarded.push(path);
+            let path = format!("capsule-runtime/src/{file}");
+            let source = own
+                .iter()
+                .find(|(name, _)| *name == path)
+                .unwrap_or_else(|| panic!("{path} is gone"));
+            guarded.push(source.clone());
         }
-        for path in guarded {
-            let text = std::fs::read_to_string(&path).unwrap();
+        for (path, text) in guarded {
             for token in FORMATION_TOKENS {
                 assert!(
                     !text.contains(token),
-                    "{} names {token}; a formation id confers no reachability",
-                    path.display()
+                    "{path} names {token}; a formation id confers no reachability"
                 );
             }
         }
@@ -308,27 +291,23 @@ mod tests {
 
     #[test]
     fn the_formation_id_is_read_from_the_process_environment_in_one_place() {
-        let crates = crates_dir();
-        let mut sources = rust_sources(&crates.join("capsule-runtime/src"));
-        sources.extend(rust_sources(&crates.join("murmur-cli/src")));
+        let mut sources = sources_of("capsule-runtime");
+        sources.extend(sources_of("murmur-cli"));
         let names_the_variable =
             |args: &&str| args.contains("MURMUR_FORMATION_ID") || args.contains("FORMATION_ID_ENV");
         let mut reads_here = 0;
-        for path in sources {
-            let text = std::fs::read_to_string(&path).unwrap();
+        for (path, text) in sources {
             let reads = env_reads(crate::source_scan::production_part(&text))
                 .into_iter()
                 .filter(names_the_variable)
                 .count();
-            if path.ends_with("capsule-runtime/src/formation.rs") {
+            if path == "capsule-runtime/src/formation.rs" {
                 reads_here = reads;
             } else {
                 assert_eq!(
-                    reads,
-                    0,
-                    "{} reads the formation id from the process environment; only \
-                     FormationId::from_env does",
-                    path.display()
+                    reads, 0,
+                    "{path} reads the formation id from the process environment; only \
+                     FormationId::from_env does"
                 );
             }
         }

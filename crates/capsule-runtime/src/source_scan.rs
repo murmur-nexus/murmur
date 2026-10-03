@@ -5,11 +5,31 @@ use std::path::Path;
 /// Every `.rs` file under this crate's `src`, as `(path relative to src, contents)`, sorted by
 /// path.
 pub(crate) fn crate_sources() -> Vec<(String, String)> {
-    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    let sources = sources_under(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")));
+    assert!(
+        sources.len() > 10,
+        "the source sweep found only {} files, so it is not sweeping the crate",
+        sources.len()
+    );
+    sources
+}
+
+/// The `src` directory of the workspace crate named `crate_dir` (`"mur-roost"`, `"murmur-cli"`),
+/// for a sweep that holds a construct out of a crate other than this one.
+pub(crate) fn sibling_crate_src(crate_dir: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("capsule-runtime sits under crates/")
+        .join(crate_dir)
+        .join("src")
+}
+
+/// Every `.rs` file under `root`, as `(path relative to root, contents)`, sorted by path.
+pub(crate) fn sources_under(root: &Path) -> Vec<(String, String)> {
     let mut sources = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("the crate's src directory is readable") {
+        for entry in std::fs::read_dir(&dir).expect("the swept src directory is readable") {
             let path = entry.expect("a readable directory entry").path();
             if path.is_dir() {
                 pending.push(path);
@@ -27,9 +47,9 @@ pub(crate) fn crate_sources() -> Vec<(String, String)> {
         }
     }
     assert!(
-        sources.len() > 10,
-        "the source sweep found only {} files, so it is not sweeping the crate",
-        sources.len()
+        !sources.is_empty(),
+        "no Rust sources under {}",
+        root.display()
     );
     sources.sort();
     sources
