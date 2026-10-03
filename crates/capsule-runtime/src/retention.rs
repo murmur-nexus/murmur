@@ -134,11 +134,14 @@ pub struct RemovedRecord {
 /// milliseconds. This is the whole of the session age policy: no `stat`, no walk, and a lexical
 /// sort of the names is a chronological sort of the sessions.
 pub fn session_id_timestamp_ms(name: &str) -> Option<u64> {
-    let hex = name.strip_prefix("ses_")?;
-    if hex.len() < 12 {
-        return None;
-    }
-    u64::from_str_radix(&hex[..12], 16).ok()
+    uuid_v7_timestamp_ms(name, "ses_")
+}
+
+/// The millisecond timestamp in the first 12 hex characters after `prefix`, the mint time of a
+/// uuid v7 in simple form. `None` when `id` does not start with `prefix` or they are not hex.
+pub(crate) fn uuid_v7_timestamp_ms(id: &str, prefix: &str) -> Option<u64> {
+    let hex = id.strip_prefix(prefix)?;
+    u64::from_str_radix(hex.get(..12)?, 16).ok()
 }
 
 /// Remove the session directories under `sessions_root` that `policy` does not keep.

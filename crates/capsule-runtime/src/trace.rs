@@ -14,6 +14,7 @@ use tokio::{
 use crate::{
     agent::DriverUsage,
     containment::ScopeReport,
+    formation::FormationId,
     gateway_credential::CredentialChange,
     lanes::TaskLane,
     origin::{TaskProvenance, TrustClass},
@@ -80,6 +81,9 @@ pub(crate) struct TraceWriter {
     /// delegated, and both omitted from `session_start` when absent rather than written as null.
     spawned_by: Option<String>,
     spawn_delegation_id: Option<String>,
+    /// The formation this session is a member of. Set by [`Self::set_formation_id`] before
+    /// `session_start` is written; `None` for a session in no formation.
+    formation_id: Option<FormationId>,
     session_start_time: Instant,
     /// The session node of the event tree: the `event_id` `session_start` carries, and the
     /// `parent_id` every launch-scoped event names. Minted in [`TraceWriter::open`] rather than
@@ -325,6 +329,11 @@ struct SessionStartEvent {
     /// in the spawning session's own `delegation_start`. Present exactly when `spawned_by` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     delegation_id: Option<String>,
+    /// The formation this session is a member of. Omitted entirely for a session in no formation,
+    /// absent rather than null, on the same terms as `spawned_by`. Being on `session_start`, it is
+    /// on the trace's first line, which is the only line a reader grouping sessions reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formation_id: Option<FormationId>,
 }
 
 #[derive(Serialize)]
@@ -1652,6 +1661,7 @@ impl TraceWriter {
             context_id,
             spawned_by,
             spawn_delegation_id,
+            formation_id: None,
             session_start_time: Instant::now(),
             session_event_id: new_event_id(),
             session_started: false,
@@ -1790,6 +1800,11 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Records the formation this session is a member of for `session_start.formation_id`.
+    pub(crate) fn set_formation_id(&mut self, formation_id: Option<&FormationId>) {
+        self.formation_id = formation_id.cloned();
+    }
+
     /// Records `inference.tool_refresh` for `session_start.tool_refresh`: the wire name under
     /// `transport: http`, `None` under `transport: process`.
     pub(crate) fn set_tool_refresh(&mut self, tool_refresh: Option<&'static str>) {
@@ -1862,6 +1877,7 @@ impl TraceWriter {
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
             delegation_id: self.spawn_delegation_id.clone(),
+            formation_id: self.formation_id.clone(),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -4311,6 +4327,43 @@ mod tests {
         assert_eq!(e["containment_achieved"], "advisory");
         assert_eq!(e["workdir_exec"], false);
         assert!(e["timestamp"].as_u64().unwrap() > 0);
+    }
+
+    /// A member's formation is on the trace's first line, which is all a reader grouping sessions
+    /// reads; a session in no formation writes no key at all.
+    #[tokio::test]
+    async fn session_start_is_the_first_line_and_carries_a_members_formation() {
+        let formation = FormationId::mint();
+        for member in [Some(&formation), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.set_formation_id(member);
+            w.write_session_start(10, Vec::new()).await.unwrap();
+            w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
+                .await
+                .unwrap();
+            w.flush().await.unwrap();
+
+            let content = std::fs::read_to_string(dir.path().join("trace.jsonl")).unwrap();
+            let first_line = content.lines().next().unwrap();
+            let first: Value = serde_json::from_str(first_line).unwrap();
+            assert_eq!(first["event_type"], "session_start");
+            match member {
+                Some(id) => {
+                    assert_eq!(first["formation_id"], id.as_str());
+                    assert!(
+                        first_line.contains(&format!("\"formation_id\":\"{id}\"")),
+                        "{first_line}"
+                    );
+                }
+                None => assert!(!first_line.contains("formation_id"), "{first_line}"),
+            }
+            // Only the session frame carries it.
+            assert_eq!(
+                content.matches("formation_id").count(),
+                usize::from(member.is_some())
+            );
+        }
     }
 
     /// The three `system_prompt_source` values, each paired with the hash the same call derives.

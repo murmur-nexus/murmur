@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod env_requirements;
 mod error;
+mod formation_trace;
 mod live_address;
 mod registry_client;
 mod residue;

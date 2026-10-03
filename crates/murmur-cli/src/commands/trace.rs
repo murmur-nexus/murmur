@@ -9,7 +9,10 @@ use std::{
 use clap::Subcommand;
 use serde::Deserialize;
 
+use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
+
 use crate::error::{CliError, E_IO_001, E_IO_003};
+use crate::formation_trace::{recorded_members, RecordedMembers};
 use crate::session_address::{self, ses_entries, SessionQuery};
 
 const E_TRC_001: &str = "E-TRC-001";
@@ -154,6 +157,9 @@ struct SessionStartEvent {
     spawned_by: Option<String>,
     #[serde(default)]
     delegation_id: Option<String>,
+    /// The formation this session is a member of. Absent for a session in no formation.
+    #[serde(default)]
+    formation_id: Option<String>,
     /// The staged artifacts whose `murmur.lock` pin a running capsule fetched. Absent on a trace
     /// from a runtime predating the key, which reads as none.
     #[serde(default)]
@@ -1094,6 +1100,8 @@ struct TraceMetrics {
     /// capsule nobody delegated.
     spawned_by: Option<String>,
     spawned_by_delegation: Option<String>,
+    /// `session_start.formation_id`: the formation this session is a member of, if any.
+    formation_id: Option<String>,
     /// Every delegation this session made, in the order it started them.
     delegations: Vec<DelegationRecord>,
     /// Every plan run this trace records, in the order they started.
@@ -1974,9 +1982,17 @@ fn compute_metrics(
         )
     })?;
     let se = se.ok_or_else(|| {
+        // A member killed before it could write its ending is still findable through its
+        // formation, which is the one place the rest of what it was part of is listed.
+        let formation = match &ss.formation_id {
+            Some(id) => format!(
+                "; this session is a member of formation {id} — `mur trace show {id}` lists the formation"
+            ),
+            None => String::new(),
+        };
         CliError::new(
             E_TRC_001,
-            format!("{}: no session_end event found", path.display()),
+            format!("{}: no session_end event found{formation}", path.display()),
         )
     })?;
 
@@ -2039,6 +2055,7 @@ fn compute_metrics(
             artifacts_pulled,
             spawned_by: ss.spawned_by,
             spawned_by_delegation: ss.delegation_id,
+            formation_id: ss.formation_id,
             delegations,
             plan_runs,
             control_changes,
@@ -2257,6 +2274,9 @@ fn print_show(m: &TraceMetrics) {
             Some(id) => println!("Spawned by {parent} (delegation {id})"),
             None => println!("Spawned by {parent}"),
         }
+    }
+    if let Some(formation) = &m.formation_id {
+        println!("formation:  {formation}");
     }
     println!("capsule:    {} v{}", m.capsule_name, m.capsule_version);
     println!("model:      {}", m.model);
@@ -3099,17 +3119,29 @@ pub(crate) fn run_trace_show(
     body: Option<String>,
     turn: Option<u32>,
 ) -> Result<(), CliError> {
+    let workdir = workdir_arg.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("workdir")
+    });
+    if let Some(formation) = session
+        .as_deref()
+        .filter(|arg| arg.starts_with(FORMATION_ID_PREFIX))
+    {
+        if body.is_some() || turn.is_some() {
+            return Err(CliError::new(
+                E_TRC_001,
+                "--body and --turn read one session's trace; a formation id names several sessions",
+            ));
+        }
+        return run_formation_show(formation, &workdir);
+    }
     if body.is_none() && turn.is_some() {
         return Err(CliError::new(
             E_TRC_001,
             "--turn has no meaning without --body",
         ));
     }
-    let workdir = workdir_arg.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("workdir")
-    });
     let path = resolve_session(session, &workdir)?;
     if let Some(arg) = &body {
         return print_body(&path, arg, turn);
@@ -3142,7 +3174,74 @@ pub(crate) fn run_trace_show(
             );
         }
     }
+    if let Some(formation) = &metrics.formation_id {
+        // Written by a runtime, so it parses; a value that does not names no formation to list.
+        if let (Ok(formation), Some(root)) = (FormationId::parse(formation), session_root(&path)) {
+            let found = recorded_members(&root, &formation)?;
+            println!();
+            print_formation(&formation, &root, &found);
+        }
+    }
     Ok(())
+}
+
+/// `mur trace show frm_<id>`: every session under `root` whose `session_start` names the
+/// formation, and how each ended.
+fn run_formation_show(arg: &str, root: &Path) -> Result<(), CliError> {
+    let formation = FormationId::parse(arg)
+        .map_err(|_| CliError::new(E_TRC_002, format!("'{arg}' is not a formation id")))?;
+    let found = recorded_members(root, &formation)?;
+    if found.members.is_empty() {
+        return Err(CliError::new(
+            E_TRC_002,
+            format!(
+                "no session under {} belongs to formation {formation}",
+                root.display()
+            ),
+        ));
+    }
+    print_formation(&formation, root, &found);
+    Ok(())
+}
+
+/// The session root a resolved `trace.jsonl` sits in: the parent of its session directory.
+fn session_root(trace: &Path) -> Option<PathBuf> {
+    let session_dir = trace.parent().filter(|dir| !dir.as_os_str().is_empty());
+    match session_dir.and_then(Path::parent) {
+        Some(root) if !root.as_os_str().is_empty() => Some(root.to_path_buf()),
+        _ => fs::canonicalize(trace)
+            .ok()?
+            .parent()?
+            .parent()
+            .map(Path::to_path_buf),
+    }
+}
+
+/// The Formation section: one row per member found under `root`, oldest first.
+///
+/// Searches one root and follows no delegation edge out of it, so a member's child recorded
+/// elsewhere is counted and pointed at rather than listed.
+fn print_formation(formation: &FormationId, root: &Path, found: &RecordedMembers) {
+    println!("── Formation ────────────────────────────────────");
+    println!("formation:  {formation}");
+    println!("searched:   {}", root.display());
+    for member in &found.members {
+        let ending = member.exit_status.as_deref().unwrap_or("no session_end");
+        let spawned_by = match &member.spawned_by {
+            Some(parent) => format!("  spawned by {parent}"),
+            None => String::new(),
+        };
+        println!(
+            "{:<36}  {:<24}  {ending}{spawned_by}",
+            member.session_id, member.capsule
+        );
+    }
+    if !found.children_elsewhere.is_empty() {
+        println!(
+            "delegated children not under this root: {} — `mur trace show <member>` names each child trace",
+            found.children_elsewhere.len()
+        );
+    }
 }
 
 pub(crate) fn run_trace_steps(

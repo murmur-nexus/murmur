@@ -76,6 +76,7 @@ before the first task begins
 | `inference_choices` | array of object | Every [driver choice](manifest.md#inference-alternates), `primary` first, one object each: `name`, `driver`, `model`, `credential_source` (as on `gateways`, or `"none"` for a credential found nowhere at launch) and `available` (whether that credential resolved at launch; an injected one is `true` here and checked again at each switch). Written only when `inference.alternates` is declared; absent otherwise |
 | `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
+| `formation_id` | string | `frm_…` — the [formation](cli.md#mur-run-formation) this session is a member of. Written only for a member; absent rather than `null` otherwise, so a session in no formation produces a byte-identical record. `session_start` is always the trace's first line, so this is too. See [Reading a formation](#formation) |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `credential_source` | string | `"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` \| `"none"` — where the inference key this session attaches came from: [`credentials.<NAME>`](config.md#credentials) in the global config, the launching environment, a literal `gateway.api_key` on the driver's entry, a driver entry with [`keyless: true`](manifest.md#gateway-keyless), or no inference gateway at all. Never the key, a hash of it, its length or any part of it |
 | `gateways` | array of object | Every [credential gateway](manifest.md#artifact-gateway) the session holds, the configured driver's first and the rest by artifact name. One object per gateway: `artifact` (the entry's name), `host` (the host of `gateway.endpoint`, with its port when one was written), `credential_source` (`"config"` \| `"environment"` \| `"manifest"` \| `"keyless"` as `credential_source` above, or `"injected"` for a name in [`control.secrets`](manifest.md#field-control), supplied by a controller and held in memory only) and `metered` (`true` only for the gateways of the configured `transport: http` driver and of each `inference.alternates` driver, whose calls count toward the spend ceilings). Always written; `[]` when no entry declares `gateway:`. Never a key |
@@ -997,6 +998,27 @@ the delegation pair records one child launch.
 The `delegation` line carries neither the task text nor the child's answer — both are the agent's
 own conversation, which the `tool_call` line for the same call already records under the session's
 [`trace.capture`](manifest.md#field-trace) setting.
+
+### Reading a formation { #formation }
+
+A formation member's id is recorded in two places:
+
+| Where | Field | Lifetime |
+|---|---|---|
+| The first line of the member's `trace.jsonl` | `session_start.formation_id` | As long as the trace is kept |
+| The member's [running-capsule record](cli.md#running-capsule-records) | `formation_id` | While the session runs |
+
+[`mur trace show <formation-id>`](cli.md#mur-trace-show-formation) reconstructs a formation from one
+session root: it reads the first line of each session's trace, and for each member reads on to its
+`session_end`. A member with no `session_end` — killed, or still running — is listed as
+`no session_end`. A session whose first line is not a `session_start` is no member. The command
+searches only the root it is given and does not follow `delegation_start` lines into other roots; it
+counts a member's children found elsewhere, and the member's own `mur trace show` names each child's
+trace. [`mur ps`](cli.md#mur-ps-formations) reads the same lines to account for members it does not
+list.
+
+A session resumed with `mur run --resume` is a member only when its own launch names a formation;
+its `resumed_from` names the member it continues.
 
 ### Reading a delegation tree { #delegation-lineage }
 

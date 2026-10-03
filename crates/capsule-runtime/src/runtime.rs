@@ -2395,6 +2395,7 @@ fn launch(
                 (inference.transport != "process").then(|| inference.tool_refresh.wire_name()),
             );
             trace.set_runtime_artifacts(&installed_artifacts);
+            trace.set_formation_id(formation_id.as_ref());
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -3768,6 +3769,7 @@ fn running_record_for(
             .door_auth
             .as_ref()
             .map(|auth| auth.operator_token().clone()),
+        formation_id: staged.formation_id.clone(),
     }
 }
 

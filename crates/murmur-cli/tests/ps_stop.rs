@@ -108,8 +108,9 @@ fn shell_extra() -> &'static str {
 
 struct Capsule {
     child: Child,
-    /// Held so the manifest outlives the process reading it.
-    _project: TempDir,
+    /// Held so the manifest outlives the process reading it, and shared by capsules launched from
+    /// one project.
+    _project: Arc<TempDir>,
     /// The `mur run --json` startup line: `url`, `pid`, `session_id`, `name`, `version`, `workdir`.
     startup: Value,
 }
@@ -165,7 +166,13 @@ fn start_agent_with_env(
     extra: &str,
     env: &[(&str, &str)],
 ) -> Capsule {
-    let project = agent_project(&server.endpoint, name, extra);
+    let project = Arc::new(agent_project(&server.endpoint, name, extra));
+    start_in_project(home, project, env)
+}
+
+/// Starts `mur run` on the manifest in `project`, which other capsules may be launched from too:
+/// each launch is its own session under the project's `workdir/`.
+fn start_in_project(home: &Arc<TempDir>, project: Arc<TempDir>, env: &[(&str, &str)]) -> Capsule {
     let manifest = project.path().join("murmur.yaml");
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
         .args(["run", "--manifest"])
@@ -1921,4 +1928,426 @@ fn door_auth_ps_lists_and_stop_ends_an_authenticated_capsule() {
         assert!(Instant::now() < deadline, "the capsule outlived mur stop");
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+// ── Formations ────────────────────────────────────────────────────────────────
+
+/// A formation's member, launched the way a launcher starts one: `MURMUR_FORMATION_ID` set.
+fn start_member(home: &Arc<TempDir>, project: &Arc<TempDir>, formation: &str) -> Capsule {
+    start_in_project(
+        home,
+        Arc::clone(project),
+        &[("MURMUR_FORMATION_ID", formation)],
+    )
+}
+
+/// The session root a capsule's session directory sits in.
+fn session_root(capsule: &Capsule) -> PathBuf {
+    capsule
+        .trace_path()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn read_record(home: &Path, session_id: &str) -> Value {
+    serde_json::from_slice(&fs::read(record_for(home, session_id)).unwrap()).unwrap()
+}
+
+/// The first line of a trace, parsed.
+fn first_trace_line(trace_path: &Path) -> Value {
+    let content = fs::read_to_string(trace_path).unwrap();
+    serde_json::from_str(content.lines().next().unwrap()).unwrap()
+}
+
+/// The table rows of a `mur ps` listing: neither the header, a blank line, nor a summary line.
+fn table_rows(stdout: &str) -> Vec<&str> {
+    ps_rows(stdout)
+        .into_iter()
+        .filter(|line| !line.starts_with("formation "))
+        .collect()
+}
+
+fn summary_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("formation "))
+        .collect()
+}
+
+/// The value in the `FORMATION` column of a row.
+fn formation_cell(row: &str) -> &str {
+    // The cell before the URL: an uptime past a day is two fields, so counting from the left
+    // would not find it.
+    row.split_whitespace().rev().nth(1).unwrap()
+}
+
+/// A record the runtime would write for a member, naming a session directory under `root`.
+fn write_member_record(
+    home: &Path,
+    session_id: &str,
+    pid: u32,
+    process_start: &str,
+    formation: Option<&str>,
+    root: &Path,
+) {
+    let dir = running_dir(home);
+    fs::create_dir_all(&dir).unwrap();
+    let mut record = json!({
+        "session_id": session_id,
+        "url": "127.0.0.1:1",
+        "pid": pid,
+        "process_start": process_start,
+        "capsule_name": "fabricated",
+        "capsule_version": "0.1.0",
+        "workdir": root.join(session_id),
+        "outlives_launcher": true,
+        "started_at": "2026-01-01T00:00:00Z",
+    });
+    if let Some(formation) = formation {
+        record["formation_id"] = formation.into();
+    }
+    fs::write(
+        dir.join(format!("{session_id}.json")),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Two members of one formation launched from one project, and a standalone capsule launched
+/// between them. The records and the members' first trace lines carry the id, the standalone
+/// session's carry no key, and `mur ps` keeps the members together without moving `@1`.
+#[test]
+fn ps_groups_a_formations_members_and_leaves_row_one_the_newest() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let formation = capsule_runtime::FormationId::mint();
+    let project = Arc::new(agent_project(&server.endpoint, "member", ""));
+    let older_member = start_member(&home, &project, formation.as_str());
+    let standalone = start_agent(&home, &server, "standalone");
+    let newer_member = start_member(&home, &project, formation.as_str());
+    assert!(older_member.session_id() < standalone.session_id());
+    assert!(standalone.session_id() < newer_member.session_id());
+
+    for member in [&older_member, &newer_member] {
+        let record = read_record(home.path(), &member.session_id());
+        assert_eq!(record["formation_id"], formation.as_str(), "{record}");
+        let first = first_trace_line(&member.trace_path());
+        assert_eq!(first["event_type"], "session_start");
+        assert_eq!(first["formation_id"], formation.as_str());
+    }
+    let record = read_record(home.path(), &standalone.session_id());
+    assert!(record.get("formation_id").is_none(), "{record}");
+    let first = first_trace_line(&standalone.trace_path());
+    assert_eq!(first["event_type"], "session_start");
+    assert!(first.get("formation_id").is_none(), "{first}");
+
+    let (stdout, stderr) = ps_output(home.path());
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    let header = stdout.lines().next().unwrap();
+    assert!(header.contains("  UPTIME     FORMATION"), "{header}");
+    assert!(
+        header.ends_with("FORMATION                             URL"),
+        "{header}"
+    );
+
+    let rows = table_rows(&stdout);
+    assert_eq!(rows.len(), 3, "{stdout}");
+    // Newest first, then its formation's other member, then the standalone session that sorts
+    // between them by id.
+    assert!(rows[0].contains(&newer_member.session_id()), "{stdout}");
+    assert!(rows[1].contains(&older_member.session_id()), "{stdout}");
+    assert!(rows[2].contains(&standalone.session_id()), "{stdout}");
+    assert_eq!(formation_cell(rows[0]), formation.as_str());
+    assert_eq!(formation_cell(rows[1]), formation.as_str());
+    assert_eq!(formation_cell(rows[2]), "-");
+
+    assert_eq!(
+        summary_lines(&stdout),
+        [format!(
+            "formation {formation}: 2 listed (2 running); no other member found in 1 session root"
+        )]
+    );
+    assert!(
+        stdout.contains(&format!("{}\n\nformation ", rows[2])),
+        "{stdout}"
+    );
+    assert_eq!(session_root(&older_member), session_root(&newer_member));
+}
+
+/// A machine with no member lists no `FORMATION` column and prints no summary.
+#[test]
+fn ps_without_a_formation_prints_what_it_always_printed() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let capsule = start_agent(&home, &server, "standalone");
+
+    let stdout = ps_stdout(home.path());
+    assert!(!stdout.contains("FORMATION"), "{stdout}");
+    assert!(summary_lines(&stdout).is_empty(), "{stdout}");
+    assert!(!stdout.contains("\n\n"), "{stdout}");
+    let rows = ps_rows(&stdout);
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert!(
+        rows[0].ends_with(&format!("  {}", capsule.url())),
+        "{stdout}"
+    );
+}
+
+/// A member whose process is gone is pruned and named with its formation; a member whose door is
+/// quiet stays listed in its formation's group, ahead of an unrelated quiet session.
+#[test]
+fn ps_counts_a_formations_pruned_and_unreachable_members() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let formation = capsule_runtime::FormationId::mint();
+    let project = Arc::new(agent_project(&server.endpoint, "member", ""));
+    let live = start_member(&home, &project, formation.as_str());
+    let root = session_root(&live);
+
+    let quiet_member = Stray::sleeping();
+    let quiet_other = Stray::sleeping();
+    let dead = fabricated_id("dead");
+    let unreachable = fabricated_id("ee");
+    let unrelated = fabricated_id("ff");
+    write_member_record(
+        home.path(),
+        &dead,
+        0x7FFF_FFFE,
+        "1",
+        Some(formation.as_str()),
+        &root,
+    );
+    write_member_record(
+        home.path(),
+        &unreachable,
+        quiet_member.pid(),
+        &quiet_member.token(),
+        Some(formation.as_str()),
+        &root,
+    );
+    write_member_record(
+        home.path(),
+        &unrelated,
+        quiet_other.pid(),
+        &quiet_other.token(),
+        None,
+        &root,
+    );
+
+    let (stdout, stderr) = ps_output(home.path());
+    let pruned = pruned_lines(&stderr);
+    assert_eq!(pruned.len(), 1, "{stderr}");
+    assert!(
+        pruned[0].starts_with(&format!("pruned: {dead} — ")),
+        "{stderr}"
+    );
+    assert!(
+        pruned[0].ends_with(&format!(" (formation {formation})")),
+        "{stderr}"
+    );
+
+    let rows = table_rows(&stdout);
+    assert_eq!(rows.len(), 3, "{stdout}");
+    assert!(rows[0].contains(&live.session_id()), "{stdout}");
+    assert!(rows[1].contains(&unreachable), "{stdout}");
+    assert!(rows[1].contains(STATUS_UNREACHABLE_CELL), "{stdout}");
+    assert_eq!(formation_cell(rows[1]), formation.as_str());
+    assert!(rows[2].contains(&unrelated), "{stdout}");
+    assert_eq!(formation_cell(rows[2]), "-");
+
+    assert_eq!(
+        summary_lines(&stdout),
+        [format!(
+            "formation {formation}: 2 listed (1 running, 1 unreachable), 1 pruned now; no other member found in 1 session root"
+        )]
+    );
+
+    // The dead record went with the first read: a second neither lists nor prunes it.
+    let (stdout, stderr) = ps_output(home.path());
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    assert!(!stdout.contains(&dead), "{stdout}");
+    assert_eq!(
+        summary_lines(&stdout),
+        [format!(
+            "formation {formation}: 2 listed (1 running, 1 unreachable); no other member found in 1 session root"
+        )]
+    );
+}
+
+const STATUS_UNREACHABLE_CELL: &str = " unreachable ";
+
+/// One member killed outright, one stopped, one running: `mur ps` lists the running one and the
+/// traces account for the other two. Once all three are gone, `mur trace show` rebuilds the
+/// formation from the session root, and the killed member's own trace points at it.
+#[test]
+fn a_formation_is_accounted_for_after_its_members_end() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let formation = capsule_runtime::FormationId::mint();
+    let project = Arc::new(agent_project(&server.endpoint, "member", ""));
+    let mut killed = start_member(&home, &project, formation.as_str());
+    let stopped = start_member(&home, &project, formation.as_str());
+    let survivor = start_member(&home, &project, formation.as_str());
+    let root = session_root(&survivor);
+
+    kill(killed.pid(), 9);
+    killed.child.wait().unwrap();
+    let (_, stderr) = ps_output(home.path());
+    let pruned = pruned_lines(&stderr);
+    assert_eq!(pruned.len(), 1, "{stderr}");
+    assert!(pruned[0].contains(&killed.session_id()), "{stderr}");
+    assert!(
+        pruned[0].ends_with(&format!(" (formation {formation})")),
+        "{stderr}"
+    );
+
+    mur(home.path())
+        .args(["stop", &stopped.session_id()])
+        .assert()
+        .success();
+
+    let stdout = ps_stdout(home.path());
+    let rows = table_rows(&stdout);
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert!(rows[0].contains(&survivor.session_id()), "{stdout}");
+    assert_eq!(
+        summary_lines(&stdout),
+        [format!(
+            "formation {formation}: 1 listed (1 running); not listed: 1 ended, 1 with no record"
+        )]
+    );
+
+    mur(home.path())
+        .args(["stop", &survivor.session_id()])
+        .assert()
+        .success();
+
+    let shown = mur(home.path())
+        .args(["trace", "show", formation.as_str(), "--workdir"])
+        .arg(&root)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let shown = String::from_utf8_lossy(&shown).to_string();
+    assert!(shown.starts_with("── Formation "), "{shown}");
+    assert!(
+        shown.contains(&format!("formation:  {formation}\n")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("searched:   {}\n", root.display())),
+        "{shown}"
+    );
+    let member_rows: Vec<&str> = shown.lines().filter(|l| l.starts_with("ses_")).collect();
+    assert_eq!(member_rows.len(), 3, "{shown}");
+    for (row, capsule) in member_rows.iter().zip([&killed, &stopped, &survivor]) {
+        assert!(row.starts_with(&capsule.session_id()), "{shown}");
+        assert!(row.contains("member@0.1.0"), "{shown}");
+    }
+    assert!(member_rows[0].ends_with("  no session_end"), "{shown}");
+    // `mur stop` ends a member cleanly, and its row carries that `session_end.exit_status`.
+    assert!(member_rows[1].ends_with("  ok"), "{shown}");
+    assert!(member_rows[2].ends_with("  ok"), "{shown}");
+
+    let shown = mur(home.path())
+        .args(["trace", "show", &survivor.session_id(), "--workdir"])
+        .arg(&root)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let shown = String::from_utf8_lossy(&shown).to_string();
+    assert!(
+        shown.contains(&format!(
+            "session:    {}\nformation:  {formation}\n",
+            survivor.session_id()
+        )),
+        "{shown}"
+    );
+    assert!(shown.contains("\n\n── Formation "), "{shown}");
+    assert_eq!(
+        shown.lines().filter(|l| l.starts_with("ses_")).count(),
+        3,
+        "{shown}"
+    );
+
+    let failed = mur(home.path())
+        .args(["trace", "show", &killed.session_id(), "--workdir"])
+        .arg(&root)
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let failed = String::from_utf8_lossy(&failed).to_string();
+    assert!(failed.contains("E-TRC-001"), "{failed}");
+    assert!(failed.contains("no session_end event found"), "{failed}");
+    assert!(
+        failed.contains(&format!(
+            "this session is a member of formation {formation} — `mur trace show {formation}` lists the formation"
+        )),
+        "{failed}"
+    );
+}
+
+/// A formation address that names no recorded session, or is not a formation id at all.
+#[test]
+fn trace_show_refuses_a_formation_it_cannot_find() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let unused = capsule_runtime::FormationId::mint();
+
+    let output = mur(home.path())
+        .args(["trace", "show", unused.as_str(), "--workdir"])
+        .arg(root.path())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        output.stdout.is_empty(),
+        "a refusal prints no Formation section"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-TRC-002"), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "no session under {} belongs to formation {unused}",
+            root.path().display()
+        )),
+        "{stderr}"
+    );
+
+    let output = mur(home.path())
+        .args(["trace", "show", "frm_ABC", "--workdir"])
+        .arg(root.path())
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        output.stdout.is_empty(),
+        "a refusal prints no Formation section"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-TRC-002"), "{stderr}");
+    assert!(
+        stderr.contains("'frm_ABC' is not a formation id"),
+        "{stderr}"
+    );
+
+    let output = mur(home.path())
+        .args(["trace", "show", unused.as_str(), "--body", "system"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-TRC-001"), "{stderr}");
 }
