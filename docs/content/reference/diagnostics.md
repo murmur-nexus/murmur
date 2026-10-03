@@ -105,6 +105,9 @@ section that explains it.
 | `E-RUN-042` | `mur control` named a session with no control surface, or the control surface refused the request | [E-RUN-042](#e-run-042) |
 | `E-RUN-043` | A `murmur.lock` pin written by `manage.pull()` is declared as `runtime: hook`, `runtime: driver`, with `gateway:`, or bound as `inference.system_prompt_artifact` | [E-RUN-043](#e-run-043) |
 | `E-RUN-044` | `MURMUR_FORMATION_ID` is set to something that is not a formation id | [E-RUN-044](#e-run-044) |
+| `E-RUN-045` | A formation member did not come up, so `mur run --roster` launched nothing and stopped every member it had started | [E-RUN-045](#e-run-045) |
+| `E-RUN-046` | `mur run --roster` was run inside a formation member, or `MURMUR_FORMATION_PEERS` is malformed or set without `MURMUR_FORMATION_ID` | [E-RUN-046](#e-run-046) |
+| `E-RUN-047` | An installed capsule's bytes no longer hash to the sha256 roster admission bound its member to | [E-RUN-047](#e-run-047) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -122,6 +125,7 @@ section that explains it.
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
 | `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
+| `W-RUN-005` | A roster edge between two members neither of which is the entry member has no address to travel on | [W-RUN-005](#w-run-005) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -854,6 +858,81 @@ lowercase hex — and never the value itself.
 
 An unset or blank `MURMUR_FORMATION_ID` is not this error: it is the ordinary case of a session in
 no formation.
+
+### E-RUN-045 — a formation member did not come up { #e-run-045 }
+
+[`mur run --roster`](cli.md#mur-run-roster) starts every peer and waits for each one's door to
+answer. A peer that does not come up refuses the whole launch. Every member already started is
+stopped, the entry member is never started, and no formation line is printed:
+
+```text
+error[E-RUN-045]: the formation could not be launched
+  'broken' (broken@0.1.0): its process exited with status 1 before reporting; its last stderr lines were:
+      [capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key is written literally in murmur.yaml, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.<NAME> <key>` to have it re-read (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027)
+      error[E-RUN-008]: missing artifacts: murmur-driver-anthropic@9.9.9
+        hint: run `mur install` to install all manifest dependencies
+  stopped: coder (pid 529088), reviewer (pid 529091)
+  hint: the formation was not launched, and nothing it started is still running; fix the member named above and launch again. `mur run --capsule <capsule> --capsule-version <version>` runs one member on its own and shows its whole output
+```
+
+Each failed member is named as `'<name>' (<capsule>@<version>)`, in roster order, with one reason:
+
+| Reason | Means |
+|---|---|
+| `its process could not be started` | The `mur` binary could not be executed |
+| `its process exited with <status> before reporting` | The member's `mur run` refused or crashed before its readiness line. Its last stderr lines follow, and carry the member's own error code |
+| `its process reported and then exited with <status> before its door answered` | The member reported a door and ended before it answered |
+| `it did not report within 180s` | No readiness line within the [deadline](roster.md#launch-readiness) |
+| `its first line is not a readiness line` | The member printed something other than a JSON readiness line first |
+| `it reported no door` | The readiness line names no URL |
+| `it reported formation <x> instead of <minted>`, or `it reported no formation instead of <minted>` | The member is not running in the formation it was launched into |
+| `its door at <url> did not answer as session <ses> within 180s` | Nothing answered at the reported address, or something else did. The last probe's error follows |
+
+`stopped:` lists the members that were running when the launch was refused, as `name (pid N)`, or
+`none`. Every one of them has been stopped and reaped.
+
+### E-RUN-046 — not a formation's launcher, or unreadable peers { #e-run-046 }
+
+A process that already carries `MURMUR_FORMATION_ID` is a formation member, and a member cannot
+launch a formation:
+
+```text
+error[E-RUN-046]: MURMUR_FORMATION_ID is set, so this process is already a member of a formation, and a formation member cannot launch a formation
+  hint: a member joins the formation it was launched into and never starts one; unset MURMUR_FORMATION_ID to launch this roster as a formation of its own
+```
+
+The same code refuses a `mur run` whose
+[`MURMUR_FORMATION_PEERS`](roster.md#formation-peers) cannot be read, before a session directory
+exists:
+
+```text
+error[E-RUN-046]: MURMUR_FORMATION_PEERS does not carry a formation's peer addresses: pair 2 is empty; pairs are separated by exactly one space; a member handed addresses it cannot read would call the wrong peer or none, so the launch is refused
+  hint: MURMUR_FORMATION_PEERS is set by `mur run --roster` in its entry member's environment only, beside MURMUR_FORMATION_ID; unset it to run this capsule on its own
+```
+
+| The reason says | Means |
+|---|---|
+| `it is set, but MURMUR_FORMATION_ID is not` | Only a formation's entry member is handed peers |
+| `it is blank` | The variable is set and empty; a launcher leaves it unset instead |
+| `pair N is empty` | Two spaces in a row, or a leading or trailing space |
+| `pair N has no '='` | A pair is not `name=url` |
+| `pair N names a member whose name …` | The name does not match `^[a-z][a-z0-9-]{0,31}$` |
+| `pair N names '<name>' a second time` | A member is named twice |
+| `pair N ('<name>') has a URL …` | The URL is not `http://<host>:<port>` |
+
+### E-RUN-047 — the capsule changed since admission { #e-run-047 }
+
+Every member `mur run --roster` starts is handed the sha256 of the artifact admission resolved for
+it. A member whose installed artifact now hashes differently — reinstalled or republished between
+admission and launch — refuses before staging, rather than run other bytes:
+
+```text
+error[E-RUN-047]: capsule 'coder@1.2.0' resolved to bytes with sha256 7bec909458461f9f56fca830b2c939a63eb79f2041c758e7390c1a9704a0167f, but it was admitted with sha256 0000000000000000000000000000000000000000000000000000000000000000
+  hint: the installed artifact changed after the roster was admitted; launch the formation again so admission reads what is installed now
+```
+
+Under `mur run --roster` it reaches the operator inside [`E-RUN-045`](#e-run-045), quoted from the
+member's stderr. Launching again admits what is installed now.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1740,6 +1819,18 @@ first time the tool is called in a session, and not again.
 Fix the schema in the tool's own `murmur.yaml`: `required` is a JSON array of property names. A
 field the tool supplies a default for belongs out of `required` — a listed field is refused when it
 is missing.
+
+### W-RUN-005 — a peer edge with no address { #w-run-005 }
+
+```text
+warning[W-RUN-005]: roster.yaml lets 'reviewer' call 'coder' (reviewer → coder), but only the entry member 'planner' is handed peer addresses, so this call has none to travel on; both members are launched (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-005)
+```
+
+[`mur run --roster`](cli.md#mur-run-roster) hands addresses to the entry member only, as
+[`MURMUR_FORMATION_PEERS`](roster.md#formation-peers). A `reachability` edge from any other member
+is admitted and both members are launched, but the member it names as the caller is told no
+address to call. The warning prints once per such edge, before any member starts. Nothing is
+refused.
 
 ---
 

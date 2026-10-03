@@ -617,6 +617,17 @@ pub enum RuntimeError {
     )]
     FormationIdUnreadable { reason: String },
 
+    /// `MURMUR_FORMATION_PEERS` was set to something that is not a list of peer addresses, or was
+    /// set in a process that carries no formation id.
+    ///
+    /// `reason` names the pair at fault by its position and what is wrong with it.
+    #[error(
+        "MURMUR_FORMATION_PEERS does not carry a formation's peer addresses: {reason}; a member \
+         handed addresses it cannot read would call the wrong peer or none, so the launch is \
+         refused"
+    )]
+    FormationPeersUnreadable { reason: String },
+
     /// A native tool's `bin/<name>` payload was built for another operating system or CPU
     /// architecture than this host.
     ///

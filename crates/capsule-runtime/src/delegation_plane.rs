@@ -1512,6 +1512,37 @@ through that constructor rather than composing a second request literal."
         }
     }
 
+    /// A delegated child is never handed the doors its parent may call: the request carries no
+    /// such field, and the environment built from it holds no `MURMUR_FORMATION_PEERS` even when
+    /// the parent's process carries one and the child allowlists the name.
+    #[test]
+    fn a_launch_request_hands_a_child_no_formation_peers() {
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = crate::formation::FORMATION_PEERS_ENV;
+        let store = store_with_worker();
+        let plane = plane_in_formation(&store, &["B", name], Some(FormationId::mint()));
+        let mut launch = plane
+            .launch_request(
+                &request(),
+                &origin(),
+                SpawnApproval::new("approved".to_string()),
+                Some(completion_address()),
+            )
+            .expect("the store holds the child's declaration");
+        launch.child_env_allow.push(name.to_string());
+        std::env::set_var(name, "coder=http://localhost:41873");
+        let env = crate::child_launch::child_environment(&launch, None);
+        std::env::remove_var(name);
+        assert!(env.iter().all(|(key, _)| key != name), "{env:?}");
+        assert!(
+            env.iter()
+                .any(|(key, _)| key == crate::formation::FORMATION_ID_ENV),
+            "the formation id is still handed on: {env:?}"
+        );
+    }
+
     /// The trailing slash is taken off once, so no request is built against `//spawn`.
     #[test]
     fn a_trailing_slash_on_the_daemon_url_is_trimmed_once() {

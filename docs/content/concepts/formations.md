@@ -19,4 +19,11 @@ with A2A messaging](../how-to/capsules-a2a-messaging.md) for the full protocol a
 A formation is declared in a `roster.yaml` beside the project's `murmur.yaml`: its members, each a
 capsule at an exact version, the entry member that receives the formation's task, and which
 members may call which. [`mur doctor`](../reference/cli.md#doctor-roster) checks a roster against
-the installed capsules; nothing launches one. See the [Roster Schema](../reference/roster.md).
+the installed capsules. See the [Roster Schema](../reference/roster.md).
+
+`mur run --roster` launches a roster for one task. Every member runs as its own `mur run` process
+under one formation id: the peers start first, each counted ready only once its door answers as the
+session it reported, and the entry member starts last, handed the address of every member it may
+call. When the entry member's task ends, every member is stopped. See
+[Launching a formation](../reference/roster.md#launch) and the
+[`mur run --roster` flags and output](../reference/cli.md#mur-run-roster).

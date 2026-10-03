@@ -115,6 +115,8 @@ fn local_source_file_path_installs_skill_md() {
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         },
     )
     .unwrap();
@@ -184,6 +186,8 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         },
     )
     .unwrap();
@@ -264,6 +268,8 @@ fn local_source_coexists_with_registry_skill() {
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
+            formation_peers: None,
+            ignore_task_file: false,
         },
     )
     .unwrap();

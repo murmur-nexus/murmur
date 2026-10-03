@@ -22,6 +22,7 @@ pub(crate) mod precompile;
 pub(crate) mod ps;
 pub(crate) mod publish;
 pub(crate) mod run;
+pub(crate) mod run_roster;
 pub(crate) mod search;
 pub(crate) mod stop;
 #[cfg(feature = "beta-mur-topology")]

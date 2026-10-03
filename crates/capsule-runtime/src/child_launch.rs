@@ -36,7 +36,7 @@ use crate::delegation::{
     SPAWNER_ENV,
 };
 use crate::errors::RuntimeError;
-use crate::formation::{FormationId, FORMATION_ID_ENV};
+use crate::formation::{FormationId, FORMATION_ID_ENV, FORMATION_PEERS_ENV};
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 
@@ -383,37 +383,31 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     let env = child_environment(&request, handle.as_ref());
     let started = Instant::now();
 
-    let mut command = Command::new(&binary);
-    command
-        .args(&argv[1..])
-        .current_dir(&workdir)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in &env {
-        command.env(key, value);
-    }
-
-    let mut child = command.spawn().map_err(|error| {
+    // The grant's one and only appearance outside the parent's memory: one line on a pipe that is
+    // closed immediately afterwards. Failing to write it is fatal — the child would otherwise sit
+    // waiting on a line that will never come.
+    let StartedProcess {
+        child,
+        stderr_tail,
+        stdin_written: write_result,
+    } = start_process(&ProcessLaunch {
+        binary: &binary,
+        args: &argv[1..],
+        cwd: Some(&workdir),
+        env: ProcessEnv::Cleared(&env),
+        stdin_line: Some(request.grant.expose()),
+        stderr_prefix: None,
+        inherit_output: false,
+        own_process_group: false,
+    })
+    .map_err(|error| {
         RuntimeError::Runtime(format!(
             "failed to start the child capsule process '{}': {error}",
             binary.display()
         ))
     })?;
-
-    // The grant's one and only appearance outside the parent's memory: one line on a pipe that is
-    // closed immediately afterwards. Failing to write it is fatal — the child would otherwise sit
-    // waiting on a line that will never come.
-    let write_result = child
-        .stdin
-        .take()
-        .ok_or_else(|| "the child process exposed no standard input".to_string())
-        .and_then(|mut stdin| {
-            writeln!(stdin, "{}", request.grant.expose())
-                .map_err(|error| format!("failed to hand the child its launch grant: {error}"))
-        });
-    let stderr_tail = drain_stderr(&mut child);
+    let write_result =
+        write_result.map_err(|error| format!("failed to hand the child its launch grant: {error}"));
     let mut launched = LaunchedChild {
         workdir,
         session_id: String::new(),
@@ -489,7 +483,9 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
 
 /// The operator token a child's `--json` readiness line carries under `tokens.operator`, present
 /// only when the child declares `network.authentication`.
-fn readiness_door_token(report: &serde_json::Value) -> Option<crate::door_auth::DoorToken> {
+pub(crate) fn readiness_door_token(
+    report: &serde_json::Value,
+) -> Option<crate::door_auth::DoorToken> {
     report
         .pointer("/tokens/operator")
         .and_then(serde_json::Value::as_str)
@@ -656,7 +652,9 @@ fn watch_for_completion(
 /// launch and [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last,
 /// so a child cannot displace the daemon URL it is required to register with, the handle it
 /// reports its outcome to, or the formation it joins, by allowlisting the name.
-fn child_environment(
+/// [`FORMATION_PEERS_ENV`] is never handed on at all: the doors a formation's entry member may
+/// call are the entry member's, and a child that allowlists the name receives nothing.
+pub(crate) fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
 ) -> Vec<(String, String)> {
@@ -670,6 +668,7 @@ fn child_environment(
         !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL")
             && key != SPAWNER_ENV
             && key != FORMATION_ID_ENV
+            && key != FORMATION_PEERS_ENV
     });
 
     if let Ok(path) = std::env::var("PATH") {
@@ -694,7 +693,7 @@ fn child_environment(
 }
 
 /// The binary a child is started from: [`MUR_BINARY_ENV`] when set, else this process's own image.
-fn mur_binary() -> Result<PathBuf, RuntimeError> {
+pub(crate) fn mur_binary() -> Result<PathBuf, RuntimeError> {
     if let Some(path) = std::env::var_os(MUR_BINARY_ENV) {
         if !path.is_empty() {
             return Ok(PathBuf::from(path));
@@ -727,7 +726,7 @@ fn create_child_dir(workdir: &Path) -> Result<(), RuntimeError> {
 /// The child's stderr as the parent keeps it: every line echoed to this process's stderr as it
 /// arrives, with the last [`CHILD_STDERR_TAIL_LINES`] retained so a child that dies before
 /// reporting can say why.
-struct StderrTail {
+pub(crate) struct StderrTail {
     state: Mutex<StderrState>,
     /// Notified once [`StderrState::at_eof`] is set.
     drained: Condvar,
@@ -743,7 +742,7 @@ struct StderrState {
 impl StderrTail {
     /// What the child has said so far, without waiting for anything. For a child that is still
     /// running, which is the only state in which "so far" is the question being asked.
-    fn lines(&self) -> Vec<String> {
+    pub(crate) fn lines(&self) -> Vec<String> {
         lock(&self.state).lines.clone()
     }
 
@@ -754,7 +753,7 @@ impl StderrTail {
     /// empty for as long as the drain has not caught up. Reading it unsynchronised turns "refused
     /// because the declared floor is unmeetable here" into a refusal that names no reason —
     /// the one case the tail is kept for. Bounded by [`CHILD_STDERR_DRAIN_TIMEOUT`].
-    fn lines_at_end(&self) -> Vec<String> {
+    pub(crate) fn lines_at_end(&self) -> Vec<String> {
         let (state, _) = self
             .drained
             .wait_timeout_while(lock(&self.state), CHILD_STDERR_DRAIN_TIMEOUT, |state| {
@@ -774,8 +773,9 @@ impl StderrTail {
 /// Start draining the child's stderr into a [`StderrTail`].
 ///
 /// The child's diagnostics belong to the operator running the parent, so nothing is swallowed —
-/// this only remembers, in addition to printing.
-fn drain_stderr(child: &mut Child) -> Arc<StderrTail> {
+/// this only remembers, in addition to printing. `prefix`, when given, is written in front of
+/// every echoed line and kept off the remembered ones.
+fn drain_stderr(child: &mut Child, prefix: Option<&str>) -> Arc<StderrTail> {
     let tail = Arc::new(StderrTail {
         state: Mutex::new(StderrState::default()),
         drained: Condvar::new(),
@@ -787,9 +787,10 @@ fn drain_stderr(child: &mut Child) -> Arc<StderrTail> {
         return tail;
     };
     let collector = Arc::clone(&tail);
+    let prefix = prefix.unwrap_or_default().to_string();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            crate::runtime_err!("{line}");
+            crate::runtime_err!("{prefix}{line}");
             let mut state = lock(&collector.state);
             if state.lines.len() == CHILD_STDERR_TAIL_LINES {
                 state.lines.remove(0);
@@ -817,28 +818,7 @@ fn first_json_line(
             RuntimeError::Runtime("the child process exposed no standard output".to_string())
         })?;
 
-    let (tx, rx) = mpsc::channel::<Option<String>>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let first = match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim_end().to_string()),
-        };
-        let _ = tx.send(first);
-        // Everything the child says after its launch line goes to this process's own stdout, so
-        // the pipe stays drained for as long as the child lives. This thread outlives the parent's
-        // own readiness line by the whole life of the child, so it is the one relay most likely to
-        // meet a reader that has already gone: it relays the line and keeps draining either way.
-        let mut rest = String::new();
-        while let Ok(read) = reader.read_line(&mut rest) {
-            if read == 0 {
-                break;
-            }
-            crate::diagnostic::raw_to_stdout(&rest);
-            rest.clear();
-        }
-    });
+    let rx = relay_readiness_line(stdout, AfterReadiness::Stdout);
 
     match rx.recv_timeout(CHILD_READY_TIMEOUT) {
         Ok(Some(line)) => Ok(line),
@@ -864,6 +844,163 @@ fn first_json_line(
             CHILD_READY_TIMEOUT.as_secs()
         ))),
     }
+}
+
+/// How a launched `mur run` process's environment is built.
+pub(crate) enum ProcessEnv<'a> {
+    /// Cleared, then exactly these pairs: a delegated child, which holds nothing of the parent's
+    /// that it did not declare.
+    Cleared(&'a [(String, String)]),
+    /// This process's own, with `set` applied over it and every name in `remove` taken out: a
+    /// formation member, which the operator launched and which reads the operator's environment.
+    Inherited {
+        set: &'a [(String, String)],
+        remove: &'a [&'a str],
+    },
+}
+
+/// Where a launched process's standard output goes once its readiness line has been read.
+pub(crate) enum AfterReadiness {
+    /// To this process's standard output, as written.
+    Stdout,
+    /// To this process's standard error, one line at a time behind this prefix.
+    PrefixedStderr(String),
+}
+
+/// One `mur run` subprocess to start.
+pub(crate) struct ProcessLaunch<'a> {
+    pub(crate) binary: &'a Path,
+    /// The argument vector after the binary.
+    pub(crate) args: &'a [String],
+    /// The working directory, or `None` for this process's own.
+    pub(crate) cwd: Option<&'a Path>,
+    pub(crate) env: ProcessEnv<'a>,
+    /// One line written to the process's standard input, which is then closed; `None` gives it a
+    /// null standard input.
+    pub(crate) stdin_line: Option<&'a str>,
+    /// Written in front of every stderr line echoed to this process's stderr.
+    pub(crate) stderr_prefix: Option<&'a str>,
+    /// Hand the process this process's own standard output and error rather than pipes. Its
+    /// stdout is then not read here, and its stderr tail stays empty.
+    pub(crate) inherit_output: bool,
+    /// Start the process as the leader of a process group of its own, so a signal meant for this
+    /// process's group — a terminal's `^C` — does not reach it, and its whole tree can be
+    /// signalled at once.
+    pub(crate) own_process_group: bool,
+}
+
+/// A process [`start_process`] started, with its stderr already being drained.
+pub(crate) struct StartedProcess {
+    /// Its standard output, unless inherited, is still piped and unread.
+    pub(crate) child: Child,
+    pub(crate) stderr_tail: Arc<StderrTail>,
+    /// Whether [`ProcessLaunch::stdin_line`] was written: `Ok` when there was none to write.
+    pub(crate) stdin_written: Result<(), String>,
+}
+
+/// Start one `mur run` subprocess: spawn it, write its standard-input line, and start draining its
+/// stderr. The one spawn site for a delegated child and a formation member alike.
+pub(crate) fn start_process(launch: &ProcessLaunch<'_>) -> std::io::Result<StartedProcess> {
+    let mut command = Command::new(launch.binary);
+    command
+        .args(launch.args)
+        .stdin(if launch.stdin_line.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if launch.inherit_output {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .stderr(if launch.inherit_output {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        });
+    if let Some(cwd) = launch.cwd {
+        command.current_dir(cwd);
+    }
+    match launch.env {
+        ProcessEnv::Cleared(pairs) => {
+            command.env_clear();
+            for (key, value) in pairs {
+                command.env(key, value);
+            }
+        }
+        ProcessEnv::Inherited { set, remove } => {
+            for name in remove {
+                command.env_remove(name);
+            }
+            for (key, value) in set {
+                command.env(key, value);
+            }
+        }
+    }
+    #[cfg(unix)]
+    if launch.own_process_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = command.spawn()?;
+    let stdin_written = match launch.stdin_line {
+        None => Ok(()),
+        Some(line) => child
+            .stdin
+            .take()
+            .ok_or_else(|| "the process exposed no standard input".to_string())
+            .and_then(|mut stdin| writeln!(stdin, "{line}").map_err(|error| error.to_string())),
+    };
+    let stderr_tail = drain_stderr(&mut child, launch.stderr_prefix);
+    Ok(StartedProcess {
+        child,
+        stderr_tail,
+        stdin_written,
+    })
+}
+
+/// Read a launched process's first standard-output line on a thread of its own, and hand it back
+/// on the returned channel: `Some(line)` without its line ending, or `None` when the stream ended
+/// first.
+///
+/// The thread then keeps draining the pipe to `after` for as long as the process lives. The drain
+/// matters: a process whose stdout pipe fills blocks forever, and a capsule that logs after its
+/// launch line would otherwise deadlock against a reader that had stopped reading. This thread
+/// outlives the readiness line by the whole life of the process, so it is the one relay most
+/// likely to meet a reader that has already gone: it relays each line and keeps draining either
+/// way.
+pub(crate) fn relay_readiness_line(
+    stdout: std::process::ChildStdout,
+    after: AfterReadiness,
+) -> mpsc::Receiver<Option<String>> {
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let first = match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim_end().to_string()),
+        };
+        let _ = tx.send(first);
+        let mut rest = String::new();
+        while let Ok(read) = reader.read_line(&mut rest) {
+            if read == 0 {
+                break;
+            }
+            match &after {
+                AfterReadiness::Stdout => {
+                    crate::diagnostic::raw_to_stdout(&rest);
+                }
+                AfterReadiness::PrefixedStderr(prefix) => {
+                    crate::runtime_err!("{prefix}{}", rest.trim_end_matches(['\r', '\n']));
+                }
+            }
+            rest.clear();
+        }
+    });
+    rx
 }
 
 #[cfg(test)]
