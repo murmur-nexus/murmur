@@ -217,6 +217,21 @@ fn required_string(root: &serde_yaml::Mapping, field: &str) -> Result<String, Ma
     Ok(value_str.to_string())
 }
 
+/// What kind of YAML node this is, in the vocabulary a manifest author writes in, for a refusal
+/// that tells them what they wrote rather than what a deserializer expected.
+#[must_use]
+pub fn describe_yaml_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "an empty block",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Sequence(_) => "a sequence",
+        Value::Mapping(_) => "a mapping",
+        Value::Tagged(_) => "a tagged value",
+    }
+}
+
 fn yaml_type_name(value: &Value) -> String {
     match value {
         Value::Null => "null".into(),

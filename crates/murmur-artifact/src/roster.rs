@@ -20,6 +20,7 @@ use serde_yaml::Value;
 use thiserror::Error;
 
 use crate::build::artifact_name_format_error;
+use crate::manifest::describe_yaml_shape;
 use crate::registry::is_reserved_version;
 
 /// Filename of a project's formation roster, read from the directory that holds `murmur.yaml`.
@@ -159,7 +160,7 @@ impl Roster {
         let Value::Mapping(top) = document else {
             return Err(malformed(format!(
                 "{ROSTER_FILENAME}: must be a mapping with `roster_version` and `members`, found {}",
-                describe(&document)
+                describe_yaml_shape(&document)
             )));
         };
         refuse_unknown_keys(&top, TOP_LEVEL_KEYS, "", None)?;
@@ -174,7 +175,7 @@ impl Roster {
                     &format!(
                         "must be {ROSTER_VERSION}, the only roster format this build reads; found \
                          {}",
-                        describe(other)
+                        describe_yaml_shape(other)
                     ),
                 ))
             }
@@ -190,7 +191,7 @@ impl Roster {
                 return Err(fault(
                     "members",
                     None,
-                    &format!("must be a list, found {}", describe(other)),
+                    &format!("must be a list, found {}", describe_yaml_shape(other)),
                 ))
             }
         };
@@ -227,7 +228,7 @@ impl Roster {
                     None,
                     &format!(
                         "must be `{REACHABILITY_ALL}` or a list of rules, found {}",
-                        describe(other)
+                        describe_yaml_shape(other)
                     ),
                 ))
             }
@@ -268,7 +269,7 @@ fn parse_member(index: usize, entry: &Value) -> Result<RosterMember, RosterError
         return Err(fault(
             &path,
             None,
-            &format!("must be a mapping, found {}", describe(entry)),
+            &format!("must be a mapping, found {}", describe_yaml_shape(entry)),
         ));
     };
     // The member's own name labels every later fault in this entry, once it is a usable one.
@@ -296,7 +297,7 @@ fn parse_member(index: usize, entry: &Value) -> Result<RosterMember, RosterError
             return Err(fault(
                 &format!("{path}.name"),
                 None,
-                &format!("must be a string, found {}", describe(other)),
+                &format!("must be a string, found {}", describe_yaml_shape(other)),
             ))
         }
     };
@@ -318,7 +319,7 @@ fn parse_member(index: usize, entry: &Value) -> Result<RosterMember, RosterError
             return Err(fault(
                 &format!("{path}.capsule"),
                 label,
-                &format!("must be a string, found {}", describe(other)),
+                &format!("must be a string, found {}", describe_yaml_shape(other)),
             ))
         }
     };
@@ -353,7 +354,10 @@ fn parse_member(index: usize, entry: &Value) -> Result<RosterMember, RosterError
             return Err(fault(
                 &format!("{path}.version"),
                 label,
-                &format!("must be a version string, found {}", describe(other)),
+                &format!(
+                    "must be a version string, found {}",
+                    describe_yaml_shape(other)
+                ),
             ))
         }
     };
@@ -365,7 +369,10 @@ fn parse_member(index: usize, entry: &Value) -> Result<RosterMember, RosterError
             return Err(fault(
                 &format!("{path}.entry"),
                 label,
-                &format!("must be true or false, found {}", describe(other)),
+                &format!(
+                    "must be true or false, found {}",
+                    describe_yaml_shape(other)
+                ),
             ))
         }
     };
@@ -386,7 +393,7 @@ fn parse_rule(index: usize, rule: &Value) -> Result<ReachabilityRule, RosterErro
             None,
             &format!(
                 "must be a mapping with `from` and `to`, found {}",
-                describe(rule)
+                describe_yaml_shape(rule)
             ),
         ));
     };
@@ -399,7 +406,10 @@ fn parse_rule(index: usize, rule: &Value) -> Result<ReachabilityRule, RosterErro
             return Err(fault(
                 &format!("{path}.from"),
                 None,
-                &format!("must be a member name, found {}", describe(other)),
+                &format!(
+                    "must be a member name, found {}",
+                    describe_yaml_shape(other)
+                ),
             ))
         }
     };
@@ -421,7 +431,10 @@ fn parse_rule(index: usize, rule: &Value) -> Result<ReachabilityRule, RosterErro
                 other => Err(fault(
                     &format!("{path}.to[{position}]"),
                     None,
-                    &format!("must be a member name, found {}", describe(other)),
+                    &format!(
+                        "must be a member name, found {}",
+                        describe_yaml_shape(other)
+                    ),
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?,
@@ -429,7 +442,10 @@ fn parse_rule(index: usize, rule: &Value) -> Result<ReachabilityRule, RosterErro
             return Err(fault(
                 &format!("{path}.to"),
                 None,
-                &format!("must be a list of member names, found {}", describe(other)),
+                &format!(
+                    "must be a list of member names, found {}",
+                    describe_yaml_shape(other)
+                ),
             ))
         }
     };
@@ -464,7 +480,7 @@ fn refuse_unknown_keys(
             Value::String(key) => key.clone(),
             other => serde_yaml::to_string(other)
                 .map(|text| text.trim_end().to_string())
-                .unwrap_or_else(|_| describe(other).to_string()),
+                .unwrap_or_else(|_| describe_yaml_shape(other).to_string()),
         })
         .collect();
     let Some(first) = unknown.first() else {
@@ -505,18 +521,6 @@ fn fault(key_path: &str, member: Option<&str>, problem: &str) -> RosterError {
 
 fn malformed(message: String) -> RosterError {
     RosterError::Malformed { message }
-}
-
-fn describe(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "nothing",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Sequence(_) => "a list",
-        Value::Mapping(_) => "a mapping",
-        Value::Tagged(_) => "a tagged value",
-    }
 }
 
 #[cfg(test)]

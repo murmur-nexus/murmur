@@ -1559,7 +1559,8 @@ does declare fails the checklist instead, because the next `mur run` refuses it.
 ## Roster errors
 
 A [`roster.yaml`](roster.md) is admitted whole or refused with one of these codes. Every message
-names `roster.yaml`, and every code except `E-ROS-001` names the member at fault. The order
+names `roster.yaml`. Every code except `E-ROS-001` names the member at fault, apart from an
+`E-ROS-002` for a roster with no entry member, where no single member is at fault. The order
 admission checks them in is in [Admission order](roster.md#admission).
 
 ### E-ROS-001 — the roster is missing or malformed { #e-ros-001 }

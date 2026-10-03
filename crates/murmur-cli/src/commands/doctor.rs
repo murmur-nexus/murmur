@@ -1084,8 +1084,8 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
 }
 
 /// Print the `Roster` block when `roster.yaml` sits beside the project's `murmur.yaml`: the roster
-/// admitted against the same stores and `murmur.lock` the launch path admits it against, with each
-/// member's peer posture and the expanded reachability. Returns the `Fix:` entries; a refusal is
+/// admitted through [`capsule_runtime::admit_roster_file`], with each member's peer posture and the
+/// expanded reachability. Returns the `Fix:` entries; a refusal is
 /// one, and it fails the exit code.
 ///
 /// Prints nothing, and finds nothing, when there is no `roster.yaml`.
@@ -1136,13 +1136,7 @@ fn report_roster(
         } else {
             "refuses peers"
         };
-        let door = if member
-            .manifest
-            .network
-            .as_ref()
-            .and_then(|network| network.authentication.as_ref())
-            .is_some()
-        {
+        let door = if member.requires_authentication() {
             "authenticated door"
         } else {
             "public door"
@@ -1436,8 +1430,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let platform = current_platform();
 
-    // The formation beside this project, admitted through the function the launch path calls,
-    // against the stores `mur run --capsule` resolves from, in the same order.
+    // Members resolve from the stores `mur run --capsule` resolves from, in the same order.
     let roster_fixes = report_roster(
         &project_root,
         &FallbackRegistry {

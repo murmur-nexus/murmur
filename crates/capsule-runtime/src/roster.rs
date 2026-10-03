@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 
 use murmur_artifact::{
     current_platform, load_roster, resolve_roster_path, sha256_hex, LockedSha256, MurmurLock,
-    Registry, RegistryError, Roster, RosterReachability, RuntimeManifest, RuntimeType,
-    ROSTER_FILENAME,
+    Registry, RegistryError, Roster, RosterReachability, RuntimeManifest, ROSTER_FILENAME,
 };
 use thiserror::Error;
 
@@ -52,10 +51,22 @@ pub struct AdmittedMember {
     /// Whether this is the roster's entry member.
     pub entry: bool,
     /// SHA-256 of the artifact bytes admission resolved and checked, as 64 lowercase hex
-    /// characters. A launch starts these bytes and no others.
+    /// characters. Whatever starts this member must start these bytes and no others.
     pub sha256: String,
     /// The member's packed `murmur.yaml`, parsed.
     pub manifest: RuntimeManifest,
+}
+
+impl AdmittedMember {
+    /// Whether the member's door requires authentication: its manifest declares
+    /// `network.authentication`.
+    #[must_use]
+    pub fn requires_authentication(&self) -> bool {
+        self.manifest
+            .network
+            .as_ref()
+            .is_some_and(|network| network.authentication.is_some())
+    }
 }
 
 /// `from` may call `to`. Both are member names.
@@ -301,11 +312,7 @@ pub fn admit_roster(
         })?;
 
         if let Some(pinned) = lock.and_then(|lock| lock.artifact_for(&member.capsule)) {
-            let incoming = if resolved.meta.runtime == RuntimeType::Native {
-                LockedSha256::for_one_platform(platform, resolved.sha256.clone())
-            } else {
-                LockedSha256::any(resolved.sha256.clone())
-            };
+            let incoming = LockedSha256::for_resolved(&resolved, platform);
             if let Some(conflict) = pinned.conflict_with(&member.version, &incoming) {
                 return Err(RosterRefusal::MemberLockConflict {
                     member: member.name.clone(),
@@ -367,14 +374,10 @@ pub fn admit_roster(
     };
 
     if !pairs.is_empty() {
-        if let Some(public) = members.iter().find(|member| {
-            member
-                .manifest
-                .network
-                .as_ref()
-                .and_then(|network| network.authentication.as_ref())
-                .is_none()
-        }) {
+        if let Some(public) = members
+            .iter()
+            .find(|member| !member.requires_authentication())
+        {
             return Err(RosterRefusal::MemberNotAuthenticated {
                 member: public.name.clone(),
             });
@@ -406,7 +409,7 @@ mod tests {
 
     use murmur_artifact::{
         ArtifactMeta, LocalRegistry, LockOrigin, LockedArtifact, ReachabilityRule, RosterMember,
-        LOCK_VERSION,
+        RuntimeType, LOCK_VERSION,
     };
 
     use super::*;
