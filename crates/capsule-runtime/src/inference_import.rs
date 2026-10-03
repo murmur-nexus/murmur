@@ -96,6 +96,9 @@ pub(crate) struct HookInferenceCtx {
     /// The session's inference gateway, so a hook's `run-inference` reaches the provider exactly
     /// as the agent loop's own turns do. Never another artifact's gateway.
     pub(crate) gateway: Option<Arc<crate::credential_gateway::CredentialGateway>>,
+    /// The session's formation membership, so the driver's guest reaches the callees its
+    /// environment names exactly as the agent loop's own driver does.
+    pub(crate) formation: Option<Arc<crate::formation_credentials::FormationMember>>,
     /// The session's spend account — the same one the agent loop admits its turns against — so a
     /// hook's completion counts toward, and is refused by, the same ceilings.
     pub(crate) spend: Arc<SpendMeter>,
@@ -217,6 +220,10 @@ impl HookInferenceCtx {
                 network_allow_rules: &self.network_allow_rules,
                 artifact_grant: self.driver_grant.as_ref(),
                 gateway: self.gateway.as_ref(),
+                formation: self.formation.as_ref(),
+                // A hook's completion runs for no task of its own, so a formation call from it
+                // stamps `untrusted`.
+                task_provenance: None,
             },
             // A hook's completion is not part of the user-facing turn: it must
             // not stream chunks into the SSE stream or ask the user for input.
@@ -560,6 +567,7 @@ mod tests {
             network_allow_rules: Vec::new(),
             driver_grant: None,
             gateway: None,
+            formation: None,
             spend,
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),

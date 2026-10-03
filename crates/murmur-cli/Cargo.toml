@@ -78,6 +78,8 @@ alloc-bench = ["capsule-runtime/alloc-bench"]
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
 assert_cmd = "2"
+# Already in the build through capsule-runtime: the formation-token tests forge tokens with it.
+base64 = "0.22"
 predicates = "3"
 sha2 = "0.10"
 tempfile = "3"

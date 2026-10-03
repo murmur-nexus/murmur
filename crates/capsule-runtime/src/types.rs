@@ -12,7 +12,8 @@ use wasmtime::{component::Component, Engine};
 
 use crate::{
     bindings::host::murmur::tool::run::ToolResult,
-    formation::{FormationId, FormationPeers},
+    formation::FormationId,
+    formation_credentials::FormationMember,
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
     network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
@@ -456,14 +457,15 @@ pub struct StageRequest {
     /// [`crate::formation::FormationId::from_env`], which reads what the launcher of a formation's
     /// members, or a member's runtime for its child, put in the environment.
     pub formation_id: Option<FormationId>,
-    /// The doors of the formation members this session may call, as its launcher handed them.
+    /// What this session's formation launcher handed it: its roster name, what its door checks a
+    /// formation token with, and the tokens and addresses of the members it may call.
     ///
-    /// `Some` only for a formation's entry member whose roster lets it call someone: `mur run`
-    /// sets it from [`crate::formation::FormationPeers::from_env`], and refuses the launch when it
-    /// is set without [`Self::formation_id`]. The session injects it as
-    /// [`crate::formation::FORMATION_PEERS_ENV`] into every guest and native process it starts for
-    /// itself, and into no delegated child.
-    pub formation_peers: Option<FormationPeers>,
+    /// `Some` only for a session `mur run --roster` launched as a member: `mur run` reads it from
+    /// the channel [`crate::formation_credentials::FormationMember::from_env`] names, and refuses
+    /// the launch when that cannot be read. The door verifies formation tokens with it, every WASM
+    /// guest is handed its callees' names, and the runtime's egress resolves and authorizes calls
+    /// to them. No native process and no delegated child is handed any of it.
+    pub formation_member: Option<Arc<FormationMember>>,
     /// Never run a `task.md` found in the accessible workdir at launch: this session takes work
     /// only at its door.
     ///
@@ -643,8 +645,8 @@ pub struct StagedSession {
     /// Copied from [`StageRequest::formation_id`]. Hooks see it as `MURMUR_FORMATION_ID` and the
     /// delegation plane hands it to every child this session spawns.
     pub(crate) formation_id: Option<FormationId>,
-    /// Copied from [`StageRequest::formation_peers`].
-    pub(crate) formation_peers: Option<FormationPeers>,
+    /// Copied from [`StageRequest::formation_member`].
+    pub(crate) formation_member: Option<Arc<FormationMember>>,
     /// Copied from [`StageRequest::ignore_task_file`].
     pub(crate) ignore_task_file: bool,
 }
@@ -679,10 +681,10 @@ impl StagedSession {
         self.formation_id.as_ref()
     }
 
-    /// The doors this session may call in its formation, or `None` for every session but an
-    /// entry member with callees.
-    pub fn formation_peers(&self) -> Option<&FormationPeers> {
-        self.formation_peers.as_ref()
+    /// What this session's formation launcher handed it, or `None` for every session but a
+    /// formation member's.
+    pub fn formation_member(&self) -> Option<&Arc<FormationMember>> {
+        self.formation_member.as_ref()
     }
 }
 

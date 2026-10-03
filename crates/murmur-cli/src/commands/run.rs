@@ -249,22 +249,16 @@ pub(crate) fn run_run(
     // staging, as an unreadable spawner handle does.
     let formation_id = capsule_runtime::FormationId::from_env()
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
-    // Beside it and on the same terms: the doors a formation's entry member may call, handed only
-    // to an entry member, and so meaningless — and refused — without a formation id.
-    let formation_peers = capsule_runtime::FormationPeers::from_env()
+    // The callees' names reach a member's guests from its runtime alone, never from a process
+    // environment, so a value found in this one is refused rather than silently ignored.
+    capsule_runtime::formation::refuse_formation_peers_in_process_env()
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
-    if formation_peers.is_some() && formation_id.is_none() {
-        return Err(fail(
-            &session_id,
-            &workdir,
-            CliError::from(RuntimeError::FormationPeersUnreadable {
-                reason: "it is set, but MURMUR_FORMATION_ID is not, and only a formation's \
-                         entry member is handed peers"
-                    .to_string(),
-            }),
-            json,
-        ));
-    }
+    // Beside the id and on the same terms: what a formation launcher handed this member on its
+    // channel — its name, the key its door verifies formation tokens with, and the tokens and
+    // addresses of the members it may call. Read before anything is staged or started, which is
+    // also what marks the channel close-on-exec before any process could inherit it.
+    let formation_member = capsule_runtime::FormationMember::from_env(formation_id.as_ref())
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
 
     // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
     // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
@@ -758,7 +752,7 @@ pub(crate) fn run_run(
         spawn_grant,
         machine_tokens_per_day,
         formation_id,
-        formation_peers,
+        formation_member,
         ignore_task_file,
     };
 

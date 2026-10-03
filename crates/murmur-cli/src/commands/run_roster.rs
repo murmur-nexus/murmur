@@ -12,11 +12,11 @@
 use std::path::{Path, PathBuf};
 
 use capsule_runtime::formation_launch::{
-    self, render_stopped, signal_name, FormationEnding, FormationLaunchOptions,
+    self, render_stopped, signal_name, unserved_edges, FormationEnding, FormationLaunchOptions,
     MemberLaunchFailure, RunningFormation,
 };
 use capsule_runtime::{admit_roster_file, AdmittedRoster, FormationId};
-use murmur_artifact::{runtime_warning_link, LocalRegistry, ROSTER_FILENAME, W_RUN_005};
+use murmur_artifact::{runtime_warning_link, LocalRegistry, ROSTER_FILENAME, W_RUN_006};
 
 use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046};
 use crate::registry_client::FallbackRegistry;
@@ -48,7 +48,7 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
     let lock = read_optional_lockfile(&project_dir)?;
     let roster =
         admit_roster_file(&project_dir, &registry, lock.as_ref()).map_err(CliError::from)?;
-    warn_on_unaddressed_edges(&roster);
+    warn_on_unserved_edges(&roster);
 
     let mut options = FormationLaunchOptions::new(FormationId::mint(), project_dir);
     options.task = launch.task.map(str::to_string);
@@ -134,18 +134,17 @@ fn roster_project_dir(arg: &Path) -> Result<PathBuf, CliError> {
     ))
 }
 
-/// `W-RUN-005` once per edge between two members neither of which is the entry member: only the
-/// entry member is handed addresses, so the call such an edge allows has none to travel on.
-fn warn_on_unaddressed_edges(roster: &AdmittedRoster) {
-    let entry = &roster.entry().name;
-    for edge in roster.edges().iter().filter(|edge| &edge.from != entry) {
+/// `W-RUN-006` once per edge into the entry member: the entry member accepts only the formation's
+/// own task, so the member calling it is handed no credential or address for it.
+fn warn_on_unserved_edges(roster: &AdmittedRoster) {
+    for edge in unserved_edges(roster) {
         capsule_runtime::runtime_err!(
-            "warning[{W_RUN_005}]: roster.yaml lets '{from}' call '{to}' ({from} \u{2192} {to}), \
-             but only the entry member '{entry}' is handed peer addresses, so this call has none \
-             to travel on; both members are launched ({link})",
+            "warning[{W_RUN_006}]: roster edge '{from} \u{2192} {to}' is not served: the entry \
+             member accepts only the formation's own task, so '{from}' is handed no credential \
+             or address for it ({link})",
             from = edge.from,
             to = edge.to,
-            link = runtime_warning_link(W_RUN_005),
+            link = runtime_warning_link(W_RUN_006),
         );
     }
 }

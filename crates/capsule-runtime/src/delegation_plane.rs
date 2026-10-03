@@ -1075,6 +1075,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .expect_err("the same door refuses a peer message");
@@ -1512,17 +1513,19 @@ through that constructor rather than composing a second request literal."
         }
     }
 
-    /// A delegated child is never handed the doors its parent may call: the request carries no
-    /// such field, and the environment built from it holds no `MURMUR_FORMATION_PEERS` even when
-    /// the parent's process carries one and the child allowlists the name.
+    /// A delegated child is never handed its parent's formation channel or callees: the request
+    /// carries no such field, and the environment built from it holds neither
+    /// `MURMUR_FORMATION_CHANNEL` nor `MURMUR_FORMATION_PEERS` even when the parent's process
+    /// carries both and the child allowlists both names. The formation id is still handed on.
     #[test]
-    fn a_launch_request_hands_a_child_no_formation_peers() {
+    fn a_launch_request_hands_a_child_no_formation_channel_or_peers() {
         let _guard = crate::formation::FORMATION_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let name = crate::formation::FORMATION_PEERS_ENV;
+        let peers = crate::formation::FORMATION_PEERS_ENV;
+        let channel = crate::formation_credentials::FORMATION_CHANNEL_ENV;
         let store = store_with_worker();
-        let plane = plane_in_formation(&store, &["B", name], Some(FormationId::mint()));
+        let plane = plane_in_formation(&store, &["B", peers, channel], Some(FormationId::mint()));
         let mut launch = plane
             .launch_request(
                 &request(),
@@ -1531,11 +1534,17 @@ through that constructor rather than composing a second request literal."
                 Some(completion_address()),
             )
             .expect("the store holds the child's declaration");
-        launch.child_env_allow.push(name.to_string());
-        std::env::set_var(name, "coder=http://localhost:41873");
+        launch.child_env_allow.push(peers.to_string());
+        launch.child_env_allow.push(channel.to_string());
+        std::env::set_var(peers, "coder=http://coder.formation.invalid");
+        std::env::set_var(channel, "7");
         let env = crate::child_launch::child_environment(&launch, None);
-        std::env::remove_var(name);
-        assert!(env.iter().all(|(key, _)| key != name), "{env:?}");
+        std::env::remove_var(peers);
+        std::env::remove_var(channel);
+        assert!(
+            env.iter().all(|(key, _)| key != peers && key != channel),
+            "{env:?}"
+        );
         assert!(
             env.iter()
                 .any(|(key, _)| key == crate::formation::FORMATION_ID_ENV),

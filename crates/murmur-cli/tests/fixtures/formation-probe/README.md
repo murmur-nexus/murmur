@@ -1,20 +1,28 @@
 # formation-probe fixture
 
-A test-only WASM tool for `tests/formation_launch.rs`, run by a formation's entry member to show
-which peers it was handed and whether each one's door answers.
+A test-only WASM tool for `tests/formation_launch.rs`, run by a formation member to show which
+callees its runtime handed it and whether each one answers through the runtime's formation egress.
 
-`tool/formation-probe.wasm` is built against `crates/capsule-runtime/wit/guest` `world tool`. It
-reads `MURMUR_FORMATION_PEERS` and, for each `name=url` pair, sends
-`GET <url>/.well-known/agent-card.json` and one unauthenticated JSON-RPC `message/send` as
-`POST <url>/`. It returns one line per peer, in the order the variable names them:
+`tool/formation-probe.wasm` is built against `crates/capsule-runtime/wit/guest` `world tool`. Its
+input is optional:
 
-```text
-<name> card=<status> card_name=<card's "name"> send=<status>
+```json
+{"names": ["coder", "reviewer", "nosuch"]}
 ```
 
-with `card_error=<what>` or `send_error=<what>` in place of a status when a request does not
-complete, and the single line `peers=absent` when the variable is not set. It holds no token, so an
-authenticated peer answers its public card with `200` and `message/send` with `401`.
+Without `names`, it probes the names `MURMUR_FORMATION_PEERS` lists. For each name, in order, it
+sends `GET http://<name>.formation.invalid/.well-known/agent-card.json` and one JSON-RPC
+`message/send` as `POST http://<name>.formation.invalid/`. It holds no token and no port: the
+member's runtime resolves each virtual address to the callee's real door and presents the callee's
+formation token. Its summary is one line per name, then the variable it was handed:
+
+```text
+<name> card=<status|refused:<error>> send=<status|refused:<error>>
+peers=<value of MURMUR_FORMATION_PEERS, or absent>
+```
+
+`refused:<error>` is the request's failure as wasi-http reported it, for example
+`refused:HttpRequestDenied` for a name the member may not call.
 
 ## Rebuild
 

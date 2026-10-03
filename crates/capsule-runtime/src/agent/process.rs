@@ -407,8 +407,7 @@ fn substitute_files_dir(value: &str, files_dir: &str) -> String {
 }
 
 /// The environment the harness starts with: nothing, then the host values of the names
-/// `capabilities.env.allow` declares, then the plan's `env-set`, then `runtime_env` — the
-/// session's runtime-owned names, which neither a declaration nor the driver's plan can replace.
+/// `capabilities.env.allow` declares, then the plan's `env-set`, which wins.
 ///
 /// The same mechanism every WASM guest gets, credential backstop included — a credential-shaped
 /// name in `env.allow` is refused at staging, so the harness cannot be handed a key that way
@@ -418,7 +417,6 @@ pub(super) fn build_harness_env(
     policy: &CapabilityPolicy,
     env_set: &[(String, String)],
     files_dir: &str,
-    runtime_env: &[(String, String)],
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = shell::build_declared_env(policy);
     for (name, value) in env_set {
@@ -429,7 +427,6 @@ pub(super) fn build_harness_env(
         }
         env.insert(name.clone(), substitute_files_dir(value, files_dir));
     }
-    env.extend(runtime_env.iter().cloned());
     Ok(env)
 }
 
@@ -752,8 +749,7 @@ async fn run_harness(
     .await?;
 
     let description = &staged.description;
-    let mut base_env = shell::build_declared_env(&store_state.capability_policy);
-    base_env.extend(crate::runtime::formation_env(&store_state.inference_env));
+    let base_env = shell::build_declared_env(&store_state.capability_policy);
     let probe = probe_harness_version(
         &staged.binary,
         &description.version_args,
@@ -832,7 +828,6 @@ async fn run_harness(
         &store_state.capability_policy,
         &plan.env_set,
         &files_dir_path,
-        &crate::runtime::formation_env(&store_state.inference_env),
     )
     .map_err(launch_error)?;
 
@@ -1994,7 +1989,6 @@ mod tests {
             &policy_allowing(&["MURMUR_TEST_HARNESS_DECLARED"]),
             &[],
             "/files",
-            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2018,7 +2012,6 @@ mod tests {
                 ("FILES".to_string(), "{files_dir}/config.json".to_string()),
             ],
             "/tmp/run",
-            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2043,7 +2036,6 @@ mod tests {
             &policy_allowing(&["MURMUR_TEST_HARNESS_API_KEY"]),
             &[],
             "/files",
-            &[],
         )
         .unwrap();
         assert!(
@@ -2052,32 +2044,25 @@ mod tests {
         );
     }
 
-    /// The session's runtime-owned names reach the harness over both a declaration and the
-    /// driver's plan.
+    /// A harness is a native process: it cannot reach a formation callee's virtual address, so it
+    /// is handed no formation peers and no channel, and a declaration resolves neither from the
+    /// host.
     #[test]
-    fn harness_env_applies_the_formation_peers_last() {
+    fn harness_env_carries_no_formation_names() {
         let _guard = crate::formation::FORMATION_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let name = crate::formation::FORMATION_PEERS_ENV;
-        std::env::set_var(name, "decoy=http://localhost:1");
-        let env = build_harness_env(
-            &policy_allowing(&[name]),
-            &[(name.to_string(), "plan=http://localhost:2".to_string())],
-            "/files",
-            &[(name.to_string(), "coder=http://localhost:3".to_string())],
-        )
-        .unwrap();
+        let peers = crate::formation::FORMATION_PEERS_ENV;
+        let channel = crate::formation_credentials::FORMATION_CHANNEL_ENV;
+        std::env::set_var(peers, "decoy=http://localhost:1");
+        std::env::set_var(channel, "9");
         let declared_only =
-            build_harness_env(&policy_allowing(&[name]), &[], "/files", &[]).unwrap();
-        std::env::remove_var(name);
-        assert_eq!(
-            env.get(name).map(String::as_str),
-            Some("coder=http://localhost:3")
-        );
+            build_harness_env(&policy_allowing(&[peers, channel]), &[], "/files").unwrap();
+        std::env::remove_var(peers);
+        std::env::remove_var(channel);
         assert!(
-            !declared_only.contains_key(name),
-            "a declaration resolved the runtime-owned name from the host: {declared_only:?}"
+            !declared_only.contains_key(peers) && !declared_only.contains_key(channel),
+            "a declaration resolved a formation name from the host: {declared_only:?}"
         );
     }
 
@@ -2215,7 +2200,6 @@ mod tests {
                 &CapabilityPolicy::default(),
                 &[(bad.to_string(), "v".to_string())],
                 "/files",
-                &[],
             )
             .unwrap_err();
             assert!(error.contains("env-set"), "{bad:?}: {error}");

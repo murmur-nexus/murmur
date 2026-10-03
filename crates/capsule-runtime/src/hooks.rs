@@ -670,10 +670,11 @@ pub(crate) struct HookEnvVars<'a> {
     /// [`crate::formation::FORMATION_ID_ENV`]. Taken from the session and never from the process
     /// environment, so two sessions staged in one process each hand their hooks their own.
     pub formation_id: Option<&'a str>,
-    /// The session's [`crate::formation::FormationPeers`], rendered, injected as
-    /// [`crate::formation::FORMATION_PEERS_ENV`] right after the formation id. `Some` only for a
-    /// formation's entry member with callees; taken from the session, never from the process.
-    pub formation_peers: Option<&'a str>,
+    /// The session's formation membership. Its callees, at their virtual addresses, are injected
+    /// as [`crate::formation::FORMATION_PEERS_ENV`] right after the formation id, and the hook's
+    /// egress reaches them through it. `Some` only for a formation member; taken from the
+    /// session, never from the process.
+    pub formation_member: Option<&'a Arc<crate::formation_credentials::FormationMember>>,
 }
 
 /// Dispatch `on-stage` for all blocking hooks with a matching binding.
@@ -814,6 +815,10 @@ async fn call_stage_once(
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
             gateway: staged.gateway.clone(),
+            formation: env_vars.formation_member.cloned(),
+            // A hook runs for no task of its own, so a formation call from it stamps
+            // `untrusted`.
+            task_provenance: None,
         },
     };
     let mut store = Store::new(engine, state);
@@ -1603,6 +1608,10 @@ async fn instantiate_hook(
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
             gateway: staged.gateway.clone(),
+            formation: env_vars.formation_member.cloned(),
+            // A hook runs for no task of its own, so a formation call from it stamps
+            // `untrusted`.
+            task_provenance: None,
         },
     };
     let mut store = Store::new(engine, state);
@@ -2089,8 +2098,9 @@ fn build_wasi_ctx(
     if let Some(id) = env.formation_id {
         builder.env(crate::formation::FORMATION_ID_ENV, id);
     }
-    if let Some(peers) = env.formation_peers {
-        builder.env(crate::formation::FORMATION_PEERS_ENV, peers);
+    if let Some(peers) = env.formation_member.and_then(|member| member.guest_peers()) {
+        let (name, value) = peers.env_pair();
+        builder.env(name, value);
     }
     if let Some(config_json) = env.eval_config_json {
         builder.env("MURMUR_EVAL_CONFIG", config_json);
@@ -3523,6 +3533,7 @@ mod tests {
             network_allow_rules: Vec::new(),
             driver_grant: None,
             gateway: None,
+            formation: None,
             spend: Arc::new(crate::spend::SpendMeter::unlimited()),
             records: std::sync::Mutex::new(Vec::new()),
             spend_refusals: std::sync::Mutex::new(Vec::new()),
@@ -4536,6 +4547,8 @@ mod tests {
             http_hooks: NetworkPolicyHooks {
                 network_allow_rules: grant.network_allow_rules.clone(),
                 gateway,
+                formation: None,
+                task_provenance: None,
             },
         }
     }
@@ -6721,22 +6734,28 @@ artifacts:
         assert_eq!(seen, "no-env");
     }
 
-    /// An entry member's hooks see the doors it may call as `MURMUR_FORMATION_PEERS`, from the
-    /// session, and never from the process environment.
+    /// A member's hooks see the members it may call as `MURMUR_FORMATION_PEERS`, at their
+    /// virtual addresses, from the session, and never from the process environment.
     #[test]
-    fn an_entry_members_hook_sees_its_formation_peers_and_only_from_the_session() {
+    fn a_members_hook_sees_its_formation_peers_and_only_from_the_session() {
         let _guard = crate::formation::FORMATION_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let peers = "coder=http://localhost:41873 reviewer=http://localhost:41874";
+        let authority = crate::formation_credentials::FormationAuthority::for_test();
+        let member = Arc::new(crate::formation_credentials::FormationMember::from_bundle(
+            authority.member_bundle("planner", &["coder", "reviewer"]),
+        ));
         let seen = first_hook_env_entry(
             HookCapabilityGrant::default(),
             HookEnvVars {
-                formation_peers: Some(peers),
+                formation_member: Some(&member),
                 ..HookEnvVars::default()
             },
         );
-        assert_eq!(seen, peers);
+        assert_eq!(
+            seen,
+            "coder=http://coder.formation.invalid reviewer=http://reviewer.formation.invalid"
+        );
 
         std::env::set_var(
             crate::formation::FORMATION_PEERS_ENV,

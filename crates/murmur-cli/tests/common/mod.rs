@@ -435,7 +435,7 @@ fn stage_agent_session_inner(
             spawn_grant: None,
             machine_tokens_per_day: None,
             formation_id: None,
-            formation_peers: None,
+            formation_member: None,
             ignore_task_file: false,
         },
     )

@@ -31,6 +31,8 @@ http = "1"
 http-body-util = "0.1"
 libc = "0.2"
 murmur-artifact.workspace = true
+# Ed25519 for formation tokens: the launcher signs, every member's door verifies.
+ring = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

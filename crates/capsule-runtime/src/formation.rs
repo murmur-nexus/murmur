@@ -8,10 +8,11 @@
 //! sessions carry no formation id — they are joined by lineage (`session_start.spawned_by`,
 //! `delegation_id`) instead.
 //!
-//! **The id groups; it grants nothing.** No authorization decision reads it — not the door's
-//! Bearer check, not task-origin classification, not peer handoff, not the spawn referee.
-//! Reachability between sessions comes from the manifest's peer-service declaration, never from
-//! sharing a formation.
+//! **The id groups; it grants nothing.** No authorization decision reads it alone — not the door's
+//! Bearer check, not task-origin classification, not peer handoff, not the spawn referee. What a
+//! member may call is decided by a formation token ([`crate::formation_credentials`]), which the
+//! launcher signs over the id together with the caller and the callee; a session that merely
+//! carries the id, a delegated child among them, holds no such token and reaches nobody by it.
 //!
 //! **It belongs to the session, not the process.** [`FormationId::from_env`] is the one read of
 //! [`FORMATION_ID_ENV`] from a process environment, and only `mur run` — whose process is one
@@ -24,11 +25,12 @@
 //! by launch. A value that sessions are grouped on admits no near-misses, so anything else in the
 //! variable — other than nothing at all — refuses the launch.
 //!
-//! **The entry member is also handed addresses.** A formation launcher sets
-//! [`FORMATION_PEERS_ENV`] in its entry member's environment, naming the door of each member the
-//! roster lets the entry member call. Like the id it is read once, by [`FormationPeers::from_env`],
-//! and travels on the session ([`crate::StageRequest::formation_peers`]). Unlike the id it is not
-//! handed to a delegated child.
+//! **A member's guests are handed its callees' names.** [`FORMATION_PEERS_ENV`] is set by a
+//! member's runtime inside its own WASM guests, never by a launcher in a process environment: each
+//! callee at its virtual address `http://<name>.formation.invalid`, which only the runtime's egress
+//! can reach. `mur run` refuses a launch whose own environment carries the variable
+//! ([`refuse_formation_peers_in_process_env`]). A delegated child and a native process are never
+//! handed it.
 
 use std::fmt;
 
@@ -152,23 +154,23 @@ impl<'de> Deserialize<'de> for FormationId {
     }
 }
 
-/// The variable a formation launcher sets in its entry member's environment only, naming the
-/// door of every member the roster lets the entry member call.
+/// The variable a formation member's runtime sets in each of its WASM guests, naming every member
+/// the roster lets it call at that member's virtual address.
 ///
-/// The entry member's runtime reads it once, through [`FormationPeers::from_env`], and hands it on
-/// as a runtime-owned name to every guest and native process its session starts for itself. A
-/// delegated child is never handed it: an address is not inherited along with the formation id.
+/// Runtime-owned: no declaration supplies or displaces it, no native process or delegated child is
+/// handed it, and `mur run` refuses a process environment that carries it.
 pub const FORMATION_PEERS_ENV: &str = "MURMUR_FORMATION_PEERS";
 
 /// The only scheme a peer address may carry. Members of one formation share a host.
 const PEER_URL_SCHEME: &str = "http://";
 
-/// One member the entry member may call, and the door it answers at.
+/// One member a member may call, and the address its guests call it at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormationPeer {
     /// The member's roster name, matching `^[a-z][a-z0-9-]{0,31}$`.
     pub name: String,
-    /// `http://host:port`, with no path.
+    /// `http://host` or `http://host:port`, with no path: the virtual address a guest is handed,
+    /// or the real door URL the channel carries.
     pub url: String,
 }
 
@@ -203,7 +205,7 @@ impl FormationPeers {
                     peer.name
                 )));
             }
-            if let Some(problem) = peer_url_format_error(&peer.url) {
+            if let Some(problem) = url_format_error(&peer.url, false) {
                 return Err(peers_unreadable(&format!(
                     "pair {position} ('{}') {problem}",
                     peer.name
@@ -240,18 +242,6 @@ impl FormationPeers {
         Self::new(peers)
     }
 
-    /// The peers this session's launcher handed it, read from [`FORMATION_PEERS_ENV`].
-    ///
-    /// `Ok(None)` when the variable is absent, which is every session but a formation's entry
-    /// member, and an entry member that may call nobody. A variable that is present is parsed,
-    /// blank included: a launcher never sets an empty one.
-    pub fn from_env() -> Result<Option<Self>, RuntimeError> {
-        let Some(raw) = std::env::var_os(FORMATION_PEERS_ENV) else {
-            return Ok(None);
-        };
-        Self::parse(&raw.to_string_lossy()).map(Some)
-    }
-
     /// The variable's value: `name=url` pairs joined by single spaces, in order.
     pub fn render(&self) -> String {
         self.0
@@ -261,8 +251,8 @@ impl FormationPeers {
             .join(" ")
     }
 
-    /// The `(name, value)` pair a launcher writes into the entry member's environment, and the
-    /// entry member's runtime into each of its guests'.
+    /// The `(name, value)` pair a member's runtime writes into each of its WASM guests'
+    /// environments.
     pub fn env_pair(&self) -> (&'static str, String) {
         (FORMATION_PEERS_ENV, self.render())
     }
@@ -272,20 +262,47 @@ impl FormationPeers {
     }
 }
 
+/// `Err` when [`FORMATION_PEERS_ENV`] is set in this process's environment.
+///
+/// Only a member's runtime sets the variable, and only inside its own guests, from what the
+/// formation channel delivered. A value in `mur run`'s own environment came from somewhere else —
+/// an older launcher, a shell, a parent that should not have passed it on — and is refused rather
+/// than ignored, so nobody is led to believe it was read. The value is never read or quoted.
+pub fn refuse_formation_peers_in_process_env() -> Result<(), RuntimeError> {
+    if std::env::var_os(FORMATION_PEERS_ENV).is_some() {
+        return Err(peers_unreadable(
+            "it is set in this process's environment, and only a member's runtime sets it, inside \
+             its own WASM guests",
+        ));
+    }
+    Ok(())
+}
+
 fn peers_unreadable(reason: &str) -> RuntimeError {
     RuntimeError::FormationPeersUnreadable {
         reason: reason.to_string(),
     }
 }
 
-/// Why `url` is not `http://host:port`, or `None` when it is.
-fn peer_url_format_error(url: &str) -> Option<String> {
+/// Why `url` is not `http://host:port`, or `None` when it is: the shape of a real door address.
+pub(crate) fn peer_url_format_error(url: &str) -> Option<String> {
+    url_format_error(url, true)
+}
+
+/// Why `url` is not `http://host[:port]`, or `None` when it is. The port is optional only when
+/// `port_required` is false.
+fn url_format_error(url: &str, port_required: bool) -> Option<String> {
     let Some(authority) = url.strip_prefix(PEER_URL_SCHEME) else {
         return Some("has a URL that does not start with 'http://'".to_string());
     };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return Some("has a URL with no port".to_string());
+    // A bracketed IPv6 host ends in `]` when no port follows it.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !authority.ends_with(']') => (host, Some(port)),
+        _ => (authority, None),
     };
+    if port.is_none() && port_required {
+        return Some("has a URL with no port".to_string());
+    }
     let bracketed_ip = host.len() > 2 && host.starts_with('[') && host.ends_with(']');
     let plain_host = !host.is_empty()
         && host
@@ -294,6 +311,7 @@ fn peer_url_format_error(url: &str) -> Option<String> {
     if !(bracketed_ip || plain_host) {
         return Some("has a URL whose host is not a hostname or an IP address".to_string());
     }
+    let port = port?;
     let digits_only = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
     match port.parse::<u16>() {
         Ok(port) if digits_only && port > 0 => None,
@@ -607,7 +625,6 @@ mod tests {
             ("coder=http://localhost:1 reviewer", "pair 2 has no '='"),
             ("coder=https://localhost:1", "does not start with 'http://'"),
             ("coder=localhost:1", "does not start with 'http://'"),
-            ("coder=http://localhost", "no port"),
             ("coder=http://localhost:0", "port is not a number"),
             ("coder=http://localhost:99999", "port is not a number"),
             ("coder=http://localhost:1/x", "port is not a number"),
@@ -626,25 +643,39 @@ mod tests {
             assert!(message.contains(FORMATION_PEERS_ENV), "{message}");
         }
         assert!(FormationPeers::new(Vec::new()).is_err());
+        // A guest's peers are virtual addresses with no port; a real door always has one.
+        assert_eq!(
+            FormationPeers::parse("coder=http://coder.formation.invalid")
+                .unwrap()
+                .render(),
+            "coder=http://coder.formation.invalid"
+        );
+        assert_eq!(
+            peer_url_format_error("http://localhost").as_deref(),
+            Some("has a URL with no port")
+        );
+        assert_eq!(peer_url_format_error("http://localhost:1"), None);
+        assert_eq!(peer_url_format_error("http://[::1]:9"), None);
+        assert!(peer_url_format_error("http://[::1]").is_some());
     }
 
     #[test]
-    fn formation_peers_are_read_from_the_process_environment_only_when_present() {
+    fn formation_peers_in_the_process_environment_are_refused_and_never_read() {
         let _guard = env_guard();
         std::env::remove_var(FORMATION_PEERS_ENV);
-        assert_eq!(FormationPeers::from_env().unwrap(), None);
+        assert!(refuse_formation_peers_in_process_env().is_ok());
 
-        std::env::set_var(FORMATION_PEERS_ENV, "coder=http://localhost:7");
-        let read = FormationPeers::from_env();
-        std::env::set_var(FORMATION_PEERS_ENV, "");
-        let blank = FormationPeers::from_env();
-        std::env::remove_var(FORMATION_PEERS_ENV);
-
-        assert_eq!(read.unwrap().unwrap().render(), "coder=http://localhost:7");
-        assert!(matches!(
-            blank,
-            Err(RuntimeError::FormationPeersUnreadable { .. })
-        ));
+        for value in ["coder=http://localhost:7", ""] {
+            std::env::set_var(FORMATION_PEERS_ENV, value);
+            let refused = refuse_formation_peers_in_process_env();
+            std::env::remove_var(FORMATION_PEERS_ENV);
+            let message = refused.unwrap_err().to_string();
+            assert!(
+                message.contains("set in this process's environment"),
+                "{message}"
+            );
+            assert!(!message.contains("localhost"), "{message}");
+        }
     }
 
     #[test]
@@ -665,11 +696,14 @@ mod tests {
             } else {
                 assert_eq!(
                     reads, 0,
-                    "{path} reads the formation's peers from the process environment; only \
-                     FormationPeers::from_env does"
+                    "{path} reads the formation's peers from the process environment; nothing \
+                     does but the refusal of a value found there"
                 );
             }
         }
-        assert_eq!(reads_here, 1, "FormationPeers::from_env is the one reader");
+        assert_eq!(
+            reads_here, 1,
+            "refuse_formation_peers_in_process_env is the one place that looks"
+        );
     }
 }

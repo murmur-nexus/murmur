@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::door_capsule::{driver_home, rpc, DRIVER_NAME, DRIVER_VERSION};
+use common::door_capsule::{driver_home, message, rpc, DRIVER_NAME, DRIVER_VERSION};
 use common::{publish_to_store, tool_result_text, tool_use_response, ScriptedServer};
 use murmur_artifact::LocalRegistry;
 use serde_json::{json, Value};
@@ -40,18 +40,14 @@ fn launch_lock() -> std::sync::MutexGuard<'static, ()> {
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
 /// An agent capsule's manifest body: its driver against `endpoint`, an authenticated door that
-/// serves peers, `lifecycle`, and `extra_artifacts` / `network_allow` for the entry member.
-fn member_manifest(
-    endpoint: &str,
-    lifecycle: &str,
-    extra_artifacts: &str,
-    network_allow: &str,
-    driver_version: &str,
-) -> String {
+/// serves peers, `lifecycle`, `formation-probe` installed, and `localhost` — where every member's
+/// door is — in `capabilities.network.allow`.
+fn member_manifest(endpoint: &str, lifecycle: &str, driver_version: &str) -> String {
     format!(
         "artifacts:\n  - name: {DRIVER_NAME}\n    version: {driver_version}\n    runtime: driver\n    \
-         gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n{extra_artifacts}\
-         capabilities:\n  network:\n    allow: [{network_allow}]\n\
+         gateway:\n      endpoint: {endpoint}\n      api_key: test-key\n\
+         \x20 - name: {PROBE_TOOL}\n    version: {PROBE_VERSION}\n    runtime: tool\n\
+         capabilities:\n  network:\n    allow: [localhost]\n\
          lifecycle:\n  {lifecycle}\n\
          inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n\
          exports:\n  peer_tasks:\n    accept: true\n\
@@ -65,9 +61,16 @@ fn end_turn_response(text: &str) -> String {
     common::door_capsule::end_turn(1, text)
 }
 
-/// A model that calls `formation-probe` once and then ends its turn, holding the second reply
-/// until `release` is sent — so a case can look at a running formation before its task ends.
-fn probe_model() -> (ScriptedServer, mpsc::Sender<()>, Arc<AtomicUsize>) {
+/// One member's scripted model, and how many requests it has received, counted on arrival.
+struct MemberModel {
+    server: ScriptedServer,
+    arrived: Arc<AtomicUsize>,
+}
+
+/// The entry member's model: it calls `formation-probe` with `input` once and then ends its turn,
+/// holding the second reply until `release` is sent — so a case can look at a running formation
+/// before its task ends.
+fn entry_model(input: Value) -> (MemberModel, mpsc::Sender<()>) {
     let (release, released) = mpsc::channel::<()>();
     let released = Mutex::new(released);
     let arrived = Arc::new(AtomicUsize::new(0));
@@ -75,7 +78,7 @@ fn probe_model() -> (ScriptedServer, mpsc::Sender<()>, Arc<AtomicUsize>) {
     let server = ScriptedServer::start_answering(2, move |_| {
         let calls = counter.fetch_add(1, Ordering::SeqCst) + 1;
         if calls == 1 {
-            tool_use_response(PROBE_CALL, PROBE_TOOL, json!({}))
+            tool_use_response(PROBE_CALL, PROBE_TOOL, input.clone())
         } else {
             let _ = released
                 .lock()
@@ -84,7 +87,22 @@ fn probe_model() -> (ScriptedServer, mpsc::Sender<()>, Arc<AtomicUsize>) {
             end_turn_response("probed")
         }
     });
-    (server, release, arrived)
+    (MemberModel { server, arrived }, release)
+}
+
+/// A peer's model: with `input`, it calls `formation-probe` with it on its first request; every
+/// other request ends the turn.
+fn peer_model(input: Option<Value>) -> MemberModel {
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&arrived);
+    let server = ScriptedServer::start_answering(64, move |_| {
+        let calls = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        match &input {
+            Some(input) if calls == 1 => tool_use_response(PROBE_CALL, PROBE_TOOL, input.clone()),
+            _ => end_turn_response("done"),
+        }
+    });
+    MemberModel { server, arrived }
 }
 
 // ── A project holding a roster ────────────────────────────────────────────────
@@ -131,28 +149,28 @@ const REVIEWER: Member = peer("reviewer", "0.9.0");
 const PLANNER: Member = entry("planner", "0.3.0");
 
 /// A project directory with every member published into its store, a `roster.yaml`, and a scratch
-/// `HOME` holding the driver.
+/// `HOME` holding the driver. Every member has a scripted model of its own.
 struct Project {
     dir: TempDir,
     home: TempDir,
-    model: ScriptedServer,
+    models: Vec<(&'static str, MemberModel)>,
     release: mpsc::Sender<()>,
-    /// How many requests the entry member's model has received, counted on arrival: the second
-    /// is the one held until `release`.
-    arrived: Arc<AtomicUsize>,
-    /// Kept so the peers' gateway endpoint stays an address nothing else is handed.
-    _peer_model: ScriptedServer,
 }
 
 impl Project {
+    /// The entry member probes with `{}` — the names it was handed — and no peer probes.
     fn new(members: &[Member], reachability: &str) -> Self {
+        Self::with_probes(members, reachability, &[])
+    }
+
+    /// As [`Self::new`], with `probes` naming the input each listed member's model calls
+    /// `formation-probe` with.
+    fn with_probes(members: &[Member], reachability: &str, probes: &[(&str, Value)]) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("formation-launch-")
             .tempdir()
             .unwrap();
         let home = driver_home();
-        let (model, release, arrived) = probe_model();
-        let peer_model = ScriptedServer::start(Vec::new());
         let store = dir.path().join(".murmur").join("artifacts");
         publish_to_store(
             &store,
@@ -165,6 +183,14 @@ impl Project {
                 &common::fixture_path("formation-probe/tool/formation-probe.wasm"),
             )),
         );
+        let probe_of = |name: &str| {
+            probes
+                .iter()
+                .find(|(member, _)| *member == name)
+                .map(|(_, input)| input.clone())
+        };
+        let mut models = Vec::new();
+        let mut release = None;
         let mut roster = String::from("roster_version: 1\nmembers:\n");
         for member in members {
             let driver_version = if member.broken {
@@ -172,20 +198,16 @@ impl Project {
             } else {
                 DRIVER_VERSION
             };
-            let body = if member.entry {
-                member_manifest(
-                    &model.endpoint,
-                    "task_acceptance: single\n  after_task: exit",
-                    &format!(
-                        "  - name: {PROBE_TOOL}\n    version: {PROBE_VERSION}\n    runtime: tool\n"
-                    ),
-                    "localhost",
-                    driver_version,
-                )
+            let (model, lifecycle) = if member.entry {
+                let (model, sender) = entry_model(probe_of(member.name).unwrap_or(json!({})));
+                release = Some(sender);
+                (model, "task_acceptance: single\n  after_task: exit")
             } else {
-                member_manifest(&peer_model.endpoint, PEER_LIFECYCLE, "", "", driver_version)
+                (peer_model(probe_of(member.name)), PEER_LIFECYCLE)
             };
+            let body = member_manifest(&model.server.endpoint, lifecycle, driver_version);
             publish_to_store(&store, member.name, member.version, "capsule", &body, None);
+            models.push((member.name, model));
             roster.push_str(&format!(
                 "  - name: {name}\n    capsule: {name}\n    version: {version}\n{entry}",
                 name = member.name,
@@ -199,13 +221,40 @@ impl Project {
         }
         roster.push_str(reachability);
         std::fs::write(dir.path().join("roster.yaml"), roster).unwrap();
+        // A roster with no entry member still needs a sender to drop.
+        let release = release.unwrap_or_else(|| mpsc::channel().0);
         Self {
             dir,
             home,
-            model,
+            models,
             release,
-            arrived,
-            _peer_model: peer_model,
+        }
+    }
+
+    /// The scripted model of the member `name`.
+    fn model(&self, name: &str) -> &MemberModel {
+        &self
+            .models
+            .iter()
+            .find(|(member, _)| *member == name)
+            .unwrap_or_else(|| panic!("no member {name}"))
+            .1
+    }
+
+    /// The entry member's model.
+    fn entry_model(&self) -> &ScriptedServer {
+        &self.model("planner").server
+    }
+
+    /// Block until `member`'s model has received `count` requests.
+    fn await_requests(&self, member: &str, count: usize) {
+        let deadline = Instant::now() + LAUNCH_LIMIT;
+        while self.model(member).arrived.load(Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "{member}'s model never received {count} requests"
+            );
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -215,14 +264,7 @@ impl Project {
 
     /// Block until the entry member is mid-task: its model holds the reply to the probe's result.
     fn await_entry_mid_task(&self) {
-        let deadline = Instant::now() + LAUNCH_LIMIT;
-        while self.arrived.load(Ordering::SeqCst) < 2 {
-            assert!(
-                Instant::now() < deadline,
-                "the entry member never reached its second turn"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        self.await_requests("planner", 2);
     }
 
     /// `mur <args>` in the project directory, under the scratch `HOME`, with no formation, door
@@ -237,6 +279,7 @@ impl Project {
             .env_remove(capsule_runtime::DOOR_TOKEN_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_PEERS_ENV)
+            .env_remove(capsule_runtime::FORMATION_CHANNEL_ENV)
             .env_remove("MURMUR_SPAWNER");
         command
     }
@@ -560,12 +603,58 @@ const FULL_REACH: &str = "reachability:\n  - from: planner\n    to: [coder, revi
 
 // ── Scenarios ─────────────────────────────────────────────────────────────────
 
-/// Scenario 1: the formation comes up, the entry member reaches each peer's door, and the whole
-/// formation is gone once the entry member's task ends.
+/// S1's roster: `planner` may call `coder`, and `coder` may call `reviewer`.
+const S1_REACH: &str =
+    "reachability:\n  - from: planner\n    to: [coder]\n  - from: coder\n    to: [reviewer]\n";
+
+/// S1's probes: `planner` tries a callee, a member it may not call and a name that is no member;
+/// `coder`, on the task `planner` sends it, tries its callee and the entry member.
+fn s1_probes() -> [(&'static str, Value); 2] {
+    [
+        ("planner", json!({"names": ["coder", "reviewer", "nosuch"]})),
+        ("coder", json!({"names": ["reviewer", "planner"]})),
+    ]
+}
+
+/// The probe's line for `name`, with the name taken off: what a refusal says, compared across
+/// names.
+fn outcome_of<'a>(lines: &'a [&'a str], name: &str) -> &'a str {
+    lines
+        .iter()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("no line for {name}: {lines:?}"))
+}
+
+/// The `session_start` and every `a2a_task_received` of the one session `capsule` ran.
+fn member_trace(project: &Project, capsule: &str) -> (Value, Vec<Value>) {
+    let sessions = project.sessions_of(capsule);
+    assert_eq!(sessions.len(), 1, "{capsule}: {sessions:?}");
+    let trace = std::fs::read_to_string(sessions[0].join("trace.jsonl")).unwrap();
+    let events: Vec<Value> = trace
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let received = events
+        .iter()
+        .filter(|event| event["event_type"] == "a2a_task_received")
+        .cloned()
+        .collect();
+    (events[0].clone(), received)
+}
+
+/// Every file under `root` holding `needle`.
+fn files_holding(root: &Path, needle: &str) -> Vec<PathBuf> {
+    common::door_capsule::files_containing(root, needle)
+}
+
+/// S1, S2, S5 and S10: the roster's reachability is enforced end to end. `planner` reaches
+/// `coder` and cannot address `reviewer`; `coder` reaches `reviewer` and cannot address the entry
+/// member; every door answers an unauthenticated or forged call `401`; no token appears in
+/// anything the run produced; and once the launcher exits, every door is gone.
 #[test]
-fn a_declared_formation_launches_reaches_its_peers_and_goes() {
+fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     let _lock = launch_lock();
-    let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+    let project = Project::with_probes(&[CODER, REVIEWER, PLANNER], S1_REACH, &s1_probes());
     let mut launcher = project.launch(&[], &[]);
 
     let (_, formation) = launcher.next_json();
@@ -577,7 +666,33 @@ fn a_declared_formation_launches_reaches_its_peers_and_goes() {
     );
     assert_eq!(planner["name"], "planner");
 
-    // While up, each peer's door answers as the session the formation line names.
+    // S2, while up: every door refuses a caller with no credential, and one presenting a formation
+    // token that does not verify, with the ordinary bodies.
+    let mut doors: Vec<String> = formation["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|peer| {
+            peer["url"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("http://")
+                .to_string()
+        })
+        .collect();
+    doors.push(planner["url"].as_str().unwrap().to_string());
+    for door in &doors {
+        for (token, code) in [
+            (None, "unauthenticated"),
+            (Some("mft1.x.y"), "invalid_token"),
+        ] {
+            let refused = rpc(door, token, "message/send", message("msg_s2", "hello"));
+            assert_eq!(refused.status, 401, "{door} {token:?}: {}", refused.body);
+            assert_eq!(refused.json()["error"], code, "{door}: {}", refused.body);
+        }
+    }
+
+    // Each peer's door answers as the session the formation line names, to its operator token.
     for peer in formation["peers"].as_array().unwrap() {
         let session_id = peer["session_id"].as_str().unwrap();
         let addr = peer["url"].as_str().unwrap().trim_start_matches("http://");
@@ -592,28 +707,125 @@ fn a_declared_formation_launches_reaches_its_peers_and_goes() {
         assert!(card.body.contains(session_id), "{}", card.body);
     }
 
+    // `coder` has run `planner`'s task and probed; `reviewer` has taken `coder`'s.
+    project.await_requests("coder", 2);
+    project.await_requests("reviewer", 1);
+    // While every member runs, its running record and session directory hold no formation token.
+    for root in [project.path(), project.home.path()] {
+        let holding = files_holding(root, "mft1.");
+        assert!(holding.is_empty(), "while up: {holding:?}");
+    }
     project.release.send(()).unwrap();
     let status = launcher.wait();
     assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
 
-    let result = tool_result_text(&project.model.requests(), PROBE_CALL)
-        .expect("the probe's result reached the model");
-    assert_eq!(
-        result.lines().collect::<Vec<_>>(),
-        [
-            "coder card=200 card_name=coder send=401",
-            "reviewer card=200 card_name=reviewer send=401",
-        ],
-        "{result}"
-    );
+    let planner_result = tool_result_text(&project.entry_model().requests(), PROBE_CALL)
+        .expect("planner's probe result reached its model");
+    println!("planner's probe:\n{planner_result}");
+    let lines: Vec<&str> = planner_result.lines().collect();
+    assert_eq!(lines.len(), 4, "{planner_result}");
+    assert_eq!(outcome_of(&lines, "coder"), "card=200 send=200");
+    let reviewer = outcome_of(&lines, "reviewer");
+    assert!(reviewer.starts_with("card=refused:"), "{reviewer}");
+    assert_eq!(reviewer, outcome_of(&lines, "nosuch"), "{planner_result}");
+    assert_eq!(lines[3], "peers=coder=http://coder.formation.invalid");
 
+    let coder_result = tool_result_text(&project.model("coder").server.requests(), PROBE_CALL)
+        .expect("coder's probe result reached its model");
+    println!("coder's probe:\n{coder_result}");
+    let lines: Vec<&str> = coder_result.lines().collect();
+    assert_eq!(lines.len(), 3, "{coder_result}");
+    assert_eq!(outcome_of(&lines, "reviewer"), "card=200 send=200");
+    assert_eq!(
+        outcome_of(&lines, "planner"),
+        reviewer,
+        "the entry member is refused as an unknown name is"
+    );
+    assert_eq!(lines[2], "peers=reviewer=http://reviewer.formation.invalid");
+
+    // The trace names each member, its callees, and who called it.
+    for (capsule, callees, callers) in [
+        ("planner", json!(["coder"]), Vec::<&str>::new()),
+        ("coder", json!(["reviewer"]), vec!["planner"]),
+        ("reviewer", json!([]), vec!["coder"]),
+    ] {
+        let (start, received) = member_trace(&project, capsule);
+        assert_eq!(start["formation_member"], capsule, "{start}");
+        assert_eq!(start["formation_callees"], callees, "{start}");
+        let seen: Vec<&str> = received
+            .iter()
+            .map(|event| event["caller_member"].as_str().unwrap_or("<none>"))
+            .collect();
+        assert_eq!(seen, callers, "{capsule}");
+    }
+
+    let stderr = launcher.stderr();
+    assert!(!stderr.contains("W-RUN-005"), "{stderr}");
+    assert!(!stderr.contains("W-RUN-006"), "{stderr}");
+
+    // S5: no formation token anywhere the run wrote, and no door token but the entry member's own
+    // readiness-line tokens.
     let stdout = launcher.stdout();
     assert_eq!(stdout.len(), 2, "{stdout:?}");
-    assert_no_token_but_the_entrys(&stdout, &launcher.stderr());
+    assert_no_formation_token(&project, &stdout, &stderr);
+    assert_no_token_but_the_entrys(&stdout, &stderr);
+
     project.assert_no_member_remains(
         &reported_pids(&formation, Some(&planner)),
         Duration::from_secs(30),
     );
+
+    // S10: once the launcher has exited, no reported door answers.
+    for door in &doors {
+        assert!(
+            std::net::TcpStream::connect(door).is_err(),
+            "{door} still accepts connections"
+        );
+    }
+    // A second launch of the same roster is a new formation.
+    let again = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        S1_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut relaunched = again.launch(&[], &[]);
+    let (_, second) = relaunched.next_json();
+    assert_ne!(second["formation_id"], formation["formation_id"]);
+    let (_, second_planner) = relaunched.next_json();
+    again.release.send(()).unwrap();
+    assert_eq!(relaunched.wait().code(), Some(0), "{}", relaunched.stderr());
+    again.assert_no_member_remains(
+        &reported_pids(&second, Some(&second_planner)),
+        Duration::from_secs(30),
+    );
+}
+
+/// S5: `mft1.` appears nowhere the run produced — the launcher's two streams, any file under the
+/// project or the scratch `HOME` (every session directory and running record among them), or any
+/// request any member's model was sent.
+fn assert_no_formation_token(project: &Project, stdout: &[String], stderr: &str) {
+    assert!(
+        !stdout.iter().any(|line| line.contains("mft1.")),
+        "{stdout:?}"
+    );
+    assert!(
+        !stderr.contains("mft1."),
+        "stderr carries a formation token"
+    );
+    for root in [project.path(), project.home.path()] {
+        let holding = files_holding(root, "mft1.");
+        assert!(
+            holding.is_empty(),
+            "files hold a formation token: {holding:?}"
+        );
+    }
+    for (member, model) in &project.models {
+        let requests = serde_json::to_string(&model.server.requests()).unwrap();
+        assert!(
+            !requests.contains("mft1."),
+            "{member}'s model was sent a formation token"
+        );
+    }
 }
 
 /// Every member's workdir is the project directory, where the entry member's task is written and
@@ -622,7 +834,11 @@ fn a_declared_formation_launches_reaches_its_peers_and_goes() {
 #[test]
 fn a_task_file_in_the_project_is_never_a_peers_task() {
     let _lock = launch_lock();
-    let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
     std::fs::write(project.path().join("task.md"), "an earlier launch's task").unwrap();
     let mut launcher = project.launch(&[], &[]);
     let (_, formation) = launcher.next_json();
@@ -656,7 +872,10 @@ fn only_the_entry_members_callees_are_handed_to_it() {
     for (reachability, expected) in [
         (
             "reachability:\n  - from: planner\n    to: [coder]\n",
-            vec!["coder card=200 card_name=coder send=401"],
+            vec![
+                "coder card=200 send=200",
+                "peers=coder=http://coder.formation.invalid",
+            ],
         ),
         ("", vec!["peers=absent"]),
     ] {
@@ -668,7 +887,7 @@ fn only_the_entry_members_callees_are_handed_to_it() {
         project.release.send(()).unwrap();
         assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
 
-        let result = tool_result_text(&project.model.requests(), PROBE_CALL).unwrap();
+        let result = tool_result_text(&project.entry_model().requests(), PROBE_CALL).unwrap();
         assert_eq!(
             result.lines().collect::<Vec<_>>(),
             expected,
@@ -725,7 +944,7 @@ fn a_peer_that_cannot_start_refuses_the_launch_and_leaves_nothing_running() {
         );
         assert!(!stderr.contains("[planner]"), "{stderr}");
         assert!(
-            project.model.requests().is_empty(),
+            project.entry_model().requests().is_empty(),
             "planner never asked its model"
         );
         project.assert_no_member_remains(&pids, Duration::from_secs(30));
@@ -739,7 +958,11 @@ fn a_peer_that_cannot_start_refuses_the_launch_and_leaves_nothing_running() {
 fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
     let _lock = launch_lock();
     for (kill_launcher, expected) in [(true, 143), (false, 137)] {
-        let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+        let project = Project::with_probes(
+            &[CODER, REVIEWER, PLANNER],
+            FULL_REACH,
+            &[("planner", json!({"names": []}))],
+        );
         let mut launcher = project.launch(&[], &[]);
         let (_, formation) = launcher.next_json();
         let (_, planner) = launcher.next_json();
@@ -849,10 +1072,8 @@ fn a_member_whose_bytes_changed_since_admission_is_refused() {
         &format!(
             "{}description: rebuilt\n",
             member_manifest(
-                &project.model.endpoint,
+                &project.entry_model().endpoint,
                 PEER_LIFECYCLE,
-                "",
-                "",
                 DRIVER_VERSION
             )
         ),
@@ -983,25 +1204,49 @@ fn refusals_before_anything_starts() {
     project.assert_no_member_remains(&[], Duration::from_secs(1));
 }
 
-/// Scenario 9: an edge between two peers is launched, and named once as having no address.
+/// S9: an edge into the entry member is named once, `W-RUN-006`, and served to nobody: `coder` is
+/// refused `planner` exactly as it is refused a name that is no member, and is handed no
+/// credential for it. Everything else is as in S1.
 #[test]
-fn a_peer_to_peer_edge_warns_once_and_launches() {
+fn an_edge_into_the_entry_member_warns_once_and_is_not_served() {
     let _lock = launch_lock();
-    let project = Project::new(
+    let project = Project::with_probes(
         &[CODER, REVIEWER, PLANNER],
-        "reachability:\n  - from: planner\n    to: [coder, reviewer]\n  - from: reviewer\n    to: [coder]\n",
+        "reachability:\n  - from: planner\n    to: [coder]\n  - from: coder\n    to: [reviewer, planner]\n",
+        &[
+            ("planner", json!({"names": ["coder"]})),
+            ("coder", json!({"names": ["reviewer", "planner", "nosuch"]})),
+        ],
     );
     let mut launcher = project.launch(&[], &[]);
     let (_, formation) = launcher.next_json();
     assert_formation_line(&formation, "planner", &["coder", "reviewer"]);
     let (_, planner) = launcher.next_json();
+    project.await_requests("coder", 2);
+    project.await_requests("reviewer", 1);
     project.release.send(()).unwrap();
     assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
     let stderr = launcher.stderr();
-    assert_eq!(stderr.matches("warning[W-RUN-005]").count(), 1, "{stderr}");
-    assert!(stderr.contains("reviewer \u{2192} coder"), "{stderr}");
-    let result = tool_result_text(&project.model.requests(), PROBE_CALL).unwrap();
-    assert_eq!(result.lines().count(), 2, "{result}");
+    assert_eq!(stderr.matches("warning[W-RUN-006]").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("roster edge 'coder \u{2192} planner' is not served"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("W-RUN-005"), "{stderr}");
+
+    let coder_result =
+        tool_result_text(&project.model("coder").server.requests(), PROBE_CALL).unwrap();
+    let lines: Vec<&str> = coder_result.lines().collect();
+    assert_eq!(outcome_of(&lines, "reviewer"), "card=200 send=200");
+    assert!(outcome_of(&lines, "planner").starts_with("card=refused:"));
+    assert_eq!(outcome_of(&lines, "planner"), outcome_of(&lines, "nosuch"));
+    assert_eq!(
+        lines.last().copied(),
+        Some("peers=reviewer=http://reviewer.formation.invalid")
+    );
+    let (start, _) = member_trace(&project, "coder");
+    assert_eq!(start["formation_callees"], json!(["reviewer"]));
+    assert_no_formation_token(&project, &launcher.stdout(), &stderr);
     project.assert_no_member_remains(
         &reported_pids(&formation, Some(&planner)),
         Duration::from_secs(30),

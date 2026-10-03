@@ -91,8 +91,10 @@ A rule names members only. Every member a rule lists in `to` must declare
 
 When the roster has at least one edge, **every** member must declare
 [`network.authentication`](manifest.md#field-network-authentication), including members on no
-edge. A peer task carries no credential of its own, so a public door in a formation takes a task
-from any member. A missing declaration is refused with [`E-ROS-006`](diagnostics.md#e-ros-006).
+edge. A member's door is where the roster is enforced: a call from another member carries the
+formation token its launcher issued for that edge, and the door checks it — see
+[How reachability is enforced](#enforcement). A public door checks nothing and takes a task from
+any caller. A missing declaration is refused with [`E-ROS-006`](diagnostics.md#e-ros-006).
 
 A roster with one member, no `reachability`, or an `all` that pairs no members has no edges and
 needs no authentication.
@@ -124,21 +126,27 @@ installed. Check 5 takes each member in turn through both rows before the next.
 [`mur run --roster`](cli.md#mur-run-roster) launches the admitted roster for one task:
 
 1. **Admit.** The roster is admitted as above. A refusal starts nothing.
-2. **Mint.** One formation id is minted for this launch.
+2. **Mint.** One formation id and one signing key are minted for this launch. The key exists only
+   in the launcher's memory.
 3. **Start the peers.** Every member except the entry member starts at once, as its own
-   `mur run --capsule <capsule> --capsule-version <version> --json` process, bound to `127.0.0.1`.
-   A peer takes work only at its door: it never runs a `task.md` in the project directory, where
-   the entry member's task is written.
+   `mur run --capsule <capsule> --capsule-version <version> --json` process, bound to `127.0.0.1`,
+   with its own [formation channel](#formation-channel) already holding its credentials. A peer
+   takes work only at its door: it never runs a `task.md` in the project directory, where the
+   entry member's task is written.
 4. **Wait for each door.** A peer is ready when the door at the URL its readiness line reported
    serves an agent card naming the session id that line reported.
-5. **Start the entry member.** The entry member starts last, with
-   `--lifecycle-task-acceptance single --lifecycle-after-task exit`, and with
-   [`MURMUR_FORMATION_PEERS`](#formation-peers) naming the members it may call.
-6. **Stop.** When the entry member's process ends, for any reason, every peer is stopped.
+5. **Hand out addresses.** Each peer that may call other peers is sent their door URLs on its
+   channel.
+6. **Start the entry member.** The entry member starts last, with
+   `--lifecycle-task-acceptance single --lifecycle-after-task exit`. Its channel holds its
+   credentials and its callees' door URLs before it starts.
+7. **Stop.** When the entry member's process ends, for any reason, every peer is stopped and the
+   signing key is dropped.
 
 | Every member | Value |
 |---|---|
 | `MURMUR_FORMATION_ID` | The formation id minted in step 2 |
+| `MURMUR_FORMATION_CHANNEL` | The number of the inherited file descriptor its [formation channel](#formation-channel) is read from |
 | `--workdir` | The roster's project directory, so every member resolves from the stores admission read, and sessions land under `<project>/.murmur/` |
 | Current directory | The launcher's, so a relative `--task` path names the same file |
 | The installed artifact | Exactly the bytes admission bound it to. A member whose installed artifact changed since admission refuses with [`E-RUN-047`](diagnostics.md#e-run-047) |
@@ -175,26 +183,118 @@ is killed and its `trace.jsonl` stays whole.
 Each peer runs in a process group of its own; the entry member stays in the launcher's. A
 `SIGKILL` of the launcher itself leaves the members running.
 
-### What the entry member is handed { #formation-peers }
+A roster edge into the entry member is admitted and every member is launched, but the edge is not
+served: the entry member is busy with the formation's own task from launch until it exits, so it
+never accepts a peer task. The calling member is handed no credential or address for it, and the
+launch prints [`W-RUN-006`](diagnostics.md#w-run-006) once per such edge.
 
-The entry member is the only member handed addresses. `MURMUR_FORMATION_PEERS` names the door of
-every member the roster lets it call, as `name=url` pairs separated by single spaces, in roster
-order:
+A process that already carries `MURMUR_FORMATION_ID` is a formation member, and refuses
+`mur run --roster` with [`E-RUN-046`](diagnostics.md#e-run-046).
+
+## How reachability is enforced { #enforcement }
+
+In a formation launched by `mur run --roster`, a member can call exactly the members the roster
+lets it call, and no other member answers it. No member's model ever sees a credential.
+
+### The formation credential { #formation-token }
+
+The launcher is the only principal that issues credentials. For every served edge `from → to` it
+signs one **formation token** with the formation's signing key:
 
 ```text
-MURMUR_FORMATION_PEERS=coder=http://localhost:41873 reviewer=http://localhost:41874
+mft1.<payload>.<signature>
+payload: {"formation":"frm_…","from":"<member>","to":"<member>"}
 ```
+
+Every member's door is handed the key's public half, which verifies a token and cannot sign one,
+so no member can mint a token. A token names the one door it is for: `to` is part of what is
+signed.
+
+### What a door answers { #enforcement-door }
+
+A member's door checks the `Authorization` header before anything else, in this order:
+
+| Request | Status | `error` |
+|---|---|---|
+| No `Authorization` header | `401` | `unauthenticated` |
+| A formation token that does not verify: forged, altered, another formation's, or any formation token at a door in no formation | `401` | `invalid_token` — the same body as any other invalid token |
+| A valid formation token issued for another member's door | `403` | `not_permitted` — the message names only the member that presented it |
+| A valid formation token issued for this door, calling a method outside its three scopes | `403` | `insufficient_scope`, naming the credential `member:<caller>` |
+| A valid formation token issued for this door, within its scopes | Served, as the credential `member:<caller>` | — |
+
+A formation token carries exactly these scopes:
+
+| Scope | Lets the caller |
+|---|---|
+| `message/send` | Start a task |
+| `message/stream` | Start a task and stream it |
+| `tasks/get` | Read a task's state |
+
+The operator token and declared credentials work as they do outside a formation. A peer task is
+still refused with `403 peer_not_accepted` by a member that does not declare
+[`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks).
+
+### The formation channel { #formation-channel }
+
+The launcher hands each member its credentials on a pipe that only that member's `mur run`
+inherits. `MURMUR_FORMATION_CHANNEL` names the pipe's file descriptor. It is set by
+`mur run --roster` and by nothing else.
+
+| Line | Carries | Written |
+|---|---|---|
+| First | The formation id, the member's name, the verification key, and one token for each member it may call | Before the member starts |
+| Later | The door URLs of the members it may call | Once every peer's door answers; for the entry member, before it starts |
+
+`mur run` reads the first line before it stages the session, and refuses with
+[`E-RUN-046`](diagnostics.md#e-run-046) when:
+
+- `MURMUR_FORMATION_CHANNEL` is set without `MURMUR_FORMATION_ID`;
+- the descriptor is not open, or is not a pipe or a file;
+- no first line arrives within 10 seconds;
+- the first line is not a member's credentials, or a token in it was not issued to this member;
+- the first line names another formation than `MURMUR_FORMATION_ID`.
+
+No token is put in an environment variable, a command line, a file, the trace, a log line or
+stdout.
+
+### What a member's guests are handed { #formation-peers }
+
+Every WASM component a member runs — its capsule, its tools, a `transport: http` driver and its
+hooks — is handed `MURMUR_FORMATION_PEERS`, naming each member it may call at a virtual address,
+in roster order:
+
+```text
+MURMUR_FORMATION_PEERS=coder=http://coder.formation.invalid reviewer=http://reviewer.formation.invalid
+```
+
+A component calls a member at its virtual address. `.invalid` never resolves; the member's runtime
+recognises the address and sends the request on:
+
+1. It resolves the name to the member's real door URL. A door URL that has not arrived on the
+   channel yet is waited for up to 10 seconds.
+2. It checks the real URL against the sending component's
+   [`capabilities.network.allow`](manifest.md#field-capabilities), per-artifact narrowing
+   included. The roster grants a credential and a name, never network access: a member whose
+   components may not reach `localhost` cannot call anyone.
+3. It removes any `Authorization`, `x-murmur-task-origin` and `x-murmur-task-trust` header the
+   component set, attaches `Authorization: Bearer <token>`, and stamps the origin `peer` with the
+   trust class of the task the component is running for (`untrusted` when there is none).
+
+[`murmur:message/send`](wit-interfaces.md#message-send) resolves a virtual `peer-url` the same way, and the
+trace records the virtual address.
+
+A request to any other name under `formation.invalid` — a member it may not call, or no member at
+all — is refused before a connection opens, with the same refusal either way.
 
 | Property | Value |
 |---|---|
-| Pair | `<member name>=http://<host>:<port>` |
-| Absent | When the entry member may call nobody. The variable is never set empty |
-| Reaches | The entry member's capsule, its tools, a `transport: http` driver, its hooks, its shell commands, its native tools and a `transport: process` harness |
+| Pair | `<member name>=http://<member name>.formation.invalid` |
+| Absent | When the member may call nobody. The variable is never set empty |
 | Runtime-owned | `capabilities.env.allow` and `capabilities.shell.baseline_env` neither supply nor replace it |
-| Delegated children | Do not receive it |
-| Malformed, or set without `MURMUR_FORMATION_ID` | The launch is refused with [`E-RUN-046`](diagnostics.md#e-run-046) |
+| Shell commands, native tools, a `transport: process` harness | Do not receive it. A virtual address works only through the runtime |
+| Set in `mur run`'s own environment | The launch is refused with [`E-RUN-046`](diagnostics.md#e-run-046) |
 
-A shell reads it without a parser:
+A shell-script component reads it without a parser:
 
 ```sh
 for peer in $MURMUR_FORMATION_PEERS; do
@@ -202,13 +302,22 @@ for peer in $MURMUR_FORMATION_PEERS; do
 done
 ```
 
-A peer's door that requires authentication answers its public agent card to anyone, and answers
-`message/send` from the entry member with `401`: no member is handed another's token.
+### What each member learns { #enforcement-learns }
 
-A roster edge between two members neither of which is the entry member is admitted and both members
-are launched, but no address is handed for it, and the launch prints
-[`W-RUN-005`](diagnostics.md#w-run-005) once per such edge.
+| A member | Learns |
+|---|---|
+| About a member it may call | The member's name, in its components' environment. Only its runtime holds the door URL and the token |
+| About a member it may not call | Nothing: no name, no address, no token |
+| Its delegated children | Inherit `MURMUR_FORMATION_ID` and nothing else: no channel, no token, no `MURMUR_FORMATION_PEERS`. A child's door belongs to no formation, so it refuses every formation token with `401` |
 
-A process that already carries `MURMUR_FORMATION_ID` is a formation member, and refuses
-`mur run --roster` with [`E-RUN-046`](diagnostics.md#e-run-046).
+Each member's trace names it and its callees on `session_start`, and names the calling member on
+each `a2a_task_received` a formation token let in — see the
+[trace schema](observability-schemas.md#session-trace-tracejsonl).
 
+### Why a formation credential never expires { #enforcement-lifetime }
+
+A formation credential has no expiry, no rotation and no revocation list, because it cannot outlive
+the one task it was issued for. The signing key exists only in the launcher's memory and is dropped
+when the formation is torn down; a new launch of the same roster has a new formation id and a new
+key, so a token from an earlier launch is `401` at every door of the new one. Rotation would solve
+a problem that cannot occur.

@@ -386,6 +386,7 @@ dependencies = [
  "libseccomp",
  "mur-roost",
  "murmur-artifact",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1896,6 +1897,7 @@ name = "murmur-cli"
 version = "0.5.0"
 dependencies = [
  "assert_cmd",
+ "base64 0.22.1",
  "bytes",
  "capsule-runtime",
  "chrono",

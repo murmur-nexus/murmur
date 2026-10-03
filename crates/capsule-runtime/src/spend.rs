@@ -846,6 +846,8 @@ mod tests {
         NetworkPolicyHooks {
             network_allow_rules: Vec::new(),
             gateway: Some(gateway),
+            formation: None,
+            task_provenance: None,
         }
     }
 

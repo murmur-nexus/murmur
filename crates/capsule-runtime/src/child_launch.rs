@@ -19,7 +19,8 @@
 //! **A child joins its parent's formation; it never starts one.** A parent session that belongs to
 //! a formation hands its id to every child as [`FORMATION_ID_ENV`], beside the spawner handle and
 //! independent of it, so a launch that names no lineage still carries it. A parent in no
-//! formation hands none.
+//! formation hands none. Inheriting the id is not a grant: the child gets no formation channel, no
+//! formation token and no callee, so its door has no membership and refuses every formation token.
 //!
 //! **The approval travels on the child's standard input.** Not on the argument vector and not in
 //! the environment: both are readable from `/proc/<pid>` by any process running as the same user,
@@ -37,6 +38,7 @@ use crate::delegation::{
 };
 use crate::errors::RuntimeError;
 use crate::formation::{FormationId, FORMATION_ID_ENV, FORMATION_PEERS_ENV};
+use crate::formation_credentials::FORMATION_CHANNEL_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 
@@ -399,6 +401,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         stderr_prefix: None,
         inherit_output: false,
         own_process_group: false,
+        inherit_fd: None,
     })
     .map_err(|error| {
         RuntimeError::Runtime(format!(
@@ -652,8 +655,9 @@ fn watch_for_completion(
 /// launch and [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last,
 /// so a child cannot displace the daemon URL it is required to register with, the handle it
 /// reports its outcome to, or the formation it joins, by allowlisting the name.
-/// [`FORMATION_PEERS_ENV`] is never handed on at all: the doors a formation's entry member may
-/// call are the entry member's, and a child that allowlists the name receives nothing.
+/// [`FORMATION_PEERS_ENV`] and [`FORMATION_CHANNEL_ENV`] are never handed on at all: inheriting a
+/// formation is not a grant, so a member's child holds no channel, no token and no callee, and a
+/// child that allowlists either name receives nothing.
 pub(crate) fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
@@ -669,6 +673,7 @@ pub(crate) fn child_environment(
             && key != SPAWNER_ENV
             && key != FORMATION_ID_ENV
             && key != FORMATION_PEERS_ENV
+            && key != FORMATION_CHANNEL_ENV
     });
 
     if let Ok(path) = std::env::var("PATH") {
@@ -887,6 +892,10 @@ pub(crate) struct ProcessLaunch<'a> {
     /// process's group — a terminal's `^C` — does not reach it, and its whole tree can be
     /// signalled at once.
     pub(crate) own_process_group: bool,
+    /// One descriptor of this process's to hand the process at the same number: a formation
+    /// member's channel. It is close-on-exec here, so no other process this one starts inherits
+    /// it, and the flag is cleared in the started process alone, just before it execs.
+    pub(crate) inherit_fd: Option<i32>,
 }
 
 /// A process [`start_process`] started, with its stderr already being drained.
@@ -943,6 +952,10 @@ pub(crate) fn start_process(launch: &ProcessLaunch<'_>) -> std::io::Result<Start
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(unix)]
+    if let Some(fd) = launch.inherit_fd {
+        keep_across_exec(&mut command, fd);
+    }
 
     let mut child = command.spawn()?;
     let stdin_written = match launch.stdin_line {
@@ -959,6 +972,26 @@ pub(crate) fn start_process(launch: &ProcessLaunch<'_>) -> std::io::Result<Start
         stderr_tail,
         stdin_written,
     })
+}
+
+/// Clear `FD_CLOEXEC` on `fd` in the started process alone, after everything else that runs before
+/// its `exec`, so that process inherits `fd` and no other does.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn keep_across_exec(command: &mut Command, fd: i32) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the forked child between `fork` and `exec`, where only
+    // async-signal-safe calls are allowed; it makes two `fcntl` calls on an integer descriptor,
+    // which allocate nothing and take no lock.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Read a launched process's first standard-output line on a thread of its own, and hand it back

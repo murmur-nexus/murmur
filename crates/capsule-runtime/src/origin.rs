@@ -137,10 +137,13 @@ impl TaskProvenance {
 /// can talk itself into a trusted class it was not given by a murmur runtime.
 ///
 /// Provenance is the caller's claim, whether or not the door authenticates. A door declaring
-/// `network.authentication` decides *who may call*; it does not bind a class to a credential, so
-/// any caller it lets in that claims `peer` + `trusted` gets what a genuine trusted peer gets, and
-/// on a public door that is any caller at all. The boundary closed here is untrust laundering
-/// across an honest chain.
+/// `network.authentication` decides *who may call*: an operator or declared credential, or — on a
+/// formation member's door — another member, let in as the grant `member:<caller>` on the
+/// formation token the launcher issued it for this door. No credential binds a trust class, so any
+/// caller a door lets in that claims `peer` + `trusted` gets what a genuine trusted peer gets, and
+/// on a public door that is any caller at all. Formation calls narrow this: the runtime presents
+/// the token, so it drops whatever origin and trust its guest set and stamps [`stamp_for_peer`] of
+/// the sending task itself. The boundary closed here is untrust laundering across an honest chain.
 pub fn from_wire(origin_header: Option<&str>, trust_header: Option<&str>) -> TaskProvenance {
     let origin = origin_header.and_then(TaskOrigin::parse);
     match origin {
