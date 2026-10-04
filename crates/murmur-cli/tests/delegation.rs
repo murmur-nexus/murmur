@@ -1239,8 +1239,50 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         ]),
         "the enum is this capsule's own spawn.allow"
     );
+    // And the description says what the call does: it returns on start, naming the delegation,
+    // and the answer comes later.
+    let description = declared["description"]
+        .as_str()
+        .expect("the manifest carries a description")
+        .to_string();
+    for said in [
+        "return as soon as it is running and holding that task",
+        "does not wait for the sub-capsule to finish",
+        "`delegation_id`",
+        "`child_workdir`",
+    ] {
+        assert!(
+            description.contains(said),
+            "missing '{said}': {description}"
+        );
+    }
 
     let text = parent.delegate("toolu_happy", WORKER, VERSION, "summarise the report");
+
+    // The description on disk is the one the model was sent.
+    let offered: Vec<String> = parent
+        .server
+        .requests()
+        .iter()
+        .filter_map(|request| request.get("tools").and_then(Value::as_array).cloned())
+        .flatten()
+        .filter(|tool| tool.get("name").and_then(Value::as_str) == Some("delegate-task"))
+        .filter_map(|tool| {
+            tool.get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        !offered.is_empty(),
+        "the model was never offered delegate-task"
+    );
+    for sent in &offered {
+        assert_eq!(
+            sent, &description,
+            "the provider was sent a different description"
+        );
+    }
     let result: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
 
