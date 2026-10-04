@@ -270,3 +270,127 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         );
     }
 }
+
+/// Polls `tasks/get` under `token` until `task_id` reaches a terminal state, and returns it.
+fn wait_terminal(addr: &str, token: &str, task_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let task = rpc(addr, Some(token), "tasks/get", json!({"id": task_id})).json();
+        let state = task["result"]["status"]["state"]
+            .as_str()
+            .unwrap_or_default();
+        if matches!(state, "completed" | "failed" | "canceled" | "rejected") {
+            return task;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task never ended: {task}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A finished task answers `tasks/get` with how it ended — a completed one with its `response`
+/// artifact, a failed one with its `status.message` — and a formation member reads only the tasks
+/// it submitted itself. Another member's task is the same `-32001` an unknown id is; the
+/// operator reads every task.
+#[test]
+fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
+    if common::skip_without_host_support("a_task_answers_with_its_outcome_to_its_own_caller_only") {
+        return;
+    }
+    // The first task completes; the second gets a reply the driver cannot read, and fails.
+    let server = common::ScriptedServer::start(vec![
+        end_turn(1, "PLANNER-ANSWER"),
+        "not a provider reply".to_string(),
+    ]);
+    let home = driver_home();
+    let authority = FormationAuthority::generate(&FormationId::mint()).unwrap();
+    let coder = door(
+        &home,
+        &server.endpoint,
+        "coder",
+        true,
+        Some(member(&authority, "coder", &[])),
+    );
+    let planner = authority.member_bundle("planner", &["coder"]).calls[0]
+        .1
+        .expose()
+        .to_string();
+    let reviewer = authority.member_bundle("reviewer", &["coder"]).calls[0]
+        .1
+        .expose()
+        .to_string();
+
+    let sent = rpc(
+        &coder.addr,
+        Some(&planner),
+        "message/send",
+        message("m-1", "answer"),
+    );
+    let completed_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let completed = wait_terminal(&coder.addr, &planner, &completed_id);
+    assert_eq!(
+        completed["result"]["status"]["state"], "completed",
+        "{completed}"
+    );
+    assert_eq!(
+        completed["result"]["artifacts"],
+        json!([{"name": "response", "parts": [{"text": "PLANNER-ANSWER"}]}]),
+        "{completed}"
+    );
+    let message_of = |task: &Value| task["result"]["status"]["message"].clone();
+    assert_eq!(message_of(&completed)["role"], "agent", "{completed}");
+
+    let sent = rpc(
+        &coder.addr,
+        Some(&planner),
+        "message/send",
+        message("m-2", "fail"),
+    );
+    let failed_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let failed = wait_terminal(&coder.addr, &planner, &failed_id);
+    assert_eq!(failed["result"]["status"]["state"], "failed", "{failed}");
+    assert!(failed["result"].get("artifacts").is_none(), "{failed}");
+    // The final status a task whose driver response could not be read ends with.
+    assert_eq!(
+        message_of(&failed)["parts"][0]["text"],
+        "session ended",
+        "{failed}"
+    );
+
+    // Another member reads neither task, and is told what an unknown id is told.
+    let unknown = rpc(
+        &coder.addr,
+        Some(&reviewer),
+        "tasks/get",
+        json!({"id": "tsk_none"}),
+    );
+    assert_eq!(unknown.json()["error"]["code"], -32001, "{unknown:?}");
+    for task_id in [&completed_id, &failed_id] {
+        let refused = rpc(
+            &coder.addr,
+            Some(&reviewer),
+            "tasks/get",
+            json!({"id": task_id}),
+        );
+        assert_eq!(refused.status, 200, "{refused:?}");
+        assert_eq!(
+            refused.json()["error"],
+            unknown.json()["error"],
+            "{refused:?}"
+        );
+        assert!(refused.json().get("result").is_none(), "{refused:?}");
+    }
+
+    // The operator reads both, exactly as their submitter does.
+    for (task_id, as_submitter) in [(&completed_id, &completed), (&failed_id, &failed)] {
+        let read = rpc(
+            &coder.addr,
+            Some(&coder.operator),
+            "tasks/get",
+            json!({"id": task_id}),
+        );
+        assert_eq!(read.json()["result"], as_submitter["result"], "{read:?}");
+    }
+}

@@ -83,7 +83,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// A child that produced a hundred megabytes must not be able to spend its parent's whole context
 /// by being asked one question. Past this, the text is cut and [`DelegationResult::result_path`]
 /// is how the parent reads the rest.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// The three strings an agent supplies for one delegation, and the whole of what it supplies.
 #[derive(Debug, Clone)]
@@ -182,18 +182,14 @@ impl DelegationResult {
     /// child's process never started. A delegation id is minted by the launcher, so neither has
     /// one to report.
     fn unmade(request: &DelegationRequest, status: DelegationStatus, reason: String) -> Self {
-        let truncated = reason.len() > MAX_OUTPUT_BYTES;
+        let (output, truncated) = bounded(reason);
         Self {
             delegation_id: String::new(),
             session_id: String::new(),
             capsule: request.capsule.clone(),
             version: request.version.clone(),
             status,
-            output: if truncated {
-                bound_output(reason)
-            } else {
-                reason
-            },
+            output,
             result_path: None,
             truncated,
             child_workdir: None,
@@ -330,7 +326,7 @@ impl DelegationPlane {
             roost_url: roost_url.trim_end_matches('/').to_string(),
             credential,
             accessible_workdir,
-            result_timeout: configured_result_timeout(declared_deadline),
+            result_timeout: handed_off_work_deadline(declared_deadline),
             session_id,
             registry,
             parent_env_allow,
@@ -595,18 +591,14 @@ impl DelegationPlane {
 
         let child_workdir = self.workdir_relative(&child.workdir);
         let failed = |session_id: &str, output: String| {
-            let truncated = output.len() > MAX_OUTPUT_BYTES;
+            let (output, truncated) = bounded(output);
             DelegationResult {
                 delegation_id: delegation_id.clone(),
                 session_id: session_id.to_string(),
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
                 status: DelegationStatus::Failed,
-                output: if truncated {
-                    bound_output(output)
-                } else {
-                    output
-                },
+                output,
                 result_path: None,
                 truncated,
                 child_workdir: None,
@@ -718,18 +710,14 @@ impl DelegationPlane {
         // [`MAX_OUTPUT_BYTES`] bounds every branch. A child's *failure* message is as much its own
         // text as its answer is, so it is cut on the same terms.
         let outcome = |status, session_id: &str, output: String| {
-            let truncated = output.len() > MAX_OUTPUT_BYTES;
+            let (output, truncated) = bounded(output);
             DelegationResult {
                 delegation_id: delegation_id.clone(),
                 session_id: session_id.to_string(),
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
                 status,
-                output: if truncated {
-                    bound_output(output)
-                } else {
-                    output
-                },
+                output,
                 result_path: None,
                 truncated,
                 child_workdir: None,
@@ -812,10 +800,11 @@ impl DelegationPlane {
             match task.pointer("/result/status/state").and_then(Value::as_str) {
                 Some("submitted" | "working" | "input-required") => continue,
                 // Two places the answer can be, and both are read. A2A carries a completed task's
-                // output in its artifacts, which is where a capsule this runtime did not build
-                // would put it; a murmur capsule's own listener attaches an artifact only to an
-                // `input-required` task, so its answer is read from the result file its runtime
-                // wrote into the directory this parent composed for it.
+                // output in its artifacts: a murmur door attaches a `response` artifact to a
+                // completed task that produced a response, and a capsule this runtime did not
+                // build puts its answer there too. A task that ended with no response text has no
+                // artifact, so the result file the child's runtime wrote into the directory this
+                // parent composed for it is read as well.
                 Some("completed") => {
                     let carried = task
                         .pointer("/result/artifacts/0/parts/0/text")
@@ -938,6 +927,16 @@ fn read_child_result(
         .find_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
 }
 
+/// `(output, truncated)`, with `output` cut by [`bound_output`] when it is over
+/// [`MAX_OUTPUT_BYTES`].
+pub(crate) fn bounded(output: String) -> (String, bool) {
+    if output.len() > MAX_OUTPUT_BYTES {
+        (bound_output(output), true)
+    } else {
+        (output, false)
+    }
+}
+
 /// `output` cut to [`MAX_OUTPUT_BYTES`] at a character boundary, with the cut marked.
 fn bound_output(output: String) -> String {
     let mut end = MAX_OUTPUT_BYTES;
@@ -963,17 +962,20 @@ fn env_allow_intersection(child: &[String], parent: &[String]) -> Vec<String> {
     allowed
 }
 
-/// The bound this session delegates under: [`DELEGATION_TIMEOUT_ENV`] when it names a positive
+/// The bound on work this session hands off: [`DELEGATION_TIMEOUT_ENV`] when it names a positive
 /// number of seconds, and `declared` — the capsule's own `lifecycle.delegation_deadline_secs` —
 /// otherwise.
-fn configured_result_timeout(declared: Duration) -> Duration {
+///
+/// The one resolver for the one bound: a delegation's wait for its child, and a `call-member`
+/// call's wait for the callee's answer ([`crate::member_call`]), both read it.
+pub(crate) fn handed_off_work_deadline(declared: Duration) -> Duration {
     result_timeout_from(
         std::env::var(DELEGATION_TIMEOUT_ENV).ok().as_deref(),
         declared,
     )
 }
 
-/// [`configured_result_timeout`]'s rule, without the environment read, so it is testable without
+/// [`handed_off_work_deadline`]'s rule, without the environment read, so it is testable without
 /// mutating process-wide state that every other test in this binary shares.
 ///
 /// `declared` is taken as written, including zero: a capsule that declares `0` means the first

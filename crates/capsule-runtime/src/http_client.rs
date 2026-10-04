@@ -20,7 +20,7 @@ use crate::dns_resolver::Resolution;
 
 /// Deadline every request gets unless the caller states a shorter one: long enough for a daemon
 /// that is staging a child, short enough that a session cannot block on it forever.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One request, one response, one connection, under [`DEFAULT_TIMEOUT`].
 ///

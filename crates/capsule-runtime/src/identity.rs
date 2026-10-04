@@ -1317,6 +1317,9 @@ async fn handle_message_stream(
         let mut reg = task_registry.lock().unwrap();
         if reg.can_accept() {
             reg.enqueue(&task_id, &context_id);
+            if let Some(member) = &caller_member {
+                reg.record_submitter(&task_id, member);
+            }
             None
         } else if reg.is_closed() {
             Some(crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE)
@@ -1578,7 +1581,9 @@ fn handle_jsonrpc(
             forget_session,
             caller_member,
         ),
-        DoorMethod::TasksGet => handle_tasks_get(id, &req.params, task_registry),
+        DoorMethod::TasksGet => {
+            handle_tasks_get(id, &req.params, task_registry, caller_member.as_deref())
+        }
         DoorMethod::TasksCancel => {
             handle_tasks_cancel(id, &req.params, task_registry, detached, live_delegations)
         }
@@ -1638,17 +1643,26 @@ fn handle_message_send(
     {
         let mut reg = task_registry.lock().unwrap();
         if !reg.can_accept() {
+            let refusal = if reg.is_closed() {
+                crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE
+            } else {
+                REJECTED_BUSY_MESSAGE
+            };
             let task = A2aTask {
-                id: task_id,
-                context_id,
                 status: TaskStatus {
                     state: TaskState::Rejected,
+                    message: Some(crate::a2a::StatusMessage::agent(&task_id, refusal)),
                 },
+                id: task_id,
+                context_id,
                 artifacts: None,
             };
             return JsonRpcResponse::ok(id, task).into_http_response();
         }
         reg.enqueue(&task_id, &context_id);
+        if let Some(member) = &caller_member {
+            reg.record_submitter(&task_id, member);
+        }
     }
 
     // Send to mpsc (should always succeed — capacity was checked under the same lock)
@@ -1676,16 +1690,29 @@ fn handle_message_send(
     let task = A2aTask {
         id: task_id,
         context_id,
-        status: TaskStatus {
-            state: TaskState::Submitted,
-        },
+        status: TaskStatus::of(TaskState::Submitted),
         artifacts: None,
     };
     JsonRpcResponse::ok(id, task).into_http_response()
 }
 
-fn handle_tasks_get(id: Value, params: &Value, task_registry: &Arc<Mutex<TaskRegistry>>) -> String {
+/// `tasks/get`: one task's state, and how it ended once it has.
+///
+/// A formation member — `caller_member`, from the formation token the door let in — reads only
+/// the tasks it submitted itself. Every other id, another member's task or the operator's
+/// included, gets the same `-32001` an id this capsule never held gets. This scopes `tasks/get`
+/// only: `message/stream` forwards every task's frames to whoever holds the connection.
+fn handle_tasks_get(
+    id: Value,
+    params: &Value,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    caller_member: Option<&str>,
+) -> String {
     let requested_id = params.get("id").and_then(Value::as_str).map(str::to_string);
+    let visible = |reg: &TaskRegistry, task_id: &str| match caller_member {
+        Some(member) => reg.submitter(task_id) == Some(member),
+        None => true,
+    };
 
     let Some(task_id) = requested_id else {
         // Backward compat: if no id provided, return the active slot's task if any
@@ -1701,7 +1728,10 @@ fn handle_tasks_get(id: Value, params: &Value, task_registry: &Arc<Mutex<TaskReg
                     | crate::a2a::TaskSlotState::Done { task_id, .. } => task_id.clone(),
                     crate::a2a::TaskSlotState::Empty => unreachable!(),
                 };
-                match reg.get_task(&active_id) {
+                match reg
+                    .get_task(&active_id)
+                    .filter(|_| visible(&reg, &active_id))
+                {
                     Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
                     None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
                 }
@@ -1710,7 +1740,7 @@ fn handle_tasks_get(id: Value, params: &Value, task_registry: &Arc<Mutex<TaskReg
     };
 
     let reg = task_registry.lock().unwrap();
-    match reg.get_task(&task_id) {
+    match reg.get_task(&task_id).filter(|_| visible(&reg, &task_id)) {
         Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
         None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
     }
@@ -2988,6 +3018,7 @@ mod tests {
             serde_json::json!(1),
             &serde_json::json!({"id": "tsk_refused"}),
             &task_registry,
+            None,
         );
 
         assert!(response.contains(r#""state":"rejected""#), "{response}");

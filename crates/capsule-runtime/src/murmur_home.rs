@@ -148,13 +148,14 @@ pub enum HomeEntryKind {
     Artifacts,
     CompiledForms,
     BinaryCache,
+    Formations,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 11] = [
+    const KNOWN: [HomeEntryKind; 12] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -166,6 +167,7 @@ impl HomeEntryKind {
         Self::Artifacts,
         Self::CompiledForms,
         Self::BinaryCache,
+        Self::Formations,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -183,6 +185,7 @@ impl HomeEntryKind {
             Self::Artifacts => "artifacts",
             Self::CompiledForms => "compiled",
             Self::BinaryCache => "bin",
+            Self::Formations => crate::formation_launch::FORMATIONS_DIR,
             Self::Unrecognised(name) => name,
         })
     }
@@ -202,6 +205,7 @@ impl HomeEntryKind {
             Self::Artifacts => "installed artifacts",
             Self::CompiledForms => "compiled WASM cache",
             Self::BinaryCache => "cached mur binaries",
+            Self::Formations => "formation members' working directories",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -211,12 +215,27 @@ impl HomeEntryKind {
         matches!(self, Self::CompiledForms)
     }
 
-    /// Whether the entry, and everything beneath it, is expected to be owner-only.
+    /// Whether the entry, and everything beneath it down to [`Self::private_depth`], is expected
+    /// to be owner-only.
     pub fn expected_private(&self) -> bool {
         !matches!(
             self,
             Self::Artifacts | Self::BinaryCache | Self::Unrecognised(_)
         )
+    }
+
+    /// How many directory levels below the entry the audit holds owner-only, or `None` for every
+    /// level.
+    ///
+    /// `formations/<frm_id>/<member>/` is held at two: the launcher makes those directories
+    /// owner-only, and below them is a member's ordinary working directory, whose sessions are
+    /// written at the umask's modes like any `--workdir`. The owner-only member directory is what
+    /// keeps them from other accounts, so walking further reports every file a session writes.
+    pub fn private_depth(&self) -> Option<usize> {
+        match self {
+            Self::Formations => Some(2),
+            _ => None,
+        }
     }
 }
 
@@ -336,7 +355,12 @@ fn report_entry(path: PathBuf, kind: HomeEntryKind) -> HomeEntryReport {
     let mut omitted = 0;
     // The home's own entries are reported one by one, so only an entry below it is walked.
     if private && file_type.is_dir() && kind != HomeEntryKind::Home {
-        collect_wide_descendants(&path, &mut wide_descendants, &mut omitted);
+        collect_wide_descendants(
+            &path,
+            kind.private_depth(),
+            &mut wide_descendants,
+            &mut omitted,
+        );
     }
 
     HomeEntryReport {
@@ -351,9 +375,18 @@ fn report_entry(path: PathBuf, kind: HomeEntryKind) -> HomeEntryReport {
     }
 }
 
-fn collect_wide_descendants(dir: &Path, found: &mut Vec<WideEntry>, omitted: &mut usize) {
+/// Wide paths beneath `dir`, `depth` levels down, or every level for `None`.
+fn collect_wide_descendants(
+    dir: &Path,
+    depth: Option<usize>,
+    found: &mut Vec<WideEntry>,
+    omitted: &mut usize,
+) {
     use std::os::unix::fs::PermissionsExt;
 
+    if depth == Some(0) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -381,7 +414,7 @@ fn collect_wide_descendants(dir: &Path, found: &mut Vec<WideEntry>, omitted: &mu
             }
         }
         if file_type.is_dir() {
-            collect_wide_descendants(&path, found, omitted);
+            collect_wide_descendants(&path, depth.map(|depth| depth - 1), found, omitted);
         }
     }
 }
@@ -590,14 +623,59 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 12);
+        assert_eq!(reports.len(), 13);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
         assert_eq!(reports[11].kind, HomeEntryKind::BinaryCache);
+        assert_eq!(reports[12].kind, HomeEntryKind::Formations);
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
+    }
+
+    /// `formations/` holds members' working directories: known, owner-only down to each member's
+    /// directory, and never offered for deletion. What a member's sessions write beneath its
+    /// directory, at the umask's modes, is not reported.
+    #[test]
+    fn murmur_home_audit_knows_formations_as_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".murmur");
+        wide_dir(&home, 0o700);
+        wide_dir(&home.join("formations"), 0o700);
+        wide_dir(&home.join("formations/frm_x"), 0o700);
+        wide_dir(&home.join("formations/frm_x/worker"), 0o755);
+        wide_dir(&home.join("formations/frm_x/worker/.murmur/ses_1"), 0o775);
+        wide_file(
+            &home.join("formations/frm_x/worker/.murmur/ses_1/trace.jsonl"),
+            "{}\n",
+            0o664,
+        );
+        wide_file(&home.join("formations/frm_x/worker/task.md"), "t", 0o664);
+
+        let report = audit_murmur_home(&home)
+            .into_iter()
+            .find(|report| report.kind == HomeEntryKind::Formations)
+            .unwrap();
+        assert_eq!(report.path, home.join("formations"));
+        assert_eq!(
+            report.kind.holds(),
+            "formation members' working directories"
+        );
+        assert!(report.kind.expected_private());
+        assert!(!report.kind.safe_to_delete());
+        match report.state {
+            HomeEntryState::Present {
+                wide,
+                wide_descendants,
+                ..
+            } => {
+                assert!(!wide);
+                assert_eq!(wide_descendants.len(), 1);
+                assert!(wide_descendants[0].path.ends_with("frm_x/worker"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

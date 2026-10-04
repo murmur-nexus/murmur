@@ -506,7 +506,6 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap()

@@ -118,7 +118,6 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .expect("stage_session should succeed");
@@ -229,7 +228,6 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .expect("stage_session should succeed without shell-desc driver");
@@ -345,7 +343,6 @@ fn shell_desc_driver_respects_custom_manifest() {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .expect("stage_session should succeed");

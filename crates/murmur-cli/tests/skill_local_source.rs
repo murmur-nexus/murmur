@@ -116,7 +116,6 @@ fn local_source_file_path_installs_skill_md() {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap();
@@ -187,7 +186,6 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap();
@@ -269,7 +267,6 @@ fn local_source_coexists_with_registry_skill() {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap();

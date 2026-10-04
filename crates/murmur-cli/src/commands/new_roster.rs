@@ -747,6 +747,31 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
         member.after_task_note,
     )
     .blank();
+    let callees = callees_of(member.name);
+    if !callees.is_empty() {
+        yaml.comment(
+            0,
+            &format!(
+                "Where the capsule may connect. ../roster.yaml lets {} call {}, but a roster rule
+                 grants a name and a credential, never egress: each call-member call is checked
+                 against this list at the callee's real door. A formation serves that door on
+                 loopback http at a port chosen at launch, so the rule names the host and pins no
+                 port.",
+                member.name,
+                callees.join(", "),
+            ),
+        )
+        .see(0, "manifest/#field-capabilities")
+        .bare(0, "capabilities:")
+        .line(2, "network:", "IP destinations the capsule may reach")
+        .line(4, "allow:", "anything not listed is denied")
+        .line(
+            6,
+            "- localhost",
+            "every member's door, at any port and scheme",
+        )
+        .blank();
+    }
     let callers: Vec<&str> = REACHABILITY
         .iter()
         .filter(|(_, to)| to.contains(&member.name))
@@ -804,8 +829,26 @@ fn render_member(name: &str, member: &MemberTemplate, choice: &ProviderChoice) -
     yaml.0
 }
 
+/// The members `member` may call, in rule order.
+fn callees_of(member: &str) -> Vec<&'static str> {
+    REACHABILITY
+        .iter()
+        .filter(|(from, _)| *from == member)
+        .flat_map(|(_, to)| to.iter().copied())
+        .collect()
+}
+
 fn system_prompt(name: &str, member: &MemberTemplate) -> String {
-    if member.entry {
+    let callees = callees_of(member.name);
+    if member.entry && !callees.is_empty() {
+        format!(
+            "You are '{}', the entry member of the formation '{name}'. Hand the task you are \
+             given to {} with the call-member tool, stating it in full, then end your turn while \
+             it works. When its answer arrives in this conversation, answer with the result.",
+            member.name,
+            callees.join(" or "),
+        )
+    } else if member.entry {
         format!(
             "You are '{}', the entry member of the formation '{name}'. Complete the task you are \
              given and answer with the result.",
@@ -930,6 +973,52 @@ mod tests {
             let called = REACHABILITY.iter().any(|(_, to)| to.contains(&member.name));
             assert_eq!(member.serves_peers, called, "{}", member.name);
         }
+    }
+
+    /// The caller's egress is what `call-member` is checked against at the callee's door, so the
+    /// member that calls declares the door host at every port, and the member that only serves
+    /// declares no capabilities at all.
+    #[test]
+    fn only_the_caller_declares_network_allow_reaching_every_door() {
+        let (_, lead, worker, scaffold) = files(&default_choice());
+        let allow = lead
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.network.as_ref())
+            .map(|network| network.allow.clone())
+            .unwrap_or_default();
+        assert_eq!(allow, ["localhost"]);
+        assert!(worker.capabilities.is_none());
+        let text = scaffold.file(Path::new("lead/murmur.yaml")).unwrap();
+        let prose = text
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("# "))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for said in [
+            "grants a name and a credential, never egress",
+            "each call-member call is checked against this list at the callee's real door",
+            "loopback http at a port chosen at launch",
+        ] {
+            assert!(prose.contains(said), "{said}: {text}");
+        }
+    }
+
+    /// Lead's prompt names the hand-off: call-member to worker, end the turn, answer with what
+    /// comes back.
+    #[test]
+    fn the_lead_prompt_hands_the_task_to_worker() {
+        let (_, lead, worker, _) = files(&default_choice());
+        let prompt = lead.inference.unwrap().system_prompt.unwrap();
+        for said in [
+            "to worker with the call-member tool",
+            "end your turn",
+            "answer with the result",
+        ] {
+            assert!(prompt.contains(said), "{said}: {prompt}");
+        }
+        let worker_prompt = worker.inference.unwrap().system_prompt.unwrap();
+        assert!(!worker_prompt.contains("call-member"), "{worker_prompt}");
     }
 
     #[test]

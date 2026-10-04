@@ -1,8 +1,9 @@
 //! The untrusted fence: the markers that name where a piece of model-facing content came from.
 //!
 //! Every tool result the runtime hands the model, every skill result whose `murmur.lock` origin
-//! derives [`crate::origin::TrustClass::Untrusted`] (see [`crate::origin::artifact_trust`]), and
-//! every task payload whose derived trust class is untrusted, arrives wrapped between
+//! derives [`crate::origin::TrustClass::Untrusted`] (see [`crate::origin::artifact_trust`]), every
+//! task payload whose derived trust class is untrusted, and every formation member's answer to a
+//! `call-member` call, arrives wrapped between
 //! [`open_marker`]'s output and [`FENCE_CLOSE`]. The fence is a *marker*, not a capability
 //! control: nothing is refused, delayed or reordered for being fenced, no grant is widened or
 //! narrowed by it, and the model is free to act on what it reads. It gives the model a stable
@@ -59,6 +60,12 @@ pub(crate) fn tool_source(tool_name: &str) -> String {
 /// `skill:pulled-style`. An operator-declared skill is never fenced and has no source name.
 pub(crate) fn skill_source(skill_name: &str) -> String {
     format!("skill:{skill_name}")
+}
+
+/// The source name for a formation member's answer to a `call-member` call: `member:<name>`, e.g.
+/// `member:worker`. Every answer is fenced under it, whatever the calling task's trust.
+pub(crate) fn member_source(member: &str) -> String {
+    format!("member:{member}")
 }
 
 /// The source name for a task payload: `task:<origin>`, e.g. `task:event`.
@@ -121,9 +128,9 @@ mod tests {
     use crate::agent::count_tokens;
 
     /// Every non-test call site of [`wrap_untrusted`] in this crate, as file names relative to
-    /// `src/`. The fence is applied once, at the tool-result boundary and at the task-payload
-    /// boundary, and a third application would fence a fenced block.
-    const PERMITTED_FENCE_CALL_SITES: [&str; 2] = ["runtime.rs", "agent.rs"];
+    /// `src/`. The fence is applied once, at the tool-result boundary, the task-payload boundary
+    /// and the member-answer boundary, and another application would fence a fenced block.
+    const PERMITTED_FENCE_CALL_SITES: [&str; 3] = ["runtime.rs", "agent.rs", "member_call.rs"];
 
     #[test]
     fn fence_names_its_source_and_closes_once() {
@@ -250,15 +257,15 @@ mod tests {
         );
     }
 
-    /// The source guard: [`wrap_untrusted`] is called from exactly the two boundaries the fence
-    /// exists for. A third call site — a second application in a dispatch branch, a re-fence in
+    /// The source guard: [`wrap_untrusted`] is called from exactly the three boundaries the fence
+    /// exists for. Another call site — a second application in a dispatch branch, a re-fence in
     /// a hook or in the A2A path — fails here rather than reaching a model as a doubled fence.
     ///
     /// Reads every `.rs` file under `src/`, drops line comments and the trailing `mod tests`,
     /// and counts occurrences of the call. `fence.rs` itself is excluded: its own tests call the
     /// function by design.
     #[test]
-    fn fence_is_applied_from_exactly_two_call_sites() {
+    fn fence_is_applied_from_exactly_three_call_sites() {
         let mut found: Vec<(String, usize)> = Vec::new();
 
         for (name, text) in crate::source_scan::crate_sources() {
@@ -287,10 +294,11 @@ mod tests {
         };
         assert_eq!(
             found, expected,
-            "`fence::wrap_untrusted` may be called from exactly two places: the tool-result \
-boundary in runtime.rs (`dispatch_agent_tool_async`) and the task-payload boundary in agent.rs \
-(`fence_task_payload`). Found: {found:?}. Route new content through one of those two rather \
-than adding a third application site."
+            "`fence::wrap_untrusted` may be called from exactly three places: the tool-result \
+boundary in runtime.rs (`dispatch_agent_tool_async`), the task-payload boundary in agent.rs \
+(`fence_task_payload`) and the member-answer boundary in member_call.rs (`answers_message`). \
+Found: {found:?}. Route new content through one of those rather than adding another \
+application site."
         );
     }
 }

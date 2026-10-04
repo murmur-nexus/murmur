@@ -57,18 +57,12 @@ pub(crate) async fn send_a2a_message(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
-    if let Some(ref tp) = traceparent {
-        request.push_str(&format!("traceparent: {tp}\r\n"));
-    }
     if let Some(token) = authorization {
         request.push_str(&format!("Authorization: Bearer {}\r\n", token.expose()));
     }
-    let stamped = stamp_for_peer(sender_task);
-    request.push_str(&format!(
-        "{PEER_ORIGIN_HEADER}: {}\r\n{PEER_TRUST_HEADER}: {}\r\n",
-        stamped.origin().as_str(),
-        stamped.trust().as_str(),
-    ));
+    for (name, value) in peer_call_headers(sender_task, traceparent.as_deref()) {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
     request.push_str("\r\n");
     request.push_str(&body);
 
@@ -97,11 +91,27 @@ pub(crate) async fn send_a2a_message(
         .map_err(|e| format!("failed to parse A2A task from {peer_url}: {e}"))
 }
 
-/// What a non-2xx answer to [`send_a2a_message`] is reported as: the status, and the receiver's
-/// own `error` code and `message` when its body is a JSON object carrying them, so a guest reads
-/// why the peer refused rather than a bare status.
-fn refused_message(peer_url: &str, raw: &RawHttpResponse) -> String {
-    let body: Option<serde_json::Value> = serde_json::from_slice(&raw.body).ok();
+/// The headers every request to a peer presents besides `Authorization`: the provenance stamped
+/// for the sending task — see [`stamp_for_peer`] — and the trace context it continues.
+pub(crate) fn peer_call_headers(
+    sender_task: Option<TaskProvenance>,
+    traceparent: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let stamped = stamp_for_peer(sender_task);
+    let mut headers = vec![
+        (PEER_ORIGIN_HEADER, stamped.origin().as_str().to_string()),
+        (PEER_TRUST_HEADER, stamped.trust().as_str().to_string()),
+    ];
+    if let Some(traceparent) = traceparent {
+        headers.push(("traceparent", traceparent.to_string()));
+    }
+    headers
+}
+
+/// How a door that refused a request is named: `status`, followed by the refusal's own `error`
+/// code when `body` is a JSON object carrying one, and the body's `message` when it has one.
+pub(crate) fn refusal_status(status: &str, body: &[u8]) -> (String, Option<String>) {
+    let body: Option<serde_json::Value> = serde_json::from_slice(body).ok();
     let field = |name: &str| {
         body.as_ref()
             .and_then(|body| body.get(name))
@@ -109,12 +119,21 @@ fn refused_message(peer_url: &str, raw: &RawHttpResponse) -> String {
             .map(str::to_string)
     };
     let status = match field("error") {
-        Some(code) => format!("{} {code}", raw.status),
-        None => raw.status.to_string(),
+        Some(code) => format!("{status} {code}"),
+        None => status.to_string(),
     };
-    match field("message") {
-        Some(message) => format!("peer at {peer_url} refused the message ({status}): {message}"),
-        None => format!("peer at {peer_url} refused the message ({status})"),
+    (status, field("message"))
+}
+
+/// What a non-2xx answer to [`send_a2a_message`] is reported as: the status, and the receiver's
+/// own `error` code and `message` when its body is a JSON object carrying them, so a guest reads
+/// why the peer refused rather than a bare status.
+fn refused_message(peer_url: &str, raw: &RawHttpResponse) -> String {
+    match refusal_status(&raw.status.to_string(), &raw.body) {
+        (status, Some(message)) => {
+            format!("peer at {peer_url} refused the message ({status}): {message}")
+        }
+        (status, None) => format!("peer at {peer_url} refused the message ({status})"),
     }
 }
 

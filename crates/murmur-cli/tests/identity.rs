@@ -129,7 +129,6 @@ fn stage_agent_with_port(
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap()

@@ -11,16 +11,15 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::door_capsule::{driver_home, message, rpc, DRIVER_NAME, DRIVER_VERSION};
-use common::formation::{alive, launch_lock};
+use common::formation::{alive, launch_lock, reported_pids, signal, Launcher, LAUNCH_LIMIT};
 use common::{
     assert_wound_down_by_formation as assert_wound_down, event_kinds, publish_to_store,
     read_whole_trace as read_trace, tool_result_text, tool_use_response, ScriptedServer,
@@ -32,9 +31,6 @@ use tempfile::TempDir;
 const PROBE_TOOL: &str = "formation-probe";
 const PROBE_VERSION: &str = "0.1.0";
 const PROBE_CALL: &str = "toolu_formation_probe";
-
-/// How long one launch may take end to end before the test gives up on it.
-const LAUNCH_LIMIT: Duration = Duration::from_secs(240);
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
@@ -306,59 +302,20 @@ impl Project {
         let mut args = vec!["run", "--roster", "--json", "--task", "probe"];
         args.extend_from_slice(extra);
         let mut command = self.command(&args);
-        command
-            .envs(env.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.envs(env.iter().copied());
         if own_group {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let started = Instant::now();
-        let mut child = command.spawn().unwrap();
-        let (line_tx, lines) = mpsc::channel::<(Instant, String)>();
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&stdout);
-        let out = child.stdout.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                seen.lock().unwrap().push(line.clone());
-                let _ = line_tx.send((Instant::now(), line));
-            }
-        });
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&stderr);
-        let err = child.stderr.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                eprintln!("[launcher] {line}");
-                let mut sink = sink.lock().unwrap();
-                sink.push_str(&line);
-                sink.push('\n');
-            }
-        });
-        Launcher {
-            child,
-            started,
-            lines,
-            stdout,
-            stderr,
-        }
+        Launcher::spawn(command)
     }
 
-    /// Every `ses_*` session directory members created under the project.
+    /// Every `ses_*` session directory members created: the entry member's under the project,
+    /// each peer's under its own directory in the scratch `HOME`.
     fn sessions(&self) -> Vec<PathBuf> {
-        let Ok(entries) = std::fs::read_dir(self.path().join(".murmur")) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("ses_"))
-            })
+        std::iter::once(self.path().join(".murmur"))
+            .chain(common::formation::peer_session_roots(self.home.path()))
+            .flat_map(|root| common::formation::session_dirs(&root))
             .collect()
     }
 
@@ -396,15 +353,7 @@ impl Project {
 
     /// The operator token the running record of `session_id` holds.
     fn door_token(&self, session_id: &str) -> String {
-        let record = self
-            .home
-            .path()
-            .join(".murmur")
-            .join("running")
-            .join(format!("{session_id}.json"));
-        let record: Value =
-            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-        record["door_token"].as_str().unwrap().to_string()
+        common::formation::door_token(self.home.path(), session_id)
     }
 
     /// Fail unless no process on the host carries this project's path on its command line within
@@ -418,92 +367,6 @@ struct Finished {
     status: ExitStatus,
     stdout: String,
     stderr: String,
-}
-
-/// A running `mur run --roster`.
-struct Launcher {
-    child: Child,
-    started: Instant,
-    lines: mpsc::Receiver<(Instant, String)>,
-    stdout: Arc<Mutex<Vec<String>>>,
-    stderr: Arc<Mutex<String>>,
-}
-
-impl Launcher {
-    /// The next stdout line, parsed, and when it arrived.
-    fn next_json(&self) -> (Instant, Value) {
-        let (at, line) = self
-            .lines
-            .recv_timeout(LAUNCH_LIMIT)
-            .unwrap_or_else(|_| panic!("no stdout line; stderr:\n{}", self.stderr()));
-        let value = serde_json::from_str(&line)
-            .unwrap_or_else(|_| panic!("stdout line is not JSON: {line}"));
-        (at, value)
-    }
-
-    fn wait(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + LAUNCH_LIMIT;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                panic!("the launcher did not exit; stderr:\n{}", self.stderr());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn stderr(&self) -> String {
-        self.stderr.lock().unwrap().clone()
-    }
-
-    fn stdout(&self) -> Vec<String> {
-        // The relay thread may still be appending the last line when the process has exited.
-        thread::sleep(Duration::from_millis(200));
-        self.stdout.lock().unwrap().clone()
-    }
-
-    fn signal(&self, signal: i32) {
-        signal_pid(self.child.id(), signal);
-    }
-}
-
-impl Drop for Launcher {
-    fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            self.signal(libc::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-fn signal_pid(pid: u32, signal: i32) {
-    // SAFETY: `kill` takes two integers and dereferences nothing; `pid` is a child of this test.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
-}
-
-/// Every pid a formation line and a readiness line reported.
-fn reported_pids(formation: &Value, entry: Option<&Value>) -> Vec<u32> {
-    let mut pids: Vec<u32> = formation["peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|peer| peer["pid"].as_u64().unwrap() as u32)
-        .collect();
-    if let Some(entry) = entry {
-        pids.push(entry["pid"].as_u64().unwrap() as u32);
-    }
-    pids
 }
 
 /// `stdout` and `stderr` with the entry member's own readiness-line tokens taken out: the one
@@ -547,9 +410,26 @@ fn assert_formation_line(formation: &Value, entry: &str, peers: &[&str]) {
     assert_eq!(names, peers, "{formation}");
     for peer in formation["peers"].as_array().unwrap() {
         let keys: Vec<&String> = peer.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["name", "pid", "session_id", "url"], "{peer}");
+        assert_eq!(
+            keys,
+            ["name", "pid", "session_id", "url", "workdir"],
+            "{peer}"
+        );
         assert!(peer["session_id"].as_str().unwrap().starts_with("ses_"));
         assert!(peer["url"].as_str().unwrap().starts_with("http://"));
+        // The peer's own directory, `<home>/.murmur/formations/<frm_id>/<member>`, owner-only.
+        let workdir = Path::new(peer["workdir"].as_str().unwrap());
+        assert!(
+            workdir.ends_with(
+                Path::new("formations")
+                    .join(id)
+                    .join(peer["name"].as_str().unwrap())
+            ),
+            "{peer}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(workdir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{peer}");
     }
     let keys: Vec<&String> = formation.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["entry", "formation_id", "peers"], "{formation}");
@@ -852,9 +732,9 @@ fn assert_no_formation_token(project: &Project, stdout: &[String], stderr: &str)
     }
 }
 
-/// Every member's workdir is the project directory, where the entry member's task is written and
-/// left behind. A peer takes work only at its door: a `task.md` already there — an earlier
-/// launch's — is never run by a peer.
+/// The entry member's task is written to the project directory and left behind there. A peer
+/// runs in a directory of its own and takes work only at its door: a `task.md` already in the
+/// project — an earlier launch's — is never run by a peer.
 #[test]
 fn a_task_file_in_the_project_is_never_a_peers_task() {
     let _lock = launch_lock();
@@ -1008,7 +888,7 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
         if kill_launcher {
             launcher.signal(libc::SIGTERM);
         } else {
-            signal_pid(planner["pid"].as_u64().unwrap() as u32, libc::SIGKILL);
+            signal(planner["pid"].as_u64().unwrap() as u32, libc::SIGKILL);
         }
         let status = launcher.wait();
         assert_eq!(
@@ -1781,4 +1661,83 @@ fn four_member_formation_cost() {
             }
         })
     );
+}
+
+/// The member flags a launcher passes: `--ignore-task-file` is an unknown argument, and the hidden
+/// `--store-root` is not shown, needs `--capsule` and `--workdir`, and conflicts with `--roster`.
+#[test]
+fn the_hidden_member_flags_are_exactly_what_a_launcher_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mur = |args: &[&str]| {
+        Command::new(assert_cmd::cargo::cargo_bin("mur"))
+            .args(args)
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .output()
+            .unwrap()
+    };
+    let removed = mur(&[
+        "run",
+        "--ignore-task-file",
+        "--capsule",
+        "c",
+        "--capsule-version",
+        "1",
+    ]);
+    assert_eq!(removed.status.code(), Some(2), "{removed:?}");
+    assert!(
+        String::from_utf8_lossy(&removed.stderr)
+            .contains("unexpected argument '--ignore-task-file'"),
+        "{removed:?}"
+    );
+
+    let help = mur(&["run", "--help"]);
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("--store-root"));
+
+    let store = dir.path().display().to_string();
+    for (args, refusal) in [
+        (
+            vec!["run", "--store-root", &store],
+            "the following required arguments were not provided",
+        ),
+        (
+            vec!["run", "--store-root", &store, "--workdir", &store],
+            "the following required arguments were not provided",
+        ),
+        (
+            vec![
+                "run",
+                "--store-root",
+                &store,
+                "--capsule",
+                "c",
+                "--capsule-version",
+                "1",
+            ],
+            "the following required arguments were not provided",
+        ),
+        // Every argument `--store-root` requires is given, so only the conflict can refuse it.
+        (
+            vec![
+                "run",
+                "--roster",
+                &store,
+                "--store-root",
+                &store,
+                "--capsule",
+                "c",
+                "--workdir",
+                &store,
+            ],
+            "'--roster [<PATH>]' cannot be used with",
+        ),
+    ] {
+        let refused = mur(&args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(refusal),
+            "{args:?}: {refused:?}"
+        );
+    }
 }

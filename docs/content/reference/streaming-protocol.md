@@ -275,7 +275,7 @@ resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 
 | `status.state` | `final` | `status.message` |
 |---|---|---|
-| `working` | `false` | `inference turn <n>`, counted from 1, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task |
+| `working` | `false` | `inference turn <n>`, counted from 1, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task. `waiting on call-member: <n> call(s) outstanding` when the model ends a turn, with a turn left, while [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered and none has answered yet. `continuing with <n> member answer(s)` when the task continues with the answers that arrived |
 | `input-required` | `false` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
 | `completed` | `true` | `session ended` |
 | `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
@@ -286,7 +286,7 @@ resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 
 Every task the capsule accepts ends in exactly one `status` frame with `"final":true`, whether it
 ran or not. It is the task's last frame, and it is written after
-[`tasks/get`](agent-card.md#murmur-door-v1) answers the same state. For a task that ran, it is
+[`tasks/get`](agent-card.md#tasks-get) answers the same state. For a task that ran, it is
 also written after every `on-task-end` hook has run and after `task_end` is in the trace. For a
 task the session refused, it follows the task's
 [`task_rejected`](observability-schemas.md#task-rejected) trace line.

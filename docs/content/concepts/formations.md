@@ -1,10 +1,5 @@
 # Formations
 
-!!! note "Partially implemented"
-
-    Formations are an area of Murmur that is only partly built out. Agent Card discovery and
-    A2A messaging between capsules, described below, are implemented.
-
 ## Agent Card & A2A messaging
 
 While an agent session is active, the runtime serves a small HTTP endpoint exposing an A2A v1.0
@@ -34,6 +29,15 @@ name; the runtime attaches the token, so no model ever sees it. Every member's d
 token issued for that door, answers any other caller `401` or `403`, and the whole set of
 credentials ends with the formation. See
 [How reachability is enforced](../reference/roster.md#enforcement).
+
+A member gives another member work with the runtime-provided
+[`call-member`](../reference/runtime-provided-tools.md#call-member) tool, which a member has only
+when the roster lets it call another. The call returns as soon as the other member holds the task.
+The other member runs the task in its own directory, and its answer comes back into the caller's
+same task, marked as coming from that member. Members share no files, so whatever the other member
+needs goes in the task text. The roster grants the name and the credential, not the network: the
+caller's own `capabilities.network.allow` must list `localhost`. See
+[Giving a member work](../reference/roster.md#member-calls).
 
 A formation's members end with it, however it ends. Each member holds one end of a lifeline whose
 other end only the launcher holds; when the launcher ends the formation, or dies — even by

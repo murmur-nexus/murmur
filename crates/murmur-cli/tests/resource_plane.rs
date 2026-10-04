@@ -314,7 +314,6 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .expect("staging should succeed");

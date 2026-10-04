@@ -1418,7 +1418,13 @@ fn env_requirements_output_never_says_formation() {
 
     for output in [&unset, &refused] {
         for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
-            let text = String::from_utf8_lossy(bytes);
+            // The Murmur home block's `formations` row names the directory formation members run
+            // in, which is what the word means there.
+            let text: String = String::from_utf8_lossy(bytes)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("formations: "))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
                 !says_formation(&text),
                 "{stream} says {FORMATION_WORD}:\n{text}"
@@ -2201,4 +2207,49 @@ fn door_posture_names_every_credential() {
         "{doctor}"
     );
     assert!(w_sec_032_lines(&doctor).is_empty(), "{doctor}");
+}
+
+/// `mur doctor` lists `~/.murmur/formations`, where formation peers run, as an owner-only entry
+/// of its own that is not safe to delete, and flags a member directory wider than owner-only.
+#[test]
+fn doctor_reports_the_formations_directory_as_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path(), "  []\n");
+    let murmur = home.path().join(".murmur");
+    for (dir, mode) in [
+        (murmur.clone(), 0o700),
+        (murmur.join("formations"), 0o700),
+        (murmur.join("formations/frm_x"), 0o700),
+        (murmur.join("formations/frm_x/worker"), 0o755),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    let output = mur_doctor(&home, project.path())
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stdout.contains(
+            "  formations: 0700  formation members' working directories, expected owner-only\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("    wider than 0700: formations/frm_x/worker is 0755"),
+        "{stdout}"
+    );
+    let worker = murmur.join("formations/frm_x/worker").display().to_string();
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("warning[W-SEC-028]") && line.contains(&worker)),
+        "{stderr}"
+    );
 }

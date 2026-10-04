@@ -43,6 +43,9 @@ pub(crate) const PHASE_INFERENCE: &str = "inference";
 pub(crate) const PHASE_INPUT: &str = "input";
 /// Cancelled while a `delegate-task` call was waiting for its child to be up.
 pub(crate) const PHASE_DELEGATION: &str = "delegation";
+/// Cancelled while a `call-member` call was reaching the callee's door, or while a finished
+/// attempt was waiting for a callee's answer.
+pub(crate) const PHASE_MEMBER_CALL: &str = "member_call";
 /// Cancelled while a `transport: process` harness was running the turn. The runtime interrupts
 /// the harness it spawned, and kills it when the interrupt is refused or unavailable.
 pub(crate) const PHASE_HARNESS: &str = "harness";

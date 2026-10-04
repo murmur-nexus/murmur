@@ -13,14 +13,14 @@ use std::{
 use murmur_artifact::{
     current_platform, is_credential_shaped_env_name, native_binary_verdict,
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
-    security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask, ApiKeyReference,
-    ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
-    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockOrigin, LockedSha256,
-    LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeArtifact,
-    RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_RUN_003,
-    W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
-    W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024,
-    W_SEC_025, W_SEC_027, W_SEC_030,
+    runtime_warning_link, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
+    ApiKeyReference, ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode,
+    HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockOrigin,
+    LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
+    RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
+    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
+    W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -121,6 +121,11 @@ pub(crate) const WIT_TOOL_IFACE_VERSIONED: &str = "murmur:tool/run@0.1.0";
 pub(crate) const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.1.0";
 pub(crate) const WIT_STREAM_EVENTS_IFACE: &str = "murmur:stream/events@0.1.0";
 pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
+
+/// The host every door's URL names, whatever address it is bound on: the readiness line's `url`,
+/// and so every formation callee's real door. `call-member` reaches a callee only through a
+/// `capabilities.network.allow` rule matching this host.
+pub(crate) const DOOR_HOST: &str = "localhost";
 
 /// How long an agent session's teardown may run after its termination begins — the first
 /// `SIGTERM`, EOF on a formation member's lifeline, or EOF on a delegated child's spawner lifeline
@@ -242,10 +247,20 @@ async fn run_task_with_reopens(
     // re-read of a file whose path is a convention. A continued attempt received the same content
     // as the original task message followed by one feedback message per reopen.
     let mut as_given = original_task.clone();
+    // Every delivered batch of `call-member` answers so far, in delivery order — re-injected into
+    // a rewritten `task.md` alongside the reopen feedback.
+    let mut member_answers: Vec<String> = Vec::new();
     // The conversation this task has built, handed from each attempt to the next.
     let mut thread = agent::TaskThread::default();
-    // This reopen's feedback text, `None` until a hook reopens the task.
-    let mut reopen_feedback: Option<String> = None;
+    // What the next attempt continues with: `None` until a hook reopens the task or member
+    // answers arrive.
+    let mut continuation: Option<agent::Continuation> = None;
+    // The calls this task makes are this task's: put it in scope, with the flag that cancels it,
+    // until this function returns.
+    let _calls_scope = state
+        .member_calls
+        .clone()
+        .map(|calls| calls.scope_task(trace_task_id, cancel.clone()));
 
     loop {
         // This function owns the task's scope: nothing else puts a task in scope, which is why
@@ -284,7 +299,7 @@ async fn run_task_with_reopens(
             seed.clone(),
             cancel.clone(),
             &mut thread,
-            reopen_feedback.take(),
+            continuation.take(),
         )
         .await;
 
@@ -311,6 +326,88 @@ async fn run_task_with_reopens(
                         &error.to_string(),
                     )
                     .await;
+            }
+        }
+
+        // Every `call-member` call this task made is accounted for before its `on-task-end`: a
+        // finished attempt with a turn left waits for an answer and continues with it, and any
+        // other ending leaves its calls behind. With no turn left nothing could read an answer, so
+        // the attempt does not wait for one.
+        let mut result = result;
+        if let Some(calls) = state.member_calls.clone() {
+            let (outstanding, arrived) = calls.counts();
+            if outstanding + arrived > 0 {
+                if matches!(result, Ok(AgentLoopExit::Ok))
+                    && trace.task_turns() < inference.max_turns
+                {
+                    match wait_for_member_answers(
+                        &calls,
+                        cancel.as_ref(),
+                        &sse,
+                        agent_task_id.as_deref(),
+                        context_id.as_ref(),
+                    )
+                    .await
+                    {
+                        Some(outcomes) => {
+                            record_member_calls(state, trace_task_id, &outcomes, true).await;
+                            let message = crate::member_call::answers_message(&outcomes);
+                            member_answers.push(message.clone());
+                            emit_task_working(
+                                &sse,
+                                agent_task_id.as_deref(),
+                                context_id.as_ref(),
+                                format!("continuing with {} member answer(s)", outcomes.len()),
+                            )
+                            .await;
+                            // Original + reopen feedback + answers so far: what a restarted
+                            // attempt reads as its task, and what `as-given` reports.
+                            let rewritten =
+                                build_continued_task_md(&original_task, &feedback, &member_answers);
+                            if !thread.can_continue(&inference.transport) {
+                                if let Err(e) =
+                                    tokio::fs::write(&task_md_path, rewritten.as_bytes()).await
+                                {
+                                    crate::runtime_err!(
+                                        "[capsule-runtime] failed to inject member answers into \
+                                         task.md: {e}"
+                                    );
+                                }
+                            }
+                            as_given = rewritten;
+                            continuation = Some(agent::Continuation::MemberAnswers(message));
+                            continue;
+                        }
+                        // The task was cancelled while it waited.
+                        None => {
+                            if let Some(signal) = &cancel {
+                                signal.note_phase(crate::cancel::PHASE_MEMBER_CALL);
+                                let residue = crate::cancel::Residue::snapshot(
+                                    state.detached.as_ref(),
+                                    &state.live_delegations,
+                                );
+                                let _ = trace
+                                    .write_task_canceled(
+                                        trace_task_id,
+                                        None,
+                                        signal.phase(),
+                                        residue.detached_work_ids(),
+                                        residue.delegation_ids(),
+                                    )
+                                    .await;
+                            }
+                            result = Ok(AgentLoopExit::Canceled);
+                            thread.ending = Some(agent::AttemptEnding {
+                                state: TaskState::Canceled,
+                                message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
+                                response: None,
+                            });
+                        }
+                    }
+                }
+                let left = calls.account_for_all();
+                record_member_calls(state, trace_task_id, &left.abandoned, false).await;
+                record_member_calls(state, trace_task_id, &left.undelivered, false).await;
             }
         }
 
@@ -390,14 +487,13 @@ async fn run_task_with_reopens(
                         )
                         .await;
                     }
-                    reopen_feedback = Some(reopen_feedback_message(
-                        reopens_used as usize,
-                        &hook_name,
-                        &reason,
+                    continuation = Some(agent::Continuation::ReopenFeedback(
+                        reopen_feedback_message(reopens_used as usize, &hook_name, &reason),
                     ));
                     // Original + all feedback so far: what a restarted attempt reads as its task,
                     // and what `as-given` reports on either kind of attempt.
-                    let rewritten = build_reopen_task_md(&original_task, &feedback);
+                    let rewritten =
+                        build_continued_task_md(&original_task, &feedback, &member_answers);
                     if let Err(e) = tokio::fs::write(&task_md_path, rewritten.as_bytes()).await {
                         crate::runtime_err!(
                             "[capsule-runtime] failed to inject reopen feedback into task.md: {e}"
@@ -492,21 +588,31 @@ async fn end_task(
     let Some(task_id) = agent_task_id else {
         return;
     };
-    let recorded = state.a2a_task_registry.as_ref().and_then(|registry| {
-        let mut reg = registry.lock().unwrap();
-        let recorded = reg.finish_task(ending.state.clone());
-        // Immediately after the terminal state, so a resource-plane read that lands next
-        // reports the turn these bytes belong to.
-        reg.advance_resource_generation();
-        recorded
-    });
-    let ending = match recorded {
-        Some(TaskState::Canceled) if ending.state != TaskState::Canceled => agent::AttemptEnding {
-            state: TaskState::Canceled,
-            message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
-            response: None,
-        },
-        _ => ending,
+    // The ending `tasks/get` reports is recorded under the lock the terminal state is, after the
+    // cancel override, so it is the one the final frame below says.
+    let ending = match state.a2a_task_registry.as_ref() {
+        None => ending,
+        Some(registry) => {
+            let mut reg = registry.lock().unwrap();
+            let recorded = reg.finish_task(ending.state.clone());
+            // Immediately after the terminal state, so a resource-plane read that lands next
+            // reports the turn these bytes belong to.
+            reg.advance_resource_generation();
+            let ending = match recorded {
+                Some(TaskState::Canceled) if ending.state != TaskState::Canceled => {
+                    agent::AttemptEnding {
+                        state: TaskState::Canceled,
+                        message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
+                        response: None,
+                    }
+                }
+                _ => ending,
+            };
+            if recorded.is_some() {
+                reg.record_ending(task_id, &ending.message, ending.response.as_deref());
+            }
+            ending
+        }
     };
     emit_sse(
         sse,
@@ -589,6 +695,110 @@ fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String
         out.push('\n');
     }
     out
+}
+
+/// [`build_reopen_task_md`]'s `task.md`, followed by every batch of member answers delivered so
+/// far. With no answers it is exactly the reopened task; with no feedback it is the original task
+/// and the answers.
+fn build_continued_task_md(
+    original: &str,
+    feedback: &[(String, String)],
+    member_answers: &[String],
+) -> String {
+    let mut out = if feedback.is_empty() {
+        original.to_string()
+    } else {
+        build_reopen_task_md(original, feedback)
+    };
+    if member_answers.is_empty() {
+        return out;
+    }
+    out = out.trim_end().to_string();
+    out.push_str("\n\n---\n\n# Member answers\n");
+    for answers in member_answers {
+        out.push('\n');
+        out.push_str(answers);
+        out.push('\n');
+    }
+    out
+}
+
+/// A non-final `working` frame on an A2A task's stream saying `message`. Nothing for a task with
+/// no A2A id, whose stream no client watches.
+async fn emit_task_working(
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    agent_task_id: Option<&str>,
+    context_id: Option<&String>,
+    message: String,
+) {
+    let Some(task_id) = agent_task_id else {
+        return;
+    };
+    emit_sse(
+        sse,
+        StreamFrame::Status,
+        &TaskStatusUpdateEvent {
+            id: task_id.to_string(),
+            context_id: context_id.cloned(),
+            status: StreamStatus {
+                state: "working".into(),
+                message,
+                response: None,
+                reopen: None,
+            },
+            r#final: false,
+        },
+    )
+    .await;
+}
+
+/// Wait for at least one of the running task's `call-member` calls to end, and take every outcome
+/// that has. `None` when `cancel` fires first.
+///
+/// Says so on the task's stream when nothing has arrived yet, so a client does not read the quiet
+/// as the task's end.
+async fn wait_for_member_answers(
+    calls: &crate::member_call::MemberCalls,
+    cancel: Option<&crate::cancel::CancelSignal>,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    agent_task_id: Option<&str>,
+    context_id: Option<&String>,
+) -> Option<Vec<crate::member_call::MemberCallOutcome>> {
+    let (outstanding, arrived) = calls.counts();
+    if arrived == 0 {
+        emit_task_working(
+            sse,
+            agent_task_id,
+            context_id,
+            format!("waiting on call-member: {outstanding} call(s) outstanding"),
+        )
+        .await;
+    }
+    tokio::select! {
+        biased;
+        () = async {
+            match cancel {
+                Some(signal) => signal.canceled().await,
+                None => std::future::pending().await,
+            }
+        } => None,
+        () = calls.wait_for_outcome() => Some(calls.take_arrived()),
+    }
+}
+
+/// One `member_call` line per outcome, `delivered` as given.
+async fn record_member_calls(
+    state: &CapsuleStoreState,
+    task_id: &str,
+    outcomes: &[crate::member_call::MemberCallOutcome],
+    delivered: bool,
+) {
+    let Some(trace) = &state.peer_trace else {
+        return;
+    };
+    for outcome in outcomes {
+        trace.write_member_call(task_id, outcome, delivered).await;
+    }
 }
 
 /// The launch-outcome combine rule: a run that did not complete — anything but
@@ -1697,6 +1907,15 @@ pub fn stage_session(
     // model is offered the names the operator granted and cannot name anything else.
     write_delegate_task_tool_manifest(&workdir, &request.capability_policy.spawn_allow)?;
 
+    // And the member-call tool, whose grant is the roster: written only for a formation member
+    // the roster lets call another, its schema's `enum` the members it may call.
+    write_member_call_tool_manifest(&workdir, request.formation_member.as_deref())?;
+    warn_on_member_calls_without_egress(
+        &workdir,
+        request.formation_member.as_deref(),
+        &request.capability_policy.network_allow,
+    );
+
     // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
     // plan reaches this session's own tools, so there is no granted list to fold into it.
     write_submit_plan_tool_manifest(&workdir, request.capability_policy.plan_submit)?;
@@ -1846,7 +2065,6 @@ pub fn stage_session(
         spawner: SpawnerHandle::from_env()?,
         formation_id: request.formation_id,
         formation_member: request.formation_member,
-        ignore_task_file: request.ignore_task_file,
         #[cfg(unix)]
         formation_lifeline: None,
         #[cfg(unix)]
@@ -2105,7 +2323,7 @@ fn launch(
             staged.internal_port,
         ))?;
 
-        let capsule_url = format!("localhost:{external_port}");
+        let capsule_url = format!("{DOOR_HOST}:{external_port}");
         staged.capsule_url = capsule_url.clone();
 
         // Built while `staged` is still whole. It is written, and the URL announced, inside the
@@ -2449,10 +2667,6 @@ fn launch(
         // pre-seed check misses a `--task`-written file and the agent's own read of task.md
         // 404s even after a task was delivered.
         let workdir_task_md = accessible_workdir.join("task.md");
-        // Whether a `task.md` in the accessible workdir is this launch's task. A session told to
-        // ignore it — a formation peer, which shares that directory with the entry member — never
-        // runs one, and waits for work at its door.
-        let adopts_task_file = !staged.ignore_task_file;
 
         // Extra copies retained for the LaunchResult returned after block_on consumes the others.
         let session_id_ret = session_id.clone();
@@ -2738,6 +2952,18 @@ fn launch(
                         driver_continuation_acked_len: 0,
                         driver_continuation_choice: None,
                         control: control_for_state.clone(),
+                        member_calls: formation_member
+                            .as_ref()
+                            .filter(|formation| formation.callees().next().is_some())
+                            .map(|_| {
+                                Arc::new(crate::member_call::MemberCalls::new(
+                                    crate::delegation_plane::handed_off_work_deadline(
+                                        std::time::Duration::from_secs(
+                                            effective_lifecycle.delegation_deadline_secs,
+                                        ),
+                                    ),
+                                ))
+                            }),
                     };
 
                     // Backing for the hooks' `murmur:runtime/inference` import, or why a
@@ -2938,7 +3164,7 @@ fn launch(
                             match effective_lifecycle.task_acceptance {
                                 TaskAcceptance::None => {
                                     // Does not accept incoming tasks; run from task.md if present
-                                    if adopts_task_file && workdir_task_md.exists() {
+                                    if workdir_task_md.exists() {
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
                                         let bytes = tokio::fs::metadata(&workdir_task_md)
@@ -3023,7 +3249,7 @@ fn launch(
                                     }
                                 }
                                 TaskAcceptance::Single | TaskAcceptance::Queue => {
-                                    if adopts_task_file && workdir_task_md.exists() {
+                                    if workdir_task_md.exists() {
                                         // A `task.md` runs before any A2A message is waited for.
                                         let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
                                         let context_id = task_context_id(supplied_context_id.as_deref());
@@ -3761,6 +3987,8 @@ fn launch(
         driver_continuation_acked_len: 0,
         driver_continuation_choice: None,
         control: None,
+        // A script capsule has no agent loop to offer the tool to.
+        member_calls: None,
         limits: capsule_limits.limiter(),
     };
 
@@ -4257,6 +4485,68 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
             &format!(
                 "[capability-policy] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"
             ),
+        );
+    }
+}
+
+/// `W-RUN-008`'s text for `member`, which may call `callees` and whose `network_allow` reaches no
+/// loopback `http` door at an unpinned port; `None` when it may call nobody or its grant does.
+///
+/// A grant reaches the doors when one rule matches the door host over `http` at every port: a
+/// callee's port is chosen at launch, so a rule pinning one reaches nothing reliably.
+pub(crate) fn member_calls_without_egress_warning(
+    member: &str,
+    callees: &[&str],
+    network_allow: &[String],
+) -> Option<String> {
+    if callees.is_empty() {
+        return None;
+    }
+    let reaches_every_port = network_allow
+        .iter()
+        .filter_map(|entry| NetworkAllowRule::parse(entry).ok())
+        .any(|rule| {
+            rule.port.is_none()
+                && rule.matches(&RequestTarget {
+                    scheme: "http".to_string(),
+                    host: DOOR_HOST.to_string(),
+                    port: Some(1),
+                })
+        });
+    if reaches_every_port {
+        return None;
+    }
+    let callees = callees
+        .iter()
+        .map(|callee| format!("'{callee}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "roster.yaml lets '{member}' call {callees}, but its capabilities.network.allow reaches \
+         no loopback http door at an unpinned port, so every call-member call will be refused; \
+         declare \"{DOOR_HOST}\""
+    ))
+}
+
+/// `W-RUN-008` once at staging, to stderr and `logs/bootstrap.log`, for a member whose calls its
+/// own egress grant would refuse. The launch goes ahead: the member may still be called.
+fn warn_on_member_calls_without_egress(
+    workdir: &Path,
+    formation: Option<&FormationMember>,
+    network_allow: &[String],
+) {
+    let Some(formation) = formation else {
+        return;
+    };
+    let callees: Vec<&str> = formation.callees().collect();
+    if let Some(message) =
+        member_calls_without_egress_warning(formation.name(), &callees, network_allow)
+    {
+        let link = runtime_warning_link(W_RUN_008);
+        crate::runtime_err!("[capsule-runtime] warning[{W_RUN_008}]: {message} ({link})");
+        agent::append_bootstrap_log(
+            workdir,
+            &format!("[capability-policy] warning[{W_RUN_008}]: {message} ({link})"),
         );
     }
 }
@@ -5475,29 +5765,25 @@ impl NetworkPolicyHooks {
 /// call, whether or not such a member exists; a callee whose address does not arrive within the
 /// member's address wait; and a real door URL that `network_allow_rules` do not reach. The roster
 /// grants a credential and a name, never egress.
+///
+/// The routing rule is [`crate::member_call::resolve_member_call`]'s, the one `call-member` is
+/// routed by; this reads the member's name off the virtual address and renders every refusal as
+/// the one denial a guest is shown.
 pub(crate) fn resolve_formation_call(
     formation: Option<&FormationMember>,
     network_allow_rules: &[NetworkAllowRule],
     uri: &http::Uri,
 ) -> Result<(http::Uri, FormationToken), WasiHttpError> {
     let denied = || WasiHttpError::HttpRequestDenied;
-    let member = formation.ok_or_else(denied)?;
-    if uri.scheme_str() != Some("http") {
+    if formation.is_none() || uri.scheme_str() != Some("http") {
         return Err(denied());
     }
     let name = uri
         .authority()
         .and_then(|authority| virtual_member(authority.as_str()))
         .ok_or_else(denied)?;
-    let (url, token) = member
-        .resolve(name, member.address_wait())
-        .ok_or_else(denied)?;
-    let url: http::Uri = url.parse().map_err(|_| denied())?;
-    let target = RequestTarget::from_request(&url, false).ok_or_else(denied)?;
-    if !network_allow_rules.iter().any(|rule| rule.matches(&target)) {
-        return Err(denied());
-    }
-    Ok((url, token))
+    crate::member_call::resolve_member_call(formation, network_allow_rules, name)
+        .map_err(|_| denied())
 }
 
 /// `request`, readdressed at the callee's real door `url` and presenting `token`.
@@ -5787,6 +6073,10 @@ pub(crate) struct CapsuleStoreState {
     /// [`StagedSession::control`]. Read by the runtime-provided `switch-driver` tool; `None` for a
     /// capsule with no `control:` block, and on the script-capsule path.
     pub(crate) control: Option<Arc<crate::control_plane::ControlState>>,
+    /// The `call-member` calls the running task has made and not yet accounted for. `Some` only
+    /// for a formation member the roster lets call another, which is exactly the session that has
+    /// the tool.
+    pub(crate) member_calls: Option<Arc<crate::member_call::MemberCalls>>,
 }
 
 impl CapsuleStoreState {
@@ -5921,7 +6211,7 @@ impl send::Host for CapsuleStoreState {
         // hook does it: the real door must be reachable under `capabilities.network.allow`, and
         // the runtime presents the callee's token. The guest learns neither the door nor the
         // token, and the trace records the address the guest named.
-        let (connect_url, authorization) = match formation_send_target(&peer_url) {
+        let (connect_url, authorization, door) = match formation_send_target(&peer_url) {
             Some(uri) => {
                 // The callee's address may still be on its way; wait for it without holding up
                 // the runtime worker this host call runs on.
@@ -5936,7 +6226,15 @@ impl send::Host for CapsuleStoreState {
                     format!("network policy: '{peer_url}' not in capabilities.network.allow")
                 })?;
                 let authority = url.authority().map(|a| a.to_string()).unwrap_or_default();
-                (format!("http://{authority}"), Some(token))
+                let member = uri
+                    .authority()
+                    .and_then(|authority| virtual_member(authority.as_str()))
+                    .map(str::to_string);
+                (
+                    format!("http://{authority}"),
+                    Some(token),
+                    member.map(|member| (url, member)),
+                )
             }
             None => {
                 check_destination_allowed(
@@ -5944,7 +6242,7 @@ impl send::Host for CapsuleStoreState {
                     &peer_url,
                     "capabilities.network.allow",
                 )?;
-                (peer_url.clone(), None)
+                (peer_url.clone(), None, None)
             }
         };
 
@@ -5971,7 +6269,10 @@ impl send::Host for CapsuleStoreState {
                 authorization.as_ref(),
             ))
         })
-        .map_err(|error| error.replace(&connect_url, &peer_url))?;
+        .map_err(|error| match &door {
+            Some((door, member)) => crate::member_call::redact_door(&error, door, member),
+            None => error.replace(&connect_url, &peer_url),
+        })?;
 
         self.pending_a2a_events.push((
             peer_url.clone(),
@@ -7049,6 +7350,7 @@ impl CapsuleStoreState {
         if name == SHARE_FILE_TOOL
             || name == FETCH_PEER_FILE_TOOL
             || name == DELEGATE_TASK_TOOL
+            || name == MEMBER_CALL_TOOL
             || name == SUBMIT_PLAN_TOOL
             || name == SWITCH_DRIVER_TOOL
         {
@@ -7229,6 +7531,12 @@ impl CapsuleStoreState {
         if name == DELEGATE_TASK_TOOL {
             return self
                 .dispatch_delegate_task(input)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+        if name == MEMBER_CALL_TOOL {
+            return self
+                .dispatch_call_member(input)
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -7703,6 +8011,158 @@ impl CapsuleStoreState {
             truncated: result.truncated,
             metadata: Vec::new(),
         })
+    }
+
+    /// `call-member`: hand one task to one formation member and return as soon as its door holds
+    /// it.
+    ///
+    /// The agent names a member and a task. The member's door, the token and the egress check are
+    /// the runtime's, through [`crate::member_call::resolve_member_call`] under this capsule's own
+    /// `capabilities.network.allow`, and never enter the model's context: every text this returns
+    /// names the member by its roster name.
+    ///
+    /// **The call returns when the member holds the task, not when it answers.** A started call is
+    /// registered in the session's [`crate::member_call::MemberCalls`] and watched on a thread of
+    /// its own; its answer is delivered into this same task once the model ends its turn, by
+    /// [`run_task_with_reopens`]. A call that did not start fails in this turn: the result is its
+    /// delivery, so its `member_call` line is written here.
+    async fn dispatch_call_member(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        use crate::delegation_plane::bounded;
+        use crate::member_call::{
+            elapsed_ms, mint_call_id, send_task, CallHeaders, CallRoute, MemberCallOutcome,
+            MemberCallRefusal, MemberCallStatus,
+        };
+
+        let args = parse_tool_json_input(MEMBER_CALL_TOOL, &input)?;
+        let member = required_string_arg(MEMBER_CALL_TOOL, &args, "member")?;
+        let task = required_string_arg(MEMBER_CALL_TOOL, &args, "task")?;
+        let (Some(formation), Some(calls)) =
+            (self.http_hooks.formation.clone(), self.member_calls.clone())
+        else {
+            return Err(format!(
+                "'{MEMBER_CALL_TOOL}' is answered only for a formation member that roster.yaml \
+                 lets call another; this session is not one"
+            ));
+        };
+        let callees: Vec<String> = formation.callees().map(str::to_string).collect();
+        if !callees.contains(&member) {
+            return Err(MemberCallRefusal::NotACallee.describe(&member, &callees));
+        }
+        // A call is accounted for by the task that made it; outside every task nothing would
+        // deliver its answer or record how it ended.
+        let Some(task_id) = calls.task_id() else {
+            return Err(format!(
+                "'{MEMBER_CALL_TOOL}' is answered only while a task runs; this session is running \
+                 none"
+            ));
+        };
+
+        let call_id = mint_call_id();
+        let route = CallRoute {
+            formation,
+            network_allow_rules: self.http_hooks.network_allow_rules.clone(),
+            member: member.clone(),
+            headers: CallHeaders::new(
+                self.current_task_provenance,
+                self.current_traceparent.clone(),
+            ),
+        };
+        let started = Instant::now();
+        // How a call the member never held ended, as its one `member_call` record carries it.
+        let unstarted =
+            |status: MemberCallStatus, output: String, truncated: bool| MemberCallOutcome {
+                call_id: call_id.clone(),
+                member: member.clone(),
+                member_task_id: None,
+                status,
+                output,
+                truncated,
+                duration_ms: elapsed_ms(started),
+            };
+        // The A2A task's own flag, or the flag the task loop put in scope for a task with no A2A
+        // id, which `SIGTERM` and a closed lifeline raise.
+        let cancel = self.task_cancel_signal().or_else(|| calls.task_cancel());
+        let sending = {
+            let (route, call_id) = (route.clone(), call_id.clone());
+            tokio::task::spawn_blocking(move || send_task(&route, &call_id, &task))
+        };
+        let joined = tokio::select! {
+            biased;
+            () = async {
+                match &cancel {
+                    Some(signal) => signal.canceled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(signal) = &cancel {
+                    signal.note_phase(crate::cancel::PHASE_MEMBER_CALL);
+                }
+                let output = format!(
+                    "the calling task was cancelled while {member}'s door was being reached; \
+                     {member} may hold the task"
+                );
+                if let Some(trace) = &self.peer_trace {
+                    let outcome = unstarted(MemberCallStatus::Abandoned, output.clone(), false);
+                    trace.write_member_call(&task_id, &outcome, false).await;
+                }
+                return Err(format!("'{MEMBER_CALL_TOOL}' was canceled: {output}"));
+            }
+            joined = sending => joined,
+        };
+        let sent = joined.map_err(|error| format!("'{MEMBER_CALL_TOOL}' panicked: {error}"))?;
+
+        match sent {
+            Ok(member_task_id) => {
+                if let Some(trace) = &self.peer_trace {
+                    trace
+                        .write_member_call_start(&task_id, &call_id, &member, &member_task_id)
+                        .await;
+                }
+                calls.watch(route, &call_id, &member_task_id, started);
+                Ok(murmur::tool::run::ToolResult {
+                    status: murmur::tool::run::Status::Passed,
+                    summary: Some(format!("Called {member}: started")),
+                    data: Some(
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "member": member,
+                            "status": "started",
+                            "task_id": member_task_id,
+                        })
+                        .to_string(),
+                    ),
+                    data_path: None,
+                    truncated: false,
+                    metadata: Vec::new(),
+                })
+            }
+            Err(reason) => {
+                let (output, truncated) = bounded(reason);
+                if let Some(trace) = &self.peer_trace {
+                    let outcome = unstarted(MemberCallStatus::Failed, output.clone(), truncated);
+                    trace.write_member_call(&task_id, &outcome, true).await;
+                }
+                Ok(murmur::tool::run::ToolResult {
+                    status: murmur::tool::run::Status::Failed,
+                    summary: Some(format!("Called {member}: failed")),
+                    data: Some(
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "member": member,
+                            "status": "failed",
+                            "output": output,
+                        })
+                        .to_string(),
+                    ),
+                    data_path: None,
+                    truncated,
+                    metadata: Vec::new(),
+                })
+            }
+        }
     }
 
     /// `switch-driver`: the agent selects the driver choice its next inference call is served by.
@@ -8440,12 +8900,13 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 5] = [
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 6] = [
     SHARE_FILE_TOOL,
     FETCH_PEER_FILE_TOOL,
     DELEGATE_TASK_TOOL,
     SUBMIT_PLAN_TOOL,
     SWITCH_DRIVER_TOOL,
+    MEMBER_CALL_TOOL,
 ];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
@@ -8872,6 +9333,58 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          the sub-capsule is told, so state the objective in full. The sub-capsule runs as its own \
          process with its own workdir and this call does not return until it has finished. \
          Returns its answer text.\"\n\
+         input_schema: '{schema}'\n",
+    )
+}
+
+/// Writes the member-call tool's synthetic manifest, only for a formation member with at least one
+/// callee.
+///
+/// The roster edge is the grant: a member with no callee, and a session in no formation, get no
+/// file, so `call-member` is absent from their tool inventory and from `session_start`'s
+/// `tools_declared`.
+fn write_member_call_tool_manifest(
+    workdir: &Path,
+    formation: Option<&FormationMember>,
+) -> Result<(), RuntimeError> {
+    let callees: Vec<&str> = formation
+        .map(|formation| formation.callees().collect())
+        .unwrap_or_default();
+    if callees.is_empty() {
+        return Ok(());
+    }
+    write_runtime_provided_tool_manifest(
+        workdir,
+        MEMBER_CALL_TOOL,
+        &member_call_tool_manifest(&callees),
+    )
+}
+
+/// Tool a formation member gains from a roster edge out of it.
+pub(crate) const MEMBER_CALL_TOOL: &str = "call-member";
+
+/// `call-member`'s manifest, with the member's callees, in roster order, built into its schema.
+///
+/// The description tells the model what the schema cannot: that the task text is all the callee
+/// is told, because members share no files; that the call returns once the callee holds the task;
+/// and that the answer arrives in this conversation later, so the turn should end rather than
+/// wait.
+fn member_call_tool_manifest(callees: &[&str]) -> String {
+    let allowed = serde_json::to_string(callees).unwrap_or_else(|_| "[]".to_string());
+    let schema = format!(
+        r#"{{"type":"object","properties":{{"member":{{"type":"string","enum":{allowed}}},"task":{{"type":"string"}}}},"required":["member","task"]}}"#
+    );
+    format!(
+        "name: {MEMBER_CALL_TOOL}\n\
+         version: 0.0.0\n\
+         runtime: tool\n\
+         implementation: native\n\
+         description: \"Hand one task to another member of this formation. `member` must be one \
+         of the members this capsule may call. `task` is the whole of what that member is told, \
+         so state it in full and include the content of any file the member needs: members do \
+         not share files. The call returns as soon as the member holds the task, with a call id. \
+         The member's answer arrives in this conversation, naming that call id, after you end \
+         your turn, so do not wait or poll for it.\"\n\
          input_schema: '{schema}'\n",
     )
 }
@@ -9992,6 +10505,10 @@ async fn refuse_undelivered_tasks(
         crate::a2a::REJECTED_SESSION_ENDED_MESSAGE
     };
     for (task_id, context_id) in refused {
+        task_registry
+            .lock()
+            .unwrap()
+            .record_ending(&task_id, reason, None);
         let source = sources
             .get(&task_id)
             .copied()
@@ -10424,7 +10941,7 @@ mod tests {
     fn the_reserved_set_covers_every_runtime_provided_tool() {
         assert_eq!(
             super::RESERVED_TOOL_NAMES.len(),
-            5,
+            6,
             "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
              raised, before its writer can succeed"
         );
@@ -10434,6 +10951,7 @@ mod tests {
             super::DELEGATE_TASK_TOOL,
             super::SUBMIT_PLAN_TOOL,
             super::SWITCH_DRIVER_TOOL,
+            super::MEMBER_CALL_TOOL,
         ] {
             assert!(
                 super::is_reserved_tool_name(name),
@@ -11476,7 +11994,6 @@ inference:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11579,7 +12096,6 @@ inference:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11668,7 +12184,6 @@ inference:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11756,7 +12271,6 @@ inference:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -11896,7 +12410,6 @@ inference:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         };
 
         match stage_session(Arc::new(PanicRegistry), request) {
@@ -12002,7 +12515,6 @@ inference:
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         }
     }
 
@@ -12820,6 +13332,7 @@ inference:
             driver_continuation_acked_len: 0,
             driver_continuation_choice: None,
             control: None,
+            member_calls: None,
         }
     }
 
@@ -12920,14 +13433,14 @@ inference:
     /// An in-test registry serving `bytes` for every name and version: a skill, or a WASM tool
     /// when built with [`Self::wasm_tool`]. `sha256` is what the registry reports, which need not
     /// be the hash of `bytes`.
-    struct FakeSkillRegistry {
+    pub(crate) struct FakeSkillRegistry {
         bytes: Vec<u8>,
         sha256: String,
         runtime: RuntimeType,
     }
 
     impl FakeSkillRegistry {
-        fn new(bytes: Vec<u8>) -> Self {
+        pub(crate) fn new(bytes: Vec<u8>) -> Self {
             let sha256 = murmur_artifact::sha256_hex(&bytes);
             Self {
                 bytes,
@@ -18464,5 +18977,477 @@ inference:
         );
         assert!(!refused_planner.contains("127.0.0.1"), "{refused_planner}");
         assert_eq!(door.requests().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod member_call_tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    use super::tests::build_test_state;
+    use super::*;
+    use crate::formation_credentials::FormationAuthority;
+
+    /// A formation member named `caller` who may call `callees`, every callee's door at `url`.
+    fn member(callees: &[&str], url: &str) -> Arc<FormationMember> {
+        crate::member_call::tests::member_calling(callees, url)
+    }
+
+    fn tools_declared(workdir: &Path) -> Vec<String> {
+        agent::inventory::tool_names(&agent::inventory::build_tool_inventory(workdir, None, &[]))
+    }
+
+    /// One request as a stand-in door received it.
+    #[derive(Debug, Clone, Default)]
+    struct Seen {
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    /// A stand-in door on loopback answering each connection with the next of `answers` — a
+    /// status line and a JSON body — and recording what it was sent.
+    fn stand_in_door(answers: Vec<(&'static str, String)>) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for (status, body) in answers {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = Seen::default();
+                let mut length = 0usize;
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    let (name, value) = trimmed.split_once(':').unwrap();
+                    let (name, value) = (name.to_ascii_lowercase(), value.trim().to_string());
+                    if name == "content-length" {
+                        length = value.parse().unwrap();
+                    }
+                    request.headers.push((name, value));
+                }
+                let mut buf = vec![0u8; length];
+                reader.read_exact(&mut buf).unwrap();
+                request.body = String::from_utf8(buf).unwrap();
+                recorded.lock().unwrap().push(request);
+                let mut stream = stream;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: \
+                         {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (port, seen)
+    }
+
+    /// A session of `formation` with `call-member`, its egress `network_allow`, and a trace.
+    async fn calling_state(
+        workdir: &Path,
+        formation: Arc<FormationMember>,
+        network_allow: &[&str],
+    ) -> CapsuleStoreState {
+        let mut state = build_test_state(
+            Arc::new(super::tests::FakeSkillRegistry::new(Vec::new())),
+            workdir.to_path_buf(),
+            workdir.join("murmur.lock"),
+        );
+        state.http_hooks.network_allow_rules = network_allow
+            .iter()
+            .map(|entry| NetworkAllowRule::parse(entry).unwrap())
+            .collect();
+        state.http_hooks.formation = Some(formation);
+        state.current_task_provenance = Some(TaskProvenance::derive(TaskOrigin::User, None));
+        let calls = Arc::new(crate::member_call::MemberCalls::new(
+            std::time::Duration::from_secs(60),
+        ));
+        calls.begin_task("tsk_caller", None);
+        state.member_calls = Some(calls);
+        state.peer_trace = Some(Arc::new(
+            crate::trace::ResourceTraceAppender::open(
+                workdir,
+                "ses_test".to_string(),
+                "evt_session".to_string(),
+            )
+            .await
+            .unwrap(),
+        ));
+        state
+    }
+
+    fn call(member: &str, task: &str) -> murmur::tool::run::ToolInput {
+        murmur::tool::run::ToolInput {
+            data: Some(serde_json::json!({"member": member, "task": task}).to_string()),
+            log_path: None,
+        }
+    }
+
+    fn trace_lines(workdir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(workdir.join("trace.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The roster edge is the grant: the tool exists, with the callees in roster order as its
+    /// schema's `enum`, for a member that may call another — and for nobody else.
+    #[test]
+    fn call_member_exists_only_for_a_member_with_callees() {
+        let with = tempfile::tempdir().unwrap();
+        write_member_call_tool_manifest(
+            with.path(),
+            Some(&member(&["worker", "reviewer"], "http://localhost:1")),
+        )
+        .unwrap();
+        let manifest: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(
+                with.path()
+                    .join("tools")
+                    .join(MEMBER_CALL_TOOL)
+                    .join(PACKED_MANIFEST_ENTRY),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["name"], "call-member");
+        assert_eq!(manifest["version"], "0.0.0");
+        assert_eq!(manifest["runtime"], "tool");
+        assert_eq!(manifest["implementation"], "native");
+        let schema: serde_json::Value =
+            serde_json::from_str(manifest["input_schema"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "member": {"type": "string", "enum": ["worker", "reviewer"]},
+                    "task": {"type": "string"},
+                },
+                "required": ["member", "task"],
+            })
+        );
+        let description = manifest["description"].as_str().unwrap();
+        for said in [
+            "members this capsule may call",
+            "include the content of any file",
+            "do not share files",
+            "returns as soon as the member holds the task",
+            "call id",
+            "after you end your turn",
+            "do not wait or poll",
+        ] {
+            assert!(description.contains(said), "{said}: {description}");
+        }
+        assert!(tools_declared(with.path()).contains(&MEMBER_CALL_TOOL.to_string()));
+
+        let authority = FormationAuthority::generate(&FormationId::mint()).unwrap();
+        let callee = FormationMember::from_bundle(authority.member_bundle("worker", &[]));
+        for formation in [Some(&callee), None] {
+            let without = tempfile::tempdir().unwrap();
+            write_member_call_tool_manifest(without.path(), formation).unwrap();
+            assert!(!without.path().join("tools").join(MEMBER_CALL_TOOL).exists());
+            assert!(!tools_declared(without.path()).contains(&MEMBER_CALL_TOOL.to_string()));
+        }
+    }
+
+    /// A call naming a member outside the roster's edges is refused in the same turn, naming the
+    /// members it may call, and nothing is sent anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_refuses_a_non_callee_and_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker", "reviewer"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let Err(refused) = state
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("critic", "review"), None)
+            .await
+        else {
+            panic!("a call to a non-callee was dispatched");
+        };
+        assert!(
+            refused.contains("'critic'") && refused.contains("worker, reviewer"),
+            "{refused}"
+        );
+        assert!(listener.accept().is_err(), "a refused call reached a door");
+        assert!(trace_lines(dir.path()).is_empty());
+        assert_eq!(state.member_calls.as_ref().unwrap().counts(), (0, 0));
+    }
+
+    /// A call made while no task is in scope — after the task that held the scope has returned —
+    /// is refused before anything is sent: nothing would deliver its answer or record its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_outside_every_task_is_refused_and_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let calls = Arc::clone(state.member_calls.as_ref().unwrap());
+        drop(calls.scope_task("tsk_done", None));
+        assert_eq!(calls.task_id(), None);
+        let Err(refused) = state
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "work"), None)
+            .await
+        else {
+            panic!("a call with no task in scope was dispatched");
+        };
+        assert!(refused.contains("only while a task runs"), "{refused}");
+        assert!(listener.accept().is_err(), "a refused call reached a door");
+        assert!(trace_lines(dir.path()).is_empty());
+        assert_eq!(calls.counts(), (0, 0));
+    }
+
+    /// A call the callee's door does not take fails in the same turn: the door's status and
+    /// message come back as a failed tool result, no watcher starts, and the one trace line is a
+    /// failed `member_call`. The door saw one bearer token and the stamped provenance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_refusals_fail_in_the_same_turn() {
+        let answers: Vec<(&'static str, String, &'static str)> = vec![
+            (
+                "403 Forbidden",
+                r#"{"error":"not_permitted","message":"this token is for another door"}"#
+                    .to_string(),
+                "403 not_permitted: this token is for another door",
+            ),
+            (
+                "200 OK",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "id": "tsk_busy", "contextId": "ctx", "status": {"state": "rejected",
+                    "message": {"messageId": "m", "role": "agent",
+                                "parts": [{"text": "task rejected: capsule is busy"}]}}}})
+                .to_string(),
+                "rejected: task rejected: capsule is busy",
+            ),
+            (
+                "200 OK",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params"}}"#
+                    .to_string(),
+                "JSON-RPC error -32602: Invalid params",
+            ),
+            (
+                "200 OK",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "id": "tsk_r", "contextId": "ctx", "status": {"state": "rejected"}}})
+                .to_string(),
+                "answered the task rejected",
+            ),
+        ];
+        for (status, body, expected) in answers {
+            let (port, seen) = stand_in_door(vec![(status, body)]);
+            let dir = tempfile::tempdir().unwrap();
+            let state = calling_state(
+                dir.path(),
+                member(&["worker"], &format!("http://localhost:{port}")),
+                &["localhost"],
+            )
+            .await;
+            let outcome = state
+                .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None)
+                .await
+                .unwrap();
+            let result = &outcome.result;
+            assert_eq!(result.status, murmur::tool::run::Status::Failed);
+            let data = result.data.as_deref().unwrap();
+            assert!(data.contains(expected), "{expected}: {data}");
+            assert!(
+                data.starts_with("<untrusted-content source=tool:call-member>"),
+                "{data}"
+            );
+            assert!(!data.contains(&port.to_string()), "{data}");
+            assert!(!data.contains("mft1."), "{data}");
+            assert_eq!(state.member_calls.as_ref().unwrap().counts(), (0, 0));
+
+            let lines = trace_lines(dir.path());
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0]["event_type"], "member_call");
+            assert_eq!(lines[0]["status"], "failed");
+            assert_eq!(lines[0]["delivered"], true);
+            assert_eq!(lines[0]["member"], "worker");
+            assert_eq!(lines[0]["task_id"], "tsk_caller");
+            assert!(lines[0].get("member_task_id").is_none(), "{:?}", lines[0]);
+            assert!(lines[0]["call_id"].as_str().unwrap().starts_with("mcl_"));
+            let line = lines[0].to_string();
+            assert!(
+                !line.contains(&port.to_string()) && !line.contains("mft1."),
+                "{line}"
+            );
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let header = |name: &str| -> Vec<&str> {
+                seen[0]
+                    .headers
+                    .iter()
+                    .filter(|(header, _)| header == name)
+                    .map(|(_, value)| value.as_str())
+                    .collect()
+            };
+            let bearer = header("authorization");
+            assert_eq!(bearer.len(), 1);
+            assert!(bearer[0].starts_with("Bearer mft1."), "{bearer:?}");
+            assert_eq!(header("x-murmur-task-origin"), ["peer"]);
+            assert_eq!(header("x-murmur-task-trust"), ["trusted"]);
+            let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
+            assert_eq!(sent["method"], "message/send");
+            let message = &sent["params"]["message"];
+            assert_eq!(message["role"], "user");
+            assert_eq!(message["parts"][0]["text"], "add 2 and 2");
+            assert!(message.get("contextId").is_none());
+            assert_eq!(
+                message["messageId"],
+                format!("msg_{}", lines[0]["call_id"].as_str().unwrap())
+            );
+        }
+    }
+
+    /// A caller whose egress does not reach the callee's door is refused without a connection,
+    /// naming the grant and no door.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_without_egress_names_the_grant_and_no_door() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &[],
+        )
+        .await;
+        let outcome = state
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "x"), None)
+            .await
+            .unwrap();
+        let data = outcome.result.data.unwrap();
+        assert!(data.contains("capabilities.network.allow"), "{data}");
+        assert!(!data.contains(&port.to_string()), "{data}");
+        assert!(listener.accept().is_err());
+    }
+
+    /// A started call returns its call id and the callee's task id, writes `member_call_start`,
+    /// and is watched until its answer arrives in the set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_started_call_is_recorded_and_its_answer_arrives() {
+        let (port, _seen) = stand_in_door(vec![
+            (
+                "200 OK",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "id": "tsk_w", "contextId": "ctx", "status": {"state": "submitted"}}})
+                .to_string(),
+            ),
+            (
+                "200 OK",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "id": "tsk_w", "contextId": "ctx", "status": {"state": "completed"},
+                    "artifacts": [{"name": "response", "parts": [{"text": "four"}]}]}})
+                .to_string(),
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let result = state
+            .dispatch_call_member(call("worker", "add 2 and 2"))
+            .await
+            .unwrap();
+        assert_eq!(result.status, murmur::tool::run::Status::Passed);
+        assert_eq!(result.summary.as_deref(), Some("Called worker: started"));
+        let lines = trace_lines(dir.path());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event_type"], "member_call_start");
+        assert_eq!(lines[0]["member_task_id"], "tsk_w");
+        let call_id = lines[0]["call_id"].as_str().unwrap().to_string();
+        let data: serde_json::Value = serde_json::from_str(&result.data.unwrap()).unwrap();
+        assert_eq!(
+            data,
+            serde_json::json!({"call_id": call_id, "member": "worker", "status": "started",
+                               "task_id": "tsk_w"})
+        );
+
+        let calls = state.member_calls.clone().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), calls.wait_for_outcome())
+            .await
+            .unwrap();
+        let arrived = calls.take_arrived();
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(arrived[0].call_id, call_id);
+        assert_eq!(
+            arrived[0].status,
+            crate::member_call::MemberCallStatus::Completed
+        );
+        assert_eq!(arrived[0].output, "four");
+        assert_eq!(calls.counts(), (0, 0));
+    }
+
+    /// `W-RUN-008` names the member and its callees for a grant that reaches no loopback door at
+    /// every port, and is silent for one that does or for a member that calls nobody.
+    #[test]
+    fn a_caller_without_egress_is_warned_once_naming_the_member() {
+        let text = member_calls_without_egress_warning("lead", &["worker"], &[]).unwrap();
+        assert_eq!(
+            text,
+            "roster.yaml lets 'lead' call 'worker', but its capabilities.network.allow reaches no \
+             loopback http door at an unpinned port, so every call-member call will be refused; \
+             declare \"localhost\""
+        );
+        for pinned in [
+            vec!["http://localhost:8080".to_string()],
+            vec!["http://localhost".to_string()],
+            vec!["https://localhost".to_string()],
+            vec!["127.0.0.1".to_string()],
+        ] {
+            assert!(member_calls_without_egress_warning("lead", &["worker"], &pinned).is_some());
+        }
+        assert!(member_calls_without_egress_warning(
+            "lead",
+            &["worker"],
+            &["localhost".to_string()]
+        )
+        .is_none());
+        assert!(member_calls_without_egress_warning("worker", &[], &[]).is_none());
+    }
+
+    /// The continued task's `task.md` is the original, every reopen's feedback, then every batch
+    /// of member answers; with no answers it is exactly the reopened task.
+    #[test]
+    fn a_restarted_continuation_reads_the_task_feedback_and_answers() {
+        let feedback = vec![("check".to_string(), "be brief".to_string())];
+        assert_eq!(
+            build_continued_task_md("do it\n", &feedback, &[]),
+            build_reopen_task_md("do it\n", &feedback)
+        );
+        assert_eq!(build_continued_task_md("do it", &[], &[]), "do it");
+        let answered = build_continued_task_md("do it", &[], &["ANSWERS".to_string()]);
+        assert_eq!(answered, "do it\n\n---\n\n# Member answers\n\nANSWERS\n");
     }
 }

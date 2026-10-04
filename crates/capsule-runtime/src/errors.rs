@@ -268,7 +268,7 @@ pub enum RuntimeError {
     /// A capsule declares an artifact whose name collides with a tool the runtime provides
     /// itself.
     ///
-    /// The four names in [`crate::runtime::RESERVED_TOOL_NAMES`] are answered inside
+    /// Every name in [`crate::runtime::RESERVED_TOOL_NAMES`] is answered inside
     /// `dispatch_agent_tool_unfenced` before any allowlist check is reached, and their synthetic
     /// manifests are written after the staging loop. An artifact installed under one of them would
     /// have its manifest overwritten and every call to it answered by the runtime, so the collision
