@@ -45,7 +45,7 @@ Every key is listed below. Any other key, at any level, is refused with
 | `members[].entry` | boolean | no | `true` on exactly one member. Default: `false`. |
 | `reachability` | `all` or list | no | Which members may call which. Default: no member may call another. An empty list means the same. |
 | `reachability[].from` | string | yes | The calling member. |
-| `reachability[].to` | list of strings | yes | The members `from` may call. At least one, and never `from` itself. |
+| `reachability[].to` | list of strings | yes | The members `from` may call. At least one, never `from` itself, and never the entry member. |
 
 A key written with no value, such as `entry:`, is the same as an absent key.
 
@@ -70,9 +70,18 @@ changes `murmur.lock`.
 The entry member receives the formation's task, splits it up and hands the parts to the members
 it may call. Its task outcome is the formation's outcome.
 
-The entry member gets no edge of its own. Under `reachability: all` it calls and is called only
-if it serves peers, like any other member. To let it call members without being callable, write
-a rule for it.
+The entry member is never called. It runs the formation's one task from launch until the
+formation ends, and accepts no other, so there is no task slot for a peer's call to fill. A rule
+that lists it in `to` is refused with [`E-ROS-008`](diagnostics.md#e-ros-008).
+
+| Reachability | The entry member calls | The entry member is called by |
+|---|---|---|
+| `all` | Every other member that serves peers, if it serves peers itself | No member |
+| list of rules | The members its own rules list in `to` | No member |
+
+To have a member report to the entry member, let the entry member call it: write a rule
+`from: <entry>` with that member in `to`. The member's answer comes back into the entry member's
+own task — see [Giving a member work](#member-calls).
 
 ## `reachability` { #reachability }
 
@@ -82,12 +91,13 @@ twice is one edge.
 | Value | Edges |
 |---|---|
 | absent, or `[]` | None |
-| `all` | Every ordered pair of distinct members that both declare [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) |
+| `all` | Every ordered pair of distinct members that both declare [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks), except pairs into the entry member |
 | list of rules | Each rule's `from` to each member in its `to` |
 
 A rule names members only. Every member a rule lists in `to` must declare
 `exports.peer_tasks.accept: true`, or the roster is refused with
-[`E-ROS-005`](diagnostics.md#e-ros-005). A caller does not need to.
+[`E-ROS-005`](diagnostics.md#e-ros-005). A caller does not need to. A rule that lists the
+[entry member](#entry-member) in `to` is refused with [`E-ROS-008`](diagnostics.md#e-ros-008).
 
 ## Authentication { #authentication }
 
@@ -115,13 +125,14 @@ at the first failure. Within a check, members are taken in roster order.
 | 2 | Member names are unique | [`E-ROS-003`](diagnostics.md#e-ros-003) |
 | 3 | Exactly one member has `entry: true` | [`E-ROS-002`](diagnostics.md#e-ros-002) |
 | 4 | Every rule's `from` and `to` names a member | [`E-ROS-004`](diagnostics.md#e-ros-004) |
-| 5 | Each member is installed at its version, and its packed `murmur.yaml` parses | [`E-ROS-007`](diagnostics.md#e-ros-007) |
-| 5 | `murmur.lock` agrees with each member it pins | [`E-REG-005`](diagnostics.md#index) |
-| 6 | Every member a rule calls serves peers | [`E-ROS-005`](diagnostics.md#e-ros-005) |
-| 7 | With any edge, every member's door requires authentication | [`E-ROS-006`](diagnostics.md#e-ros-006) |
+| 5 | No rule lists the entry member in `to` | [`E-ROS-008`](diagnostics.md#e-ros-008) |
+| 6 | Each member is installed at its version, and its packed `murmur.yaml` parses | [`E-ROS-007`](diagnostics.md#e-ros-007) |
+| 6 | `murmur.lock` agrees with each member it pins | [`E-REG-005`](diagnostics.md#index) |
+| 7 | Every member a rule calls serves peers | [`E-ROS-005`](diagnostics.md#e-ros-005) |
+| 8 | With any edge, every member's door requires authentication | [`E-ROS-006`](diagnostics.md#e-ros-006) |
 
-Checks 1–4 read no store, so a roster with a structural fault is refused even when no member is
-installed. Check 5 takes each member in turn through both rows before the next.
+Checks 1–5 read no store, so a roster with a structural fault is refused even when no member is
+installed. Check 6 takes each member in turn through both rows before the next.
 
 ## Launching a formation { #launch }
 
@@ -241,11 +252,6 @@ no formation lifeline, and prints nothing. It holds a
 [spawner lifeline](roost-api.md#spawner-lifeline) instead, so it winds down when the
 member that delegated to it ends, however that member ends.
 
-A roster edge into the entry member is admitted and every member is launched, but the edge is not
-served: the entry member is busy with the formation's own task from launch until it exits, so it
-never accepts a peer task. The calling member is handed no credential or address for it, and the
-launch prints [`W-RUN-006`](diagnostics.md#w-run-006) once per such edge.
-
 A process that already carries `MURMUR_FORMATION_ID` is a formation member, and refuses
 `mur run --roster` with [`E-RUN-046`](diagnostics.md#e-run-046).
 
@@ -256,7 +262,7 @@ lets it call, and no other member answers it. No member's model ever sees a cred
 
 ### The formation credential { #formation-token }
 
-The launcher is the only principal that issues credentials. For every served edge `from → to` it
+The launcher is the only principal that issues credentials. For every edge `from → to` it
 signs one **formation token** with the formation's signing key:
 
 ```text

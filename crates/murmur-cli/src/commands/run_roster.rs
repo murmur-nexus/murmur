@@ -12,11 +12,11 @@
 use std::path::{Path, PathBuf};
 
 use capsule_runtime::formation_launch::{
-    self, render_stopped, signal_name, unserved_edges, FormationEnding, FormationLaunchOptions,
+    self, render_stopped, signal_name, FormationEnding, FormationLaunchOptions,
     MemberLaunchFailure, RunningFormation,
 };
-use capsule_runtime::{admit_roster_file, AdmittedRoster, FormationId};
-use murmur_artifact::{runtime_warning_link, LocalRegistry, ROSTER_FILENAME, W_RUN_006};
+use capsule_runtime::{admit_roster_file, FormationId};
+use murmur_artifact::{LocalRegistry, ROSTER_FILENAME};
 
 use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046};
 use crate::registry_client::FallbackRegistry;
@@ -48,7 +48,6 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
     let lock = read_optional_lockfile(&project_dir)?;
     let roster =
         admit_roster_file(&project_dir, &registry, lock.as_ref()).map_err(CliError::from)?;
-    warn_on_unserved_edges(&roster);
 
     let mut options = FormationLaunchOptions::new(FormationId::mint(), project_dir);
     options.task = launch.task.map(str::to_string);
@@ -132,21 +131,6 @@ fn roster_project_dir(arg: &Path) -> Result<PathBuf, CliError> {
         "pass the project directory, or the roster.yaml inside it, to --roster; a bare --roster \
          means ./roster.yaml",
     ))
-}
-
-/// `W-RUN-006` once per edge into the entry member: the entry member accepts only the formation's
-/// own task, so the member calling it is handed no credential or address for it.
-fn warn_on_unserved_edges(roster: &AdmittedRoster) {
-    for edge in unserved_edges(roster) {
-        capsule_runtime::runtime_err!(
-            "warning[{W_RUN_006}]: roster edge '{from} \u{2192} {to}' is not served: the entry \
-             member accepts only the formation's own task, so '{from}' is handed no credential \
-             or address for it ({link})",
-            from = edge.from,
-            to = edge.to,
-            link = runtime_warning_link(W_RUN_006),
-        );
-    }
 }
 
 /// The formation line on stdout under `--json`, or the formation block on stderr. Printed once
