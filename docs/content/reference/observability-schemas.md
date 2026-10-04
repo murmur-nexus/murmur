@@ -36,7 +36,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `harness_start`, `harness_warning`, `harness_session`, `harness_session_forgotten`, `harness_retry`, `harness_note`, `harness_failed`, `harness_interrupt`, `harness_exit` | The task node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `artifact_pulled`, `hook_dispatch_error`, `retention`, `task_rejected`, `formation_ended`, `spawner_ended` | The session node |
 | `inference_credential`, `gateway_credential` | The session node — written as the keyed request is sent, outside any turn |
 | `control_change`, `control_refused` | The session node — written as the control surface answers, outside any turn |
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
@@ -615,6 +615,23 @@ session in no formation.
 {"event_type":"formation_ended","event_id":"evt_0192a5b3c4d97c1e9a3b5d0c4e8f2a61","parent_id":"evt_0192a5b3c4a17b2c8d4e6f0a1b3c5d7e","session_id":"ses_0192a5b3c4a07e6f8a9b0c1d2e3f4a5b","timestamp":1767225600123,"formation_id":"frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b"}
 ```
 
+**`spawner_ended`**{ #spawner-ended } — written once by a delegated child whose
+[spawner lifeline](roost-api.md#spawner-lifeline) closed: the process that delegated to it ended,
+and the session is winding down because of it
+
+| Field | Type | Notes |
+|---|---|---|
+| `spawned_by` | string | The `ses_` id of the session that spawned this one, as `session_start.spawned_by` names it. Absent, not null, when the session was launched with no `MURMUR_SPAWNER` |
+| `delegation_id` | string | The `dlg_` id of the delegation this session was launched for, as `session_start.delegation_id` names it. Absent under the same condition |
+
+Written at the moment the child sees its lifeline close, before every `task_canceled`, `task_end`,
+`task_rejected`, `shell_abandoned` and `session_end` its wind-down writes. A child already ending
+because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
+
+```json
+{"event_type":"spawner_ended","event_id":"evt_01a1058d3a9070319d2783f65aa594f3","parent_id":"evt_01a1058d39ef70d18c55d007dae98732","session_id":"ses_01a1058d39de73f18822af4c5494398f","timestamp":1791094504080,"spawned_by":"ses_01a1058d39217722b5e52c896926dbf4","delegation_id":"dlg_01a1058d39a07992a594e3ff0888c45a"}
+```
+
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's
 terminal `task_end`
 
@@ -1052,6 +1069,7 @@ The relationship between a parent and a child is recorded once, from both ends, 
 |---|---|---|
 | A parent's trace | `delegation_start.child_workdir` and `child_session_id` | `<accessible workdir>/<child_workdir>/.murmur/<child_session_id>/trace.jsonl` |
 | A child's trace | `session_start.spawned_by` | The `ses_` id of the session that spawned it |
+| A child's trace | `spawner_ended.spawned_by` and `delegation_id` | The same lineage, on a child that wound down because that session's process ended |
 | A parent's trace | `delegation_start.delegation_id` | The `task_start` with origin `"completion"` and the same `delegation_id`, which is that delegation's outcome arriving |
 
 [`mur trace show`](cli.md#mur-trace-show) renders both ends within the one file it is given: a child's

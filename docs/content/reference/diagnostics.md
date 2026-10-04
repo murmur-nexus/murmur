@@ -84,7 +84,7 @@ section that explains it.
 | `E-RUN-017` | The context `--resume` resolved to kept no conversation record | [E-RUN-017](#e-run-017) |
 | `E-RUN-018` | `--resume-mode compact` with no hook bound to `on-compaction` | [E-RUN-018](#e-run-018) |
 | `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
-| `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle | [E-RUN-020](#e-run-020) |
+| `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle, or `MURMUR_SPAWNER_LIFELINE` to something that is not this session's spawner lifeline | [E-RUN-020](#e-run-020) |
 | `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
 | `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
@@ -351,7 +351,7 @@ the refusal is visible before a run meets it. See
 A capsule that declares no spawn capability never reaches this — it opens no connection to the
 daemon at all, and `mur run` succeeds with nothing listening.
 
-### E-RUN-020 — the spawner handle could not be read { #e-run-020 }
+### E-RUN-020 — the spawner handle or spawner lifeline could not be read { #e-run-020 }
 
 A capsule launched as a delegated child is handed `MURMUR_SPAWNER`, which names where its outcome
 is reported and under which delegation id (see
@@ -369,6 +369,28 @@ capsule's address and session.
 
 An unset or blank `MURMUR_SPAWNER` is not this error: it is the ordinary case of a capsule nobody
 delegated, which reports to nobody and runs exactly as it would have.
+
+The same code refuses a `MURMUR_SPAWNER_LIFELINE` that does not name this session's
+[spawner lifeline](roost-api.md#spawner-lifeline), before any session directory exists. A child
+that cannot hear its spawner would outlive it:
+
+```text
+error[E-RUN-020]: MURMUR_SPAWNER_LIFELINE does not carry this session's spawner lifeline: descriptor 9 is a regular file, and a lifeline is a pipe's read end; a delegated child that cannot hear its spawner would keep running after the session that delegated to it has ended, so the launch is refused
+  hint: MURMUR_SPAWNER_LIFELINE is set by a parent capsule's runtime for each child it launches, beside MURMUR_SPAWNER, and is not for operators; unset it to run this capsule directly
+```
+
+| Reason | The value |
+|---|---|
+| `it is not a decimal descriptor number` | Holds anything but digits |
+| `it is not a descriptor number this platform has` | Is too large to be a descriptor |
+| `descriptor N is a standard stream, and a lifeline is 3 or above` | Is 0, 1 or 2 |
+| `descriptor N is not open` | Names no open descriptor |
+| `descriptor N is a character device` / `a regular file` / `a directory` / `a socket` / `not a pipe`, `and a lifeline is a pipe's read end` | Names something other than a pipe |
+| `descriptor N is open for writing, and a child holds only a read end` | Names a pipe's write end |
+| `this session was launched by a caller that does not own its process, and a lifeline ends the process` | Reached a launch embedded in another program rather than `mur run` |
+
+A blank `MURMUR_SPAWNER_LIFELINE` is absent. The variable needs no `MURMUR_SPAWNER` and no
+`MURMUR_FORMATION_ID` beside it.
 
 ### E-RUN-021 — the native binary is built for another platform { #e-run-021 }
 
@@ -2594,18 +2616,19 @@ or [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) is anyth
 Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-020]: this capsule declares capabilities.spawn.allow, but its lifecycle block cannot receive a delegation's outcome: delegate-task returns as soon as the sub-capsule is running, and what the sub-capsule did arrives afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, and a lifecycle.queue_depth covering how many delegations one turn issues, or every outcome this capsule delegates for will be posted to a session that has already exited. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-020)
+[capsule-runtime] warning[W-SEC-020]: this capsule declares capabilities.spawn.allow, but its lifecycle block cannot receive a delegation's outcome: delegate-task returns as soon as the sub-capsule is running, and what the sub-capsule did arrives afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, and a lifecycle.queue_depth covering how many delegations one turn issues, or every outcome this capsule delegates for will be posted to a session that has already exited. Every sub-capsule this capsule delegated to also winds down when this capsule exits, finished or not. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-020)
 ```
 
 **Why it matters:** [`delegate-task`](roost-api.md#the-delegation-tool) returns as soon as the
 sub-capsule is running and holding its task. What the sub-capsule did arrives afterwards, as a
 `completion`-origin task in the `bg` lane. Under the default lifecycle the session ends with the
-task that made the delegation, so the sub-capsule runs, finishes, posts its outcome to an address
-nothing answers on, and records the failed delivery in its own `completion.json` — where nobody is
-looking. The work happens and the result is lost.
+task that made the delegation, and its process exits. Every sub-capsule it delegated to holds a
+[spawner lifeline](roost-api.md#spawner-lifeline) to that process, so each one winds down as soon
+as the delegating capsule exits, whether or not it had finished. Whatever outcome is reported is
+posted to an address nothing answers on.
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The delegation
-still runs and the sub-capsule still does its work; only the report has nowhere to land.
+still starts; the sub-capsule runs only as long as the capsule that delegated to it.
 
 **What to do:** declare a lifecycle that outlives the delegating task.
 
@@ -2617,9 +2640,9 @@ lifecycle:
 ```
 
 `queue_depth` covers how many delegations one turn issues, because each outcome in flight occupies
-a slot. A capsule that delegates and deliberately does not wait — one that hands work off and exits
-— is a legitimate shape, which is why this is a warning and not a refusal; silence it by not
-declaring `capabilities.spawn.allow` on a capsule that does not delegate.
+a slot. A capsule that delegates and does not wait for the outcome is a legitimate shape, which is
+why this is a warning and not a refusal, but its sub-capsules end when it exits. Silence the warning
+by not declaring `capabilities.spawn.allow` on a capsule that does not delegate.
 
 ### W-SEC-021 — a declared I/O ceiling did not apply { #w-sec-021 }
 

@@ -218,7 +218,9 @@ to the stderr it shares with the launcher.
 lifeline, and which is not a delegated child, runs as any other `mur run` does: nothing winds it
 down when its formation ends. It prints [`W-RUN-007`](diagnostics.md#w-run-007) once at launch.
 End it with [`mur stop`](cli.md#mur-stop). A delegated child carries its parent's formation id and
-no lifeline; its parent session ends it, and it prints nothing.
+no formation lifeline, and prints nothing. It holds a
+[spawner lifeline](roost-api.md#spawner-lifeline) instead, so it winds down when the
+member that delegated to it ends, however that member ends.
 
 A roster edge into the entry member is admitted and every member is launched, but the edge is not
 served: the entry member is busy with the formation's own task from launch until it exits, so it
@@ -345,7 +347,7 @@ done
 |---|---|
 | About a member it may call | The member's name, in its components' environment. Only its runtime holds the door URL and the token |
 | About a member it may not call | Nothing: no name, no address, no token |
-| Its delegated children | Inherit `MURMUR_FORMATION_ID` and nothing else: no channel, no token, no `MURMUR_FORMATION_PEERS`. A child's door belongs to no formation, so it refuses every formation token with `401` |
+| Its delegated children | Inherit `MURMUR_FORMATION_ID` and nothing else of the formation: no channel, no token, no `MURMUR_FORMATION_PEERS`, no formation lifeline. A child's door belongs to no formation, so it refuses every formation token with `401`. Each child holds a [spawner lifeline](roost-api.md#spawner-lifeline) of its own, which ends it when the member does |
 
 Each member's trace names it and its callees on `session_start`, and names the calling member on
 each `a2a_task_received` a formation token let in — see the

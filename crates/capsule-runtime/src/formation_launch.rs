@@ -68,6 +68,7 @@ use crate::formation::{FormationId, FormationPeer, FORMATION_PEERS_ENV};
 use crate::formation_credentials::{
     render_address_line, FormationAuthority, FORMATION_CHANNEL_ENV,
 };
+use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::roster::{AdmittedRoster, RosterEdge};
 
 /// How long a member has, from its spawn, to report itself and have its door answer.
@@ -943,7 +944,7 @@ fn start_peer(
         cwd: None,
         env: ProcessEnv::Inherited {
             set: &set,
-            remove: &[FORMATION_PEERS_ENV, SPAWNER_ENV],
+            remove: &[FORMATION_PEERS_ENV, SPAWNER_ENV, SPAWNER_LIFELINE_ENV],
         },
         stdin_line: None,
         stderr_prefix: Some(&prefix),
@@ -951,7 +952,7 @@ fn start_peer(
         own_process_group: true,
         inherit_fd: Some(channel.fd()),
         #[cfg(unix)]
-        lifeline: Some(&lifeline),
+        lifeline: Some(crate::child_launch::Lifeline::Member(&lifeline)),
     });
     // The member holds its own copy of the read end now, or never will.
     let Channel { writer, reader } = channel;
@@ -1452,7 +1453,7 @@ impl RunningFormation {
             cwd: None,
             env: ProcessEnv::Inherited {
                 set: &set,
-                remove: &[SPAWNER_ENV, FORMATION_PEERS_ENV],
+                remove: &[SPAWNER_ENV, FORMATION_PEERS_ENV, SPAWNER_LIFELINE_ENV],
             },
             stdin_line: None,
             stderr_prefix: None,
@@ -1460,7 +1461,10 @@ impl RunningFormation {
             own_process_group: false,
             inherit_fd: Some(channel.fd()),
             #[cfg(unix)]
-            lifeline: self.entry_lifeline.as_ref(),
+            lifeline: self
+                .entry_lifeline
+                .as_ref()
+                .map(crate::child_launch::Lifeline::Member),
         });
         let Channel { writer, reader } = channel;
         drop(reader);

@@ -315,6 +315,7 @@ before the restart then returns `404`.
 | Probe the host for its containment class | The child's own runtime, in the child's own process |
 | Record what the child holds | The daemon, at the child's `POST /register` |
 | Stop the child | The parent capsule's runtime |
+| Stop the child once the parent's process has ended | The child's own runtime, on EOF on its [spawner lifeline](#spawner-lifeline) |
 
 Three problems are absent rather than solved by this split. A daemon crash takes no child with it,
 because nothing a child needs lives in the daemon's address space. Each child has its own process
@@ -347,23 +348,59 @@ the child holds:
 | `PATH` | Always, from the parent's own value |
 | `HOME` | Always, from the parent's own value |
 | `MURMUR_ROOST_URL` | Always, so the child registers at the same daemon its parent asked |
+| `MURMUR_SPAWNER_LIFELINE` | Always: the descriptor of the child's own [spawner lifeline](#spawner-lifeline) |
 | `MURMUR_SPAWNER` | The child was given a spawner handle — see [The completion path](#the-completion-path) |
 | `MURMUR_FORMATION_ID` | The parent session belongs to a formation. The child joins it, whether or not it was given a spawner handle |
 | Any other name | The name appears in both the child's and the parent's `capabilities.env.allow`, and the parent's own process environment holds it |
 
 Every other variable the parent holds is absent from the child, including
-[`MURMUR_FORMATION_CHANNEL`](roster.md#formation-channel) and
-[`MURMUR_FORMATION_PEERS`](roster.md#formation-peers): a child that declares either receives
-nothing, and holds no formation token. A
+[`MURMUR_FORMATION_CHANNEL`](roster.md#formation-channel),
+[`MURMUR_FORMATION_PEERS`](roster.md#formation-peers), `MURMUR_FORMATION_LIFELINE` and the
+parent's own `MURMUR_SPAWNER_LIFELINE`: a child that declares any of them receives nothing from
+the parent's environment, and holds no formation token. A
 name a child declares that its parent does not is refused at `POST /spawn` on the
 [`capabilities.env.allow` axis](#spawn-envelope).
-The five names above are the runtime's, and a child that lists one of them under
+The six names above are the runtime's, and a child that lists one of them under
 `capabilities.env.allow` does not displace the runtime's value.
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself
 does not hold is absent from the child even where both manifests declare it, and a child whose
 `gateway.api_key` references it fails at manifest load with
 [`E-MAN-003`](diagnostics.md#index).
+
+### A child ends with its parent { #spawner-lifeline }
+
+Every delegated child — from `delegate-task` or a plan `capsule` step, in a formation or not — is
+handed a **spawner lifeline**: the read end of a pipe of its own, named by
+`MURMUR_SPAWNER_LIFELINE`. The only write end is held by the runtime of the process that launched
+it, which never writes to it. When that process ends by any means — a clean exit, `SIGTERM`,
+`SIGKILL`, the OOM killer — the kernel closes the write end and the child reads EOF.
+
+What the child does on EOF depends on what it is:
+
+| Child | On EOF |
+|---|---|
+| Agent capsule | Appends [`spawner_ended`](observability-schemas.md#spawner-ended) to its trace, then winds down as a first `SIGTERM` winds it down: cancels its live tasks, abandons detached shell work, writes `session_end` and exits. A teardown still running 20 seconds after EOF is cut short with status 143 |
+| Script capsule | Exits with status 143 at once, as a `SIGTERM` ends it |
+
+EOF after the child's wind-down has already begun — from a `SIGTERM` or
+[`mur stop`](cli.md#mur-stop) — writes nothing. The child's diagnostics go to its
+`logs/bootstrap.log` once its parent is gone, since its standard error was a pipe to the parent.
+
+A child that delegates hands each of its own children a lifeline of its own, so a chain ends from
+the top down: a descendant `d` levels below the process that ended exits within `d` × 20 seconds,
+and usually well under a second per level. With the default [`--max-depth`](#the-depth-budget) of
+3, every descendant of a killed top-level capsule is gone within 60 seconds.
+
+| Ending | Effect on the child |
+|---|---|
+| The parent's process exits, or is killed | The child winds down |
+| The parent's session cancels the task that delegated (`tasks/cancel`) | None: the child keeps running while the parent's process lives |
+| The parent ends the delegation itself, or the [delegation deadline](#bounds) passes | The child is killed |
+
+On macOS a child can occasionally outlive its parent: if the parent starts another process at the
+instant it creates the child's lifeline, that process can hold the lifeline open, and the child
+winds down only once that process has exited too.
 
 ---
 
@@ -433,7 +470,8 @@ is already gone. A capsule that delegates declares:
 
 A capsule that declares `capabilities.spawn.allow` and leaves that block unable to receive a
 completion is warned at launch with [`W-SEC-020`](diagnostics.md#w-sec-020). The launch is not
-refused: a capsule that delegates and deliberately does not wait is legitimate.
+refused: a capsule that delegates and does not wait is legitimate. Its sub-capsules end when it
+exits, finished or not — see [A child ends with its parent](#spawner-lifeline).
 
 ### Bounds
 
@@ -877,6 +915,7 @@ ends gives its slot back — a total would only ever grow.
 | `MURMUR_ROOST_URL` | The environment of the process that runs the capsule; set on a child by its parent's runtime | Base URL the runtime registers at, and the base URL a plan's `capsule` step asks permission at. When it is unset or blank, a capsule that declares `capabilities.spawn.allow` refuses to launch with [`E-RUN-019`](diagnostics.md#e-run-019), and a `capsule` step fails with `MURMUR_ROOST_URL is not set; capsule steps require mur-roost` |
 | `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which its traces carry and which `mur run` prints |
 | `MURMUR_SPAWNER` | The parent capsule's runtime, on a delegated child only | Where the child reports its outcome, and under which delegation id — see [The completion path](#the-completion-path). A value that is not a spawner handle refuses the launch with [`E-RUN-020`](diagnostics.md#e-run-020) |
+| `MURMUR_SPAWNER_LIFELINE` | The parent capsule's runtime, on every delegated child. Not for operators | The number of the descriptor holding the child's end of its [spawner lifeline](#spawner-lifeline). Never handed to a component, a shell command, a native tool, a hook, or a child of the child, which gets a lifeline of its own. Blank is absent. Naming anything but an open pipe's read end numbered 3 or above refuses the launch with [`E-RUN-020`](diagnostics.md#e-run-020) before any session exists |
 | `MURMUR_FORMATION_ID` | [`mur run --roster`](cli.md#mur-run-roster), in each member's `mur run` environment; set on a member's children by the member's runtime | The formation the session belongs to: `frm_` followed by 32 lowercase hex digits. Shown on the [readiness line](cli.md#mur-run-formation) and handed to every hook. Unset or blank is a session in no formation. A value that is not a formation id refuses the launch with [`E-RUN-044`](diagnostics.md#e-run-044). It grants nothing on its own: what a member may call is decided by the [formation tokens](roster.md#formation-token) on its channel |
 | `MURMUR_FORMATION_CHANNEL` | [`mur run --roster`](cli.md#mur-run-roster), in each member's `mur run` environment, and nothing else | The number of the inherited file descriptor the member reads its [formation channel](roster.md#formation-channel) from: its credentials and its callees' door URLs. Never handed to a delegated child. One that cannot be read refuses the launch with [`E-RUN-046`](diagnostics.md#e-run-046) |
 | `MURMUR_FORMATION_PEERS` | A formation member's runtime, inside each of its WASM components | The members it may call at their virtual addresses, as `name=http://<name>.formation.invalid` pairs separated by single spaces — see [What a member's components are handed](roster.md#formation-peers). Never handed to a native process or a delegated child. Set in `mur run`'s own environment, it refuses the launch with [`E-RUN-046`](diagnostics.md#e-run-046) |

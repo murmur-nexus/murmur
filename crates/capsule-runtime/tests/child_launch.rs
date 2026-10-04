@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use capsule_runtime::{
     child_workdir_for, delegation::SPAWNER_ENV, formation::FORMATION_ID_ENV, launch_child_capsule,
-    ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner,
+    ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner, SPAWNER_LIFELINE_ENV,
 };
 use common::{component, files_under, find_in_files, mur_binary, Roost, ScriptedServer};
 use serde_json::{json, Value};
@@ -77,7 +77,7 @@ fn suite() -> &'static Suite {
                  network:\n    allow: [{endpoint}]\n  \
                  env:\n    allow: [{A_ONLY}, {B_ONLY}, MURMUR_TEST_ALLOWED_VAR]\n  \
                  spawn:\n    allow: [child-agent, child-a, child-b, child-escape, child-sealed, \
-                 child-leak, child-reader, child-repeat]\n",
+                 child-leak, child-reader, child-repeat, child-handed]\n",
                 endpoint = inference.authority(),
             ),
             Some(&component("capsule-env-echo.wasm")),
@@ -128,6 +128,7 @@ fn suite() -> &'static Suite {
         for (name, containment) in [
             ("child-agent", ""),
             ("child-sealed", "  containment: sealed\n"),
+            ("child-handed", ""),
         ] {
             common::publish_capsule(
                 &registry_path,
@@ -149,7 +150,10 @@ fn suite() -> &'static Suite {
         // The parent's own registration: this is where its credential comes from, exactly as a
         // real parent's runtime would have obtained it at launch.
         let credential = roost.register(PARENT_SESSION, PARENT_CAPSULE, "0.1.0");
-        std::env::set_var(capsule_runtime::MUR_BINARY_ENV, mur_binary());
+        std::env::set_var(
+            capsule_runtime::MUR_BINARY_ENV,
+            recording_wrapper(home.path(), mur_binary()),
+        );
 
         Suite {
             roost,
@@ -158,6 +162,41 @@ fn suite() -> &'static Suite {
             _inference: inference,
         }
     })
+}
+
+/// A script that execs `mur` with its arguments, and first, for a launch of `child-handed` alone,
+/// records into the child's directory what the process was handed: its environment
+/// (`handed.env`) and its descriptors (`handed.fd`, and `handed.fdinfo` for the spawner lifeline).
+///
+/// `mur` makes itself non-dumpable as its first act, which closes its `/proc/<pid>/environ` and
+/// `/proc/<pid>/fd` to every non-root reader, this test included. The script runs in the same
+/// process before that `exec`, so what it records is exactly what the launch handed the child.
+/// Every other launch passes straight through.
+fn recording_wrapper(home: &Path, mur: &Path) -> PathBuf {
+    let wrapper = home.join("mur-recording-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh
+             case \" $* \" in
+  *\" child-handed \"*)
+                 env > handed.env
+                 ls -l /proc/$$/fd > handed.fd
+                 cat \"/proc/$$/fdinfo/$MURMUR_SPAWNER_LIFELINE\" > handed.fdinfo
+                 ;;
+esac
+             exec '{}' \"$@\"
+",
+            mur.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    wrapper
 }
 
 /// One case's parent: an accessible workdir children are composed beneath, and the shared
@@ -422,7 +461,10 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     };
 
     let plain = parent.launch("child-a", &[]);
-    assert_eq!(keys(&plain), ["PATH", "HOME", "MURMUR_ROOST_URL"]);
+    assert_eq!(
+        keys(&plain),
+        ["PATH", "HOME", "MURMUR_ROOST_URL", SPAWNER_LIFELINE_ENV]
+    );
 
     // The same launch with lineage. It reports to nobody, so the handle is the whole of what the
     // spawner adds and no watcher runs.
@@ -445,7 +487,13 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     .expect("a child that declares no variables launches");
     assert_eq!(
         keys(&delegated),
-        ["PATH", "HOME", "MURMUR_ROOST_URL", SPAWNER_ENV]
+        [
+            "PATH",
+            "HOME",
+            "MURMUR_ROOST_URL",
+            SPAWNER_LIFELINE_ENV,
+            SPAWNER_ENV
+        ]
     );
 }
 
@@ -900,6 +948,143 @@ fn a_released_child_survives_the_handle_that_launched_it() {
     let _ = std::process::Command::new("kill")
         .arg(pid.to_string())
         .status();
+}
+
+/// What `/proc/<pid>/fd/<fd>` points at, e.g. `pipe:[1234]`.
+#[cfg(target_os = "linux")]
+fn fd_target(pid: u32, fd: &str) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+        .ok()
+        .map(|target| target.display().to_string())
+}
+
+/// A delegated child is handed one descriptor of its parent's making: the read end of a spawner
+/// lifeline of its own, named by `MURMUR_SPAWNER_LIFELINE` exactly once and open read-only, with
+/// the pipe's write end held by this process and by nothing in the child. Neither lifeline
+/// variable is copied from this process's environment, even allowlisted, and the formation id is
+/// still handed on.
+///
+/// The child's side is read from what [`recording_wrapper`] wrote at its `exec`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_holds_its_own_spawner_lifeline_read_end_and_no_formation_lifeline() {
+    use capsule_runtime::FORMATION_LIFELINE_ENV;
+
+    let parent = Parent::new();
+    let formation = FormationId::mint();
+    let (grant, _) = parent.approve("child-handed");
+    // Decoys in this process's own environment, allowlisted for the child: neither may reach it.
+    std::env::set_var(FORMATION_LIFELINE_ENV, "4097");
+    std::env::set_var(SPAWNER_LIFELINE_ENV, "4098");
+    let launched = launch_child_capsule(ChildLaunchRequest {
+        parent_accessible_workdir: parent.dir().to_path_buf(),
+        capsule_name: "child-handed".to_string(),
+        capsule_version: "0.1.0".to_string(),
+        grant,
+        child_env_allow: vec![
+            FORMATION_LIFELINE_ENV.to_string(),
+            SPAWNER_LIFELINE_ENV.to_string(),
+        ],
+        roost_url: suite().roost.url.clone(),
+        spawner: None,
+        completion_deadline: None,
+        formation_id: Some(formation.clone()),
+    });
+    std::env::remove_var(FORMATION_LIFELINE_ENV);
+    std::env::remove_var(SPAWNER_LIFELINE_ENV);
+    let child = launched.unwrap_or_else(|error| panic!("launching 'child-handed' failed: {error}"));
+
+    // What the parent built.
+    let handed: Vec<&String> = child
+        .env
+        .iter()
+        .filter(|(key, _)| key == SPAWNER_LIFELINE_ENV)
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(handed.len(), 1, "{:?}", child.env);
+    let fd = handed[0].clone();
+    assert!(fd != "4098" && fd.parse::<i32>().unwrap() >= 3, "{fd}");
+    assert!(
+        !child
+            .env
+            .iter()
+            .any(|(key, _)| key == FORMATION_LIFELINE_ENV),
+        "{:?}",
+        child.env
+    );
+    assert_eq!(
+        child.env.last(),
+        Some(&(FORMATION_ID_ENV.to_string(), formation.as_str().to_string())),
+        "{:?}",
+        child.env
+    );
+
+    // What the child was handed.
+    let read = |name: &str| {
+        std::fs::read_to_string(child.workdir.join(name))
+            .unwrap_or_else(|error| panic!("the wrapper wrote no {name}: {error}"))
+    };
+    let environ = read("handed.env");
+    let named: Vec<&str> = environ
+        .lines()
+        .filter(|line| line.starts_with(&format!("{SPAWNER_LIFELINE_ENV}=")))
+        .collect();
+    assert_eq!(named, [format!("{SPAWNER_LIFELINE_ENV}={fd}")], "{environ}");
+    assert!(
+        !environ
+            .lines()
+            .any(|line| line.starts_with(&format!("{FORMATION_LIFELINE_ENV}="))),
+        "{environ}"
+    );
+    assert!(
+        environ
+            .lines()
+            .any(|line| line == format!("{FORMATION_ID_ENV}={}", formation.as_str())),
+        "{environ}"
+    );
+
+    // `ls -l /proc/<pid>/fd`: `... <n> -> <target>` per descriptor.
+    let descriptors: Vec<(String, String)> = read("handed.fd")
+        .lines()
+        .filter_map(|line| {
+            let (left, target) = line.split_once(" -> ")?;
+            let number = left.split_whitespace().last()?;
+            Some((number.to_string(), target.trim().to_string()))
+        })
+        .collect();
+    let pipe = descriptors
+        .iter()
+        .find(|(number, _)| *number == fd)
+        .map(|(_, target)| target.clone())
+        .unwrap_or_else(|| panic!("descriptor {fd} was not handed: {descriptors:?}"));
+    assert!(pipe.starts_with("pipe:["), "{pipe}");
+    let flags = read("handed.fdinfo")
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .map(|octal| u32::from_str_radix(octal.trim(), 8).unwrap())
+        .expect("fdinfo names the descriptor's flags");
+    assert_eq!(flags & 0o3, 0, "descriptor {fd} is not read-only");
+
+    // Both ends of a pipe share its inode: the read end is the one descriptor the child was
+    // handed that names it, and this process holds the write end.
+    let in_child: Vec<&String> = descriptors
+        .iter()
+        .filter(|(_, target)| *target == pipe)
+        .map(|(number, _)| number)
+        .collect();
+    assert_eq!(in_child, [&fd], "the child holds a write end too");
+    let own = std::process::id();
+    let in_parent = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            fd_target(own, &entry.file_name().to_string_lossy()).as_deref() == Some(pipe.as_str())
+        })
+        .count();
+    assert_eq!(
+        in_parent, 1,
+        "this process holds the write end, and only that"
+    );
 }
 
 #[cfg(target_os = "linux")]

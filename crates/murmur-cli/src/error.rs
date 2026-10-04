@@ -54,7 +54,7 @@ pub const E_RUN_016: &str = "E-RUN-016"; // the resumed session's trace holds no
 pub const E_RUN_017: &str = "E-RUN-017"; // the resolved context has no conversation record on disk
 pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook bound to on-compaction
 pub const E_RUN_019: &str = "E-RUN-019"; // a session declaring capabilities.spawn.allow could not register with mur-roost
-pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something that is not a spawner handle
+pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something that is not a spawner handle, or MURMUR_SPAWNER_LIFELINE to something that is not this session's spawner lifeline
 pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built for another platform
 pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
@@ -744,6 +744,13 @@ impl From<RuntimeError> for CliError {
                 "MURMUR_SPAWNER is injected by a parent capsule's runtime at launch; unset it to \
                  run this capsule directly",
             ),
+            error @ RuntimeError::SpawnerLifelineUnreadable { .. } => CliError::with_hint(
+                E_RUN_020,
+                error.to_string(),
+                "MURMUR_SPAWNER_LIFELINE is set by a parent capsule's runtime for each child it \
+                 launches, beside MURMUR_SPAWNER, and is not for operators; unset it to run this \
+                 capsule directly",
+            ),
             error @ RuntimeError::FormationIdUnreadable { .. } => CliError::with_hint(
                 E_RUN_044,
                 error.to_string(),
@@ -1133,6 +1140,34 @@ mod tests {
         );
         assert!(cli.message.contains("descriptor 9"), "{}", cli.message);
         let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("not for operators"), "{hint}");
+    }
+
+    #[test]
+    fn an_unreadable_spawner_lifeline_maps_to_e_run_020() {
+        let cli = CliError::from(RuntimeError::SpawnerLifelineUnreadable {
+            reason: "descriptor 9 is a regular file, and a lifeline is a pipe's read end"
+                .to_string(),
+        });
+        assert_eq!(cli.code, E_RUN_020);
+        assert!(
+            cli.message.starts_with(
+                "MURMUR_SPAWNER_LIFELINE does not carry this session's spawner lifeline: \
+                 descriptor 9 is a regular file"
+            ),
+            "{}",
+            cli.message
+        );
+        assert!(
+            cli.message.ends_with(
+                "a delegated child that cannot hear its spawner would keep running after the \
+                 session that delegated to it has ended, so the launch is refused"
+            ),
+            "{}",
+            cli.message
+        );
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("beside MURMUR_SPAWNER"), "{hint}");
         assert!(hint.contains("not for operators"), "{hint}");
     }
 

@@ -654,6 +654,11 @@ pub struct StagedSession {
     /// one, so it never travels on [`StageRequest`].
     #[cfg(unix)]
     pub(crate) formation_lifeline: Option<crate::lifeline::FormationLifeline>,
+    /// This delegated child's spawner lifeline, attached after staging by
+    /// [`StagedSession::attach_spawner_lifeline`]. A process property on the same terms as
+    /// [`Self::formation_lifeline`].
+    #[cfg(unix)]
+    pub(crate) spawner_lifeline: Option<crate::lifeline::SpawnerLifeline>,
 }
 
 impl StagedSession {
@@ -693,6 +698,15 @@ impl StagedSession {
     #[cfg(unix)]
     pub fn attach_formation_lifeline(&mut self, lifeline: crate::lifeline::FormationLifeline) {
         self.formation_lifeline = Some(lifeline);
+    }
+
+    /// Hand this session the spawner lifeline its process was launched with. Honoured only by
+    /// [`crate::launch_session_handling_sigterm`], for an agent and a script capsule alike: every
+    /// other launch of a session holding one is refused with
+    /// [`crate::RuntimeError::SpawnerLifelineUnreadable`] before anything is instantiated.
+    #[cfg(unix)]
+    pub fn attach_spawner_lifeline(&mut self, lifeline: crate::lifeline::SpawnerLifeline) {
+        self.spawner_lifeline = Some(lifeline);
     }
 }
 

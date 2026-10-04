@@ -123,8 +123,12 @@ pub(crate) const WIT_STREAM_EVENTS_IFACE: &str = "murmur:stream/events@0.1.0";
 pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 
 /// How long an agent session's teardown may run after its termination begins — the first
-/// `SIGTERM`, or EOF on a formation member's lifeline — before the process exits with status 143
-/// regardless.
+/// `SIGTERM`, EOF on a formation member's lifeline, or EOF on a delegated child's spawner lifeline
+/// — before the process exits with status 143 regardless.
+///
+/// It is also what bounds a chain of delegations: a child exits within this long of its spawner
+/// lifeline's EOF, which closes the write ends it holds for its own children, so a descendant `d`
+/// levels below a process that ended exits within `d` times this, plus scheduling.
 ///
 /// Longer than the async-hook drain budget (`ASYNC_HOOK_DRAIN_TIMEOUT` in `hooks.rs`, 15 s), so a
 /// drain that stays inside its own bound is never cut short by this one. A second `SIGTERM`
@@ -1845,6 +1849,8 @@ pub fn stage_session(
         ignore_task_file: request.ignore_task_file,
         #[cfg(unix)]
         formation_lifeline: None,
+        #[cfg(unix)]
+        spawner_lifeline: None,
     })
 }
 
@@ -1872,11 +1878,20 @@ pub fn launch_session(
 /// outlives the session may share it. A script capsule, or a platform without `SIGTERM`, launches
 /// exactly as [`launch_session`] does.
 ///
-/// It is also the one launch that honours a formation lifeline
-/// ([`StagedSession::attach_formation_lifeline`]): EOF on it begins the same termination a first
-/// `SIGTERM` does, after appending `formation_ended` to the trace, and never counts as a
-/// `SIGTERM`. Every other launch of a session holding a lifeline, and this one for a script
-/// capsule, is refused with [`RuntimeError::FormationLifelineUnreadable`].
+/// It is also the one launch that honours a lifeline:
+///
+/// * A formation lifeline ([`StagedSession::attach_formation_lifeline`]): EOF on it begins the
+///   same termination a first `SIGTERM` does, after appending `formation_ended` to the trace, and
+///   never counts as a `SIGTERM`. Every other launch of a session holding one, and this one for a
+///   script capsule, is refused with [`RuntimeError::FormationLifelineUnreadable`].
+/// * A spawner lifeline ([`StagedSession::attach_spawner_lifeline`]): on an agent capsule, EOF on
+///   it begins that termination after appending `spawner_ended`, on the same terms. A script
+///   capsule takes no `SIGTERM` handler, so there EOF does what a `SIGTERM` does to it: the
+///   process exits with status 143. Every other launch of a session holding one is refused with
+///   [`RuntimeError::SpawnerLifelineUnreadable`].
+///
+/// Whichever lifeline closes first while nothing else has begun the termination is the one whose
+/// record is written.
 pub fn launch_session_handling_sigterm(
     staged: StagedSession,
     on_url: impl FnOnce(&str),
@@ -1922,6 +1937,18 @@ fn launch(
                     .to_string(),
             });
         }
+    }
+    // A spawner lifeline needs no formation and no door: any session can be delegated to, and a
+    // script capsule honours one by exiting.
+    #[cfg(unix)]
+    let spawner_lifeline = staged.spawner_lifeline.take();
+    #[cfg(unix)]
+    if spawner_lifeline.is_some() && !handle_sigterm {
+        return Err(RuntimeError::SpawnerLifelineUnreadable {
+            reason: "this session was launched by a caller that does not own its process, and a \
+                     lifeline ends the process"
+                .to_string(),
+        });
     }
 
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
@@ -2142,7 +2169,7 @@ fn launch(
         // this session was staging is seen the moment the task loop's termination routine
         // listens.
         #[cfg(unix)]
-        let lifeline_closed = match formation_lifeline {
+        let formation_closed = match formation_lifeline {
             None => None,
             Some(lifeline) => {
                 let (closed, on_closed) = tokio::sync::oneshot::channel::<()>();
@@ -2151,6 +2178,21 @@ fn launch(
                         let _ = closed.send(());
                     })
                     .map_err(|error| RuntimeError::FormationLifelineUnreadable {
+                        reason: format!("its watcher thread could not be started: {error}"),
+                    })?;
+                Some(on_closed)
+            }
+        };
+        #[cfg(unix)]
+        let spawner_closed = match spawner_lifeline {
+            None => None,
+            Some(lifeline) => {
+                let (closed, on_closed) = tokio::sync::oneshot::channel::<()>();
+                lifeline
+                    .watch(move || {
+                        let _ = closed.send(());
+                    })
+                    .map_err(|error| RuntimeError::SpawnerLifelineUnreadable {
                         reason: format!("its watcher thread could not be started: {error}"),
                     })?;
                 Some(on_closed)
@@ -2271,6 +2313,10 @@ fn launch(
             .spawner
             .as_ref()
             .map(|handle| handle.delegation_id.clone());
+        // The same lineage again, for `spawner_ended`, which is written after `TraceWriter::open`
+        // has taken the two above.
+        #[cfg(unix)]
+        let spawner_lineage = (trace_spawned_by.clone(), trace_spawn_delegation_id.clone());
         let queue_capacity = match effective_lifecycle.task_acceptance {
             TaskAcceptance::Queue => effective_lifecycle.queue_depth,
             _ => 1,
@@ -2519,8 +2565,9 @@ fn launch(
                     }
                 }
             }
-            // `formation_ended` lands through the same kind of handle: the termination routine
-            // runs on a task of its own, and its record must precede what the wind-down writes.
+            // `formation_ended` and `spawner_ended` land through the same kind of handle: the
+            // termination routine runs on a task of its own, and its record must precede what the
+            // wind-down writes.
             #[cfg(unix)]
             let formation_end_trace = resource_trace
                 .clone()
@@ -2529,6 +2576,12 @@ fn launch(
                     appender,
                     formation_id,
                 });
+            #[cfg(unix)]
+            let spawner_end_trace = resource_trace.clone().map(|appender| SpawnerEndTrace {
+                appender,
+                spawned_by: spawner_lineage.0,
+                delegation_id: spawner_lineage.1,
+            });
             // The same file again, for the same reason and on the same terms: a plan's steps run
             // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
             // that cannot be opened leaves a plan unrecorded and still runs it.
@@ -2833,22 +2886,29 @@ fn launch(
                         }
                     }
 
-                    // Raised once, by the termination routine, which the first `SIGTERM` or the
+                    // Raised once, by the termination routine, which the first `SIGTERM` or either
                     // lifeline's EOF begins. Every wait below that is not already a task's own
                     // cancel races it, and the loop takes no new work once it is up, so the
                     // session falls through to the same teardown a clean exit runs.
                     let terminating = crate::cancel::CancelSignal::new();
                     #[cfg(unix)]
-                    if sigterm.is_some() || lifeline_closed.is_some() {
-                        tokio::spawn(run_termination(
-                            TerminationSources {
-                                sigterm,
-                                lifeline_closed,
-                            },
-                            formation_end_trace,
-                            Arc::clone(&task_registry),
-                            terminating.clone(),
-                        ));
+                    {
+                        let sources = TerminationSources {
+                            sigterm,
+                            formation_closed,
+                            spawner_closed,
+                        };
+                        if sources.any() {
+                            tokio::spawn(run_termination(
+                                sources,
+                                EndTraces {
+                                    formation: formation_end_trace,
+                                    spawner: spawner_end_trace,
+                                },
+                                Arc::clone(&task_registry),
+                                terminating.clone(),
+                            ));
+                        }
                     }
 
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
@@ -3561,6 +3621,20 @@ fn launch(
         });
     }
 
+    // A script capsule takes no `SIGTERM` handler, so a `SIGTERM` ends its process at once; the
+    // spawner lifeline's EOF does the same, before the run starts and for as long as it lasts.
+    #[cfg(unix)]
+    if let Some(lifeline) = spawner_lifeline {
+        lifeline
+            .watch(|| {
+                crate::runtime_err!("{SPAWNER_LIFELINE_CLOSED}; ending the run");
+                std::process::exit(143);
+            })
+            .map_err(|error| RuntimeError::SpawnerLifelineUnreadable {
+                reason: format!("its watcher thread could not be started: {error}"),
+            })?;
+    }
+
     // Script capsule path — requires a compiled WASM component.
     let capsule_component = staged
         .capsule_component
@@ -4192,7 +4266,8 @@ its lifecycle block cannot receive a delegation's outcome: delegate-task returns
 sub-capsule is running, and what the sub-capsule did arrives afterwards as a background task. \
 Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, and a \
 lifecycle.queue_depth covering how many delegations one turn issues, or every outcome this \
-capsule delegates for will be posted to a session that has already exited.";
+capsule delegates for will be posted to a session that has already exited. Every sub-capsule this \
+capsule delegated to also winds down when this capsule exits, finished or not.";
 
 /// Pure decision for the delegation-lifecycle warning, split out of
 /// [`warn_for_unreachable_delegation_outcomes`] the same way `sandbox::aggregate_bounding_warning`
@@ -4201,7 +4276,8 @@ capsule delegates for will be posted to a session that has already exited.";
 /// Fires exactly where an outcome has nowhere to land: a capsule that can delegate and either
 /// exits after its task or accepts no second one. Never a refusal — a capsule that delegates and
 /// deliberately does not wait for the answer is legitimate, and this is what makes that a choice
-/// rather than an accident.
+/// rather than an accident. Its sub-capsules still end when it exits: each holds a spawner
+/// lifeline whose write end only this capsule's process holds.
 pub(crate) fn unreachable_delegation_outcomes_warning(
     can_delegate: bool,
     lifecycle: &LifecycleConfig,
@@ -9670,20 +9746,52 @@ async fn record_canceled_before_start(
     .await;
 }
 
+/// What a session says, on standard error, when its spawner lifeline reads EOF. An agent session
+/// adds that it is winding down, a script capsule that its run is ending.
+#[cfg(unix)]
+const SPAWNER_LIFELINE_CLOSED: &str =
+    "[capsule-runtime] spawner lifeline closed — the session that delegated to this one has ended";
+
 /// What can begin an agent session's termination from outside it.
 #[cfg(unix)]
 struct TerminationSources {
     /// The session's `SIGTERM` stream, when the caller owns the process and the handler installed.
     sigterm: Option<tokio::signal::unix::Signal>,
-    /// Fired once by the lifeline's watcher thread, at EOF, for a formation member.
-    lifeline_closed: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Fired once by the formation lifeline's watcher thread, at EOF, for a formation member.
+    formation_closed: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Fired once by the spawner lifeline's watcher thread, at EOF, for a delegated child.
+    spawner_closed: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
-/// Where a lifeline-begun termination records `formation_ended`.
+#[cfg(unix)]
+impl TerminationSources {
+    /// Whether anything is left to listen to.
+    fn any(&self) -> bool {
+        self.sigterm.is_some() || self.formation_closed.is_some() || self.spawner_closed.is_some()
+    }
+}
+
+/// Where a lifeline-begun termination records why it began.
+#[cfg(unix)]
+struct EndTraces {
+    formation: Option<FormationEndTrace>,
+    spawner: Option<SpawnerEndTrace>,
+}
+
+/// Where a formation-lifeline-begun termination records `formation_ended`.
 #[cfg(unix)]
 struct FormationEndTrace {
     appender: Arc<crate::trace::ResourceTraceAppender>,
     formation_id: FormationId,
+}
+
+/// Where a spawner-lifeline-begun termination records `spawner_ended`, and the lineage it names:
+/// the session's own `session_start` lineage, `None` for a session nobody named a spawner for.
+#[cfg(unix)]
+struct SpawnerEndTrace {
+    appender: Arc<crate::trace::ResourceTraceAppender>,
+    spawned_by: Option<String>,
+    delegation_id: Option<String>,
 }
 
 /// Why the termination routine began.
@@ -9691,7 +9799,25 @@ struct FormationEndTrace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminationCause {
     Sigterm,
-    LifelineClosed,
+    /// EOF on the formation lifeline: the formation has ended.
+    FormationEnded,
+    /// EOF on the spawner lifeline: the process that spawned this session has ended.
+    SpawnerEnded,
+}
+
+/// Wait for a lifeline watcher's signal, or forever when there is no watcher.
+///
+/// A watcher that ended without sending did not hear EOF and never will, which leaves the session
+/// as deaf to its lifeline as EOF itself would: a dropped sender resolves this too, and is treated
+/// as EOF.
+#[cfg(unix)]
+async fn lifeline_closed(closed: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    match closed.as_mut() {
+        Some(closed) => {
+            let _ = closed.await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Listen for every source until the session's termination has begun, begin it at most once, and
@@ -9699,19 +9825,20 @@ enum TerminationCause {
 ///
 /// * The first `SIGTERM` begins it. A second exits with status 143 at once; lifeline EOF never
 ///   counts toward that, so a `SIGTERM` after EOF is a first `SIGTERM`, and changes nothing.
-/// * Lifeline EOF begins it only when nothing has yet: `formation_ended` is then appended before
-///   any live task is cancelled, so it precedes every record the wind-down writes. EOF after a
-///   `SIGTERM` writes nothing; the trace already says why the session ended.
+/// * EOF on either lifeline begins it only when nothing has yet: `formation_ended` or
+///   `spawner_ended`, for the lifeline that closed, is then appended before any live task is
+///   cancelled, so it precedes every record the wind-down writes. EOF after anything else began
+///   the termination writes nothing; the trace already says why the session ended.
 #[cfg(unix)]
 async fn run_termination(
     mut sources: TerminationSources,
-    formation_end: Option<FormationEndTrace>,
+    ends: EndTraces,
     task_registry: Arc<Mutex<TaskRegistry>>,
     terminating: crate::cancel::CancelSignal,
 ) {
     let mut sigterms = 0u32;
     let mut begun = false;
-    while sources.sigterm.is_some() || sources.lifeline_closed.is_some() {
+    while sources.any() {
         let cause = tokio::select! {
             received = async {
                 match sources.sigterm.as_mut() {
@@ -9729,28 +9856,39 @@ async fn run_termination(
                 }
                 TerminationCause::Sigterm
             }
-            // A watcher that ended without sending did not hear EOF and never will, which leaves
-            // this member as deaf to its formation as EOF itself would: treated as EOF.
-            _ = async {
-                match sources.lifeline_closed.as_mut() {
-                    Some(closed) => closed.await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                sources.lifeline_closed = None;
-                TerminationCause::LifelineClosed
+            () = lifeline_closed(&mut sources.formation_closed) => {
+                sources.formation_closed = None;
+                TerminationCause::FormationEnded
+            }
+            () = lifeline_closed(&mut sources.spawner_closed) => {
+                sources.spawner_closed = None;
+                TerminationCause::SpawnerEnded
             }
         };
         if begun || terminating.is_canceled() {
             continue;
         }
         begun = true;
-        if cause == TerminationCause::LifelineClosed {
-            if let Some(trace) = &formation_end {
-                trace
-                    .appender
-                    .write_formation_ended(&trace.formation_id)
-                    .await;
+        match cause {
+            TerminationCause::Sigterm => {}
+            TerminationCause::FormationEnded => {
+                if let Some(trace) = &ends.formation {
+                    trace
+                        .appender
+                        .write_formation_ended(&trace.formation_id)
+                        .await;
+                }
+            }
+            TerminationCause::SpawnerEnded => {
+                if let Some(trace) = &ends.spawner {
+                    trace
+                        .appender
+                        .write_spawner_ended(
+                            trace.spawned_by.as_deref(),
+                            trace.delegation_id.as_deref(),
+                        )
+                        .await;
+                }
             }
         }
         begin_termination(&task_registry, &terminating, cause);
@@ -9774,9 +9912,12 @@ fn begin_termination(
         TerminationCause::Sigterm => crate::runtime_err!(
             "[capsule-runtime] SIGTERM received — cancelling live tasks and ending the session"
         ),
-        TerminationCause::LifelineClosed => crate::runtime_err!(
+        TerminationCause::FormationEnded => crate::runtime_err!(
             "[capsule-runtime] formation lifeline closed — the formation has ended; cancelling \
              live tasks and ending the session"
+        ),
+        TerminationCause::SpawnerEnded => crate::runtime_err!(
+            "{SPAWNER_LIFELINE_CLOSED}; cancelling live tasks and ending the session"
         ),
     }
     std::thread::spawn(|| {

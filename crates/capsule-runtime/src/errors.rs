@@ -650,6 +650,18 @@ pub enum RuntimeError {
     )]
     FormationLifelineUnreadable { reason: String },
 
+    /// `MURMUR_SPAWNER_LIFELINE` does not name a lifeline this session can hold: the value is not
+    /// a pipe's read end, it was read twice, or the launch cannot honour one (a caller that does
+    /// not own its process).
+    ///
+    /// `reason` names what is wrong, by descriptor number where there is one.
+    #[error(
+        "MURMUR_SPAWNER_LIFELINE does not carry this session's spawner lifeline: {reason}; a \
+         delegated child that cannot hear its spawner would keep running after the session that \
+         delegated to it has ended, so the launch is refused"
+    )]
+    SpawnerLifelineUnreadable { reason: String },
+
     /// A native tool's `bin/<name>` payload was built for another operating system or CPU
     /// architecture than this host.
     ///

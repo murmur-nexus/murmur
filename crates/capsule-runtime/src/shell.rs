@@ -689,9 +689,11 @@ pub(crate) fn build_shell_env(
     }
 
     for key in &policy.shell_baseline_env {
-        // Formation names are never a native process's: a baseline entry naming one supplies
-        // nothing from the host.
-        if crate::formation::is_member_grant_env(key) {
+        // Formation names and the spawner lifeline are never a native process's: a baseline
+        // entry naming one supplies nothing from the host.
+        if crate::formation::is_member_grant_env(key)
+            || key == crate::lifeline::SPAWNER_LIFELINE_ENV
+        {
             continue;
         }
         if let Ok(value) = std::env::var(key) {
@@ -782,16 +784,20 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 /// run on [`DEFAULT_ENV_BASELINE`] plus `capabilities.shell.baseline_env`, built by
 /// [`build_shell_env`].
 ///
-/// [`ARTIFACT_CONFIG_ENV`] and a formation member's names
-/// ([`crate::formation::is_member_grant_env`]) are reserved and never resolved from the host,
-/// whatever a manifest allowlists: the names are runtime-owned, and their values come from the
-/// declaring artifact's own `config:` block and from the session, or from nowhere. Skipped here rather than relied on being overwritten later, so a host value
-/// cannot reach a guest whose entry declared no config at all.
+/// [`ARTIFACT_CONFIG_ENV`], a formation member's names
+/// ([`crate::formation::is_member_grant_env`]) and [`crate::lifeline::SPAWNER_LIFELINE_ENV`] are
+/// reserved and never resolved from the host, whatever a manifest allowlists: the names are
+/// runtime-owned, and their values come from the declaring artifact's own `config:` block and from
+/// the session, or from nowhere. Skipped here rather than relied on being overwritten later, so a
+/// host value cannot reach a guest whose entry declared no config at all.
 pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
     for key in &policy.env_allow {
-        if key == ARTIFACT_CONFIG_ENV || crate::formation::is_member_grant_env(key) {
+        if key == ARTIFACT_CONFIG_ENV
+            || crate::formation::is_member_grant_env(key)
+            || key == crate::lifeline::SPAWNER_LIFELINE_ENV
+        {
             continue;
         }
         if let Ok(value) = std::env::var(key) {
@@ -1233,6 +1239,27 @@ mod tests {
             "{declared:?}"
         );
         assert!(!shell.contains_key(FORMATION_LIFELINE_ENV), "{shell:?}");
+    }
+
+    /// The spawner lifeline names a descriptor of the child's own process, on the same terms.
+    #[test]
+    fn declared_and_shell_env_never_carry_the_spawner_lifeline() {
+        use crate::lifeline::SPAWNER_LIFELINE_ENV;
+        let _guard = crate::formation::FORMATION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempdir().unwrap();
+        std::env::set_var(SPAWNER_LIFELINE_ENV, "7");
+        let policy = CapabilityPolicy {
+            env_allow: vec![SPAWNER_LIFELINE_ENV.to_string()],
+            shell_baseline_env: vec![SPAWNER_LIFELINE_ENV.to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let declared = build_declared_env(&policy);
+        let shell = build_shell_env(&policy, &[], temp.path()).unwrap();
+        std::env::remove_var(SPAWNER_LIFELINE_ENV);
+        assert!(!declared.contains_key(SPAWNER_LIFELINE_ENV), "{declared:?}");
+        assert!(!shell.contains_key(SPAWNER_LIFELINE_ENV), "{shell:?}");
     }
 
     #[test]

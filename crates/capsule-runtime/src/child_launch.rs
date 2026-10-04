@@ -20,7 +20,16 @@
 //! a formation hands its id to every child as [`FORMATION_ID_ENV`], beside the spawner handle and
 //! independent of it, so a launch that names no lineage still carries it. A parent in no
 //! formation hands none. Inheriting the id is not a grant: the child gets no formation channel, no
-//! formation token and no callee, so its door has no membership and refuses every formation token.
+//! formation token, no callee and no formation lifeline, so its door has no membership and refuses
+//! every formation token.
+//!
+//! **A child dies with the process that spawned it.** Every child, in a formation or not, is
+//! handed a spawner lifeline of its own ([`crate::lifeline::ChildLifeline`], named by
+//! [`SPAWNER_LIFELINE_ENV`]): the read end of a pipe whose only write end this process holds.
+//! When this process ends, by any means, the kernel closes the write end and the child winds down
+//! as a first `SIGTERM` would wind it down. A child that delegates hands its own children a
+//! lifeline of its own the same way, so a grandchild ends once its parent has. A launch whose
+//! lifeline cannot be created is refused rather than started without one.
 //!
 //! **The approval travels on the child's standard input.** Not on the argument vector and not in
 //! the environment: both are readable from `/proc/<pid>` by any process running as the same user,
@@ -38,6 +47,7 @@ use crate::delegation::{
 };
 use crate::errors::RuntimeError;
 use crate::formation::{FormationId, FORMATION_ID_ENV};
+use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
 
@@ -150,9 +160,23 @@ struct ChildProcess {
     deliberate: bool,
     /// The exit status, once anyone has observed it.
     status: Option<ExitStatus>,
+    /// The write end of the child's spawner lifeline, open for as long as the child is this
+    /// process's to end. Closed once the child is observed ended, when it is ended deliberately,
+    /// or when this process exits; [`LaunchedChild::release`] of a child no watcher observes
+    /// moves it out to be held until then. Nothing writes to it.
+    #[cfg(unix)]
+    lifeline: Option<crate::lifeline::ChildLifeline>,
 }
 
 impl ChildProcess {
+    /// Close the write end of the child's spawner lifeline, if this still holds it.
+    fn close_lifeline(&mut self) {
+        #[cfg(unix)]
+        if let Some(mut lifeline) = self.lifeline.take() {
+            lifeline.close();
+        }
+    }
+
     /// How the process ended, or `None` while it is still running.
     ///
     /// Reaps a process that exited on its own, which is what makes a later `wait` in `shutdown`
@@ -166,28 +190,32 @@ impl ChildProcess {
             // is unreachable, and reporting the exit is the harmless reading of it.
             return Some(Ending::Exited(self.status));
         };
-        match child.try_wait() {
+        let ending = match child.try_wait() {
             Ok(Some(status)) => {
                 self.status = Some(status);
-                Some(Ending::Exited(Some(status)))
+                Ending::Exited(Some(status))
             }
-            Ok(None) => None,
+            Ok(None) => return None,
             // The handle is unusable; treating the child as gone is the only outcome that lets
             // the delegation be reported at all.
-            Err(_) => Some(Ending::Exited(self.status)),
-        }
+            Err(_) => Ending::Exited(self.status),
+        };
+        self.close_lifeline();
+        Some(ending)
     }
 
-    /// Kill and reap. Idempotent.
+    /// Kill and reap, then close the child's lifeline. Idempotent.
     fn end(&mut self) -> Result<(), std::io::Error> {
         let Some(mut child) = self.child.take() else {
+            self.close_lifeline();
             return Ok(());
         };
         // `kill` on an already-exited process is not an error worth surfacing — the wait below is
         // what actually retires the entry in the process table.
         let _ = child.kill();
-        let status = child.wait()?;
-        self.status = Some(status);
+        let waited = child.wait();
+        self.close_lifeline();
+        self.status = Some(waited?);
         Ok(())
     }
 }
@@ -230,6 +258,9 @@ pub struct LaunchedChild {
     /// Set by [`LaunchedChild::release`]. The one thing that stops [`Drop`] signalling the child:
     /// a released process is no longer this handle's to end.
     released: bool,
+    /// Whether a completion watcher observes this child, and so will close its lifeline once it
+    /// sees the child end.
+    watched: bool,
 }
 
 impl std::fmt::Debug for LaunchedChild {
@@ -290,8 +321,19 @@ impl LaunchedChild {
     /// This is how a delegation outlives the call that made it: `delegate-task` returns as soon as
     /// the child is running and holding its task, and what the child eventually did arrives at the
     /// parent as a completion the watcher either forwards or writes itself.
+    ///
+    /// It does not outlive this process. The write end of the child's spawner lifeline stays open
+    /// for as long as this process runs: with the watcher holding it, until the watcher sees the
+    /// child end; with no watcher, until this process exits, since nothing would ever close it
+    /// sooner. Either way the child winds down once this process has gone.
     pub fn release(mut self) {
         self.released = true;
+        #[cfg(unix)]
+        if !self.watched {
+            if let Some(lifeline) = lock(&self.process).lifeline.take() {
+                lifeline.hold_until_exit();
+            }
+        }
     }
 }
 
@@ -357,7 +399,18 @@ pub fn child_workdir_for(parent_accessible_workdir: &Path, capsule_name: &str) -
 }
 
 /// Create the child's directory, start `mur` on it, and wait for the child to report itself.
+///
+/// The child is handed a spawner lifeline of its own; a launch whose lifeline cannot be created
+/// starts nothing.
 pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild, RuntimeError> {
+    // First, so a launch that cannot have one creates nothing: a child without a lifeline would
+    // outlive this process.
+    #[cfg(unix)]
+    let mut lifeline = crate::lifeline::ChildLifeline::new().map_err(|error| {
+        RuntimeError::Runtime(format!(
+            "the child capsule's spawner lifeline could not be created: {error}"
+        ))
+    })?;
     let workdir = child_workdir_for(&request.parent_accessible_workdir, &request.capsule_name);
     create_child_dir(&workdir)?;
 
@@ -381,7 +434,18 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         .spawner
         .as_ref()
         .map(|spawner| SpawnerHandle::for_delegation(spawner, delegation::new_delegation_id()));
-    let env = child_environment(&request, handle.as_ref());
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut env = child_environment(&request, handle.as_ref());
+    // Recorded among the runtime-owned names, just ahead of the spawner handle it sits beside
+    // (or the formation id, or the end), exactly as `hand_to` sets it in the child.
+    #[cfg(unix)]
+    if let Some((name, value)) = lifeline.env_pair() {
+        let at = env
+            .iter()
+            .position(|(key, _)| key == SPAWNER_ENV || key == FORMATION_ID_ENV)
+            .unwrap_or(env.len());
+        env.insert(at, (name.to_string(), value));
+    }
     let started = Instant::now();
 
     // The grant's one and only appearance outside the parent's memory: one line on a pipe that is
@@ -402,7 +466,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         own_process_group: false,
         inherit_fd: None,
         #[cfg(unix)]
-        lifeline: None,
+        lifeline: Some(Lifeline::Child(&lifeline)),
     })
     .map_err(|error| {
         RuntimeError::Runtime(format!(
@@ -410,6 +474,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
             binary.display()
         ))
     })?;
+    #[cfg(unix)]
+    lifeline.spawned();
     let write_result =
         write_result.map_err(|error| format!("failed to hand the child its launch grant: {error}"));
     let mut launched = LaunchedChild {
@@ -425,10 +491,13 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
             child: Some(child),
             deliberate: false,
             status: None,
+            #[cfg(unix)]
+            lifeline: Some(lifeline),
         })),
         stderr_tail: Arc::clone(&stderr_tail),
         started,
         released: false,
+        watched: false,
     };
     if let Err(reason) = write_result {
         return Err(RuntimeError::Runtime(reason));
@@ -472,6 +541,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     // no watcher behind it and posts nothing anywhere.
     if let Some(handle) = handle {
         if let Some(address) = handle.report_to.clone() {
+            launched.watched = true;
             watch_for_completion(
                 &launched,
                 handle,
@@ -656,10 +726,16 @@ fn watch_for_completion(
 /// launch and [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last,
 /// so a child cannot displace the daemon URL it is required to register with, the handle it
 /// reports its outcome to, or the formation it joins, by allowlisting the name.
-/// A formation member's names ([`crate::formation::is_member_grant_env`]) are never handed on at
-/// all: inheriting a formation is not a grant, so a member's child holds no channel, no token, no
-/// callee and no lifeline (its parent session contains it), and a child that allowlists any of the
-/// names receives nothing.
+///
+/// Two kinds of name are never copied from this process's environment, whatever the child
+/// allowlists:
+///
+/// * A formation member's names ([`crate::formation::is_member_grant_env`]): inheriting a
+///   formation is not a grant, so a member's child holds no channel, no token, no callee and no
+///   formation lifeline.
+/// * [`SPAWNER_LIFELINE_ENV`]: a value here names a descriptor of this process's own, the lifeline
+///   its own spawner handed it. The child holds a spawner lifeline of its own instead, which
+///   [`launch_child_capsule`] hands it alongside this environment.
 pub(crate) fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
@@ -674,6 +750,7 @@ pub(crate) fn child_environment(
         !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL")
             && key != SPAWNER_ENV
             && key != FORMATION_ID_ENV
+            && key != SPAWNER_LIFELINE_ENV
             && !crate::formation::is_member_grant_env(key)
     });
 
@@ -897,10 +974,28 @@ pub(crate) struct ProcessLaunch<'a> {
     /// member's channel. It is close-on-exec here, so no other process this one starts inherits
     /// it, and the flag is cleared in the started process alone, just before it execs.
     pub(crate) inherit_fd: Option<i32>,
-    /// A formation member's lifeline, whose read end the process is handed. Every lifeline end is
-    /// created close-on-exec, and this is the one the member's spawn clears it on.
+    /// The lifeline whose read end the process is handed. Every lifeline end is created
+    /// close-on-exec, and this is the one the process's spawn clears it on.
     #[cfg(unix)]
-    pub(crate) lifeline: Option<&'a crate::lifeline::MemberLifeline>,
+    pub(crate) lifeline: Option<Lifeline<'a>>,
+}
+
+/// The lifeline a started process is handed: a formation member's, or a delegated child's.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+pub(crate) enum Lifeline<'a> {
+    Member(&'a crate::lifeline::MemberLifeline),
+    Child(&'a crate::lifeline::ChildLifeline),
+}
+
+#[cfg(unix)]
+impl Lifeline<'_> {
+    fn hand_to(self, command: &mut Command) {
+        match self {
+            Lifeline::Member(lifeline) => lifeline.hand_to(command),
+            Lifeline::Child(lifeline) => lifeline.hand_to(command),
+        }
+    }
 }
 
 /// A process [`start_process`] started, with its stderr already being drained.
@@ -963,6 +1058,7 @@ pub(crate) fn start_process(launch: &ProcessLaunch<'_>) -> std::io::Result<Start
     }
     // No `apply_fd_hygiene` here: it fails the spawn outright on a kernel without
     // `CLOSE_RANGE_CLOEXEC`, and a lifeline needs none, since both ends are created close-on-exec.
+    // The lifeline's `pre_exec` is the last one registered.
     #[cfg(unix)]
     if let Some(lifeline) = launch.lifeline {
         lifeline.hand_to(&mut command);
@@ -1292,6 +1388,8 @@ mod tests {
                 child: None,
                 deliberate: false,
                 status: None,
+                #[cfg(unix)]
+                lifeline: None,
             })),
             stderr_tail: Arc::new(StderrTail {
                 state: Mutex::new(StderrState::default()),
@@ -1299,9 +1397,152 @@ mod tests {
             }),
             started: Instant::now(),
             released: true,
+            watched: false,
         };
         let debug = format!("{child:?}");
         assert!(!debug.contains("secretpayload"), "{debug}");
         assert!(debug.contains("door_token"), "{debug}");
+    }
+
+    /// The code of `start_process`, with its comments taken out.
+    fn start_process_code() -> String {
+        let source = include_str!("child_launch.rs");
+        let start = source
+            .find("pub(crate) fn start_process(")
+            .expect("start_process is defined here");
+        let end = start
+            + source[start..]
+                .find("\n}\n")
+                .expect("start_process ends at a closing brace");
+        source[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The one spawn site for delegated children and formation members registers no fd hygiene:
+    /// `mark_inherited_fds_cloexec` is a `close_range(CLOSE_RANGE_CLOEXEC)`, which fails the spawn
+    /// outright on a kernel below 5.11. The lifeline's two-`fcntl` `pre_exec` is the last one
+    /// registered.
+    #[test]
+    fn start_process_registers_no_fd_hygiene() {
+        let code = start_process_code();
+        for name in [
+            "apply_fd_hygiene",
+            "mark_inherited_fds_cloexec",
+            "close_range",
+        ] {
+            assert!(!code.contains(name), "start_process names {name}:\n{code}");
+        }
+        let handed = code
+            .rfind("lifeline.hand_to")
+            .expect("the lifeline is handed");
+        let kept = code
+            .find("keep_across_exec")
+            .expect("an inherited descriptor is kept");
+        assert!(kept < handed, "the lifeline is registered last:\n{code}");
+        assert!(
+            !code[handed..].contains("pre_exec"),
+            "nothing is registered after the lifeline:\n{code}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_with_lifeline(program: &str, args: &[&str]) -> (ChildProcess, i32) {
+        let lifeline = crate::lifeline::ChildLifeline::new().unwrap();
+        let write = lifeline.write_fd().unwrap();
+        let child = Command::new(program).args(args).spawn().unwrap();
+        (
+            ChildProcess {
+                child: Some(child),
+                deliberate: false,
+                status: None,
+                lifeline: Some(lifeline),
+            },
+            write,
+        )
+    }
+
+    /// Ending a child deliberately closes the write end of its lifeline after the reap.
+    #[cfg(unix)]
+    #[test]
+    fn ending_a_child_closes_its_lifeline() {
+        let (mut process, _) = process_with_lifeline("sleep", &["30"]);
+        process.end().unwrap();
+        assert!(process.lifeline.is_none());
+        assert!(process.status.is_some());
+        process.end().unwrap();
+    }
+
+    /// A child observed to have exited on its own has its lifeline closed by the observer.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_seen_exited_has_its_lifeline_closed() {
+        let (mut process, _) = process_with_lifeline("true", &[]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ending = loop {
+            if let Some(ending) = process.poll() {
+                break ending;
+            }
+            assert!(Instant::now() < deadline, "`true` never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(matches!(ending, Ending::Exited(Some(_))));
+        assert!(process.lifeline.is_none());
+    }
+
+    /// A released child nothing watches keeps its lifeline's write end open in this process,
+    /// which is what lets it run until this process exits. A watched one leaves the write end
+    /// with the watcher.
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn releasing_an_unwatched_child_holds_its_lifeline_until_exit() {
+        let launched = |watched: bool| {
+            let (process, write) = process_with_lifeline("sleep", &["30"]);
+            let process = Arc::new(Mutex::new(process));
+            let child = LaunchedChild {
+                workdir: PathBuf::from("/tmp/child"),
+                session_id: "ses_child".to_string(),
+                capsule_url: String::new(),
+                argv: Vec::new(),
+                env: Vec::new(),
+                delegation_id: None,
+                formation_id: None,
+                door_token: None,
+                process: Arc::clone(&process),
+                stderr_tail: Arc::new(StderrTail {
+                    state: Mutex::new(StderrState::default()),
+                    drained: Condvar::new(),
+                }),
+                started: Instant::now(),
+                released: false,
+                watched,
+            };
+            (child, process, write)
+        };
+        let is_open = |fd: i32| {
+            // SAFETY: `F_GETFD` takes and returns integers.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+        };
+
+        let (child, process, write) = launched(false);
+        child.release();
+        assert!(lock(&process).lifeline.is_none(), "moved out to be held");
+        assert!(is_open(write), "the write end stays open");
+        // This test's stand-in for the process exiting.
+        // SAFETY: `write` was leaked by `hold_until_exit` and is owned by nothing.
+        drop(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(write) });
+        lock(&process).end().unwrap();
+
+        let (child, process, _) = launched(true);
+        child.release();
+        assert!(
+            lock(&process).lifeline.is_some(),
+            "the watcher's to close once it sees the child end"
+        );
+        lock(&process).end().unwrap();
+        assert!(lock(&process).lifeline.is_none());
     }
 }
