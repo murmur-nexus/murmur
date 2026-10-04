@@ -15,6 +15,7 @@ use murmur_artifact::{
     RegistryError, RuntimeManifest, MANIFEST_FILENAME,
 };
 
+use super::new_roster::{Provider, ANTHROPIC, OPENAI};
 use crate::{
     config::{load_mur_config, save_mur_config, InferenceConfig},
     error::{CliError, E_CFG_001, E_IO_003, E_MAN_002, E_RUN_008},
@@ -253,30 +254,20 @@ fn resolve_inference_config() -> Result<InferenceConfig, CliError> {
     }
 
     // 2. Env var fallback.
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            eprintln!(
-                "hint: found ANTHROPIC_API_KEY in environment; add [inference] to ~/.murmur/config.yaml to persist your provider settings"
-            );
-            return Ok(InferenceConfig {
-                provider: "anthropic".to_string(),
-                model: "claude-haiku-4-5-20251001".to_string(),
-                api_key: key,
-                endpoint: String::new(),
-            });
-        }
-    }
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        if !key.is_empty() {
-            eprintln!(
-                "hint: found OPENAI_API_KEY in environment; add [inference] to ~/.murmur/config.yaml to persist your provider settings"
-            );
-            return Ok(InferenceConfig {
-                provider: "openai".to_string(),
-                model: "gpt-4o-mini".to_string(),
-                api_key: key,
-                endpoint: String::new(),
-            });
+    for provider in [&ANTHROPIC, &OPENAI] {
+        if let Ok(key) = std::env::var(provider.key_var) {
+            if !key.is_empty() {
+                eprintln!(
+                    "hint: found {} in environment; add [inference] to ~/.murmur/config.yaml to persist your provider settings",
+                    provider.key_var
+                );
+                return Ok(InferenceConfig {
+                    provider: provider.name.to_string(),
+                    model: provider.default_model.to_string(),
+                    api_key: key,
+                    endpoint: String::new(),
+                });
+            }
         }
     }
 
@@ -304,36 +295,26 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
         .interact()
         .map_err(|_| non_tty_err())?;
 
-    let (provider_str, model_labels, model_values): (&str, &[&str], &[&str]) = match provider_idx {
+    // The first model each provider offers is its default, labelled as the recommendation.
+    let (provider, model_values): (&Provider, &[&str]) = match provider_idx {
         0 => (
-            "anthropic",
+            &ANTHROPIC,
             &[
-                "claude-haiku-4-5-20251001  (fast — recommended)",
-                "claude-sonnet-4-5-20251001",
-                "claude-opus-4-5-20251001",
-                "Enter manually",
-            ],
-            &[
-                "claude-haiku-4-5-20251001",
+                ANTHROPIC.default_model,
                 "claude-sonnet-4-5-20251001",
                 "claude-opus-4-5-20251001",
             ],
         ),
-        _ => (
-            "openai",
-            &[
-                "gpt-4o-mini  (fast — recommended)",
-                "gpt-4o",
-                "o3-mini",
-                "Enter manually",
-            ],
-            &["gpt-4o-mini", "gpt-4o", "o3-mini"],
-        ),
+        _ => (&OPENAI, &[OPENAI.default_model, "gpt-4o", "o3-mini"]),
     };
+    let mut model_labels: Vec<String> =
+        model_values.iter().map(|model| model.to_string()).collect();
+    model_labels[0].push_str("  (fast — recommended)");
+    model_labels.push("Enter manually".to_string());
 
     let model_idx = Select::with_theme(&theme)
         .with_prompt("Model")
-        .items(model_labels)
+        .items(&model_labels)
         .default(0)
         .interact()
         .map_err(|_| non_tty_err())?;
@@ -353,7 +334,7 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
         .map_err(|_| non_tty_err())?;
 
     let config = InferenceConfig {
-        provider: provider_str.to_string(),
+        provider: provider.name.to_string(),
         model,
         api_key,
         endpoint: String::new(),
@@ -375,14 +356,12 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
 }
 
 fn build_meta_manifest(config: &InferenceConfig) -> String {
-    let (driver_name, driver_version, default_endpoint) = match config.provider.as_str() {
-        "openai" => ("murmur-driver-openai", "0.3.34", "https://api.openai.com"),
-        _ => (
-            "murmur-driver-anthropic",
-            "0.3.33",
-            "https://api.anthropic.com",
-        ),
+    // The generator capsule's own driver pins, independent of `Provider::driver_version`.
+    let (provider, driver_version) = match config.provider.as_str() {
+        "openai" => (&OPENAI, "0.3.34"),
+        _ => (&ANTHROPIC, "0.3.33"),
     };
+    let (driver_name, default_endpoint) = (provider.driver, provider.default_endpoint);
     let endpoint = if config.endpoint.is_empty() {
         default_endpoint
     } else {

@@ -29,6 +29,11 @@ pub const E_ROS_005: &str = "E-ROS-005"; // a reachability rule calls a member t
 pub const E_ROS_006: &str = "E-ROS-006"; // a roster declares peer traffic and a member's door is public
 pub const E_ROS_007: &str = "E-ROS-007"; // a roster member is not installed at its version, or its manifest is unreadable
 
+// Scaffolds
+pub const E_NEW_002: &str = "E-NEW-002"; // mur new --roster was given a name that is, or derives, an invalid artifact name
+pub const E_NEW_003: &str = "E-NEW-003"; // the directory mur new --roster would write already exists
+pub const E_NEW_004: &str = "E-NEW-004"; // inference.provider names a provider mur new --roster has no driver for
+
 // Capsule execution
 pub const E_RUN_001: &str = "E-RUN-001"; // capsule trap
 pub const E_RUN_002: &str = "E-RUN-002"; // missing linker import (WASI interface not linked)

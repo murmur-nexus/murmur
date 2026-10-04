@@ -15,11 +15,12 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::door_capsule::{driver_home, message, rpc, DRIVER_NAME, DRIVER_VERSION};
+use common::formation::{alive, launch_lock};
 use common::{
     assert_wound_down_by_formation as assert_wound_down, event_kinds, publish_to_store,
     read_whole_trace as read_trace, tool_result_text, tool_use_response, ScriptedServer,
@@ -34,15 +35,6 @@ const PROBE_CALL: &str = "toolu_formation_probe";
 
 /// How long one launch may take end to end before the test gives up on it.
 const LAUNCH_LIMIT: Duration = Duration::from_secs(240);
-
-/// Formation launches start three or four `mur run` processes each; running several suites of
-/// them at once on one host turns a readiness deadline into a measure of contention.
-fn launch_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
@@ -418,22 +410,7 @@ impl Project {
     /// Fail unless no process on the host carries this project's path on its command line within
     /// `limit`.
     fn assert_no_member_remains(&self, pids: &[u32], limit: Duration) {
-        let needle = self.path().to_string_lossy().into_owned();
-        let deadline = Instant::now() + limit;
-        loop {
-            let holders = processes_mentioning(&needle);
-            let alive: Vec<u32> = pids.iter().copied().filter(|pid| alive(*pid)).collect();
-            if holders.is_empty() && alive.is_empty() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "member processes remain after {limit:?}: by command line {holders:?}, by \
-                     reported pid {alive:?}"
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
+        common::formation::assert_no_member_remains(self.path(), pids, limit);
     }
 }
 
@@ -513,40 +490,6 @@ fn signal_pid(pid: u32, signal: i32) {
     unsafe {
         libc::kill(pid as libc::pid_t, signal);
     }
-}
-
-/// Whether `pid` is a live process: present, and not a zombie.
-fn alive(pid: u32) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => {
-            stat.rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-                != Some("Z")
-        }
-        Err(_) => false,
-    }
-}
-
-/// Every live process whose command line contains `needle`.
-fn processes_mentioning(needle: &str) -> Vec<(u32, String)> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
-        if cmdline.contains(needle) && alive(pid) {
-            found.push((pid, cmdline));
-        }
-    }
-    found
 }
 
 /// Every pid a formation line and a readiness line reported.

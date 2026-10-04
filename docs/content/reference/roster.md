@@ -27,6 +27,8 @@ reachability:
 [`mur run --roster`](cli.md#mur-run-roster) admits a roster and launches it — see
 [Launching a formation](#launch). [`mur doctor`](cli.md#mur-doctor) admits it and reports the
 result. `mur run` without `--roster` does not read `roster.yaml`.
+[`mur new --roster <NAME>`](cli.md#mur-new-roster) writes a two-member roster, with a source
+directory for each member, that admission accepts as written.
 
 ## Fields { #fields }
 

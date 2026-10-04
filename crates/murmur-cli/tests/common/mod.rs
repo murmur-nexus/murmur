@@ -5,6 +5,7 @@
 #[path = "../../../capsule-runtime/src/a2a_card_conformance.rs"]
 pub mod a2a_card_conformance;
 pub mod door_capsule;
+pub mod formation;
 pub mod hook_wat;
 pub mod idle_capsule;
 pub mod leaks;

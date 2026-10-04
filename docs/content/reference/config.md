@@ -37,12 +37,14 @@ full: a key it omits is empty, not defaulted, so a global file that declares no
 
 ### `inference:` section
 
-Which inference provider `mur` uses, and the credentials and endpoint to reach it with.
-[`mur new`](cli.md#mur-new) reads this block from `~/.murmur/config.yaml` directly rather than
-from the effective config, and uses it only when it is complete: `provider` is `anthropic` or
-`openai`, and both `model` and `api_key` are non-empty. An incomplete block is skipped, and
-`mur new` falls back to the `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` environment variables and
-then the interactive wizard.
+Which inference provider `mur` uses, and the credentials and endpoint to reach it with. Both
+forms of [`mur new`](cli.md#mur-new) read this block from `~/.murmur/config.yaml` directly rather
+than from the effective config, and neither writes it:
+
+| Command | Reads | An empty or absent field |
+|---|---|---|
+| [`mur new --roster`](cli.md#mur-new-roster-provider) | `provider`, `model` and `endpoint`. Never `api_key`: the generated members reference the key by name | Takes the provider's default. With no block the provider is `anthropic` |
+| [`mur new "<task description>"`](cli.md#mur-new-task) (beta) | All four keys | `provider` must be `anthropic` or `openai`, and `model` and `api_key` non-empty, or the whole block is skipped: `mur new` falls back to the `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` environment variables, then the interactive wizard |
 
 ```yaml
 inference:
@@ -52,12 +54,12 @@ inference:
   endpoint: ""                     # optional; leave empty for the provider default
 ```
 
-| Key | Required | Description |
-|---|---|---|
-| `provider` | yes | `anthropic` or `openai` |
-| `model` | yes | Model name to request from the provider |
-| `api_key` | yes | API key for the provider |
-| `endpoint` | no | Base URL of the provider's API, for a proxy or a compatible service. Empty selects the provider default |
+| Key | Description |
+|---|---|
+| `provider` | `anthropic` or `openai` |
+| `model` | Model name to request from the provider |
+| `api_key` | API key for the provider |
+| `endpoint` | Base URL of the provider's API, for a proxy or a compatible service. Empty selects the provider default |
 
 An empty `endpoint` resolves per provider:
 
