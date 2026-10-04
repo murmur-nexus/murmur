@@ -122,6 +122,11 @@ pub(crate) const WIT_TOOL_REGISTRY_IFACE: &str = "murmur:tool-registry/invoke@0.
 pub(crate) const WIT_STREAM_EVENTS_IFACE: &str = "murmur:stream/events@0.1.0";
 pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 
+/// The host every door's URL names, whatever address it is bound on: the readiness line's `url`,
+/// and so every formation callee's real door. `call-member` reaches a callee only through a
+/// `capabilities.network.allow` rule matching this host.
+pub(crate) const DOOR_HOST: &str = "localhost";
+
 /// How long an agent session's teardown may run after its termination begins — the first
 /// `SIGTERM`, EOF on a formation member's lifeline, or EOF on a delegated child's spawner lifeline
 /// — before the process exits with status 143 regardless.
@@ -133,11 +138,6 @@ pub(crate) const WIT_TASK_IFACE: &str = "murmur:task/task@0.1.0";
 /// Longer than the async-hook drain budget (`ASYNC_HOOK_DRAIN_TIMEOUT` in `hooks.rs`, 15 s), so a
 /// drain that stays inside its own bound is never cut short by this one. A second `SIGTERM`
 /// exits at once without waiting for either.
-/// The host every door's URL names, whatever address it is bound on: the readiness line's `url`,
-/// and so every formation callee's real door. `call-member` reaches a callee only through a
-/// `capabilities.network.allow` rule matching this host.
-pub(crate) const DOOR_HOST: &str = "localhost";
-
 pub(crate) const TERMINATE_TEARDOWN_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(20);
 
@@ -255,10 +255,12 @@ async fn run_task_with_reopens(
     // What the next attempt continues with: `None` until a hook reopens the task or member
     // answers arrive.
     let mut continuation: Option<agent::Continuation> = None;
-    // The calls this task makes are this task's: put it in scope, with the flag that cancels it.
-    if let Some(calls) = &state.member_calls {
-        calls.begin_task(trace_task_id, cancel.clone());
-    }
+    // The calls this task makes are this task's: put it in scope, with the flag that cancels it,
+    // until this function returns.
+    let _calls_scope = state
+        .member_calls
+        .clone()
+        .map(|calls| calls.scope_task(trace_task_id, cancel.clone()));
 
     loop {
         // This function owns the task's scope: nothing else puts a task in scope, which is why
@@ -328,13 +330,16 @@ async fn run_task_with_reopens(
         }
 
         // Every `call-member` call this task made is accounted for before its `on-task-end`: a
-        // finished attempt waits for an answer and continues with it, and any other ending leaves
-        // its calls behind.
+        // finished attempt with a turn left waits for an answer and continues with it, and any
+        // other ending leaves its calls behind. With no turn left nothing could read an answer, so
+        // the attempt does not wait for one.
         let mut result = result;
         if let Some(calls) = state.member_calls.clone() {
             let (outstanding, arrived) = calls.counts();
             if outstanding + arrived > 0 {
-                if matches!(result, Ok(AgentLoopExit::Ok)) {
+                if matches!(result, Ok(AgentLoopExit::Ok))
+                    && trace.task_turns() < inference.max_turns
+                {
                     match wait_for_member_answers(
                         &calls,
                         cancel.as_ref(),
@@ -344,7 +349,7 @@ async fn run_task_with_reopens(
                     )
                     .await
                     {
-                        Some(outcomes) if trace.task_turns() < inference.max_turns => {
+                        Some(outcomes) => {
                             record_member_calls(state, trace_task_id, &outcomes, true).await;
                             let message = crate::member_call::answers_message(&outcomes);
                             member_answers.push(message.clone());
@@ -372,11 +377,6 @@ async fn run_task_with_reopens(
                             as_given = rewritten;
                             continuation = Some(agent::Continuation::MemberAnswers(message));
                             continue;
-                        }
-                        // No turn is left to read them in: they are recorded undelivered and the
-                        // attempt's own ending stands.
-                        Some(outcomes) => {
-                            record_member_calls(state, trace_task_id, &outcomes, false).await;
                         }
                         // The task was cancelled while it waited.
                         None => {
@@ -797,19 +797,7 @@ async fn record_member_calls(
         return;
     };
     for outcome in outcomes {
-        trace
-            .write_member_call(
-                task_id,
-                &outcome.call_id,
-                &outcome.member,
-                Some(&outcome.member_task_id),
-                outcome.status.as_str(),
-                outcome.duration_ms,
-                &outcome.output,
-                outcome.truncated,
-                delivered,
-            )
-            .await;
+        trace.write_member_call(task_id, outcome, delivered).await;
     }
 }
 
@@ -4504,9 +4492,8 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
 /// `W-RUN-008`'s text for `member`, which may call `callees` and whose `network_allow` reaches no
 /// loopback `http` door at an unpinned port; `None` when it may call nobody or its grant does.
 ///
-/// Split from [`warn_on_member_calls_without_egress`] so a test can assert it without capturing
-/// stderr. A grant reaches the doors when one rule matches the door host over `http` at every
-/// port: a callee's port is chosen at launch, so a rule pinning one reaches nothing reliably.
+/// A grant reaches the doors when one rule matches the door host over `http` at every port: a
+/// callee's port is chosen at launch, so a rule pinning one reaches nothing reliably.
 pub(crate) fn member_calls_without_egress_warning(
     member: &str,
     callees: &[&str],
@@ -6224,7 +6211,7 @@ impl send::Host for CapsuleStoreState {
         // hook does it: the real door must be reachable under `capabilities.network.allow`, and
         // the runtime presents the callee's token. The guest learns neither the door nor the
         // token, and the trace records the address the guest named.
-        let (connect_url, authorization) = match formation_send_target(&peer_url) {
+        let (connect_url, authorization, door) = match formation_send_target(&peer_url) {
             Some(uri) => {
                 // The callee's address may still be on its way; wait for it without holding up
                 // the runtime worker this host call runs on.
@@ -6239,7 +6226,15 @@ impl send::Host for CapsuleStoreState {
                     format!("network policy: '{peer_url}' not in capabilities.network.allow")
                 })?;
                 let authority = url.authority().map(|a| a.to_string()).unwrap_or_default();
-                (format!("http://{authority}"), Some(token))
+                let member = uri
+                    .authority()
+                    .and_then(|authority| virtual_member(authority.as_str()))
+                    .map(str::to_string);
+                (
+                    format!("http://{authority}"),
+                    Some(token),
+                    member.map(|member| (url, member)),
+                )
             }
             None => {
                 check_destination_allowed(
@@ -6247,7 +6242,7 @@ impl send::Host for CapsuleStoreState {
                     &peer_url,
                     "capabilities.network.allow",
                 )?;
-                (peer_url.clone(), None)
+                (peer_url.clone(), None, None)
             }
         };
 
@@ -6274,7 +6269,10 @@ impl send::Host for CapsuleStoreState {
                 authorization.as_ref(),
             ))
         })
-        .map_err(|error| error.replace(&connect_url, &peer_url))?;
+        .map_err(|error| match &door {
+            Some((door, member)) => crate::member_call::redact_door(&error, door, member),
+            None => error.replace(&connect_url, &peer_url),
+        })?;
 
         self.pending_a2a_events.push((
             peer_url.clone(),
@@ -8032,8 +8030,10 @@ impl CapsuleStoreState {
         &self,
         input: murmur::tool::run::ToolInput,
     ) -> Result<murmur::tool::run::ToolResult, String> {
+        use crate::delegation_plane::bounded;
         use crate::member_call::{
-            bounded, mint_call_id, send_task, CallHeaders, CallRoute, MemberCallRefusal,
+            elapsed_ms, mint_call_id, send_task, CallHeaders, CallRoute, MemberCallOutcome,
+            MemberCallRefusal, MemberCallStatus,
         };
 
         let args = parse_tool_json_input(MEMBER_CALL_TOOL, &input)?;
@@ -8043,16 +8043,24 @@ impl CapsuleStoreState {
             (self.http_hooks.formation.clone(), self.member_calls.clone())
         else {
             return Err(format!(
-                "'{MEMBER_CALL_TOOL}' is answered only for a formation member that roster.yaml                  lets call another; this session is not one"
+                "'{MEMBER_CALL_TOOL}' is answered only for a formation member that roster.yaml \
+                 lets call another; this session is not one"
             ));
         };
         let callees: Vec<String> = formation.callees().map(str::to_string).collect();
         if !callees.contains(&member) {
             return Err(MemberCallRefusal::NotACallee.describe(&member, &callees));
         }
+        // A call is accounted for by the task that made it; outside every task nothing would
+        // deliver its answer or record how it ended.
+        let Some(task_id) = calls.task_id() else {
+            return Err(format!(
+                "'{MEMBER_CALL_TOOL}' is answered only while a task runs; this session is running \
+                 none"
+            ));
+        };
 
         let call_id = mint_call_id();
-        let task_id = calls.task_id().unwrap_or_default();
         let route = CallRoute {
             formation,
             network_allow_rules: self.http_hooks.network_allow_rules.clone(),
@@ -8063,7 +8071,17 @@ impl CapsuleStoreState {
             ),
         };
         let started = Instant::now();
-        let duration_ms = || started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        // How a call the member never held ended, as its one `member_call` record carries it.
+        let unstarted =
+            |status: MemberCallStatus, output: String, truncated: bool| MemberCallOutcome {
+                call_id: call_id.clone(),
+                member: member.clone(),
+                member_task_id: None,
+                status,
+                output,
+                truncated,
+                duration_ms: elapsed_ms(started),
+            };
         // The A2A task's own flag, or the flag the task loop put in scope for a task with no A2A
         // id, which `SIGTERM` and a closed lifeline raise.
         let cancel = self.task_cancel_signal().or_else(|| calls.task_cancel());
@@ -8087,19 +8105,8 @@ impl CapsuleStoreState {
                      {member} may hold the task"
                 );
                 if let Some(trace) = &self.peer_trace {
-                    trace
-                        .write_member_call(
-                            &task_id,
-                            &call_id,
-                            &member,
-                            None,
-                            crate::member_call::MemberCallStatus::Abandoned.as_str(),
-                            duration_ms(),
-                            &output,
-                            false,
-                            false,
-                        )
-                        .await;
+                    let outcome = unstarted(MemberCallStatus::Abandoned, output.clone(), false);
+                    trace.write_member_call(&task_id, &outcome, false).await;
                 }
                 return Err(format!("'{MEMBER_CALL_TOOL}' was canceled: {output}"));
             }
@@ -8135,19 +8142,8 @@ impl CapsuleStoreState {
             Err(reason) => {
                 let (output, truncated) = bounded(reason);
                 if let Some(trace) = &self.peer_trace {
-                    trace
-                        .write_member_call(
-                            &task_id,
-                            &call_id,
-                            &member,
-                            None,
-                            crate::member_call::MemberCallStatus::Failed.as_str(),
-                            duration_ms(),
-                            &output,
-                            truncated,
-                            true,
-                        )
-                        .await;
+                    let outcome = unstarted(MemberCallStatus::Failed, output.clone(), truncated);
+                    trace.write_member_call(&task_id, &outcome, true).await;
                 }
                 Ok(murmur::tool::run::ToolResult {
                     status: murmur::tool::run::Status::Failed,
@@ -19196,6 +19192,35 @@ mod member_call_tests {
         assert!(listener.accept().is_err(), "a refused call reached a door");
         assert!(trace_lines(dir.path()).is_empty());
         assert_eq!(state.member_calls.as_ref().unwrap().counts(), (0, 0));
+    }
+
+    /// A call made while no task is in scope — after the task that held the scope has returned —
+    /// is refused before anything is sent: nothing would deliver its answer or record its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_outside_every_task_is_refused_and_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let calls = Arc::clone(state.member_calls.as_ref().unwrap());
+        drop(calls.scope_task("tsk_done", None));
+        assert_eq!(calls.task_id(), None);
+        let Err(refused) = state
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "work"), None)
+            .await
+        else {
+            panic!("a call with no task in scope was dispatched");
+        };
+        assert!(refused.contains("only while a task runs"), "{refused}");
+        assert!(listener.accept().is_err(), "a refused call reached a door");
+        assert!(trace_lines(dir.path()).is_empty());
+        assert_eq!(calls.counts(), (0, 0));
     }
 
     /// A call the callee's door does not take fails in the same turn: the door's status and

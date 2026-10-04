@@ -11,16 +11,15 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::door_capsule::{driver_home, message, rpc, DRIVER_NAME, DRIVER_VERSION};
-use common::formation::{alive, launch_lock};
+use common::formation::{alive, launch_lock, reported_pids, signal, Launcher, LAUNCH_LIMIT};
 use common::{
     assert_wound_down_by_formation as assert_wound_down, event_kinds, publish_to_store,
     read_whole_trace as read_trace, tool_result_text, tool_use_response, ScriptedServer,
@@ -32,9 +31,6 @@ use tempfile::TempDir;
 const PROBE_TOOL: &str = "formation-probe";
 const PROBE_VERSION: &str = "0.1.0";
 const PROBE_CALL: &str = "toolu_formation_probe";
-
-/// How long one launch may take end to end before the test gives up on it.
-const LAUNCH_LIMIT: Duration = Duration::from_secs(240);
 
 // ── Artifacts ─────────────────────────────────────────────────────────────────
 
@@ -306,44 +302,12 @@ impl Project {
         let mut args = vec!["run", "--roster", "--json", "--task", "probe"];
         args.extend_from_slice(extra);
         let mut command = self.command(&args);
-        command
-            .envs(env.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.envs(env.iter().copied());
         if own_group {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let started = Instant::now();
-        let mut child = command.spawn().unwrap();
-        let (line_tx, lines) = mpsc::channel::<(Instant, String)>();
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&stdout);
-        let out = child.stdout.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                seen.lock().unwrap().push(line.clone());
-                let _ = line_tx.send((Instant::now(), line));
-            }
-        });
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&stderr);
-        let err = child.stderr.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                eprintln!("[launcher] {line}");
-                let mut sink = sink.lock().unwrap();
-                sink.push_str(&line);
-                sink.push('\n');
-            }
-        });
-        Launcher {
-            child,
-            started,
-            lines,
-            stdout,
-            stderr,
-        }
+        Launcher::spawn(command)
     }
 
     /// Every `ses_*` session directory members created: the entry member's under the project,
@@ -389,15 +353,7 @@ impl Project {
 
     /// The operator token the running record of `session_id` holds.
     fn door_token(&self, session_id: &str) -> String {
-        let record = self
-            .home
-            .path()
-            .join(".murmur")
-            .join("running")
-            .join(format!("{session_id}.json"));
-        let record: Value =
-            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
-        record["door_token"].as_str().unwrap().to_string()
+        common::formation::door_token(self.home.path(), session_id)
     }
 
     /// Fail unless no process on the host carries this project's path on its command line within
@@ -411,92 +367,6 @@ struct Finished {
     status: ExitStatus,
     stdout: String,
     stderr: String,
-}
-
-/// A running `mur run --roster`.
-struct Launcher {
-    child: Child,
-    started: Instant,
-    lines: mpsc::Receiver<(Instant, String)>,
-    stdout: Arc<Mutex<Vec<String>>>,
-    stderr: Arc<Mutex<String>>,
-}
-
-impl Launcher {
-    /// The next stdout line, parsed, and when it arrived.
-    fn next_json(&self) -> (Instant, Value) {
-        let (at, line) = self
-            .lines
-            .recv_timeout(LAUNCH_LIMIT)
-            .unwrap_or_else(|_| panic!("no stdout line; stderr:\n{}", self.stderr()));
-        let value = serde_json::from_str(&line)
-            .unwrap_or_else(|_| panic!("stdout line is not JSON: {line}"));
-        (at, value)
-    }
-
-    fn wait(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + LAUNCH_LIMIT;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                panic!("the launcher did not exit; stderr:\n{}", self.stderr());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn stderr(&self) -> String {
-        self.stderr.lock().unwrap().clone()
-    }
-
-    fn stdout(&self) -> Vec<String> {
-        // The relay thread may still be appending the last line when the process has exited.
-        thread::sleep(Duration::from_millis(200));
-        self.stdout.lock().unwrap().clone()
-    }
-
-    fn signal(&self, signal: i32) {
-        signal_pid(self.child.id(), signal);
-    }
-}
-
-impl Drop for Launcher {
-    fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            self.signal(libc::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-fn signal_pid(pid: u32, signal: i32) {
-    // SAFETY: `kill` takes two integers and dereferences nothing; `pid` is a child of this test.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
-}
-
-/// Every pid a formation line and a readiness line reported.
-fn reported_pids(formation: &Value, entry: Option<&Value>) -> Vec<u32> {
-    let mut pids: Vec<u32> = formation["peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|peer| peer["pid"].as_u64().unwrap() as u32)
-        .collect();
-    if let Some(entry) = entry {
-        pids.push(entry["pid"].as_u64().unwrap() as u32);
-    }
-    pids
 }
 
 /// `stdout` and `stderr` with the entry member's own readiness-line tokens taken out: the one
@@ -1018,7 +888,7 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
         if kill_launcher {
             launcher.signal(libc::SIGTERM);
         } else {
-            signal_pid(planner["pid"].as_u64().unwrap() as u32, libc::SIGKILL);
+            signal(planner["pid"].as_u64().unwrap() as u32, libc::SIGKILL);
         }
         let status = launcher.wait();
         assert_eq!(
@@ -1793,8 +1663,8 @@ fn four_member_formation_cost() {
     );
 }
 
-/// The member flags a launcher passes: `--ignore-task-file` is not a flag at all, and the hidden
-/// `--store-root` is not shown, needs `--capsule` and `--workdir`, and is no `--roster` flag.
+/// The member flags a launcher passes: `--ignore-task-file` is an unknown argument, and the hidden
+/// `--store-root` is not shown, needs `--capsule` and `--workdir`, and conflicts with `--roster`.
 #[test]
 fn the_hidden_member_flags_are_exactly_what_a_launcher_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1826,21 +1696,48 @@ fn the_hidden_member_flags_are_exactly_what_a_launcher_passes() {
     assert!(!String::from_utf8_lossy(&help.stdout).contains("--store-root"));
 
     let store = dir.path().display().to_string();
-    for args in [
-        vec!["run", "--store-root", &store],
-        vec!["run", "--store-root", &store, "--workdir", &store],
-        vec![
-            "run",
-            "--store-root",
-            &store,
-            "--capsule",
-            "c",
-            "--capsule-version",
-            "1",
-        ],
-        vec!["run", "--roster", &store, "--store-root", &store],
+    for (args, refusal) in [
+        (
+            vec!["run", "--store-root", &store],
+            "the following required arguments were not provided",
+        ),
+        (
+            vec!["run", "--store-root", &store, "--workdir", &store],
+            "the following required arguments were not provided",
+        ),
+        (
+            vec![
+                "run",
+                "--store-root",
+                &store,
+                "--capsule",
+                "c",
+                "--capsule-version",
+                "1",
+            ],
+            "the following required arguments were not provided",
+        ),
+        // Every argument `--store-root` requires is given, so only the conflict can refuse it.
+        (
+            vec![
+                "run",
+                "--roster",
+                &store,
+                "--store-root",
+                &store,
+                "--capsule",
+                "c",
+                "--workdir",
+                &store,
+            ],
+            "'--roster [<PATH>]' cannot be used with",
+        ),
     ] {
         let refused = mur(&args);
         assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(refusal),
+            "{args:?}: {refused:?}"
+        );
     }
 }

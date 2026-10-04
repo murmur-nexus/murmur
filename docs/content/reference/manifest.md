@@ -1167,7 +1167,7 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
-| `lifecycle.delegation_deadline_secs` | integer | no | Default: `600`. Seconds a delegated sub-capsule may run before it is ended — see [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs). |
+| `lifecycle.delegation_deadline_secs` | integer | no | Default: `600`. Seconds a delegated sub-capsule may run before it is ended, and a [`call-member`](runtime-provided-tools.md#call-member) call waits for its answer — see [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs). |
 
 #### `exports` { #field-exports }
 
@@ -2246,8 +2246,9 @@ consequence that a later resume has nothing to find and that command's loss is n
 
 ### `lifecycle.delegation_deadline_secs` { #lifecycle-delegation-deadline-secs }
 
-The single bound on a delegation. The capsule's own runtime holds the clock; no daemon has to be
-reachable for the deadline to fire.
+The single bound on work a capsule hands off: delegations and
+[`call-member`](runtime-provided-tools.md#call-member) calls. The capsule's own runtime holds the
+clock; no daemon has to be reachable for the deadline to fire.
 
 It covers every wait on handed-off work, one per caller:
 
@@ -2259,13 +2260,11 @@ It covers every wait on handed-off work, one per caller:
 
 | Value | Behaviour |
 |---|---|
-| `600` (default) | A sub-capsule has 10 minutes from the moment it reports itself ready |
+| `600` (default) | A sub-capsule has 10 minutes from the moment it reports itself ready. A `call-member` call has 10 minutes from the call |
 | `N` (positive integer) | The same, with an `N`-second window |
-| `0` | For a plan step, the first poll after the task is delivered gives up |
+| `0` | For a plan step, the first poll after the task is delivered gives up. A `call-member` call times out before its first read of the member's task |
 
-Absent is a ceiling, not an absence: a capsule that never declares this one still delegates under
-600 seconds, because an unbounded delegation leaves a wedged sub-capsule running for as long as the
-capsule that started it. The `MURMUR_DELEGATION_TIMEOUT_SECS` environment variable sets the same
+A capsule that does not declare it hands off work under the 600-second default. The `MURMUR_DELEGATION_TIMEOUT_SECS` environment variable sets the same
 bound for a whole process when it names a positive integer; the declared value applies otherwise,
 and `600` when neither is given. Getting the sub-capsule *started* is bounded separately — see
 [Bounds](roost-api.md#bounds) — so a slow host does not spend this window on staging.

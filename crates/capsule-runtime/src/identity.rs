@@ -1700,8 +1700,8 @@ fn handle_message_send(
 ///
 /// A formation member — `caller_member`, from the formation token the door let in — reads only
 /// the tasks it submitted itself. Every other id, another member's task or the operator's
-/// included, gets the same `-32001` an id this capsule never held gets, so a member learns
-/// nothing about work it did not hand over.
+/// included, gets the same `-32001` an id this capsule never held gets. This scopes `tasks/get`
+/// only: `message/stream` forwards every task's frames to whoever holds the connection.
 fn handle_tasks_get(
     id: Value,
     params: &Value,

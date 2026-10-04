@@ -3290,11 +3290,9 @@ pub(crate) fn run_trace_show(
     body: Option<String>,
     turn: Option<u32>,
 ) -> Result<(), CliError> {
-    let workdir = workdir_arg.unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("workdir")
-    });
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let given_workdir = workdir_arg.is_some();
+    let workdir = workdir_arg.unwrap_or_else(|| current_dir.join("workdir"));
     if let Some(formation) = session
         .as_deref()
         .filter(|arg| arg.starts_with(FORMATION_ID_PREFIX))
@@ -3305,7 +3303,10 @@ pub(crate) fn run_trace_show(
                 "--body and --turn read one session's trace; a formation id names several sessions",
             ));
         }
-        return run_formation_show(formation, &workdir);
+        // With no `--workdir`, the directory a roster runs from is searched too: its entry
+        // member's `--workdir` is the roster's directory, so it records under `./.murmur`.
+        let entry_root = (!given_workdir).then(|| current_dir.join(".murmur"));
+        return run_formation_show(formation, &workdir, entry_root);
     }
     if body.is_none() && turn.is_some() {
         return Err(CliError::new(
@@ -3356,12 +3357,17 @@ pub(crate) fn run_trace_show(
     Ok(())
 }
 
-/// `mur trace show frm_<id>`: every session under `root`, and under each of the formation's peer
-/// directories in the murmur home, whose `session_start` names the formation, and how each ended.
-fn run_formation_show(arg: &str, root: &Path) -> Result<(), CliError> {
+/// `mur trace show frm_<id>`: every session under `root`, under `entry_root` when there is one,
+/// and under each of the formation's peer directories in the murmur home, whose `session_start`
+/// names the formation, and how each ended.
+fn run_formation_show(arg: &str, root: &Path, entry_root: Option<PathBuf>) -> Result<(), CliError> {
     let formation = FormationId::parse(arg)
         .map_err(|_| CliError::new(E_TRC_002, format!("'{arg}' is not a formation id")))?;
-    let search = search_formation(root, formation_member_roots(&formation), &formation)?;
+    let more = entry_root
+        .into_iter()
+        .chain(formation_member_roots(&formation))
+        .collect();
+    let search = search_formation(root, more, &formation)?;
     if search.found.members.is_empty() {
         let roots: Vec<String> = search
             .searched

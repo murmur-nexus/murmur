@@ -10,11 +10,8 @@ keeps its bookkeeping in.
 
 Without `--workdir` the two are one directory and everything below lands in the same place.
 
-A [formation](roster.md#launch) peer's accessible workdir is
-`~/.murmur/formations/<frm_id>/<member>/`, a directory of its own, owner-only, that its launcher
-makes and passes as `--workdir`; its sessions nest under `.murmur/` there. It resolves its
-artifacts and `murmur.lock` from the roster's project, not from this directory. The entry member's
-accessible workdir is the roster's project directory. See
+In a [formation](roster.md#launch), the entry member's accessible workdir is the roster's project
+directory, and each peer's is `~/.murmur/formations/<frm_id>/<member>/` — see
 [Member directories](roster.md#member-directories).
 
 To find what the *capsule* changed, diff the accessible workdir and subtract what the runtime wrote
@@ -48,7 +45,7 @@ of:
 | Writer | When |
 |---|---|
 | `mur run --task <value>` | Before launch. A value naming an existing file is copied; anything else is written as text |
-| The runtime | On each incoming A2A message, and again when an `on-task-end` hook returns `reopen-task` — rewritten as the original task plus every reopen's feedback so far. A task continued with [`call-member`](runtime-provided-tools.md#call-member) answers on an attempt that restarts from a fresh context gets the original task, every reopen's feedback, and every batch of answers so far |
+| The runtime | On each incoming A2A message, and again when an `on-task-end` hook returns `reopen-task` — rewritten as the original task plus every reopen's feedback so far. When a task continues with [`call-member`](runtime-provided-tools.md#call-member) answers on an attempt that restarts rather than continuing its conversation, the rewrite also holds every batch of answers so far |
 | The capsule | Through its own file tools, like any other file in the accessible workdir |
 
 A task whose text is empty or only whitespace fails without a request to the model, with a message
@@ -114,8 +111,8 @@ An artifact that declares `capabilities.state` is granted one directory outside 
 | Accessible workdir | `--workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | One session, unless `--workdir` names a directory you keep |
 | State store | `~/.murmur/state/<store>/` | Every session of that capsule, on that machine |
 
-The store is mounted into the guest as a second WASI preopen named `state`, alongside the workdir
-mounted as `.`. Guest code reaches it with an ordinary relative path:
+A component sees the store as a directory named `state`, beside the workdir it sees as its
+current directory. Its code reaches the store with an ordinary relative path:
 
 ```rust
 std::fs::write("state/notes.jsonl", contents)?;   // the store
@@ -133,7 +130,7 @@ launch that gets a fresh `<manifest-dir>/workdir/<session-id>` reads back exactl
 launch wrote.
 
 **It sits outside every workdir, and only the artifact that declared it can reach it.** A subtree
-of the workdir would be readable by anything holding the workdir preopen — `murmur-tool-editor` and
+of the workdir would be readable by anything that can reach the workdir — `murmur-tool-editor` and
 `shell` included — and `capabilities.filesystem.scope` cannot help, because it is a single path
 prefix: protecting one subtree would mean narrowing every other artifact. The capsule's own code
 declares no artifact grant and reaches no store.

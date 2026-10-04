@@ -115,7 +115,7 @@ section that explains it.
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
 | `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`/`session_end`, empty file); unknown event types are silently skipped. A formation member's missing `session_end` also names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, and `--body` or `--turn` with a formation id | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation) |
-| `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under the workdir belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
+| `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
@@ -906,7 +906,7 @@ Each failed member is named as `'<name>' (<capsule>@<version>)`, in roster order
 
 | Reason | Means |
 |---|---|
-| `its process could not be started` | The `mur` binary could not be executed |
+| `its process could not be started: <why>` | The `mur` binary could not be executed, or `<why>` is `its directory <dir> could not be made: …`: the peer's [directory](roster.md#member-directories) could not be made, or something is already at its path |
 | `its process exited with <status> before reporting` | The member's `mur run` refused or crashed before its readiness line. Its last stderr lines follow, and carry the member's own error code |
 | `its process reported and then exited with <status> before its door answered` | The member reported a door and ended before it answered |
 | `it did not report within 180s` | No readiness line within the [deadline](roster.md#launch-readiness) |
@@ -2879,7 +2879,7 @@ that. It fires from two places, on stderr:
 | Source | Fires for | How often |
 |---|---|---|
 | `mur run` | The config file a capsule reads a `gateway.api_key` from, as [`credentials.<NAME>`](config.md#credentials), when its mode grants any group or other permission | Once per launch. A key from the environment or a literal never fires it, and neither does a re-read while the capsule runs |
-| `mur doctor` | Every owner-only entry in [the `~/.murmur` modes table](config.md#murmur-home-permissions) wider than its mode, and every directory wider than `0700` or file wider than `0600` beneath one | Once per path |
+| `mur doctor` | Every owner-only entry in [the `~/.murmur` modes table](config.md#murmur-home-permissions) wider than its mode, and every directory wider than `0700` or file wider than `0600` beneath one — under `formations/`, down to each member's directory only | Once per path |
 
 ```text
 [capsule-runtime] warning[W-SEC-028]: the credential credentials.ANTHROPIC_API_KEY is read from /home/alice/.murmur/config.yaml, which is mode 0644 and readable by other accounts on this host; run `chmod 600 /home/alice/.murmur/config.yaml` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)

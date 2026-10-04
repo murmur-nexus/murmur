@@ -7,22 +7,20 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use common::door_capsule::{driver_home, end_turn, rpc, DRIVER_NAME, DRIVER_VERSION};
-use common::formation::{assert_no_member_remains, launch_lock, session_dirs};
+use common::formation::{
+    assert_no_member_remains, launch_lock, reported_pids, session_dirs, Launcher, LAUNCH_LIMIT,
+};
 use common::{publish_to_store, read_whole_trace, ScriptedServer};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-
-/// How long one launch may take end to end before the test gives up on it.
-const LAUNCH_LIMIT: Duration = Duration::from_secs(240);
 
 /// A reply holding `calls`, one `call-member` tool use per `(member, task)`, in one response.
 fn call_members(calls: &[(&str, &str)]) -> String {
@@ -105,12 +103,15 @@ struct Member {
     entry: bool,
     /// `capabilities.network.allow`, when the member declares one.
     allow: Option<&'static str>,
+    /// `inference.max_turns`, when the member declares one.
+    max_turns: Option<u32>,
     model: Model,
 }
 
 /// A member manifest's body: the fixture driver against `endpoint`, an authenticated door that
-/// serves peers unless it is the entry member, and `allow` as its egress.
-fn manifest(endpoint: &str, entry: bool, allow: Option<&str>) -> String {
+/// serves peers unless it is the entry member, `allow` as its egress and `max_turns` as its turn
+/// limit.
+fn manifest(endpoint: &str, entry: bool, allow: Option<&str>, max_turns: Option<u32>) -> String {
     let lifecycle = if entry {
         "task_acceptance: single\n  after_task: exit"
     } else {
@@ -118,6 +119,9 @@ fn manifest(endpoint: &str, entry: bool, allow: Option<&str>) -> String {
     };
     let capabilities = allow
         .map(|allow| format!("capabilities:\n  network:\n    allow: [{allow}]\n"))
+        .unwrap_or_default();
+    let max_turns = max_turns
+        .map(|turns| format!("  max_turns: {turns}\n"))
         .unwrap_or_default();
     let exports = if entry {
         ""
@@ -130,6 +134,7 @@ fn manifest(endpoint: &str, entry: bool, allow: Option<&str>) -> String {
          {capabilities}\
          lifecycle:\n  {lifecycle}\n\
          inference:\n  transport: http\n  model: test-model\n  driver:\n    artifact: {DRIVER_NAME}\n\
+         {max_turns}\
          {exports}\
          network:\n  authentication:\n    scheme: bearer\n"
     )
@@ -153,7 +158,12 @@ impl Project {
         let store = dir.path().join(".murmur").join("artifacts");
         let mut roster = String::from("roster_version: 1\nmembers:\n");
         for member in &members {
-            let body = manifest(&member.model.server.endpoint, member.entry, member.allow);
+            let body = manifest(
+                &member.model.server.endpoint,
+                member.entry,
+                member.allow,
+                member.max_turns,
+            );
             publish_to_store(&store, member.name, "0.1.0", "capsule", &body, None);
             roster.push_str(&format!(
                 "  - name: {name}\n    capsule: {name}\n    version: 0.1.0\n{entry}",
@@ -209,33 +219,8 @@ impl Project {
             .env_remove(capsule_runtime::FORMATION_CHANNEL_ENV)
             .env_remove(capsule_runtime::delegation_plane::DELEGATION_TIMEOUT_ENV)
             .env_remove("MURMUR_SPAWNER")
-            .envs(env.iter().copied())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        let (line_tx, lines) = mpsc::channel::<String>();
-        let out = child.stdout.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = line_tx.send(line);
-            }
-        });
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&stderr);
-        let err = child.stderr.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                eprintln!("[launcher] {line}");
-                let mut sink = sink.lock().unwrap();
-                sink.push_str(&line);
-                sink.push('\n');
-            }
-        });
-        Launcher {
-            child,
-            lines,
-            stderr,
-        }
+            .envs(env.iter().copied());
+        Launcher::spawn(command)
     }
 
     /// The directory `member` of `formation` runs in.
@@ -262,74 +247,7 @@ impl Project {
 
     /// The operator token the running record of `session_id` holds.
     fn door_token(&self, session_id: &str) -> String {
-        let record = self
-            .home
-            .path()
-            .join(".murmur")
-            .join("running")
-            .join(format!("{session_id}.json"));
-        let record: Value =
-            serde_json::from_str(&std::fs::read_to_string(record).unwrap()).unwrap();
-        record["door_token"].as_str().unwrap().to_string()
-    }
-}
-
-/// A running `mur run --roster`.
-struct Launcher {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    stderr: Arc<Mutex<String>>,
-}
-
-impl Launcher {
-    /// The next stdout line, parsed.
-    fn next_json(&self) -> Value {
-        let line = self
-            .lines
-            .recv_timeout(LAUNCH_LIMIT)
-            .unwrap_or_else(|_| panic!("no stdout line; stderr:\n{}", self.stderr()));
-        serde_json::from_str(&line).unwrap_or_else(|_| panic!("not JSON: {line}"))
-    }
-
-    fn wait(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + LAUNCH_LIMIT;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                panic!("the launcher did not exit; stderr:\n{}", self.stderr());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn stderr(&self) -> String {
-        self.stderr.lock().unwrap().clone()
-    }
-
-    #[allow(unsafe_code)]
-    fn signal(&self, signal: i32) {
-        // SAFETY: `kill` is called with this test's own child's pid and a valid signal number; it
-        // touches no memory.
-        unsafe {
-            libc::kill(self.child.id() as i32, signal);
-        }
-    }
-}
-
-impl Drop for Launcher {
-    fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            self.signal(libc::SIGTERM);
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        common::formation::door_token(self.home.path(), session_id)
     }
 }
 
@@ -356,19 +274,7 @@ fn await_task_start(root: &Path, member: &str) {
     }
 }
 
-/// The pids the formation line and the entry member's readiness line report.
-fn member_pids(formation: &Value, readiness: &Value) -> Vec<u32> {
-    formation["peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|peer| peer["pid"].as_u64())
-        .chain(readiness["pid"].as_u64())
-        .map(|pid| pid as u32)
-        .collect()
-}
-
-// ── S2 ────────────────────────────────────────────────────────────────────────
+// ── Two callees at once ───────────────────────────────────────────────────────
 
 /// Lead calls two members in one response. Both run at once, each with its task in a
 /// `task.md` of its own while lead's stays in the project; both answers come back into lead's
@@ -390,18 +296,21 @@ fn two_callees_work_at_once_each_in_its_own_directory() {
                 name: "lead",
                 entry: true,
                 allow: Some("localhost"),
+                max_turns: None,
                 model: lead,
             },
             Member {
                 name: "worker",
                 entry: false,
                 allow: None,
+                max_turns: None,
                 model: worker,
             },
             Member {
                 name: "reviewer",
                 entry: false,
                 allow: None,
+                max_turns: None,
                 model: reviewer,
             },
         ],
@@ -410,9 +319,9 @@ fn two_callees_work_at_once_each_in_its_own_directory() {
 
     let _lock = launch_lock();
     let mut launcher = project.launch(LEAD_TASK, &[]);
-    let formation = launcher.next_json();
+    let formation = launcher.next_json().1;
     let formation_id = formation["formation_id"].as_str().unwrap().to_string();
-    let readiness = launcher.next_json();
+    let readiness = launcher.next_json().1;
     for peer in formation["peers"].as_array().unwrap() {
         let name = peer["name"].as_str().unwrap();
         let workdir = project.member_dir(&formation_id, name);
@@ -455,12 +364,12 @@ fn two_callees_work_at_once_each_in_its_own_directory() {
 
     assert_no_member_remains(
         project.path(),
-        &member_pids(&formation, &readiness),
+        &reported_pids(&formation, Some(&readiness)),
         Duration::from_secs(30),
     );
 }
 
-// ── S4 ────────────────────────────────────────────────────────────────────────
+// ── A caller with no egress ───────────────────────────────────────────────────
 
 /// A caller whose egress reaches no member's door is warned once at staging, and its call is
 /// refused in the same turn naming the grant, never the door. The callee is never reached.
@@ -477,12 +386,14 @@ fn a_caller_without_egress_is_warned_and_refused() {
                 name: "lead",
                 entry: true,
                 allow: None,
+                max_turns: None,
                 model: lead,
             },
             Member {
                 name: "worker",
                 entry: false,
                 allow: None,
+                max_turns: None,
                 model: worker,
             },
         ],
@@ -491,10 +402,10 @@ fn a_caller_without_egress_is_warned_and_refused() {
 
     let _lock = launch_lock();
     let mut launcher = project.launch("call worker", &[]);
-    let formation = launcher.next_json();
+    let formation = launcher.next_json().1;
     let formation_id = formation["formation_id"].as_str().unwrap().to_string();
     let door = formation["peers"][0]["url"].as_str().unwrap().to_string();
-    let readiness = launcher.next_json();
+    let readiness = launcher.next_json().1;
     let status = launcher.wait();
     assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
 
@@ -516,6 +427,12 @@ fn a_caller_without_egress_is_warned_and_refused() {
     );
 
     let requests = project.model("lead").requests();
+    let raw = common::find_tool_result(&requests, "toolu_call_0").expect("a tool result");
+    assert!(
+        common::extract_result_text(&raw)
+            .starts_with("<untrusted-content source=tool:call-member>\n"),
+        "{raw}"
+    );
     let result = common::tool_result_text(&requests, "toolu_call_0").expect("a tool result");
     assert!(result.contains("\"status\":\"failed\""), "{result}");
     assert!(result.contains("capabilities.network.allow"), "{result}");
@@ -523,6 +440,14 @@ fn a_caller_without_egress_is_warned_and_refused() {
     assert!(
         !result.contains(&door) && !result.contains(&format!(":{port}")),
         "{result}"
+    );
+
+    let lead_session = &session_dirs(&project.path().join(".murmur"))[0];
+    let bootstrap = std::fs::read_to_string(lead_session.join("logs/bootstrap.log")).unwrap();
+    assert_eq!(
+        bootstrap.matches("warning[W-RUN-008]").count(),
+        1,
+        "{bootstrap}"
     );
 
     let lead_trace = project.trace_of(&formation_id, "lead");
@@ -537,12 +462,12 @@ fn a_caller_without_egress_is_warned_and_refused() {
 
     assert_no_member_remains(
         project.path(),
-        &member_pids(&formation, &readiness),
+        &reported_pids(&formation, Some(&readiness)),
         Duration::from_secs(30),
     );
 }
 
-// ── S6 ────────────────────────────────────────────────────────────────────────
+// ── Timed-out and abandoned calls ─────────────────────────────────────────────
 
 /// (a) A callee that does not answer within the shared bound gives lead a `timed_out` answer
 /// that says the callee was not cancelled, and the callee's task is still working. (b) A launcher
@@ -571,12 +496,14 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
                     name: "lead",
                     entry: true,
                     allow: Some("localhost"),
+                    max_turns: None,
                     model: lead,
                 },
                 Member {
                     name: "worker",
                     entry: false,
                     allow: None,
+                    max_turns: None,
                     model: worker,
                 },
             ],
@@ -591,10 +518,10 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
                 "2",
             )],
         );
-        let formation = launcher.next_json();
+        let formation = launcher.next_json().1;
         let formation_id = formation["formation_id"].as_str().unwrap().to_string();
         let peer = &formation["peers"][0];
-        let readiness = launcher.next_json();
+        let readiness = launcher.next_json().1;
 
         // Lead is continued with the timed-out answer while worker is still working.
         project.await_requests("lead", 3);
@@ -629,7 +556,7 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
         assert_eq!(ends[0]["delivered"], true);
         assert_no_member_remains(
             project.path(),
-            &member_pids(&formation, &readiness),
+            &reported_pids(&formation, Some(&readiness)),
             Duration::from_secs(30),
         );
     }
@@ -647,12 +574,14 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
                     name: "lead",
                     entry: true,
                     allow: Some("localhost"),
+                    max_turns: None,
                     model: lead,
                 },
                 Member {
                     name: "worker",
                     entry: false,
                     allow: None,
+                    max_turns: None,
                     model: worker,
                 },
             ],
@@ -661,9 +590,9 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
 
         let _lock = launch_lock();
         let mut launcher = project.launch("call worker", &[]);
-        let formation = launcher.next_json();
+        let formation = launcher.next_json().1;
         let formation_id = formation["formation_id"].as_str().unwrap().to_string();
-        let readiness = launcher.next_json();
+        let readiness = launcher.next_json().1;
         project.await_requests("lead", 2);
         project.await_requests("worker", 1);
         // Lead's attempt has ended; it is waiting on worker.
@@ -673,7 +602,7 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
         assert_eq!(status.code(), Some(143), "stderr:\n{}", launcher.stderr());
         assert_no_member_remains(
             project.path(),
-            &member_pids(&formation, &readiness),
+            &reported_pids(&formation, Some(&readiness)),
             Duration::from_secs(30),
         );
 
@@ -685,4 +614,67 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
         // Every trace the formation wrote parses line by line.
         let _ = project.trace_of(&formation_id, "worker");
     }
+}
+
+/// A lead that ends its last allowed turn with a call still out does not wait for the answer it
+/// has no turn to read: the call is recorded `abandoned`, undelivered, and the formation ends
+/// without waiting out the bound for handed-off work.
+#[test]
+fn a_call_left_out_on_the_last_turn_is_abandoned_without_waiting() {
+    let lead = Model::new(|n| match n {
+        1 => call_members(&[("worker", "take your time")]),
+        _ => end_turn(n, "out of turns"),
+    });
+    let (worker, _never) = Model::held("too late");
+    let project = Project::new(
+        vec![
+            Member {
+                name: "lead",
+                entry: true,
+                allow: Some("localhost"),
+                max_turns: Some(2),
+                model: lead,
+            },
+            Member {
+                name: "worker",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: worker,
+            },
+        ],
+        "reachability:\n  - from: lead\n    to: [worker]\n",
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch(
+        "call worker",
+        &[(
+            capsule_runtime::delegation_plane::DELEGATION_TIMEOUT_ENV,
+            "600",
+        )],
+    );
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    let ended = Instant::now();
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+    assert!(
+        ended.elapsed() < Duration::from_secs(60),
+        "lead waited {:?} for an answer it had no turn to read",
+        ended.elapsed()
+    );
+    assert_eq!(project.model("lead").arrived(), 2);
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 1, "{lead_trace:?}");
+    assert_eq!(ends[0]["status"], "abandoned");
+    assert_eq!(ends[0]["delivered"], false);
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
 }

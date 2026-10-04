@@ -89,14 +89,14 @@ The runtime answers the call in-process: it presents no credential and never rea
 
 `call-member` exists for a member of a formation launched by
 [`mur run --roster`](cli.md#mur-run-roster) when `roster.yaml` lets it call at least one other
-member. A member nobody lets it call, and a session in no formation, has no such tool.
+member. A member the roster lets call nobody, and a session in no formation, has no such tool.
 
 | Aspect | Behaviour |
 |---|---|
 | Input | `{"member": "<name>", "task": "<text>"}`, both required. The schema's `member` is an `enum` of the members this one may call, in roster order |
 | Description | Tells the model that `task` is the whole of what the member is told, so any file content it needs goes in the task text; that the call returns once the member holds the task; and that the answer arrives in the conversation after the turn ends, so it should not wait or poll |
 | Sent | One `message/send` to the member's door, carrying `task` as one text part, the formation token, and the calling task's trust class with origin `peer`. The model never sees the door's address or the token |
-| Egress | The member's door is checked against this capsule's own [`capabilities.network.allow`](manifest.md#network-allow-entries). Doors are served on loopback `http` at a port chosen at launch, so only a bare `localhost` entry reaches them. Without one, every call fails and staging prints [`W-RUN-008`](diagnostics.md#w-run-008) |
+| Egress | The member's door is checked against this capsule's own [`capabilities.network.allow`](manifest.md#network-allow-entries), which must list `localhost` — see [Giving a member work](roster.md#member-calls). Without it, every call fails and staging prints [`W-RUN-008`](diagnostics.md#w-run-008) |
 | Trace | [`member_call_start`](observability-schemas.md#member-call-start) when the member holds the task, and one [`member_call`](observability-schemas.md#member-call) per call once it is accounted for |
 
 ### What a call returns { #call-member-result }
@@ -108,12 +108,16 @@ A call ends its tool call in one of two ways:
 | `passed`, summary `Called <member>: started` | The member's door answered with a task id and a state that is not terminal | `{"call_id": "mcl_…", "member": "<name>", "status": "started", "task_id": "<the member's task id>"}` |
 | `failed`, summary `Called <member>: failed` | The call was refused, the door could not be reached, the door answered an error status or a JSON-RPC error, or the member answered with a terminal state such as `rejected` | `{"call_id": "mcl_…", "member": "<name>", "status": "failed", "output": "<why>"}` |
 
-A `member` the roster does not let this capsule call is refused as a tool error naming the members
-it may call, and nothing is sent.
+Two calls are refused as a tool error, with nothing sent:
+
+| Call | Error |
+|---|---|
+| A `member` the roster does not let this capsule call | Names the members it may call |
+| A call made while no task is running | Says the tool is answered only while a task runs |
 
 ### How the answer arrives { #call-member-answer }
 
-1. The model ends its turn.
+1. The model ends its turn with a turn still left.
 2. If no answer has arrived yet, the task's stream shows a `working` status
    `waiting on call-member: <n> call(s) outstanding`, and the task waits.
 3. Once at least one answer has arrived, the task continues with one new user message holding
@@ -139,11 +143,19 @@ WORKER-0123
 
 Output is cut at 64 KiB. Continuing with answers is not a reopen: it spends no
 [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle), writes no `task_reopened`, and runs
-before the task's `on-task-end` hooks. The task's turns stay bounded by `inference.max_turns`; a
-task with no turn left ends as its attempt ended, and the answers are recorded undelivered.
+before the task's `on-task-end` hooks. Its turns count against
+[`inference.max_turns`](manifest.md#field-inference).
 
-A task that ends any other way — failed, cancelled, out of turns, or stopped by `SIGTERM` or its
-formation ending — leaves its outstanding calls behind: each is recorded `abandoned`.
+The task waits for answers only when the model ends a turn with a turn still left. Every other ending accounts for the task's calls at once, and
+the task ends as its attempt ended:
+
+| The attempt | Calls still outstanding | Answers that arrived |
+|---|---|---|
+| The model ends a turn with a turn left | Waited for, as above | Delivered in the continuation |
+| The model ends its last allowed turn | Not waited for: each is recorded `abandoned` | Recorded `delivered: false` |
+| Fails, runs out of turns, is cancelled, or is stopped by `SIGTERM` or its formation ending | Each is recorded `abandoned` | Recorded `delivered: false` |
+
+A task cancelled while it waits ends `canceled`.
 
 | Bound | Value |
 |---|---|

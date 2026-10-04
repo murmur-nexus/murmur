@@ -527,6 +527,12 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     let third = lead_requests[2].to_string();
     let fenced = format!("<untrusted-content source=member:worker>\\nWORKER-{nonce}");
     assert!(third.contains(&fenced), "{third}");
+    assert!(
+        third.contains(&format!(
+            "[call-member] call {call_id} to worker ended completed"
+        )),
+        "{third}"
+    );
 
     // Nothing real about the door, and no token, in any request, tool result or trace line.
     let port = door.rsplit(':').next().unwrap();

@@ -215,12 +215,27 @@ impl HomeEntryKind {
         matches!(self, Self::CompiledForms)
     }
 
-    /// Whether the entry, and everything beneath it, is expected to be owner-only.
+    /// Whether the entry, and everything beneath it down to [`Self::private_depth`], is expected
+    /// to be owner-only.
     pub fn expected_private(&self) -> bool {
         !matches!(
             self,
             Self::Artifacts | Self::BinaryCache | Self::Unrecognised(_)
         )
+    }
+
+    /// How many directory levels below the entry the audit holds owner-only, or `None` for every
+    /// level.
+    ///
+    /// `formations/<frm_id>/<member>/` is held at two: the launcher makes those directories
+    /// owner-only, and below them is a member's ordinary working directory, whose sessions are
+    /// written at the umask's modes like any `--workdir`. The owner-only member directory is what
+    /// keeps them from other accounts, so walking further reports every file a session writes.
+    pub fn private_depth(&self) -> Option<usize> {
+        match self {
+            Self::Formations => Some(2),
+            _ => None,
+        }
     }
 }
 
@@ -340,7 +355,12 @@ fn report_entry(path: PathBuf, kind: HomeEntryKind) -> HomeEntryReport {
     let mut omitted = 0;
     // The home's own entries are reported one by one, so only an entry below it is walked.
     if private && file_type.is_dir() && kind != HomeEntryKind::Home {
-        collect_wide_descendants(&path, &mut wide_descendants, &mut omitted);
+        collect_wide_descendants(
+            &path,
+            kind.private_depth(),
+            &mut wide_descendants,
+            &mut omitted,
+        );
     }
 
     HomeEntryReport {
@@ -355,9 +375,18 @@ fn report_entry(path: PathBuf, kind: HomeEntryKind) -> HomeEntryReport {
     }
 }
 
-fn collect_wide_descendants(dir: &Path, found: &mut Vec<WideEntry>, omitted: &mut usize) {
+/// Wide paths beneath `dir`, `depth` levels down, or every level for `None`.
+fn collect_wide_descendants(
+    dir: &Path,
+    depth: Option<usize>,
+    found: &mut Vec<WideEntry>,
+    omitted: &mut usize,
+) {
     use std::os::unix::fs::PermissionsExt;
 
+    if depth == Some(0) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -385,7 +414,7 @@ fn collect_wide_descendants(dir: &Path, found: &mut Vec<WideEntry>, omitted: &mu
             }
         }
         if file_type.is_dir() {
-            collect_wide_descendants(&path, found, omitted);
+            collect_wide_descendants(&path, depth.map(|depth| depth - 1), found, omitted);
         }
     }
 }
@@ -605,8 +634,9 @@ mod tests {
             .all(|report| report.state == HomeEntryState::Absent));
     }
 
-    /// `formations/` holds members' working directories: known, owner-only to the last
-    /// descendant, and never offered for deletion.
+    /// `formations/` holds members' working directories: known, owner-only down to each member's
+    /// directory, and never offered for deletion. What a member's sessions write beneath its
+    /// directory, at the umask's modes, is not reported.
     #[test]
     fn murmur_home_audit_knows_formations_as_owner_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -615,6 +645,13 @@ mod tests {
         wide_dir(&home.join("formations"), 0o700);
         wide_dir(&home.join("formations/frm_x"), 0o700);
         wide_dir(&home.join("formations/frm_x/worker"), 0o755);
+        wide_dir(&home.join("formations/frm_x/worker/.murmur/ses_1"), 0o775);
+        wide_file(
+            &home.join("formations/frm_x/worker/.murmur/ses_1/trace.jsonl"),
+            "{}\n",
+            0o664,
+        );
+        wide_file(&home.join("formations/frm_x/worker/task.md"), "t", 0o664);
 
         let report = audit_murmur_home(&home)
             .into_iter()

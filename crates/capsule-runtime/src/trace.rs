@@ -3709,19 +3709,11 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
-    /// Records one `call-member` call's ending. `member_task_id` is `None` for a call the callee
-    /// never held.
-    #[allow(clippy::too_many_arguments)]
+    /// Records one `call-member` call's ending, and whether its outcome reached the calling task.
     pub(crate) async fn write_member_call(
         &self,
         task_id: &str,
-        call_id: &str,
-        member: &str,
-        member_task_id: Option<&str>,
-        status: &str,
-        duration_ms: u64,
-        output: &str,
-        truncated: bool,
+        outcome: &crate::member_call::MemberCallOutcome,
         delivered: bool,
     ) {
         let event = MemberCallEvent {
@@ -3731,13 +3723,13 @@ impl ResourceTraceAppender {
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             task_id: task_id.to_string(),
-            call_id: call_id.to_string(),
-            member: member.to_string(),
-            member_task_id: member_task_id.map(str::to_string),
-            status: status.to_string(),
-            duration_ms,
-            output: output.to_string(),
-            truncated,
+            call_id: outcome.call_id.clone(),
+            member: outcome.member.clone(),
+            member_task_id: outcome.member_task_id.clone(),
+            status: outcome.status.as_str().to_string(),
+            duration_ms: outcome.duration_ms,
+            output: outcome.output.clone(),
+            truncated: outcome.truncated,
             delivered,
         };
         self.append(&event).await;

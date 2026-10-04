@@ -352,11 +352,12 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
     let failed = wait_terminal(&coder.addr, &planner, &failed_id);
     assert_eq!(failed["result"]["status"]["state"], "failed", "{failed}");
     assert!(failed["result"].get("artifacts").is_none(), "{failed}");
-    let reason = message_of(&failed)["parts"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(!reason.is_empty(), "{failed}");
+    // The final status a task whose driver response could not be read ends with.
+    assert_eq!(
+        message_of(&failed)["parts"][0]["text"],
+        "session ended",
+        "{failed}"
+    );
 
     // Another member reads neither task, and is told what an unknown id is told.
     let unknown = rpc(

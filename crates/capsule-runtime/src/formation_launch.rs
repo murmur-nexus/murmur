@@ -883,13 +883,6 @@ pub(crate) fn entry_args(member: &PlannedMember, options: &FormationLaunchOption
     args
 }
 
-/// A peer's accessible directory: `<murmur home>/formations/<frm_id>/<member>`.
-///
-/// Resolved from `HOME` without creating anything. The `Err` is `HOME` being unset or relative.
-pub fn member_workdir(formation_id: &FormationId, member: &str) -> Result<PathBuf, String> {
-    Ok(formations_dir()?.join(formation_id.as_str()).join(member))
-}
-
 /// `<murmur home>/formations`, resolved without creating anything.
 fn formations_dir() -> Result<PathBuf, String> {
     Ok(crate::state_store::murmur_home_dir()?.join(FORMATIONS_DIR))
@@ -2297,20 +2290,21 @@ mod tests {
         }
     }
 
-    /// The roots `mur trace show frm_<id>` searches: one `.murmur` per member directory that has
-    /// one, sorted, and none for a formation with no directory.
+    /// A member's directory is `formations/<frm_id>/<member>`, and the roots `mur trace show
+    /// frm_<id>` searches are one `.murmur` per member directory that has one, sorted, and none for
+    /// a formation with no directory.
     #[test]
-    fn member_workdir_names_the_formation_and_the_member() {
-        let id = FormationId::mint();
-        if let Ok(workdir) = member_workdir(&id, "worker") {
-            assert!(workdir.ends_with(Path::new(FORMATIONS_DIR).join(id.as_str()).join("worker")));
-        }
+    fn member_roots_are_the_member_directories_that_hold_sessions() {
         assert!(formation_member_roots(&FormationId::mint()).is_empty());
 
+        let id = FormationId::mint();
         let home = tempfile::tempdir().unwrap();
         let formations = home.path().join(FORMATIONS_DIR);
         for member in ["worker", "reviewer", "idle"] {
-            make_member_workdir(&formations, &id, member).unwrap();
+            assert_eq!(
+                make_member_workdir(&formations, &id, member).unwrap(),
+                formations.join(id.as_str()).join(member)
+            );
         }
         for member in ["worker", "reviewer"] {
             std::fs::create_dir(formations.join(id.as_str()).join(member).join(".murmur")).unwrap();

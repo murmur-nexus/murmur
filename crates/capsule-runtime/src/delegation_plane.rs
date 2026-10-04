@@ -182,18 +182,14 @@ impl DelegationResult {
     /// child's process never started. A delegation id is minted by the launcher, so neither has
     /// one to report.
     fn unmade(request: &DelegationRequest, status: DelegationStatus, reason: String) -> Self {
-        let truncated = reason.len() > MAX_OUTPUT_BYTES;
+        let (output, truncated) = bounded(reason);
         Self {
             delegation_id: String::new(),
             session_id: String::new(),
             capsule: request.capsule.clone(),
             version: request.version.clone(),
             status,
-            output: if truncated {
-                bound_output(reason)
-            } else {
-                reason
-            },
+            output,
             result_path: None,
             truncated,
             child_workdir: None,
@@ -595,18 +591,14 @@ impl DelegationPlane {
 
         let child_workdir = self.workdir_relative(&child.workdir);
         let failed = |session_id: &str, output: String| {
-            let truncated = output.len() > MAX_OUTPUT_BYTES;
+            let (output, truncated) = bounded(output);
             DelegationResult {
                 delegation_id: delegation_id.clone(),
                 session_id: session_id.to_string(),
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
                 status: DelegationStatus::Failed,
-                output: if truncated {
-                    bound_output(output)
-                } else {
-                    output
-                },
+                output,
                 result_path: None,
                 truncated,
                 child_workdir: None,
@@ -718,18 +710,14 @@ impl DelegationPlane {
         // [`MAX_OUTPUT_BYTES`] bounds every branch. A child's *failure* message is as much its own
         // text as its answer is, so it is cut on the same terms.
         let outcome = |status, session_id: &str, output: String| {
-            let truncated = output.len() > MAX_OUTPUT_BYTES;
+            let (output, truncated) = bounded(output);
             DelegationResult {
                 delegation_id: delegation_id.clone(),
                 session_id: session_id.to_string(),
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
                 status,
-                output: if truncated {
-                    bound_output(output)
-                } else {
-                    output
-                },
+                output,
                 result_path: None,
                 truncated,
                 child_workdir: None,
@@ -939,8 +927,18 @@ fn read_child_result(
         .find_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
 }
 
+/// `(output, truncated)`, with `output` cut by [`bound_output`] when it is over
+/// [`MAX_OUTPUT_BYTES`].
+pub(crate) fn bounded(output: String) -> (String, bool) {
+    if output.len() > MAX_OUTPUT_BYTES {
+        (bound_output(output), true)
+    } else {
+        (output, false)
+    }
+}
+
 /// `output` cut to [`MAX_OUTPUT_BYTES`] at a character boundary, with the cut marked.
-pub(crate) fn bound_output(output: String) -> String {
+fn bound_output(output: String) -> String {
     let mut end = MAX_OUTPUT_BYTES;
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;

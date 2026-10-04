@@ -248,7 +248,7 @@ section of this reference.
 | [`inference.system_prompt`](manifest.md#field-inference) | Names the member and the formation, and the hand-off: give the task to `worker` with [`call-member`](runtime-provided-tools.md#call-member), end the turn while it works, and answer with the result when its answer arrives | One sentence naming the member and the formation |
 | [`lifecycle.task_acceptance`](manifest.md#field-lifecycle) | `single`: the formation's one task | `queue` |
 | [`lifecycle.after_task`](manifest.md#field-lifecycle) | `exit`, which stops the formation | `sleep`: it waits at its door while the formation runs |
-| [`capabilities.network.allow`](manifest.md#field-capabilities) | `[localhost]`: a roster rule grants no egress, and `call-member` reaches `worker`'s door, served on loopback `http` at a port chosen at launch, only through this entry | Absent: `worker` declares no `capabilities` |
+| [`capabilities.network.allow`](manifest.md#field-capabilities) | `[localhost]`, the entry through which `call-member` reaches `worker`'s door — see [Giving a member work](roster.md#member-calls) | Absent: `worker` declares no `capabilities` |
 | [`exports.peer_tasks.accept`](manifest.md#field-exports-peer-tasks) | Absent: `lead` serves no peer | `true`, because the rule calls `worker` |
 | [`network.authentication.scheme`](manifest.md#field-network-authentication) | `bearer`, because a roster with a rule needs every member's door authenticated | `bearer` |
 
@@ -914,6 +914,7 @@ Murmur home (/home/alice/.murmur)
   artifacts: 0755  installed artifacts
   compiled: 0700  compiled WASM cache, safe to delete, expected owner-only
   bin: absent  cached mur binaries
+  formations: 0700  formation members' working directories, expected owner-only
   nexus-config.json: 0644  something not recognised by this build
 ```
 
@@ -922,7 +923,7 @@ Murmur home (/home/alice/.murmur)
 | `<name>: <mode>` | The entry's permission bits. `.` is `~/.murmur` itself |
 | `<name>: absent` | Nothing exists at that name |
 | `<name>: unreadable (<error>)` | The entry exists and its metadata could not be read |
-| `expected owner-only` | The entry is held at the mode in [`~/.murmur` modes](config.md#murmur-home-permissions), and so is everything beneath it |
+| `expected owner-only` | The entry is held at the mode in [`~/.murmur` modes](config.md#murmur-home-permissions), and so is everything beneath it. Under `formations`, only the `<frm_id>/` and `<member>/` levels are held: what a member's sessions write inside its owner-only member directory is not reported |
 | `wider than <mode>: <path> is <mode>` | A directory beneath an owner-only entry wider than `0700`, or a file wider than `0600`. At most 20 are listed per entry, then `and N more wider than expected` |
 
 Each owner-only entry wider than expected, and each path listed beneath one, also prints
@@ -2032,7 +2033,7 @@ mur trace show <formation-id> [--workdir <dir>]
 | Argument / Flag | Default | Description |
 |---|---|---|
 | `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), or a formation id (`frm_…`), which prints only the [Formation section](#mur-trace-show-formation) |
-| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories. With a formation id, the first root searched — see [Listing a formation](#mur-trace-show-formation) |
 | `--body` | — | Print the body behind one hash and nothing else. Selectors below |
 | `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name. Required with those four, invalid without `--body` |
 
@@ -2069,13 +2070,25 @@ Output sections, in the order they are printed:
 #### Listing a formation { #mur-trace-show-formation }
 
 `mur trace show <formation-id>` lists every session whose trace names that formation, by session
-id, with how each ended. It searches `--workdir` first, then each peer's session root under
-`~/.murmur/formations/<formation-id>/` — see [Member directories](roster.md#member-directories). A
-member's own `mur trace show` prints the same section, searching the session root it is in first.
+id, with how each ended. It searches these session roots, in order:
+
+| `--workdir` | Roots searched |
+|---|---|
+| Not given | `./workdir`, then `./.murmur`, then each peer's session root under `~/.murmur/formations/<formation-id>/` |
+| Given | That directory, then each peer's session root under `~/.murmur/formations/<formation-id>/` |
+
+The entry member records under the roster's directory, so run the command from that directory, or
+pass `--workdir <roster directory>/.murmur`. Each peer's session root is
+`~/.murmur/formations/<formation-id>/<member>/.murmur` — see
+[Member directories](roster.md#member-directories). A member's own `mur trace show` prints the same
+section, searching the session root it is in and then each peer's session root.
+
+Run from the roster's directory `/home/me/project`:
 
 ```text
 ── Formation ────────────────────────────────────
 formation:  frm_019f01a93ff27c1e9a3b5d0c4e8f2a61
+searched:   /home/me/project/workdir
 searched:   /home/me/project/.murmur
 searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/writer/.murmur
 ses_019f01a940ce7761854e768ecbe3d399  researcher@0.1.0          ok
@@ -2087,7 +2100,7 @@ delegated children not under these roots: 1 — `mur trace show <member>` names 
 | Row | Carries |
 |---|---|
 | `formation:` | The formation id |
-| `searched:` | One line per session root searched, in the order searched. A peer's root that could not be listed ends `could not be read: <why>`, and fails nothing |
+| `searched:` | One line per session root searched, in the order searched, whether or not it exists. A root after the first that could not be listed ends `could not be read: <why>`, and fails nothing |
 | One per member | Session id, `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to |
 | `delegated children not under these roots` | Members' delegated children whose traces are in another session root. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
 
@@ -2105,7 +2118,7 @@ A member killed before it wrote `session_end` cannot be summarized on its own. I
 formation and the command that lists it:
 
 ```text
-error[E-TRC-001]: /home/me/project/workdir/ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0/trace.jsonl: no session_end event found; this session is a member of formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61 — `mur trace show frm_019f01a93ff27c1e9a3b5d0c4e8f2a61` lists the formation
+error[E-TRC-001]: /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/writer/.murmur/ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0/trace.jsonl: no session_end event found; this session is a member of formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61 — `mur trace show frm_019f01a93ff27c1e9a3b5d0c4e8f2a61` lists the formation
 ```
 
 #### Printing one recorded body { #mur-trace-show-body }

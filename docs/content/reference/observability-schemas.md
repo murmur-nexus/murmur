@@ -564,7 +564,7 @@ called [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running
 |---|---|---|
 | `task_id` | string | The task that was stopped |
 | `turn` | u32 | The turn that was in flight, 0-based. Absent for a task cancelled before it ran |
-| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"harness"` — which wait the cancel interrupted. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted |
+| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"member_call"` \| `"harness"` — which wait the cancel interrupted. `"member_call"` is a wait on a [`call-member`](runtime-provided-tools.md#call-member) call: reaching the member's door, or waiting for its answer. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted |
 | `detached_work_ids` | array of string | Demoted shell commands still running when the loop stopped |
 | `delegation_ids` | array of string | Delegations still in flight when the loop stopped |
 
@@ -660,14 +660,14 @@ delivered to the calling task, or left behind when that task ended
 | `duration_ms` | u64 | From the tool call to this outcome |
 | `output` | string | The member's answer for `completed`, its task's status message for `failed`, `canceled` and `rejected`, or why the call ended otherwise. At most 64 KiB and a cut marker |
 | `truncated` | bool | Whether `output` was cut |
-| `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that never started, as a continuation for one that did |
+| `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that failed to start, as a continuation for one that started. `false` for every `abandoned` call, and for an answer that arrived when the task did not wait for it — see [How the answer arrives](runtime-provided-tools.md#call-member-answer) |
 
 | `status` | Meaning |
 |---|---|
 | `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state. `failed` is also a call that never started, with no `member_task_id` |
 | `timed_out` | The member had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); its task was not cancelled |
 | `unreachable` | The member's door stopped answering |
-| `abandoned` | The calling task ended before the answer arrived. Always `delivered: false` |
+| `abandoned` | The calling task ended before the answer arrived, or was cancelled while the member's door was being reached, in which case there is no `member_task_id`. Always `delivered: false` |
 
 Neither line carries the member's door address or a token.
 
@@ -1088,13 +1088,13 @@ A formation member's id is recorded in two places:
 | The first line of the member's `trace.jsonl` | `session_start.formation_id` | As long as the trace is kept |
 | The member's [running-capsule record](cli.md#running-capsule-records) | `formation_id` | While the session runs |
 
-[`mur trace show <formation-id>`](cli.md#mur-trace-show-formation) reconstructs a formation from one
-session root: it reads the first line of each session's trace, and for each member reads on to its
-`session_end`. A member with no `session_end` — killed, or still running — is listed as
-`no session_end`. A session whose first line is not a `session_start` is no member. The command
-searches only the root it is given and does not follow `delegation_start` lines into other roots; it
-counts a member's children found elsewhere, and the member's own `mur trace show` names each child's
-trace. [`mur ps`](cli.md#mur-ps-formations) reads the same lines to account for members it does not
+[`mur trace show <formation-id>`](cli.md#mur-trace-show-formation) reconstructs a formation from
+the session roots it searches: it reads the first line of each
+session's trace, and for each member reads on to its `session_end`. A member with no `session_end`
+— killed, or still running — is listed as `no session_end`. A session whose first line is not a
+`session_start` is no member. The command does not follow `delegation_start` lines into other
+roots; it counts a member's children found elsewhere, and the member's own `mur trace show` names
+each child's trace. [`mur ps`](cli.md#mur-ps-formations) reads the same lines to account for members it does not
 list.
 
 A member that wound down because its formation ended carries one

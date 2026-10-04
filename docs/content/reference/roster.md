@@ -364,13 +364,16 @@ done
 
 A member's agent calls another member with the runtime-provided
 [`call-member`](runtime-provided-tools.md#call-member) tool, which exists exactly when this roster
-lets it call someone. It names the member and states the task in full:
+lets it call someone. A call is made from a running task, and names the member and states the task
+in full:
 
 1. The member's door gets the task as a `message/send`, carrying the caller's formation token. The
    tool call returns as soon as the door holds the task.
 2. The member runs it in its own directory, as any task at its door.
-3. When the caller's turn ends, its runtime waits for the answer, then continues the caller's same
-   task with it, fenced under `member:<name>`.
+3. When the caller's turn ends with an [`inference.max_turns`](manifest.md#field-inference) turn
+   still left, the caller's same task waits for the answer and continues with it, fenced under
+   `member:<name>`. A task with no turn left does not wait — see
+   [How the answer arrives](runtime-provided-tools.md#call-member-answer).
 
 The call reaches the member's real door only if the caller's own
 [`capabilities.network.allow`](manifest.md#network-allow-entries) does. A door is served on
@@ -386,8 +389,8 @@ capabilities:
 A member the roster lets call others, whose grant reaches no such door, prints
 [`W-RUN-008`](diagnostics.md#w-run-008) at launch, and every call it makes fails.
 
-The answer is read from the member's [`tasks/get`](agent-card.md#tasks-get), which shows a member
-only the tasks it submitted itself.
+The caller's runtime reads the answer from the member's [`tasks/get`](agent-card.md#tasks-get).
+On a formation token, `tasks/get` answers only the tasks the calling member submitted.
 
 ### What each member learns { #enforcement-learns }
 
