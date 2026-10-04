@@ -2,9 +2,9 @@
 //! which.
 //!
 //! This module parses the file's shape and nothing else. Whether two members share a name, whether
-//! exactly one is the entry member, whether a rule names a member that exists, and everything about
-//! the capsules the members name are decided by admission in `capsule-runtime`, which reads the
-//! stores.
+//! exactly one is the entry member, whether a rule names a member that exists or calls the entry
+//! member, and everything about the capsules the members name are decided by admission in
+//! `capsule-runtime`, which reads the stores.
 //!
 //! The parse is strict: a key this build does not know is a refusal, not a `W-SEC-019` warning. A
 //! roster authorizes peer traffic, so a misspelt `reachability` must not read as a closed roster.
@@ -36,7 +36,8 @@ const TOP_LEVEL_KEYS: &[&str] = &["roster_version", "members", "reachability"];
 const MEMBER_KEYS: &[&str] = &["name", "capsule", "version", "entry"];
 const RULE_KEYS: &[&str] = &["from", "to"];
 
-/// The `reachability` string that expands to every pair of members that both serve peers.
+/// The `reachability` string that expands to every pair of members that both serve peers, except
+/// pairs into the entry member, which admission never makes.
 pub const REACHABILITY_ALL: &str = "all";
 
 /// Resolve the roster path for a project directory.

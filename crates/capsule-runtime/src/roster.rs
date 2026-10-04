@@ -11,11 +11,12 @@
 //! 1. member names are unique;
 //! 2. exactly one member is the entry member;
 //! 3. every rule's `from` and `to` names a member;
-//! 4. each member resolves, its packed manifest parses, and `murmur.lock` agrees with it;
-//! 5. every member an explicit rule calls serves peers;
-//! 6. when any edge exists, every member's door requires authentication.
+//! 4. no rule calls the entry member;
+//! 5. each member resolves, its packed manifest parses, and `murmur.lock` agrees with it;
+//! 6. every member an explicit rule calls serves peers;
+//! 7. when any edge exists, every member's door requires authentication.
 //!
-//! Checks 1–3 read no store, so a structurally broken roster is refused without a lookup. Within a
+//! Checks 1–4 read no store, so a structurally broken roster is refused without a lookup. Within a
 //! check, members are taken in roster order.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -104,6 +105,13 @@ pub enum RosterRefusal {
          member of this roster"
     )]
     UnknownMemberInRule { from: String, unknown: String },
+    /// `from` is the offending rule's own `from`; `entry` is the entry member's name.
+    #[error(
+        "{ROSTER_FILENAME}: the reachability rule from '{from}' lists the entry member '{entry}' \
+         in `to`, but the entry member is never called: it runs the formation's own task from \
+         launch until the formation ends"
+    )]
+    RuleCallsEntryMember { from: String, entry: String },
     /// `coordinate` is `capsule@version`.
     #[error("{ROSTER_FILENAME}: member '{member}' ({coordinate}) cannot be admitted: {reason}")]
     MemberUnresolvable {
@@ -159,7 +167,9 @@ impl AdmittedRoster {
         self.members.iter().find(|member| member.name == name)
     }
 
-    /// The member that receives the formation's task. It has no edge it did not declare.
+    /// The member that receives the formation's task. No edge ever leads into it: admission
+    /// refuses a rule that lists it in `to`, and `all` never pairs it as a callee. Its outgoing
+    /// edges come from rules, or from `all` when it serves peers.
     #[must_use]
     pub fn entry(&self) -> &AdmittedMember {
         &self.members[self.entry]
@@ -171,7 +181,8 @@ impl AdmittedRoster {
         &self.reachability
     }
 
-    /// Every edge, without repeats, ordered by the roster index of `from` and then of `to`.
+    /// Every edge, without repeats, ordered by the roster index of `from` and then of `to`. No
+    /// edge's `to` is the entry member.
     #[must_use]
     pub fn edges(&self) -> &[RosterEdge] {
         &self.edges
@@ -185,7 +196,7 @@ impl AdmittedRoster {
             .any(|edge| edge.from == from && edge.to == to)
     }
 
-    /// The members `from` may call, in roster order.
+    /// The members `from` may call, in roster order. The entry member is never among them.
     pub fn callees<'a>(&'a self, from: &'a str) -> impl Iterator<Item = &'a AdmittedMember> + 'a {
         self.edges
             .iter()
@@ -273,6 +284,13 @@ pub fn admit_roster(
                 }
             }
         }
+        let entry_name = &roster.members[entry].name;
+        if let Some(rule) = rules.iter().find(|rule| rule.to.contains(entry_name)) {
+            return Err(RosterRefusal::RuleCallsEntryMember {
+                from: rule.from.clone(),
+                entry: entry_name.clone(),
+            });
+        }
     }
 
     let platform = current_platform();
@@ -334,6 +352,7 @@ pub fn admit_roster(
 
     let pairs: BTreeSet<(usize, usize)> = match &roster.reachability {
         RosterReachability::Closed => BTreeSet::new(),
+        // The entry member calls under `all` when it serves peers, but is never called.
         RosterReachability::All => {
             let serving: Vec<usize> = members
                 .iter()
@@ -346,7 +365,7 @@ pub fn admit_roster(
                 .flat_map(|from| {
                     serving
                         .iter()
-                        .filter(move |to| *to != from)
+                        .filter(move |to| *to != from && **to != entry)
                         .map(move |to| (*from, *to))
                 })
                 .collect()
@@ -635,7 +654,8 @@ mod tests {
             reachability: RosterReachability::All,
         };
         let admitted = admit_roster(&roster, &store, None).unwrap();
-        assert_eq!(edges(&admitted), [("a", "b"), ("b", "a")]);
+        // `a` is the entry member: it calls `b`, and nothing calls it.
+        assert_eq!(edges(&admitted), [("a", "b")]);
         assert!(matches!(admitted.reachability(), RosterReachability::All));
 
         // `a` stops serving: `all` expands to nothing, and nothing then needs authentication.
@@ -712,6 +732,132 @@ mod tests {
                 unknown: "ghost".to_string()
             }
         );
+    }
+
+    #[test]
+    fn a_rule_calling_the_entry_member_is_refused_naming_both() {
+        let mut f = formation();
+        f.roster.reachability = RosterReachability::Rules(vec![
+            rule("planner", &["coder", "reviewer"]),
+            rule("reviewer", &["coder", "planner"]),
+        ]);
+        assert_eq!(
+            refusal(&f.roster, &f.store, None),
+            RosterRefusal::RuleCallsEntryMember {
+                from: "reviewer".to_string(),
+                entry: "planner".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn the_first_rule_calling_the_entry_member_in_file_order_is_named() {
+        let mut f = formation();
+        f.roster.reachability = RosterReachability::Rules(vec![
+            rule("planner", &["coder"]),
+            rule("coder", &["reviewer", "planner"]),
+            rule("reviewer", &["planner"]),
+        ]);
+        assert_eq!(
+            refusal(&f.roster, &f.store, None),
+            RosterRefusal::RuleCallsEntryMember {
+                from: "coder".to_string(),
+                entry: "planner".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_rule_calling_the_entry_member_is_refused_before_any_lookup() {
+        let empty = tempfile::tempdir().unwrap();
+        let empty_store = LocalRegistry::new(empty.path());
+        let mut f = formation();
+        f.roster.reachability =
+            RosterReachability::Rules(vec![rule("reviewer", &["coder", "planner"])]);
+        assert_eq!(
+            refusal(&f.roster, &empty_store, None),
+            RosterRefusal::RuleCallsEntryMember {
+                from: "reviewer".to_string(),
+                entry: "planner".to_string()
+            }
+        );
+
+        // An entry member that does not serve peers is still refused as the entry member, not as
+        // a callee that does not serve.
+        install(
+            &f.store,
+            "planner",
+            "0.3.0",
+            &manifest("planner", "0.3.0", false, true),
+        );
+        assert_eq!(
+            refusal(&f.roster, &f.store, None),
+            RosterRefusal::RuleCallsEntryMember {
+                from: "reviewer".to_string(),
+                entry: "planner".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_rule_name_is_refused_before_a_rule_calling_the_entry_member() {
+        let mut f = formation();
+        for rules in [
+            vec![rule("ghost", &["coder"]), rule("reviewer", &["planner"])],
+            vec![rule("reviewer", &["planner"]), rule("coder", &["ghost"])],
+        ] {
+            f.roster.reachability = RosterReachability::Rules(rules);
+            assert!(matches!(
+                refusal(&f.roster, &f.store, None),
+                RosterRefusal::UnknownMemberInRule { unknown, .. } if unknown == "ghost"
+            ));
+        }
+    }
+
+    #[test]
+    fn no_admitted_edge_ever_leads_into_the_entry_member() {
+        let mut f = formation();
+        let reachabilities = [
+            RosterReachability::All,
+            f.roster.reachability.clone(),
+            RosterReachability::Rules(vec![
+                rule("reviewer", &["coder", "coder"]),
+                rule("planner", &["reviewer", "coder"]),
+                rule("planner", &["coder"]),
+            ]),
+            RosterReachability::Rules(vec![
+                rule("planner", &["coder"]),
+                rule("reviewer", &["coder"]),
+            ]),
+        ];
+        for reachability in reachabilities {
+            f.roster.reachability = reachability;
+            let admitted = admit_roster(&f.roster, &f.store, None).unwrap();
+            let entry = admitted.entry().name.clone();
+            assert!(admitted.declares_peer_traffic());
+            assert!(
+                admitted.edges().iter().all(|edge| edge.to != entry),
+                "{:?}",
+                admitted.edges()
+            );
+            for member in admitted.members() {
+                assert!(admitted.callees(&member.name).all(|callee| !callee.entry));
+            }
+        }
+
+        // Under `all`, whichever member is the entry member calls every other and is never called.
+        f.roster.reachability = RosterReachability::All;
+        for entry in 0..f.roster.members.len() {
+            for (index, member) in f.roster.members.iter_mut().enumerate() {
+                member.entry = index == entry;
+            }
+            let admitted = admit_roster(&f.roster, &f.store, None).unwrap();
+            let entry = admitted.entry().name.as_str();
+            let pairs = edges(&admitted);
+            assert_eq!(pairs.len(), 4, "{pairs:?}");
+            assert!(pairs.iter().all(|(_, to)| *to != entry), "{pairs:?}");
+            assert_eq!(pairs.iter().filter(|(from, _)| *from == entry).count(), 2);
+        }
     }
 
     #[test]
@@ -897,6 +1043,10 @@ mod tests {
             RosterRefusal::UnknownMemberInRule {
                 from: "a".into(),
                 unknown: "b".into(),
+            },
+            RosterRefusal::RuleCallsEntryMember {
+                from: "a".into(),
+                entry: "b".into(),
             },
             RosterRefusal::MemberUnresolvable {
                 member: "a".into(),

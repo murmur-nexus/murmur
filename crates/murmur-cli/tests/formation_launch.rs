@@ -1387,11 +1387,11 @@ fn refusals_before_anything_starts() {
     project.assert_no_member_remains(&[], Duration::from_secs(1));
 }
 
-/// An edge into the entry member is named once, `W-RUN-006`, and served to nobody: `coder` is
-/// refused `planner` exactly as it is refused a name that is no member, and is handed no
-/// credential for it. Everything else is as in the chain.
+/// An edge into the entry member is refused at admission, `E-ROS-008`, naming the rule's caller
+/// and the entry member, with the turned-around edge as the fix. Nothing starts, nothing is
+/// minted and nothing is written.
 #[test]
-fn an_edge_into_the_entry_member_warns_once_and_is_not_served() {
+fn an_edge_into_the_entry_member_is_refused_before_anything_starts() {
     let _lock = launch_lock();
     let project = Project::with_probes(
         &[CODER, REVIEWER, PLANNER],
@@ -1402,38 +1402,38 @@ fn an_edge_into_the_entry_member_warns_once_and_is_not_served() {
         ],
     );
     let mut launcher = project.launch(&[], &[]);
-    let (_, formation) = launcher.next_json();
-    assert_formation_line(&formation, "planner", &["coder", "reviewer"]);
-    let (_, planner) = launcher.next_json();
-    project.await_requests("coder", 2);
-    project.await_requests("reviewer", 1);
-    project.release.send(()).unwrap();
-    assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
+    let status = launcher.wait();
     let stderr = launcher.stderr();
-    assert_eq!(stderr.matches("warning[W-RUN-006]").count(), 1, "{stderr}");
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("error[E-ROS-008]"), "{stderr}");
     assert!(
-        stderr.contains("roster edge 'coder \u{2192} planner' is not served"),
+        stderr.contains("the reachability rule from 'coder' lists the entry member 'planner'"),
         "{stderr}"
     );
-    assert!(!stderr.contains("W-RUN-005"), "{stderr}");
+    let hint = &stderr[stderr.find("hint: ").expect("a hint")..];
+    assert!(hint.contains("- from: planner"), "{stderr}");
+    assert!(hint.contains("to: [coder]"), "{stderr}");
+    assert!(!stderr.contains("W-RUN-006"), "{stderr}");
+    let stdout = launcher.stdout();
+    assert!(
+        !stdout.iter().any(|line| line.contains("formation_id")),
+        "{stdout:?}"
+    );
 
-    let coder_result =
-        tool_result_text(&project.model("coder").server.requests(), PROBE_CALL).unwrap();
-    let lines: Vec<&str> = coder_result.lines().collect();
-    assert_eq!(outcome_of(&lines, "reviewer"), "card=200 send=200");
-    assert!(outcome_of(&lines, "planner").starts_with("card=refused:"));
-    assert_eq!(outcome_of(&lines, "planner"), outcome_of(&lines, "nosuch"));
-    assert_eq!(
-        lines.last().copied(),
-        Some("peers=reviewer=http://reviewer.formation.invalid")
+    for member in ["planner", "coder", "reviewer"] {
+        assert!(
+            project.model(member).server.requests().is_empty(),
+            "{member}'s model was called"
+        );
+    }
+    assert!(project.sessions().is_empty(), "a refusal created a session");
+    let formations = project.home.path().join(".murmur").join("formations");
+    assert!(
+        std::fs::read_dir(&formations).map_or(true, |mut entries| entries.next().is_none()),
+        "a refusal created a formation directory under {}",
+        formations.display()
     );
-    let (start, _) = member_trace(&project, "coder");
-    assert_eq!(start["formation_callees"], json!(["reviewer"]));
-    assert_no_formation_token(&project, &launcher.stdout(), &stderr);
-    project.assert_no_member_remains(
-        &reported_pids(&formation, Some(&planner)),
-        Duration::from_secs(30),
-    );
+    project.assert_no_member_remains(&[], Duration::from_secs(1));
 }
 
 /// Scenario 10: without `--roster`, `mur run` never reads `roster.yaml`, however broken.

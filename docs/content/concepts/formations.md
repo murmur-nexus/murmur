@@ -39,6 +39,9 @@ needs goes in the task text. The roster grants the name and the credential, not 
 caller's own `capabilities.network.allow` must list `localhost`. See
 [Giving a member work](../reference/roster.md#member-calls).
 
+The entry member is never called, because it runs the formation's own task from launch to end;
+members report to it by answering its calls. See [The entry member](../reference/roster.md#entry-member).
+
 A formation's members end with it, however it ends. Each member holds one end of a lifeline whose
 other end only the launcher holds; when the launcher ends the formation, or dies — even by
 `SIGKILL` — every member's lifeline closes. A member whose lifeline closes records

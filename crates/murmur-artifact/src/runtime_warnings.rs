@@ -9,6 +9,8 @@
 //! These fire mid-session, after the loop has been running, so they go to stderr alone. The
 //! staging-time `W-SEC-*` warnings also land in `logs/bootstrap.log`, which is closed to writes
 //! by the time a turn happens.
+//!
+//! Numbers 005 and 006 are retired and never reused.
 
 /// A turn the provider cut off at the `inference.max_tokens` output cap.
 ///
@@ -38,14 +40,6 @@ pub const W_RUN_003: &str = "W-RUN-003";
 /// skipped for that tool, its calls are dispatched unchecked, the session continues, and the
 /// malformation is named once per tool per session.
 pub const W_RUN_004: &str = "W-RUN-004";
-
-/// A roster edge into the entry member.
-///
-/// The entry member runs `task_acceptance: single` and is busy with the formation's own task from
-/// launch until it exits, so it can never accept a peer's task. Such an edge is admitted and every
-/// member is launched, but the calling member is handed no credential or address for it. Nothing
-/// is refused; the edge is named once per launch.
-pub const W_RUN_006: &str = "W-RUN-006";
 
 /// A `mur run` that carries a formation id but was handed no lifeline, and is no delegated child.
 ///
@@ -79,7 +73,7 @@ mod tests {
     #[test]
     fn every_code_is_unique_and_well_formed() {
         let codes = [
-            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006, W_RUN_007, W_RUN_008,
+            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_007, W_RUN_008,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");
