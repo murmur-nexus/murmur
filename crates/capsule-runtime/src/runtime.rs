@@ -9294,8 +9294,7 @@ fn write_delegate_task_tool_manifest(
 /// Tool a capsule gains from `capabilities.spawn.allow`.
 pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 
-/// `delegate-task`'s manifest, with the granted capsule names built into its schema. Built from
-/// YAML values rather than text, so the description's backticks and colons cannot break it.
+/// `delegate-task`'s manifest, with the granted capsule names built into its schema.
 ///
 /// The description tells the model what the schema cannot: that the call returns once the
 /// sub-capsule is running and holding its task, without its answer; that `version` is exact
@@ -9328,18 +9327,7 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          that waits for it: carry on with other work or end your turn, and handle the outcome \
          when it arrives."
     );
-    let mut manifest = serde_yaml::Mapping::new();
-    for (key, value) in [
-        ("name", DELEGATE_TASK_TOOL.to_string()),
-        ("version", "0.0.0".to_string()),
-        ("runtime", "tool".to_string()),
-        ("implementation", "native".to_string()),
-        ("description", description),
-        ("input_schema", schema),
-    ] {
-        manifest.insert(Value::String(key.to_string()), Value::String(value));
-    }
-    serde_yaml::to_string(&manifest).unwrap_or_default()
+    native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
 }
 
 /// The `data` a `delegate-task` call returns for `result`, as JSON.
@@ -9458,8 +9446,7 @@ fn write_switch_driver_tool_manifest(
     )
 }
 
-/// `switch-driver`'s manifest for `choices`. Built from YAML values rather than text, so a model
-/// string carrying a quote or a colon cannot break it.
+/// `switch-driver`'s manifest for `choices`.
 fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) -> String {
     let listed: Vec<String> = choices
         .iter()
@@ -9484,14 +9471,20 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
         "properties": {"driver": {"type": "string", "enum": names}},
         "required": ["driver"],
     });
+    native_tool_manifest_yaml(SWITCH_DRIVER_TOOL, description, schema.to_string())
+}
+
+/// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
+/// description carrying a quote, a colon or a backtick cannot break it.
+fn native_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
     let mut manifest = serde_yaml::Mapping::new();
     for (key, value) in [
-        ("name", SWITCH_DRIVER_TOOL.to_string()),
+        ("name", name.to_string()),
         ("version", "0.0.0".to_string()),
         ("runtime", "tool".to_string()),
         ("implementation", "native".to_string()),
         ("description", description),
-        ("input_schema", schema.to_string()),
+        ("input_schema", input_schema),
     ] {
         manifest.insert(Value::String(key.to_string()), Value::String(value));
     }
@@ -10839,11 +10832,10 @@ mod tests {
                 "missing '{said}': {description}"
             );
         }
-        // Split so a search of the crates for a blocking claim finds none, this list included.
         for forbidden in [
-            concat!("wait for its ", "answer"),
-            concat!("does not return ", "until"),
-            concat!("Returns its ", "answer"),
+            "wait for its answer",
+            "does not return until",
+            "Returns its answer",
         ] {
             assert!(
                 !description.contains(forbidden),
