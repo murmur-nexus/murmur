@@ -572,7 +572,7 @@ fn streaming_agent_card_has_streaming_capability() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let card_json = http_get(&capsule_url, "/.well-known/agent-card.json");

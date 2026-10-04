@@ -93,7 +93,9 @@ run tell the two apart:
 | `error: test failed, to rerun pass …` with no `targets failed` list | The run stopped at that binary; the binaries after it never ran |
 
 To count how many binaries a stopped run never reached, compare the binaries a full run executes
-with the ones the stopped run started, using the same package selection as the stopped run:
+with the ones the stopped run started, using the same package selection as the stopped run. Cargo
+prints its `Running` lines to standard error, so save a run with `2>&1`, for example
+`cargo test --workspace 2>&1 | tee stopped-run.log`:
 
 ```bash
 cargo test --workspace --no-run 2>&1 | grep -c '^ *Executable'   # binaries a full run executes

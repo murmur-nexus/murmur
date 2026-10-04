@@ -40,7 +40,7 @@ Run the full suite with `--no-fail-fast`. Plain `cargo test` stops at the first 
 - A run that ends with `error: N targets failed:` (`error: 1 target failed:` for one) ran every binary, and the list under it is the whole set of failures.
 - A run that ends with `error: test failed, to rerun pass …` and no `targets failed` list stopped at that binary and has not run the suite.
 
-To count how many binaries a stopped run never reached, compare the `Executable` lines of a `--no-run` build with the `Running` lines of the stopped run, using the same package selection:
+To count how many binaries a stopped run never reached, compare the `Executable` lines of a `--no-run` build with the `Running` lines of the stopped run, using the same package selection. Cargo prints its `Running` lines to standard error, so save a run with `2>&1`, for example `cargo test --workspace 2>&1 | tee stopped-run.log`:
 
 ```bash
 cargo test --workspace --no-run 2>&1 | grep -c '^ *Executable'   # binaries a full run executes
