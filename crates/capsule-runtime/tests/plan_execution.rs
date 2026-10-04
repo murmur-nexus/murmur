@@ -6,10 +6,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use capsule_runtime::{
@@ -147,16 +147,38 @@ fn test_parallel_tool_steps_run_concurrently() {
     if capsule_runtime::skip_without_host_support("test_parallel_tool_steps_run_concurrently") {
         return;
     }
+    // How long a step waits for its sibling to be in flight. Run sequentially, the first step
+    // waits this out alone; run concurrently, the steps meet as soon as both start.
+    const RENDEZVOUS_GUARD: Duration = Duration::from_secs(30);
+
+    /// `met` latches once both steps are in flight together, so the first step to leave the
+    /// rendezvous cannot strand the other.
+    #[derive(Default)]
+    struct Rendezvous {
+        in_flight: usize,
+        met: bool,
+    }
+
     let dir = tempdir().unwrap();
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    let invoke_active = Arc::clone(&active);
-    let invoke_max = Arc::clone(&max_active);
+    let rendezvous = Arc::new((Mutex::new(Rendezvous::default()), Condvar::new()));
+    let met_sibling = Arc::new(AtomicUsize::new(0));
+    let invoke_rendezvous = Arc::clone(&rendezvous);
+    let invoke_met = Arc::clone(&met_sibling);
     let invoke = move |_name: &str, _input: ToolInput| {
-        let now = invoke_active.fetch_add(1, Ordering::SeqCst) + 1;
-        invoke_max.fetch_max(now, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(150));
-        invoke_active.fetch_sub(1, Ordering::SeqCst);
+        let (state, changed) = &*invoke_rendezvous;
+        let mut state = state.lock().unwrap();
+        state.in_flight += 1;
+        if state.in_flight == 2 {
+            state.met = true;
+        }
+        changed.notify_all();
+        let (mut state, _) = changed
+            .wait_timeout_while(state, RENDEZVOUS_GUARD, |state| !state.met)
+            .unwrap();
+        if state.met {
+            invoke_met.fetch_add(1, Ordering::SeqCst);
+        }
+        state.in_flight -= 1;
         Ok(tool_result(
             ToolStatus::Passed,
             Some("ok".to_string()),
@@ -168,12 +190,14 @@ fn test_parallel_tool_steps_run_concurrently() {
         json!({"id":"p","steps":[{"id":"a","tool":"slow"},{"id":"b","tool":"slow"}]}),
     );
 
-    let started = Instant::now();
     let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
 
     assert!(report.completed, "{report:?}");
-    assert!(started.elapsed() < Duration::from_millis(280));
-    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        met_sibling.load(Ordering::SeqCst),
+        2,
+        "the two independent steps never ran at the same time"
+    );
 }
 
 #[test]

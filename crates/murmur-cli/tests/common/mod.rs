@@ -1095,6 +1095,10 @@ pub fn parse_workdir_from_stdout(stdout: &str) -> PathBuf {
     )
 }
 
+/// How long a test waits for a launched capsule to report its URL. A liveness bound sized for a
+/// loaded host, not a claim about how fast a capsule starts.
+pub const CAPSULE_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// URI of the agent card's door extension: every JSON-RPC method the door answers. Written out
 /// here rather than imported because it is the wire contract an external client reads.
 pub const DOOR_EXTENSION_URI: &str =

@@ -96,7 +96,7 @@ fn launch(staged: StagedSession) -> Running {
         });
     });
     let url = url_rx
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("the capsule reports its address");
 
     Running {

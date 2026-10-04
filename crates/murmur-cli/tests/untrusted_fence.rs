@@ -490,7 +490,7 @@ fn event_origin_task_payload_is_fenced() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let body = json!({

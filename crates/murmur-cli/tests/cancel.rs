@@ -241,7 +241,7 @@ fn launch(staged: capsule_runtime::StagedSession) -> Capsule {
         });
     });
     let url = url_rx
-        .recv_timeout(Duration::from_secs(60))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for the capsule URL");
     Capsule {
         url,
@@ -1232,7 +1232,7 @@ fn the_session_frame_is_in_the_trace_when_the_address_is_announced() {
         });
     });
     let (url, events) = seen_rx
-        .recv_timeout(Duration::from_secs(60))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for the capsule URL");
 
     assert!(!url.is_empty(), "an agent capsule announces an address");

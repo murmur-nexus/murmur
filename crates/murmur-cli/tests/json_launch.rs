@@ -224,7 +224,7 @@ fn json_launch_emits_parseable_json() {
     });
 
     let json_line = json_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for JSON line");
 
     handle.join().expect("launch thread should not panic");
@@ -308,7 +308,7 @@ fn json_launch_url_is_reachable() {
     });
 
     let json_line = json_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for JSON line");
 
     let parsed: Value =
@@ -368,7 +368,7 @@ fn json_launch_session_id_matches_trace() {
     });
 
     let json_line = json_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for JSON line");
 
     handle.join().expect("launch thread should not panic");

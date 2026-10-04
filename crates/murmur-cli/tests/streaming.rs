@@ -377,7 +377,7 @@ fn streaming_basic_events_received() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let events = collect_sse_events(&capsule_url, None, Duration::from_secs(30));
@@ -430,7 +430,7 @@ fn streaming_tool_artifact_event() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let events = collect_sse_events(&capsule_url, None, Duration::from_secs(30));
@@ -489,7 +489,7 @@ fn streaming_reconnect_replays_missed_events() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     // First connection: receive first event and record its ID
@@ -572,7 +572,7 @@ fn streaming_agent_card_has_streaming_capability() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let card_json = http_get(&capsule_url, "/.well-known/agent-card.json");
@@ -719,7 +719,7 @@ fn streaming_text_chunks_received() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let events = collect_sse_events(&capsule_url, None, Duration::from_secs(30));
@@ -787,7 +787,7 @@ fn streaming_non_streaming_driver_fallback() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let events = collect_sse_events(&capsule_url, None, Duration::from_secs(30));
@@ -856,7 +856,7 @@ fn streamed_artifact_frames(
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
     let events = collect_sse_events(&capsule_url, None, Duration::from_secs(30));
     let launched = handle.join().expect("launch thread should not panic");

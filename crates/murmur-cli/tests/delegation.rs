@@ -741,7 +741,7 @@ impl Parent {
             .expect("launch should succeed")
         });
         let url = url_rx
-            .recv_timeout(Duration::from_secs(120))
+            .recv_timeout(common::CAPSULE_URL_WAIT)
             .expect("timed out waiting for the capsule URL");
 
         Self {

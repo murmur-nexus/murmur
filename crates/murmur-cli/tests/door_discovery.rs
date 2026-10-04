@@ -330,7 +330,7 @@ fn launch(task_acceptance: TaskAcceptance, exports: Option<&str>) -> Capsule {
         .expect("launch should succeed")
     });
     let url = url_rx
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for the capsule URL");
 
     Capsule {
