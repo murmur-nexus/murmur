@@ -7980,25 +7980,7 @@ impl CapsuleStoreState {
             result.version,
             status.as_str()
         );
-        let mut data = serde_json::json!({
-            "delegation_id": result.delegation_id,
-            "session_id": result.session_id,
-            "capsule": result.capsule,
-            "version": result.version,
-            "status": status.as_str(),
-        });
-        match &result.child_workdir {
-            // Present only on a started delegation, and the only path there is to the child's own
-            // trace: joined to this capsule's workdir, it is a directory the parent's ordinary
-            // file tools can already address.
-            Some(workdir) => {
-                data["child_workdir"] = serde_json::Value::String(workdir.clone());
-            }
-            // A failed start produced no child worth naming, so what the agent gets is why.
-            None => {
-                data["output"] = serde_json::Value::String(result.output.clone());
-            }
-        }
+        let data = delegate_task_result_data(&result);
         Ok(murmur::tool::run::ToolResult {
             status: if status == crate::delegation_plane::DelegationStatus::Started {
                 murmur::tool::run::Status::Passed
@@ -9314,27 +9296,69 @@ pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 
 /// `delegate-task`'s manifest, with the granted capsule names built into its schema.
 ///
-/// The description tells the model the three things the schema cannot: that the call does not
-/// return until the sub-capsule has finished, that `version` is exact because there is no `latest`
-/// anywhere in this system, and that the task text is the whole of what the sub-capsule is told.
+/// The description tells the model what the schema cannot: that the call returns once the
+/// sub-capsule is running and holding its task, without its answer; that `version` is exact
+/// because there is no `latest` anywhere in this system; that the task text is the whole of what
+/// the sub-capsule is told; which fields [`delegate_task_result_data`] returns and why `output`
+/// and `result_path` are absent; that the outcome arrives later as a separate task naming the
+/// result file; and that there is nothing to poll in the meantime. It is identical on every launch
+/// for a given `spawn_allow`, because it sits in the cached prompt prefix.
 fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
     let allowed = serde_json::to_string(spawn_allow).unwrap_or_else(|_| "[]".to_string());
     let schema = format!(
         r#"{{"type":"object","properties":{{"capsule":{{"type":"string","enum":{allowed}}},"version":{{"type":"string"}},"task":{{"type":"string"}}}},"required":["capsule","version","task"]}}"#
     );
-    format!(
-        "name: {DELEGATE_TASK_TOOL}\n\
-         version: 0.0.0\n\
-         runtime: tool\n\
-         implementation: native\n\
-         description: \"Hand one task to one sub-capsule and wait for its answer. `capsule` must \
-         be one of the names this capsule is allowed to delegate to; `version` is that capsule's \
-         exact version, because there is no latest or stable alias; `task` is the whole of what \
-         the sub-capsule is told, so state the objective in full. The sub-capsule runs as its own \
-         process with its own workdir and this call does not return until it has finished. \
-         Returns its answer text.\"\n\
-         input_schema: '{schema}'\n",
-    )
+    let started = crate::delegation_plane::DelegationStatus::Started.as_str();
+    let failed = crate::delegation_plane::DelegationStatus::Failed.as_str();
+    let description = format!(
+        "Hand one task to one sub-capsule and return as soon as it is running and holding that \
+         task. This call does not wait for the sub-capsule to finish and never returns its \
+         answer. `capsule` must be one of the names this capsule is allowed to delegate to; \
+         `version` is that capsule's exact version, because there is no latest or stable alias; \
+         `task` is the whole of what the sub-capsule is told, so state the objective in full. \
+         The sub-capsule runs as its own process with its own workdir. On success the result \
+         has `status: {started}`, a `delegation_id`, the sub-capsule's `session_id` and its \
+         `child_workdir`, along with the `capsule` and `version` it was given; there is no \
+         `output` and no `result_path`, because nothing has been produced yet. A refused \
+         delegation comes back as an error saying why; one that could not be started has \
+         `status: {failed}` and an `output` saying why. What the sub-capsule did arrives later \
+         as a separate task carrying the same `delegation_id`, its final status and the path of \
+         its result file; read that file for its answer. There is nothing to poll and no tool \
+         that waits for it: carry on with other work or end your turn, and handle the outcome \
+         when it arrives."
+    );
+    native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
+}
+
+/// The `data` a `delegate-task` call returns for `result`, as JSON.
+///
+/// Every status carries `delegation_id`, `session_id`, `capsule`, `version` and `status`. A
+/// started delegation adds `child_workdir`; any other adds `output`. `result_path` is never
+/// present, because a call that returns on start has no result file to name. The tool's
+/// description names every key this produces, and a test holds the two together.
+fn delegate_task_result_data(
+    result: &crate::delegation_plane::DelegationResult,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "delegation_id": result.delegation_id,
+        "session_id": result.session_id,
+        "capsule": result.capsule,
+        "version": result.version,
+        "status": result.status.as_str(),
+    });
+    match &result.child_workdir {
+        // Present only on a started delegation, and the only path there is to the child's own
+        // trace: joined to this capsule's workdir, it is a directory the parent's ordinary
+        // file tools can already address.
+        Some(workdir) => {
+            data["child_workdir"] = serde_json::Value::String(workdir.clone());
+        }
+        // A failed start produced no child worth naming, so what the agent gets is why.
+        None => {
+            data["output"] = serde_json::Value::String(result.output.clone());
+        }
+    }
+    data
 }
 
 /// Writes the member-call tool's synthetic manifest, only for a formation member with at least one
@@ -9422,8 +9446,7 @@ fn write_switch_driver_tool_manifest(
     )
 }
 
-/// `switch-driver`'s manifest for `choices`. Built from YAML values rather than text, so a model
-/// string carrying a quote or a colon cannot break it.
+/// `switch-driver`'s manifest for `choices`.
 fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) -> String {
     let listed: Vec<String> = choices
         .iter()
@@ -9448,14 +9471,20 @@ fn switch_driver_tool_manifest(choices: &crate::driver_choice::DriverChoices) ->
         "properties": {"driver": {"type": "string", "enum": names}},
         "required": ["driver"],
     });
+    native_tool_manifest_yaml(SWITCH_DRIVER_TOOL, description, schema.to_string())
+}
+
+/// A runtime-provided tool's `murmur.yaml`, built from YAML values rather than text so a
+/// description carrying a quote, a colon or a backtick cannot break it.
+fn native_tool_manifest_yaml(name: &str, description: String, input_schema: String) -> String {
     let mut manifest = serde_yaml::Mapping::new();
     for (key, value) in [
-        ("name", SWITCH_DRIVER_TOOL.to_string()),
+        ("name", name.to_string()),
         ("version", "0.0.0".to_string()),
         ("runtime", "tool".to_string()),
         ("implementation", "native".to_string()),
         ("description", description),
-        ("input_schema", schema.to_string()),
+        ("input_schema", input_schema),
     ] {
         manifest.insert(Value::String(key.to_string()), Value::String(value));
     }
@@ -9577,7 +9606,9 @@ const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
     "The call does not return until every step has finished. Independent `shell` and `capsule` ",
     "steps run at the same time; `tool` steps are dispatched one at a time even when nothing ",
     "orders them. A step's output is reachable from a later step as ",
-    "$<step id>.output and its status as $<step id>.status, anywhere in that step's input.\"\n",
+    "$<step id>.output and its status as $<step id>.status. A reference in a step's input is ",
+    "substituted only where it is the whole of a string value, at any depth; one in its `if` is ",
+    "read as part of the condition.\"\n",
     "input_schema: '",
     r#"{"type":"object","properties":{"plan":{"type":"object"}},"required":["plan"]}"#,
     "'\n",
@@ -10707,6 +10738,117 @@ mod tests {
             .exists());
     }
 
+    /// The description is the model's only account of what a call returns, so every key the
+    /// handler emits has to be named in it. The key sets come from the handler's own builder: a
+    /// key added there fails here until the description names it.
+    #[test]
+    fn the_delegation_description_names_every_field_the_handler_returns() {
+        use crate::delegation_plane::{DelegationResult, DelegationStatus};
+
+        let manifest = super::delegate_task_tool_manifest(&["worker".to_string()]);
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
+        let description = parsed["description"].as_str().expect("a description");
+
+        let started = DelegationResult {
+            delegation_id: "dlg_started".to_string(),
+            session_id: "ses_started".to_string(),
+            capsule: "worker".to_string(),
+            version: "1.0.0".to_string(),
+            status: DelegationStatus::Started,
+            output: String::new(),
+            result_path: None,
+            truncated: false,
+            child_workdir: Some("delegations/dlg_started".to_string()),
+        };
+        let failed = DelegationResult {
+            delegation_id: "dlg_failed".to_string(),
+            session_id: String::new(),
+            capsule: "worker".to_string(),
+            version: "1.0.0".to_string(),
+            status: DelegationStatus::Failed,
+            output: "the child exited before taking its task".to_string(),
+            result_path: None,
+            truncated: false,
+            child_workdir: None,
+        };
+
+        let started_data = super::delegate_task_result_data(&started);
+        let started_keys = started_data.as_object().expect("an object");
+        let failed_data = super::delegate_task_result_data(&failed);
+        let failed_keys = failed_data.as_object().expect("an object");
+        // A key is named on its own, `key`, or with the value it carries, `key: value`.
+        for key in started_keys.keys().chain(failed_keys.keys()) {
+            assert!(
+                description.contains(&format!("`{key}`"))
+                    || description.contains(&format!("`{key}: ")),
+                "the handler returns '{key}' but the description does not name it: {description}"
+            );
+        }
+
+        for absent in ["output", "result_path"] {
+            assert!(
+                !started_keys.contains_key(absent),
+                "a started delegation has produced nothing, so it carries no '{absent}'"
+            );
+            assert!(
+                description.contains(&format!("`{absent}`")),
+                "the description must say '{absent}' is absent: {description}"
+            );
+        }
+        assert!(description.contains(DelegationStatus::Started.as_str()));
+    }
+
+    /// What the model reads is the file staging writes, and the inventory in MURMUR.md is that
+    /// description cut at its first 200 characters, so the non-blocking claim has to survive the
+    /// cut.
+    #[test]
+    fn the_written_delegation_manifest_says_the_call_returns_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        super::write_delegate_task_tool_manifest(dir.path(), &["worker".to_string()]).unwrap();
+        let written = std::fs::read_to_string(
+            dir.path()
+                .join("tools")
+                .join("delegate-task")
+                .join(PACKED_MANIFEST_ENTRY),
+        )
+        .expect("the manifest is written");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&written).expect("the written manifest is YAML");
+        let description = parsed["description"]
+            .as_str()
+            .expect("a description")
+            .to_string();
+
+        for said in [
+            "return as soon as it is running and holding that task",
+            "does not wait for the sub-capsule to finish",
+            "arrives later as a separate task carrying the same `delegation_id`",
+            "the path of its result file",
+            "There is nothing to poll",
+        ] {
+            assert!(
+                description.contains(said),
+                "missing '{said}': {description}"
+            );
+        }
+        for forbidden in [
+            "wait for its answer",
+            "does not return until",
+            "Returns its answer",
+        ] {
+            assert!(
+                !description.contains(forbidden),
+                "'{forbidden}' contradicts what the call does: {description}"
+            );
+        }
+        assert!(
+            crate::murmur_md::sanitize_description(&description)
+                .contains("does not wait for the sub-capsule to finish"),
+            "the MURMUR.md inventory cuts the description before it says the call does not wait"
+        );
+    }
+
     // ── submit-plan's synthetic manifest ─────────────────────────────────────
 
     /// The plan tool's contract, pinned: one object argument, and a description carrying the
@@ -10730,6 +10872,9 @@ mod tests {
         assert!(description.contains("does not return until every step has finished"));
         assert!(description.contains("at the same time"));
         assert!(description.contains("$<step id>.output"));
+        assert!(description.contains("$<step id>.status"));
+        assert!(description.contains("only where it is the whole of a string value"));
+        assert!(!description.contains("anywhere in that step's input"));
     }
 
     /// A capsule that declares no `capabilities.plan.submit` gets no file, so the tool is absent

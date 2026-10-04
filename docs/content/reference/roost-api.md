@@ -4,10 +4,9 @@
 listens on loopback and exposes five endpoints: a health check, one to ask permission to spawn a
 capsule, one for a session to announce itself, one to retire it, and one to poll a session.
 
-The daemon runs nothing. It holds no capsule runtime, stages no session, creates no directory,
-takes no host probe and starts no process — it resolves manifests from its registry, referees them
-against one another, and mints tokens. The launching is done by the runtime of the capsule that
-asked, in a process of the child's own.
+The daemon only referees: it resolves manifests from its registry, compares them against one
+another, and mints tokens. The runtime of the capsule that asked does the launching, in a process
+of the child's own.
 
 One thing calls it: a capsule's runtime. A spawn on behalf of a running capsule requires a
 credential the daemon minted for that capsule's runtime, which is held in runtime memory and is not
@@ -144,8 +143,6 @@ hash. `name`, `version` and `sha256` are that artifact, echoed so the caller lau
 the referee judged. `expires_at_ms` is the approval's absolute expiry in unix milliseconds, 60
 seconds after it was granted.
 
-The response carries no `capsule_url` and no `session_id`, because nothing was started.
-
 **Error responses**
 
 | Status | Condition |
@@ -165,9 +162,8 @@ The response carries no `capsule_url` and no `session_id`, because nothing was s
 
 A session announcing itself, and taking the credential it will delegate with.
 
-The registrant names an artifact. The daemon resolves *that* artifact from its own registry and
-lowers the manifest into a spawn envelope itself; the request never states what the session holds.
-A request that could state its grants would be a request that could declare its own ceiling.
+The registrant names an artifact. The daemon resolves that artifact from its own registry and
+reads the session's grants from its manifest.
 
 A session registers when its manifest declares `capabilities.spawn.allow`, and when it was launched
 under an approval — the second because presenting the approval is what marks it spent. Every other
@@ -195,8 +191,8 @@ capsule never calls this endpoint, needs no daemon, and runs with nothing listen
 | `name` | string | yes | Capsule name, as published |
 | `version` | string | yes | Capsule version |
 
-Extra keys are accepted and change nothing. A body carrying its own `capabilities` or `envelope`
-block registers exactly the same grants as one carrying neither: the ones in the registry manifest.
+Extra keys are ignored, including a `capabilities` or `envelope` block: the session's grants are
+always the ones in the registry manifest.
 
 **Success — `200 OK`**
 
@@ -255,9 +251,8 @@ A session reporting that it has ended.
 {}
 ```
 
-The credential still carries a valid MAC afterwards — nothing can un-mint one — but every endpoint
-that means anything requires the session it names to be running, so it authorises nothing from
-here on.
+The credential authorises nothing afterwards, because every endpoint that acts on one requires the
+session it names to be running.
 
 **Error responses**
 
@@ -317,11 +312,12 @@ before the restart then returns `404`.
 | Stop the child | The parent capsule's runtime |
 | Stop the child once the parent's process has ended | The child's own runtime, on EOF on its [spawner lifeline](#spawner-lifeline) |
 
-Three problems are absent rather than solved by this split. A daemon crash takes no child with it,
-because nothing a child needs lives in the daemon's address space. Each child has its own process
-environment and working directory, so a native subprocess started by one child inherits nothing a
-sibling shares. And a child declaring the `sealed` containment floor enters a mount namespace of
-its own, because every containment mechanism is installed per process and the child *is* a process.
+Because every child is a process of its own:
+
+- A daemon crash takes no child with it.
+- Each child has its own process environment and working directory, so a native subprocess started
+  by one child inherits nothing a sibling holds.
+- A child declaring the `sealed` containment floor gets a mount namespace of its own.
 
 ### The child's directory
 
@@ -330,13 +326,10 @@ The parent's runtime composes the child's directory at
 (`0700` on Unix), and passes it as the child's `--workdir`. The 16 hex characters are fresh per
 delegation, so spawning the same capsule twice yields two directories rather than one shared one.
 
-**The parent retains write access to a running child's directory.** That is deliberate: the parent
-creates the directory and places the child's inputs in it before launch, and the directory sits
-beneath the parent's own accessible workdir, which the parent is granted as one directory with no
-subtree excluded. It is convenient — it is how a parent streams inputs to a child that is already
-running — and it is a channel the spawn envelope does not cover. A child cannot reach out of its own
-directory, so nothing flows the other way, but a parent can write into a running child's workspace
-without any grant saying so.
+**The parent retains write access to a running child's directory.** The directory sits beneath the
+parent's own accessible workdir, so a parent can place inputs in it before launch and keep writing
+to it while the child runs, without any grant saying so. The spawn envelope does not cover this
+channel. A child cannot reach out of its own directory, so nothing flows the other way.
 
 ### The child's environment
 
@@ -431,7 +424,7 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 | `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` and on the outcome that arrives later |
 | `session_id` | string | `ses_…`, the child's own session |
 | `capsule`, `version` | string | The artifact that was launched |
-| `status` | string | `started`, `failed` or `refused` |
+| `status` | string | `started` or `failed`. A refused call returns no object — see below |
 | `child_workdir` | string | The child's directory, relative to the delegating capsule's accessible workdir — where its own `trace.jsonl` is, and where its result will be. Present only on `started` |
 | `output` | string | Why there is no delegation, on `failed`. Absent on `started`, which has produced nothing yet |
 
@@ -485,9 +478,7 @@ The child-watch bound is the delegating capsule's own runtime's clock. No reques
 daemon to decide or enforce it, so no daemon has to be reachable for it to fire.
 
 How deep a chain of delegations may go, how many a capsule may have running at once, and how many
-capsules the host carries are the daemon's, not this tool's — see
-[Delegation bounds](#delegation-bounds). A delegation the daemon refuses comes back as a failed
-tool call carrying the refusal.
+capsules the host carries are set on the daemon — see [Delegation bounds](#delegation-bounds).
 
 **What a capsule meant to be delegated to declares depends on which caller delegates to it**, and
 the two want opposite things:
@@ -617,9 +608,8 @@ spawning capsule may spawn. The envelope answers *how much* any of them may hold
 the child's registry manifest and refuses the request when the child would hold more capability
 than its parent on any axis.
 
-The comparison runs at `POST /spawn`, after the name check, and it runs exactly once per
-delegation: the approval it grants names the resolved artifact by content hash, and that hash
-determines the manifest the comparison read.
+The comparison runs at `POST /spawn`, after the name check. The approval it grants names the
+artifact it compared by content hash, so the child launched is the one that was judged.
 
 | Axis | Manifest key | Rule |
 |---|---|---|
@@ -670,14 +660,11 @@ A delegated spawn travels on two opaque, MAC'd tokens, presented by two differen
 | Credential | At `POST /register` | The session it was minted for | That session's own runtime, at `POST /spawn` and `POST /deregister` | The daemon process |
 | Approval | At `POST /spawn`, once the referee has passed | One session, and one artifact by name, version and content hash | The launched child's runtime, at `POST /register` | 60 seconds, one redemption |
 
-The credential is handed to the session's *runtime* and stays in memory there. Nothing the capsule
-can read carries it: not the workdir, not an environment variable, not a tool result, not an error
-message. A capsule therefore cannot call the daemon itself; its runtime makes the requests on its
+The credential is handed to the session's runtime and stays in its memory, out of the capsule's
+reach. A capsule therefore cannot call the daemon itself; its runtime makes the requests on its
 behalf.
 
-The approval reaches the child on the child process's standard input, written by the parent and
-closed immediately — not on the argument vector and not in the environment, both of which any
-process running as the same user can read out of `/proc`.
+The approval reaches the child on its standard input, written by the parent and closed immediately.
 
 The approval binds a launch to the artifact the referee actually judged. A different name, a
 different version, or the same coordinates resolving to different bytes is refused. An approval is
@@ -702,9 +689,8 @@ message, on every endpoint:
 }
 ```
 
-Two requests differing only in whether the session they name exists get byte-identical responses —
-same status line, same headers, same body — so no endpoint can be used to discover which sessions
-are running.
+The response is the same whether or not the named session exists, so no endpoint reveals which
+sessions are running.
 
 *Approval-state* failures answer `403` and say what went wrong, because reaching one requires
 already holding a verifiable approval:
@@ -762,11 +748,9 @@ with no approval holds `--max-depth`. Every other session holds the number seale
 it registered with, which is one less than what its parent held. A session at `0` is refused every
 spawn it asks for.
 
-The budget rides the approval. `POST /spawn` computes the child's number, seals it into the MAC'd
-approval it mints, and reads it back out when that child presents the approval at `POST /register`.
-Between those two moments no party states it: the parent's runtime never sees the number, the
-`POST /register` body has no field it could arrive in, and an extra `depth_remaining` key in that
-body is read by nothing. An approval whose payload was edited fails its MAC and is refused with the
+The budget rides the approval. `POST /spawn` seals the child's number into the approval it mints,
+and reads it back when that child presents the approval at `POST /register`. No request body can
+set it, and an approval whose contents were edited is refused with the
 [identity refusal](#refusals).
 
 This is what terminates a capsule whose `capabilities.spawn.allow` names itself. The
@@ -838,14 +822,12 @@ removes a session's record from its store.
 
 **Enforced at `POST /spawn`, counted at every registration.** A `POST /register` presenting no
 approval is the operator starting a capsule from their own terminal. It counts toward the census
-once it is running, and the ceiling never refuses it — refusing would be `mur run` failing on a
-machine the operator has just chosen to use, and this daemon referees delegation rather than
-admitting the operator's own launches. An operator who starts more roots by hand than the ceiling
-allows exceeds it, and the next delegated spawn is refused until the census falls back under.
+once it is running, and the ceiling never refuses it. An operator who starts more roots by hand
+than the ceiling allows exceeds it, and the next delegated spawn is refused until the census falls
+back under.
 
-**One daemon per host.** The ceiling counts what *this* daemon has admitted, plus what it found
-running when it started. Two `mur-roost` processes on one host each enforce their own ceiling and
-together exceed it, because roost coordinates with no other process. Run one daemon per host.
+The ceiling counts what this daemon has admitted, plus what it found running when it started — run
+one daemon per host, as [Start the daemon](#start-the-daemon) explains.
 
 #### Capsules running at startup { #capsules-running-at-startup }
 
