@@ -1384,6 +1384,25 @@ struct FormationEndedEvent {
     formation_id: String,
 }
 
+/// A delegated child's spawner lifeline read EOF: the process that spawned this session has
+/// ended, and this session is winding down because of it. Written only when that lifeline is what
+/// began the session's termination.
+///
+/// The lineage keys are the ones `session_start` carries, and like there they are absent rather
+/// than null for a session launched with a lifeline but no `MURMUR_SPAWNER`.
+#[derive(Serialize)]
+struct SpawnerEndedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spawned_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegation_id: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ResourceListEvent {
     event_type: &'static str,
@@ -3453,6 +3472,26 @@ impl ResourceTraceAppender {
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             formation_id: formation_id.as_str().to_string(),
+        };
+        self.append(&event).await;
+    }
+
+    /// Records `spawner_ended`, hung off the session node, naming the session that spawned this
+    /// one and the delegation it was spawned under. Failures are swallowed: a child whose trace
+    /// cannot be written still winds down.
+    pub(crate) async fn write_spawner_ended(
+        &self,
+        spawned_by: Option<&str>,
+        delegation_id: Option<&str>,
+    ) {
+        let event = SpawnerEndedEvent {
+            event_type: "spawner_ended",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            spawned_by: spawned_by.map(str::to_string),
+            delegation_id: delegation_id.map(str::to_string),
         };
         self.append(&event).await;
     }
@@ -6816,5 +6855,53 @@ mod tests {
                 assert!(!called.contains_key(key), "{key} is on {called:?}");
             }
         }
+    }
+
+    /// `spawner_ended` carries the lineage `session_start` does, on the same terms: both keys
+    /// present for a delegated child, both absent — not null — for a session launched with a
+    /// lifeline but no spawner handle.
+    #[tokio::test]
+    async fn spawner_ended_names_the_lineage_or_omits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "ses_0000000000004000800000000child".to_string();
+        let node = "evt_0000000000004000800000000000node".to_string();
+        let appender = ResourceTraceAppender::open(dir.path(), session.clone(), node.clone())
+            .await
+            .unwrap();
+
+        appender
+            .write_spawner_ended(Some("ses_parent"), Some("dlg_abc123"))
+            .await;
+        appender.write_spawner_ended(None, None).await;
+
+        let lines: Vec<serde_json::Map<String, Value>> =
+            std::fs::read_to_string(dir.path().join("trace.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(lines.len(), 2);
+        let named = &lines[0];
+        assert_eq!(named["event_type"], "spawner_ended");
+        assert_eq!(named["parent_id"], node.as_str());
+        assert_eq!(named["session_id"], session.as_str());
+        assert_eq!(named["spawned_by"], "ses_parent");
+        assert_eq!(named["delegation_id"], "dlg_abc123");
+        assert_eq!(
+            named.keys().collect::<Vec<_>>(),
+            [
+                "delegation_id",
+                "event_id",
+                "event_type",
+                "parent_id",
+                "session_id",
+                "spawned_by",
+                "timestamp"
+            ]
+        );
+        let bare = &lines[1];
+        assert_eq!(bare["event_type"], "spawner_ended");
+        assert!(!bare.contains_key("spawned_by"), "{bare:?}");
+        assert!(!bare.contains_key("delegation_id"), "{bare:?}");
     }
 }

@@ -165,9 +165,9 @@ pub use formation_credentials::{
     FormationVerifyKey, FORMATION_CALL_SCOPES, FORMATION_CHANNEL_ENV,
 };
 pub use lanes::TaskLane;
-pub use lifeline::FORMATION_LIFELINE_ENV;
 #[cfg(unix)]
-pub use lifeline::{FormationLifeline, MemberLifeline};
+pub use lifeline::{ChildLifeline, FormationLifeline, MemberLifeline, SpawnerLifeline};
+pub use lifeline::{FORMATION_LIFELINE_ENV, SPAWNER_LIFELINE_ENV};
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 // The types and header names are flat; `origin::from_wire` and `origin::stamp_for_peer` stay

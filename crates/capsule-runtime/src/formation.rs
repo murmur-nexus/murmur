@@ -706,4 +706,30 @@ mod tests {
             "FormationLifeline::from_env is the one reader"
         );
     }
+
+    #[test]
+    fn the_spawner_lifeline_is_read_from_the_process_environment_in_one_place() {
+        let mut sources = sources_of("capsule-runtime");
+        sources.extend(sources_of("murmur-cli"));
+        let names_the_variable = |args: &&str| {
+            args.contains("MURMUR_SPAWNER_LIFELINE") || args.contains("SPAWNER_LIFELINE_ENV")
+        };
+        let mut reads_here = 0;
+        for (path, text) in sources {
+            let reads = env_reads(crate::source_scan::production_part(&text))
+                .into_iter()
+                .filter(names_the_variable)
+                .count();
+            if path == "capsule-runtime/src/lifeline.rs" {
+                reads_here = reads;
+            } else {
+                assert_eq!(
+                    reads, 0,
+                    "{path} reads the spawner lifeline from the process environment; only \
+                     SpawnerLifeline::from_env does"
+                );
+            }
+        }
+        assert_eq!(reads_here, 1, "SpawnerLifeline::from_env is the one reader");
+    }
 }

@@ -1552,16 +1552,23 @@ through that constructor rather than composing a second request literal."
         );
     }
 
-    /// A delegated child is never handed its parent's lifeline, even when it allowlists the name:
-    /// its parent session contains it, and the descriptor is the parent process's.
+    /// A delegated child is handed neither of its parent's lifelines, even when it allowlists both
+    /// names and the parent's process carries both: each names a descriptor of the parent's own
+    /// process. The child holds a spawner lifeline of its own, which the launch hands it beside
+    /// this environment, and no formation lifeline at all. The formation id is still handed on.
     #[test]
-    fn a_launch_request_hands_a_child_no_formation_lifeline() {
+    fn a_launch_request_hands_a_child_its_own_spawner_lifeline_and_no_formation_one() {
         let _guard = crate::formation::FORMATION_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let name = crate::lifeline::FORMATION_LIFELINE_ENV;
+        let formation = crate::lifeline::FORMATION_LIFELINE_ENV;
+        let spawner = crate::lifeline::SPAWNER_LIFELINE_ENV;
         let store = store_with_worker();
-        let plane = plane_in_formation(&store, &["B", name], Some(FormationId::mint()));
+        let plane = plane_in_formation(
+            &store,
+            &["B", formation, spawner],
+            Some(FormationId::mint()),
+        );
         let mut launch = plane
             .launch_request(
                 &request(),
@@ -1570,11 +1577,27 @@ through that constructor rather than composing a second request literal."
                 Some(completion_address()),
             )
             .expect("the store holds the child's declaration");
-        launch.child_env_allow.push(name.to_string());
-        std::env::set_var(name, "7");
+        launch.child_env_allow.push(formation.to_string());
+        launch.child_env_allow.push(spawner.to_string());
+        std::env::set_var(formation, "7");
+        std::env::set_var(spawner, "8");
         let env = crate::child_launch::child_environment(&launch, None);
-        std::env::remove_var(name);
-        assert!(env.iter().all(|(key, _)| key != name), "{env:?}");
+        std::env::remove_var(formation);
+        std::env::remove_var(spawner);
+        assert!(
+            env.iter()
+                .all(|(key, _)| key != formation && key != spawner),
+            "{env:?}"
+        );
+        assert!(
+            env.iter().all(|(_, value)| value != "7" && value != "8"),
+            "{env:?}"
+        );
+        assert!(
+            env.iter()
+                .any(|(key, _)| key == crate::formation::FORMATION_ID_ENV),
+            "the formation id is still handed on: {env:?}"
+        );
     }
 
     /// The trailing slash is taken off once, so no request is built against `//spawn`.

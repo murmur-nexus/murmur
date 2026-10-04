@@ -40,3 +40,9 @@ other end only the launcher holds; when the launcher ends the formation, or dies
 `SIGKILL` — every member's lifeline closes. A member whose lifeline closes records
 `formation_ended` in its trace, cancels the work it had in flight, since nothing remains to receive
 the result, and ends its session in order. See [How a formation ends](../reference/roster.md#launch-stop).
+
+A sub-capsule a member delegates to is not a member: it shares the formation's id and nothing
+else. It ends with the member that started it, through a lifeline of its own whose other end only
+that member's process holds — see
+[A child ends with its parent](../reference/roost-api.md#spawner-lifeline). When the formation
+ends, its members end, and their delegated children end with them.

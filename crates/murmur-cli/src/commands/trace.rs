@@ -430,6 +430,17 @@ struct FormationEndedEvent {
     formation_id: String,
 }
 
+/// A delegated child's spawner lifeline closed: the session that delegated to it ended, and that
+/// began this session's wind-down. Both lineage keys are absent for a session launched with a
+/// lifeline but no spawner handle.
+#[derive(Debug, Deserialize)]
+struct SpawnerEndedEvent {
+    #[serde(default)]
+    spawned_by: Option<String>,
+    #[serde(default)]
+    delegation_id: Option<String>,
+}
+
 /// A task attempt failed, and why.
 #[derive(Debug, Deserialize)]
 struct TaskFailedEvent {
@@ -790,6 +801,7 @@ enum TraceEvent {
     TaskRejected(TaskRejectedEvent),
     TaskFailed(TaskFailedEvent),
     FormationEnded(FormationEndedEvent),
+    SpawnerEnded(SpawnerEndedEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
     ToolInputRefused(ToolInputRefusedEvent),
@@ -1075,6 +1087,8 @@ struct TraceMetrics {
     rejections: Vec<TaskRejectedEvent>,
     /// `formation_ended.formation_id`, when the session wound down because its formation ended.
     formation_ended: Option<String>,
+    /// The `spawner_ended` record, when the session wound down because its spawner ended.
+    spawner_ended: Option<SpawnerEndedEvent>,
     /// Every `task_failed` record, in file order — one per failing attempt.
     failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
@@ -1209,6 +1223,17 @@ fn rejected_show_row(r: &TaskRejectedEvent) -> String {
 /// The `formation_ended` record's row under `mur trace show`'s `Formation ended` section.
 fn formation_ended_show_row(formation_id: &str) -> String {
     format!("formation_ended  {formation_id}  the formation ended; this session wound down")
+}
+
+/// The `spawner_ended` record's row under `mur trace show`'s `Spawner ended` section, with `-`
+/// for an absent lineage key.
+fn spawner_ended_show_row(e: &SpawnerEndedEvent) -> String {
+    format!(
+        "spawner_ended  {}  {}  the session that delegated to this one ended; this session wound \
+         down",
+        e.spawned_by.as_deref().unwrap_or("-"),
+        e.delegation_id.as_deref().unwrap_or("-")
+    )
 }
 
 /// The Session block's line naming every runtime-origin artifact and the session that pulled
@@ -1614,6 +1639,7 @@ fn compute_metrics(
     let mut cancels: Vec<CancelRecord> = Vec::new();
     let mut rejections: Vec<TaskRejectedEvent> = Vec::new();
     let mut formation_ended: Option<String> = None;
+    let mut spawner_ended: Option<SpawnerEndedEvent> = None;
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
@@ -1781,6 +1807,7 @@ fn compute_metrics(
             }
             TraceEvent::TaskRejected(e) => rejections.push(e),
             TraceEvent::FormationEnded(e) => formation_ended = Some(e.formation_id),
+            TraceEvent::SpawnerEnded(e) => spawner_ended = Some(e),
             TraceEvent::TaskFailed(e) => failures.push(e),
             TraceEvent::TaskReopened(e) => {
                 reopens.push(ReopenRecord {
@@ -2054,6 +2081,7 @@ fn compute_metrics(
             cancels,
             rejections,
             formation_ended,
+            spawner_ended,
             failures,
             reopens,
             context_seeds,
@@ -2599,6 +2627,12 @@ fn print_show(m: &TraceMetrics) {
         println!();
         println!("── Formation ended ──────────────────────────────");
         println!("{}", formation_ended_show_row(formation));
+    }
+
+    if let Some(spawner) = &m.spawner_ended {
+        println!();
+        println!("── Spawner ended ────────────────────────────────");
+        println!("{}", spawner_ended_show_row(spawner));
     }
 
     if !m.cancels.is_empty() {
@@ -3526,6 +3560,11 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_id_short(&e.task_id, 12)
         ),
         TraceEvent::FormationEnded(e) => format!("{}{}", kind("formation_ended"), e.formation_id),
+        TraceEvent::SpawnerEnded(e) => format!(
+            "{}{}",
+            kind("spawner_ended"),
+            e.spawned_by.as_deref().unwrap_or("-")
+        ),
         TraceEvent::TaskFailed(e) => {
             let reason: String = e.reason.chars().take(120).collect();
             format!("{}{}  {reason}", kind("task_failed"), e.cause)
@@ -4719,6 +4758,33 @@ mod tests {
             formation_ended_show_row(&e.formation_id),
             "formation_ended  frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b  the formation ended; this \
              session wound down"
+        );
+    }
+
+    /// A `spawner_ended` record's `steps` row names the spawning session, and its `show` row names
+    /// the lineage, with `-` for a key the record omits.
+    #[test]
+    fn spawner_ended_renders_a_steps_row_and_a_show_row() {
+        let line = r#"{"event_type":"spawner_ended","event_id":"evt_8","parent_id":"evt_1","session_id":"s","timestamp":8,"spawned_by":"ses_parent","delegation_id":"dlg_abc"}"#;
+        assert_eq!(row(line), "spawner_ended ses_parent");
+        let TraceEvent::SpawnerEnded(e) = serde_json::from_str::<TraceEvent>(line).unwrap() else {
+            panic!("a spawner_ended line parses as SpawnerEnded");
+        };
+        assert_eq!(
+            spawner_ended_show_row(&e),
+            "spawner_ended  ses_parent  dlg_abc  the session that delegated to this one ended; \
+             this session wound down"
+        );
+
+        let bare = r#"{"event_type":"spawner_ended","event_id":"evt_8","parent_id":"evt_1","session_id":"s","timestamp":8}"#;
+        assert_eq!(row(bare), "spawner_ended -");
+        let TraceEvent::SpawnerEnded(e) = serde_json::from_str::<TraceEvent>(bare).unwrap() else {
+            panic!("a bare spawner_ended line parses as SpawnerEnded");
+        };
+        assert_eq!(
+            spawner_ended_show_row(&e),
+            "spawner_ended  -  -  the session that delegated to this one ended; this session \
+             wound down"
         );
     }
 

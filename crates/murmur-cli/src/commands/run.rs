@@ -279,6 +279,12 @@ pub(crate) fn run_run(
             json,
         ));
     }
+    // The spawner lifeline a parent capsule's runtime handed this child, read once per process on
+    // the same terms. It needs no formation id and no spawn grant beside it: EOF on it means the
+    // process that started this one has ended, whoever that was.
+    #[cfg(unix)]
+    let spawner_lifeline = capsule_runtime::SpawnerLifeline::from_env()
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
     #[cfg(unix)]
     let has_lifeline = formation_lifeline.is_some();
     #[cfg(not(unix))]
@@ -807,6 +813,10 @@ pub(crate) fn run_run(
     #[cfg(unix)]
     if let Some(lifeline) = formation_lifeline {
         staged.attach_formation_lifeline(lifeline);
+    }
+    #[cfg(unix)]
+    if let Some(lifeline) = spawner_lifeline {
+        staged.attach_spawner_lifeline(lifeline);
     }
 
     session_id = staged.session_id.clone();
