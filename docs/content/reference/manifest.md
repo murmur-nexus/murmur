@@ -2249,12 +2249,13 @@ consequence that a later resume has nothing to find and that command's loss is n
 The single bound on a delegation. The capsule's own runtime holds the clock; no daemon has to be
 reachable for the deadline to fire.
 
-It covers the two waits a delegation has, one per caller:
+It covers every wait on handed-off work, one per caller:
 
 | Caller | What the deadline bounds |
 |---|---|
 | [`delegate-task`](runtime-provided-tools.md) | How long the started sub-capsule is watched. On expiry the sub-capsule is ended and a `terminated` outcome is posted to the delegating capsule |
 | A plan's `capsule` step | How long the step waits for the sub-capsule's answer. On expiry the step fails and the sub-capsule is stopped |
+| [`call-member`](runtime-provided-tools.md#call-member) | How long a call waits for the formation member's answer. On expiry the calling task gets a `timed_out` answer; the member is not stopped |
 
 | Value | Behaviour |
 |---|---|

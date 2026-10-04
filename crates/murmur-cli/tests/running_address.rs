@@ -1144,7 +1144,6 @@ fn stage_in_process(
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap()

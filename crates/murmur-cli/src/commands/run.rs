@@ -146,7 +146,7 @@ pub(crate) fn run_run(
     capsule_arg: Option<&str>,
     capsule_version_arg: Option<&str>,
     capsule_sha256_arg: Option<&str>,
-    ignore_task_file: bool,
+    store_root_arg: Option<&Path>,
     spawn_grant_stdin: bool,
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
@@ -176,7 +176,9 @@ pub(crate) fn run_run(
 
     let (manifest_path, project_dir) = match installed_capsule {
         Some(_) => {
-            let dir = match workdir_arg.as_deref() {
+            // `--store-root` moves the stores and the lock away from `--workdir`, which then names
+            // only where the session runs.
+            let dir = match store_root_arg.or(workdir_arg.as_deref()) {
                 Some(dir) => absolutise(dir),
                 None => std::env::current_dir().map_err(|source| {
                     fail(
@@ -793,7 +795,6 @@ pub(crate) fn run_run(
         machine_tokens_per_day,
         formation_id,
         formation_member,
-        ignore_task_file,
     };
 
     // Stage against project-then-global, the same order `check_artifacts_installed` just

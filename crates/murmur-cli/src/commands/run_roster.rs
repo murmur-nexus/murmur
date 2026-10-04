@@ -162,6 +162,7 @@ fn announce(formation: &RunningFormation, json: bool) {
                     "pid": peer.pid,
                     "session_id": peer.session_id,
                     "url": peer.url,
+                    "workdir": peer.workdir.display().to_string(),
                 })
             })
             .collect();
@@ -183,12 +184,15 @@ fn announce(formation: &RunningFormation, json: bool) {
     let mut block = format!("formation: {}", formation.formation_id());
     for peer in formation.peers() {
         block.push_str(&format!(
-            "\n  peer   {name:<width$}  {coordinate}  pid {pid}  {session}  {url}",
+            "\n  peer   {name:<width$}  {coordinate}  pid {pid}  {session}  {url}\n         \
+             {blank:<width$}  workdir {workdir}",
             name = peer.name,
             coordinate = format_args!("{}@{}", peer.capsule, peer.version),
             pid = peer.pid,
             session = peer.session_id,
             url = peer.url,
+            blank = "",
+            workdir = peer.workdir.display(),
         ));
     }
     block.push_str(&format!(

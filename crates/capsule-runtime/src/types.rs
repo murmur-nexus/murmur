@@ -466,14 +466,6 @@ pub struct StageRequest {
     /// guest is handed its callees' names, and the runtime's egress resolves and authorizes calls
     /// to them. No native process and no delegated child is handed any of it.
     pub formation_member: Option<Arc<FormationMember>>,
-    /// Never run a `task.md` found in the accessible workdir at launch: this session takes work
-    /// only at its door.
-    ///
-    /// Set by `mur run --ignore-task-file`, which a formation launcher passes to every peer. A
-    /// formation's members share the roster's project directory as their workdir, and the entry
-    /// member's task is written there; a peer that adopted it would run the entry member's task,
-    /// or a stale one from an earlier launch. `false` everywhere else.
-    pub ignore_task_file: bool,
 }
 
 /// The `transport: process` driver this session runs its harness through, compiled and described
@@ -647,8 +639,6 @@ pub struct StagedSession {
     pub(crate) formation_id: Option<FormationId>,
     /// Copied from [`StageRequest::formation_member`].
     pub(crate) formation_member: Option<Arc<FormationMember>>,
-    /// Copied from [`StageRequest::ignore_task_file`].
-    pub(crate) ignore_task_file: bool,
     /// This member's formation lifeline, attached after staging by
     /// [`StagedSession::attach_formation_lifeline`]. A process property rather than a staged
     /// one, so it never travels on [`StageRequest`].

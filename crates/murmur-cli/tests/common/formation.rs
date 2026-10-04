@@ -92,3 +92,43 @@ pub fn assert_no_member_remains(project: &Path, pids: &[u32], limit: Duration) {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Every `ses_*` session directory directly under `root`, sorted. A root that does not exist holds
+/// none.
+pub fn session_dirs(root: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ses_"))
+        })
+        .collect();
+    sessions.sort();
+    sessions
+}
+
+/// Every session root the formations launched under the scratch `home` gave their peers:
+/// `<home>/.murmur/formations/<frm_id>/<member>/.murmur`, sorted.
+pub fn peer_session_roots(home: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    let Ok(formations) = std::fs::read_dir(home.join(".murmur").join("formations")) else {
+        return roots;
+    };
+    for formation in formations.flatten() {
+        let Ok(members) = std::fs::read_dir(formation.path()) else {
+            continue;
+        };
+        for member in members.flatten() {
+            roots.push(member.path().join(".murmur"));
+        }
+    }
+    roots.sort();
+    roots
+}

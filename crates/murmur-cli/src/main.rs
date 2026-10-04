@@ -249,11 +249,16 @@ enum Commands {
         #[arg(long, value_name = "SHA256", requires = "capsule", hide = true)]
         capsule_sha256: Option<String>,
 
-        /// Never run a task.md found in the workdir at launch; take work only at the door. Set by
-        /// `mur run --roster` on every peer, which shares the roster's project directory with the
-        /// entry member and its task.
-        #[arg(long, hide = true, conflicts_with = "task")]
-        ignore_task_file: bool,
+        /// The project directory the --capsule artifact and its dependencies resolve from, in
+        /// place of --workdir. Set by `mur run --roster` on every peer, whose --workdir is a
+        /// directory of its own while its stores and lock are the roster's project's.
+        #[arg(
+            long,
+            value_name = "DIR",
+            hide = true,
+            requires_all = ["capsule", "workdir"]
+        )]
+        store_root: Option<PathBuf>,
 
         /// Launch the formation a roster declares, one task, then stop every member.
         /// Takes the roster's project directory or its roster.yaml; given with no value it means
@@ -270,7 +275,7 @@ enum Commands {
                 "capsule",
                 "capsule_version",
                 "capsule_sha256",
-                "ignore_task_file",
+                "store_root",
                 "spawn_grant_stdin",
                 "system_prompt",
                 "context",
@@ -668,7 +673,7 @@ fn main() {
             capsule,
             capsule_version,
             capsule_sha256,
-            ignore_task_file,
+            store_root,
             roster: None,
             spawn_grant_stdin,
             task,
@@ -691,7 +696,7 @@ fn main() {
             capsule.as_deref(),
             capsule_version.as_deref(),
             capsule_sha256.as_deref(),
-            ignore_task_file,
+            store_root.as_deref(),
             spawn_grant_stdin,
             task.as_deref(),
             system_prompt.as_deref(),

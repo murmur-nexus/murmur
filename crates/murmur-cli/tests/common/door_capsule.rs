@@ -89,7 +89,6 @@ pub fn stage_door(
             machine_tokens_per_day: None,
             formation_id: member.as_ref().map(|member| member.formation_id().clone()),
             formation_member: member,
-            ignore_task_file: false,
         },
     )
     .unwrap()

@@ -1566,6 +1566,56 @@ impl DelegationStartEvent {
     }
 }
 
+/// A `call-member` call whose callee holds the task, written as the tool call returns.
+///
+/// Carries the callee's roster name and the id of the task its door holds, never its door's URL
+/// or the token the call presented.
+#[derive(Serialize)]
+struct MemberCallStartEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The calling task.
+    task_id: String,
+    /// The `mcl_` id the call returned to the model.
+    call_id: String,
+    /// The callee's roster name.
+    member: String,
+    /// The task the callee's door holds, as its `tasks/get` names it.
+    member_task_id: String,
+}
+
+/// One `call-member` call, written once it is accounted for: delivered to the calling task, or
+/// left behind when that task ended.
+///
+/// A call that never started writes only this, with no `member_task_id`. Carries no URL and no
+/// token.
+#[derive(Serialize)]
+struct MemberCallEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: String,
+    call_id: String,
+    member: String,
+    /// Absent, not null, for a call the callee never held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_task_id: Option<String>,
+    /// `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned`.
+    status: String,
+    duration_ms: u64,
+    /// The callee's answer, its status message, or why the call ended.
+    output: String,
+    truncated: bool,
+    /// Whether the calling task received `output`: as the tool result for a call that never
+    /// started, as a continuation for one that did.
+    delivered: bool,
+}
+
 /// One delegation, written when it ends.
 ///
 /// One line per call whatever happened, including a call the daemon refused: a delegation that was
@@ -3634,6 +3684,62 @@ impl ResourceTraceAppender {
             outcome,
             reason,
         );
+        self.append(&event).await;
+    }
+
+    /// Records a `call-member` call whose callee now holds the task.
+    pub(crate) async fn write_member_call_start(
+        &self,
+        task_id: &str,
+        call_id: &str,
+        member: &str,
+        member_task_id: &str,
+    ) {
+        let event = MemberCallStartEvent {
+            event_type: "member_call_start",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            call_id: call_id.to_string(),
+            member: member.to_string(),
+            member_task_id: member_task_id.to_string(),
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one `call-member` call's ending. `member_task_id` is `None` for a call the callee
+    /// never held.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_member_call(
+        &self,
+        task_id: &str,
+        call_id: &str,
+        member: &str,
+        member_task_id: Option<&str>,
+        status: &str,
+        duration_ms: u64,
+        output: &str,
+        truncated: bool,
+        delivered: bool,
+    ) {
+        let event = MemberCallEvent {
+            event_type: "member_call",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            call_id: call_id.to_string(),
+            member: member.to_string(),
+            member_task_id: member_task_id.map(str::to_string),
+            status: status.to_string(),
+            duration_ms,
+            output: output.to_string(),
+            truncated,
+            delivered,
+        };
         self.append(&event).await;
     }
 

@@ -132,9 +132,9 @@ installed. Check 5 takes each member in turn through both rows before the next.
    in the launcher's memory.
 3. **Start the peers.** Every member except the entry member starts at once, as its own
    `mur run --capsule <capsule> --capsule-version <version> --json` process, bound to `127.0.0.1`,
-   with its own [formation channel](#formation-channel) already holding its credentials. A peer
-   takes work only at its door: it never runs a `task.md` in the project directory, where the
-   entry member's task is written.
+   in a [directory of its own](#member-directories), with its own
+   [formation channel](#formation-channel) already holding its credentials. A peer takes work only
+   at its door.
 4. **Wait for each door.** A peer is ready when the door at the URL its readiness line reported
    serves an agent card naming the session id that line reported.
 5. **Hand out addresses.** Each peer that may call other peers is sent their door URLs on its
@@ -150,9 +150,28 @@ installed. Check 5 takes each member in turn through both rows before the next.
 | `MURMUR_FORMATION_ID` | The formation id minted in step 2 |
 | `MURMUR_FORMATION_CHANNEL` | The number of the inherited file descriptor its [formation channel](#formation-channel) is read from |
 | `MURMUR_FORMATION_LIFELINE` | The descriptor of the member's own [lifeline](#launch-stop). Set by the launcher; not for operators |
-| `--workdir` | The roster's project directory, so every member resolves from the stores admission read, and sessions land under `<project>/.murmur/` |
+| Directory | The entry member runs in the roster's project directory, where its `--task` is written. Each peer runs in its own directory under `~/.murmur/formations/` — see [Member directories](#member-directories) |
+| Stores | The roster's project, for every member: the project store, then the global store, and the project's `murmur.lock` — the stores admission read |
 | Current directory | The launcher's, so a relative `--task` path names the same file |
 | The installed artifact | Exactly the bytes admission bound it to. A member whose installed artifact changed since admission refuses with [`E-RUN-047`](diagnostics.md#e-run-047) |
+
+### Member directories { #member-directories }
+
+| Member | Accessible directory | Sessions |
+|---|---|---|
+| Entry member | The roster's project directory | `<project>/.murmur/<ses_id>/` |
+| Each peer | `~/.murmur/formations/<frm_id>/<member>/` | `~/.murmur/formations/<frm_id>/<member>/.murmur/<ses_id>/` |
+
+- The launcher makes `~/.murmur/formations/` and `~/.murmur/formations/<frm_id>/` owner-only, and
+  makes each peer's directory with mode `0700`. A path already there is never reused: the peer is
+  refused with [`E-RUN-045`](diagnostics.md#e-run-045) naming it, and nothing is launched.
+- Every member resolves its artifacts and its lock from the roster's project, wherever it runs, so
+  a peer installed only in `<project>/.murmur/artifacts` launches.
+- Files do not cross between members. A peer's directory is in no other member's reach, and each
+  member's `task.md` is its own: two members working at once never touch each other's. A member
+  that needs a file's content sends it in the task text.
+- The [formation line](cli.md#mur-run-roster) names each peer's directory as `workdir`.
+- Nothing removes a formation's directories when it ends.
 
 ### Readiness { #launch-readiness }
 
@@ -340,6 +359,35 @@ for peer in $MURMUR_FORMATION_PEERS; do
   echo "${peer%%=*} answers at ${peer#*=}"
 done
 ```
+
+### Giving a member work { #member-calls }
+
+A member's agent calls another member with the runtime-provided
+[`call-member`](runtime-provided-tools.md#call-member) tool, which exists exactly when this roster
+lets it call someone. It names the member and states the task in full:
+
+1. The member's door gets the task as a `message/send`, carrying the caller's formation token. The
+   tool call returns as soon as the door holds the task.
+2. The member runs it in its own directory, as any task at its door.
+3. When the caller's turn ends, its runtime waits for the answer, then continues the caller's same
+   task with it, fenced under `member:<name>`.
+
+The call reaches the member's real door only if the caller's own
+[`capabilities.network.allow`](manifest.md#network-allow-entries) does. A door is served on
+loopback `http` at a port chosen at launch, so the caller declares the bare host:
+
+```yaml
+capabilities:
+  network:
+    allow:
+      - localhost
+```
+
+A member the roster lets call others, whose grant reaches no such door, prints
+[`W-RUN-008`](diagnostics.md#w-run-008) at launch, and every call it makes fails.
+
+The answer is read from the member's [`tasks/get`](agent-card.md#tasks-get), which shows a member
+only the tasks it submitted itself.
 
 ### What each member learns { #enforcement-learns }
 

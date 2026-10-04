@@ -346,19 +346,12 @@ impl Project {
         }
     }
 
-    /// Every `ses_*` session directory members created under the project.
+    /// Every `ses_*` session directory members created: the entry member's under the project,
+    /// each peer's under its own directory in the scratch `HOME`.
     fn sessions(&self) -> Vec<PathBuf> {
-        let Ok(entries) = std::fs::read_dir(self.path().join(".murmur")) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("ses_"))
-            })
+        std::iter::once(self.path().join(".murmur"))
+            .chain(common::formation::peer_session_roots(self.home.path()))
+            .flat_map(|root| common::formation::session_dirs(&root))
             .collect()
     }
 
@@ -547,9 +540,26 @@ fn assert_formation_line(formation: &Value, entry: &str, peers: &[&str]) {
     assert_eq!(names, peers, "{formation}");
     for peer in formation["peers"].as_array().unwrap() {
         let keys: Vec<&String> = peer.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["name", "pid", "session_id", "url"], "{peer}");
+        assert_eq!(
+            keys,
+            ["name", "pid", "session_id", "url", "workdir"],
+            "{peer}"
+        );
         assert!(peer["session_id"].as_str().unwrap().starts_with("ses_"));
         assert!(peer["url"].as_str().unwrap().starts_with("http://"));
+        // The peer's own directory, `<home>/.murmur/formations/<frm_id>/<member>`, owner-only.
+        let workdir = Path::new(peer["workdir"].as_str().unwrap());
+        assert!(
+            workdir.ends_with(
+                Path::new("formations")
+                    .join(id)
+                    .join(peer["name"].as_str().unwrap())
+            ),
+            "{peer}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(workdir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{peer}");
     }
     let keys: Vec<&String> = formation.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["entry", "formation_id", "peers"], "{formation}");
@@ -852,9 +862,9 @@ fn assert_no_formation_token(project: &Project, stdout: &[String], stderr: &str)
     }
 }
 
-/// Every member's workdir is the project directory, where the entry member's task is written and
-/// left behind. A peer takes work only at its door: a `task.md` already there — an earlier
-/// launch's — is never run by a peer.
+/// The entry member's task is written to the project directory and left behind there. A peer
+/// runs in a directory of its own and takes work only at its door: a `task.md` already in the
+/// project — an earlier launch's — is never run by a peer.
 #[test]
 fn a_task_file_in_the_project_is_never_a_peers_task() {
     let _lock = launch_lock();
@@ -1781,4 +1791,56 @@ fn four_member_formation_cost() {
             }
         })
     );
+}
+
+/// The member flags a launcher passes: `--ignore-task-file` is not a flag at all, and the hidden
+/// `--store-root` is not shown, needs `--capsule` and `--workdir`, and is no `--roster` flag.
+#[test]
+fn the_hidden_member_flags_are_exactly_what_a_launcher_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mur = |args: &[&str]| {
+        Command::new(assert_cmd::cargo::cargo_bin("mur"))
+            .args(args)
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .output()
+            .unwrap()
+    };
+    let removed = mur(&[
+        "run",
+        "--ignore-task-file",
+        "--capsule",
+        "c",
+        "--capsule-version",
+        "1",
+    ]);
+    assert_eq!(removed.status.code(), Some(2), "{removed:?}");
+    assert!(
+        String::from_utf8_lossy(&removed.stderr)
+            .contains("unexpected argument '--ignore-task-file'"),
+        "{removed:?}"
+    );
+
+    let help = mur(&["run", "--help"]);
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("--store-root"));
+
+    let store = dir.path().display().to_string();
+    for args in [
+        vec!["run", "--store-root", &store],
+        vec!["run", "--store-root", &store, "--workdir", &store],
+        vec![
+            "run",
+            "--store-root",
+            &store,
+            "--capsule",
+            "c",
+            "--capsule-version",
+            "1",
+        ],
+        vec!["run", "--roster", &store, "--store-root", &store],
+    ] {
+        let refused = mur(&args);
+        assert_eq!(refused.status.code(), Some(2), "{args:?}: {refused:?}");
+    }
 }

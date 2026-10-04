@@ -35,6 +35,16 @@ token issued for that door, answers any other caller `401` or `403`, and the who
 credentials ends with the formation. See
 [How reachability is enforced](../reference/roster.md#enforcement).
 
+A member gives another member work with the runtime-provided
+[`call-member`](../reference/runtime-provided-tools.md#call-member) tool, which the roster's edge
+creates: a member the roster lets call nobody has no such tool. The call returns as soon as the
+other member holds the task, so the caller's turn ends rather than waiting. The other member runs
+the task in its own directory, and its answer comes back into the caller's same task, marked as
+coming from that member. Members share no files: whatever the other member needs goes in the task
+text. The roster grants the name and the credential, not the network: the caller's own
+`capabilities.network.allow` must reach `localhost`. See
+[Giving a member work](../reference/roster.md#member-calls).
+
 A formation's members end with it, however it ends. Each member holds one end of a lifeline whose
 other end only the launcher holds; when the launcher ends the formation, or dies — even by
 `SIGKILL` — every member's lifeline closes. A member whose lifeline closes records

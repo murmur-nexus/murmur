@@ -101,17 +101,20 @@ pub const PEER_BIND_ADDR: &str = "127.0.0.1";
 /// The hidden `mur run` flag carrying the sha256 admission bound a member to.
 pub const CAPSULE_SHA256_FLAG: &str = "--capsule-sha256";
 
-/// The hidden `mur run` flag that keeps a peer from running a `task.md` it finds in the shared
-/// project directory.
-pub const IGNORE_TASK_FILE_FLAG: &str = "--ignore-task-file";
+/// The hidden `mur run` flag naming the directory a peer resolves its artifacts, its lock and its
+/// workspace from, apart from its `--workdir`.
+pub const STORE_ROOT_FLAG: &str = "--store-root";
+
+/// The directory under the murmur home that holds every formation's peer directories.
+pub const FORMATIONS_DIR: &str = "formations";
 
 /// What a formation launch is given besides its roster.
 #[derive(Debug, Clone)]
 pub struct FormationLaunchOptions {
     /// The id every member is launched with, minted once for this launch.
     pub formation_id: FormationId,
-    /// The roster's project directory: every member's `--workdir`, so all of them resolve from
-    /// the stores admission read.
+    /// The roster's project directory: the entry member's `--workdir`, and every peer's
+    /// `--store-root`, so every member resolves from the stores admission read.
     pub project_dir: PathBuf,
     /// `--task`, passed to the entry member only.
     pub task: Option<String>,
@@ -129,6 +132,9 @@ pub struct FormationLaunchOptions {
     /// How long a stopped member has after its lifeline is closed. [`MEMBER_STOP_GRACE`] in
     /// production.
     pub stop_grace: Duration,
+    /// Where peers' directories are made in place of `<murmur home>/formations`. `None` in
+    /// production; set by tests that must not write under the developer's home.
+    pub(crate) formations_dir: Option<PathBuf>,
 }
 
 impl FormationLaunchOptions {
@@ -144,6 +150,7 @@ impl FormationLaunchOptions {
             containment: None,
             ready_timeout: MEMBER_READY_TIMEOUT,
             stop_grace: MEMBER_STOP_GRACE,
+            formations_dir: None,
         }
     }
 }
@@ -240,6 +247,9 @@ pub struct ReadyPeer {
     pub session_id: String,
     /// `http://host:port`.
     pub url: String,
+    /// The peer's accessible directory, `<murmur home>/formations/<frm_id>/<member>`: its
+    /// `--workdir`, where its `task.md` is written and its sessions nest.
+    pub workdir: PathBuf,
     /// The operator token from the peer's readiness line, present when the peer declares
     /// `network.authentication`. Held for the readiness probe and never printed.
     door_token: Option<DoorToken>,
@@ -261,6 +271,7 @@ impl std::fmt::Debug for ReadyPeer {
             .field("pid", &self.pid)
             .field("session_id", &self.session_id)
             .field("url", &self.url)
+            .field("workdir", &self.workdir)
             .field(
                 "door_token",
                 &self.door_token.as_ref().map(|_| "<redacted>"),
@@ -803,8 +814,8 @@ impl Drop for MemberSet {
 
 // ── Starting members ──────────────────────────────────────────────────────────
 
-/// The arguments every member's `mur run` starts with.
-fn member_args(member: &PlannedMember, options: &FormationLaunchOptions) -> Vec<String> {
+/// The arguments every member's `mur run` starts with, running in `workdir`.
+fn member_args(member: &PlannedMember, workdir: &Path) -> Vec<String> {
     vec![
         "run".to_string(),
         "--capsule".to_string(),
@@ -814,7 +825,7 @@ fn member_args(member: &PlannedMember, options: &FormationLaunchOptions) -> Vec<
         CAPSULE_SHA256_FLAG.to_string(),
         member.sha256.clone(),
         "--workdir".to_string(),
-        options.project_dir.display().to_string(),
+        workdir.display().to_string(),
     ]
 }
 
@@ -829,24 +840,29 @@ fn pass_through(args: &mut Vec<String>, options: &FormationLaunchOptions) {
     }
 }
 
-/// A peer's arguments after the binary.
-pub(crate) fn peer_args(member: &PlannedMember, options: &FormationLaunchOptions) -> Vec<String> {
-    let mut args = member_args(member, options);
+/// A peer's arguments after the binary: it runs in `workdir`, a directory of its own, and resolves
+/// from the project's stores.
+pub(crate) fn peer_args(
+    member: &PlannedMember,
+    options: &FormationLaunchOptions,
+    workdir: &Path,
+) -> Vec<String> {
+    let mut args = member_args(member, workdir);
     args.extend([
+        STORE_ROOT_FLAG.to_string(),
+        options.project_dir.display().to_string(),
         "--json".to_string(),
         "--bind".to_string(),
         PEER_BIND_ADDR.to_string(),
-        // Every member's workdir is the project directory, where the entry member's task is
-        // written; a peer takes work only at its door.
-        IGNORE_TASK_FILE_FLAG.to_string(),
     ]);
     pass_through(&mut args, options);
     args
 }
 
-/// The entry member's arguments after the binary.
+/// The entry member's arguments after the binary. It runs in the project directory, where its
+/// `--task` is written.
 pub(crate) fn entry_args(member: &PlannedMember, options: &FormationLaunchOptions) -> Vec<String> {
-    let mut args = member_args(member, options);
+    let mut args = member_args(member, &options.project_dir);
     args.extend([
         "--lifecycle-task-acceptance".to_string(),
         "single".to_string(),
@@ -865,6 +881,98 @@ pub(crate) fn entry_args(member: &PlannedMember, options: &FormationLaunchOption
     }
     pass_through(&mut args, options);
     args
+}
+
+/// A peer's accessible directory: `<murmur home>/formations/<frm_id>/<member>`.
+///
+/// Resolved from `HOME` without creating anything. The `Err` is `HOME` being unset or relative.
+pub fn member_workdir(formation_id: &FormationId, member: &str) -> Result<PathBuf, String> {
+    Ok(formations_dir()?.join(formation_id.as_str()).join(member))
+}
+
+/// `<murmur home>/formations`, resolved without creating anything.
+fn formations_dir() -> Result<PathBuf, String> {
+    Ok(crate::state_store::murmur_home_dir()?.join(FORMATIONS_DIR))
+}
+
+/// Every session root a formation's peers record under: `<dir>/.murmur` for each directory under
+/// `<murmur home>/formations/<frm_id>/`, sorted.
+///
+/// Reads the directory and creates nothing. A formation with no directory, or a `HOME` that does
+/// not resolve, has no roots. A formation directory that exists and cannot be listed is returned
+/// as a root itself, so the caller's read of it fails and is reported as an unreadable root.
+pub fn formation_member_roots(formation_id: &FormationId) -> Vec<PathBuf> {
+    match formations_dir() {
+        Ok(dir) => formation_member_roots_in(&dir, formation_id),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`formation_member_roots`] under `formations_dir` in place of `<murmur home>/formations`.
+pub fn formation_member_roots_in(
+    formations_dir: &Path,
+    formation_id: &FormationId,
+) -> Vec<PathBuf> {
+    let dir = formations_dir.join(formation_id.as_str());
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => return vec![dir],
+    };
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path().join(".murmur"))
+        .filter(|root| root.exists())
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// Make `member`'s directory under `formations_dir`, owner-only, and return it.
+///
+/// `formations_dir` and the formation's directory are held at `0700` whether or not this call made
+/// them. The member's own directory is made with a single non-recursive create at `0700`, so a
+/// path that already exists — a directory, a file or a symlink — is refused rather than reused:
+/// nothing another process placed there becomes a member's preopen.
+fn make_member_workdir(
+    formations_dir: &Path,
+    formation_id: &FormationId,
+    member: &str,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let formation_dir = formations_dir.join(formation_id.as_str());
+    let workdir = formation_dir.join(member);
+    let failed = |path: &Path, reason: String| {
+        format!(
+            "its directory {} could not be made: {}: {reason}",
+            workdir.display(),
+            path.display()
+        )
+    };
+    for dir in [formations_dir, formation_dir.as_path()] {
+        crate::state_store::ensure_private_dir(dir, crate::murmur_home::MURMUR_HOME_DIR_MODE)
+            .map_err(|reason| failed(dir, reason))?;
+    }
+    std::fs::DirBuilder::new()
+        .mode(crate::murmur_home::MURMUR_HOME_DIR_MODE)
+        .create(&workdir)
+        .map_err(|error| failed(&workdir, error.to_string()))?;
+    // The umask may have narrowed the create's mode further; it can never have widened it.
+    Ok(workdir)
+}
+
+/// The directory peers' directories are made under for this launch: the override, or
+/// `<murmur home>/formations` with the home held owner-only first.
+fn launch_formations_dir(options: &FormationLaunchOptions) -> Result<PathBuf, String> {
+    match &options.formations_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => {
+            crate::murmur_home::ensure_murmur_home()?;
+            formations_dir()
+        }
+    }
 }
 
 /// What became of one peer's start.
@@ -929,7 +1037,13 @@ fn start_peer(
     abort: &AtomicBool,
     #[cfg(unix)] mut lifeline: crate::lifeline::MemberLifeline,
 ) -> (Option<MemberProcess>, PeerOutcome) {
-    let args = peer_args(member, options);
+    let workdir = match launch_formations_dir(options)
+        .and_then(|dir| make_member_workdir(&dir, &options.formation_id, &member.name))
+    {
+        Ok(workdir) => workdir,
+        Err(error) => return (None, PeerOutcome::Failed(not_started(&error))),
+    };
+    let args = peer_args(member, options, &workdir);
     let prefix = format!("[{}] ", member.name);
     let channel = match Channel::open(first_line) {
         Ok(channel) => channel,
@@ -1068,6 +1182,7 @@ fn start_peer(
                         pid,
                         session_id: report.session_id,
                         url: report.url,
+                        workdir,
                         door_token: report.door_token,
                     }),
                 );
@@ -1554,6 +1669,8 @@ mod tests {
             FormationLaunchOptions::new(FormationId::mint(), PathBuf::from("/tmp/project"));
         options.ready_timeout = deadline;
         options.stop_grace = Duration::from_secs(2);
+        // Peers' directories go under a scratch directory, never the developer's home.
+        options.formations_dir = Some(tempfile::tempdir().unwrap().keep());
         options
     }
 
@@ -1561,8 +1678,9 @@ mod tests {
     fn member_argv_is_exactly_the_documented_shape() {
         let mut options = options(MEMBER_READY_TIMEOUT);
         let coder = member("coder");
+        let workdir = PathBuf::from("/home/u/.murmur/formations/frm_x/coder");
         assert_eq!(
-            peer_args(&coder, &options),
+            peer_args(&coder, &options, &workdir),
             [
                 "run",
                 "--capsule",
@@ -1572,11 +1690,12 @@ mod tests {
                 "--capsule-sha256",
                 &"ab".repeat(32),
                 "--workdir",
+                "/home/u/.murmur/formations/frm_x/coder",
+                "--store-root",
                 "/tmp/project",
                 "--json",
                 "--bind",
                 "127.0.0.1",
-                "--ignore-task-file",
             ]
         );
         options.task = Some("probe".to_string());
@@ -1585,6 +1704,7 @@ mod tests {
         options.no_env_file = true;
         options.containment = Some("scoped".to_string());
         let entry = entry_args(&member("planner"), &options);
+        assert_eq!(&entry[7..9], ["--workdir", "/tmp/project"]);
         assert_eq!(
             &entry[9..],
             [
@@ -1604,10 +1724,10 @@ mod tests {
         assert!(
             !entry
                 .iter()
-                .any(|arg| arg == "--bind" || arg == "--ignore-task-file"),
+                .any(|arg| arg == "--bind" || arg == STORE_ROOT_FLAG),
             "{entry:?}"
         );
-        let peer = peer_args(&coder, &options);
+        let peer = peer_args(&coder, &options, &workdir);
         assert!(peer.ends_with(&[
             "--no-env-file".to_string(),
             "--containment".to_string(),
@@ -2113,10 +2233,94 @@ mod tests {
             pid: 1,
             session_id: "ses_x".to_string(),
             url: "http://localhost:1".to_string(),
+            workdir: PathBuf::from("/home/u/.murmur/formations/frm_x/coder"),
             door_token: Some(DoorToken::new("mdt1.secretpayload.mac".to_string())),
         };
         let debug = format!("{peer:?}");
         assert!(!debug.contains("secretpayload"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    /// A peer's directory is `<home>/formations/<frm_id>/<member>`, every level owner-only.
+    #[test]
+    fn a_member_directory_is_made_owner_only_under_its_formation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let formations = home.path().join(FORMATIONS_DIR);
+        let id = FormationId::mint();
+        let workdir = make_member_workdir(&formations, &id, "worker").unwrap();
+        assert_eq!(workdir, formations.join(id.as_str()).join("worker"));
+        for dir in [&formations, &formations.join(id.as_str()), &workdir] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+    }
+
+    /// Nothing already at a member's path becomes its preopen: a directory, a file or a symlink
+    /// there refuses the member, naming the path.
+    #[test]
+    fn an_existing_member_path_is_refused_and_named() {
+        let home = tempfile::tempdir().unwrap();
+        let formations = home.path().join(FORMATIONS_DIR);
+        let id = FormationId::mint();
+        make_member_workdir(&formations, &id, "worker").unwrap();
+        let again = make_member_workdir(&formations, &id, "worker").unwrap_err();
+        let path = formations.join(id.as_str()).join("worker");
+        assert!(again.contains(&path.display().to_string()), "{again}");
+        std::os::unix::fs::symlink(home.path(), formations.join(id.as_str()).join("linked"))
+            .unwrap();
+        assert!(make_member_workdir(&formations, &id, "linked").is_err());
+    }
+
+    /// A peer whose directory cannot be made is not started, and the launch is refused naming it.
+    #[test]
+    fn a_peer_whose_directory_cannot_be_made_refuses_the_launch() {
+        let _guard = binary_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(Duration::from_secs(5));
+        let formations = options.formations_dir.clone().unwrap();
+        let taken = formations.join(options.formation_id.as_str()).join("coder");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::env::set_var(child_launch::MUR_BINARY_ENV, stand_in(dir.path(), None));
+        let result = launch_plan(plan_of("coder"), options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        let Err(failure) = result else {
+            panic!("the launch was expected to be refused");
+        };
+        assert!(failure.stopped.is_empty(), "{failure:?}");
+        match only_reason(&failure) {
+            MemberFailureReason::NotStarted { error } => {
+                assert!(error.contains(&taken.display().to_string()), "{error}")
+            }
+            other => panic!("expected NotStarted, got {other:?}"),
+        }
+    }
+
+    /// The roots `mur trace show frm_<id>` searches: one `.murmur` per member directory that has
+    /// one, sorted, and none for a formation with no directory.
+    #[test]
+    fn member_workdir_names_the_formation_and_the_member() {
+        let id = FormationId::mint();
+        if let Ok(workdir) = member_workdir(&id, "worker") {
+            assert!(workdir.ends_with(Path::new(FORMATIONS_DIR).join(id.as_str()).join("worker")));
+        }
+        assert!(formation_member_roots(&FormationId::mint()).is_empty());
+
+        let home = tempfile::tempdir().unwrap();
+        let formations = home.path().join(FORMATIONS_DIR);
+        for member in ["worker", "reviewer", "idle"] {
+            make_member_workdir(&formations, &id, member).unwrap();
+        }
+        for member in ["worker", "reviewer"] {
+            std::fs::create_dir(formations.join(id.as_str()).join(member).join(".murmur")).unwrap();
+        }
+        assert_eq!(
+            formation_member_roots_in(&formations, &id),
+            [
+                formations.join(id.as_str()).join("reviewer/.murmur"),
+                formations.join(id.as_str()).join("worker/.murmur"),
+            ]
+        );
     }
 }

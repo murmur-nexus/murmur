@@ -54,6 +54,14 @@ pub const W_RUN_006: &str = "W-RUN-006";
 /// names the formation and `mur stop` as the way to end it. Printed once, at launch.
 pub const W_RUN_007: &str = "W-RUN-007";
 
+/// A formation member the roster lets call another whose `capabilities.network.allow` reaches no
+/// loopback `http` door at an unpinned port.
+///
+/// A roster edge grants a name and a credential, never egress, and a callee's door is served at a
+/// port chosen at launch, so every `call-member` call from such a member is refused. Nothing is
+/// refused at launch: the member may still be called. Printed once, at staging.
+pub const W_RUN_008: &str = "W-RUN-008";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -71,7 +79,7 @@ mod tests {
     #[test]
     fn every_code_is_unique_and_well_formed() {
         let codes = [
-            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006, W_RUN_007,
+            W_RUN_001, W_RUN_002, W_RUN_003, W_RUN_004, W_RUN_006, W_RUN_007, W_RUN_008,
         ];
         for code in codes {
             assert!(code.starts_with("W-RUN-"), "malformed code: {code}");

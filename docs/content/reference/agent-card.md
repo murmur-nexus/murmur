@@ -414,6 +414,31 @@ answers the header with `-32602` without starting a task — see
 [`E-RUN-039`](diagnostics.md#e-run-039). What the forget does, and what it records, is
 [what removes an entry](workdir.md#what-removes-an-entry).
 
+#### `tasks/get` { #tasks-get }
+
+`tasks/get` answers the task `params.id` names, running or finished, as an A2A `Task`:
+
+| Key | Present |
+|---|---|
+| `id`, `contextId`, `status.state` | Always |
+| `status.message` | On a terminal task — `completed`, `failed`, `canceled` or `rejected` — whose final status said something: a message from the agent with one text part, the same text as the task's final [`status` frame](streaming-protocol.md#one-final-status) |
+| `artifacts: [{"name": "response", …}]` | On a `completed` task that produced a response: its answer, as one text part |
+| `artifacts: [{"name": "prompt", …}]` | On an `input-required` task: the question it is waiting on |
+
+```json
+{"id": "tsk_…", "contextId": "ctx_…",
+ "status": {"state": "completed",
+            "message": {"messageId": "msg_tsk_…_status", "role": "agent", "parts": [{"text": "session ended"}]}},
+ "artifacts": [{"name": "response", "parts": [{"text": "four"}]}]}
+```
+
+A caller holding a [formation token](roster.md#formation-token) reads only the tasks it submitted
+on that token. Any other id — another member's task, the operator's, or one the session never held
+— is answered `-32001 Task not found`. Every other credential reads every task.
+
+A `message/send` the door has no room for answers a `rejected` task whose `status.message` says
+why: `task rejected: capsule is busy`, or `task rejected: the session is closing`.
+
 ### Capsule extension { #murmur-capsule-v1 }
 
 URI: `https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1`

@@ -7,14 +7,17 @@
 //! known to be a member. A session whose first line is anything else — a script capsule's
 //! drain-only trace, a torn file — is no member.
 //!
-//! Nothing here follows a delegation edge into another session root: a member's delegated child
-//! that was not found under the searched root is counted, not chased.
+//! A formation's members record under more than one root: the entry member under the roster's
+//! project, each peer under its own directory in `~/.murmur/formations/<frm_id>/`.
+//! [`search_formation`] reads a given root and then those, and merges what they record. Nothing
+//! here follows a delegation edge into another session root: a member's delegated child that was
+//! not found under a searched root is counted, not chased.
 
 use std::{
     collections::BTreeSet,
     fs,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use capsule_runtime::{retention::session_id_timestamp_ms, FormationId};
@@ -125,6 +128,79 @@ pub(crate) fn recorded_members(
     })
 }
 
+/// One root [`search_formation`] searched, and why it could not be read when it could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchedRoot {
+    pub(crate) root: PathBuf,
+    /// `None` for a root that was read.
+    pub(crate) unreadable: Option<String>,
+}
+
+/// What every searched root records about one formation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FormationSearch {
+    /// Every root searched, in the order searched.
+    pub(crate) searched: Vec<SearchedRoot>,
+    /// Every member found under any of them, once each, by session id ascending.
+    pub(crate) found: RecordedMembers,
+}
+
+/// Every session under `first`, then under each of `more`, whose `session_start` names
+/// `formation`.
+///
+/// `first` is the root the caller was given, and one that cannot be listed fails the search as
+/// [`recorded_members`] does. A root among `more` that cannot be listed is reported in
+/// [`FormationSearch::searched`] and fails nothing. A session found under two roots is listed
+/// once; `more` repeating `first` is searched once.
+pub(crate) fn search_formation(
+    first: &Path,
+    more: Vec<PathBuf>,
+    formation: &FormationId,
+) -> Result<FormationSearch, CliError> {
+    let mut members = recorded_members(first, formation)?.members;
+    let mut searched = vec![SearchedRoot {
+        root: first.to_path_buf(),
+        unreadable: None,
+    }];
+    for root in more {
+        if searched.iter().any(|done| done.root == root) {
+            continue;
+        }
+        match recorded_members(&root, formation) {
+            Ok(found) => {
+                for member in found.members {
+                    if !members.iter().any(|m| m.session_id == member.session_id) {
+                        members.push(member);
+                    }
+                }
+                searched.push(SearchedRoot {
+                    root,
+                    unreadable: None,
+                });
+            }
+            Err(error) => searched.push(SearchedRoot {
+                root,
+                unreadable: Some(error.message),
+            }),
+        }
+    }
+    members.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let found: BTreeSet<&str> = members.iter().map(|m| m.session_id.as_str()).collect();
+    let children_elsewhere: BTreeSet<String> = members
+        .iter()
+        .flat_map(|member| member.delegated_children.iter())
+        .filter(|child| !found.contains(child.as_str()))
+        .cloned()
+        .collect();
+    Ok(FormationSearch {
+        searched,
+        found: RecordedMembers {
+            members,
+            children_elsewhere: children_elsewhere.into_iter().collect(),
+        },
+    })
+}
+
 /// A member's whole trace, read for its identity, its ending and its delegations.
 fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
     let mut member = RecordedMember {
@@ -209,6 +285,71 @@ mod tests {
             "child_workdir": "/elsewhere",
         })
         .to_string()
+    }
+
+    /// A formation's peers record under their own directories in the murmur home: the search
+    /// reads the given root and then each peer's root, lists every member once, and reports a
+    /// root it could not read without failing.
+    #[test]
+    fn a_formation_is_found_across_the_project_root_and_its_peers_roots() {
+        let formation = FormationId::mint();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().join(".murmur");
+        let entry = session_after(&formation, 30, "1");
+        write_trace(
+            &root,
+            &entry,
+            &[start(&entry, Some(formation.as_str()), None), end("ok")],
+        );
+        let formations = home.path().join("formations");
+        let worker_root = formations
+            .join(formation.as_str())
+            .join("worker")
+            .join(".murmur");
+        let worker = session_after(&formation, 10, "2");
+        write_trace(
+            &worker_root,
+            &worker,
+            &[
+                start(&worker, Some(formation.as_str()), None),
+                end("canceled"),
+            ],
+        );
+        let roots =
+            capsule_runtime::formation_launch::formation_member_roots_in(&formations, &formation);
+        assert_eq!(roots, std::slice::from_ref(&worker_root));
+
+        // A directory this user may not list.
+        let unreadable = home.path().join("closed");
+        fs::create_dir(&unreadable).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut more = roots.clone();
+        more.push(root.clone());
+        more.push(unreadable.clone());
+        let search = search_formation(&root, more, &formation).unwrap();
+        let sessions: Vec<&str> = search
+            .found
+            .members
+            .iter()
+            .map(|member| member.session_id.as_str())
+            .collect();
+        assert_eq!(sessions, [worker.as_str(), entry.as_str()]);
+        let searched: Vec<(&Path, bool)> = search
+            .searched
+            .iter()
+            .map(|root| (root.root.as_path(), root.unreadable.is_some()))
+            .collect();
+        assert_eq!(
+            searched,
+            [
+                (root.as_path(), false),
+                (worker_root.as_path(), false),
+                (unreadable.as_path(), fs::read_dir(&unreadable).is_err())
+            ]
+        );
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

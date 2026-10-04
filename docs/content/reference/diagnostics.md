@@ -130,6 +130,7 @@ section that explains it.
 | `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
 | `W-RUN-006` | A roster edge into the entry member is not served | [W-RUN-006](#w-run-006) |
 | `W-RUN-007` | A session carries a formation id but no lifeline, so it does not wind down when its formation ends | [W-RUN-007](#w-run-007) |
+| `W-RUN-008` | A formation member the roster lets call another reaches no member's door with its `capabilities.network.allow` | [W-RUN-008](#w-run-008) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -1232,11 +1233,11 @@ rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 
 ### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
 
-`share-file`, `fetch-peer-file`, `delegate-task` and `submit-plan` are answered by the runtime
-itself, so an artifact cannot be declared under any of them:
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver` and `call-member`
+are answered by the runtime itself, so an artifact cannot be declared under any of them:
 
 ```text
-error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan
+error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member
   hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see docs/content/reference/runtime-provided-tools.md
 ```
 
@@ -1905,6 +1906,31 @@ a delegated child, is a formation member started by hand. It runs as any other `
 as long as its lifecycle keeps it, and appears in [`mur ps`](cli.md#mur-ps). Nothing ends it when
 its formation ends; end it with [`mur stop`](cli.md#mur-stop). The warning prints once, at launch.
 Nothing is refused. See [How a formation ends](roster.md#launch-stop).
+
+### W-RUN-008 — a caller that cannot reach a member's door { #w-run-008 }
+
+```text
+[capsule-runtime] warning[W-RUN-008]: roster.yaml lets 'lead' call 'worker', but its capabilities.network.allow reaches no loopback http door at an unpinned port, so every call-member call will be refused; declare "localhost" (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-008)
+```
+
+A member that `roster.yaml` lets call another has the
+[`call-member`](runtime-provided-tools.md#call-member) tool, but a roster rule grants a name and a
+credential, never network access. Each call is checked against the member's own
+[`capabilities.network.allow`](manifest.md#network-allow-entries) at the called member's real door,
+which a formation serves on loopback `http` at a port chosen at launch. Only an entry that matches
+`localhost` over `http` at every port reaches it:
+
+| Entry | Reaches a member's door |
+|---|---|
+| `localhost` | Yes |
+| `http://localhost` | No: a URL entry with no port means the scheme's default port, `80` |
+| `localhost:8080`, `http://localhost:8080` | No: the door's port is chosen at launch |
+| `127.0.0.1` | No: a door's address names `localhost` |
+
+The warning prints once, at staging, to stderr and the member's `logs/bootstrap.log`. Nothing is
+refused: the member launches and may still be called, and each `call-member` call it makes fails
+in the same turn, naming `capabilities.network.allow`. Declare `localhost` in the member's
+`capabilities.network.allow`. See [Giving a member work](roster.md#member-calls).
 
 ---
 

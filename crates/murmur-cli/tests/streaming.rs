@@ -194,7 +194,6 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap()
@@ -697,7 +696,6 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
             machine_tokens_per_day: None,
             formation_id: None,
             formation_member: None,
-            ignore_task_file: false,
         },
     )
     .unwrap()

@@ -115,7 +115,7 @@ pub(crate) struct A2aArtifact {
     pub parts: Vec<ArtifactPart>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ArtifactPart {
     pub text: String,
 }
@@ -123,7 +123,55 @@ pub(crate) struct ArtifactPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TaskStatus {
     pub state: TaskState,
+    /// What the task's final status said, for a terminal task that said something.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<StatusMessage>,
 }
+
+impl TaskStatus {
+    /// A status in `state` with no message.
+    pub(crate) fn of(state: TaskState) -> Self {
+        Self {
+            state,
+            message: None,
+        }
+    }
+}
+
+/// A task status's message: an A2A message from the agent with one text part, in the shape this
+/// door reads an incoming message in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StatusMessage {
+    pub message_id: String,
+    pub role: String,
+    pub parts: Vec<ArtifactPart>,
+}
+
+impl StatusMessage {
+    /// The agent's message `text` about `task_id`.
+    pub(crate) fn agent(task_id: &str, text: &str) -> Self {
+        Self {
+            message_id: format!("msg_{task_id}_status"),
+            role: "agent".to_string(),
+            parts: vec![ArtifactPart {
+                text: text.to_string(),
+            }],
+        }
+    }
+}
+
+/// How a finished task ended, as its final status reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskEnding {
+    /// The final status's message.
+    message: String,
+    /// The task's response text, kept only for a `completed` task.
+    response: Option<String>,
+}
+
+/// The name of the artifact a completed task's response is carried in over `tasks/get`.
+pub(crate) const RESPONSE_ARTIFACT: &str = "response";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -227,6 +275,10 @@ pub(crate) struct TaskRegistry {
     /// Set by [`Self::close_to_new_work`] once the task loop has ended. A closed registry
     /// accepts nothing, whatever its acceptance mode and depth.
     closed: bool,
+    /// How each finished task ended, recorded by [`Self::record_ending`].
+    endings: HashMap<String, TaskEnding>,
+    /// The formation member that submitted each task the door let in on a formation token.
+    submitters: HashMap<String, String>,
 }
 
 /// The `status.message` of a task refused because the session ended before it started.
@@ -253,6 +305,8 @@ impl TaskRegistry {
             cancels: HashMap::new(),
             resource_generation: Arc::new(AtomicU64::new(0)),
             closed: false,
+            endings: HashMap::new(),
+            submitters: HashMap::new(),
         }
     }
 
@@ -293,6 +347,32 @@ impl TaskRegistry {
         self.history.insert(
             task_id.to_string(),
             (TaskState::Submitted, context_id.to_string()),
+        );
+    }
+
+    /// Record that the formation member `member` submitted `task_id`. Called under the lock the
+    /// task was enqueued under, so no `tasks/get` can see the task without its submitter.
+    pub(crate) fn record_submitter(&mut self, task_id: &str, member: &str) {
+        self.submitters
+            .insert(task_id.to_string(), member.to_string());
+    }
+
+    /// The formation member that submitted `task_id`, or `None` for a task no formation token
+    /// submitted.
+    pub(crate) fn submitter(&self, task_id: &str) -> Option<&str> {
+        self.submitters.get(task_id).map(String::as_str)
+    }
+
+    /// Record how `task_id` ended: its final status's `message`, and its `response` when it
+    /// completed. A response on any other state is not kept.
+    pub(crate) fn record_ending(&mut self, task_id: &str, message: &str, response: Option<&str>) {
+        let completed = matches!(self.history.get(task_id), Some((TaskState::Completed, _)));
+        self.endings.insert(
+            task_id.to_string(),
+            TaskEnding {
+                message: message.to_string(),
+                response: response.filter(|_| completed).map(str::to_string),
+            },
         );
     }
 
@@ -531,25 +611,40 @@ impl TaskRegistry {
             .map(|(prompt, _)| prompt.as_str())
     }
 
+    /// `task_id` as `tasks/get` reports it.
+    ///
+    /// An `input-required` task carries its prompt as a `prompt` artifact. A terminal task carries
+    /// its final status's message as `status.message`, and a `completed` one its response as a
+    /// `response` artifact, each when it has one.
     pub(crate) fn get_task(&self, task_id: &str) -> Option<A2aTask> {
         self.history.get(task_id).map(|(state, context_id)| {
-            let artifacts = if matches!(state, TaskState::InputRequired) {
-                self.input_waiters.get(task_id).map(|(prompt, _)| {
-                    vec![A2aArtifact {
-                        name: "prompt".to_string(),
-                        parts: vec![ArtifactPart {
-                            text: prompt.clone(),
-                        }],
-                    }]
-                })
-            } else {
-                None
+            let artifact = |name: &str, text: &str| A2aArtifact {
+                name: name.to_string(),
+                parts: vec![ArtifactPart {
+                    text: text.to_string(),
+                }],
             };
+            let ending = self.endings.get(task_id).filter(|_| state.is_terminal());
+            let artifacts = match state {
+                TaskState::InputRequired => self
+                    .input_waiters
+                    .get(task_id)
+                    .map(|(prompt, _)| vec![artifact("prompt", prompt)]),
+                TaskState::Completed => ending
+                    .and_then(|ending| ending.response.as_deref())
+                    .filter(|response| !response.is_empty())
+                    .map(|response| vec![artifact(RESPONSE_ARTIFACT, response)]),
+                _ => None,
+            };
+            let message = ending
+                .filter(|ending| !ending.message.is_empty())
+                .map(|ending| StatusMessage::agent(task_id, &ending.message));
             A2aTask {
                 id: task_id.to_string(),
                 context_id: context_id.clone(),
                 status: TaskStatus {
                     state: state.clone(),
+                    message,
                 },
                 artifacts,
             }
@@ -674,21 +769,89 @@ mod tests {
     }
 
     #[test]
-    fn get_task_includes_artifacts_only_for_input_required() {
-        let mut r = running_registry("tsk_001");
-        let task = r.get_task("tsk_001").unwrap();
-        assert!(
-            task.artifacts.is_none(),
-            "working task should have no artifacts"
-        );
-
+    fn an_input_required_task_carries_its_prompt_and_nothing_else() {
+        let mut r = running_registry("tsk_1");
         let (tx, _rx) = oneshot::channel();
-        r.set_input_required("tsk_001", "my prompt".into(), tx)
+        r.set_input_required("tsk_1", "Which file?".to_string(), tx)
             .unwrap();
-        let task = r.get_task("tsk_001").unwrap();
+        let task = r.get_task("tsk_1").unwrap();
         let artifacts = task.artifacts.unwrap();
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].parts[0].text, "my prompt");
+        assert_eq!(artifacts[0].name, "prompt");
+        assert_eq!(artifacts[0].parts[0].text, "Which file?");
+        assert!(task.status.message.is_none());
+    }
+
+    /// A live task carries nothing beyond its state: no artifact and no status message.
+    #[test]
+    fn a_working_task_carries_no_artifact_and_no_message() {
+        let r = running_registry("tsk_1");
+        let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
+        assert_eq!(
+            task,
+            serde_json::json!({"id": "tsk_1", "contextId": "ctx_001", "status": {"state": "working"}})
+        );
+    }
+
+    /// A completed task answers with its response as the `response` artifact and its final
+    /// message as `status.message`, an A2A message from the agent.
+    #[test]
+    fn a_completed_task_carries_its_response_artifact_and_status_message() {
+        let mut r = running_registry("tsk_1");
+        r.finish_task(TaskState::Completed);
+        r.record_ending("tsk_1", "done", Some("the answer is 4"));
+        let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
+        assert_eq!(
+            task,
+            serde_json::json!({
+                "id": "tsk_1",
+                "contextId": "ctx_001",
+                "status": {
+                    "state": "completed",
+                    "message": {
+                        "messageId": "msg_tsk_1_status",
+                        "role": "agent",
+                        "parts": [{"text": "done"}],
+                    },
+                },
+                "artifacts": [{"name": "response", "parts": [{"text": "the answer is 4"}]}],
+            })
+        );
+    }
+
+    /// A task that did not complete carries its message and no response, whatever was passed.
+    #[test]
+    fn a_failed_task_carries_its_status_message_and_no_response() {
+        let mut r = running_registry("tsk_1");
+        r.finish_task(TaskState::Failed);
+        r.record_ending("tsk_1", "the driver failed", Some("partial"));
+        let task = r.get_task("tsk_1").unwrap();
+        assert!(task.artifacts.is_none());
+        let message = task.status.message.unwrap();
+        assert_eq!(message.role, "agent");
+        assert_eq!(message.parts[0].text, "the driver failed");
+    }
+
+    /// A completed task with no response text, or no recorded ending, carries no artifact.
+    #[test]
+    fn a_completed_task_without_a_response_carries_no_artifact() {
+        let mut r = running_registry("tsk_1");
+        r.finish_task(TaskState::Completed);
+        assert!(r.get_task("tsk_1").unwrap().artifacts.is_none());
+        r.record_ending("tsk_1", "ok", Some(""));
+        let task = r.get_task("tsk_1").unwrap();
+        assert!(task.artifacts.is_none());
+        assert_eq!(task.status.message.unwrap().parts[0].text, "ok");
+    }
+
+    #[test]
+    fn a_submitter_is_recorded_per_task() {
+        let mut r = make_registry();
+        r.enqueue("tsk_a", "ctx_001");
+        r.record_submitter("tsk_a", "lead");
+        r.enqueue("tsk_b", "ctx_001");
+        assert_eq!(r.submitter("tsk_a"), Some("lead"));
+        assert_eq!(r.submitter("tsk_b"), None);
     }
 
     #[test]

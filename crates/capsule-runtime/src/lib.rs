@@ -51,6 +51,7 @@ pub mod lanes;
 pub mod lifeline;
 pub mod limits;
 pub mod mac_token;
+pub(crate) mod member_call;
 pub mod murmur_home;
 pub(crate) mod murmur_md;
 pub mod network_namespace;

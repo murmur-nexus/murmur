@@ -560,13 +560,44 @@ impl TaskThread {
     }
 }
 
+/// What a continued attempt adds to its task's conversation before its next turn, and which
+/// fencing applies to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Continuation {
+    /// One reopen's feedback, plain and unfenced: the task's own words, fenced on the task's own
+    /// provenance exactly as the task message is.
+    ReopenFeedback(String),
+    /// `call-member` answers as [`crate::member_call::answers_message`] wrote them: the runtime's
+    /// own lines, each answer already fenced under its member. Sent as written, never fenced again
+    /// on the task's provenance and never unfenced.
+    MemberAnswers(String),
+}
+
+impl Continuation {
+    /// The message text this continuation adds, and the fence source to label it with when the
+    /// whole of it was wrapped.
+    pub(crate) fn into_payload(
+        self,
+        provenance: Option<TaskProvenance>,
+    ) -> (String, Option<String>) {
+        match self {
+            Self::ReopenFeedback(feedback) => fence_task_payload(provenance, feedback),
+            Self::MemberAnswers(answers) => (answers, None),
+        }
+    }
+}
+
 /// A user message carrying task text, fenced on the task's own provenance and labelled with the
 /// fence source when it was wrapped.
 ///
-/// Builds both the task message a fresh context starts from and the feedback message a reopened
-/// attempt continues with, so the two are fenced on one condition.
+/// Builds the task message a fresh context starts from; [`Continuation::into_payload`] fences a
+/// reopen's feedback on the same condition.
 fn task_user_message(provenance: Option<TaskProvenance>, text: String) -> Value {
-    let (text, fence_source) = fence_task_payload(provenance, text);
+    user_message(fence_task_payload(provenance, text))
+}
+
+/// A user message carrying `text`, labelled with `fence_source` when the text was wrapped.
+fn user_message((text, fence_source): (String, Option<String>)) -> Value {
     with_fence_source(
         with_new_id(json!({
             "role": "user",
@@ -578,10 +609,11 @@ fn task_user_message(provenance: Option<TaskProvenance>, text: String) -> Value 
 
 /// Run one attempt of one task.
 ///
-/// `reopen_feedback` is `None` on a task's first attempt and the plain, unfenced feedback text
-/// for this reopen on every later one. An attempt continues `thread` when it has feedback and
-/// [`TaskThread::can_continue`] holds for its transport; it then consults neither `seed` nor the
-/// store's forget request, loads no history and sends no task message. Every other attempt builds
+/// `continuation` is `None` on a task's first attempt, and on every later one what that attempt
+/// adds: a reopen's feedback, or the answers to the task's `call-member` calls. An attempt
+/// continues `thread` when it has a continuation and [`TaskThread::can_continue`] holds for its
+/// transport; it then consults neither `seed` nor the store's forget request, loads no history
+/// and sends no task message. Every other attempt builds
 /// a fresh context from `task.md`, as `lifecycle.conversation` and `--resume` direct, and fails
 /// with [`EMPTY_TASK_REFUSAL`] before touching either transport when [`fresh_task_text`] is blank.
 #[allow(clippy::too_many_arguments)]
@@ -606,11 +638,11 @@ pub(crate) async fn run_agent_loop(
     // which run no A2A task, and the idle-timeout path that runs an `input.txt` task.
     cancel: Option<CancelSignal>,
     thread: &mut TaskThread,
-    reopen_feedback: Option<String>,
+    continuation: Option<Continuation>,
 ) -> Result<AgentLoopExit, RuntimeError> {
-    // The feedback this attempt continues the task's conversation with, or `None` for an attempt
-    // that builds a fresh context.
-    let continuation = reopen_feedback.filter(|_| thread.can_continue(&inference.transport));
+    // What this attempt continues the task's conversation with, or `None` for an attempt that
+    // builds a fresh context.
+    let continuation = continuation.filter(|_| thread.can_continue(&inference.transport));
 
     // A fresh attempt with nothing to say fails before either transport starts: the http path
     // would otherwise load history, which may compact through the driver, and then send an empty
@@ -802,13 +834,15 @@ pub(crate) async fn run_agent_loop(
     let ending = &mut thread.ending;
 
     match continuation {
-        // A reopened attempt continues the conversation its task already built, rejected answer
-        // included, and the hook's feedback is the one message it adds before the next turn.
-        // Nothing is loaded and no task message is sent: both are already in the list.
-        Some(feedback) => {
-            let feedback_message = task_user_message(store_state.current_task_provenance, feedback);
-            append_to_record(record.as_mut(), std::slice::from_ref(&feedback_message));
-            messages.push(feedback_message);
+        // A continued attempt continues the conversation its task already built — a rejected
+        // answer, or a turn that ended waiting on a member — and the continuation is the one
+        // message it adds before the next turn. Nothing is loaded and no task message is sent:
+        // both are already in the list.
+        Some(continuation) => {
+            let continuation_message =
+                user_message(continuation.into_payload(store_state.current_task_provenance));
+            append_to_record(record.as_mut(), std::slice::from_ref(&continuation_message));
+            messages.push(continuation_message);
         }
         None => {
             // In threaded mode the task continues the record's conversation, so the message list
@@ -4373,7 +4407,7 @@ forgery: {prompt}"
         }
     }
 
-    /// A continued attempt's feedback message is built by the function that builds the task
+    /// A continued attempt's feedback message is fenced by the function that fences the task
     /// message, so an untrusted task's feedback is fenced and labelled like its task, and a
     /// trusted task's is handed over verbatim with no label.
     #[test]
@@ -4381,9 +4415,9 @@ forgery: {prompt}"
         use crate::origin::TaskOrigin;
         let feedback = "The previous attempt was not accepted.";
 
-        let untrusted = task_user_message(
-            Some(TaskProvenance::derive(TaskOrigin::Event, None)),
-            feedback.to_string(),
+        let untrusted = user_message(
+            Continuation::ReopenFeedback(feedback.to_string())
+                .into_payload(Some(TaskProvenance::derive(TaskOrigin::Event, None))),
         );
         assert_eq!(untrusted["role"], "user");
         let text = untrusted["content"][0]["text"].as_str().unwrap();
@@ -4394,12 +4428,35 @@ forgery: {prompt}"
         assert_eq!(untrusted[MESSAGE_FENCE_KEY], "task:event");
         assert!(message_id(&untrusted).is_some());
 
-        let trusted = task_user_message(
-            Some(TaskProvenance::derive(TaskOrigin::User, None)),
-            feedback.to_string(),
+        let trusted = user_message(
+            Continuation::ReopenFeedback(feedback.to_string())
+                .into_payload(Some(TaskProvenance::derive(TaskOrigin::User, None))),
         );
         assert_eq!(trusted["content"][0]["text"], feedback);
         assert!(trusted.get(MESSAGE_FENCE_KEY).is_none());
+        assert_eq!(
+            trusted,
+            json!({"role": "user", "content": [{"type": "text", "text": feedback}],
+                   MESSAGE_ID_KEY: trusted[MESSAGE_ID_KEY].clone()}),
+        );
+    }
+
+    /// Member answers carry their own fences, one per member, so a continuation of them is sent
+    /// as written whatever the calling task's trust: never wrapped again under `task:<origin>`,
+    /// and never stripped.
+    #[test]
+    fn member_answers_are_sent_as_written_whatever_the_task_s_trust() {
+        use crate::origin::TaskOrigin;
+        let answers = "[call-member] call mcl_1 to worker ended completed:\n\
+                       <untrusted-content source=member:worker>\nfour\n</untrusted-content>";
+        for origin in [TaskOrigin::Event, TaskOrigin::User, TaskOrigin::Peer] {
+            let message = user_message(
+                Continuation::MemberAnswers(answers.to_string())
+                    .into_payload(Some(TaskProvenance::derive(origin, None))),
+            );
+            assert_eq!(message["content"][0]["text"], answers, "{origin:?}");
+            assert!(message.get(MESSAGE_FENCE_KEY).is_none());
+        }
     }
 
     // ── prompt_cache_key ────────────────────────────────────────────────────────

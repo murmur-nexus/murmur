@@ -205,6 +205,11 @@ fn summary_line(
         .filter(in_formation)
         .chain(pruned_here.iter().copied())
         .filter_map(|record| record.workdir.parent().map(PathBuf::from))
+        // Each peer records under its own directory in the murmur home, whether or not a record
+        // of it is left to point there.
+        .chain(capsule_runtime::formation_launch::formation_member_roots(
+            formation,
+        ))
         .collect();
     // Every session this read had a record for, so a trace is never counted beside its own row.
     let recorded: HashSet<&str> = rows
@@ -367,6 +372,33 @@ mod tests {
             summary_line(&listed, &rows, &pruned),
             format!(
                 "formation {listed}: 1 listed (1 running), 1 pruned now; no other member found in 1 session root"
+            )
+        );
+    }
+
+    /// A formation's peers record under their own directories in the murmur home and its entry
+    /// member under the project: their rows group as one formation, and each directory is a
+    /// root searched for members not listed.
+    #[test]
+    fn members_recorded_under_formation_directories_group_as_one_formation() {
+        let formation = FormationId::mint();
+        let mut entry = row("ses_3", Some(&formation));
+        entry.0.workdir = PathBuf::from("/nonexistent/project/.murmur/ses_3");
+        let mut worker = row("ses_2", Some(&formation));
+        worker.0.workdir = PathBuf::from(format!(
+            "/nonexistent/home/.murmur/formations/{formation}/worker/.murmur/ses_2"
+        ));
+        let rows = vec![entry, row("ses_1", None), worker];
+        let order: Vec<String> = grouped(rows.clone())
+            .into_iter()
+            .map(|(record, _)| record.session_id)
+            .collect();
+        assert_eq!(order, ["ses_3", "ses_2", "ses_1"]);
+        assert_eq!(
+            summary_line(&formation, &rows, &[]),
+            format!(
+                "formation {formation}: 2 listed (2 running); no other member found in 2 session \
+                 roots"
             )
         );
     }

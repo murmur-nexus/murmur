@@ -10,6 +10,13 @@ keeps its bookkeeping in.
 
 Without `--workdir` the two are one directory and everything below lands in the same place.
 
+A [formation](roster.md#launch) peer's accessible workdir is
+`~/.murmur/formations/<frm_id>/<member>/`, a directory of its own, owner-only, that its launcher
+makes and passes as `--workdir`; its sessions nest under `.murmur/` there. It resolves its
+artifacts and `murmur.lock` from the roster's project, not from this directory. The entry member's
+accessible workdir is the roster's project directory. See
+[Member directories](roster.md#member-directories).
+
 To find what the *capsule* changed, diff the accessible workdir and subtract what the runtime wrote
 there. `mur run --explain-scope` enumerates those paths, as `runtime_writes` under `--json`:
 
@@ -41,7 +48,7 @@ of:
 | Writer | When |
 |---|---|
 | `mur run --task <value>` | Before launch. A value naming an existing file is copied; anything else is written as text |
-| The runtime | On each incoming A2A message, and again when an `on-task-end` hook returns `reopen-task` — rewritten as the original task plus every reopen's feedback so far |
+| The runtime | On each incoming A2A message, and again when an `on-task-end` hook returns `reopen-task` — rewritten as the original task plus every reopen's feedback so far. A task continued with [`call-member`](runtime-provided-tools.md#call-member) answers on an attempt that restarts from a fresh context gets the original task, every reopen's feedback, and every batch of answers so far |
 | The capsule | Through its own file tools, like any other file in the accessible workdir |
 
 A task whose text is empty or only whitespace fails without a request to the model, with a message

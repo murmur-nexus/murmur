@@ -42,7 +42,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
-| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_start`, `member_call` | The session node |
 | `plan_start` | The session node. Its `event_id` is the plan node |
 | `plan_step_start`, `plan_step` | The plan node |
 | `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
@@ -630,6 +630,49 @@ because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
 
 ```json
 {"event_type":"spawner_ended","event_id":"evt_01a1058d3a9070319d2783f65aa594f3","parent_id":"evt_01a1058d39ef70d18c55d007dae98732","session_id":"ses_01a1058d39de73f18822af4c5494398f","timestamp":1791094504080,"spawned_by":"ses_01a1058d39217722b5e52c896926dbf4","delegation_id":"dlg_01a1058d39a07992a594e3ff0888c45a"}
+```
+
+**`member_call_start`**{ #member-call-start } — written once per
+[`call-member`](runtime-provided-tools.md#call-member) call whose member holds the task, as the
+tool call returns
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The calling task |
+| `call_id` | string | `mcl_` and 32 hex digits, as the tool result names it |
+| `member` | string | The called member's roster name |
+| `member_task_id` | string | The id of the task the member's door holds: the `task_id` on the member's own `a2a_task_received` |
+
+```json
+{"event_type":"member_call_start","event_id":"evt_01a106502a41776088ec506b49b10a1c","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107279425,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c5","member":"worker","member_task_id":"tsk_01a106502a41745381369d93d349d695"}
+```
+
+**`member_call`**{ #member-call } — written once per `call-member` call, when it is accounted for:
+delivered to the calling task, or left behind when that task ended
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The calling task |
+| `call_id` | string | As on `member_call_start` |
+| `member` | string | The called member's roster name |
+| `member_task_id` | string | As on `member_call_start`. Absent for a call the member never held |
+| `status` | string | `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned` — see below |
+| `duration_ms` | u64 | From the tool call to this outcome |
+| `output` | string | The member's answer for `completed`, its task's status message for `failed`, `canceled` and `rejected`, or why the call ended otherwise. At most 64 KiB and a cut marker |
+| `truncated` | bool | Whether `output` was cut |
+| `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that never started, as a continuation for one that did |
+
+| `status` | Meaning |
+|---|---|
+| `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state. `failed` is also a call that never started, with no `member_task_id` |
+| `timed_out` | The member had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); its task was not cancelled |
+| `unreachable` | The member's door stopped answering |
+| `abandoned` | The calling task ended before the answer arrived. Always `delivered: false` |
+
+Neither line carries the member's door address or a token.
+
+```json
+{"event_type":"member_call","event_id":"evt_01a106502c377c72bcc0f222268e783d","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107279927,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c5","member":"worker","member_task_id":"tsk_01a106502a41745381369d93d349d695","status":"completed","duration_ms":504,"output":"WORKER-0123456789abcdef0123456789abcdef","truncated":false,"delivered":true}
 ```
 
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's

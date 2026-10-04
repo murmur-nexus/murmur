@@ -614,9 +614,10 @@ pub(crate) async fn run_process_inference_loop(
     // This task's cancel flag, or `None` for a run with no task to stop — `mur run`, a `task.md`
     // launch. Without one the harness is never interrupted.
     cancel: Option<CancelSignal>,
-    // The reopen feedback this attempt continues `session_policy.reopen_session` with, sent as
-    // the harness's prompt in place of `task.md`. `None` on an attempt that starts from the task.
-    reopen_feedback: Option<String>,
+    // What this attempt continues `session_policy.reopen_session` with — a reopen's feedback or
+    // member answers — sent as the harness's prompt in place of `task.md`. `None` on an attempt
+    // that starts from the task.
+    continuation: Option<super::Continuation>,
     // Where the session this run leaves behind is written, for the task's next attempt.
     carried_session: &mut Option<String>,
     // Where this attempt's ending is recorded, for the reopen loop's final status.
@@ -646,7 +647,7 @@ pub(crate) async fn run_process_inference_loop(
         session_policy,
         cancel.as_ref(),
         &mut a2a,
-        reopen_feedback,
+        continuation,
         carried_session,
     )
     .await;
@@ -674,7 +675,7 @@ async fn run_attempt(
     session_policy: HarnessSessionPolicy,
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
-    reopen_feedback: Option<String>,
+    continuation: Option<super::Continuation>,
     carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let Some(staged) = store_state.process_driver.clone() else {
@@ -699,7 +700,7 @@ async fn run_attempt(
         session_policy,
         cancel,
         a2a,
-        reopen_feedback,
+        continuation,
         carried_session,
     )
     .await;
@@ -729,7 +730,7 @@ async fn run_harness(
     session_policy: HarnessSessionPolicy,
     cancel: Option<&TaskCancel>,
     a2a: &mut A2aStream,
-    reopen_feedback: Option<String>,
+    continuation: Option<super::Continuation>,
     carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // Nothing is spawned for a task a person already stopped: the probe, the bridge and the
@@ -780,16 +781,20 @@ async fn run_harness(
     );
     let bridge = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory).await;
 
-    // A continued attempt's prompt is its reopen feedback alone: the resumed session already
-    // holds the task. Otherwise it is task.md, which lives in accessible_workdir (where the
-    // agent's own tools are preopened), not the internal session workdir. Either is fenced on the
-    // same condition as the http path, from the same function, so the transport a capsule runs on
+    // A continued attempt's prompt is its continuation alone: the resumed session already holds
+    // the task. Otherwise it is task.md, which lives in accessible_workdir (where the agent's own
+    // tools are preopened), not the internal session workdir. Either is fenced on the same
+    // condition as the http path, from the same functions, so the transport a capsule runs on
     // does not decide whether an untrusted payload is marked. The fence source is discarded: this
     // transport keeps no conversation record.
-    let (task, _fence_source) = super::fence_task_payload(
-        store_state.current_task_provenance,
-        reopen_feedback.unwrap_or_else(|| super::fresh_task_text(inference, accessible_workdir)),
-    );
+    let provenance = store_state.current_task_provenance;
+    let (task, _fence_source) = match continuation {
+        Some(continuation) => continuation.into_payload(provenance),
+        None => super::fence_task_payload(
+            provenance,
+            super::fresh_task_text(inference, accessible_workdir),
+        ),
+    };
 
     forget_harness_session(&session_policy, trace).await;
     let session_plan = plan_session(&session_policy);

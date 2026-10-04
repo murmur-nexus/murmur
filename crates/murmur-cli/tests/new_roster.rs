@@ -315,6 +315,240 @@ fn the_scaffold_installs_and_launches_as_printed() {
     }
 }
 
+// ── The scaffold's lead hands worker its task ────────────────────────────────
+
+/// The model of both scaffolded members, told apart by the system prompt each sends. Lead calls
+/// `call-member` once, ends the turn while worker works, and answers with what came back; worker
+/// answers with `WORKER-<nonce>`.
+fn crew_model(nonce: &str) -> ScriptedServer {
+    let nonce = nonce.to_string();
+    let mut lead_turns = 0usize;
+    ScriptedServer::start_answering(4, move |request| {
+        let system = common::system_text(&request["system"]).unwrap_or_default();
+        if system.contains("You are 'worker'") {
+            return end_turn(1, &format!("WORKER-{nonce}"));
+        }
+        lead_turns += 1;
+        match lead_turns {
+            1 => common::tool_use_response(
+                "toolu_call_worker",
+                "call-member",
+                serde_json::json!({
+                    "member": "worker",
+                    "task": "Reply with your token and nothing else.",
+                }),
+            ),
+            2 => end_turn(2, "worker is on it"),
+            _ => {
+                let seen = request.to_string();
+                let token = seen
+                    .find("WORKER-")
+                    .map(|at| seen[at..at + "WORKER-".len() + 32].to_string())
+                    .unwrap_or_else(|| "nothing".to_string());
+                end_turn(3, &format!("worker answered {token}"))
+            }
+        }
+    })
+}
+
+/// Every record of the one session under `root`.
+fn only_trace(root: &Path) -> Vec<Value> {
+    let sessions = common::formation::session_dirs(root);
+    assert_eq!(sessions.len(), 1, "{}: {sessions:?}", root.display());
+    common::read_whole_trace(&sessions[0].join("trace.jsonl"))
+}
+
+fn records<'a>(trace: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    trace
+        .iter()
+        .filter(|record| record["event_type"] == kind)
+        .collect()
+}
+
+/// `mur new --roster crew`, every printed install step, then `mur run --roster crew`: lead hands
+/// worker a task through `call-member`, worker runs it in its own directory, and the answer
+/// comes back into lead's same task, fenced under `member:worker`. Nothing in the scaffold is
+/// edited, and nothing real about worker's door reaches a model or a trace.
+#[test]
+fn the_scaffolded_lead_hands_the_worker_a_task() {
+    let scratch = Scratch::new();
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let server = crew_model(&nonce);
+    scratch.write_config(&format!(
+        "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
+        server.endpoint
+    ));
+    let new = scratch.run(&["new", "--roster", "crew"]);
+    new.assert_code(0);
+    let steps = next_steps(&new.stdout);
+    let hashes: Vec<String> = CREW_FILES
+        .iter()
+        .map(|file| sha256(&scratch.path().join(file)))
+        .collect();
+    let (driver_name, driver_version) = steps[0]
+        .strip_prefix("mur install -g ")
+        .unwrap()
+        .split_once('@')
+        .unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let driver_zip = common::create_driver_artifact(
+        artifacts.path(),
+        driver_name,
+        driver_version,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&scratch.home, &driver_zip).success();
+    for step in &steps[1..3] {
+        for command in step.split("&&") {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            scratch.run(&words[1..]).assert_code(0);
+        }
+    }
+
+    let _lock = launch_lock();
+    let run = scratch
+        .command(&[
+            "run",
+            "--roster",
+            "crew",
+            "--json",
+            "--task",
+            "Get worker's token.",
+        ])
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for (file, hash) in CREW_FILES.iter().zip(&hashes) {
+        assert_eq!(&sha256(&scratch.path().join(file)), hash, "{file} changed");
+    }
+
+    let formation: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    let formation_id = formation["formation_id"].as_str().unwrap();
+    let peer = &formation["peers"][0];
+    assert_eq!(peer["name"], "worker", "{formation}");
+    let worker_dir = scratch
+        .home
+        .path()
+        .join(".murmur/formations")
+        .join(formation_id)
+        .join("worker");
+    assert_eq!(peer["workdir"], worker_dir.display().to_string());
+    let door = peer["url"].as_str().unwrap().to_string();
+    let readiness: Value = serde_json::from_str(stdout.lines().nth(1).unwrap()).unwrap();
+
+    // Lead, under the roster's project.
+    let lead = only_trace(&scratch.path().join("crew/.murmur"));
+    let start = &records(&lead, "session_start")[0];
+    assert!(
+        start["tools_declared"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("call-member")),
+        "{start}"
+    );
+    let call_start = records(&lead, "member_call_start");
+    assert_eq!(call_start.len(), 1, "{lead:?}");
+    let call_id = call_start[0]["call_id"].as_str().unwrap().to_string();
+    let hex = call_id.strip_prefix("mcl_").unwrap();
+    assert!(
+        hex.len() == 32
+            && hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "{call_id}"
+    );
+    assert_eq!(call_start[0]["member"], "worker");
+    let member_task_id = call_start[0]["member_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let call_end = records(&lead, "member_call");
+    assert_eq!(call_end.len(), 1, "{lead:?}");
+    assert_eq!(call_end[0]["call_id"], call_id.as_str());
+    assert_eq!(call_end[0]["status"], "completed");
+    assert_eq!(call_end[0]["delivered"], true);
+    assert_eq!(call_end[0]["member_task_id"], member_task_id.as_str());
+    assert!(
+        call_end[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("WORKER-{nonce}")),
+        "{}",
+        call_end[0]
+    );
+    assert_eq!(records(&lead, "task_start").len(), 1, "one task in lead");
+    assert_eq!(records(&lead, "task_reopened").len(), 0);
+
+    // Worker, under its own directory.
+    let worker = only_trace(&worker_dir.join(".murmur"));
+    assert!(!records(&worker, "session_start")[0]["tools_declared"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::from("call-member")));
+    let received = records(&worker, "a2a_task_received");
+    assert_eq!(received.len(), 1, "{worker:?}");
+    assert_eq!(received[0]["caller_member"], "lead");
+    assert_eq!(received[0]["message_id"], format!("msg_{call_id}"));
+    assert_eq!(received[0]["task_id"], member_task_id.as_str());
+    let kinds = common::event_kinds(&worker);
+    let task_start = kinds.iter().position(|kind| *kind == "task_start").unwrap();
+    let task_end = kinds.iter().position(|kind| *kind == "task_end").unwrap();
+    assert!(task_start < task_end, "{kinds:?}");
+    assert_eq!(worker[task_start]["origin"], "peer");
+    assert!(!scratch.path().join("crew/worker/.murmur").exists());
+
+    // Lead's model: call-member offered with worker as its only member, and the answer fenced.
+    let requests = server.requests();
+    let lead_requests: Vec<&Value> = requests
+        .iter()
+        .filter(|request| {
+            common::system_text(&request["system"])
+                .is_some_and(|system| system.contains("You are 'lead'"))
+        })
+        .collect();
+    assert_eq!(lead_requests.len(), 3, "{requests:?}");
+    let tool = lead_requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "call-member")
+        .expect("call-member is offered to lead");
+    assert_eq!(
+        tool["input_schema"]["properties"]["member"]["enum"],
+        serde_json::json!(["worker"])
+    );
+    let third = lead_requests[2].to_string();
+    let fenced = format!("<untrusted-content source=member:worker>\\nWORKER-{nonce}");
+    assert!(third.contains(&fenced), "{third}");
+
+    // Nothing real about the door, and no token, in any request, tool result or trace line.
+    let port = door.rsplit(':').next().unwrap();
+    let mut texts: Vec<String> = requests.iter().map(Value::to_string).collect();
+    texts.extend(lead.iter().chain(&worker).map(Value::to_string));
+    for text in &texts {
+        assert!(!text.contains("mft1."), "a token leaked: {text}");
+        assert!(!text.contains(&door), "the door leaked: {text}");
+        assert!(
+            !text.contains(&format!("localhost:{port}")),
+            "the door leaked: {text}"
+        );
+    }
+
+    let pids: Vec<u32> = [peer["pid"].as_u64(), readiness["pid"].as_u64()]
+        .into_iter()
+        .flatten()
+        .map(|pid| pid as u32)
+        .collect();
+    assert_no_member_remains(scratch.path(), &pids, Duration::from_secs(30));
+}
+
 // ── S3: the provider ─────────────────────────────────────────────────────────
 
 #[test]

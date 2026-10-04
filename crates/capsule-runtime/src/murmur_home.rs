@@ -148,13 +148,14 @@ pub enum HomeEntryKind {
     Artifacts,
     CompiledForms,
     BinaryCache,
+    Formations,
     /// A top-level name this build writes nothing under.
     Unrecognised(String),
 }
 
 impl HomeEntryKind {
     /// Every kind with a fixed name, in the order the audit reports them after the home itself.
-    const KNOWN: [HomeEntryKind; 11] = [
+    const KNOWN: [HomeEntryKind; 12] = [
         Self::Config,
         Self::DeployKeys,
         Self::DeployStaging,
@@ -166,6 +167,7 @@ impl HomeEntryKind {
         Self::Artifacts,
         Self::CompiledForms,
         Self::BinaryCache,
+        Self::Formations,
     ];
 
     /// The entry's name under `~/.murmur`, or `None` for the home itself.
@@ -183,6 +185,7 @@ impl HomeEntryKind {
             Self::Artifacts => "artifacts",
             Self::CompiledForms => "compiled",
             Self::BinaryCache => "bin",
+            Self::Formations => crate::formation_launch::FORMATIONS_DIR,
             Self::Unrecognised(name) => name,
         })
     }
@@ -202,6 +205,7 @@ impl HomeEntryKind {
             Self::Artifacts => "installed artifacts",
             Self::CompiledForms => "compiled WASM cache",
             Self::BinaryCache => "cached mur binaries",
+            Self::Formations => "formation members' working directories",
             Self::Unrecognised(_) => "something not recognised by this build",
         }
     }
@@ -590,14 +594,51 @@ mod tests {
 
         let reports = audit_murmur_home(&home);
 
-        assert_eq!(reports.len(), 12);
+        assert_eq!(reports.len(), 13);
         assert_eq!(reports[0].kind, HomeEntryKind::Home);
         assert_eq!(reports[1].kind, HomeEntryKind::Config);
         assert_eq!(reports[10].kind, HomeEntryKind::CompiledForms);
         assert_eq!(reports[11].kind, HomeEntryKind::BinaryCache);
+        assert_eq!(reports[12].kind, HomeEntryKind::Formations);
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
+    }
+
+    /// `formations/` holds members' working directories: known, owner-only to the last
+    /// descendant, and never offered for deletion.
+    #[test]
+    fn murmur_home_audit_knows_formations_as_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".murmur");
+        wide_dir(&home, 0o700);
+        wide_dir(&home.join("formations"), 0o700);
+        wide_dir(&home.join("formations/frm_x"), 0o700);
+        wide_dir(&home.join("formations/frm_x/worker"), 0o755);
+
+        let report = audit_murmur_home(&home)
+            .into_iter()
+            .find(|report| report.kind == HomeEntryKind::Formations)
+            .unwrap();
+        assert_eq!(report.path, home.join("formations"));
+        assert_eq!(
+            report.kind.holds(),
+            "formation members' working directories"
+        );
+        assert!(report.kind.expected_private());
+        assert!(!report.kind.safe_to_delete());
+        match report.state {
+            HomeEntryState::Present {
+                wide,
+                wide_descendants,
+                ..
+            } => {
+                assert!(!wide);
+                assert_eq!(wide_descendants.len(), 1);
+                assert!(wide_descendants[0].path.ends_with("frm_x/worker"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
