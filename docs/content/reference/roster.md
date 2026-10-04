@@ -262,7 +262,7 @@ lets it call, and no other member answers it. No member's model ever sees a cred
 
 ### The formation credential { #formation-token }
 
-The launcher is the only principal that issues credentials. For every served edge `from → to` it
+The launcher is the only principal that issues credentials. For every edge `from → to` it
 signs one **formation token** with the formation's signing key:
 
 ```text

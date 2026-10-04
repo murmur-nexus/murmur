@@ -811,7 +811,13 @@ fn s14_a_rule_calling_the_entry_member_is_e_ros_008() {
 
     // The turned-around edge, `planner → reviewer`, is S1's own roster.
     write_roster(project.path(), S1_ROSTER);
-    assert_admitted(&mur_doctor(&home, project.path()));
+    let doctor = mur_doctor(&home, project.path());
+    assert_admitted(&doctor);
+    assert!(
+        doctor.stdout.contains("planner \u{2192} reviewer"),
+        "{}",
+        doctor.stdout
+    );
 
     // Refused before any lookup: no member need be installed.
     let empty = tempfile::tempdir().unwrap();
