@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use common::door_capsule::{message, rpc, DRIVER_NAME, DRIVER_VERSION};
 use common::formation::{launch_lock, processes_mentioning};
 use common::{
-    event_kinds as kinds, publish_to_store, read_whole_trace as read_trace, tool_use_response,
-    ScriptedServer,
+    event_kinds as kinds, never_replying, publish_to_store, read_whole_trace as read_trace, signal,
+    tool_use_response, ScriptedServer,
 };
 use mur_roost::{authority::SpawnAuthority, State};
 use serde_json::{json, Value};
@@ -59,19 +59,6 @@ struct World {
     registry: PathBuf,
     roost_url: String,
     _state: Arc<State>,
-}
-
-/// An inference endpoint that accepts every connection and never answers on it.
-fn never_replying() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in listener.incoming().flatten() {
-            held.push(stream);
-        }
-    });
-    endpoint
 }
 
 /// An agent capsule's manifest body against `endpoint`, reaching every loopback port, with
@@ -268,14 +255,6 @@ impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-#[allow(unsafe_code)]
-fn signal(pid: u32, signal: i32) {
-    // SAFETY: `kill` takes two integers and dereferences nothing.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
     }
 }
 

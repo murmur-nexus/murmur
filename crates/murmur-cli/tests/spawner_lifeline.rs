@@ -27,7 +27,9 @@ use common::door_capsule::{
     agent_project, driver_home, end_turn, message, rpc, wait_for_requests, AUTHENTICATION_YAML,
     QUEUE_SLEEP_YAML,
 };
-use common::{event_kinds as kinds, read_whole_trace as read_trace, ScriptedServer};
+use common::{
+    event_kinds as kinds, read_whole_trace as read_trace, sessions_under, signal, ScriptedServer,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -267,14 +269,6 @@ impl Drop for Session {
 
 fn position(events: &[Value], kind: &str) -> Option<usize> {
     events.iter().position(|event| event["event_type"] == kind)
-}
-
-#[allow(unsafe_code)]
-fn signal(pid: u32, signal: i32) {
-    // SAFETY: `kill` takes two integers and dereferences nothing; `pid` is a child of this test.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
 }
 
 /// A session wound down because its spawner ended: exactly one `spawner_ended`, carrying its own
@@ -636,28 +630,6 @@ fn with_both_lifelines_only_the_first_closed_is_recorded() {
 }
 
 // ── The variable is read strictly ─────────────────────────────────────────────
-
-/// Every `ses_*` directory under `root`.
-fn sessions_under(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("ses_"))
-                {
-                    found.push(path.clone());
-                }
-                stack.push(path);
-            }
-        }
-    }
-    found
-}
 
 /// The highest descriptor a process may have, which nothing has open.
 #[allow(unsafe_code)]

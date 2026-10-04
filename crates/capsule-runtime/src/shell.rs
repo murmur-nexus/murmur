@@ -786,10 +786,10 @@ pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool 
 ///
 /// [`ARTIFACT_CONFIG_ENV`], a formation member's names
 /// ([`crate::formation::is_member_grant_env`]) and [`crate::lifeline::SPAWNER_LIFELINE_ENV`] are
-/// reserved and never resolved from the host,
-/// whatever a manifest allowlists: the names are runtime-owned, and their values come from the
-/// declaring artifact's own `config:` block and from the session, or from nowhere. Skipped here rather than relied on being overwritten later, so a host value
-/// cannot reach a guest whose entry declared no config at all.
+/// reserved and never resolved from the host, whatever a manifest allowlists: the names are
+/// runtime-owned, and their values come from the declaring artifact's own `config:` block and from
+/// the session, or from nowhere. Skipped here rather than relied on being overwritten later, so a
+/// host value cannot reach a guest whose entry declared no config at all.
 pub(crate) fn build_declared_env(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 

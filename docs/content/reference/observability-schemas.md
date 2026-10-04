@@ -626,8 +626,7 @@ and the session is winding down because of it
 
 Written at the moment the child sees its lifeline close, before every `task_canceled`, `task_end`,
 `task_rejected`, `shell_abandoned` and `session_end` its wind-down writes. A child already ending
-because of `SIGTERM`, [`mur stop`](cli.md#mur-stop) or its formation lifeline writes none; a session
-holding both lifelines records only the one that closed first.
+because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
 
 ```json
 {"event_type":"spawner_ended","event_id":"evt_01a1058d3a9070319d2783f65aa594f3","parent_id":"evt_01a1058d39ef70d18c55d007dae98732","session_id":"ses_01a1058d39de73f18822af4c5494398f","timestamp":1791094504080,"spawned_by":"ses_01a1058d39217722b5e52c896926dbf4","delegation_id":"dlg_01a1058d39a07992a594e3ff0888c45a"}

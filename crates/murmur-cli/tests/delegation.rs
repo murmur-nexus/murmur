@@ -18,7 +18,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{tool_result_text, tool_use_response};
+use common::{never_replying, tool_result_text, tool_use_response};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -402,22 +402,6 @@ fn always_replying(text: &str) -> AlwaysReplying {
         }
     });
     AlwaysReplying { endpoint, requests }
-}
-
-/// An inference endpoint that accepts a connection and never answers on it, for a sub-capsule that
-/// goes silent mid-task.
-fn never_replying() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in listener.incoming().flatten() {
-            // Held rather than dropped: a closed connection would fail the child's turn, and the
-            // case is about a child that never answers, not one that errors.
-            held.push(stream);
-        }
-    });
-    endpoint
 }
 
 /// A stand-in inference endpoint whose responses are a queue the test pushes into while the

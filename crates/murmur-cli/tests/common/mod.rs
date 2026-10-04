@@ -59,6 +59,54 @@ pub fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Send `signal` to `pid`, ignoring whether it was delivered.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn signal(pid: u32, signal: i32) {
+    // SAFETY: `kill` takes two integers and dereferences nothing.
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+/// Every `ses_*` directory beneath `root`.
+pub fn sessions_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ses_"))
+                {
+                    found.push(path.clone());
+                }
+                stack.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// An inference endpoint that accepts every connection and never answers on it, for a capsule
+/// whose turn must stay in flight.
+pub fn never_replying() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            // Held rather than dropped: a closed connection would fail the turn, where the case
+            // needs one that never ends.
+            held.push(stream);
+        }
+    });
+    endpoint
+}
+
 /// Wait for a process to be gone, failing the test if it outlives `limit`.
 #[cfg(unix)]
 pub fn assert_dead_within(pid: i32, limit: std::time::Duration) {

@@ -383,8 +383,8 @@ What the child does on EOF depends on what it is:
 | Agent capsule | Appends [`spawner_ended`](observability-schemas.md#spawner-ended) to its trace, then winds down as a first `SIGTERM` winds it down: cancels its live tasks, abandons detached shell work, writes `session_end` and exits. A teardown still running 20 seconds after EOF is cut short with status 143 |
 | Script capsule | Exits with status 143 at once, as a `SIGTERM` ends it |
 
-EOF after the child's wind-down has already begun — from a `SIGTERM`, or its
-[formation lifeline](roster.md#launch-stop) — writes nothing. The child's diagnostics go to its
+EOF after the child's wind-down has already begun — from a `SIGTERM` or
+[`mur stop`](cli.md#mur-stop) — writes nothing. The child's diagnostics go to its
 `logs/bootstrap.log` once its parent is gone, since its standard error was a pipe to the parent.
 
 A child that delegates hands each of its own children a lifeline of its own, so a chain ends from
@@ -398,9 +398,9 @@ and usually well under a second per level. With the default [`--max-depth`](#the
 | The parent's session cancels the task that delegated (`tasks/cancel`) | None: the child keeps running while the parent's process lives |
 | The parent ends the delegation itself, or the [delegation deadline](#bounds) passes | The child is killed |
 
-On macOS the lifeline is created with `pipe` and marked close-on-exec just after, so a process the
-parent starts on another thread in that instant can inherit a write end and hold back that one
-child's EOF until it exits.
+On macOS a child can occasionally outlive its parent: if the parent starts another process at the
+instant it creates the child's lifeline, that process can hold the lifeline open, and the child
+winds down only once that process has exited too.
 
 ---
 
