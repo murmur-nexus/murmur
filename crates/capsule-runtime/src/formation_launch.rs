@@ -31,9 +31,9 @@
 //! Once every peer's door answers, each peer that calls other peers is written one address line
 //! naming their doors; the entry member's first line and address line are both written before it is
 //! spawned. Nothing here writes a token to stdout, stderr, a file, argv or an environment
-//! variable. Callees never include the entry member, which runs `task_acceptance: single` busy
-//! with the formation's own task and so can serve no peer; such an edge is reported by
-//! [`unserved_edges`]. The key and the write ends are dropped once every member is reaped.
+//! variable. Callees never include the entry member: it runs the formation's own task from launch
+//! until the formation ends and serves no peer, and admission never admits an edge into it. The
+//! key and the write ends are dropped once every member is reaped.
 //!
 //! **Teardown.**
 //!
@@ -69,7 +69,7 @@ use crate::formation_credentials::{
     render_address_line, FormationAuthority, FORMATION_CHANNEL_ENV,
 };
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
-use crate::roster::{AdmittedRoster, RosterEdge};
+use crate::roster::AdmittedRoster;
 
 /// How long a member has, from its spawn, to report itself and have its door answer.
 ///
@@ -171,8 +171,8 @@ pub(crate) struct PlannedMember {
 pub(crate) struct FormationPlan {
     pub(crate) peers: Vec<PlannedMember>,
     pub(crate) entry: PlannedMember,
-    /// Every member's callees in roster order, the entry member never among them. A member with
-    /// none is absent.
+    /// Every member's callees in roster order. Admission never admits an edge into the entry
+    /// member, so it is never among them. A member with none is absent.
     pub(crate) callees: Vec<(String, Vec<String>)>,
 }
 
@@ -199,7 +199,6 @@ impl FormationPlan {
                 .map(|member| {
                     let callees: Vec<String> = roster
                         .callees(&member.name)
-                        .filter(|callee| !callee.entry)
                         .map(|callee| callee.name.clone())
                         .collect();
                     (member.name.clone(), callees)
@@ -223,19 +222,6 @@ impl FormationPlan {
         let callees: Vec<&str> = self.callees_of(member).iter().map(String::as_str).collect();
         authority.member_bundle(member, &callees).render_line()
     }
-}
-
-/// Every roster edge into the entry member, in roster order: none is served. The entry member runs
-/// `task_acceptance: single` and is busy with the formation's own task from launch until it exits,
-/// so it can never accept a peer's task, and the member at the edge's other end is handed no
-/// credential or address for it.
-pub fn unserved_edges(roster: &AdmittedRoster) -> Vec<&RosterEdge> {
-    let entry = &roster.entry().name;
-    roster
-        .edges()
-        .iter()
-        .filter(|edge| &edge.to == entry)
-        .collect()
 }
 
 /// A peer whose door answered as the session its readiness line named.
@@ -1512,7 +1498,7 @@ impl RunningFormation {
     }
 
     /// The members `member` is handed a credential and an address for, in roster order: its
-    /// roster callees, less the entry member.
+    /// roster callees.
     pub fn callees_of(&self, member: &str) -> &[String] {
         self.plan.callees_of(member)
     }
@@ -2079,7 +2065,8 @@ mod tests {
         let plan = FormationPlan {
             peers: vec![member("coder"), member("reviewer")],
             entry: member("planner"),
-            // `reviewer → planner` is an edge into the entry member: `from_roster` leaves it out.
+            // `reviewer` calls no one, so it is absent; no plan has a callee that is the entry
+            // member, because admission never admits an edge into it.
             callees: vec![
                 ("planner".to_string(), vec!["coder".to_string()]),
                 ("coder".to_string(), vec!["reviewer".to_string()]),

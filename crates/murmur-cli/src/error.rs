@@ -28,6 +28,7 @@ pub const E_ROS_004: &str = "E-ROS-004"; // a reachability rule names no member 
 pub const E_ROS_005: &str = "E-ROS-005"; // a reachability rule calls a member that does not serve peers
 pub const E_ROS_006: &str = "E-ROS-006"; // a roster declares peer traffic and a member's door is public
 pub const E_ROS_007: &str = "E-ROS-007"; // a roster member is not installed at its version, or its manifest is unreadable
+pub const E_ROS_008: &str = "E-ROS-008"; // a reachability rule calls the entry member
 
 // Scaffolds
 pub const E_NEW_002: &str = "E-NEW-002"; // mur new --roster was given a name that is, or derives, an invalid artifact name
@@ -973,6 +974,16 @@ impl From<RosterRefusal> for CliError {
                 format!(
                     "add '{unknown}' to roster.yaml's members, or correct the name in the \
                      reachability rule"
+                ),
+            ),
+            RosterRefusal::RuleCallsEntryMember { from, entry } => (
+                E_ROS_008,
+                format!(
+                    "remove '{entry}' from that rule's `to` in roster.yaml. For '{from}' to report \
+                     to '{entry}', write the edge the other way — `- from: {entry}` with `to: \
+                     [{from}]` — so '{entry}' hands '{from}' its work with call-member and \
+                     '{from}''s answer comes back into '{entry}''s own task; '{from}' then needs \
+                     exports.peer_tasks.accept: true in its murmur.yaml"
                 ),
             ),
             RosterRefusal::MemberUnresolvable { coordinate, .. } => (

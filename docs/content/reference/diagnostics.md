@@ -65,6 +65,7 @@ section that explains it.
 | `E-ROS-005` | A `reachability` rule calls a member that does not declare `exports.peer_tasks.accept: true` | [E-ROS-005](#e-ros-005) |
 | `E-ROS-006` | A roster with peer traffic has a member with no `network.authentication` | [E-ROS-006](#e-ros-006) |
 | `E-ROS-007` | A roster member is not installed at its version, or its packed `murmur.yaml` cannot be read | [E-ROS-007](#e-ros-007) |
+| `E-ROS-008` | A `reachability` rule lists the entry member in `to` | [E-ROS-008](#e-ros-008) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
 | `E-RUN-003` | Unsupported `lock_version`, missing lock entry, a lock entry with no hash for this host's platform, or a malformed `origin` / `session` pair | [Lockfile](workdir.md#lockfile-murmurlock) |
@@ -128,7 +129,6 @@ section that explains it.
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
 | `W-RUN-004` | A tool's `input_schema` is malformed where the required-field check reads it, so its calls run unchecked | [W-RUN-004](#w-run-004) |
-| `W-RUN-006` | A roster edge into the entry member is not served | [W-RUN-006](#w-run-006) |
 | `W-RUN-007` | A session carries a formation id but no lifeline, so it does not wind down when its formation ends | [W-RUN-007](#w-run-007) |
 | `W-RUN-008` | A formation member the roster lets call another reaches no member's door with its `capabilities.network.allow` | [W-RUN-008](#w-run-008) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
@@ -1784,6 +1784,25 @@ store nor the global store at that version, its bytes do not match the hash the 
 them, or its packed `murmur.yaml` cannot be read or parsed. Install the capsule at that version
 with `mur install <capsule>@<version>`, or change the member's `version` to one `mur list` shows.
 
+### E-ROS-008 — a rule calls the entry member { #e-ros-008 }
+
+```text
+error[E-ROS-008]: roster.yaml: the reachability rule from 'coder' lists the entry member 'planner' in `to`, but the entry member is never called: it runs the formation's own task from launch until the formation ends
+  hint: remove 'planner' from that rule's `to` in roster.yaml. For 'coder' to report to 'planner', write the edge the other way — `- from: planner` with `to: [coder]` — so 'planner' hands 'coder' its work with call-member and 'coder''s answer comes back into 'planner''s own task; 'coder' then needs exports.peer_tasks.accept: true in its murmur.yaml
+```
+
+The message names the rule's `from` and the entry member. The entry member is never called: it
+runs the formation's own task from launch until the formation ends and accepts no other, so a call
+into it has nothing to run in. See [The entry member](roster.md#entry-member).
+
+Turn the edge around: remove the entry member from the rule's `to`, and write a rule `from:` the
+entry member with the caller in `to`. The entry member then hands the caller its work with
+[`call-member`](runtime-provided-tools.md#call-member), and the caller's answer comes back into the
+entry member's own task. The caller, as a callee, then needs
+[`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) in its `murmur.yaml`.
+`reachability: all` never pairs a member with the entry member as its callee, so it never raises
+this code.
+
 ---
 
 ## Runtime warnings
@@ -1881,19 +1900,6 @@ first time the tool is called in a session, and not again.
 Fix the schema in the tool's own `murmur.yaml`: `required` is a JSON array of property names. A
 field the tool supplies a default for belongs out of `required` — a listed field is refused when it
 is missing.
-
-### W-RUN-006 — an edge into the entry member { #w-run-006 }
-
-```text
-warning[W-RUN-006]: roster edge 'coder → planner' is not served: the entry member accepts only the formation's own task, so 'coder' is handed no credential or address for it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-006)
-```
-
-[`mur run --roster`](cli.md#mur-run-roster) starts the entry member with
-`task_acceptance: single`, busy with the formation's own task from launch until it exits, so it
-never accepts a task from a peer. A `reachability` edge into it is admitted and every member is
-launched, but the calling member is handed no [formation token](roster.md#formation-token) and no
-address for it, and its call is refused as a call to any member it may not call is. The warning
-prints once per such edge, before any member starts. Nothing is refused.
 
 ### W-RUN-007 — a formation member with no lifeline { #w-run-007 }
 

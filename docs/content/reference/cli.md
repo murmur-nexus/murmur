@@ -950,7 +950,7 @@ store and then the global store, and checks each one against `murmur.lock`, as d
 
 A refused roster is an error: its code goes to stderr with a hint, the hint is added as a `Fix:`
 entry, and the exit code is `1`. The codes are [`E-ROS-001`](diagnostics.md#e-ros-001) to
-[`E-ROS-007`](diagnostics.md#e-ros-007), and [`E-REG-005`](diagnostics.md#index) for a member
+[`E-ROS-008`](diagnostics.md#e-ros-008), and [`E-REG-005`](diagnostics.md#index) for a member
 `murmur.lock` pins at another version or hash.
 
 **Output — an admitted roster:**

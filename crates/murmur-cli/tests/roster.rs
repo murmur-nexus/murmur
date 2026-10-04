@@ -330,7 +330,7 @@ fn s3_all_expands_to_the_members_that_both_serve_peers() {
     assert!(
         doctor
             .stdout
-            .contains("  reachability (all): a \u{2192} b, b \u{2192} a\n"),
+            .contains("  reachability (all): a \u{2192} b\n"),
         "{}",
         doctor.stdout
     );
@@ -786,6 +786,67 @@ fn s13_a_duplicate_and_an_unknown_rule_name_is_e_ros_003_every_time() {
         assert_refused(&doctor, "E-ROS-003", &["'coder'"]);
         assert!(!doctor.stderr.contains("E-ROS-004"), "{}", doctor.stderr);
     }
+}
+
+#[test]
+fn s14_a_rule_calling_the_entry_member_is_e_ros_008() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    s1_project(project.path());
+    let calls_entry = S1_ROSTER.replace(
+        "from: reviewer\n    to: [coder]",
+        "from: reviewer\n    to: [coder, planner]",
+    );
+    assert_ne!(calls_entry, S1_ROSTER);
+
+    write_roster(project.path(), &calls_entry);
+    let doctor = mur_doctor(&home, project.path());
+    assert_refused(&doctor, "E-ROS-008", &["'reviewer'", "'planner'"]);
+    assert!(
+        doctor.stdout.contains("- from: planner"),
+        "{}",
+        doctor.stdout
+    );
+    assert!(!doctor.stderr.contains("E-ROS-005"), "{}", doctor.stderr);
+
+    // The turned-around edge, `planner → reviewer`, is S1's own roster.
+    write_roster(project.path(), S1_ROSTER);
+    let doctor = mur_doctor(&home, project.path());
+    assert_admitted(&doctor);
+    assert!(
+        doctor.stdout.contains("planner \u{2192} reviewer"),
+        "{}",
+        doctor.stdout
+    );
+
+    // Refused before any lookup: no member need be installed.
+    let empty = tempfile::tempdir().unwrap();
+    create_project(empty.path());
+    write_roster(empty.path(), &calls_entry);
+    let doctor = mur_doctor(&home, empty.path());
+    assert_refused(&doctor, "E-ROS-008", &["'reviewer'", "'planner'"]);
+    assert!(!doctor.stderr.contains("E-ROS-007"), "{}", doctor.stderr);
+
+    // An entry member that does not serve peers is still refused as the entry member.
+    install_capsule(
+        &project_store(project.path()),
+        "planner",
+        "0.3.0",
+        &manifest("planner", "0.3.0", false, true),
+    );
+    write_roster(project.path(), &calls_entry);
+    let doctor = mur_doctor(&home, project.path());
+    assert_refused(&doctor, "E-ROS-008", &["'reviewer'", "'planner'"]);
+    assert!(!doctor.stderr.contains("E-ROS-005"), "{}", doctor.stderr);
+
+    // A name that is no member is refused first.
+    write_roster(
+        project.path(),
+        &calls_entry.replace("to: [coder, reviewer]", "to: [coder, tester]"),
+    );
+    let doctor = mur_doctor(&home, project.path());
+    assert_refused(&doctor, "E-ROS-004", &["'tester'"]);
+    assert!(!doctor.stderr.contains("E-ROS-008"), "{}", doctor.stderr);
 }
 
 /// The project store, then the global store: the order `mur doctor` and `mur run --capsule` resolve
