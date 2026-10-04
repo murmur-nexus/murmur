@@ -32,6 +32,19 @@ Every PR that changes behavior must include tests. Refactors, docs, and CI-only 
 ```bash
 cargo test --workspace --lib --bins     # unit tests across all crates
 cargo test -p murmur-cli --test build   # one integration suite (see crates/murmur-cli/tests/)
+cargo test --workspace --no-fail-fast   # the full suite
+```
+
+Run the full suite with `--no-fail-fast`. Plain `cargo test` stops at the first test binary that fails and never runs the binaries after it, and its output reports the failure without saying what it skipped — `murmur-cli` alone has over a hundred integration-test binaries.
+
+- A run that ends with `error: N targets failed:` (`error: 1 target failed:` for one) ran every binary, and the list under it is the whole set of failures.
+- A run that ends with `error: test failed, to rerun pass …` and no `targets failed` list stopped at that binary and has not run the suite.
+
+To count how many binaries a stopped run never reached, compare the `Executable` lines of a `--no-run` build with the `Running` lines of the stopped run, using the same package selection:
+
+```bash
+cargo test --workspace --no-run 2>&1 | grep -c '^ *Executable'   # binaries a full run executes
+grep -c '^ *Running' stopped-run.log                               # binaries the stopped run started
 ```
 
 A few integration tests are marked `#[ignore]` because they depend on a sibling `default-artifacts` checkout; they only run with `cargo test -- --ignored` and are safe to skip for most changes.

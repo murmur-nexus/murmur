@@ -5,10 +5,11 @@ mod common;
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::mpsc::RecvTimeoutError,
+    time::{Duration, Instant},
 };
 
 use capsule_runtime::{
@@ -321,43 +322,67 @@ struct SseEvent {
     data: String,
 }
 
+/// Why an SSE collection stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    /// A terminal `status` event — one whose data carries `"final":true` — arrived.
+    Final,
+    /// The collection deadline passed while the stream was still open.
+    Deadline,
+    /// The peer closed the stream, or a read failed for a reason other than the deadline.
+    Closed,
+}
+
+/// How long a test waits for an SSE collection to return before concluding it never will. A
+/// liveness bound many times wider than any collection budget in this file: its failure means
+/// the reader is not bounded by its deadline, not that it was slow.
+const READER_LIVENESS_GUARD: Duration = Duration::from_secs(120);
+
 /// Read one line, bounding the socket read by whatever is left of `deadline`.
 ///
-/// Returns `None` once the deadline has passed, the peer closed the stream, or the read
-/// failed. Arming the socket against the remaining budget rather than a fixed per-read
-/// timeout is what makes the deadline cover the whole collection: the capsule sends a
-/// `:heartbeat` comment every 15s, so any per-read timeout longer than that interval is
-/// re-armed forever by traffic that carries no event.
+/// Arming the socket against the remaining budget rather than a fixed per-read timeout is what
+/// makes the deadline cover the whole collection: the capsule writes a `:heartbeat` comment on
+/// `SSE_HEARTBEAT_INTERVAL`, so a per-read timeout longer than that interval is re-armed forever
+/// by traffic that carries no event.
+///
+/// An expired `SO_RCVTIMEO` surfaces as `WouldBlock` on Linux and `TimedOut` elsewhere. Either one
+/// is [`StreamEnd::Deadline`] once the deadline has passed; one that arrives early re-arms the
+/// socket for what remains. `Ok(0)` and every other error are [`StreamEnd::Closed`].
 fn read_line_before(
-    reader: &mut BufReader<&TcpStream>,
-    stream: &TcpStream,
-    deadline: std::time::Instant,
-) -> Option<String> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return None;
-    }
-    // A zero timeout means "block forever" to the sockets API, so never pass one.
-    stream
-        .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
-        .ok()?;
-
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+) -> Result<String, StreamEnd> {
+    // A timed-out `read_line` keeps the bytes it consumed, so a partial line accumulates here
+    // across re-arms.
     let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line),
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(StreamEnd::Deadline);
+        }
+        // A zero timeout means "block forever" to the sockets API, so never pass one.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+            .map_err(|_| StreamEnd::Closed)?;
+
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err(StreamEnd::Closed),
+            Ok(_) => return Ok(line),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return Err(StreamEnd::Closed),
+        }
     }
 }
 
-/// Subscribe to `message/stream` for a new task and collect SSE events until a terminal
-/// `status` event arrives or `timeout` elapses. `timeout` bounds the whole collection,
-/// not each read; on expiry the events gathered so far are returned rather than panicking.
-fn collect_sse_events_for_message(
+/// Subscribe to `message/stream` for a new task and read the response head, both before
+/// `deadline`. The returned reader is positioned at the first SSE line.
+fn open_sse_stream(
     addr: &str,
     msg_id: &str,
     text: &str,
-    timeout: Duration,
-) -> Vec<SseEvent> {
+    deadline: Instant,
+) -> Result<BufReader<TcpStream>, StreamEnd> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -378,49 +403,38 @@ fn collect_sse_events_for_message(
         body
     );
 
-    let deadline = std::time::Instant::now() + timeout;
-    let stream = TcpStream::connect(addr).expect("should connect for SSE");
+    let mut stream = TcpStream::connect(addr).expect("should connect for SSE");
+    stream.write_all(request.as_bytes()).unwrap();
+    let _ = stream.flush();
 
-    {
-        let mut w = &stream;
-        w.write_all(request.as_bytes()).unwrap();
-        let _ = w.flush();
-    }
+    let mut reader = BufReader::new(stream);
+    // Status line, then headers up to the blank line.
+    read_line_before(&mut reader, deadline)?;
+    while !read_line_before(&mut reader, deadline)?.trim().is_empty() {}
+    Ok(reader)
+}
 
-    let mut reader = BufReader::new(&stream);
-
-    // Read status line
-    let _ = read_line_before(&mut reader, &stream, deadline);
-
-    // Skip headers
-    while let Some(line) = read_line_before(&mut reader, &stream, deadline) {
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut events = Vec::new();
+/// Read the next complete SSE event before `deadline`, passing over comment lines such as
+/// `:heartbeat`. A frame cut short by the deadline or a close is dropped.
+fn next_sse_event(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+) -> Result<SseEvent, StreamEnd> {
     let mut cur_id = None;
     let mut cur_type = String::new();
     let mut cur_data = String::new();
 
-    while let Some(line) = read_line_before(&mut reader, &stream, deadline) {
-        let line = line
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string();
+    loop {
+        let line = read_line_before(reader, deadline)?;
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
 
         if line.is_empty() {
             if !cur_type.is_empty() && !cur_data.is_empty() {
-                let is_final = cur_type == "status" && cur_data.contains("\"final\":true");
-                events.push(SseEvent {
+                return Ok(SseEvent {
                     id: cur_id,
-                    event_type: cur_type.clone(),
-                    data: cur_data.clone(),
+                    event_type: cur_type,
+                    data: cur_data,
                 });
-                if is_final {
-                    break;
-                }
             }
             cur_id = None;
             cur_type.clear();
@@ -433,8 +447,87 @@ fn collect_sse_events_for_message(
             cur_data = rest.to_string();
         }
     }
+}
 
-    events
+/// Whether `event` is the terminal `status` event that closes a task's stream.
+fn is_final(event: &SseEvent) -> bool {
+    event.event_type == "status" && event.data.contains("\"final\":true")
+}
+
+/// Read events into `events` until a terminal `status` event arrives, the peer closes the
+/// stream, or `deadline` passes, and report which.
+fn collect_sse_events_until(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+    events: &mut Vec<SseEvent>,
+) -> StreamEnd {
+    loop {
+        match next_sse_event(reader, deadline) {
+            Ok(event) => {
+                let done = is_final(&event);
+                events.push(event);
+                if done {
+                    return StreamEnd::Final;
+                }
+            }
+            Err(end) => return end,
+        }
+    }
+}
+
+/// Subscribe to `message/stream` for a new task and collect SSE events until a terminal
+/// `status` event arrives, the peer closes the stream, or `timeout` elapses, reporting which.
+/// `timeout` bounds the whole collection, not each read, and starts before the connect.
+fn collect_sse_stream(
+    addr: &str,
+    msg_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> (Vec<SseEvent>, StreamEnd) {
+    let deadline = Instant::now() + timeout;
+    let mut events = Vec::new();
+    let end = match open_sse_stream(addr, msg_id, text, deadline) {
+        Ok(mut reader) => collect_sse_events_until(&mut reader, deadline, &mut events),
+        Err(end) => end,
+    };
+    (events, end)
+}
+
+/// [`collect_sse_stream`] without the stop reason. On expiry the events gathered so far are
+/// returned rather than panicking.
+fn collect_sse_events_for_message(
+    addr: &str,
+    msg_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Vec<SseEvent> {
+    collect_sse_stream(addr, msg_id, text, timeout).0
+}
+
+/// Run `read` on its own thread and wait for it under `READER_LIVENESS_GUARD`.
+///
+/// Panics if `read` has not returned within the guard: a reader still running that long after
+/// its `budget` deadline is not bounded by it.
+fn within_reader_liveness_guard<T: Send + 'static>(
+    budget: Duration,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _ = done_tx.send(read());
+    });
+    match done_rx.recv_timeout(READER_LIVENESS_GUARD) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Disconnected) => std::panic::resume_unwind(
+            reader
+                .join()
+                .expect_err("a reader thread that sent nothing has panicked"),
+        ),
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "the SSE reader did not return within {READER_LIVENESS_GUARD:?} of a {budget:?} \
+             deadline, so it is not bounded by its deadline"
+        ),
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -457,7 +550,7 @@ fn input_required_task_suspends_loop() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start the task");
@@ -510,7 +603,7 @@ fn input_required_resumes_on_message_send() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start task");
@@ -565,7 +658,7 @@ fn input_required_working_state_rejects_message() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     // First message starts the task
@@ -610,7 +703,7 @@ fn input_required_timeout_transitions_to_failed() {
         });
     });
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start timed task");
@@ -656,7 +749,7 @@ fn input_timeout_streams_one_failed_final_status() {
         });
     });
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let events = collect_sse_events_for_message(
@@ -726,7 +819,7 @@ fn input_timeout_fails_the_launch() {
         })
     });
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start timed task");
@@ -812,7 +905,7 @@ fn input_required_sse_emits_state_event() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     // Spawn SSE collection in background — it will block until final event or timeout
@@ -917,12 +1010,21 @@ fn input_required_sse_emits_state_event() {
     handle.join().expect("launch thread should not panic");
 }
 
-/// Test 6: `collect_sse_events_for_message` gives up at its deadline even while the
-/// stream stays alive. A task that suspends on request-input with no input delivered
-/// emits no terminal event and keeps heartbeating, so a reader that bounded only each
-/// individual read would never return.
+/// Test 6: the SSE reader returns at its deadline while the capsule's stream is still open. A
+/// task suspended on request-input with no input delivered emits no terminal event and keeps its
+/// stream open, so once the input-required event has arrived the collection can only end on its
+/// deadline. The deadline starts at that event, so how long the capsule takes to suspend is
+/// bounded only by `INPUT_REQUIRED_WAIT`.
+///
+/// The budget is shorter than the capsule's `SSE_HEARTBEAT_INTERVAL`, so a heartbeat need not
+/// fall inside it; `sse_reader_returns_at_its_deadline_through_a_heartbeating_stream` covers a
+/// stream that never goes quiet.
 #[test]
 fn sse_reader_returns_when_deadline_exceeded() {
+    /// How long the stream may take to deliver the input-required event. A liveness bound sized
+    /// for a loaded host; it and the budget together sit well inside `READER_LIVENESS_GUARD`.
+    const INPUT_REQUIRED_WAIT: Duration = Duration::from_secs(60);
+
     let server = tool_then_end_turn_server("Deadline branch?", "would have completed");
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
@@ -937,36 +1039,49 @@ fn sse_reader_returns_when_deadline_exceeded() {
     });
 
     let capsule_url = url_rx
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let budget = Duration::from_secs(5);
-    let started = std::time::Instant::now();
-    let events =
-        collect_sse_events_for_message(&capsule_url, "msg-deadline-1", "stream task start", budget);
-    let elapsed = started.elapsed();
+    let addr = capsule_url.clone();
+    let (events, end, elapsed) = within_reader_liveness_guard(budget, move || {
+        let suspended_by = Instant::now() + INPUT_REQUIRED_WAIT;
+        let mut reader =
+            open_sse_stream(&addr, "msg-deadline-1", "stream task start", suspended_by)
+                .unwrap_or_else(|end| panic!("the stream ended ({end:?}) before its first event"));
+        let mut events = Vec::new();
+        loop {
+            match next_sse_event(&mut reader, suspended_by) {
+                Ok(event) => {
+                    let suspended =
+                        event.event_type == "status" && event.data.contains("input-required");
+                    events.push(event);
+                    if suspended {
+                        break;
+                    }
+                }
+                Err(end) => panic!(
+                    "the stream ended ({end:?}) before delivering the input-required event; \
+                     got events: {events:?}"
+                ),
+            }
+        }
+        let started = Instant::now();
+        let end = collect_sse_events_until(&mut reader, started + budget, &mut events);
+        (events, end, started.elapsed())
+    });
 
+    assert_eq!(
+        end,
+        StreamEnd::Deadline,
+        "the reader should stop on its deadline with the stream still open; got events: {events:?}"
+    );
     assert!(
         elapsed >= budget,
         "collection should run for the full budget before giving up; returned after {elapsed:?}"
     );
     assert!(
-        elapsed < budget + Duration::from_secs(5),
-        "collection should return at its deadline, not block on the live stream; took {elapsed:?}"
-    );
-
-    assert!(
-        !events.is_empty(),
-        "stream should have delivered events before the deadline; got none"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|e| e.event_type == "status" && e.data.contains("input-required")),
-        "stream should have delivered the input-required event; got events: {events:?}"
-    );
-    assert!(
-        !events.iter().any(|e| e.data.contains("\"final\":true")),
+        !events.iter().any(is_final),
         "no terminal event is emitted while the task waits for input; got events: {events:?}"
     );
 
@@ -981,4 +1096,57 @@ fn sse_reader_returns_when_deadline_exceeded() {
     let _ = send_message(&capsule_url, "msg-deadline-2", "use main branch");
 
     handle.join().expect("launch thread should not panic");
+}
+
+/// Test 7: the SSE reader returns at its deadline through a stream whose traffic never pauses.
+/// The server answers with an event-stream and then writes a `:heartbeat` comment every 50ms
+/// forever, never an event and never a close, so every individual read completes well inside
+/// any per-read timeout and only a deadline over the whole collection ends it.
+#[test]
+fn sse_reader_returns_at_its_deadline_through_a_heartbeating_stream() {
+    const HEARTBEAT: Duration = Duration::from_millis(50);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the heartbeat server");
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("accept the reader's connection");
+        // Discard the request up to the end of its headers; the body is never read.
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            match conn.read(&mut byte) {
+                Ok(1) => request.push(byte[0]),
+                _ => return,
+            }
+        }
+        let head =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
+        if conn.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        while conn.write_all(b":heartbeat\n\n").is_ok() {
+            std::thread::sleep(HEARTBEAT);
+        }
+    });
+
+    let budget = Duration::from_secs(1);
+    let (events, end, elapsed) = within_reader_liveness_guard(budget, move || {
+        let started = Instant::now();
+        let (events, end) = collect_sse_stream(&addr, "msg-heartbeat-1", "heartbeat only", budget);
+        (events, end, started.elapsed())
+    });
+
+    assert_eq!(
+        end,
+        StreamEnd::Deadline,
+        "the reader should stop on its deadline with the stream still open"
+    );
+    assert!(
+        elapsed >= budget,
+        "collection should run for the full budget before giving up; returned after {elapsed:?}"
+    );
+    assert!(
+        events.is_empty(),
+        "a heartbeat-only stream carries no events; got events: {events:?}"
+    );
 }

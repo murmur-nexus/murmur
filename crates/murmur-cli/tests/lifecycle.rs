@@ -238,7 +238,7 @@ fn lifecycle_none_rejects_message_send() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let response = http_post_json(
@@ -283,7 +283,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     // Enqueue both tasks before the agent processes either
@@ -446,7 +446,7 @@ fn lifecycle_queue_runs_the_peer_lane_before_the_background_lane() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let submitted = |response: &Value, label: &str| -> String {
@@ -620,7 +620,7 @@ fn lifecycle_override_forces_none() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let response = http_post_json(

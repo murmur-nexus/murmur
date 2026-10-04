@@ -79,7 +79,28 @@ Run the unit tests plus the integration suites for the area you touched before s
 ```bash
 cargo test --workspace --lib --bins     # unit tests across all crates
 cargo test -p murmur-cli --test build   # one integration suite (see crates/murmur-cli/tests/)
+cargo test --workspace --no-fail-fast   # the full suite
 ```
+
+Run the full suite with `--no-fail-fast`. Plain `cargo test` stops at the first test binary that
+fails and never runs the binaries after it, and its output reports the failure without saying what
+it skipped — `murmur-cli` alone has over a hundred integration-test binaries. The last lines of a
+run tell the two apart:
+
+| The run ends with | Meaning |
+|---|---|
+| `error: N targets failed:` (`error: 1 target failed:` for one) and one `` `-p <crate> --test <name>` `` line per failed target | Every test binary ran; that list is the whole set of failures |
+| `error: test failed, to rerun pass …` with no `targets failed` list | The run stopped at that binary; the binaries after it never ran |
+
+To count how many binaries a stopped run never reached, compare the binaries a full run executes
+with the ones the stopped run started, using the same package selection as the stopped run:
+
+```bash
+cargo test --workspace --no-run 2>&1 | grep -c '^ *Executable'   # binaries a full run executes
+grep -c '^ *Running' stopped-run.log                               # binaries the stopped run started
+```
+
+The difference is the number of binaries the stopped run did not reach.
 
 Every PR that changes behavior must include tests — see the testing section of the
 [contributor guidelines](https://github.com/murmur-nexus/murmur/blob/main/.github/CONTRIBUTING.md#testing-your-change)

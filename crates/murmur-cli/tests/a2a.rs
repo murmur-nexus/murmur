@@ -193,7 +193,7 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     // Send A2A message/send
@@ -288,7 +288,7 @@ fn a2a_second_message_send_is_rejected() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let first_body = serde_json::json!({
@@ -363,7 +363,7 @@ fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let body = serde_json::json!({
@@ -552,7 +552,7 @@ fn a2a_tasks_get_unknown_method_returns_error() {
         .unwrap()
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let body = serde_json::json!({
@@ -655,7 +655,7 @@ fn an_event_origin_task_line_is_labelled_fenced() {
         .expect("launch should succeed")
     });
     let capsule_url = url_rx
-        .recv_timeout(std::time::Duration::from_secs(15))
+        .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
     let body = serde_json::json!({
