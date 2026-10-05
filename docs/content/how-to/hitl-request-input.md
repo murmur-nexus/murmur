@@ -60,7 +60,7 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
       - name: murmur-tool-request-input
         version: "{{ v.murmur_tool_request_input }}"

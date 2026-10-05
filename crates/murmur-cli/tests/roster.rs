@@ -849,6 +849,56 @@ fn s14_a_rule_calling_the_entry_member_is_e_ros_008() {
     assert!(!doctor.stderr.contains("E-ROS-008"), "{}", doctor.stderr);
 }
 
+// ── S15: a formation directory inside a capsule project ─────────────────────
+
+/// A directory holding `roster.yaml` and no `murmur.yaml` is checked as a formation, without
+/// walking up to the capsule project around it; that project's own check is unchanged by it.
+#[test]
+fn s15_a_formation_directory_is_checked_as_one_and_its_parent_as_before() {
+    let home = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    create_project(parent.path());
+    let before = mur_doctor(&home, parent.path());
+    assert!(before.success, "{}\n{}", before.stdout, before.stderr);
+
+    let formation = parent.path().join("crew");
+    fs::create_dir(&formation).unwrap();
+    s1_project(&formation);
+    fs::remove_file(formation.join("murmur.yaml")).unwrap();
+
+    let doctor = mur_doctor(&home, &formation);
+    assert_admitted(&doctor);
+    let canonical = formation.canonicalize().unwrap();
+    assert!(
+        doctor.stdout.starts_with(&format!(
+            "No murmur.yaml in {}: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.\n\nRoster\n  file: {}\n",
+            canonical.display(),
+            canonical.join("roster.yaml").display()
+        )),
+        "{}",
+        doctor.stdout
+    );
+    assert!(
+        doctor.stdout.ends_with("\n\nAll checks passed.\n"),
+        "{}",
+        doctor.stdout
+    );
+    let parent_manifest = parent.path().canonicalize().unwrap().join("murmur.yaml");
+    for text in [&doctor.stdout, &doctor.stderr] {
+        assert!(
+            !text.contains(&parent_manifest.display().to_string()) && !text.contains("Checking "),
+            "the formation check reached the parent project:\n{text}"
+        );
+    }
+
+    let after = mur_doctor(&home, parent.path());
+    assert_eq!(
+        (after.success, &after.stdout, &after.stderr),
+        (before.success, &before.stdout, &before.stderr),
+        "a formation directory below the project changed its check"
+    );
+}
+
 /// The project store, then the global store: the order `mur doctor` and `mur run --capsule` resolve
 /// in, with only a miss in the first falling through.
 struct ProjectThenGlobal {

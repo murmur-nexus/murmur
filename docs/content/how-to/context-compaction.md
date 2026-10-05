@@ -60,7 +60,7 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
       - name: murmur-hook-compact
         version: "{{ v.murmur_hook_compact }}"

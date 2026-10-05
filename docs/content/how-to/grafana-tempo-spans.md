@@ -158,7 +158,7 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
       - name: murmur-hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
