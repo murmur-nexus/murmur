@@ -726,7 +726,7 @@ fn an_openai_config_names_the_openai_driver_and_key() {
             gateway.api_key,
             Some(ApiKeyReference::Environment("OPENAI_API_KEY".to_string()))
         );
-        assert_eq!(manifest.inference.unwrap().model, "gpt-4o-mini");
+        assert_eq!(manifest.inference.unwrap().model, "gpt-5.6-luna");
     }
     let steps = next_steps(&new.stdout);
     assert!(steps[1].starts_with("mur install -g murmur-driver-openai@"));

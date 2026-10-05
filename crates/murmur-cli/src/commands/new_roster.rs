@@ -56,7 +56,7 @@ pub(crate) const OPENAI: Provider = Provider {
     driver: "murmur-driver-openai",
     driver_version: "0.9.0",
     default_endpoint: "https://api.openai.com/v1",
-    default_model: "gpt-4o-mini",
+    default_model: "gpt-5.6-luna",
     key_var: "OPENAI_API_KEY",
 };
 

@@ -265,7 +265,7 @@ The provider comes from `inference.provider`, `inference.endpoint` and `inferenc
 | `inference.provider` | Driver | Default endpoint | Default model | `gateway.api_key` |
 |---|---|---|---|---|
 | `anthropic`, empty, or no `inference:` block | `murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}` | `https://api.anthropic.com` | `claude-haiku-4-5-20251001` | `${ANTHROPIC_API_KEY}` |
-| `openai` | `murmur-driver-openai@{{ v.murmur_driver_openai }}` | `https://api.openai.com/v1` | `gpt-4o-mini` | `${OPENAI_API_KEY}` |
+| `openai` | `murmur-driver-openai@{{ v.murmur_driver_openai }}` | `https://api.openai.com/v1` | `gpt-5.6-luna` | `${OPENAI_API_KEY}` |
 | Any other value | Refused with `E-NEW-004` | — | — | — |
 
 A configured `inference.endpoint` must pass [`gateway.endpoint` validation](manifest.md#gateway-endpoint-validation),
@@ -342,7 +342,7 @@ mur new "<task description>" [--registry <URL|local>]
 - Inference provider configured — detected in this order:
     1. `inference:` section in `~/.murmur/config.yaml` (recommended)
     2. `ANTHROPIC_API_KEY` env var (uses `claude-haiku-4-5-20251001` by default)
-    3. `OPENAI_API_KEY` env var (uses `gpt-4o-mini` by default)
+    3. `OPENAI_API_KEY` env var (uses `gpt-5.6-luna` by default)
     4. Interactive first-run wizard (requires a TTY; saves result to `~/.murmur/config.yaml`)
 
     `mur new` reads and writes the global file only — it does not consult or write the

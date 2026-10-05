@@ -503,7 +503,7 @@ mod tests {
     fn build_meta_manifest_openai_contains_correct_driver() {
         let config = InferenceConfig {
             provider: "openai".to_string(),
-            model: "gpt-4o-mini".to_string(),
+            model: "gpt-5.6-luna".to_string(),
             api_key: fake_key(&["sk-", "test"]),
             endpoint: String::new(),
         };
@@ -516,7 +516,7 @@ mod tests {
             yaml.contains("api.openai.com"),
             "should use openai endpoint"
         );
-        assert!(yaml.contains("gpt-4o-mini"), "should use model");
+        assert!(yaml.contains("gpt-5.6-luna"), "should use model");
         assert!(
             !yaml.contains("murmur-driver-anthropic"),
             "should not reference anthropic driver"
@@ -848,7 +848,7 @@ mod tests {
     fn openai_inf() -> InferenceConfig {
         InferenceConfig {
             provider: "openai".to_string(),
-            model: "gpt-4o-mini".to_string(),
+            model: "gpt-5.6-luna".to_string(),
             api_key: fake_key(&["sk-", "test"]),
             endpoint: String::new(),
         }
