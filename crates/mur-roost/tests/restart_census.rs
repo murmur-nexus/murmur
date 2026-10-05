@@ -7,6 +7,8 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "../../capsule-runtime/src/pinned_port.rs"]
+mod pinned_port;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -89,14 +91,10 @@ fn write_live_record(dir: &Path, session_id: &str, pid: u32) {
     write_record(dir, session_id, pid, &token, "127.0.0.1:1");
 }
 
-/// A port nothing holds at the moment of asking. The daemon prints the port it was given rather
-/// than the one it bound, so `--port 0` would leave the test with no address to call.
+/// A port the daemon can bind once it starts. The daemon prints the port it was given rather than
+/// the one it bound, so `--port 0` would leave the test with no address to call.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    pinned_port::claim()
 }
 
 /// A running daemon and the stderr it printed up to and including its `machine ceiling` line.

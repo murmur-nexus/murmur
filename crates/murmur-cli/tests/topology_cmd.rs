@@ -6,6 +6,9 @@
 // only under the feature, and every invocation runs against a `HOME` whose config opts in.
 #![cfg(feature = "beta-mur-topology")]
 
+#[path = "../../capsule-runtime/src/pinned_port.rs"]
+mod pinned_port;
+
 use std::{
     fs,
     io::{Read, Write},
@@ -297,11 +300,8 @@ fn topology_node_color_by_exit_status() {
 
 #[test]
 fn topology_cli_error_on_unreachable_endpoint() {
-    // Bind to get a free port, then drop so nothing is listening on it
-    let port = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // Claimed and never bound, so nothing is listening on it
+    let port = pinned_port::claim();
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let (mut cmd, _home) = mur();

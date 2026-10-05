@@ -31,18 +31,26 @@ jobs:
     runs-on: ubuntu-latest
     # The ceiling covers the whole job -- compile, link and run -- and is here so a hung test
     # fails the job rather than burning the runner's own limit.
-    timeout-minutes: 30
+    #
+    # About twice the job's median with a warm dependency cache, which also leaves room for a run
+    # that misses the cache and rebuilds every dependency at opt-level 2. A single hung test is cut
+    # off sooner, by the slow-timeout in .config/nextest.toml's `ci` profile.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      # The job runs at roughly twelve minutes. How that divides between compiling, linking and
-      # running the suite has NOT been measured -- an earlier version of this comment asserted a
-      # five-minute suite, which was already stale by the time anyone read it, so do not put a
-      # number here that nobody re-derived. What would settle it: `finished in Xs` per test binary
-      # from the `--nocapture` output below, against a timed `cargo build --workspace --all-targets`.
       # Each crate with a `tests/` directory is a separate link unit that statically links wasmtime,
-      # so adding one is not free even when its tests are fast. Four arrived in a single day with
-      # the delegation slices, and `capsule-runtime/tests/child_launch.rs` alone runs 42-45s.
+      # so adding one is not free even when its tests are fast. Phase timings for this job are in
+      # the step timings: "Build the test binaries" is compile and link, "Run the workspace test
+      # suite" is the run.
+      - name: CI-only build settings
+        # Before rust-cache and before anything builds, so every cargo invocation in the job reads
+        # them. What they are and why: .github/cargo-test-ci.toml.
+        run: cat .github/cargo-test-ci.toml >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Dependencies built under other profile settings are no use to this job: restored, they
+          # would all be rebuilt on every run and the cache never refreshed.
+          key: profile-${{ hashFiles('.github/cargo-test-ci.toml') }}
       - name: Install libseccomp
         # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
         # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
@@ -51,30 +59,52 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libseccomp-dev
-      - name: Run the workspace test suite
+      - name: Install cargo-nextest
+        # A prebuilt binary: building it from source would cost minutes on every run.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Build the test binaries
         # `--features` pulls in `topology_cmd` and `deploy_cmd`, which are `#![cfg(feature = ...)]`
-        # files and contribute zero tests without it. `--no-fail-fast` keeps one broken suite from
-        # hiding the state of every other. `--nocapture` is what lets the summary below see the
-        # skip lines at all: cargo swallows a passing test's output otherwise.
+        # files and contribute zero tests without it. The run below passes the same packages and
+        # features, so nextest's own build finds everything fresh; a `Compiling` line in its output
+        # means the two have drifted apart. `--timings` records each crate's build time.
         run: |
-          set -o pipefail
-          cargo test --workspace --no-fail-fast \
-            --features "beta-mur-topology beta-mur-deploy" \
-            -- --nocapture 2>&1 | tee test-output.log
+          cargo test --workspace --no-run --timings \
+            --features "beta-mur-topology beta-mur-deploy"
+      - name: Run the workspace test suite
+        # nextest runs the tests of every binary in parallel, each in its own process, rather
+        # than one binary after another. The `ci` profile in .config/nextest.toml retries a
+        # failure twice and reports a test that then passes as FLAKY, terminates a test still
+        # running after five minutes, does not stop at the first failure, and writes the JUnit
+        # report the next steps read. The workspace has no doctests, which nextest does not run.
+        run: |
+          cargo nextest run --profile ci --workspace \
+            --features "beta-mur-topology beta-mur-deploy"
+      - name: Upload the test report and build timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test-report
+          path: |
+            target/nextest/ci/junit.xml
+            target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
       - name: Report the tests this runner could not run
         if: always()
         # Runs even when the suite failed, so a red job still says how much of the suite was
         # skipped rather than executed.
         run: |
-          if [ ! -f test-output.log ]; then
-            echo "No test output was captured." >> "$GITHUB_STEP_SUMMARY"
+          report=target/nextest/ci/junit.xml
+          if [ ! -f "$report" ]; then
+            echo "No test report was written." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          # `--nocapture` interleaves the output of concurrently running tests, so two markers can
-          # share a line: the count is of matches, not of lines. `[SKIP-HOST]` never matches the
-          # `[SKIP]` pattern -- the `]` is literal -- so the two counts stay disjoint.
-          host_skips=$(grep -o '\[SKIP-HOST\]' test-output.log | wc -l)
-          other_skips=$(grep -o '\[SKIP\]' test-output.log | wc -l)
+          # The JUnit report keeps each test's output, passing or not. The count is of matches,
+          # not of lines. `[SKIP-HOST]` never matches the `[SKIP]` pattern -- the `]` is literal --
+          # so the two counts stay disjoint.
+          host_skips=$(grep -o '\[SKIP-HOST\]' "$report" | wc -l)
+          other_skips=$(grep -o '\[SKIP\]' "$report" | wc -l)
           {
             echo "## Tests this runner did not execute"
             echo
