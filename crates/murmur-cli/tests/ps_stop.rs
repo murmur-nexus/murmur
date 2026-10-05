@@ -282,10 +282,14 @@ impl Stray {
     }
 
     /// A process that ignores `SIGTERM`, so only `SIGKILL` ends it.
+    ///
+    /// `exec` keeps it one process: an ignored signal stays ignored across exec, and the pid the
+    /// record names is the `sleep` itself. A forked `sleep` would outlive the `SIGKILL` sent to
+    /// its shell, holding this test's stdout and stderr open for the rest of its 300 seconds.
     fn deaf_to_term() -> Self {
         Self {
             child: std::process::Command::new("sh")
-                .args(["-c", "trap \"\" TERM; sleep 300"])
+                .args(["-c", "trap \"\" TERM; exec sleep 300"])
                 .spawn()
                 .expect("sh should start"),
         }
