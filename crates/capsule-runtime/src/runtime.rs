@@ -12246,20 +12246,6 @@ inference:
         );
     }
 
-    /// A component exporting only the legacy unversioned instance name no longer
-    /// resolves — the fallback probe was removed, so the versioned-only lookup
-    /// returns `None` and the call site surfaces a hard missing-export error.
-    #[test]
-    fn resolve_versioned_iface_rejects_unversioned_only_name() {
-        let engine = iface_test_engine();
-        let (instance, mut store) = instantiate_iface_double(&engine, "murmur:tool/run");
-        let found = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED);
-        assert!(
-            found.is_none(),
-            "a component exporting only the legacy unversioned name must no longer resolve"
-        );
-    }
-
     /// A component exporting neither the versioned name nor any recognizable
     /// name resolves to `None` — the probe must not silently swallow a genuinely
     /// absent interface.

@@ -29,13 +29,6 @@ use std::{
 
 use serde_json::{json, Value};
 
-/// Colon-separated list of directory prefixes this tool may operate under.
-///
-/// Same name and same self-enforcement pattern the real native tools use: the
-/// capsule runtime does not police path arguments, so a native tool that wants a
-/// filesystem boundary has to check one itself.
-const ALLOW_ENV: &str = "MURMUR_FILESYSTEM_ALLOW";
-
 fn main() {
     let mut raw = String::new();
     if std::io::stdin().read_to_string(&mut raw).is_err() {
@@ -98,41 +91,13 @@ fn run(raw: &str) -> Value {
     }
 }
 
-/// Resolve the base directory the operation runs against, then validate it
-/// against `MURMUR_FILESYSTEM_ALLOW`.
-///
-/// The base is the explicit `repo` field when given, and the process working
-/// directory (the capsule workdir, under the runtime) otherwise.
+/// The base directory the operation runs against: the explicit `repo` field when
+/// given, and the process working directory (the capsule workdir, under the
+/// runtime) otherwise.
 fn resolve_base(op: &Value) -> Result<PathBuf, String> {
-    let base = match op.get("repo").and_then(Value::as_str) {
-        Some(repo) => PathBuf::from(repo),
-        None => std::env::current_dir().map_err(|err| format!("cannot read working dir: {err}"))?,
-    };
-
-    let allow = match std::env::var(ALLOW_ENV) {
-        Ok(value) => value,
-        Err(_) => return Ok(base),
-    };
-    let prefixes: Vec<&str> = allow.split(':').filter(|part| !part.is_empty()).collect();
-    if prefixes.is_empty() {
-        return Ok(base);
-    }
-
-    // Compare canonical paths component-wise: a textual prefix test would let
-    // `/tmp/ab` stand in for `/tmp/abc`.
-    let canonical = canonicalize_or_keep(&base);
-    let permitted = prefixes
-        .iter()
-        .any(|prefix| canonical.starts_with(canonicalize_or_keep(Path::new(prefix))));
-
-    if permitted {
-        Ok(base)
-    } else {
-        Err(format!(
-            "repo path '{}' is not within any allowed filesystem path. \
-             Add the path to capabilities.filesystem.allow in the manifest.",
-            base.display()
-        ))
+    match op.get("repo").and_then(Value::as_str) {
+        Some(repo) => Ok(PathBuf::from(repo)),
+        None => std::env::current_dir().map_err(|err| format!("cannot read working dir: {err}")),
     }
 }
 

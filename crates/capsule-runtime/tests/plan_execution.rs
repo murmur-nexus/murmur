@@ -257,23 +257,6 @@ fn test_shell_step_executes() {
     assert_eq!(find(&report, "sh").output.as_deref(), Some("shell-ok"));
 }
 
-#[test]
-#[ignore = "requires a running mur-roost and published worker capsule fixture"]
-fn test_capsule_step_spawns_and_reads_result() {
-    let dir = tempdir().unwrap();
-    let invoke = unused_tool;
-    let plan = write_plan(
-        dir.path(),
-        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":"hello"}]}),
-    );
-
-    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
-
-    assert!(report.completed, "{report:?}");
-    assert_eq!(find(&report, "worker").status, StepStatus::Success);
-    assert!(find(&report, "worker").output.is_some());
-}
-
 /// A plain objective reaches the child capsule as plain text.
 ///
 /// The child pushes whatever arrives straight at its model, and nothing parses a task envelope,

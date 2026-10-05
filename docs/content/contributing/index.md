@@ -106,17 +106,9 @@ The difference is the number of binaries the stopped run did not reach.
 
 Every PR that changes behavior must include tests — see the testing section of the
 [contributor guidelines](https://github.com/murmur-nexus/murmur/blob/main/.github/CONTRIBUTING.md#testing-your-change)
-for where tests go and how much coverage is expected. A few integration tests are marked
-`#[ignore]` because they depend on a `default-artifacts` checkout with certain artifacts
-built; set `MURMUR_DEFAULT_ARTIFACTS_DIR` to point at one, then run with
-`cargo test -- --ignored`. Without that variable set, these tests skip themselves; every
-other test runs without needing a `default-artifacts` checkout at all.
-
-Read anything the sibling owns — an artifact's version, the shape of its configuration — out of the
-checkout at run time rather than writing it as a literal in the test, so the test states what it
-means to assert rather than a copy that goes stale on the sibling's next release. A contract the
-sibling owns outright belongs in a test in that repository, where the change that breaks it is the
-change that reddens it.
+for where tests go and how much coverage is expected. No test reads a `default-artifacts`
+checkout. A contract that repository owns belongs in a test there, where the change that breaks it
+is the change that reddens it.
 
 CI runs the full workspace suite, including both beta CLI surfaces, on every push and pull
 request. Tests that need a host able to isolate a capsule — a delegated cgroup v2 scope, or a

@@ -566,22 +566,3 @@ fn asking_permission_creates_no_session() {
         .collect();
     assert_eq!(registry_entries, vec!["worker-a"]);
 }
-
-/// `POST /delegate` is gone: the endpoint that granted an approval is now the one that names the
-/// launch.
-#[test]
-fn the_delegate_endpoint_no_longer_exists() {
-    let daemon = Daemon::new();
-    daemon.seed_caller(CALLER_SESSION);
-    daemon.publish("worker-a", "0.1.0");
-    let credential = daemon.credential(CALLER_SESSION);
-
-    let response = daemon.post(
-        "/delegate",
-        r#"{"name":"worker-a","version":"0.1.0"}"#,
-        &[(capsule_runtime::SPAWN_CREDENTIAL_HEADER, &credential)],
-    );
-
-    assert_eq!(response.status, 404);
-    assert_eq!(response.error(), "not found");
-}

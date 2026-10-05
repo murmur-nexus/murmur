@@ -255,17 +255,6 @@ pub fn fixture_path(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-/// Root of a local `default-artifacts` checkout, used by tests marked
-/// `#[ignore]` that depend on artifacts built there.
-///
-/// `MURMUR_DEFAULT_ARTIFACTS_DIR` is the only way to find that checkout, and
-/// `None` means it was not set. No relative-path fallback to a sibling directory:
-/// one would make the suite pass or fail on how the machine happens to be laid
-/// out. Callers must skip when this returns `None`.
-pub fn default_artifacts_dir() -> Option<PathBuf> {
-    std::env::var_os("MURMUR_DEFAULT_ARTIFACTS_DIR").map(PathBuf::from)
-}
-
 /// Name of the fixture native tool crate under `tests/fixtures/native-tool/`,
 /// used both as the artifact name and as the binary name inside `bin/`.
 pub const FIXTURE_NATIVE_TOOL_NAME: &str = "murmur-tool-fixture";
@@ -653,43 +642,6 @@ pub fn create_skill_artifact(
 
     zip.start_file("skill.md", options).unwrap();
     zip.write_all(skill_content.as_bytes()).unwrap();
-
-    zip.finish().unwrap();
-    artifact_path
-}
-
-/// Create a shell-desc-driver native artifact .mur.zip from a pre-built binary.
-///
-/// The zip contains murmur.yaml (with artifact_type: shell-desc-driver) and the
-/// binary named exactly `<name>` at the archive root, as required by extract_native_binary.
-pub fn create_shell_desc_driver_artifact(
-    dir: &Path,
-    name: &str,
-    version: &str,
-    binary_path: &Path,
-) -> PathBuf {
-    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
-    let file = fs::File::create(&artifact_path).unwrap();
-    let mut zip = ZipWriter::new(file);
-    let options: SimpleFileOptions =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
-
-    zip.start_file("murmur.yaml", options).unwrap();
-    writeln!(zip, "name: {name}").unwrap();
-    writeln!(zip, "version: {version}").unwrap();
-    writeln!(zip, "runtime: native").unwrap();
-    writeln!(zip, "artifact_type: shell-desc-driver").unwrap();
-    writeln!(
-        zip,
-        "description: Writes enriched tool manifests for common shell binaries during stage_session."
-    )
-    .unwrap();
-
-    let exec_options: SimpleFileOptions = FileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-    zip.start_file(name, exec_options).unwrap();
-    zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
 
     zip.finish().unwrap();
     artifact_path
