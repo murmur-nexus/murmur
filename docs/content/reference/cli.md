@@ -588,7 +588,7 @@ mur run
 Example — install a specific artifact:
 
 ```bash
-mur install murmur-tool-git@1.0.0
+mur install murmur-tool-git@{{ v.murmur_tool_git }}
 ```
 
 Behavior:
@@ -633,7 +633,7 @@ Each WASM tool, driver and hook is compiled under this machine's `mur` build and
 
 ```text
 compiled        murmur-tool-echo@1.0.0
-not wasm        murmur-tool-git@1.0.0
+not wasm        murmur-tool-git@{{ v.murmur_tool_git }}
 failed          ./broken.mur.zip
 ```
 
@@ -689,24 +689,24 @@ Example output (`mur list`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORMS
-murmur-driver-anthropic  1.0.0    driver   —
-murmur-tool-git          1.0.0    tool     darwin-aarch64
+murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
+murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
 ```
 
 Example output (`mur list --all`):
 
 ```text
 SCOPE    NAME                     VERSION  RUNTIME  PLATFORMS
-project  murmur-driver-anthropic  1.0.0    driver   —
-global   murmur-tool-git          1.0.0    tool     darwin-aarch64
+project  murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —
+global   murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64
 ```
 
 Example output (`mur list -g --contract murmur:tool`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORMS       CONTRACTS
-murmur-driver-anthropic  1.0.0    driver   —               murmur:tool-registry/invoke@0.1.0
-murmur-tool-git          1.0.0    tool     darwin-aarch64  murmur:tool/run@0.1.0
+murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   —               murmur:tool-registry/invoke@0.1.0
+murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  murmur:tool/run@0.1.0
 ```
 
 ---
@@ -818,8 +818,8 @@ Read-only paths
   read_only enforcement: enforced for every tool call and every shell command the dispatch check can read
 
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✓  murmur-driver-anthropic@1.0.0    platform-independent
-  ✓  murmur-tool-git@1.0.0            darwin-aarch64
+  ✓  murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}   platform-independent
+  ✓  murmur-tool-git@{{ v.murmur_tool_git }}            darwin-aarch64
 
 All checks passed.
 ```
@@ -828,22 +828,22 @@ All checks passed.
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✗  murmur-tool-git@1.0.0   darwin-aarch64   — missing
+  ✗  murmur-tool-git@{{ v.murmur_tool_git }}   darwin-aarch64   — missing
 
 0 checks passed, 1 error found.
 
-Fix: mur install murmur-tool-git@1.0.0
+Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
 ```
 
 **Output — a native binary built for another platform:**
 
 ```text
 Checking /path/to/murmur.yaml for linux-x86_64...
-  ✗  murmur-tool-git@1.0.0   linux-x86_64   — native binary is built for darwin-aarch64, this host is linux-x86_64
+  ✗  murmur-tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native binary is built for darwin-aarch64, this host is linux-x86_64
 
 0 checks passed, 1 error found.
 
-Fix: murmur-tool-git: native binary is built for darwin-aarch64 — reinstall murmur-tool-git@1.0.0 on this host
+Fix: murmur-tool-git: native binary is built for darwin-aarch64 — reinstall murmur-tool-git@{{ v.murmur_tool_git }} on this host
 ```
 
 ### Lock integrity
@@ -1047,11 +1047,11 @@ A stale artifact this project does not declare adds its `Fix:` line in the same 
 
 ```text
 Checking /path/to/murmur.yaml for linux-x86_64...
-  ⚠  murmur-tool-git@1.0.0   linux-x86_64   — native artifact with no recorded platform (warning[W-REG-001])
+  ⚠  murmur-tool-git@{{ v.murmur_tool_git }}   linux-x86_64   — native artifact with no recorded platform (warning[W-REG-001])
 
 1 check passed, 0 errors found, 1 warning.
 
-Fix: mur install murmur-tool-git@1.0.0
+Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
 ```
 
 **Exit codes:**
@@ -2673,8 +2673,8 @@ mur search <query> [--registry <URL|local>] [--limit <n>]
 
 ```text
 NAME                     VERSION  RUNTIME  DESCRIPTION
-murmur-tool-git          1.0.0    tool     Structured git interface for Murmur capsules.
-murmur-driver-anthropic  1.0.0    driver   Anthropic Messages API inference driver for Murmur agent capsules.
+murmur-tool-git          {{ v.murmur_tool_git }}    tool     Structured git interface for Murmur capsules.
+murmur-driver-anthropic  {{ v.murmur_driver_anthropic }}   driver   Anthropic Messages API inference driver for Murmur agent capsules.
 ```
 
 When no artifacts match, prints `No results found.` and exits `0` (not an error).

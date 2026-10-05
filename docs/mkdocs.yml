@@ -101,23 +101,36 @@ extra:
     max_tokens_anthropic: 1000000
     max_tokens_openai: 200000
     max_tokens_deepseek: 1000000
-    murmur_driver_anthropic: "1.0.0"
-    murmur_driver_openai: "1.0.0"
-    murmur_driver_deepseek: "1.0.0"
-    murmur_driver_claude_code: "1.0.0"
-    murmur_hook_compact: "1.0.0"
-    murmur_hook_eval: "1.0.0"
-    murmur_hook_grafana: "1.0.0"
-    murmur_hook_debug: "1.0.0"
-    murmur_hook_diff_summary: "1.0.0"
-    murmur_hook_memory: "1.0.0"
-    murmur_tool_git: "1.0.0"
-    murmur_tool_editor: "1.0.0"
-    murmur_tool_request_input: "1.0.0"
-    murmur_tool_registry_search: "1.0.0"
-    murmur_tool_corpus: "1.0.0"
-    murmur_tool_code_graph: "1.0.0"
-    murmur_skill_create_manifest: "1.0.0"
+    # Artifact versions from the latest default-artifacts release (v0.24.0).
+    # Kept by hand: when a release ships, copy the versions from its
+    # artifacts-index.json. A pin missing from the latest release fails
+    # `mur install` with E-REG-001.
+    murmur_driver_anthropic: "0.10.0"
+    murmur_driver_claude_code: "0.4.0"
+    murmur_driver_deepseek: "0.8.0"
+    murmur_driver_moonshotai: "0.7.0"
+    murmur_driver_openai: "0.9.0"
+    murmur_hook_compact: "0.8.0"
+    murmur_hook_debug: "0.7.0"
+    murmur_hook_diff_summary: "0.8.0"
+    murmur_hook_eval: "0.8.0"
+    murmur_hook_grafana: "0.8.0"
+    murmur_hook_memory: "0.9.0"
+    murmur_hook_regression_verifier: "0.6.0"
+    murmur_hook_shell_desc: "0.6.0"
+    murmur_tool_code_coverage: "0.1.0"
+    murmur_tool_code_graph: "0.2.0"
+    murmur_tool_corpus: "0.3.0"
+    murmur_tool_create: "0.5.0"
+    murmur_tool_editor: "0.6.0"
+    murmur_tool_git: "0.2.0"
+    murmur_tool_registry_search: "0.1.0"
+    murmur_tool_report: "0.2.0"
+    murmur_tool_request_input: "0.2.0"
+    murmur_tool_tavily: "0.2.0"
+    murmur_tool_test_report: "0.1.0"
+    murmur_skill_create_manifest: "0.1.0"
+    murmur_skill_investigation_checkpoint: "0.2.0"
 
 markdown_extensions:
   - admonition
