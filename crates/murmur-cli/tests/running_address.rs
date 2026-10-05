@@ -690,11 +690,8 @@ fn a_live_process_whose_door_is_silent_is_unreachable_and_kept() {
         .expect("sleep should start");
     let start = running::process_start_token(unrelated.id())
         .expect("the host reports a start time for a process it just created");
-    // A port bound and released: nothing is listening on it.
-    let silent_port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // A port claimed and never bound: nothing is listening on it.
+    let silent_port = common::free_port();
     let session_id = "ses_0199c4e2f1b7712a9d3e4f5061728395";
     write_record(
         home.path(),

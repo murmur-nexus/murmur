@@ -10,6 +10,10 @@ pub mod hook_wat;
 pub mod idle_capsule;
 pub mod leaks;
 pub mod loopback_target;
+/// Ports claimed across every test process, compiled from the runtime's own copy so every crate's
+/// tests share one range and one lock directory.
+#[path = "../../../capsule-runtime/src/pinned_port.rs"]
+pub mod pinned_port;
 pub mod recording_upstream;
 
 use std::{
@@ -18,7 +22,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex},
     thread,
 };
 
@@ -691,42 +695,14 @@ pub fn create_shell_desc_driver_artifact(
     artifact_path
 }
 
-/// A pinned port, claimed for the lifetime of the test process.
+/// A pinned port, claimed for the lifetime of the test process and kept from every other test
+/// process on the host.
 ///
 /// For tests that need the number itself: to write into a manifest before the capsule that binds
-/// it launches, or to assert on after the capsule releases it. An OS-assigned `:0` port serves
-/// neither, because the number is only known once something has bound it, and once released it
-/// can be handed straight back out to any other binder in this process.
-///
-/// Candidates come from below the Linux ephemeral range (32768–60999), so no `:0` bind anywhere in
-/// the process can be assigned one, and a process-wide claim set keeps two tests from picking the
-/// same number.
+/// it launches, or to assert on after the capsule releases it. See [`pinned_port`] for why an
+/// OS-assigned `:0` port serves neither and how the claim holds across processes.
 pub fn free_port() -> u16 {
-    static CLAIMED: OnceLock<Mutex<(u16, HashSet<u16>)>> = OnceLock::new();
-    let claimed = CLAIMED.get_or_init(|| {
-        // Seeded from the pid so two concurrent `cargo test` invocations start in different
-        // places rather than racing over the same first candidate.
-        let seed = (std::process::id() % 8000) as u16;
-        Mutex::new((20_000 + seed, HashSet::new()))
-    });
-
-    let mut guard = claimed.lock().unwrap();
-    for _ in 0..4000 {
-        let candidate = guard.0;
-        guard.0 = if candidate >= 30_000 {
-            20_000
-        } else {
-            candidate + 1
-        };
-        if !guard.1.insert(candidate) {
-            continue;
-        }
-        // Bindable now, and nothing in this process can be handed it afterwards.
-        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("no free pinned port in 20000..30000");
+    pinned_port::claim()
 }
 
 pub struct ScriptedServer {

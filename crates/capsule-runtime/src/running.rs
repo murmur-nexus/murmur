@@ -963,11 +963,8 @@ mod tests {
         let pid = std::process::id();
         let token = process_start_token(pid).unwrap();
         let mut record = record(pid, &token);
-        // Bound and immediately dropped: the port is one nothing listens on.
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        // Claimed and never bound: the port is one nothing listens on.
+        let port = crate::pinned_port::claim();
         record.url = format!("127.0.0.1:{port}");
         assert!(matches!(verify(&record), Liveness::Unreachable(_)));
     }

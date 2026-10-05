@@ -3241,12 +3241,8 @@ mod tests {
 
     #[tokio::test]
     async fn bind_local_port_uses_specified_port() {
-        // Grab a free port from the OS, release it, then explicitly request it.
-        let port = {
-            let (l, p) = bind_local_port("127.0.0.1", None).await.unwrap();
-            drop(l);
-            p
-        };
+        // A port no other process can be handed between the claim and the bind below.
+        let port = crate::pinned_port::claim();
         let (_, bound_port) = bind_local_port("127.0.0.1", Some(port)).await.unwrap();
         assert_eq!(bound_port, port);
     }

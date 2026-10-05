@@ -1,0 +1,52 @@
+# cargo-nextest configuration. CI runs `cargo nextest run --profile ci`; a bare `cargo nextest run`
+# uses `default`, which `ci` inherits from.
+#
+# nextest runs every test in its own process, many at once across all test binaries. A test
+# helper that keeps state in a static therefore keeps it per test, not per binary, and anything
+# shared must hold across processes: `pinned_port` (capsule-runtime/src/pinned_port.rs) claims
+# ports with a lock file per port for that reason.
+#
+# Doctests are not run by nextest. The workspace has none; if one is added, CI needs a
+# `cargo test --doc` step beside the nextest run.
+
+[test-groups]
+# Tests that launch a formation hold `launch_lock` (murmur-cli/tests/common/formation.rs), a
+# host-wide file lock, for the whole launch. The lock still decides who runs; the group stops
+# nextest from starting several of them at once, where all but one would block on the lock, idle
+# a test slot each, and spend their slow-timeout waiting.
+formation-launch = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Every test that calls `launch_lock()`. A new one left out still serializes on the lock, at the
+# cost of a test slot while it waits.
+filter = """
+binary_id(murmur-cli::formation_launch)
+| binary_id(murmur-cli::formation_calls)
+| (binary_id(murmur-cli::new_roster)
+    & (test(=the_scaffold_installs_and_launches_as_printed)
+       | test(=the_scaffolded_lead_hands_the_worker_a_task)))
+| (binary_id(murmur-cli::spawner_lifeline_kill)
+    & test(=a_formation_member_killed_outright_takes_its_child_with_it))
+"""
+test-group = "formation-launch"
+
+[profile.ci]
+# One failure must not hide the state of the rest of the suite.
+fail-fast = false
+# A test that fails and then passes is reported FLAKY and does not fail the run; one that fails
+# all three attempts does. The JUnit report records every attempt.
+retries = 2
+# Flagged SLOW after each minute, terminated after five. The slowest test,
+# `formation_launch::the_entry_members_end_or_the_launchers_signal_ends_the_formation`, takes under
+# three minutes even with unoptimized dependencies on a loaded host. Keep the limit above
+# `LAUNCH_LIMIT` (murmur-cli/tests/common/formation.rs), so a formation launch that gives up fails
+# with its own message rather than being killed first. A test still running at the limit is hung,
+# and stopping it lets the rest of the suite finish inside the job's timeout.
+slow-timeout = { period = "60s", terminate-after = 5 }
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+# Written to target/nextest/ci/junit.xml and uploaded by the job. Passing tests' output is kept
+# because the job counts the `[SKIP-HOST]` and `[SKIP]` lines in it.
+path = "junit.xml"
+store-success-output = true

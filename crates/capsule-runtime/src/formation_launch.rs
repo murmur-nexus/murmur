@@ -1795,13 +1795,9 @@ mod tests {
         &failure.failed[0].reason
     }
 
-    /// A port with nothing listening on it.
+    /// A port with nothing listening on it: claimed, and never bound.
     fn silent_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        crate::pinned_port::claim()
     }
 
     #[test]

@@ -1,0 +1,26 @@
+# Cargo settings for the `cargo-test` job in ci.yml, and only that job. The job appends this file
+# to `$CARGO_HOME/config.toml` before anything builds, so every cargo invocation in it -- the
+# build, nextest's own `cargo test --no-run`, anything added later -- reads the same profile. An
+# override passed to one invocation and not another makes the second rebuild every crate it
+# touches, silently. Cargo.toml's profiles are untouched, so local builds stay as they are.
+#
+# The job's rust-cache key hashes this file: a cache of dependencies built under other settings
+# would be restored and then rebuilt in full on every run.
+
+# Capsule launches compile WASM components with Cranelift at test time, and an unoptimized
+# Cranelift makes the e2e tests CPU bound: optimized dependencies roughly halve the suite's run
+# time. Workspace crates stay at opt-level 0. `test` inherits from `dev`; its own entry keeps the
+# override from depending on that.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2
+
+# Line tables keep file and line in a panic and its backtrace, which a failed CI run is read by,
+# and drop the rest of the debuginfo, which dominates link time and binary size here.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
