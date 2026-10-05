@@ -1258,8 +1258,7 @@ pub struct ObservabilityConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceConfig {
     /// How much of each turn's driver request this session's trace keeps — resolved from
-    /// `trace.capture`, or from the retired `trace.include_tool_output` alias, by
-    /// [`crate::trace_capture::resolve_trace_capture`].
+    /// `trace.capture` by [`crate::trace_capture::resolve_trace_capture`].
     pub capture: TraceCapture,
     /// What bounds the session directories under the workdir. `None` — the `retain:` block was
     /// absent — keeps every session forever; there is no default policy, because a mechanism
@@ -1993,10 +1992,6 @@ struct RawTraceConfig {
     /// rather than as a serde message about an unknown variant.
     #[serde(default)]
     capture: Option<String>,
-    /// The retired alias. `None` means the key was absent, which is what separates a manifest
-    /// that opted out from one that never mentioned it — see [`resolve_trace_capture`].
-    #[serde(default)]
-    include_tool_output: Option<bool>,
     /// Untyped for the same reason as `context.retain` — see [`RawContextConfig::retain`].
     #[serde(default, deserialize_with = "present_yaml_value")]
     retain: Option<serde_yaml::Value>,
@@ -2335,8 +2330,6 @@ struct RawInferenceConfig {
     #[serde(default)]
     driver: Option<RawInferenceDriver>,
     #[serde(default)]
-    provider: Option<RawInferenceDriver>,
-    #[serde(default)]
     compaction: Option<RawCompactionConfig>,
     #[serde(default)]
     max_turns: Option<u32>,
@@ -2607,7 +2600,7 @@ impl RawBlock for RawObservabilityConfig {
 }
 
 impl RawBlock for RawTraceConfig {
-    const KNOWN_KEYS: &'static [&'static str] = &["capture", "include_tool_output", "retain"];
+    const KNOWN_KEYS: &'static [&'static str] = &["capture", "retain"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -2898,7 +2891,6 @@ impl RawBlock for RawInferenceConfig {
         "system_prompt_file",
         "system_prompt_artifact",
         "driver",
-        "provider",
         "compaction",
         "max_turns",
         "max_task_reopens",
@@ -2914,9 +2906,6 @@ impl RawBlock for RawInferenceConfig {
     fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
         if let Some(driver) = &self.driver {
             collect_block(driver, &child_path(path, "driver"), out);
-        }
-        if let Some(provider) = &self.provider {
-            collect_block(provider, &child_path(path, "provider"), out);
         }
         if let Some(compaction) = &self.compaction {
             collect_block(compaction, &child_path(path, "compaction"), out);
@@ -3475,10 +3464,7 @@ impl RuntimeManifest {
         let trace = raw
             .trace
             .map(|raw_trace| {
-                let capture = resolve_trace_capture(
-                    raw_trace.capture.as_deref(),
-                    raw_trace.include_tool_output,
-                )?;
+                let capture = resolve_trace_capture(raw_trace.capture.as_deref())?;
                 let retain = parse_trace_retain(raw_trace.retain)?;
                 Ok::<_, RuntimeManifestError>(TraceConfig { capture, retain })
             })
@@ -4768,7 +4754,6 @@ fn parse_inference(
         let entry = raw
             .driver
             .as_ref()
-            .or(raw.provider.as_ref())
             .and_then(|driver| driver.artifact.as_deref())
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -4784,12 +4769,12 @@ fn parse_inference(
         "http" => {
             let model = required_inference_field(raw.model, "model")?;
 
-            let driver_raw = raw.driver.or(raw.provider).ok_or_else(|| {
-                RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.driver".to_string(),
-                    message: "missing required field".to_string(),
-                }
-            })?;
+            let driver_raw =
+                raw.driver
+                    .ok_or_else(|| RuntimeManifestError::InvalidInferenceConfig {
+                        field: "inference.driver".to_string(),
+                        message: "missing required field".to_string(),
+                    })?;
             let driver = parse_inference_driver(driver_raw)?;
 
             // Advisory only: catch an authoring typo at parse time rather than as a confusing
@@ -4827,14 +4812,6 @@ fn parse_inference(
             }))
         }
         "process" => {
-            if raw.provider.is_some() {
-                return Err(RuntimeManifestError::InvalidInferenceConfig {
-                    field: "inference.provider.artifact".to_string(),
-                    message: "is not valid with transport: process; name the process driver \
-                              under inference.driver"
-                        .to_string(),
-                });
-            }
             // The CLI subprocess path never builds a driver payload, so this value would be
             // silently inert here — reject it rather than let it look effective.
             if raw.max_tokens.is_some() {
@@ -5987,47 +5964,6 @@ mod tests {
             }
             other => panic!("expected InvalidInferenceConfig, got {other:?}"),
         }
-    }
-
-    /// The retired boolean keeps working, mapping `true` to `Content` and `false` to `Meta`.
-    #[test]
-    fn include_tool_output_still_resolves_to_content_and_meta() {
-        let opted_in =
-            RuntimeManifest::from_yaml_str(&manifest_with_trace("  include_tool_output: true\n"))
-                .unwrap();
-        assert_eq!(
-            opted_in.trace,
-            Some(TraceConfig {
-                capture: TraceCapture::Content,
-                retain: None
-            })
-        );
-
-        let opted_out =
-            RuntimeManifest::from_yaml_str(&manifest_with_trace("  include_tool_output: false\n"))
-                .unwrap();
-        assert_eq!(
-            opted_out.trace,
-            Some(TraceConfig {
-                capture: TraceCapture::Meta,
-                retain: None
-            })
-        );
-    }
-
-    #[test]
-    fn setting_both_capture_keys_is_refused_naming_both() {
-        let err = RuntimeManifest::from_yaml_str(&manifest_with_trace(
-            "  capture: content\n  include_tool_output: true\n",
-        ))
-        .expect_err("both keys must be refused even when they agree");
-        assert!(matches!(
-            err,
-            RuntimeManifestError::InvalidTraceConfig { .. }
-        ));
-        let rendered = err.to_string();
-        assert!(rendered.contains("trace.capture"), "{rendered}");
-        assert!(rendered.contains("trace.include_tool_output"), "{rendered}");
     }
 
     #[test]
@@ -8672,76 +8608,6 @@ inference:
     }
 
     #[test]
-    fn accepts_legacy_inference_provider_field() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts:
-  - name: murmur-driver-openai
-    version: 0.1.0
-    runtime: driver
-    gateway:
-      endpoint: http://127.0.0.1:8080
-      keyless: true
-inference:
-  transport: http
-  model: test-model
-  provider:
-    artifact: murmur-driver-openai
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .inference
-                .unwrap()
-                .driver
-                .as_ref()
-                .unwrap()
-                .artifact,
-            "murmur-driver-openai"
-        );
-    }
-
-    #[test]
-    fn prefers_driver_field_over_legacy_provider_field() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            r#"
-name: cap
-version: 0.0.1
-artifacts:
-  - name: murmur-driver-anthropic
-    version: 0.1.0
-    runtime: driver
-    gateway:
-      endpoint: http://127.0.0.1:8080
-      keyless: true
-inference:
-  transport: http
-  model: test-model
-  driver:
-    artifact: murmur-driver-anthropic
-  provider:
-    artifact: murmur-driver-openai
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            manifest
-                .inference
-                .unwrap()
-                .driver
-                .as_ref()
-                .unwrap()
-                .artifact,
-            "murmur-driver-anthropic"
-        );
-    }
-
-    #[test]
     fn inference_requires_driver_artifact() {
         let err = RuntimeManifest::from_yaml_str(
             r#"
@@ -9207,18 +9073,6 @@ inference:
         );
         assert!(inference.command.is_none());
         assert_eq!(inference.model, "");
-    }
-
-    #[test]
-    fn process_transport_rejects_provider_alias() {
-        let msg = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  \
-             command: fixture-cli\n  provider:\n    artifact: fixture-process-driver\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(msg.contains("inference.provider.artifact"), "{msg}");
-        assert!(msg.contains("inference.driver"), "{msg}");
     }
 
     #[test]
@@ -12088,8 +11942,9 @@ capabilities:
     /// Source-derived for the same reason its sibling above is: a `Raw*`-typed field added to a
     /// block and left unwalked reports none of the keys inside that block, and reports nothing
     /// about having done so. The scan is keyed on the *parent's field*, not on the child's type,
-    /// because `inference.driver` and `inference.provider` are the same type — a check keyed on
-    /// the type would call `provider` covered because `driver` is walked.
+    /// because one type can sit under several parents — `RawInferenceDriver` is both
+    /// `inference.driver` and each alternate's `driver` — and a check keyed on the type would call
+    /// one covered because the other is walked.
     #[test]
     fn every_raw_struct_descends_into_the_blocks_it_owns() {
         let source = include_str!("runtime_manifest.rs");
@@ -12272,8 +12127,6 @@ inference:
   probe_inference: 1
   driver:
     probe_driver: 1
-  provider:
-    probe_provider: 1
   compaction:
     probe_compaction: 1
 context:
@@ -12334,7 +12187,6 @@ control:
             ("probe_install", "capabilities.install"),
             ("probe_inference", "inference"),
             ("probe_driver", "inference.driver"),
-            ("probe_provider", "inference.provider"),
             ("probe_compaction", "inference.compaction"),
             ("probe_context", "context"),
             ("probe_observability", "observability"),

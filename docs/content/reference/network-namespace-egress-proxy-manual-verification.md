@@ -399,8 +399,8 @@ cd /tmp/netns-check && mur run ; echo "exit=$?"
 ```
 
 **Expect:** `error[E-CAP-005]`, naming the missing capability grant, the exact
-`apparmor_parser` command, *and* the container remedy — and stating that the runtime will not fall
-back to the retired seccomp interception. No workdir is created. Restore the host immediately:
+`apparmor_parser` command, *and* the container remedy. No workdir is created. Restore the host
+immediately:
 
 ```bash
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

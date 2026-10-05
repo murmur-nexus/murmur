@@ -99,14 +99,6 @@ pub enum EgressNamespaceBlocker {
 }
 
 impl EgressNamespaceBlocker {
-    /// Every variant, so a caller reasoning about refusal text cannot silently miss one. Same
-    /// convention as `SealedBlocker::ALL`, which was added there after a hand-maintained list
-    /// drifted the moment a variant appeared.
-    pub const ALL: &'static [EgressNamespaceBlocker] = &[
-        EgressNamespaceBlocker::CapabilityGrantMissing,
-        EgressNamespaceBlocker::KernelSupportMissing,
-    ];
-
     /// One sentence naming the missing mechanism, plus the exact remediation. Rendered into
     /// [`crate::errors::RuntimeError::EgressNamespaceUnavailable`], so this is the text an
     /// operator sees under `E-CAP-005`.
@@ -127,9 +119,7 @@ impl EgressNamespaceBlocker {
                  where a profile genuinely cannot be loaded: `sudo sysctl -w \
                  kernel.apparmor_restrict_unprivileged_userns=0` — this removes \
                  unprivileged-userns hardening from every program on the machine, not just from \
-                 mur, and is not the configuration murmur ships. The runtime will not fall back \
-                 to the retired seccomp connect/sendto interception — that mechanism was removed \
-                 as unsound, not demoted to a fallback.",
+                 mur, and is not the configuration murmur ships.",
                 name = crate::sealed::SEALED_APPARMOR_PROFILE_NAME,
                 path = crate::sealed::SEALED_APPARMOR_PROFILE_PATH,
             ),
@@ -138,9 +128,7 @@ impl EgressNamespaceBlocker {
                  network namespace has to be created inside (CONFIG_USER_NS=n, or \
                  user.max_user_namespaces=0). Raise `sudo sysctl -w \
                  user.max_user_namespaces=10000` if the sysctl is merely zeroed, otherwise run on \
-                 a kernel built with CONFIG_USER_NS=y. The runtime will not fall back to the \
-                 retired seccomp connect/sendto interception — that mechanism was removed as \
-                 unsound, not demoted to a fallback."
+                 a kernel built with CONFIG_USER_NS=y."
                     .to_string()
             }
         }
@@ -1016,17 +1004,6 @@ mod tests {
     }
 
     // ---- refusal text --------------------------------------------------------------------
-
-    #[test]
-    fn every_blocker_refuses_the_retired_fallback_in_so_many_words() {
-        for blocker in EgressNamespaceBlocker::ALL {
-            let reason = blocker.reason();
-            assert!(
-                reason.contains("will not fall back"),
-                "{blocker:?} must state that the retired seccomp path is not a fallback"
-            );
-        }
-    }
 
     #[test]
     fn the_capability_grant_refusal_names_both_remediations() {

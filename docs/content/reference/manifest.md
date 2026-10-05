@@ -988,7 +988,6 @@ These fields are read under `transport: http`. Setting any of them except `infer
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `inference.model` | string | yes | Model identifier passed to the driver. |
-| `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
 | `inference.tool_refresh` | `compaction \| immediate` | no | When an artifact installed mid-session reaches the tool list the model is offered. Default: `compaction`. See [Tool refresh](#inference-tool-refresh). |
 | `inference.alternates` | list | no | Default: empty. Other driver choices the agent loop may be switched to while the capsule runs. Requires `inference.driver` in `control.settings` or `control.agent_settings`. See [Driver alternates](#inference-alternates). |
@@ -1140,7 +1139,6 @@ these fields are accepted and inert:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `trace.capture` | `none \| meta \| content` | no | Default: `meta`. How much of each turn's driver request `trace.jsonl` keeps — see the table below. |
-| `trace.include_tool_output` | bool | no | Retired; use `trace.capture`. Accepted as an alias — `true` for `capture: content`, `false` for `capture: meta` — and its use prints a warning. Setting it alongside `trace.capture` is an error, even when the two agree. |
 | `trace.retain` { #trace-retain } | block | no | What bounds the [session directories](workdir.md) beside the running one. Omitted, nothing is ever deleted. See [Retention](#retention). |
 | `trace.retain.max_sessions` | integer ≥ 1 | no | Session directories to keep, counting the running session itself. The rest are removed whole, taking their `trace.jsonl` and `blobs/` with them. |
 | `trace.retain.max_age` | duration | no | Age beyond which a session directory is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. |

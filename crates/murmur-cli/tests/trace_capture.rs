@@ -440,30 +440,11 @@ fn first_prefix_divergence_names_the_first_differing_index() {
     assert_eq!(first_prefix_divergence(&short_differs, &base), Some(1));
 }
 
-/// The retired boolean maps as documented — `true` stores bodies, `false` does not — and both
-/// spellings warn.
-#[test]
-fn the_include_tool_output_alias_still_behaves_as_before() {
-    let opted_in = run_session("trace:\n  include_tool_output: true\n");
-    assert!(
-        !opted_in.blob_names().is_empty(),
-        "include_tool_output: true must behave as capture: content"
-    );
-
-    let opted_out = run_session("trace:\n  include_tool_output: false\n");
-    assert!(
-        opted_out.blob_names().is_empty(),
-        "include_tool_output: false must behave as capture: meta"
-    );
-    assert!(opted_out.sole_inference()["system_sha"].is_string());
-}
-
 // ── Manifest resolution at the CLI boundary ──────────────────────────────────
 //
-// The three cases below never reach a session: `trace:` is resolved while the manifest is being
-// parsed, so a refusal happens before anything is staged and the warning is printed by the same
-// pass. They drive `mur run` rather than `launch_session` because the exit code and stderr are
-// the contract.
+// The case below never reaches a session: `trace:` is resolved while the manifest is being
+// parsed, so a refusal happens before anything is staged. It drives `mur run` rather than
+// `launch_session` because the exit code and stderr are the contract.
 
 /// `mur run` against a project whose manifest carries `trace_block`, with no artifacts published
 /// — every case here is decided while parsing, before a driver is ever resolved.
@@ -497,51 +478,6 @@ fn session_dirs(project: &tempfile::TempDir) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Using the retired boolean warns once, naming `trace.capture` as the replacement.
-#[test]
-fn the_retired_boolean_warns_and_names_its_replacement() {
-    for flag in ["true", "false"] {
-        let (assert, _project) =
-            mur_run_with_trace(&format!("trace:\n  include_tool_output: {flag}\n"));
-        let stderr = stderr_of(&assert);
-        let warnings: Vec<&str> = stderr
-            .lines()
-            .filter(|line| line.contains("trace.include_tool_output"))
-            .collect();
-        assert_eq!(
-            warnings.len(),
-            1,
-            "expected exactly one deprecation warning for '{flag}', got: {stderr}"
-        );
-        assert!(warnings[0].starts_with("warning:"), "{stderr}");
-        assert!(
-            warnings[0].contains("trace.capture"),
-            "the warning must name the replacement key, got: {stderr}"
-        );
-    }
-}
-
-/// Setting both keys is refused — even when they agree — and nothing is staged.
-#[test]
-fn setting_both_capture_keys_refuses_the_launch() {
-    let (assert, project) =
-        mur_run_with_trace("trace:\n  capture: content\n  include_tool_output: true\n");
-    let assert = assert.failure();
-    let stderr = stderr_of(&assert);
-
-    assert!(stderr.contains("trace.capture"), "{stderr}");
-    assert!(stderr.contains("trace.include_tool_output"), "{stderr}");
-    assert!(
-        stderr.contains("keep 'trace.capture'"),
-        "the error must say which of the two keys survives, got: {stderr}"
-    );
-    assert!(
-        session_dirs(&project).is_empty(),
-        "a refused manifest must stage no session, found {:?}",
-        session_dirs(&project)
-    );
 }
 
 /// A `capture` value that is not one of the three modes is refused, naming the field
