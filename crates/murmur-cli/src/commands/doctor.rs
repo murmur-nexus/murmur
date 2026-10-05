@@ -372,10 +372,17 @@ fn report_murmur_home() {
             ""
         };
         let holds = report.kind.holds();
+        let kept = report
+            .kind
+            .kept()
+            .map(|kept| format!(", {kept}"))
+            .unwrap_or_default();
         match &report.state {
-            HomeEntryState::Absent => println!("  {name}: absent  {holds}{deletable}{expected}"),
+            HomeEntryState::Absent => {
+                println!("  {name}: absent  {holds}{kept}{deletable}{expected}")
+            }
             HomeEntryState::Unreadable { error } => {
-                println!("  {name}: unreadable ({error})  {holds}{deletable}{expected}")
+                println!("  {name}: unreadable ({error})  {holds}{kept}{deletable}{expected}")
             }
             HomeEntryState::Present {
                 mode,
@@ -383,7 +390,7 @@ fn report_murmur_home() {
                 wide_descendants,
                 wide_descendants_omitted,
             } => {
-                println!("  {name}: {mode:04o}  {holds}{deletable}{expected}");
+                println!("  {name}: {mode:04o}  {holds}{kept}{deletable}{expected}");
                 if *wide {
                     warnings.push(wide_entry_warning(
                         &report.path,

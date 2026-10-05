@@ -210,7 +210,22 @@ impl HomeEntryKind {
         }
     }
 
+    /// How long what the entry holds is kept, as a clause that follows [`Self::holds`] after a
+    /// comma, or `None` for an entry `mur` never removes on its own.
+    pub fn kept(&self) -> Option<&'static str> {
+        match self {
+            Self::Formations => Some(
+                "each kept until its formation has ended and the entry member's trace.retain \
+                 expires it",
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether deleting the entry loses nothing, because `mur` writes it again when it needs it.
+    ///
+    /// `formations/` is not: deleting an ended formation's directory stops nothing, but its peers'
+    /// traces go with it and are never written again.
     pub fn safe_to_delete(&self) -> bool {
         matches!(self, Self::CompiledForms)
     }
@@ -632,6 +647,34 @@ mod tests {
         assert!(reports
             .iter()
             .all(|report| report.state == HomeEntryState::Absent));
+    }
+
+    /// Only `formations/` says how long it is kept, and only `compiled/` is safe to delete: a
+    /// formation directory is removed by retention, and what it holds is never written again.
+    #[test]
+    fn murmur_home_kinds_say_how_formations_are_kept_and_only_compiled_is_safe_to_delete() {
+        let every = HomeEntryKind::KNOWN
+            .into_iter()
+            .chain([HomeEntryKind::Home, HomeEntryKind::Unrecognised("x".into())]);
+        for kind in every {
+            assert_eq!(
+                kind.kept().is_some(),
+                kind == HomeEntryKind::Formations,
+                "{kind:?}"
+            );
+            assert_eq!(
+                kind.safe_to_delete(),
+                kind == HomeEntryKind::CompiledForms,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            HomeEntryKind::Formations.kept(),
+            Some(
+                "each kept until its formation has ended and the entry member's trace.retain \
+                 expires it"
+            )
+        );
     }
 
     /// `formations/` holds members' working directories: known, owner-only down to each member's

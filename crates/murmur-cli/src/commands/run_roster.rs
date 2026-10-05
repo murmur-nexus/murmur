@@ -16,7 +16,7 @@ use capsule_runtime::formation_launch::{
     MemberLaunchFailure, RunningFormation,
 };
 use capsule_runtime::{admit_roster_file, FormationId};
-use murmur_artifact::{LocalRegistry, ROSTER_FILENAME};
+use murmur_artifact::{LocalRegistry, TraceRetainConfig, ROSTER_FILENAME};
 
 use crate::error::{CliError, E_IO_003, E_ROS_001, E_RUN_045, E_RUN_046};
 use crate::registry_client::FallbackRegistry;
@@ -49,7 +49,22 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
     let roster =
         admit_roster_file(&project_dir, &registry, lock.as_ref()).map_err(CliError::from)?;
 
-    let mut options = FormationLaunchOptions::new(FormationId::mint(), project_dir);
+    // The entry member's `trace.retain` bounds this project's formation directories as it bounds
+    // the entry member's own sessions. Without one, nothing is removed.
+    let retain = roster
+        .entry()
+        .manifest
+        .trace
+        .as_ref()
+        .and_then(|trace| trace.retain);
+    let formation_id = FormationId::mint();
+    let prune = || {
+        if let Some(policy) = &retain {
+            prune_formation_directories(&formation_id, &project_dir, policy);
+        }
+    };
+
+    let mut options = FormationLaunchOptions::new(formation_id.clone(), project_dir.clone());
     options.task = launch.task.map(str::to_string);
     options.json = launch.json;
     options.verbose = launch.verbose;
@@ -63,12 +78,18 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
         )
     })?;
 
+    // Every return below runs the pass once, after every member of this launch is reaped: a
+    // refused launch has stopped what it started, and `wait` stops every member before it returns.
     let mut formation = match formation_launch::launch_formation(&roster, options) {
         Ok(formation) => formation,
-        Err(failure) => return refused(&failure),
+        Err(failure) => {
+            prune();
+            return refused(&failure);
+        }
     };
     announce(&formation, launch.json);
     if let Err(failure) = formation.start_entry() {
+        prune();
         return refused(&failure);
     }
     let exit = formation.wait();
@@ -79,7 +100,24 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
             render_stopped(&exit.stopped)
         );
     }
+    prune();
     Ok(exit.exit_code())
+}
+
+/// Remove the ended formation directories of `project_dir` that `policy` expires, naming each on
+/// stderr, newest first. `current` and every formation minted after it are kept.
+fn prune_formation_directories(
+    current: &FormationId,
+    project_dir: &Path,
+    policy: &TraceRetainConfig,
+) {
+    for pruned in formation_launch::prune_ended_formations(current, project_dir, policy) {
+        capsule_runtime::runtime_err!(
+            "[mur run] retention: removed formation {} ({})",
+            pruned.formation_id,
+            pruned.reason
+        );
+    }
 }
 
 /// `E-RUN-046` when this process is itself a formation member: a child joins its parent's

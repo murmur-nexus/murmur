@@ -70,6 +70,7 @@ use crate::formation_credentials::{
 };
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::roster::AdmittedRoster;
+use serde::{Deserialize, Serialize};
 
 /// How long a member has, from its spawn, to report itself and have its door answer.
 ///
@@ -107,6 +108,10 @@ pub const STORE_ROOT_FLAG: &str = "--store-root";
 
 /// The directory under the murmur home that holds every formation's peer directories.
 pub const FORMATIONS_DIR: &str = "formations";
+
+/// The ownership marker in `<murmur home>/formations/<frm_id>/`, a [`FormationMarker`]. Member
+/// names start with a letter and hold no `.`, so it never collides with a member's directory.
+pub const FORMATION_MARKER_FILE: &str = "formation.json";
 
 /// What a formation launch is given besides its roster.
 #[derive(Debug, Clone)]
@@ -908,6 +913,128 @@ pub fn formation_member_roots_in(
     roots
 }
 
+/// Who launched a formation, from which project: the contents of [`FORMATION_MARKER_FILE`].
+///
+/// The launcher writes it once, before the first peer's directory is made, and nothing rewrites
+/// it. Retention reads it to decide whether a formation directory is this project's to remove and
+/// whether the launcher that made it is still running; a directory without one is never removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormationMarker {
+    /// The roster's project directory, canonicalized when the launcher could, as given otherwise.
+    pub project_dir: PathBuf,
+    /// The launcher's pid.
+    pub launcher_pid: u32,
+    /// The launcher's start token, read as [`crate::running::process_start_token`] reads it, or
+    /// `""` when it could not be read.
+    pub launcher_start: String,
+}
+
+impl FormationMarker {
+    /// The marker for a formation this process launches from `project_dir`.
+    pub fn for_this_launcher(project_dir: &Path) -> Self {
+        let pid = std::process::id();
+        Self {
+            project_dir: canonical_project_dir(project_dir),
+            launcher_pid: pid,
+            launcher_start: crate::running::process_start_token(pid).unwrap_or_default(),
+        }
+    }
+
+    /// The marker in `formation_dir`, or `None` when it is missing or does not parse.
+    pub fn read(formation_dir: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(formation_dir.join(FORMATION_MARKER_FILE)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+}
+
+/// `project_dir` canonicalized, or as given when it cannot be: the one form a marker records and
+/// the one ownership is compared in.
+pub(crate) fn canonical_project_dir(project_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf())
+}
+
+/// Write this launch's [`FormationMarker`] into `<formations dir>/<frm_id>/`, holding both
+/// directories owner-only first. The marker itself is written at `0600`.
+fn write_formation_marker(options: &FormationLaunchOptions) -> Result<(), String> {
+    let formations_dir = launch_formations_dir(options)?;
+    let formation_dir = formations_dir.join(options.formation_id.as_str());
+    for dir in [formations_dir.as_path(), formation_dir.as_path()] {
+        crate::state_store::ensure_private_dir(dir, crate::murmur_home::MURMUR_HOME_DIR_MODE)
+            .map_err(|reason| format!("{}: {reason}", dir.display()))?;
+    }
+    let marker = FormationMarker::for_this_launcher(&options.project_dir);
+    let json = serde_json::to_string(&marker).map_err(|error| error.to_string())?;
+    crate::murmur_home::write_private_file(
+        &formation_dir.join(FORMATION_MARKER_FILE),
+        format!("{json}\n").as_bytes(),
+    )
+}
+
+/// Remove the ended formation directories of `project_dir` that the entry member's `policy` does
+/// not keep, and return what went.
+///
+/// Called by the launcher once every member of `current` has been stopped and reaped. `current`
+/// and every formation minted after it are never removed; see [`crate::retention::prune_formations`]
+/// for what else never is. A `HOME` that does not resolve removes nothing.
+pub fn prune_ended_formations(
+    current: &FormationId,
+    project_dir: &Path,
+    policy: &murmur_artifact::TraceRetainConfig,
+) -> Vec<crate::retention::PrunedFormation> {
+    let (Ok(formations_dir), Ok(running_dir)) =
+        (formations_dir(), crate::running::running_dir_location())
+    else {
+        return Vec::new();
+    };
+    prune_ended_formations_in(&formations_dir, &running_dir, current, project_dir, policy)
+}
+
+/// [`prune_ended_formations`] over `formations_dir` and `running_dir` in place of the murmur
+/// home's.
+pub fn prune_ended_formations_in(
+    formations_dir: &Path,
+    running_dir: &Path,
+    current: &FormationId,
+    project_dir: &Path,
+    policy: &murmur_artifact::TraceRetainConfig,
+) -> Vec<crate::retention::PrunedFormation> {
+    // One scan for the whole pass, and only a scan: nothing here unlinks a record.
+    let records = crate::running::scan(running_dir)
+        .ok()
+        .map(|scan| scan.records);
+    crate::retention::prune_formations(
+        formations_dir,
+        current,
+        project_dir,
+        policy,
+        crate::retention::now_ms(),
+        |id, marker| formation_is_live(id, marker, records.as_deref()),
+    )
+}
+
+/// Whether any part of formation `id` may still be running: its launcher is not gone, or a running
+/// record names `id` and its process is not gone.
+///
+/// `records` is `None` when the running directory could not be listed, and then every formation
+/// is live. [`crate::running::ProcessState::Unverified`] is live: a reading that failed says
+/// nothing about the process.
+fn formation_is_live(
+    id: &FormationId,
+    marker: &FormationMarker,
+    records: Option<&[crate::running::RunningRecord]>,
+) -> bool {
+    let not_gone = |state| !matches!(state, crate::running::ProcessState::Gone(_));
+    let Some(records) = records else {
+        return true;
+    };
+    not_gone(crate::running::process_state_of(
+        marker.launcher_pid,
+        &marker.launcher_start,
+    )) || records.iter().any(|record| {
+        record.formation_id.as_ref() == Some(id) && not_gone(crate::running::process_state(record))
+    })
+}
+
 /// Make `member`'s directory under `formations_dir`, owner-only, and return it.
 ///
 /// `formations_dir` and the formation's directory are held at `0700` whether or not this call made
@@ -1311,6 +1438,17 @@ pub(crate) fn launch_plan(
         .iter()
         .map(|member| plan.first_line(&authority, &member.name))
         .collect();
+    // Before any peer's directory exists, so no formation directory a launch made is without one.
+    // A launch with no peers makes no formation directory, and so no marker.
+    if !plan.peers.is_empty() {
+        if let Err(reason) = write_formation_marker(&options) {
+            crate::runtime_err!(
+                "[mur run] warning: formation {} has no ownership marker ({reason}); its \
+                 directory will never be removed automatically",
+                options.formation_id
+            );
+        }
+    }
 
     let abort = AtomicBool::new(false);
     let mut outcomes: Vec<Option<(Option<MemberProcess>, PeerOutcome)>> =
@@ -2299,5 +2437,220 @@ mod tests {
                 formations.join(id.as_str()).join("worker/.murmur"),
             ]
         );
+    }
+
+    /// The marker is three keys, written and read back unchanged.
+    #[test]
+    fn formation_marker_round_trips_as_three_keys() {
+        let marker = FormationMarker {
+            project_dir: PathBuf::from("/srv/project"),
+            launcher_pid: 4242,
+            launcher_start: "12345".to_string(),
+        };
+        let value = serde_json::to_value(&marker).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "project_dir": "/srv/project",
+                "launcher_pid": 4242,
+                "launcher_start": "12345",
+            })
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FORMATION_MARKER_FILE), value.to_string()).unwrap();
+        assert_eq!(FormationMarker::read(dir.path()), Some(marker));
+        std::fs::write(dir.path().join(FORMATION_MARKER_FILE), "{").unwrap();
+        assert_eq!(FormationMarker::read(dir.path()), None);
+        assert_eq!(FormationMarker::read(&dir.path().join("missing")), None);
+    }
+
+    /// A launch with peers writes its marker at `0600` into its formation's directory before the
+    /// first peer's directory is made, naming the canonical project directory and this process as
+    /// its launcher — and writes it even when the launch is then refused.
+    #[test]
+    fn formation_marker_is_written_owner_only_before_the_first_peer_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = binary_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut options = options(Duration::from_secs(1));
+        options.project_dir = project.path().join(".");
+        let formation_dir = options
+            .formations_dir
+            .clone()
+            .unwrap()
+            .join(options.formation_id.as_str());
+        std::env::set_var(child_launch::MUR_BINARY_ENV, stand_in(dir.path(), None));
+        let result = launch_plan(plan_of("coder"), options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        assert!(result.is_err(), "the stand-in never reports itself");
+
+        let path = formation_dir.join(FORMATION_MARKER_FILE);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let marker = FormationMarker::read(&formation_dir).unwrap();
+        let pid = std::process::id();
+        assert_eq!(
+            marker,
+            FormationMarker {
+                project_dir: std::fs::canonicalize(project.path()).unwrap(),
+                launcher_pid: pid,
+                launcher_start: crate::running::process_start_token(pid).unwrap_or_default(),
+            }
+        );
+        let peer_dir = std::fs::metadata(formation_dir.join("coder")).unwrap();
+        assert!(
+            metadata.modified().unwrap() <= peer_dir.modified().unwrap(),
+            "the marker was written after the peer's directory was made"
+        );
+    }
+
+    /// A plan with no peers makes no formation directory, so there is nowhere for a marker.
+    #[test]
+    fn formation_marker_is_never_written_without_peers() {
+        let _guard = binary_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(Duration::from_secs(5));
+        let formations = options.formations_dir.clone().unwrap();
+        std::env::set_var(child_launch::MUR_BINARY_ENV, stand_in(dir.path(), None));
+        let plan = FormationPlan {
+            peers: Vec::new(),
+            entry: member("planner"),
+            callees: Vec::new(),
+        };
+        let result = launch_plan(plan, options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        let formation = result.expect("a formation with no peers has nothing to wait for");
+        drop(formation);
+        assert!(
+            std::fs::read_dir(&formations).map_or(true, |mut entries| entries.next().is_none()),
+            "{}",
+            formations.display()
+        );
+    }
+
+    fn marker_of(pid: u32, start: &str) -> FormationMarker {
+        FormationMarker {
+            project_dir: PathBuf::from("/srv/project"),
+            launcher_pid: pid,
+            launcher_start: start.to_string(),
+        }
+    }
+
+    /// A pid this test started and has already reaped: no process holds it.
+    fn reaped_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn running_record(pid: u32, formation: Option<&FormationId>) -> crate::running::RunningRecord {
+        crate::running::RunningRecord {
+            session_id: "ses_0199c4e2f1b7712a9d3e4f5061728394".to_string(),
+            url: "127.0.0.1:1".to_string(),
+            pid,
+            process_start: crate::running::process_start_token(pid).unwrap_or_default(),
+            capsule_name: "worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            workdir: PathBuf::from("/tmp/worker"),
+            outlives_launcher: false,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            door_token: None,
+            formation_id: formation.cloned(),
+        }
+    }
+
+    /// A formation is live while its launcher is — this process with its own start token — and
+    /// not once its launcher's pid is held by nothing.
+    #[test]
+    fn prune_formations_liveness_reads_the_launcher_from_the_marker() {
+        let id = FormationId::mint();
+        let own = std::process::id();
+        let token = crate::running::process_start_token(own).unwrap();
+        assert!(formation_is_live(&id, &marker_of(own, &token), Some(&[])));
+        assert!(!formation_is_live(
+            &id,
+            &marker_of(reaped_pid(), &token),
+            Some(&[])
+        ));
+    }
+
+    /// A formation whose launcher is gone is live while a running record names it and that
+    /// record's process is alive; a record naming another formation, or a gone process, is not
+    /// enough.
+    #[test]
+    fn prune_formations_liveness_reads_running_records_that_name_the_formation() {
+        let id = FormationId::mint();
+        let dead = marker_of(reaped_pid(), "1");
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let live = running_record(sleeper.id(), Some(&id));
+        let other = running_record(sleeper.id(), Some(&FormationId::mint()));
+        let unnamed = running_record(sleeper.id(), None);
+        let gone = running_record(reaped_pid(), Some(&id));
+
+        assert!(formation_is_live(&id, &dead, Some(&[live])));
+        assert!(!formation_is_live(
+            &id,
+            &dead,
+            Some(&[other, unnamed, gone])
+        ));
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// A running directory that cannot be listed says nothing about what is running, so every
+    /// formation is live and nothing is removed.
+    #[test]
+    fn prune_formations_liveness_treats_an_unlistable_running_directory_as_all_live() {
+        let id = FormationId::mint();
+        assert!(formation_is_live(&id, &marker_of(reaped_pid(), "1"), None));
+
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let formations = home.path().join(FORMATIONS_DIR);
+        let old = FormationId::parse(&format!("frm_{:012x}{:020x}", 1_000_000u64, 1)).unwrap();
+        let old_dir = formations.join(old.as_str());
+        std::fs::create_dir_all(old_dir.join("worker")).unwrap();
+        let marker = FormationMarker {
+            project_dir: std::fs::canonicalize(project.path()).unwrap(),
+            ..marker_of(reaped_pid(), "1")
+        };
+        std::fs::write(
+            old_dir.join(FORMATION_MARKER_FILE),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .unwrap();
+        let policy = murmur_artifact::TraceRetainConfig {
+            max_sessions: Some(1),
+            max_age_secs: Some(1),
+        };
+
+        // A regular file where the running directory should be cannot be listed.
+        let running = home.path().join("running");
+        std::fs::write(&running, "").unwrap();
+        let current = FormationId::mint();
+        assert!(prune_ended_formations_in(
+            &formations,
+            &running,
+            &current,
+            project.path(),
+            &policy
+        )
+        .is_empty());
+        assert!(old_dir.is_dir());
+
+        // A running directory that does not exist is an empty machine, and the ended one goes.
+        std::fs::remove_file(&running).unwrap();
+        let pruned =
+            prune_ended_formations_in(&formations, &running, &current, project.path(), &policy);
+        assert_eq!(pruned.len(), 1, "{pruned:?}");
+        assert_eq!(pruned[0].formation_id, old);
+        assert_eq!(pruned[0].reason, crate::trace::RETENTION_REASON_MAX_AGE);
+        assert!(!old_dir.exists());
     }
 }

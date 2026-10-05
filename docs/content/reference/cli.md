@@ -921,7 +921,7 @@ Murmur home (/home/alice/.murmur)
   artifacts: 0755  installed artifacts
   compiled: 0700  compiled WASM cache, safe to delete, expected owner-only
   bin: absent  cached mur binaries
-  formations: 0700  formation members' working directories, expected owner-only
+  formations: 0700  formation members' working directories, each kept until its formation has ended and the entry member's trace.retain expires it, expected owner-only
   nexus-config.json: 0644  something not recognised by this build
 ```
 
@@ -930,6 +930,8 @@ Murmur home (/home/alice/.murmur)
 | `<name>: <mode>` | The entry's permission bits. `.` is `~/.murmur` itself |
 | `<name>: absent` | Nothing exists at that name |
 | `<name>: unreadable (<error>)` | The entry exists and its metadata could not be read |
+| `each kept until …` | How long `mur` keeps what the entry holds. Only `formations` has one: see [Removing formation directories](roster.md#formation-retention) |
+| `safe to delete` | Deleting the entry loses nothing, because `mur` writes it again when it needs it. Only `compiled` is. Deleting an ended formation's directory stops nothing, but loses its peers' traces |
 | `expected owner-only` | The entry is held at the mode in [`~/.murmur` modes](config.md#murmur-home-permissions), and so is everything beneath it. Under `formations`, only the `<frm_id>/` and `<member>/` levels are held: what a member's sessions write inside its owner-only member directory is not reported |
 | `wider than <mode>: <path> is <mode>` | A directory beneath an owner-only entry wider than `0700`, or a file wider than `0600`. At most 20 are listed per entry, then `and N more wider than expected` |
 
@@ -1324,6 +1326,15 @@ launcher's process group, so `^C` at a terminal reaches it as it reaches a hand-
 By the time the launcher exits, every member it started has been stopped and reaped. A launcher
 killed with `SIGKILL`, or by the OOM killer, stops none itself; each member then winds down on its
 own lifeline. See [How a formation ends](roster.md#launch-stop).
+
+Once every member is reaped, and when the entry member declares
+[`trace.retain`](manifest.md#trace-retain), the launcher removes the project's ended formation
+directories that policy expires, and names each on stderr, newest first. The exit code is
+unchanged. See [Removing formation directories](roster.md#formation-retention).
+
+```text
+[mur run] retention: removed formation frm_01a106501a1d78328710ed56d19a10a6 (max_sessions)
+```
 
 ---
 

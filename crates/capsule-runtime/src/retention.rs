@@ -1,10 +1,15 @@
-//! Retention: what bounds the two stores that grow, and what it costs to bound them.
+//! Retention: what bounds the three stores that grow, and what it costs to bound them.
 //!
-//! Two stores, two operations, because they are different shapes:
+//! Three stores, two operations, because they are different shapes:
 //!
 //! * A **session directory** — `<workdir>/.murmur/<ses_…>/` — is an independent unit. Nothing
 //!   references it and nothing spans two of them, so it is pruned by being deleted whole, taking
 //!   its `trace.jsonl` and its `blobs/` with it.
+//! * A **formation directory** — `~/.murmur/formations/<frm_…>/` — holds one ended formation's
+//!   peer directories, and with them every peer's sessions. It is the other half of the evidence
+//!   whose first half is the entry member's session in the project, so it is pruned whole, by the
+//!   entry member's `trace.retain`, and only by the launcher of a later formation from the same
+//!   project once every member of that later one is reaped.
 //! * A **conversation record** — `~/.murmur/conversations/<record>/<ctx>/conversation.jsonl` — is
 //!   one unit that grows. Deleting it destroys the conversation an operator wanted kept, so it is
 //!   pruned by truncating its front: the oldest messages go, the recent ones stay, and every
@@ -14,16 +19,17 @@
 //!
 //! * **No defaults.** Every entry point takes the policy it enforces. An absent policy is an
 //!   absent call: nothing here has a fallback that deletes.
-//! * **No clock of its own.** Both prune functions take `now_ms`, so age is a fixture's to supply
+//! * **No clock of its own.** Every prune function takes `now_ms`, so age is a fixture's to supply
 //!   and a test never sleeps.
-//! * **No trace of its own.** Both prune functions return what they removed and write nothing;
+//! * **No trace of its own.** Every prune function returns what it removed and writes nothing;
 //!   the caller holds the [`crate::trace::TraceWriter`] and records the deletion against the
-//!   session that performed it.
+//!   session that performed it, or reports it as the launcher that performed it.
 //!
-//! Session age is read out of the `ses_` id — a uuid v7 whose first 12 hex characters are a
-//! millisecond timestamp — so the whole session policy is computed from one directory listing
-//! with no `stat`. Record age is the mtime of `conversation.jsonl`, because a context id is not
-//! necessarily a uuid and "untouched since" is the useful question for a record that spans weeks.
+//! Session and formation age is read out of the `ses_` or `frm_` id — a uuid v7 whose first 12
+//! hex characters are a millisecond timestamp — so both policies are computed from one directory
+//! listing with no `stat`. Record age is the mtime of `conversation.jsonl`, because a context id
+//! is not necessarily a uuid and "untouched since" is the useful question for a record that spans
+//! weeks.
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +37,9 @@ use crate::conversation::{
     header_line, message_id_timestamp_ms, parse_message_line, read_header, CONVERSATION_ROOT_DIR,
     RECORD_FILE_NAME,
 };
+
+use crate::formation::FormationId;
+use crate::formation_launch::FormationMarker;
 
 pub use crate::conversation::{RecordHeader, TruncationMarker};
 
@@ -41,6 +50,18 @@ pub struct PrunedSession {
     pub name: String,
     /// [`crate::trace::RETENTION_REASON_MAX_SESSIONS`] or
     /// [`crate::trace::RETENTION_REASON_MAX_AGE`].
+    pub reason: &'static str,
+}
+
+/// A formation directory that was removed, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedFormation {
+    /// The formation whose directory went.
+    pub formation_id: FormationId,
+    /// The directory that was removed, whole: `<formations dir>/<frm_id>`.
+    pub path: PathBuf,
+    /// [`crate::trace::RETENTION_REASON_MAX_AGE`] or
+    /// [`crate::trace::RETENTION_REASON_MAX_SESSIONS`].
     pub reason: &'static str,
 }
 
@@ -206,6 +227,95 @@ pub fn prune_sessions(
         if std::fs::remove_dir_all(sessions_root.join(name)).is_ok() {
             pruned.push(PrunedSession {
                 name: name.clone(),
+                reason,
+            });
+        }
+    }
+    pruned
+}
+
+// ── Formation pruning ────────────────────────────────────────────────────────
+
+/// Remove the formation directories under `formations_dir` that belong to `project_dir` and that
+/// `policy` — the entry member's `trace.retain` — does not keep.
+///
+/// A directory is this project's when it is a real directory, not a symlink, its name is a
+/// formation id, and its [`FormationMarker`] parses and names `project_dir`, both sides
+/// canonicalized. Only those are ranked. A directory with no marker or an unreadable one is
+/// unowned, and one whose marker names another project is foreign: neither is ranked, and neither
+/// is ever removed. Every directory made before markers existed is unowned.
+///
+/// The policy reads as it does for sessions:
+///
+/// * `max_age_secs` is measured from the formation id's mint time, with no `stat`.
+/// * `max_sessions` counts this project's directories present, newest first, `current` and any
+///   minted after it included.
+/// * Both keys are ANDed, and reasons are attributed age-first.
+///
+/// `current` is a hard floor: no directory whose id sorts at or after it is ever removed. A
+/// directory `is_live` answers `true` for is skipped and keeps its rank, so a formation still
+/// running is never removed and still counts against `max_sessions`.
+///
+/// A missing `formations_dir` removes nothing. A directory that cannot be removed is left out of
+/// the returned list, which is newest first.
+pub fn prune_formations(
+    formations_dir: &Path,
+    current: &FormationId,
+    project_dir: &Path,
+    policy: &murmur_artifact::TraceRetainConfig,
+    now_ms: u64,
+    is_live: impl Fn(&FormationId, &FormationMarker) -> bool,
+) -> Vec<PrunedFormation> {
+    if policy.max_sessions.is_none() && policy.max_age_secs.is_none() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(formations_dir) else {
+        return Vec::new();
+    };
+    let project_dir = crate::formation_launch::canonical_project_dir(project_dir);
+    let mut owned: Vec<(FormationId, FormationMarker)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let id = FormationId::parse(entry.file_name().to_str()?).ok()?;
+            let path = entry.path();
+            if !std::fs::symlink_metadata(&path).ok()?.is_dir() {
+                return None;
+            }
+            let marker = FormationMarker::read(&path)?;
+            (crate::formation_launch::canonical_project_dir(&marker.project_dir) == project_dir)
+                .then_some((id, marker))
+        })
+        .collect();
+    // Newest first, which for uuid v7 ids is both the lexical and the chronological order.
+    owned.sort_unstable_by(|(a, _), (b, _)| b.as_str().cmp(a.as_str()));
+
+    let age_floor_ms = policy
+        .max_age_secs
+        .map(|secs| now_ms.saturating_sub(secs.saturating_mul(1000)));
+
+    let mut pruned = Vec::new();
+    for (rank, (id, marker)) in owned.iter().enumerate() {
+        if id.as_str() >= current.as_str() {
+            continue;
+        }
+        let over_age = age_floor_ms.is_some_and(|floor| id.minted_at_ms() < floor);
+        let over_count = policy.max_sessions.is_some_and(|max| rank >= max as usize);
+        if !over_age && !over_count {
+            continue;
+        }
+        if is_live(id, marker) {
+            continue;
+        }
+        let reason = if over_age {
+            crate::trace::RETENTION_REASON_MAX_AGE
+        } else {
+            crate::trace::RETENTION_REASON_MAX_SESSIONS
+        };
+        let path = formations_dir.join(id.as_str());
+        if std::fs::remove_dir_all(&path).is_ok() {
+            pruned.push(PrunedFormation {
+                formation_id: id.clone(),
+                path,
                 reason,
             });
         }
@@ -1086,5 +1196,432 @@ mod tests {
         )
         .is_empty());
         assert_eq!(names(root.path()), vec!["ctx"]);
+    }
+
+    // ── Formation pruning ────────────────────────────────────────────────────
+
+    /// A formation id whose uuid-v7 timestamp is exactly `ms`.
+    fn frm(ms: u64, tail: u64) -> FormationId {
+        FormationId::parse(&format!("frm_{ms:012x}{tail:020x}")).unwrap()
+    }
+
+    fn retain(max_sessions: Option<u32>, max_age_secs: Option<u64>) -> TraceRetainConfig {
+        TraceRetainConfig {
+            max_sessions,
+            max_age_secs,
+        }
+    }
+
+    /// `<root>/<id>/worker/.murmur/ses_…/trace.jsonl`, with `marker` as `formation.json` when
+    /// given.
+    fn make_formation(root: &Path, id: &FormationId, marker: Option<&str>) -> PathBuf {
+        let dir = root.join(id.as_str());
+        let session = dir.join("worker/.murmur").join(ses(NOW, 1));
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("trace.jsonl"), "{}\n").unwrap();
+        if let Some(marker) = marker {
+            std::fs::write(
+                dir.join(crate::formation_launch::FORMATION_MARKER_FILE),
+                marker,
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn marker_naming(project: &Path) -> String {
+        serde_json::to_string(&FormationMarker {
+            project_dir: project.to_path_buf(),
+            launcher_pid: 1,
+            launcher_start: String::new(),
+        })
+        .unwrap()
+    }
+
+    /// Owned formations of `project` under `root`, one per id.
+    fn make_owned(root: &Path, project: &Path, ids: &[&FormationId]) {
+        for id in ids {
+            make_formation(root, id, Some(&marker_naming(project)));
+        }
+    }
+
+    fn removed(pruned: &[PrunedFormation]) -> Vec<(FormationId, &'static str)> {
+        pruned
+            .iter()
+            .map(|p| (p.formation_id.clone(), p.reason))
+            .collect()
+    }
+
+    const DAY_MS: u64 = 86_400_000;
+
+    /// The current formation and every one minted after it stay, under both keys at their
+    /// tightest and every directory past both.
+    #[test]
+    fn prune_formations_never_removes_the_current_or_a_later_formation() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let old = frm(NOW - 3 * DAY_MS, 1);
+        let current = frm(NOW - 2 * DAY_MS, 2);
+        let later = frm(NOW - 2 * DAY_MS + 1000, 3);
+        make_owned(root.path(), project.path(), &[&old, &current, &later]);
+
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(1), Some(1)),
+            NOW,
+            |_, _| false,
+        );
+
+        assert_eq!(
+            removed(&pruned),
+            [(old.clone(), crate::trace::RETENTION_REASON_MAX_AGE)]
+        );
+        assert_eq!(pruned[0].path, root.path().join(old.as_str()));
+        assert_eq!(
+            names(root.path()),
+            vec![current.as_str().to_string(), later.as_str().to_string()]
+        );
+    }
+
+    /// `max_sessions: 3` leaves the three newest of this project's directories, the current one
+    /// and one minted after it among them, and what went is listed newest first.
+    #[test]
+    fn prune_formations_keeps_the_newest_n_with_the_current_counted() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let all: Vec<FormationId> = (1..=5).map(|n| frm(NOW - (5 - n) * 1000, n)).collect();
+        make_owned(root.path(), project.path(), &all.iter().collect::<Vec<_>>());
+
+        let pruned = prune_formations(
+            root.path(),
+            &all[3],
+            project.path(),
+            &retain(Some(3), None),
+            NOW,
+            |_, _| false,
+        );
+
+        let reason = crate::trace::RETENTION_REASON_MAX_SESSIONS;
+        assert_eq!(
+            removed(&pruned),
+            [(all[1].clone(), reason), (all[0].clone(), reason)]
+        );
+        assert_eq!(
+            names(root.path()),
+            all[2..]
+                .iter()
+                .map(|id| id.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Age comes out of the id: every directory here is made in the same instant, and the two
+    /// whose ids encode two hours ago are the two that go.
+    #[test]
+    fn prune_formations_reads_age_from_the_id() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let old_a = frm(NOW - 7_200_000, 1);
+        let old_b = frm(NOW - 7_100_000, 2);
+        let recent = frm(NOW - 60_000, 3);
+        let current = frm(NOW, 4);
+        make_owned(
+            root.path(),
+            project.path(),
+            &[&old_a, &old_b, &recent, &current],
+        );
+
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(None, Some(900)),
+            NOW,
+            |_, _| false,
+        );
+
+        let reason = crate::trace::RETENTION_REASON_MAX_AGE;
+        assert_eq!(removed(&pruned), [(old_b, reason), (old_a, reason)]);
+        assert_eq!(
+            names(root.path()),
+            vec![recent.as_str().to_string(), current.as_str().to_string()]
+        );
+    }
+
+    /// A directory past both limits is reported as too old; one past the count alone, as over the
+    /// count.
+    #[test]
+    fn prune_formations_attributes_reasons_age_first() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let old = frm(NOW - 7_200_000, 1);
+        let recent = frm(NOW - 60_000, 2);
+        let current = frm(NOW, 3);
+        make_owned(root.path(), project.path(), &[&old, &recent, &current]);
+
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(1), Some(900)),
+            NOW,
+            |_, _| false,
+        );
+
+        assert_eq!(
+            removed(&pruned),
+            [
+                (recent, crate::trace::RETENTION_REASON_MAX_SESSIONS),
+                (old, crate::trace::RETENTION_REASON_MAX_AGE),
+            ]
+        );
+    }
+
+    /// A live formation is never removed, and still counts: the one ranked behind it goes under
+    /// `max_sessions: 2` although only two directories are not live.
+    #[test]
+    fn prune_formations_skips_a_live_directory_and_keeps_its_rank() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let older = frm(NOW - 3000, 1);
+        let live = frm(NOW - 2000, 2);
+        let current = frm(NOW, 3);
+        make_owned(root.path(), project.path(), &[&older, &live, &current]);
+
+        let asked = std::cell::RefCell::new(Vec::new());
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(1), None),
+            NOW,
+            |id, marker| {
+                assert_eq!(marker.launcher_pid, 1);
+                asked.borrow_mut().push(id.clone());
+                *id == live
+            },
+        );
+
+        assert_eq!(
+            removed(&pruned),
+            [(older.clone(), crate::trace::RETENTION_REASON_MAX_SESSIONS)]
+        );
+        assert_eq!(*asked.borrow(), [live.clone(), older]);
+        assert_eq!(
+            names(root.path()),
+            vec![live.as_str().to_string(), current.as_str().to_string()]
+        );
+
+        // Ranked behind the live one, a directory inside the count is kept.
+        let kept = frm(NOW - 2500, 4);
+        make_owned(root.path(), project.path(), &[&kept]);
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(3), None),
+            NOW,
+            |id, _| *id == live,
+        );
+        assert!(pruned.is_empty(), "{pruned:?}");
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(2), None),
+            NOW,
+            |id, _| *id == live,
+        );
+        assert_eq!(
+            removed(&pruned),
+            [(kept, crate::trace::RETENTION_REASON_MAX_SESSIONS)]
+        );
+    }
+
+    /// No marker, a marker that does not parse, and a marker naming another project: none is
+    /// removed, and none takes a rank from this project's own directories.
+    #[test]
+    fn prune_formations_never_ranks_or_removes_unowned_or_foreign_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let owned_old = frm(NOW - 3 * DAY_MS, 1);
+        let owned_kept = frm(NOW - 2 * DAY_MS, 2);
+        let unmarked = frm(NOW - 2 * DAY_MS + 1, 3);
+        let garbled = frm(NOW - 2 * DAY_MS + 2, 4);
+        let foreign = frm(NOW - 2 * DAY_MS + 3, 5);
+        let current = frm(NOW, 6);
+        make_owned(
+            root.path(),
+            project.path(),
+            &[&owned_old, &owned_kept, &current],
+        );
+        make_formation(root.path(), &unmarked, None);
+        make_formation(root.path(), &garbled, Some("not json {"));
+        make_formation(root.path(), &foreign, Some(&marker_naming(other.path())));
+
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(2), None),
+            NOW,
+            |_, _| false,
+        );
+        assert_eq!(
+            removed(&pruned),
+            [(owned_old, crate::trace::RETENTION_REASON_MAX_SESSIONS)]
+        );
+
+        let pruned = prune_formations(
+            root.path(),
+            &current,
+            project.path(),
+            &retain(Some(1), Some(DAY_MS / 1000)),
+            NOW,
+            |_, _| false,
+        );
+        assert_eq!(
+            removed(&pruned),
+            [(owned_kept, crate::trace::RETENTION_REASON_MAX_AGE)]
+        );
+        for id in [&unmarked, &garbled, &foreign, &current] {
+            assert!(root.path().join(id.as_str()).is_dir(), "{id}");
+        }
+    }
+
+    /// A symlink, a regular file, and a directory whose name is not a formation id are never
+    /// candidates, marker or not; the symlink's target is left alone too.
+    #[test]
+    fn prune_formations_ignores_a_symlink_a_regular_file_and_a_name_that_is_not_an_id() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let marker = marker_naming(project.path());
+        let target = make_formation(elsewhere.path(), &frm(NOW - 3 * DAY_MS, 1), Some(&marker));
+        let linked = frm(NOW - 3 * DAY_MS, 2);
+        std::os::unix::fs::symlink(&target, root.path().join(linked.as_str())).unwrap();
+        std::fs::write(root.path().join(frm(NOW - 3 * DAY_MS, 3).as_str()), &marker).unwrap();
+        for name in ["not-a-formation", "frm_ABC", "frm_0123"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+            std::fs::write(
+                root.path()
+                    .join(name)
+                    .join(crate::formation_launch::FORMATION_MARKER_FILE),
+                &marker,
+            )
+            .unwrap();
+        }
+        let before = names(root.path());
+
+        let pruned = prune_formations(
+            root.path(),
+            &frm(NOW, 9),
+            project.path(),
+            &retain(Some(1), Some(1)),
+            NOW,
+            |_, _| false,
+        );
+
+        assert!(pruned.is_empty(), "{pruned:?}");
+        assert_eq!(names(root.path()), before);
+        assert!(target.join("worker/.murmur").is_dir());
+    }
+
+    /// A policy with neither key is no policy, and a missing formations directory holds nothing.
+    #[test]
+    fn prune_formations_with_neither_key_or_no_directory_removes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let old = frm(NOW - 3 * DAY_MS, 1);
+        make_owned(root.path(), project.path(), &[&old]);
+
+        let pruned = prune_formations(
+            root.path(),
+            &frm(NOW, 2),
+            project.path(),
+            &retain(None, None),
+            NOW,
+            |_, _| panic!("nothing is a candidate without a policy"),
+        );
+        assert!(pruned.is_empty());
+        assert!(root.path().join(old.as_str()).is_dir());
+
+        assert!(prune_formations(
+            &root.path().join("missing"),
+            &frm(NOW, 2),
+            project.path(),
+            &retain(Some(1), Some(1)),
+            NOW,
+            |_, _| false,
+        )
+        .is_empty());
+    }
+
+    /// The project directory is compared canonicalized: a launch through a symlink to the project
+    /// owns what a launch through its real path marked.
+    #[test]
+    fn prune_formations_compares_project_directories_canonically() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("project");
+        std::os::unix::fs::symlink(project.path(), &link).unwrap();
+        let old = frm(NOW - 3 * DAY_MS, 1);
+        make_owned(
+            root.path(),
+            &std::fs::canonicalize(project.path()).unwrap(),
+            &[&old],
+        );
+
+        let pruned = prune_formations(
+            root.path(),
+            &frm(NOW, 2),
+            &link,
+            &retain(None, Some(1)),
+            NOW,
+            |_, _| false,
+        );
+        assert_eq!(
+            removed(&pruned),
+            [(old, crate::trace::RETENTION_REASON_MAX_AGE)]
+        );
+    }
+
+    /// A directory that cannot be removed whole is not reported as removed.
+    #[test]
+    fn prune_formations_leaves_a_directory_it_could_not_remove_out_of_the_result() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let stuck = frm(NOW - 3 * DAY_MS, 1);
+        let gone = frm(NOW - 3 * DAY_MS + 1, 2);
+        make_owned(root.path(), project.path(), &[&stuck, &gone]);
+        let stuck_dir = root.path().join(stuck.as_str());
+        std::fs::set_permissions(&stuck_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root removes it regardless, so there is nothing to observe.
+        if std::fs::write(stuck_dir.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&stuck_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let pruned = prune_formations(
+            root.path(),
+            &frm(NOW, 3),
+            project.path(),
+            &retain(None, Some(1)),
+            NOW,
+            |_, _| false,
+        );
+        std::fs::set_permissions(&stuck_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            removed(&pruned),
+            [(gone, crate::trace::RETENTION_REASON_MAX_AGE)]
+        );
+        assert!(stuck_dir.is_dir());
     }
 }
