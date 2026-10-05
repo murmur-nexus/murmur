@@ -4,17 +4,18 @@
 //! answering `tasks/cancel` and the agent loop that stops:
 //!
 //! * [`CancelSignal`], the one-way flag a cancelled task's waits race against;
-//! * [`LiveDelegations`], the registry of delegations this session started and has not closed;
+//! * [`LiveDelegations`], the running task's delegations, which the door delivers outcomes into;
 //! * [`Residue`], a snapshot of what is still running when a task stops.
 //!
-//! Nothing here kills anything. A cancel stops the runtime waiting on work; the work itself keeps
-//! whatever lifecycle it already had, and is named instead.
+//! A cancel stops the runtime waiting on work. A detached shell command keeps its own lifecycle
+//! and is named. A delegation is the cancelled task's own: the task ends it, once the residue has
+//! named it.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Instant,
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use serde_json::json;
@@ -22,6 +23,7 @@ use tokio::sync::watch;
 
 use crate::{
     a2a::{A2aArtifact, ArtifactPart},
+    child_launch::LaunchedChild,
     detached::DetachedRegistry,
 };
 
@@ -41,7 +43,8 @@ pub(crate) const PHASE_TURN: &str = "turn";
 pub(crate) const PHASE_INFERENCE: &str = "inference";
 /// Cancelled while the task was waiting on a person's answer to `request-input`.
 pub(crate) const PHASE_INPUT: &str = "input";
-/// Cancelled while a `delegate-task` call was waiting for its child to be up.
+/// Cancelled while a `delegate-task` call was waiting for its child to be up, or while a finished
+/// attempt was waiting for a sub-capsule's outcome.
 pub(crate) const PHASE_DELEGATION: &str = "delegation";
 /// Cancelled while a `call-member` call was reaching the callee's door, or while a finished
 /// attempt was waiting for a callee's answer.
@@ -140,14 +143,15 @@ impl Default for CancelSignal {
 
 // ── Live delegations ──────────────────────────────────────────────────────────
 
-/// One delegation this session started and has not yet closed.
+/// One delegation the running task started and has not yet accounted for.
 ///
 /// Kept because the terminal `delegation` trace line names the capsule and the version, and the
-/// completion that arrives later carries neither: it names the delegation, and the runtime
-/// remembers what that delegation was for. A cancel reads the same entries to name what is still
-/// running.
-#[derive(Debug, Clone)]
+/// completion the child posts carries neither: it names the delegation, and the runtime remembers
+/// what that delegation was for. A cancel reads the same entries to name what was in flight.
+#[derive(Debug)]
 pub(crate) struct LiveDelegation {
+    /// The task that started it, and the only task its outcome is delivered into.
+    pub(crate) task_id: String,
     /// The child's directory, absolute — where its `completion.json` is read from.
     pub(crate) workdir: PathBuf,
     pub(crate) capsule: String,
@@ -157,19 +161,55 @@ pub(crate) struct LiveDelegation {
     /// The child's directory as the parent's own tools address it: relative to the parent's
     /// accessible workdir.
     pub(crate) child_workdir: String,
-    /// When the launch was recorded, so an unreadable completion still closes the row with a
-    /// duration rather than a zero.
+    /// When the launch was recorded: the start of the backstop's bound, and the duration of a
+    /// row closed without the child's own record.
     pub(crate) started: Instant,
+    /// The handle that ends the child. `None` from the launch notice until
+    /// [`LiveDelegations::adopt`] attaches it, which is the length of the task's delivery to the
+    /// child; dropping it kills and reaps a child still running.
+    pub(crate) child: Option<LaunchedChild>,
+    /// Whether the child's completion has reached the door. An arrived outcome is delivered at the
+    /// task's next wake, or closed from its record if the task ends first.
+    pub(crate) arrived: bool,
 }
 
-/// Every delegation in flight, by `dlg_` id.
+/// What the door is to answer a completion naming one delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// The running task was waiting for it, and now holds it.
+    Delivered,
+    /// It already arrived once; a repeat is the watcher retrying a post it could not confirm.
+    AlreadyDelivered,
+    /// No task in this session started it, or the task that did has ended it.
+    NotOutstanding,
+}
+
+#[derive(Debug, Default)]
+struct Delegations {
+    /// The task now in scope, set by [`LiveDelegations::scope_task`].
+    task_id: Option<String>,
+    /// By `dlg_` id. Every entry belongs to the task in scope.
+    entries: HashMap<String, LiveDelegation>,
+    /// Every delegation whose outcome this session has received, so a repeated post is answered
+    /// as the success the first one was.
+    delivered: HashSet<String>,
+}
+
+/// The running task's delegations: started, not yet accounted for, by `dlg_` id.
+///
+/// One per session, shared by the door that receives completions and the task loop that delivers
+/// them. A session runs one task at a time, so the set belongs to the running task:
+/// [`run_task_with_reopens`](crate::runtime) delivers or ends every delegation before the task's
+/// `on-task-end`, and dropping its [`DelegationScope`] ends whatever is left.
 ///
 /// Registered from the launch callback, on the blocking thread that launched the child, so a
-/// delegation is live from the moment the child is up — including when the call that started it
-/// is cancelled before it returns.
+/// delegation is in the set from the moment the child is up — including when the call that
+/// started it is cancelled before it returns.
 #[derive(Debug, Default)]
 pub(crate) struct LiveDelegations {
-    inner: Mutex<HashMap<String, LiveDelegation>>,
+    inner: Mutex<Delegations>,
+    /// Woken by the door each time an outcome arrives.
+    arrival: tokio::sync::Notify,
 }
 
 impl LiveDelegations {
@@ -177,39 +217,162 @@ impl LiveDelegations {
         Self::default()
     }
 
-    /// Record one launched child. A repeated id replaces the earlier entry, which is the only
-    /// reading available: two launches cannot share a `dlg_` id.
-    pub(crate) fn register(&self, delegation_id: String, delegation: LiveDelegation) {
-        self.inner
-            .lock()
-            .expect("live delegations mutex")
-            .insert(delegation_id, delegation);
+    fn lock(&self) -> std::sync::MutexGuard<'_, Delegations> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Take the entry for a delegation whose outcome has arrived, so its terminal `delegation`
-    /// trace line can be written from what the launch knew.
-    pub(crate) fn finish(&self, delegation_id: &str) -> Option<LiveDelegation> {
-        self.inner
-            .lock()
-            .expect("live delegations mutex")
-            .remove(delegation_id)
+    /// Put `task_id` in scope until the returned guard is dropped. Anything an earlier task left
+    /// is ended first; the task loop accounts for every delegation, so there is never anything.
+    pub(crate) fn scope_task(self: &Arc<Self>, task_id: &str) -> DelegationScope {
+        let left = {
+            let mut delegations = self.lock();
+            delegations.task_id = Some(task_id.to_string());
+            std::mem::take(&mut delegations.entries)
+        };
+        drop(left);
+        DelegationScope(Arc::clone(self))
     }
 
-    /// Drop a delegation that will never produce a completion — one announced by the launcher
-    /// whose start then failed. Unlike [`Self::finish`] there is nothing to close with.
-    pub(crate) fn release(&self, delegation_id: &str) {
-        self.inner
-            .lock()
-            .expect("live delegations mutex")
-            .remove(delegation_id);
+    /// The task now in scope, or `None` outside every task.
+    pub(crate) fn task_id(&self) -> Option<String> {
+        self.lock().task_id.clone()
+    }
+
+    /// Record one launched child for `delegation.task_id`. Kept only while that task is still in
+    /// scope; `false` means it has ended, and the child is ended once its handle is dropped.
+    pub(crate) fn register(&self, delegation_id: String, delegation: LiveDelegation) -> bool {
+        let mut delegations = self.lock();
+        if delegations.task_id.as_deref() != Some(delegation.task_id.as_str()) {
+            return false;
+        }
+        delegations.entries.insert(delegation_id, delegation);
+        true
+    }
+
+    /// Attach the handle that ends `delegation_id`'s child. With no entry left for it — the task
+    /// ended it while the launch was finishing — the handle is dropped, which ends the child.
+    pub(crate) fn adopt(&self, delegation_id: &str, child: LaunchedChild) {
+        let orphan = {
+            let mut delegations = self.lock();
+            match delegations.entries.get_mut(delegation_id) {
+                Some(entry) => {
+                    entry.child = Some(child);
+                    None
+                }
+                None => Some(child),
+            }
+        };
+        drop(orphan);
+    }
+
+    /// Drop a delegation that will never produce an outcome: one announced by the launcher whose
+    /// start then failed, and whose child the failed start has already ended.
+    pub(crate) fn discard(&self, delegation_id: &str) {
+        let entry = self.lock().entries.remove(delegation_id);
+        drop(entry);
+    }
+
+    /// Record that `delegation_id`'s completion reached the door, and wake the task loop.
+    pub(crate) fn arrive(&self, delegation_id: &str) -> Arrival {
+        let mut delegations = self.lock();
+        if delegations.delivered.contains(delegation_id) {
+            return Arrival::AlreadyDelivered;
+        }
+        let Some(entry) = delegations.entries.get_mut(delegation_id) else {
+            return Arrival::NotOutstanding;
+        };
+        if entry.arrived {
+            return Arrival::AlreadyDelivered;
+        }
+        entry.arrived = true;
+        drop(delegations);
+        self.arrival.notify_one();
+        Arrival::Delivered
+    }
+
+    /// `(outstanding, arrived)`: delegations still waited on, and outcomes not yet delivered.
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        let delegations = self.lock();
+        let arrived = delegations
+            .entries
+            .values()
+            .filter(|entry| entry.arrived)
+            .count();
+        (delegations.entries.len() - arrived, arrived)
+    }
+
+    /// Wait until at least one outcome has arrived. Resolves at once when one already has.
+    /// Cancellation-safe: dropping the future loses no outcome.
+    pub(crate) async fn wait_for_outcome(&self) {
+        loop {
+            if self.lock().entries.values().any(|entry| entry.arrived) {
+                return;
+            }
+            self.arrival.notified().await;
+        }
+    }
+
+    /// Every delegation whose outcome has arrived, in id order — which is start order — taken
+    /// for delivery.
+    pub(crate) fn take_arrived(&self) -> Vec<(String, LiveDelegation)> {
+        self.take_where(|entry| entry.arrived)
+    }
+
+    /// Every outstanding delegation started more than `bound` ago, taken to be ended.
+    pub(crate) fn take_overdue(&self, bound: Duration) -> Vec<(String, LiveDelegation)> {
+        let now = Instant::now();
+        self.take_where(|entry| {
+            !entry.arrived
+                && entry
+                    .started
+                    .checked_add(bound)
+                    .is_some_and(|due| due <= now)
+        })
+    }
+
+    /// The earliest instant an outstanding delegation passes `bound`, or `None` when none is
+    /// outstanding or none ever will.
+    pub(crate) fn next_overdue(&self, bound: Duration) -> Option<Instant> {
+        self.lock()
+            .entries
+            .values()
+            .filter(|entry| !entry.arrived)
+            .filter_map(|entry| entry.started.checked_add(bound))
+            .min()
+    }
+
+    /// Every delegation the task leaves behind, arrived or not, taken to be accounted for.
+    pub(crate) fn take_all(&self) -> Vec<(String, LiveDelegation)> {
+        self.take_where(|_| true)
+    }
+
+    fn take_where(&self, take: impl Fn(&LiveDelegation) -> bool) -> Vec<(String, LiveDelegation)> {
+        let mut delegations = self.lock();
+        let ids: Vec<String> = delegations
+            .entries
+            .iter()
+            .filter(|(_, entry)| take(entry))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut taken: Vec<(String, LiveDelegation)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let entry = delegations.entries.remove(&id)?;
+                if entry.arrived {
+                    delegations.delivered.insert(id.clone());
+                }
+                Some((id, entry))
+            })
+            .collect();
+        taken.sort_by(|a, b| a.0.cmp(&b.0));
+        taken
     }
 
     /// Everything still in flight, as residue items.
     pub(crate) fn live(&self) -> Vec<ResidueItem> {
         let mut items: Vec<ResidueItem> = self
-            .inner
             .lock()
-            .expect("live delegations mutex")
+            .entries
             .iter()
             .map(|(delegation_id, delegation)| ResidueItem::Delegation {
                 delegation_id: delegation_id.clone(),
@@ -226,12 +389,27 @@ impl LiveDelegations {
     }
 }
 
+/// A task kept in scope of a [`LiveDelegations`]. Dropping it leaves no task in scope and ends
+/// every delegation still held for it, so a delegation never outlives the task that made it.
+pub(crate) struct DelegationScope(Arc<LiveDelegations>);
+
+impl Drop for DelegationScope {
+    fn drop(&mut self) {
+        let left = {
+            let mut delegations = self.0.lock();
+            delegations.task_id = None;
+            std::mem::take(&mut delegations.entries)
+        };
+        drop(left);
+    }
+}
+
 // ── Residue ───────────────────────────────────────────────────────────────────
 
 /// One thing that was still running when a task stopped.
 ///
-/// Named rather than stopped: a detached shell keeps its own lifecycle and a delegated child is
-/// left exactly as a delegation deadline leaves it.
+/// A detached shell is named and keeps its own lifecycle. A delegation is named here and then
+/// ended by the task that started it, so the record still says what was in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResidueItem {
     DetachedShell {
@@ -388,13 +566,23 @@ mod tests {
 
     fn live_delegation(capsule: &str) -> LiveDelegation {
         LiveDelegation {
+            task_id: "tsk_a".to_string(),
             workdir: PathBuf::from("/tmp/child"),
             capsule: capsule.to_string(),
             version: "0.1.0".to_string(),
             child_session_id: "ses_child".to_string(),
             child_workdir: ".murmur/children/child-1".to_string(),
             started: Instant::now(),
+            child: None,
+            arrived: false,
         }
+    }
+
+    /// A set with `tsk_a` in scope.
+    fn scoped() -> (Arc<LiveDelegations>, DelegationScope) {
+        let live = Arc::new(LiveDelegations::new());
+        let scope = live.scope_task("tsk_a");
+        (live, scope)
     }
 
     /// The vocabulary the `task_canceled` record's `phase` is written from. One word per place
@@ -421,40 +609,139 @@ mod tests {
     }
 
     #[test]
-    fn a_registered_delegation_is_live_until_it_finishes() {
-        let live = LiveDelegations::new();
+    fn a_registered_delegation_is_live_until_it_is_taken() {
+        let (live, _scope) = scoped();
         assert!(live.live().is_empty());
 
-        live.register("dlg_one".to_string(), live_delegation("worker"));
+        assert!(live.register("dlg_one".to_string(), live_delegation("worker")));
         let items = live.live();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id(), "dlg_one");
         assert_eq!(items[0].kind(), "delegation");
 
-        let finished = live.finish("dlg_one").expect("the entry is still there");
-        assert_eq!(finished.capsule, "worker");
+        let taken = live.take_all();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].1.capsule, "worker");
         assert!(live.live().is_empty());
-        assert!(live.finish("dlg_one").is_none());
+        assert!(live.take_all().is_empty());
     }
 
     #[test]
-    fn releasing_drops_a_delegation_that_will_never_report() {
-        let live = LiveDelegations::new();
+    fn discarding_drops_a_delegation_that_will_never_report() {
+        let (live, _scope) = scoped();
         live.register("dlg_one".to_string(), live_delegation("worker"));
-        live.release("dlg_one");
+        live.discard("dlg_one");
         assert!(live.live().is_empty());
-        // Releasing an id that is not there is the same nothing, not a panic.
-        live.release("dlg_missing");
+        // Discarding an id that is not there is the same nothing, not a panic.
+        live.discard("dlg_missing");
     }
 
     #[test]
     fn live_delegations_are_listed_in_id_order() {
-        let live = LiveDelegations::new();
+        let (live, _scope) = scoped();
         live.register("dlg_b".to_string(), live_delegation("second"));
         live.register("dlg_a".to_string(), live_delegation("first"));
         let listed = live.live();
         let ids: Vec<&str> = listed.iter().map(ResidueItem::id).collect();
         assert_eq!(ids, vec!["dlg_a", "dlg_b"]);
+    }
+
+    /// A delegation belongs to the task that started it: outside that task's scope it is not
+    /// kept, and the scope's end takes everything left with it.
+    #[test]
+    fn a_delegation_is_kept_only_while_its_task_is_in_scope() {
+        let live = Arc::new(LiveDelegations::new());
+        assert!(live.task_id().is_none());
+        assert!(
+            !live.register("dlg_early".to_string(), live_delegation("worker")),
+            "no task is in scope"
+        );
+
+        let scope = live.scope_task("tsk_b");
+        assert_eq!(live.task_id().as_deref(), Some("tsk_b"));
+        assert!(
+            !live.register("dlg_other".to_string(), live_delegation("worker")),
+            "started for tsk_a, which is not the task in scope"
+        );
+        let mut mine = live_delegation("worker");
+        mine.task_id = "tsk_b".to_string();
+        assert!(live.register("dlg_mine".to_string(), mine));
+        assert_eq!(live.counts(), (1, 0));
+
+        drop(scope);
+        assert!(live.task_id().is_none());
+        assert!(live.live().is_empty(), "the scope's end takes what is left");
+        assert_eq!(live.arrive("dlg_mine"), Arrival::NotOutstanding);
+    }
+
+    /// The door's three answers: an outstanding delegation is delivered once, a repeat is
+    /// answered as the success the first post was, and an id nobody is waiting for is refused.
+    #[test]
+    fn the_set_delivers_each_outcome_once_and_refuses_one_nobody_waits_for() {
+        let (live, _scope) = scoped();
+        live.register("dlg_a".to_string(), live_delegation("worker"));
+        live.register("dlg_b".to_string(), live_delegation("worker"));
+
+        assert_eq!(live.arrive("dlg_a"), Arrival::Delivered);
+        assert_eq!(live.arrive("dlg_a"), Arrival::AlreadyDelivered);
+        assert_eq!(live.arrive("dlg_nobody"), Arrival::NotOutstanding);
+        assert_eq!(live.counts(), (1, 1));
+
+        let arrived = live.take_arrived();
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(arrived[0].0, "dlg_a");
+        assert_eq!(live.counts(), (1, 0));
+        // Taken for delivery, and still a success when the watcher posts it again.
+        assert_eq!(live.arrive("dlg_a"), Arrival::AlreadyDelivered);
+
+        let left = live.take_all();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "dlg_b");
+        // Ended unarrived: a later post finds nobody waiting.
+        assert_eq!(live.arrive("dlg_b"), Arrival::NotOutstanding);
+    }
+
+    /// The backstop's instant is the earliest outstanding start plus the bound, and only an
+    /// outstanding delegation past it is taken.
+    #[test]
+    fn the_backstop_takes_only_an_outstanding_delegation_past_its_bound() {
+        let (live, _scope) = scoped();
+        let mut old = live_delegation("worker");
+        old.started = Instant::now() - Duration::from_secs(120);
+        let old_started = old.started;
+        live.register("dlg_old".to_string(), old);
+        live.register("dlg_new".to_string(), live_delegation("worker"));
+        let mut arrived = live_delegation("worker");
+        arrived.started = Instant::now() - Duration::from_secs(600);
+        live.register("dlg_arrived".to_string(), arrived);
+        live.arrive("dlg_arrived");
+
+        let bound = Duration::from_secs(60);
+        assert_eq!(live.next_overdue(bound), Some(old_started + bound));
+        let overdue = live.take_overdue(bound);
+        let ids: Vec<&str> = overdue.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["dlg_old"]);
+        assert_eq!(live.counts(), (1, 1));
+    }
+
+    /// An arrival wakes a waiter, and a wait armed after it resolves at once.
+    #[tokio::test]
+    async fn an_arrival_wakes_the_wait() {
+        let (live, _scope) = scoped();
+        live.register("dlg_a".to_string(), live_delegation("worker"));
+        let door = Arc::clone(&live);
+        let waiting = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), live.wait_for_outcome())
+                .await
+                .expect("the arrival wakes the wait");
+            live
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(door.arrive("dlg_a"), Arrival::Delivered);
+        let live = waiting.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), live.wait_for_outcome())
+            .await
+            .expect("an outcome already there does not wait");
     }
 
     #[test]
@@ -467,7 +754,7 @@ mod tests {
 
     #[test]
     fn a_residue_produces_one_json_part_per_item() {
-        let live = LiveDelegations::new();
+        let (live, _scope) = scoped();
         live.register("dlg_one".to_string(), live_delegation("worker"));
         let residue = Residue {
             items: vec![

@@ -51,7 +51,7 @@ pub use unix::{ChildLifeline, FormationLifeline, MemberLifeline, SpawnerLifeline
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsString;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{FORMATION_LIFELINE_ENV, SPAWNER_LIFELINE_ENV};
@@ -489,16 +489,6 @@ mod unix {
             self.ends.write = None;
         }
 
-        /// Keep the write end open for the rest of this process's life and let this value go.
-        ///
-        /// The descriptor is leaked: nothing in this process closes it again, so the
-        /// child reads EOF exactly when this process exits, by whatever means.
-        pub fn hold_until_exit(mut self) {
-            if let Some(write) = self.ends.write.take() {
-                let _ = write.into_raw_fd();
-            }
-        }
-
         /// The write end's descriptor number, while it is open.
         pub fn write_fd(&self) -> Option<RawFd> {
             self.ends.write_fd()
@@ -539,6 +529,7 @@ mod unix {
     #[allow(unsafe_code)]
     mod tests {
         use super::*;
+        use std::os::fd::IntoRawFd;
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -869,25 +860,6 @@ mod unix {
             drop(parent);
             rx.recv_timeout(Duration::from_secs(5))
                 .expect("dropping the write end fires the watcher");
-        }
-
-        /// A write end held until exit stays open after its `ChildLifeline` is gone.
-        #[test]
-        fn spawner_lifeline_held_until_exit_stays_open() {
-            let (fd, parent) = child_side();
-            let write = parent.write_fd().unwrap();
-            let rx = watched(&SPAWNER, fd);
-            parent.hold_until_exit();
-            assert!(
-                rx.recv_timeout(Duration::from_millis(500)).is_err(),
-                "a held write end is not EOF"
-            );
-            assert!(fd_flags(write) >= 0, "the write end is still open");
-            // This test's own stand-in for the process exiting.
-            // SAFETY: `write` was leaked by `hold_until_exit` and is owned by nothing.
-            drop(unsafe { OwnedFd::from_raw_fd(write) });
-            rx.recv_timeout(Duration::from_secs(5))
-                .expect("closing the held write end fires the watcher");
         }
 
         #[test]

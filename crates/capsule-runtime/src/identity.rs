@@ -9,7 +9,7 @@ use crate::a2a::{
     A2aMessage, A2aTask, CancelOutcome, IncomingTask, JsonRpcRequest, JsonRpcResponse,
     TaskRegistry, TaskState, TaskStatus,
 };
-use crate::cancel::{LiveDelegations, Residue};
+use crate::cancel::{Arrival, LiveDelegations, Residue};
 use crate::control_plane::{handle_control_request, is_control_path, ControlPlane, ControlRequest};
 use crate::delegation::{COMPLETION_SESSION_HEADER, DELEGATION_ID_HEADER};
 use crate::detached::DetachedRegistry;
@@ -711,7 +711,8 @@ pub(crate) async fn serve_http(
     // parent's old address after a restart.
     session_id: String,
     // The two registries a cancel snapshots its residue from. `detached` is `None` for a launch
-    // that demotes nothing, which contributes no shell items rather than an empty set.
+    // that demotes nothing, which contributes no shell items rather than an empty set. The
+    // delegation set is also where every completion is handed.
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
     // Whether this capsule has a harness session to forget, which is the one thing
@@ -784,6 +785,24 @@ pub(crate) async fn serve_http(
 pub(crate) async fn serve_test_door(
     accepts_peer_tasks: bool,
 ) -> (String, oneshot::Sender<()>, mpsc::Receiver<IncomingTask>) {
+    serve_test_door_with(
+        TaskAcceptance::Queue,
+        Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue))),
+        Arc::new(LiveDelegations::new()),
+        accepts_peer_tasks,
+    )
+    .await
+}
+
+/// [`serve_test_door`] under `acceptance`, over the given registry and delegation set, for session
+/// `ses_door`.
+#[cfg(test)]
+pub(crate) async fn serve_test_door_with(
+    acceptance: TaskAcceptance,
+    task_registry: Arc<Mutex<TaskRegistry>>,
+    live_delegations: Arc<LiveDelegations>,
+    accepts_peer_tasks: bool,
+) -> (String, oneshot::Sender<()>, mpsc::Receiver<IncomingTask>) {
     use std::sync::atomic::AtomicU64;
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -800,9 +819,9 @@ pub(crate) async fn serve_test_door(
         listener,
         shutdown_rx,
         "{}".to_string(),
-        Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue))),
+        task_registry,
         task_tx,
-        TaskAcceptance::Queue,
+        acceptance,
         sse_tx,
         Arc::new(Mutex::new(SseEventBuffer::new(8))),
         ConversationMode::Stateless,
@@ -824,7 +843,7 @@ pub(crate) async fn serve_test_door(
         Arc::new(ControlPlane::undeclared(session_id.clone())),
         session_id,
         None,
-        Arc::new(LiveDelegations::new()),
+        live_delegations,
         false,
         accepts_peer_tasks,
         None,
@@ -953,11 +972,9 @@ async fn handle_connection(
     // than each interpreting the headers for itself.
     let provenance = origin::from_wire(task_origin.as_deref(), task_trust.as_deref());
 
-    // Both delegation headers mean something only on the completion path. On every other path
-    // they are ignored rather than carried: a `peer` message claiming a delegation id would put a
-    // value on the receiver's `task_start` that no delegation of its own produced.
+    // Both delegation headers mean something only on the completion path, which reads them below
+    // and starts no task. On every other path they are ignored.
     let is_completion = provenance.origin() == TaskOrigin::Completion;
-    let delegation_id = if is_completion { delegation_id } else { None };
 
     // Routed ahead of the operator plane on its own segment, and answering every method under it
     // including the ones it refuses: a `PUT` that fell through would leave no record of somebody
@@ -1094,6 +1111,16 @@ async fn handle_connection(
             }
         };
 
+        // A sub-capsule's outcome belongs to the task that delegated to it, so it is handed to the
+        // session's delegation set here and never becomes a task: ahead of method resolution,
+        // which serves no `message/send` under `task_acceptance: none`, and ahead of the task
+        // registry, which refuses a second task under `single`.
+        if is_completion {
+            let response = handle_completion(req, delegation_id.as_deref(), &live_delegations);
+            let _ = writer_half.write_all(response.as_bytes()).await;
+            return;
+        }
+
         let resolved = DoorMethod::resolve(&req.method, &task_acceptance, gate.is_some());
         // Scope is checked once the method is known to be served and before its handler runs: an
         // unserved method is `-32601` to anyone the door let in, since the card lists what it
@@ -1136,7 +1163,6 @@ async fn handle_connection(
                     &task_tx,
                     traceparent,
                     provenance,
-                    delegation_id,
                     forget_session,
                     caller_member,
                     last_event_id,
@@ -1172,7 +1198,6 @@ async fn handle_connection(
                 &task_tx,
                 traceparent,
                 provenance,
-                delegation_id,
                 forget_session,
                 caller_member,
                 detached.as_ref(),
@@ -1262,7 +1287,6 @@ async fn handle_message_stream(
     task_tx: &mpsc::Sender<IncomingTask>,
     traceparent: Option<String>,
     provenance: TaskProvenance,
-    delegation_id: Option<String>,
     forget_session: bool,
     caller_member: Option<String>,
     last_event_id: Option<u64>,
@@ -1354,7 +1378,6 @@ async fn handle_message_stream(
         traceparent,
         provenance,
         source: crate::a2a::SOURCE_A2A,
-        delegation_id,
         forget_session,
         caller_member,
     };
@@ -1552,6 +1575,56 @@ async fn handle_stream_watch(
     }
 }
 
+/// The door's whole answer to a sub-capsule's completion: hand it to the delegation set, and say
+/// whether a task here was waiting for it.
+///
+/// Success for a delegation the running task started and has not accounted for, and for one
+/// whose outcome already arrived — a repeat is the watcher retrying a post it could not confirm.
+/// Anything else is `-32004` naming the delegation, which the child records as its
+/// `delivery_error`. The outcome itself is read from the child's `completion.json` by the task
+/// that receives it, never from this message.
+fn handle_completion(
+    req: JsonRpcRequest,
+    delegation_id: Option<&str>,
+    live_delegations: &LiveDelegations,
+) -> String {
+    if req.method != DoorMethod::MessageSend.wire_name() {
+        return JsonRpcResponse::err(
+            req.id,
+            -32601,
+            &format!(
+                "a completion is posted with {}",
+                DoorMethod::MessageSend.wire_name()
+            ),
+        )
+        .into_http_response();
+    }
+    let Some(delegation_id) = delegation_id.filter(|id| !id.is_empty()) else {
+        return JsonRpcResponse::err(
+            req.id,
+            -32004,
+            &format!(
+                "completion names no delegation in {DELEGATION_ID_HEADER}, so no task in this \
+                 session is waiting for it"
+            ),
+        )
+        .into_http_response();
+    };
+    match live_delegations.arrive(delegation_id) {
+        Arrival::Delivered | Arrival::AlreadyDelivered => JsonRpcResponse::ok(
+            req.id,
+            serde_json::json!({ "delegation_id": delegation_id, "received": true }),
+        )
+        .into_http_response(),
+        Arrival::NotOutstanding => JsonRpcResponse::err(
+            req.id,
+            -32004,
+            &format!("no task in this session is waiting for delegation {delegation_id}"),
+        )
+        .into_http_response(),
+    }
+}
+
 /// Answers a resolved method that replies with one JSON-RPC body.
 #[allow(clippy::too_many_arguments)]
 fn handle_jsonrpc(
@@ -1561,7 +1634,6 @@ fn handle_jsonrpc(
     task_tx: &mpsc::Sender<IncomingTask>,
     traceparent: Option<String>,
     provenance: TaskProvenance,
-    delegation_id: Option<String>,
     forget_session: bool,
     caller_member: Option<String>,
     detached: Option<&Arc<DetachedRegistry>>,
@@ -1577,7 +1649,6 @@ fn handle_jsonrpc(
             task_tx,
             traceparent,
             provenance,
-            delegation_id,
             forget_session,
             caller_member,
         ),
@@ -1606,7 +1677,6 @@ fn handle_message_send(
     task_tx: &mpsc::Sender<IncomingTask>,
     traceparent: Option<String>,
     provenance: TaskProvenance,
-    delegation_id: Option<String>,
     forget_session: bool,
     caller_member: Option<String>,
 ) -> String {
@@ -1674,7 +1744,6 @@ fn handle_message_send(
         traceparent,
         provenance,
         source: crate::a2a::SOURCE_A2A,
-        delegation_id,
         forget_session,
         caller_member,
     };
@@ -1794,9 +1863,9 @@ fn handle_tasks_cancel(
 /// `session/stop`: cancel everything this session still holds and report what it leaves running.
 ///
 /// The one moment anything can ask a capsule for that account. A detached shell command keeps its
-/// own lifecycle and a delegated child is still going, and once the process is gone so is the
-/// registry that knew about either — so the question is asked while the door is still up, and
-/// ending the process is left to the signal that follows.
+/// own lifecycle, and a delegated child runs until the cancelled task that started it ends it;
+/// once the process is gone so is the registry that knew about either — so the question is asked
+/// while the door is still up, and ending the process is left to the signal that follows.
 ///
 /// Nothing here shuts the door down. A method that killed its own process would be racing its
 /// response out of it.
@@ -2986,7 +3055,6 @@ mod tests {
             &task_tx,
             None,
             TaskProvenance::derive(TaskOrigin::User, None),
-            None,
             false,
             None,
         ));
@@ -3069,7 +3137,6 @@ mod tests {
                 &task_tx,
                 None,
                 TaskProvenance::derive(TaskOrigin::User, None),
-                None,
                 false,
                 None,
                 None,
@@ -3601,7 +3668,6 @@ mod tests {
                 &task_tx,
                 None,
                 TaskProvenance::derive(TaskOrigin::User, None),
-                None,
                 false,
                 None,
                 None,
@@ -3699,7 +3765,6 @@ mod tests {
                 &task_tx,
                 None,
                 TaskProvenance::derive(TaskOrigin::User, None),
-                None,
                 false,
                 None,
                 None,
@@ -3962,5 +4027,154 @@ mod tests {
                  `{forbidden}`, but the heartbeat is served off the agent loop's thread"
             );
         }
+    }
+
+    // ── The completion route ─────────────────────────────────────────────────
+
+    /// One child's completion posted to the test door, as the child's own reporter posts it.
+    async fn post_completion(addr: &str, delegation_id: &str) -> Result<(), String> {
+        let handle = crate::delegation::SpawnerHandle {
+            session_id: "ses_door".to_string(),
+            context_id: "ctx_parent".to_string(),
+            delegation_id: delegation_id.to_string(),
+            report_to: Some(crate::delegation::CompletionAddress {
+                url: format!("http://{addr}"),
+            }),
+        };
+        let outcome = crate::delegation::DelegationOutcome {
+            delegation_id: delegation_id.to_string(),
+            capsule_name: "worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            session_id: "ses_child".to_string(),
+            status: crate::delegation::DelegationStatus::Ok,
+            result_path: None,
+            workdir: "/tmp/child".to_string(),
+            duration_ms: 1,
+            detail: None,
+            reported_by: crate::delegation::Reporter::Child,
+            delivered: false,
+            delivery_error: None,
+        };
+        tokio::task::spawn_blocking(move || {
+            let address = handle.report_to.clone().unwrap();
+            crate::delegation::deliver_completion(&handle, &address, &outcome)
+        })
+        .await
+        .unwrap()
+    }
+
+    fn outstanding(task_id: &str) -> crate::cancel::LiveDelegation {
+        crate::cancel::LiveDelegation {
+            task_id: task_id.to_string(),
+            workdir: std::path::PathBuf::from("/tmp/child"),
+            capsule: "worker".to_string(),
+            version: "0.1.0".to_string(),
+            child_session_id: "ses_child".to_string(),
+            child_workdir: ".murmur/children/worker-1".to_string(),
+            started: std::time::Instant::now(),
+            child: None,
+            arrived: false,
+        }
+    }
+
+    /// Under every acceptance mode, and with a `single` task busy, a completion for the running
+    /// task's delegation is received into the delegation set and starts no task; a repeat is
+    /// answered as the success the first post was; and one nobody is waiting for is refused with
+    /// `-32004` naming the delegation, still starting no task.
+    #[tokio::test]
+    async fn a_completion_is_handed_to_the_delegation_set_and_never_becomes_a_task() {
+        for acceptance in ACCEPTANCES {
+            let registry = Arc::new(Mutex::new(TaskRegistry::new(1, acceptance.clone())));
+            // A task already running: a `single` door refuses a second one.
+            {
+                let mut reg = registry.lock().unwrap();
+                reg.enqueue("tsk_running", "ctx_parent");
+                reg.start_task(
+                    "tsk_running".to_string(),
+                    "ctx_parent".to_string(),
+                    crate::lanes::TaskLane::User,
+                );
+            }
+            let live = Arc::new(LiveDelegations::new());
+            let _scope = live.scope_task("tsk_running");
+            assert!(live.register("dlg_waited".to_string(), outstanding("tsk_running")));
+            let (addr, _shutdown, mut task_rx) = serve_test_door_with(
+                acceptance.clone(),
+                Arc::clone(&registry),
+                Arc::clone(&live),
+                false,
+            )
+            .await;
+
+            post_completion(&addr, "dlg_waited")
+                .await
+                .unwrap_or_else(|error| panic!("{acceptance:?}: {error}"));
+            assert_eq!(live.counts(), (0, 1), "{acceptance:?}");
+            post_completion(&addr, "dlg_waited")
+                .await
+                .unwrap_or_else(|error| panic!("{acceptance:?}: a repeat: {error}"));
+
+            let refused = post_completion(&addr, "dlg_nobody")
+                .await
+                .expect_err("nobody is waiting for it");
+            assert!(
+                refused.contains("dlg_nobody") && refused.contains("no task"),
+                "{acceptance:?}: {refused}"
+            );
+
+            assert!(
+                task_rx.try_recv().is_err(),
+                "{acceptance:?}: a completion started a task"
+            );
+            assert_eq!(live.take_arrived().len(), 1, "{acceptance:?}");
+        }
+    }
+
+    /// The session check still comes first: a completion addressed to another session is refused
+    /// whatever the delegation set holds.
+    #[tokio::test]
+    async fn a_completion_for_another_session_is_refused_before_the_delegation_set() {
+        let live = Arc::new(LiveDelegations::new());
+        let _scope = live.scope_task("tsk_running");
+        live.register("dlg_waited".to_string(), outstanding("tsk_running"));
+        let (addr, _shutdown, mut task_rx) = serve_test_door_with(
+            TaskAcceptance::Queue,
+            Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue))),
+            Arc::clone(&live),
+            false,
+        )
+        .await;
+        let handle = crate::delegation::SpawnerHandle {
+            session_id: "ses_elsewhere".to_string(),
+            context_id: "ctx_parent".to_string(),
+            delegation_id: "dlg_waited".to_string(),
+            report_to: Some(crate::delegation::CompletionAddress {
+                url: format!("http://{addr}"),
+            }),
+        };
+        let refused = tokio::task::spawn_blocking(move || {
+            let address = handle.report_to.clone().unwrap();
+            let outcome = crate::delegation::DelegationOutcome {
+                delegation_id: "dlg_waited".to_string(),
+                capsule_name: "worker".to_string(),
+                capsule_version: "0.1.0".to_string(),
+                session_id: "ses_child".to_string(),
+                status: crate::delegation::DelegationStatus::Ok,
+                result_path: None,
+                workdir: "/tmp/child".to_string(),
+                duration_ms: 1,
+                detail: None,
+                reported_by: crate::delegation::Reporter::Child,
+                delivered: false,
+                delivery_error: None,
+            };
+            crate::delegation::deliver_completion(&handle, &address, &outcome)
+        })
+        .await
+        .unwrap()
+        .expect_err("addressed to another session");
+        assert!(refused.contains("ses_elsewhere"), "{refused}");
+        assert_eq!(live.counts(), (1, 0));
+        assert!(task_rx.try_recv().is_err());
     }
 }

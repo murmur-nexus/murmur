@@ -27,7 +27,7 @@ A fenced block is an opening marker, a newline, the content, a newline, and a cl
 | Part | Form |
 |---|---|
 | Opening marker | `<untrusted-content source=NAME>` — one line, no attributes other than `source` |
-| Source name | `tool:<artifact name>` for a tool result, `skill:<artifact name>` for a runtime-pinned skill's result, `task:<origin>` for a task payload. A `>`, a carriage return or a newline appearing in a name is replaced with `_`, ` ` and ` ` respectively |
+| Source name | `tool:<artifact name>` for a tool result, `skill:<artifact name>` for a runtime-pinned skill's result, `task:<origin>` for a task payload, `delegation:<capsule>` for a sub-capsule's outcome. A `>`, a carriage return or a newline appearing in a name is replaced with `_`, ` ` and ` ` respectively |
 | Closing marker | `</untrusted-content>`, in full. It carries no source name |
 | Separator | Exactly one `\n` after the opening marker and one before the closing marker. The content's own trailing newline, if it has one, sits before that separator |
 
@@ -127,6 +127,7 @@ holds.
 | Tool result | Every agent-facing tool dispatch except a skill — WASM tool, native subprocess tool, shell binary, and the runtime's own peer-handoff tools | `tool:<artifact name>` |
 | Skill result | A skill whose `murmur.lock` origin is `runtime`, on every call | `skill:<artifact name>` |
 | Task payload | A task whose trust class is `untrusted` | `task:<origin>` |
+| Delegation outcome | Every [`delegate-task`](roost-api.md#how-the-outcome-arrives) outcome delivered into the task that delegated, whatever that task's trust | `delegation:<capsule>` |
 
 Every boundary applies on `inference.transport: http` and `inference.transport: process`. A
 `process` capsule keeps no conversation record and emits no A2A `artifact` frame, so its fenced

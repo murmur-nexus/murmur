@@ -20,7 +20,7 @@ use murmur_artifact::{
     RuntimeArtifact, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
     PACKED_MANIFEST_ENTRY, W_RUN_003, W_RUN_008, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
     W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
-    W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
+    W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_027, W_SEC_030,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -247,20 +247,23 @@ async fn run_task_with_reopens(
     // re-read of a file whose path is a convention. A continued attempt received the same content
     // as the original task message followed by one feedback message per reopen.
     let mut as_given = original_task.clone();
-    // Every delivered batch of `call-member` answers so far, in delivery order — re-injected into
-    // a rewritten `task.md` alongside the reopen feedback.
+    // Every delivered batch of `call-member` answers and of `delegate-task` outcomes so far, in
+    // delivery order — re-injected into a rewritten `task.md` alongside the reopen feedback.
     let mut member_answers: Vec<String> = Vec::new();
+    let mut delegation_outcomes: Vec<String> = Vec::new();
     // The conversation this task has built, handed from each attempt to the next.
     let mut thread = agent::TaskThread::default();
-    // What the next attempt continues with: `None` until a hook reopens the task or member
-    // answers arrive.
+    // What the next attempt continues with: `None` until a hook reopens the task or handed-off
+    // work reports back.
     let mut continuation: Option<agent::Continuation> = None;
-    // The calls this task makes are this task's: put it in scope, with the flag that cancels it,
-    // until this function returns.
+    // The calls and delegations this task makes are this task's: put it in scope, with the flag
+    // that cancels it, until this function returns. Dropping the delegation scope ends any
+    // sub-capsule still held for it, on every way out of this function.
     let _calls_scope = state
         .member_calls
         .clone()
         .map(|calls| calls.scope_task(trace_task_id, cancel.clone()));
+    let _delegations_scope = state.live_delegations.scope_task(trace_task_id);
 
     loop {
         // This function owns the task's scope: nothing else puts a task in scope, which is why
@@ -329,88 +332,153 @@ async fn run_task_with_reopens(
             }
         }
 
-        // Every `call-member` call this task made is accounted for before its `on-task-end`: a
-        // finished attempt with a turn left waits for an answer and continues with it, and any
-        // other ending leaves its calls behind. With no turn left nothing could read an answer, so
-        // the attempt does not wait for one.
+        // Everything this task handed off — `call-member` calls and `delegate-task` delegations
+        // alike — is accounted for before its `on-task-end`: a finished attempt with a turn left
+        // waits for an outcome and continues with whatever has arrived, and any other ending
+        // leaves its calls behind and ends its delegations. With no turn left nothing could read
+        // an outcome, so the attempt does not wait for one.
         let mut result = result;
-        if let Some(calls) = state.member_calls.clone() {
-            let (outstanding, arrived) = calls.counts();
-            if outstanding + arrived > 0 {
-                if matches!(result, Ok(AgentLoopExit::Ok))
-                    && trace.task_turns() < inference.max_turns
+        let calls = state.member_calls.clone();
+        let delegations = Arc::clone(&state.live_delegations);
+        let (calls_outstanding, calls_arrived) =
+            calls.as_ref().map_or((0, 0), |calls| calls.counts());
+        let (delegations_outstanding, delegations_arrived) = delegations.counts();
+        if calls_outstanding + calls_arrived + delegations_outstanding + delegations_arrived > 0 {
+            if matches!(result, Ok(AgentLoopExit::Ok)) && trace.task_turns() < inference.max_turns {
+                // The task's own bound on a delegation whose outcome was lost on the way: the
+                // watcher's deadline, plus the grace for its post to land.
+                let backstop = state
+                    .delegation
+                    .as_ref()
+                    .map(|plane| plane.result_timeout() + DELEGATION_ARRIVAL_GRACE);
+                match wait_for_handed_off_work(
+                    calls.as_deref(),
+                    &delegations,
+                    backstop,
+                    cancel.as_ref(),
+                    &sse,
+                    agent_task_id.as_deref(),
+                    context_id.as_ref(),
+                )
+                .await
                 {
-                    match wait_for_member_answers(
-                        &calls,
-                        cancel.as_ref(),
-                        &sse,
-                        agent_task_id.as_deref(),
-                        context_id.as_ref(),
-                    )
-                    .await
-                    {
-                        Some(outcomes) => {
-                            record_member_calls(state, trace_task_id, &outcomes, true).await;
+                    Some(woken) => {
+                        record_member_calls(state, trace_task_id, &woken.answers, true).await;
+                        let mut notices = Vec::new();
+                        for (delegation_id, delegation) in woken.arrived {
+                            notices
+                                .push(deliver_delegation(state, delegation_id, delegation).await);
+                        }
+                        for (delegation_id, delegation) in woken.overdue {
+                            notices.push(
+                                end_overdue_delegation(
+                                    state,
+                                    delegation_id,
+                                    delegation,
+                                    backstop.unwrap_or_default(),
+                                )
+                                .await,
+                            );
+                        }
+                        let mut messages = Vec::new();
+                        let mut said = Vec::new();
+                        if !woken.answers.is_empty() {
+                            // Answers only come from `call-member` calls, so `calls` is set here.
+                            let still_outstanding = calls
+                                .as_ref()
+                                .map(|calls| calls.outstanding())
+                                .unwrap_or_default();
                             let message = crate::member_call::answers_message(
-                                &outcomes,
-                                &calls.outstanding(),
+                                &woken.answers,
+                                &still_outstanding,
                             );
                             member_answers.push(message.clone());
-                            emit_task_working(
-                                &sse,
-                                agent_task_id.as_deref(),
-                                context_id.as_ref(),
-                                format!("continuing with {} member answer(s)", outcomes.len()),
-                            )
-                            .await;
-                            // Original + reopen feedback + answers so far: what a restarted
-                            // attempt reads as its task, and what `as-given` reports.
-                            let rewritten =
-                                build_continued_task_md(&original_task, &feedback, &member_answers);
-                            if !thread.can_continue(&inference.transport) {
-                                if let Err(e) =
-                                    tokio::fs::write(&task_md_path, rewritten.as_bytes()).await
-                                {
-                                    crate::runtime_err!(
-                                        "[capsule-runtime] failed to inject member answers into \
-                                         task.md: {e}"
-                                    );
-                                }
-                            }
-                            as_given = rewritten;
-                            continuation = Some(agent::Continuation::MemberAnswers(message));
-                            continue;
+                            messages.push(message);
+                            said.push(format!(
+                                "continuing with {} member answer(s)",
+                                woken.answers.len()
+                            ));
                         }
-                        // The task was cancelled while it waited.
-                        None => {
-                            if let Some(signal) = &cancel {
-                                signal.note_phase(crate::cancel::PHASE_MEMBER_CALL);
-                                let residue = crate::cancel::Residue::snapshot(
-                                    state.detached.as_ref(),
-                                    &state.live_delegations,
+                        if !notices.is_empty() {
+                            let message = crate::delegation::outcomes_message(&notices);
+                            delegation_outcomes.push(message.clone());
+                            messages.push(message);
+                            said.push(format!(
+                                "continuing with {} delegation outcome(s)",
+                                notices.len()
+                            ));
+                        }
+                        emit_task_working(
+                            &sse,
+                            agent_task_id.as_deref(),
+                            context_id.as_ref(),
+                            said.join("; "),
+                        )
+                        .await;
+                        // Original + reopen feedback + every outcome so far: what a restarted
+                        // attempt reads as its task, and what `as-given` reports.
+                        let rewritten = build_continued_task_md(
+                            &original_task,
+                            &feedback,
+                            &member_answers,
+                            &delegation_outcomes,
+                        );
+                        if !thread.can_continue(&inference.transport) {
+                            if let Err(e) =
+                                tokio::fs::write(&task_md_path, rewritten.as_bytes()).await
+                            {
+                                crate::runtime_err!(
+                                    "[capsule-runtime] failed to inject handed-off work's \
+                                     outcomes into task.md: {e}"
                                 );
-                                let _ = trace
-                                    .write_task_canceled(
-                                        trace_task_id,
-                                        None,
-                                        signal.phase(),
-                                        residue.detached_work_ids(),
-                                        residue.delegation_ids(),
-                                    )
-                                    .await;
                             }
-                            result = Ok(AgentLoopExit::Canceled);
-                            thread.ending = Some(agent::AttemptEnding {
-                                state: TaskState::Canceled,
-                                message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
-                                response: None,
-                            });
                         }
+                        as_given = rewritten;
+                        continuation = Some(agent::Continuation::Outcomes(messages.join("\n\n")));
+                        continue;
+                    }
+                    // The task was cancelled while it waited.
+                    None => {
+                        if let Some(signal) = &cancel {
+                            let (outstanding, arrived) = delegations.counts();
+                            signal.note_phase(if outstanding + arrived > 0 {
+                                crate::cancel::PHASE_DELEGATION
+                            } else {
+                                crate::cancel::PHASE_MEMBER_CALL
+                            });
+                            // Taken before the delegations are ended below, so the record names
+                            // what was in flight.
+                            let residue = crate::cancel::Residue::snapshot(
+                                state.detached.as_ref(),
+                                &state.live_delegations,
+                            );
+                            let _ = trace
+                                .write_task_canceled(
+                                    trace_task_id,
+                                    None,
+                                    signal.phase(),
+                                    residue.detached_work_ids(),
+                                    residue.delegation_ids(),
+                                )
+                                .await;
+                        }
+                        result = Ok(AgentLoopExit::Canceled);
+                        thread.ending = Some(agent::AttemptEnding {
+                            state: TaskState::Canceled,
+                            message: crate::cancel::CANCELED_STATUS_MESSAGE.to_string(),
+                            response: None,
+                        });
                     }
                 }
+            }
+            if let Some(calls) = &calls {
                 let left = calls.account_for_all();
                 record_member_calls(state, trace_task_id, &left.abandoned, false).await;
                 record_member_calls(state, trace_task_id, &left.undelivered, false).await;
+            }
+            let reason = delegation_ending_reason(&result);
+            for (delegation_id, delegation) in delegations.take_all() {
+                account_for_left_delegation(state, delegation_id, delegation, &reason).await;
             }
         }
 
@@ -495,8 +563,12 @@ async fn run_task_with_reopens(
                     ));
                     // Original + all feedback so far: what a restarted attempt reads as its task,
                     // and what `as-given` reports on either kind of attempt.
-                    let rewritten =
-                        build_continued_task_md(&original_task, &feedback, &member_answers);
+                    let rewritten = build_continued_task_md(
+                        &original_task,
+                        &feedback,
+                        &member_answers,
+                        &delegation_outcomes,
+                    );
                     if let Err(e) = tokio::fs::write(&task_md_path, rewritten.as_bytes()).await {
                         crate::runtime_err!(
                             "[capsule-runtime] failed to inject reopen feedback into task.md: {e}"
@@ -700,28 +772,34 @@ fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String
     out
 }
 
-/// [`build_reopen_task_md`]'s `task.md`, followed by every batch of member answers delivered so
-/// far. With no answers it is exactly the reopened task; with no feedback it is the original task
-/// and the answers.
+/// [`build_reopen_task_md`]'s `task.md`, followed by every batch of member answers and then every
+/// batch of delegation outcomes delivered so far, each under a section of its own. With neither it
+/// is exactly the reopened task; with no feedback it is the original task and the outcomes.
 fn build_continued_task_md(
     original: &str,
     feedback: &[(String, String)],
     member_answers: &[String],
+    delegation_outcomes: &[String],
 ) -> String {
     let mut out = if feedback.is_empty() {
         original.to_string()
     } else {
         build_reopen_task_md(original, feedback)
     };
-    if member_answers.is_empty() {
-        return out;
-    }
-    out = out.trim_end().to_string();
-    out.push_str("\n\n---\n\n# Member answers\n");
-    for answers in member_answers {
-        out.push('\n');
-        out.push_str(answers);
-        out.push('\n');
+    for (heading, batches) in [
+        ("Member answers", member_answers),
+        ("Delegation outcomes", delegation_outcomes),
+    ] {
+        if batches.is_empty() {
+            continue;
+        }
+        out = out.trim_end().to_string();
+        out.push_str(&format!("\n\n---\n\n# {heading}\n"));
+        for batch in batches {
+            out.push('\n');
+            out.push_str(batch);
+            out.push('\n');
+        }
     }
     out
 }
@@ -755,38 +833,308 @@ async fn emit_task_working(
     .await;
 }
 
-/// Wait for at least one of the running task's `call-member` calls to end, and take every outcome
-/// that has. `None` when `cancel` fires first.
+/// How long a delegated child whose outcome has arrived is given to finish exiting before its
+/// handle is dropped, which kills a child still running. The child posts its outcome at the very
+/// end of its own session, so this is the length of a process exit, not of any work.
+const DELEGATION_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long past the delegation deadline a waiting task gives the watcher's `terminated` post to
+/// land before it ends the child itself and reports that no outcome arrived. No wait on one
+/// delegation outlasts the deadline plus this.
+const DELEGATION_ARRIVAL_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Two of the four `reason`s a delegation the task ended carries on its terminal `delegation` line.
+/// The other two name an exit status or a bound, and are built where they are written.
+const DELEGATING_TASK_CANCELED_REASON: &str = "the delegating task was cancelled";
+const DELEGATING_TASK_NO_TURN_REASON: &str =
+    "the delegating task had no inference turn left to read this outcome";
+
+/// What a wait for handed-off work woke to: everything that has arrived, and every delegation
+/// the backstop is to end.
+struct Woken {
+    answers: Vec<crate::member_call::MemberCallOutcome>,
+    arrived: Vec<(String, crate::cancel::LiveDelegation)>,
+    overdue: Vec<(String, crate::cancel::LiveDelegation)>,
+}
+
+/// Wait until a `call-member` answer or a delegation's outcome has arrived, or until an
+/// outstanding delegation passes `backstop`, and take everything that has. `None` when `cancel`
+/// fires first.
 ///
 /// Says so on the task's stream when nothing has arrived yet, so a client does not read the quiet
-/// as the task's end.
-async fn wait_for_member_answers(
-    calls: &crate::member_call::MemberCalls,
+/// as the task's end. Spends no tokens and counts against no spend ceiling.
+async fn wait_for_handed_off_work(
+    calls: Option<&crate::member_call::MemberCalls>,
+    delegations: &crate::cancel::LiveDelegations,
+    backstop: Option<std::time::Duration>,
     cancel: Option<&crate::cancel::CancelSignal>,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     agent_task_id: Option<&str>,
     context_id: Option<&String>,
-) -> Option<Vec<crate::member_call::MemberCallOutcome>> {
-    let (outstanding, arrived) = calls.counts();
-    if arrived == 0 {
-        emit_task_working(
-            sse,
-            agent_task_id,
-            context_id,
-            format!("waiting on call-member: {outstanding} call(s) outstanding"),
+) -> Option<Woken> {
+    let (calls_outstanding, calls_arrived) = calls.map_or((0, 0), |calls| calls.counts());
+    let (delegations_outstanding, delegations_arrived) = delegations.counts();
+    if calls_arrived + delegations_arrived == 0 {
+        let mut waiting = Vec::new();
+        if calls_outstanding > 0 {
+            waiting.push(format!(
+                "waiting on call-member: {calls_outstanding} call(s) outstanding"
+            ));
+        }
+        if delegations_outstanding > 0 {
+            waiting.push(format!(
+                "waiting on delegate-task: {delegations_outstanding} delegation(s) outstanding"
+            ));
+        }
+        emit_task_working(sse, agent_task_id, context_id, waiting.join("; ")).await;
+    }
+    loop {
+        let overdue_at = backstop.and_then(|bound| delegations.next_overdue(bound));
+        tokio::select! {
+            biased;
+            () = async {
+                match cancel {
+                    Some(signal) => signal.canceled().await,
+                    None => std::future::pending().await,
+                }
+            } => return None,
+            () = async {
+                match calls {
+                    Some(calls) => calls.wait_for_outcome().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            () = delegations.wait_for_outcome() => {}
+            () = async {
+                match overdue_at {
+                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+        let woken = Woken {
+            answers: calls.map(|calls| calls.take_arrived()).unwrap_or_default(),
+            arrived: delegations.take_arrived(),
+            overdue: backstop
+                .map(|bound| delegations.take_overdue(bound))
+                .unwrap_or_default(),
+        };
+        if !(woken.answers.is_empty() && woken.arrived.is_empty() && woken.overdue.is_empty()) {
+            return Some(woken);
+        }
+    }
+}
+
+/// Why the task is ending a delegation it leaves behind, from how its last attempt ended.
+///
+/// Reached with `Ok(AgentLoopExit::Ok)` only when no turn was left: a finished attempt with a turn
+/// to spare waits instead.
+fn delegation_ending_reason(result: &Result<AgentLoopExit, RuntimeError>) -> String {
+    match result {
+        Ok(AgentLoopExit::Canceled) => DELEGATING_TASK_CANCELED_REASON.to_string(),
+        Ok(AgentLoopExit::Ok) => DELEGATING_TASK_NO_TURN_REASON.to_string(),
+        Ok(exit) => format!(
+            "the delegating task ended {} before this sub-capsule finished",
+            exit.as_str()
+        ),
+        Err(_) => format!(
+            "the delegating task ended {} before this sub-capsule finished",
+            AgentLoopExit::Failed.as_str()
+        ),
+    }
+}
+
+/// Let a delegated child's handle go: once it has exited, or after [`DELEGATION_EXIT_GRACE`], when
+/// dropping the handle kills it. On a blocking thread, because both the wait and the kill are.
+async fn release_finished_child(child: Option<crate::child_launch::LaunchedChild>) {
+    let Some(child) = child else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        let until = std::time::Instant::now() + DELEGATION_EXIT_GRACE;
+        while !child.has_exited() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(child);
+    })
+    .await;
+}
+
+/// How long a task that has ended a child waits for the child's watcher to record the ending.
+/// The watcher polls every 100 ms and writes one file, so this bounds a stuck thread, not the
+/// ordinary case.
+const DELEGATION_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// End a delegated child: kill and reap it, on a blocking thread. Its watcher then records the
+/// delegation `terminated` in the child's `completion.json` and posts nothing; the handle is held
+/// until it has, so the record is on disk before this process can exit.
+async fn end_child(child: Option<crate::child_launch::LaunchedChild>) {
+    let Some(mut child) = child else {
+        // Not yet adopted: the launch is still finishing, and the handle it returns is dropped,
+        // which ends the child, once [`crate::cancel::LiveDelegations::adopt`] finds no entry.
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = child.shutdown();
+        let until = std::time::Instant::now() + DELEGATION_RECORD_GRACE;
+        while !child.watcher_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    })
+    .await;
+}
+
+/// Deliver one delegation whose outcome has arrived: let its child finish exiting, read the
+/// child's own record once, and write the terminal `delegation` line from it. Returns what the
+/// task is told.
+///
+/// `outcome` and `reason` come out of the child's `completion.json`, never out of the
+/// completion's message text: both reporters write that file before they post. A file that cannot
+/// be read still closes the row — a delegation left permanently in flight in the trace is a worse
+/// record than one whose outcome is stated as unknown.
+async fn deliver_delegation(
+    state: &CapsuleStoreState,
+    delegation_id: String,
+    mut delegation: crate::cancel::LiveDelegation,
+) -> crate::delegation::OutcomeNotice {
+    release_finished_child(delegation.child.take()).await;
+    match crate::delegation::read_completion(&delegation.workdir) {
+        Some(outcome) => {
+            write_delegation_end(
+                state,
+                &delegation_id,
+                &delegation,
+                Some(outcome.session_id.clone()),
+                outcome.duration_ms,
+                outcome.status.as_str(),
+                outcome.detail.clone(),
+            )
+            .await;
+            crate::delegation::OutcomeNotice::recorded(
+                &outcome,
+                &delegation.capsule,
+                &delegation.version,
+            )
+        }
+        None => {
+            let reason = format!(
+                "a completion arrived for this delegation, but no readable {} was left in {}",
+                crate::delegation::COMPLETION_FILE,
+                delegation.workdir.display()
+            );
+            write_delegation_end(
+                state,
+                &delegation_id,
+                &delegation,
+                None,
+                crate::member_call::elapsed_ms(delegation.started),
+                "unknown",
+                Some(reason.clone()),
+            )
+            .await;
+            crate::delegation::OutcomeNotice {
+                delegation_id,
+                capsule: delegation.capsule,
+                version: delegation.version,
+                status: "unknown".to_string(),
+                body: reason,
+            }
+        }
+    }
+}
+
+/// End one delegation no outcome reached within `bound` of its start, and deliver the
+/// `terminated` outcome the runtime builds for it in place of the one that never came.
+async fn end_overdue_delegation(
+    state: &CapsuleStoreState,
+    delegation_id: String,
+    mut delegation: crate::cancel::LiveDelegation,
+    bound: std::time::Duration,
+) -> crate::delegation::OutcomeNotice {
+    end_child(delegation.child.take()).await;
+    let reason = format!(
+        "no outcome reached the delegating task within {}s of this sub-capsule starting",
+        bound.as_secs()
+    );
+    let duration_ms = crate::member_call::elapsed_ms(delegation.started);
+    write_delegation_end(
+        state,
+        &delegation_id,
+        &delegation,
+        Some(delegation.child_session_id.clone()),
+        duration_ms,
+        crate::delegation::DelegationStatus::Terminated.as_str(),
+        Some(reason.clone()),
+    )
+    .await;
+    let outcome = crate::delegation::DelegationOutcome {
+        delegation_id,
+        capsule_name: delegation.capsule.clone(),
+        capsule_version: delegation.version.clone(),
+        session_id: delegation.child_session_id.clone(),
+        status: crate::delegation::DelegationStatus::Terminated,
+        result_path: None,
+        workdir: delegation.workdir.display().to_string(),
+        duration_ms,
+        detail: Some(format!("{reason}; it was ended")),
+        reported_by: crate::delegation::Reporter::Launcher,
+        delivered: false,
+        delivery_error: None,
+    };
+    crate::delegation::OutcomeNotice::recorded(&outcome, &delegation.capsule, &delegation.version)
+}
+
+/// Account for one delegation a task leaves behind. One whose outcome had already arrived is
+/// closed from its child's record, as delivered work would be; any other is ended, with `reason`
+/// saying why.
+async fn account_for_left_delegation(
+    state: &CapsuleStoreState,
+    delegation_id: String,
+    mut delegation: crate::cancel::LiveDelegation,
+    reason: &str,
+) {
+    if delegation.arrived {
+        let _ = deliver_delegation(state, delegation_id, delegation).await;
+        return;
+    }
+    end_child(delegation.child.take()).await;
+    write_delegation_end(
+        state,
+        &delegation_id,
+        &delegation,
+        Some(delegation.child_session_id.clone()),
+        crate::member_call::elapsed_ms(delegation.started),
+        crate::delegation::DelegationStatus::Terminated.as_str(),
+        Some(reason.to_string()),
+    )
+    .await;
+}
+
+/// The terminal `delegation` line for one started delegation, joined to its `delegation_start` by
+/// the `dlg_` id both carry.
+async fn write_delegation_end(
+    state: &CapsuleStoreState,
+    delegation_id: &str,
+    delegation: &crate::cancel::LiveDelegation,
+    child_session_id: Option<String>,
+    duration_ms: u64,
+    outcome: &str,
+    reason: Option<String>,
+) {
+    let Some(trace) = &state.peer_trace else {
+        return;
+    };
+    trace
+        .write_delegation(
+            &delegation.capsule,
+            &delegation.version,
+            Some(delegation_id.to_string()),
+            child_session_id.filter(|id| !id.is_empty()),
+            duration_ms,
+            outcome,
+            reason,
         )
         .await;
-    }
-    tokio::select! {
-        biased;
-        () = async {
-            match cancel {
-                Some(signal) => signal.canceled().await,
-                None => std::future::pending().await,
-            }
-        } => None,
-        () = calls.wait_for_outcome() => Some(calls.take_arrived()),
-    }
 }
 
 /// One `member_call` line per outcome, `delivered` as given.
@@ -2459,11 +2807,6 @@ fn launch(
             requires_process_bounding,
             shell_enforcement.cgroup_scope.is_some(),
         );
-        warn_for_unreachable_delegation_outcomes(
-            &workdir,
-            !staged.capability_policy.spawn_allow.is_empty(),
-            &staged.lifecycle,
-        );
         warn_for_unreachable_shell_completions(
             &workdir,
             !staged.capability_policy.shell_allow.is_empty(),
@@ -3182,9 +3525,6 @@ fn launch(
                                                 &context_id,
                                                 "task_md",
                                                 provenance,
-                                                // A `task.md` task is a person's instruction, not a
-                                                // child reporting back.
-                                                None,
                                                 bytes,
                                             )
                                             .await;
@@ -3268,9 +3608,6 @@ fn launch(
                                                 &context_id,
                                                 "task_md",
                                                 provenance,
-                                                // A `task.md` task is a person's instruction, not a
-                                                // child reporting back.
-                                                None,
                                                 bytes,
                                             )
                                             .await;
@@ -3589,15 +3926,9 @@ fn launch(
                                 &incoming.context_id,
                                 incoming.source,
                                 incoming.provenance,
-                                incoming.delegation_id.as_deref(),
                                 incoming.message_text.len() as u64,
                             )
                             .await;
-                        // A task naming a delegation is that delegation's outcome arriving, which
-                        // is where a `delegate-task` call that returned on start finally ends.
-                        if let Some(delegation_id) = &incoming.delegation_id {
-                            state.close_started_delegation(delegation_id).await;
-                        }
                         let seed = hooks
                             .dispatch_task_start(
                                 incoming.task_id.clone(),
@@ -4554,48 +4885,6 @@ fn warn_on_member_calls_without_egress(
     }
 }
 
-const NO_COMPLETION_LANE_WARNING: &str = "this capsule declares capabilities.spawn.allow, but \
-its lifecycle block cannot receive a delegation's outcome: delegate-task returns as soon as the \
-sub-capsule is running, and what the sub-capsule did arrives afterwards as a background task. \
-Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, and a \
-lifecycle.queue_depth covering how many delegations one turn issues, or every outcome this \
-capsule delegates for will be posted to a session that has already exited. Every sub-capsule this \
-capsule delegated to also winds down when this capsule exits, finished or not.";
-
-/// Pure decision for the delegation-lifecycle warning, split out of
-/// [`warn_for_unreachable_delegation_outcomes`] the same way `sandbox::aggregate_bounding_warning`
-/// is split out of its emitter, so a test can assert it without capturing stderr.
-///
-/// Fires exactly where an outcome has nowhere to land: a capsule that can delegate and either
-/// exits after its task or accepts no second one. Never a refusal — a capsule that delegates and
-/// deliberately does not wait for the answer is legitimate, and this is what makes that a choice
-/// rather than an accident. Its sub-capsules still end when it exits: each holds a spawner
-/// lifeline whose write end only this capsule's process holds.
-pub(crate) fn unreachable_delegation_outcomes_warning(
-    can_delegate: bool,
-    lifecycle: &LifecycleConfig,
-) -> Option<(&'static str, &'static str)> {
-    (can_delegate && !lifecycle.can_receive_background_tasks())
-        .then_some((W_SEC_020, NO_COMPLETION_LANE_WARNING))
-}
-
-/// Fires at every launch, not just once.
-pub(crate) fn warn_for_unreachable_delegation_outcomes(
-    workdir: &Path,
-    can_delegate: bool,
-    lifecycle: &LifecycleConfig,
-) {
-    if let Some((code, message)) = unreachable_delegation_outcomes_warning(can_delegate, lifecycle)
-    {
-        let link = security_warning_link(code);
-        crate::runtime_err!("[capsule-runtime] warning[{code}]: {message} ({link})");
-        agent::append_bootstrap_log(
-            workdir,
-            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
-        );
-    }
-}
-
 const NO_SHELL_COMPLETION_LANE_WARNING: &str = "this capsule declares \
 capabilities.shell.allow, but its lifecycle block cannot receive a background command's \
 completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, \
@@ -4604,8 +4893,9 @@ lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every comm
 demotes will be discarded at session end and reported to the operator instead of to the agent.";
 
 /// Pure decision for the shell-lifecycle warning, split out of
-/// [`warn_for_unreachable_shell_completions`] on the same terms as
-/// [`unreachable_delegation_outcomes_warning`], so a test can assert it without capturing stderr.
+/// [`warn_for_unreachable_shell_completions`] the same way
+/// [`crate::sandbox::aggregate_bounding_warning`] is split out of its emitter, so a test can assert
+/// it without capturing stderr.
 ///
 /// Fires exactly where a completion has nowhere to land: a capsule that can run shell commands and
 /// either exits after its task or accepts no second one. Deliberately not conditioned on
@@ -4709,7 +4999,7 @@ pub struct SecretShapedEnvGrant {
 
 /// Pure decision for the `capabilities.env.allow` secret warning, split out of
 /// [`warn_on_secret_shaped_env_grants`] on the same terms as
-/// [`unreachable_delegation_outcomes_warning`], so a test can assert it without capturing stderr.
+/// [`unreachable_shell_completions_warning`], so a test can assert it without capturing stderr.
 ///
 /// One entry per distinct name that [`is_credential_shaped_env_name`] flags and the credential
 /// backstop keeps, in declaration order — a name repeated in `env.allow` is judged once, because
@@ -6019,12 +6309,11 @@ pub(crate) struct CapsuleStoreState {
     /// arrived on and to no other. The value is what the trace's `harness_session_forgotten`
     /// record names as the asker.
     pub(crate) current_forget_harness_session: Option<&'static str>,
-    /// Every delegation this session started and has not yet closed, by `dlg_` id.
+    /// The running task's delegations, by `dlg_` id, from launch until the task delivers or ends
+    /// each one.
     ///
-    /// Filled from the launch notice, read from three places: the completion that arrives as a
-    /// task closes its row from the child's own `completion.json`, a cancel names whatever is
-    /// still in flight, and the plane's own failure path releases a launch that will never
-    /// report. Shared with the A2A door, which snapshots it without taking any other lock.
+    /// Filled from the launch notice under the task in scope. Shared with the A2A door, which
+    /// hands it every completion and snapshots it for a cancel's residue.
     pub(crate) live_delegations: Arc<crate::cancel::LiveDelegations>,
     // ── Detached shell ───────────────────────────────────────────────────────────
     /// Where a demoted command registers itself and delivers its completion. `None` is what
@@ -7760,8 +8049,8 @@ impl CapsuleStoreState {
     ///
     /// The registration into [`Self::live_delegations`] happens on the launching thread, in the
     /// plane's own launch callback, rather than here: this write is `async` and its wait can be
-    /// cancelled, and a delegation that is up must be nameable whether or not the call that
-    /// started it ever returned.
+    /// cancelled, and a delegation that is up must be nameable — and ended with its task — whether
+    /// or not the call that started it ever returned.
     async fn write_delegation_start(&self, notice: &crate::delegation_plane::DelegationLaunch) {
         if let Some(trace) = &self.peer_trace {
             trace
@@ -7776,65 +8065,6 @@ impl CapsuleStoreState {
         }
     }
 
-    /// Close the `delegation_start` this completion belongs to, as the task carrying it begins.
-    ///
-    /// A delegation that returns on start has not ended when its tool call returns, so this is
-    /// where its terminal `delegation` line is written — one line per delegation still, joined to
-    /// the start by the `dlg_` id both carry, and to the completion task by the same id on its
-    /// `task_start`.
-    ///
-    /// `outcome` and `reason` come out of the child's own `completion.json`, never out of the
-    /// completion's message text: both reporters write that file before they post, so the
-    /// structured record is on disk by the time this task exists. A file that cannot be read still
-    /// closes the row — a delegation left permanently in flight in the trace is a worse record
-    /// than one whose outcome is stated as unknown.
-    async fn close_started_delegation(&self, delegation_id: &str) {
-        let Some(started) = self.live_delegations.finish(delegation_id) else {
-            // A completion for a delegation this session did not start: another session's, or one
-            // whose start was never recorded. `mur trace show` renders the terminal line on its
-            // own row, which is the honest reading of it.
-            return;
-        };
-        let Some(trace) = &self.peer_trace else {
-            return;
-        };
-        let recorded = crate::delegation::read_completion(&started.workdir);
-        let (outcome, reason, child_session_id, duration_ms) = match recorded {
-            Some(outcome) => (
-                outcome.status.as_str().to_string(),
-                outcome.detail.clone(),
-                Some(outcome.session_id.clone()).filter(|id| !id.is_empty()),
-                outcome.duration_ms,
-            ),
-            None => (
-                "unknown".to_string(),
-                Some(format!(
-                    "a completion arrived for this delegation, but no readable {} was left in {}",
-                    crate::delegation::COMPLETION_FILE,
-                    started.workdir.display()
-                )),
-                None,
-                started
-                    .started
-                    .elapsed()
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
-        };
-        trace
-            .write_delegation(
-                &started.capsule,
-                &started.version,
-                Some(delegation_id.to_string()),
-                child_session_id,
-                duration_ms,
-                &outcome,
-                reason,
-            )
-            .await;
-    }
-
     /// `delegate-task`: hand one task to one sub-capsule and return as soon as it holds it.
     ///
     /// The agent names a capsule, a version and a task. Everything else — the daemon's address,
@@ -7843,16 +8073,20 @@ impl CapsuleStoreState {
     /// never enters the model's context. That is why a delegating capsule needs no
     /// `capabilities.network.allow` entry for the daemon: it never addresses it.
     ///
-    /// **The call returns when the child starts, not when it finishes.** What the child did
-    /// arrives afterwards as a `completion`-origin task in the background lane, carrying this
-    /// delegation's `dlg_` id — so one turn can issue several delegations and carry on while all
-    /// of them run. The `data` this returns therefore names a delegation in flight and carries no
-    /// answer: `output` and `result_path` are absent, and `child_workdir` is where the child's
-    /// own trace and, later, its result will be.
+    /// **The call returns when the child starts, not when it finishes.** The delegation belongs
+    /// to the running task: it is registered in [`Self::live_delegations`] under that task, the
+    /// child's handle is adopted there, and once the model ends its turn
+    /// [`run_task_with_reopens`] waits for the child's outcome and continues this same task with
+    /// it — or ends the child, when the task ends any other way. One turn can therefore issue
+    /// several delegations. The `data` this returns names a delegation in flight and carries no
+    /// answer: `output` and `result_path` are absent, and `child_workdir` is where the child's own
+    /// trace and, later, its result will be.
     ///
-    /// Still run on a blocking thread, exactly as the shell branch is, because the plane's three
-    /// steps — the daemon, the launch and the delivery — are blocking calls; it is now the length
-    /// of a launch rather than the length of a child's run.
+    /// Refused outside a task: nothing would deliver the outcome or end the child.
+    ///
+    /// Run on a blocking thread, exactly as the shell branch is, because the plane's three steps —
+    /// the daemon, the launch and the delivery — are blocking calls; it is the length of a launch
+    /// rather than the length of a child's run.
     async fn dispatch_delegate_task(
         &self,
         input: murmur::tool::run::ToolInput,
@@ -7868,6 +8102,14 @@ impl CapsuleStoreState {
             return Err(format!(
                 "'{DELEGATE_TASK_TOOL}' needs a capabilities.spawn.allow list in murmur.yaml; \
                  this capsule declares none"
+            ));
+        };
+        // A delegation is accounted for by the task that made it; outside every task nothing
+        // would deliver its outcome or end its child.
+        let Some(task_id) = self.live_delegations.task_id() else {
+            return Err(format!(
+                "'{DELEGATE_TASK_TOOL}' is answered only while a task runs; this session is \
+                 running none"
             ));
         };
 
@@ -7890,30 +8132,30 @@ impl CapsuleStoreState {
             context_id: self.current_context_id.clone().unwrap_or_default(),
             launched: Some(Arc::new(
                 move |notice: crate::delegation_plane::DelegationLaunch| {
-                    // Registered here, synchronously on the launching thread, so a child that is up is
-                    // in the live set before anything can wait on it — including when the wait below
-                    // is cancelled and the trace write never happens.
+                    // Registered here, synchronously on the launching thread and before the child is
+                    // handed its task, so a child that is up is in the task's set before its outcome
+                    // can arrive — including when the wait below is cancelled and the trace write
+                    // never happens.
                     live.register(
                         notice.delegation_id.clone(),
                         crate::cancel::LiveDelegation {
+                            task_id: task_id.clone(),
                             workdir: child_root.join(&notice.child_workdir),
                             capsule: notice.capsule.clone(),
                             version: notice.version.clone(),
                             child_session_id: notice.child_session_id.clone(),
                             child_workdir: notice.child_workdir.clone(),
                             started: std::time::Instant::now(),
+                            child: None,
+                            arrived: false,
                         },
                     );
                     let _ = launch_tx.send(notice);
                 },
             )),
-            // The completion this delegation posts inherits the delegating task's class, the same
-            // derivation a demoted shell command's completion uses. `None` — the script-capsule
-            // path — is read as untrusted by the plane.
-            trust: self.current_task_provenance.map(|task| task.trust()),
         };
-        // A cancel that lands mid-launch must not queue behind it: the child is already the live
-        // set's problem, and the person who stopped the task is waiting on an answer.
+        // A cancel that lands mid-launch must not queue behind it: the child is already in the
+        // task's set, which ends it, and the person who stopped the task is waiting on an answer.
         let cancel = self.task_cancel_signal();
         let mut starting = tokio::task::spawn_blocking(move || plane.start(&request, &origin));
         let mut notices_open = true;
@@ -7929,15 +8171,16 @@ impl CapsuleStoreState {
                     if let Some(signal) = &cancel {
                         signal.note_phase(crate::cancel::PHASE_DELEGATION);
                     }
-                    // Whatever the launch is doing continues on its own thread; nothing here kills
-                    // it. A child that came up is in the live set and is named as residue.
+                    // The launch finishes on its own thread, and the handle it returns is dropped
+                    // there, which ends the child. A child that came up is in the task's set, so
+                    // the cancel's residue names it and the task's end closes its row.
                     while let Ok(notice) = launch_rx.try_recv() {
                         self.write_delegation_start(&notice).await;
                     }
                     return Err(format!(
                         "'{DELEGATE_TASK_TOOL}' was canceled while the sub-capsule was starting; \
-                         any child that came up is still running and is named in the cancel's \
-                         residue"
+                         any child that came up is ended with the task and is named in the \
+                         cancel's residue"
                     ));
                 }
                 notice = launch_rx.recv(), if notices_open => match notice {
@@ -7953,19 +8196,23 @@ impl CapsuleStoreState {
         while let Ok(notice) = launch_rx.try_recv() {
             self.write_delegation_start(&notice).await;
         }
-        let result = joined.map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
+        let crate::delegation_plane::StartedDelegation { result, child } =
+            joined.map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
+        if let Some(child) = child {
+            self.live_delegations.adopt(&result.delegation_id, child);
+        }
 
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let status = result.status;
         // A delegation that started has not ended, so its terminal `delegation` line is not
-        // written here: it is written when the completion arrives, by
-        // [`Self::close_started_delegation`]. Only a delegation that will never produce a
-        // completion — the daemon refused it, or the child never took its task — is closed now.
+        // written here: the task writes it when the outcome is delivered or when it ends the
+        // child, in [`run_task_with_reopens`]. Only a delegation that will never produce an
+        // outcome — the daemon refused it, or the child never took its task — is closed now.
         if status != crate::delegation_plane::DelegationStatus::Started {
             // A launch that got far enough to be announced but not far enough to be started is
-            // closed here, so the row it opened is not also waiting for a completion that will
-            // never come.
-            self.live_delegations.release(&result.delegation_id);
+            // closed here, so the row it opened is not also waiting for an outcome that will
+            // never come. The failed start has already ended its child.
+            self.live_delegations.discard(&result.delegation_id);
             if let Some(trace) = &self.peer_trace {
                 trace
                     .write_delegation(
@@ -9331,9 +9578,12 @@ pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
 /// sub-capsule is running and holding its task, without its answer; that `version` is exact
 /// because there is no `latest` anywhere in this system; that the task text is the whole of what
 /// the sub-capsule is told; which fields [`delegate_task_result_data`] returns and why `output`
-/// and `result_path` are absent; that the outcome arrives later as a separate task naming the
-/// result file; and that there is nothing to poll in the meantime. It is identical on every launch
-/// for a given `spawn_allow`, because it sits in the cached prompt prefix.
+/// and `result_path` are absent; that once the turn ends the task waits for every sub-capsule and
+/// continues in this conversation with each outcome, naming the result file; that the delegation
+/// deadline ends a sub-capsule still running; that there is nothing to poll; and that a task that
+/// ends any other way ends its sub-capsules with it. It is the same on every lifecycle and
+/// identical on every launch for a given `spawn_allow`, because it sits in the cached prompt
+/// prefix.
 fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
     let allowed = serde_json::to_string(spawn_allow).unwrap_or_else(|_| "[]".to_string());
     let schema = format!(
@@ -9341,6 +9591,7 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
     );
     let started = crate::delegation_plane::DelegationStatus::Started.as_str();
     let failed = crate::delegation_plane::DelegationStatus::Failed.as_str();
+    let terminated = crate::delegation::DelegationStatus::Terminated.as_str();
     let description = format!(
         "Hand one task to one sub-capsule and return as soon as it is running and holding that \
          task. This call does not wait for the sub-capsule to finish and never returns its \
@@ -9352,11 +9603,14 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          `child_workdir`, along with the `capsule` and `version` it was given; there is no \
          `output` and no `result_path`, because nothing has been produced yet. A refused \
          delegation comes back as an error saying why; one that could not be started has \
-         `status: {failed}` and an `output` saying why. What the sub-capsule did arrives later \
-         as a separate task carrying the same `delegation_id`, its final status and the path of \
-         its result file; read that file for its answer. There is nothing to poll and no tool \
-         that waits for it: carry on with other work or end your turn, and handle the outcome \
-         when it arrives."
+         `status: {failed}` and an `output` saying why. Once you end your turn, this task waits \
+         for every sub-capsule it started and continues in this conversation with each one's \
+         outcome: its `delegation_id`, its final status, and either the path of its result \
+         file, which you read for its answer, or `result: none` when it wrote no file. A \
+         sub-capsule still running at the delegation deadline is ended and reported as \
+         `{terminated}`. There is nothing to poll: start every delegation this task needs, then \
+         end your turn. A task that is cancelled, or that ends any other way while a sub-capsule \
+         is still running, ends that sub-capsule with it."
     );
     native_tool_manifest_yaml(DELEGATE_TASK_TOOL, description, schema)
 }
@@ -10626,10 +10880,6 @@ async fn enqueue_detached_report(
                 // to it.
                 traceparent: None,
                 source: crate::a2a::SOURCE_DETACHED_SHELL,
-                // A demoted shell command reports on a work id, not on a delegation: no
-                // sub-capsule was launched, so there is no delegation for the trace to join this
-                // task to.
-                delegation_id: None,
                 // Nobody asked for anything to be forgotten: the runtime enqueued this task for
                 // itself.
                 forget_session: false,
@@ -10662,7 +10912,6 @@ async fn enqueue_detached_report(
             provenance: report.provenance,
             traceparent: None,
             source: crate::a2a::SOURCE_DETACHED_LOST,
-            delegation_id: None,
             forget_session: false,
             caller_member: None,
         },
@@ -10846,9 +11095,11 @@ mod tests {
         for said in [
             "return as soon as it is running and holding that task",
             "does not wait for the sub-capsule to finish",
-            "arrives later as a separate task carrying the same `delegation_id`",
+            "this task waits for every sub-capsule it started",
             "the path of its result file",
+            "`result: none`",
             "There is nothing to poll",
+            "ends that sub-capsule with it",
         ] {
             assert!(
                 description.contains(said),
@@ -10859,6 +11110,8 @@ mod tests {
             "wait for its answer",
             "does not return until",
             "Returns its answer",
+            "arrives later as a separate task",
+            "carry on with other work",
         ] {
             assert!(
                 !description.contains(forbidden),
@@ -11349,48 +11602,6 @@ inference:
             task_acceptance,
             after_task,
             ..LifecycleConfig::default()
-        }
-    }
-
-    /// A capsule that can delegate and leaves `lifecycle` at its defaults is warned, because
-    /// `after_task: exit` ends the session before any outcome can arrive.
-    #[test]
-    fn warn_for_unreachable_delegation_outcomes_writes_the_code_and_link_to_bootstrap_log() {
-        let temp = TempDir::new().unwrap();
-        warn_for_unreachable_delegation_outcomes(temp.path(), true, &LifecycleConfig::default());
-        let log = bootstrap_log_contents(temp.path());
-
-        assert!(log.contains(W_SEC_020), "log was: {log}");
-        assert!(
-            log.contains(&security_warning_link(W_SEC_020)),
-            "log was: {log}"
-        );
-        assert!(log.contains("lifecycle.task_acceptance"), "log was: {log}");
-        assert!(log.contains("lifecycle.after_task"), "log was: {log}");
-    }
-
-    /// The only lifecycle a completion can reach is `queue` + `sleep`; a capsule that declares no
-    /// `capabilities.spawn.allow` is never warned whatever it declares.
-    #[test]
-    fn only_a_delegating_capsule_that_cannot_be_told_is_warned() {
-        assert!(unreachable_delegation_outcomes_warning(
-            true,
-            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep)
-        )
-        .is_none());
-        for lifecycle in [
-            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
-            lifecycle(TaskAcceptance::Single, AfterTask::Sleep),
-            lifecycle(TaskAcceptance::None, AfterTask::Sleep),
-        ] {
-            assert!(
-                unreachable_delegation_outcomes_warning(true, &lifecycle).is_some(),
-                "{lifecycle:?} cannot receive a completion"
-            );
-            assert!(
-                unreachable_delegation_outcomes_warning(false, &lifecycle).is_none(),
-                "a capsule that cannot delegate is not warned about delegating"
-            );
         }
     }
 
@@ -14247,7 +14458,6 @@ inference:
                 "ctx_1",
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
-                None,
                 3,
             )
             .await
@@ -17181,7 +17391,6 @@ inference:
                 "ctx_1",
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
-                None,
                 8,
             )
             .await
@@ -17574,7 +17783,6 @@ inference:
                 "ctx_1",
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
-                None,
                 8,
             )
             .await
@@ -19603,17 +19811,34 @@ mod member_call_tests {
     }
 
     /// The continued task's `task.md` is the original, every reopen's feedback, then every batch
-    /// of member answers; with no answers it is exactly the reopened task.
+    /// of member answers, then every batch of delegation outcomes; with neither it is exactly the
+    /// reopened task.
     #[test]
-    fn a_restarted_continuation_reads_the_task_feedback_and_answers() {
+    fn a_restarted_continuation_reads_the_task_feedback_and_outcomes() {
         let feedback = vec![("check".to_string(), "be brief".to_string())];
         assert_eq!(
-            build_continued_task_md("do it\n", &feedback, &[]),
+            build_continued_task_md("do it\n", &feedback, &[], &[]),
             build_reopen_task_md("do it\n", &feedback)
         );
-        assert_eq!(build_continued_task_md("do it", &[], &[]), "do it");
-        let answered = build_continued_task_md("do it", &[], &["ANSWERS".to_string()]);
+        assert_eq!(build_continued_task_md("do it", &[], &[], &[]), "do it");
+        let answered = build_continued_task_md("do it", &[], &["ANSWERS".to_string()], &[]);
         assert_eq!(answered, "do it\n\n---\n\n# Member answers\n\nANSWERS\n");
+        let delegated = build_continued_task_md("do it", &[], &[], &["OUTCOMES".to_string()]);
+        assert_eq!(
+            delegated,
+            "do it\n\n---\n\n# Delegation outcomes\n\nOUTCOMES\n"
+        );
+        let both = build_continued_task_md(
+            "do it",
+            &[],
+            &["ANSWERS".to_string()],
+            &["OUTCOMES".to_string()],
+        );
+        assert_eq!(
+            both,
+            "do it\n\n---\n\n# Member answers\n\nANSWERS\n\n---\n\n# Delegation outcomes\n\n\
+             OUTCOMES\n"
+        );
     }
 
     /// A restarted attempt reads the same runtime line a continued one does: the answers message
@@ -19632,7 +19857,7 @@ mod member_call_tests {
             }],
             &[],
         );
-        let rewritten = build_continued_task_md("do it", &[], &[message]);
+        let rewritten = build_continued_task_md("do it", &[], &[message], &[]);
         assert!(
             rewritten.contains(
                 "# Member answers\n\n[call-member] call mcl_1 to worker ended completed:\n"

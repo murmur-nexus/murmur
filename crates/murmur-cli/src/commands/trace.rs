@@ -1375,11 +1375,35 @@ fn artifact_pulled_show_row(e: &ArtifactPulledEvent) -> String {
     )
 }
 
+/// What a `task_canceled` record names, as `mur trace show` prints it. A detached shell command
+/// keeps running after the cancel. A delegation is named as in flight rather than as running: a
+/// current runtime's cancelled task ends it, and its terminal `delegation` record follows, while a
+/// trace from an older runtime left it running.
+fn cancel_residue(detached_work_ids: &[String], delegation_ids: &[String]) -> String {
+    let mut named = Vec::new();
+    if !detached_work_ids.is_empty() {
+        named.push(format!("still running: {}", detached_work_ids.join(", ")));
+    }
+    if !delegation_ids.is_empty() {
+        named.push(format!(
+            "delegations in flight: {}",
+            delegation_ids.join(", ")
+        ));
+    }
+    if named.is_empty() {
+        "nothing left running".to_string()
+    } else {
+        named.join("; ")
+    }
+}
+
 /// One `task_canceled` trace record, surfaced in `mur trace show`.
 struct CancelRecord {
     phase: String,
-    /// Every id the runtime left running: detached work first, then delegations.
-    still_running: Vec<String>,
+    /// Detached shell commands, which keep running after the cancel.
+    detached_work_ids: Vec<String>,
+    /// Delegations in flight when the task stopped.
+    delegation_ids: Vec<String>,
 }
 
 /// One `task_reopened` trace record, surfaced in `mur trace show`.
@@ -1899,11 +1923,8 @@ fn compute_metrics(
             TraceEvent::TaskCanceled(e) => {
                 cancels.push(CancelRecord {
                     phase: e.phase,
-                    still_running: e
-                        .detached_work_ids
-                        .into_iter()
-                        .chain(e.delegation_ids)
-                        .collect(),
+                    detached_work_ids: e.detached_work_ids,
+                    delegation_ids: e.delegation_ids,
                 });
             }
             TraceEvent::TaskRejected(e) => rejections.push(e),
@@ -2744,12 +2765,11 @@ fn print_show(m: &TraceMetrics) {
         println!();
         println!("── Cancelled ────────────────────────────────────");
         for c in &m.cancels {
-            let still_running = if c.still_running.is_empty() {
-                "nothing left running".to_string()
-            } else {
-                format!("still running: {}", c.still_running.join(", "))
-            };
-            println!("task_canceled  at {}  {still_running}", c.phase);
+            println!(
+                "task_canceled  at {}  {}",
+                c.phase,
+                cancel_residue(&c.detached_work_ids, &c.delegation_ids)
+            );
         }
     }
 
@@ -3679,23 +3699,12 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                 .map(|context| format!("  {context}"))
                 .unwrap_or_default()
         ),
-        TraceEvent::TaskCanceled(e) => {
-            let still_running = e.detached_work_ids.len() + e.delegation_ids.len();
-            let residue = if still_running == 0 {
-                "no residue".to_string()
-            } else {
-                format!(
-                    "{still_running} still running: {}",
-                    e.detached_work_ids
-                        .iter()
-                        .chain(e.delegation_ids.iter())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            format!("{}{}  {residue}", kind("task_canceled"), e.phase)
-        }
+        TraceEvent::TaskCanceled(e) => format!(
+            "{}{}  {}",
+            kind("task_canceled"),
+            e.phase,
+            cancel_residue(&e.detached_work_ids, &e.delegation_ids)
+        ),
         TraceEvent::TaskRejected(e) => format!(
             "{}{}  {}",
             kind("task_rejected"),
@@ -4899,6 +4908,19 @@ mod tests {
             rejected_show_row(&e),
             "task_rejected  tsk_1  session_stopped  source unknown"
         );
+    }
+
+    /// A `task_canceled` row names a detached shell command as still running and a delegation as
+    /// in flight, and says so when the record names nothing.
+    #[test]
+    fn task_canceled_names_detached_work_running_and_delegations_in_flight() {
+        let line = r#"{"event_type":"task_canceled","task_id":"tsk_1","phase":"delegation","detached_work_ids":["wrk_1"],"delegation_ids":["dlg_1","dlg_2"]}"#;
+        assert_eq!(
+            row(line),
+            "task_canceled delegation  still running: wrk_1; delegations in flight: dlg_1, dlg_2"
+        );
+        let bare = r#"{"event_type":"task_canceled","task_id":"tsk_1","phase":"turn","detached_work_ids":[],"delegation_ids":[]}"#;
+        assert_eq!(row(bare), "task_canceled turn  nothing left running");
     }
 
     /// A `formation_ended` record's `steps` row and `show` row both name the formation.

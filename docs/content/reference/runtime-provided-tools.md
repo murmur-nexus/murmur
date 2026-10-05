@@ -17,7 +17,7 @@ Each one appears only when the declaration in the second column is present.
 | One per shell binary | [`capabilities.shell.allow`](manifest.md#shell-allow) | Runs that binary as a subprocess in the accessible workdir |
 | `share-file` | [`exports.peer_files`](manifest.md#field-exports-peer-files) | Mints a [peer-file handle](resource-plane.md#peer-plane) for one file under the declared export root |
 | `fetch-peer-file` | [`capabilities.peer_fetch`](manifest.md#field-peer-fetch) | Redeems a handle a peer sent and stores the file in this capsule's workdir |
-| `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; the outcome arrives afterwards as a background task — see [The delegation tool](roost-api.md#the-delegation-tool) |
+| `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; once the turn ends, the task waits and continues with the outcome — see [The delegation tool](roost-api.md#the-delegation-tool) |
 | `submit-plan` | [`capabilities.plan.submit`](manifest.md#field-capabilities) | Runs one plan of steps against this session's own tools and returns every step's result — see [Plans](plans.md) |
 | `switch-driver` | [`control.agent_settings: [inference.driver]`](manifest.md#field-control) | Selects the [driver choice](manifest.md#inference-alternates) the agent's next inference call is served by — see [`switch-driver`](#switch-driver) |
 | `call-member` | A [`reachability`](roster.md#reachability) rule in the formation's `roster.yaml` that lets this member call another | Hands one task to another formation member and returns as soon as that member holds it; the answer arrives later in the same task — see [`call-member`](#call-member) |
@@ -182,7 +182,9 @@ the task ends as its attempt ended:
 | The model ends its last allowed turn | Not waited for: each is recorded `abandoned` | Recorded `delivered: false` |
 | Fails, runs out of turns, is cancelled, or is stopped by `SIGTERM` or its formation ending | Each is recorded `abandoned` | Recorded `delivered: false` |
 
-A task cancelled while it waits ends `canceled`.
+A task cancelled while it waits ends `canceled`. A task with `delegate-task` delegations
+outstanding as well waits for both kinds together and continues with whatever has arrived of
+either, answers first — see [How the outcome arrives](roost-api.md#how-the-outcome-arrives).
 
 | Bound | Value |
 |---|---|

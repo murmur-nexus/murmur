@@ -284,8 +284,8 @@ Calls that can be in flight at the same time:
 
 - one agent turn per running session
 - one agent turn per [delegated child](roost-api.md#the-delegation-tool), since each child is a
-  session of its own and keeps running after `delegate-task` returns, until the capsule that
-  delegated to it [exits](roost-api.md#spawner-lifeline)
+  session of its own and keeps running after `delegate-task` returns, until it finishes or the
+  task that delegated to it [ends it](roost-api.md#how-the-outcome-arrives)
 - one `run-inference` call per [`execution_mode: async`](manifest.md#hook-contract-fields) hook,
   which runs alongside the agent turn
 

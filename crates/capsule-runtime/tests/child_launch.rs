@@ -920,34 +920,30 @@ fn dropping_a_launched_child_terminates_and_reaps_it() {
     );
 }
 
-/// `release` is the one way out of that: the parent stops owning the child's lifetime, and the
-/// handle is consumed rather than dropped normally. The process keeps running, and this suite ends
-/// it itself, because these launches name no completion address and so start no watcher — after a
-/// release nothing else in the runtime will.
+/// There is no way out of that: a launched child lives exactly as long as the handle that
+/// launched it. Held, it keeps running and is not seen exited; dropped, it is ended and reaped.
+/// A delegating task holds the handle until the outcome is delivered or the task ends the child.
 #[test]
-fn a_released_child_survives_the_handle_that_launched_it() {
+fn a_launched_child_lives_exactly_as_long_as_its_handle() {
     let parent = Parent::new();
-    let pid = {
-        let child = parent.launch("child-agent", &[]);
-        let pid = child.pid();
-        assert!(process_is_alive(pid));
+    let child = parent.launch("child-agent", &[]);
+    let pid = child.pid();
+    assert!(process_is_alive(pid));
 
-        child.release();
-        pid
-    };
-
-    // Long enough that a `Drop` which killed would have been observed.
+    // Long enough that a child which outlived nothing, or died on its own, would be observed.
     std::thread::sleep(Duration::from_millis(500));
+    assert!(process_is_alive(pid), "a held child keeps running");
     assert!(
-        process_is_alive(pid),
-        "a released child is not signalled when its launch handle is dropped"
+        !child.has_exited(),
+        "a held, running child is not seen exited"
     );
 
-    // Nothing owns this process now, so the test ends it rather than leaving it holding a daemon
-    // slot for the life of the binary.
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status();
+    drop(child);
+    wait_for(
+        "the child to end with its handle",
+        Duration::from_secs(10),
+        || !process_is_alive(pid),
+    );
 }
 
 /// What `/proc/<pid>/fd/<fd>` points at, e.g. `pipe:[1234]`.

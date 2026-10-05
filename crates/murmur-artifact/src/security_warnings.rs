@@ -182,17 +182,9 @@ pub const W_SEC_018: &str = "W-SEC-018";
 /// by an older one. Fires from `mur run` and from `mur doctor`, in the same words.
 pub const W_SEC_019: &str = "W-SEC-019";
 
-/// `capabilities.spawn.allow` is non-empty and the declared `lifecycle` block cannot receive a
-/// delegation's outcome, so every delegation this capsule makes reports into a session that has
-/// already gone.
-///
-/// `delegate-task` returns as soon as the sub-capsule is running and holding its task; the outcome
-/// arrives afterwards as a `completion`-origin task in the background lane. A capsule that leaves
-/// `lifecycle.after_task` at `exit`, or sets `lifecycle.task_acceptance` to anything but `queue`,
-/// has no session left by then. Silenced by declaring `lifecycle.task_acceptance: queue` with
-/// `lifecycle.after_task: sleep`. Never a refusal: a capsule that delegates and deliberately does
-/// not wait is legitimate, and the warning is what makes that a choice rather than an accident.
-pub const W_SEC_020: &str = "W-SEC-020";
+// W-SEC-020 is retired and its code is not reused. A delegation's outcome is delivered into the
+// task that made it on every lifecycle, and that task ends any sub-capsule still running when it
+// ends. The diagnostics page keeps the `#w-sec-020` anchor.
 
 /// The capsule was given a cgroup scope and the declared
 /// `capabilities.resources.cgroup_io_bytes_per_sec` ceiling did not apply to it, so the capsule's
@@ -343,8 +335,8 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
-            W_SEC_025, W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032,
+            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025,
+            W_SEC_027, W_SEC_028, W_SEC_029, W_SEC_030, W_SEC_031, W_SEC_032,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

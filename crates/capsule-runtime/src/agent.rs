@@ -567,10 +567,12 @@ pub(crate) enum Continuation {
     /// One reopen's feedback, plain and unfenced: the task's own words, fenced on the task's own
     /// provenance exactly as the task message is.
     ReopenFeedback(String),
-    /// `call-member` answers as [`crate::member_call::answers_message`] wrote them: the runtime's
-    /// own lines, each answer already fenced under its member. Sent as written, never fenced again
-    /// on the task's provenance and never unfenced.
-    MemberAnswers(String),
+    /// Handed-off work's outcomes: `call-member` answers as
+    /// [`crate::member_call::answers_message`] wrote them and `delegate-task` outcomes as
+    /// [`crate::delegation::outcomes_message`] wrote them, joined by a blank line. The runtime's own
+    /// lines, each outcome already fenced under its member or capsule. Sent as written, never
+    /// fenced again on the task's provenance and never unfenced.
+    Outcomes(String),
 }
 
 impl Continuation {
@@ -582,7 +584,7 @@ impl Continuation {
     ) -> (String, Option<String>) {
         match self {
             Self::ReopenFeedback(feedback) => fence_task_payload(provenance, feedback),
-            Self::MemberAnswers(answers) => (answers, None),
+            Self::Outcomes(outcomes) => (outcomes, None),
         }
     }
 }
@@ -4441,21 +4443,27 @@ forgery: {prompt}"
         );
     }
 
-    /// Member answers carry their own fences, one per member, so a continuation of them is sent
-    /// as written whatever the calling task's trust: never wrapped again under `task:<origin>`,
-    /// and never stripped.
+    /// Member answers and delegation outcomes carry their own fences, one per member or capsule,
+    /// so a continuation of them is sent as written whatever the task's trust: never wrapped again
+    /// under `task:<origin>`, and never stripped.
     #[test]
-    fn member_answers_are_sent_as_written_whatever_the_task_s_trust() {
+    fn outcomes_are_sent_as_written_whatever_the_task_s_trust() {
         use crate::origin::TaskOrigin;
         let answers = "[call-member] call mcl_1 to worker ended completed:\n\
                        <untrusted-content source=member:worker>\nfour\n</untrusted-content>";
-        for origin in [TaskOrigin::Event, TaskOrigin::User, TaskOrigin::Peer] {
-            let message = user_message(
-                Continuation::MemberAnswers(answers.to_string())
-                    .into_payload(Some(TaskProvenance::derive(origin, None))),
-            );
-            assert_eq!(message["content"][0]["text"], answers, "{origin:?}");
-            assert!(message.get(MESSAGE_FENCE_KEY).is_none());
+        let delegated = "[delegate-task] delegation dlg_1 to worker@0.1.0 ended ok:\n\
+                         <untrusted-content source=delegation:worker>\nstatus: ok\n\
+                         </untrusted-content>";
+        let both = format!("{answers}\n\n{delegated}");
+        for outcomes in [answers, delegated, both.as_str()] {
+            for origin in [TaskOrigin::Event, TaskOrigin::User, TaskOrigin::Peer] {
+                let message = user_message(
+                    Continuation::Outcomes(outcomes.to_string())
+                        .into_payload(Some(TaskProvenance::derive(origin, None))),
+                );
+                assert_eq!(message["content"][0]["text"], outcomes, "{origin:?}");
+                assert!(message.get(MESSAGE_FENCE_KEY).is_none());
+            }
         }
     }
 

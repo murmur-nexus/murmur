@@ -406,12 +406,12 @@ Cancelling a task that has already reached `completed`, `failed`, `rejected` or 
 that state and changes nothing. A task id the capsule never held is the one error: JSON-RPC code
 `-32001`, `Task not found`.
 
-### What the cancel left running
+### What the cancel names { #what-the-cancel-left-running }
 
-Nothing else is stopped. A detached shell command keeps its own lifecycle, and a delegated
-sub-capsule is left running exactly as a delegation deadline leaves it. When either was running at
-the moment the cancel was answered, the response carries an artifact named `residue` with one part
-per item, each part's `text` a JSON object:
+A detached shell command keeps its own lifecycle. A sub-capsule the task delegated to is ended by
+the cancelled task before its `task_end`. When either was in flight at the moment the cancel was
+answered, the response carries an artifact named `residue` with one part per item, each part's
+`text` a JSON object:
 
 ```json
 {
@@ -429,12 +429,14 @@ per item, each part's `text` a JSON object:
 }
 ```
 
-A cancel with nothing left running omits the `artifacts` key entirely, so "nothing else is
-running" is distinguishable from "these things are" without parsing an empty list.
+A cancel with nothing in flight omits the `artifacts` key entirely, so "nothing was in flight" is
+distinguishable from "these things were" without parsing an empty list. `mur cancel` prints a
+detached shell command as `running:` and a delegation as `ended:` — see
+[`mur cancel`](../reference/cli.md#mur-cancel).
 
 The trace tells the same story from the loop's side: a
 [`task_canceled`](../reference/observability-schemas.md#task-canceled) event naming the wait that
-was interrupted and what was still running when the loop stopped, and a `task_end` carrying
+was interrupted and what was in flight when the loop stopped, and a `task_end` carrying
 `exit_status: "canceled"`. A process capsule adds a `harness_interrupt` event naming the interrupt
 that went out and a `harness_exit` with `cause: "canceled"`, which `mur trace show` prints under
 `── Harness ──`.

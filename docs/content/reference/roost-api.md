@@ -385,11 +385,15 @@ the top down: a descendant `d` levels below the process that ended exits within 
 and usually well under a second per level. With the default [`--max-depth`](#the-depth-budget) of
 3, every descendant of a killed top-level capsule is gone within 60 seconds.
 
-| Ending | Effect on the child |
+| Ending | Effect on a `delegate-task` child |
 |---|---|
-| The parent's process exits, or is killed | The child winds down |
-| The parent's session cancels the task that delegated (`tasks/cancel`) | None: the child keeps running while the parent's process lives |
-| The parent ends the delegation itself, or the [delegation deadline](#bounds) passes | The child is killed |
+| The parent's process is killed | The child winds down |
+| The delegating task is cancelled — `tasks/cancel`, `session/stop`, or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task kills the child before it ends, and records it `terminated` |
+| The delegating task ends any other way while the child is still running | The task kills the child, and records it `terminated` |
+| The [delegation deadline](#bounds) passes | The child is killed, and the task continues with a `terminated` outcome |
+
+A plan `capsule` step's child is killed when the step returns, and otherwise ends with the parent's
+process.
 
 On macOS a child can occasionally outlive its parent: if the parent starts another process at the
 instant it creates the child's lifeline, that process can hold the lifeline open, and the child
@@ -421,7 +425,7 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 
 | Field | Type | Meaning |
 |---|---|---|
-| `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` and on the outcome that arrives later |
+| `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` and on its outcome |
 | `session_id` | string | `ses_…`, the child's own session |
 | `capsule`, `version` | string | The artifact that was launched |
 | `status` | string | `started` or `failed`. A refused call returns no object — see below |
@@ -445,26 +449,57 @@ failed tool call, and the session continues.
 
 ### How the outcome arrives
 
-What the sub-capsule did reaches the delegating capsule afterwards, as its own task with
-[origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg` lane,
-carrying the same `dlg_` id the call returned. That is the whole of what a turn issuing several
-delegations has to do differently: issue them, end the turn, and handle each outcome as it lands.
-See [The completion path](#the-completion-path) for what one carries.
+A delegation belongs to the task that made it, on every [`lifecycle`](manifest.md#field-lifecycle).
+Once the model ends its turn, the task waits for every sub-capsule it started and continues in the
+same conversation with each outcome. The task stays `working` while it waits, and its stream says
+so in a non-final `working` frame.
 
-**A delegating capsule has to be able to receive one.** Under the default `lifecycle` block the
-session ends with the task that made the delegation, and every outcome is posted to a session that
-is already gone. A capsule that delegates declares:
+| Frame message | When |
+|---|---|
+| `waiting on delegate-task: M delegation(s) outstanding` | The task starts waiting and nothing has arrived |
+| `continuing with M delegation outcome(s)` | Outcomes arrived, and the task continues with them |
 
-| Key | Value | Why |
-|---|---|---|
-| [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) | `queue` | An outcome is an inbound task; a capsule accepting one task at a time never takes it |
-| [`lifecycle.queue_depth`](manifest.md#field-lifecycle) | at least the number of delegations one turn issues | Each outcome in flight occupies a slot |
-| [`lifecycle.after_task`](manifest.md#lifecycle-after-task) | `sleep` | The session has to outlive the task that delegated |
+When the task also has [`call-member`](runtime-provided-tools.md) calls outstanding, it waits for
+both together, and the two texts are joined by `; `.
 
-A capsule that declares `capabilities.spawn.allow` and leaves that block unable to receive a
-completion is warned at launch with [`W-SEC-020`](diagnostics.md#w-sec-020). The launch is not
-refused: a capsule that delegates and does not wait is legitimate. Its sub-capsules end when it
-exits, finished or not — see [A child ends with its parent](#spawner-lifeline).
+The task waits only when its attempt finished with at least one turn of `inference.max_turns` left.
+Each wake that delivers outcomes spends one turn. The wait spends no tokens and counts against no
+spend ceiling.
+
+Each outcome reaches the model as one block:
+
+```text
+[delegate-task] delegation dlg_0193… to worker@1.0.0 ended ok:
+<untrusted-content source=delegation:worker>
+Delegated capsule finished.
+delegation_id: dlg_0193…
+capsule: worker@1.0.0
+session_id: ses_0193…
+status: ok
+duration_ms: 4210
+workdir: /home/me/project/.murmur/children/worker-3f2a…
+result: .murmur/ses_0193…/out/result.txt (in that workdir)
+
+The child's own output is in that file and is not reproduced here.
+</untrusted-content>
+```
+
+The block names the result file, which the model reads for the answer, or says
+`result: none (the child wrote no result file)`. It never carries the child's output. Outcomes for
+several delegations that arrive together are delivered in one continuation.
+
+A task that ends before an outcome arrives ends the sub-capsule. The `delegation` trace line
+records `terminated`, with a `reason` naming why:
+
+| Why the task ended it | `reason` |
+|---|---|
+| The task was cancelled, by `tasks/cancel` or by the session winding down | `the delegating task was cancelled` |
+| The attempt finished with no inference turn left | `the delegating task had no inference turn left to read this outcome` |
+| The attempt ended any other way | `the delegating task ended <exit status> before this sub-capsule finished` |
+| No outcome arrived within the backstop below | `no outcome reached the delegating task within <N>s of this sub-capsule starting` |
+
+A cancel's `task_canceled` record and its `tasks/cancel` residue name every delegation that was in
+flight, taken before the task ends them.
 
 ### Bounds
 
@@ -472,10 +507,12 @@ exits, finished or not — see [A child ends with its parent](#spawner-lifeline)
 |---|---|---|
 | Launch | 180s | From starting the child process to its first `--json` line |
 | Delivery | 30s | Retrying the task delivery while the child's listener comes up |
-| Child watch | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | How long the started child runs. Counted from the moment it reported itself ready, so the launch bound above is not spent out of it. On expiry the child is ended and a `terminated` completion is posted to the delegating capsule, naming the bound in seconds |
+| Child watch | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | How long the started child runs. Counted from the moment it reported itself ready, so the launch bound above is not spent out of it. On expiry the child is ended and a `terminated` outcome naming the bound in seconds is delivered into the delegating task |
+| Backstop | The child watch plus 30s | How long the delegating task waits for one delegation's outcome, counted from the launch. On expiry the task ends the child itself and continues with a `terminated` outcome saying no outcome arrived |
 
-The child-watch bound is the delegating capsule's own runtime's clock. No request is made to the
-daemon to decide or enforce it, so no daemon has to be reachable for it to fire.
+Both bounds are the delegating capsule's own runtime's clock. No request is made to the daemon to
+decide or enforce them, so no daemon has to be reachable for them to fire. A task's whole wait is at
+most `inference.max_turns` × (child watch + 30s).
 
 How deep a chain of delegations may go, how many a capsule may have running at once, and how many
 capsules the host carries are set on the daemon — see [Delegation bounds](#delegation-bounds).
@@ -485,7 +522,7 @@ the two want opposite things:
 
 | Delegated to by | [`lifecycle.after_task`](manifest.md#lifecycle-after-task) | Why |
 |---|---|---|
-| `delegate-task` | `exit` | A sub-capsule reports its outcome when its session ends. One that sleeps between tasks never ends, so nothing reaches its parent until the child-watch bound stops it |
+| `delegate-task` | `exit` | A sub-capsule reports its outcome when its session ends. One that sleeps between tasks never ends, so its parent hears from it only when the child-watch bound stops it |
 | A plan's `capsule` step | `sleep` | The step reads the answer with an A2A `tasks/get` after the task completes, so the sub-capsule has to still be listening |
 
 ---
@@ -493,9 +530,9 @@ the two want opposite things:
 ## The completion path
 
 A delegated child tells its parent that it finished. The parent's runtime injects one variable at
-launch, the child posts one message back at the end of its session, and the outcome arrives at the
-parent as a task with `completion` origin in the background lane — behind anything a person or a
-peer is waiting for.
+launch, the child posts one message back at the end of its session, and the parent's door hands the
+outcome to the task that made the delegation — see [How the outcome arrives](#how-the-outcome-arrives).
+A completion never becomes a task of its own.
 
 ### What is injected
 
@@ -503,8 +540,7 @@ peer is waiting for.
 |---|---|
 | `url` | The parent's own A2A endpoint, `http://host:port` |
 | `session_id` | The parent's session. A completion addressed anywhere else is refused |
-| `context_id` | The conversation the delegation was made from. The completion task runs under it |
-| `trust` | `trusted` or `untrusted` — the trust class of the parent task that made the delegation |
+| `context_id` | The conversation the delegation was made from |
 | `delegation_id` | `dlg_…`, minted by the parent's launcher, one per launch |
 
 The value is compact JSON, applied last in the child's environment alongside `MURMUR_ROOST_URL`, so
@@ -541,20 +577,26 @@ describe the delivery rather than the outcome.
 ### How it travels
 
 One JSON-RPC `message/send` to the parent's `POST /`, carrying the fields above as its message
-text, with four request headers.
+text, with three request headers.
 
 | Header | Value |
 |---|---|
 | `x-murmur-task-origin` | `completion` |
-| `x-murmur-task-trust` | The `trust` of the injected handle |
 | `x-murmur-delegation-id` | The `delegation_id` of the injected handle |
 | `x-murmur-completion-session` | The `session_id` of the injected handle |
 
-The parent's door refuses a completion whose `x-murmur-completion-session` is not the session
-running there — the shape a parent that restarted onto the same address leaves behind — with the
-JSON-RPC error `completion is addressed to session <id>, which is not the session running here`.
-Both delegation headers are read only for a request classified `completion`, and ignored on every
-other path.
+The parent's door answers a completion ahead of `lifecycle.task_acceptance` and the task queue, so
+one is received under `task_acceptance: none` and while a `single` task is busy. The task reads the
+outcome from the child's `completion.json`, not from the message.
+
+| Completion | Door's answer |
+|---|---|
+| `x-murmur-completion-session` is not the session running there — a parent that restarted onto the same address | JSON-RPC error `-32004`: `completion is addressed to session <id>, which is not the session running here` |
+| Names a delegation the running task is waiting for, or one already received | A JSON-RPC result, `{"delegation_id": "dlg_…", "received": true}` |
+| Names any other delegation, including one its task has already ended | JSON-RPC error `-32004`: `no task in this session is waiting for delegation dlg_…` |
+
+The child records an error answer as its `delivery_error`. Both delegation headers are read only
+for a request classified `completion`, and ignored on every other path.
 
 ### Who reports, and what happens when nobody can
 
@@ -562,7 +604,7 @@ other path.
 |---|---|---|
 | The child's session ended | The child, at the end of its own session | `ok` when its task completed; `error` when the task failed, spent `inference.max_turns`, hit a spend ceiling or was canceled, or the session itself failed. The child's own `task_end` holds the precise status |
 | The child's process ended without recording a completion | The parent's launcher | `crashed` |
-| The parent ended the delegation itself | The parent's launcher, recorded and posted to nobody | `terminated` |
+| The delegating task ended the delegation | The parent's launcher, recorded and posted to nobody; the `detail` is `the parent ended this delegation` | `terminated` |
 | The child was still running at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) | The parent's launcher | `terminated` |
 
 Both reporters write the outcome to `completion.json` before posting it, and rewrite the file with

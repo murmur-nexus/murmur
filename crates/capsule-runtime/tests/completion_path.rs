@@ -2,9 +2,14 @@
 //!
 //! Every case here runs the real thing: `mur-roost` on a loopback port over a real registry, a
 //! real parent capsule as its own `mur run --json` process, and children launched as processes of
-//! this one. Nothing is stubbed, and nothing asserts about a queue in isolation — what a test
-//! observes is what an operator observes, in the parent's own `trace.jsonl` and in the child's
-//! own `completion.json`.
+//! this one. Nothing is stubbed — what a test observes is what an operator observes, in the
+//! parent's own `trace.jsonl` and in the child's own `completion.json`.
+//!
+//! The children are launched by this test process, not by a task of the parent, so no task in the
+//! parent is waiting for any of them: the parent's door refuses every completion here with
+//! `-32004`, and the child records that refusal. Delivery into a delegating task is exercised end
+//! to end by `murmur-cli`'s `delegation` and `spawner_lifeline_kill` suites, where the parent's own
+//! model makes the delegation.
 //!
 //! One daemon, one registry and one `HOME` are shared by the whole suite, because `HOME` is
 //! process-wide and a child resolves its artifacts through it. Each case gets its own parent
@@ -29,15 +34,15 @@ use std::time::{Duration, Instant};
 use capsule_runtime::delegation::{DelegationStatus, Reporter, SpawnerHandle, SPAWNER_ENV};
 use capsule_runtime::{
     launch_child_capsule, ChildLaunchRequest, CompletionAddress, LaunchedChild, SpawnApproval,
-    Spawner, TrustClass,
+    Spawner,
 };
 use common::{component, mur_binary, Roost, ScriptedServer};
 use serde_json::Value;
 use tempfile::TempDir;
 
 /// The capsule every parent process in this suite runs. Its manifest is the ceiling each child is
-/// refereed against, and it accepts a queue of tasks and sleeps between them, which is what lets a
-/// completion arrive after the delegation was made.
+/// refereed against, and it accepts a queue of tasks and sleeps between them, which keeps its door
+/// answering for as long as a case needs it.
 const PARENT_CAPSULE: &str = "completion-parent";
 /// The session the suite registers for itself, to obtain the credential `POST /spawn` wants.
 const APPROVER_SESSION: &str = "ses_completion00000000000approver";
@@ -304,14 +309,13 @@ impl RunningParent {
         }
     }
 
-    /// Where the parent wants completions of its delegations sent.
-    fn spawner(&self, trust: TrustClass) -> Spawner {
+    /// Where the parent's completions are sent.
+    fn spawner(&self) -> Spawner {
         Spawner {
             session_id: self.session_id.clone(),
             context_id: format!("ctx_{}", uuid_hex()),
             report_to: Some(CompletionAddress {
                 url: self.url.clone(),
-                trust,
             }),
         }
     }
@@ -334,42 +338,12 @@ impl RunningParent {
             .collect()
     }
 
-    /// The parent's `task_start` for `delegation_id`, once it has been written.
-    fn wait_for_completion_task(&self, delegation_id: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            if let Some(event) = self.trace().into_iter().find(|event| {
-                event["event_type"] == "task_start" && event["delegation_id"] == delegation_id
-            }) {
-                return event;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the parent never started a task for delegation {delegation_id}; trace:\n{}",
-                std::fs::read_to_string(self.trace_path()).unwrap_or_default()
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// Blocks until the parent has finished `task_id`, so what it sent the model is on disk.
-    fn wait_for_task_end(&self, task_id: &str) {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            if self
-                .trace()
-                .iter()
-                .any(|event| event["event_type"] == "task_end" && event["task_id"] == task_id)
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the parent never finished task {task_id}; trace:\n{}",
-                std::fs::read_to_string(self.trace_path()).unwrap_or_default()
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    /// Whether anything in the parent's trace names `delegation_id`, or any task started with
+    /// the `completion` origin.
+    fn heard_of(&self, delegation_id: &str) -> bool {
+        self.trace().iter().any(|event| {
+            event["origin"] == "completion" || event.to_string().contains(delegation_id)
+        })
     }
 
     fn kill(&mut self) {
@@ -452,7 +426,7 @@ fn wait_for_completion(child: &LaunchedChild) -> Value {
     wait_for_completion_at(&child.workdir)
 }
 
-/// The same, named by directory rather than by a handle a release has already consumed.
+/// The same, named by directory.
 fn wait_for_completion_at(workdir: &Path) -> Value {
     let path = workdir.join("completion.json");
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -475,29 +449,46 @@ fn wait_for_completion_at(workdir: &Path) -> Value {
     }
 }
 
-/// The child's own record of how it ended, once it says the notification reached its parent.
-fn wait_for_delivered_completion(workdir: &Path) -> Value {
+/// The child's own record of how it ended, once it says the parent's door refused it.
+///
+/// A `terminated` outcome the watcher posts is written once before the post and rewritten after
+/// it, and [`is_settled`] reads any `terminated` record as settled on sight, so this waits for the
+/// refusal itself.
+fn wait_for_refused_completion(workdir: &Path) -> Value {
     let path = workdir.join("completion.json");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(raw) = std::fs::read_to_string(&path) {
             if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
-                if parsed["delivered"] == Value::Bool(true) {
+                if !parsed["delivery_error"].is_null() {
                     return parsed;
                 }
-                if !parsed["delivery_error"].is_null() {
-                    panic!("the completion was refused: {parsed}");
+                if parsed["delivered"] == Value::Bool(true) {
+                    panic!("no task was waiting, yet the completion was delivered: {parsed}");
                 }
             }
         }
         assert!(
             Instant::now() < deadline,
-            "no delivered completion appeared at {}; what is there: {}",
+            "no refused completion appeared at {}; what is there: {}",
             workdir.display(),
             std::fs::read_to_string(&path).unwrap_or_else(|_| "nothing".to_string())
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The refusal a parent's door gives a completion no task of its is waiting for: `-32004`, naming
+/// the delegation.
+fn assert_refused_as_unwaited(completion: &Value, delegation_id: &str) {
+    assert_eq!(completion["delivered"], false, "{completion}");
+    let reason = completion["delivery_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal is recorded: {completion}"));
+    assert!(
+        reason.contains(delegation_id) && reason.contains("no task"),
+        "the refusal names the delegation and says no task is waiting for it: {reason}"
+    );
 }
 
 /// Whether a completion record says what became of the delivery: it arrived, it was refused for a
@@ -561,7 +552,7 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
     std::env::set_var(SPAWNER_ENV, DECOY_HANDLE);
 
     let parent = RunningParent::start();
-    let spawner = parent.spawner(TrustClass::Trusted);
+    let spawner = parent.spawner();
 
     let delegated = launch(
         parent_dir.path(),
@@ -597,7 +588,6 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
     assert_eq!(address.url, expected.url);
     assert_eq!(handle.session_id, parent.session_id);
     assert_eq!(handle.context_id, spawner.context_id);
-    assert_eq!(address.trust, TrustClass::Trusted);
     assert_eq!(
         Some(handle.delegation_id.clone()),
         delegated.delegation_id,
@@ -631,16 +621,16 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
     std::env::remove_var(SPAWNER_ENV);
 }
 
-// ── 2. A finished child's completion arrives at a real parent ─────────────────
+// ── 2. A finished child's completion reaches a real parent's door ─────────────
 
-/// The child writes its outcome, posts it, and the parent files it as a `completion`-origin task
-/// in the background lane — joined to the delegation by the id all three carry. The result stays
-/// in the child's own directory: it is in no line of the parent's trace and in no part of the
-/// completion's text.
+/// The child writes its outcome and posts it, and the parent's door answers. No task of the
+/// parent's made this delegation, so the door refuses it with `-32004` naming the delegation, the
+/// child records the refusal, and the parent starts no task and writes nothing about it. The result
+/// stays in the child's own directory either way.
 #[test]
-fn a_finished_childs_completion_arrives_at_its_parent_as_a_completion_task() {
+fn a_finished_childs_completion_is_refused_by_a_parent_with_no_task_waiting_for_it() {
     if capsule_runtime::skip_without_host_support(
-        "a_finished_childs_completion_arrives_at_its_parent_as_a_completion_task",
+        "a_finished_childs_completion_is_refused_by_a_parent_with_no_task_waiting_for_it",
     ) {
         return;
     }
@@ -651,7 +641,7 @@ fn a_finished_childs_completion_arrives_at_its_parent_as_a_completion_task() {
         parent_dir.path(),
         "worker",
         &[MARKER_VAR],
-        Some(parent.spawner(TrustClass::Trusted)),
+        Some(parent.spawner()),
     );
     let delegation_id = child
         .delegation_id
@@ -661,78 +651,30 @@ fn a_finished_childs_completion_arrives_at_its_parent_as_a_completion_task() {
     let completion = wait_for_completion(&child);
     assert_eq!(completion["status"], DelegationStatus::Ok.as_str());
     assert_eq!(completion["reported_by"], Reporter::Child.as_str());
-    assert_eq!(completion["delivered"], true, "{completion}");
+    assert_refused_as_unwaited(&completion, &delegation_id);
     assert_eq!(completion["result_path"], "out/result.txt");
     assert_eq!(completion["delegation_id"], delegation_id);
     assert_eq!(completion["capsule_name"], "worker");
     assert_eq!(completion["session_id"], child.session_id);
     assert_eq!(completion["workdir"], child.workdir.display().to_string());
 
-    // The three-way equality that joins a completion to the delegation that produced it.
-    let task_start = parent.wait_for_completion_task(&delegation_id);
-    assert_eq!(task_start["origin"], "completion");
-    assert_eq!(task_start["trust"], "trusted");
-    assert_eq!(task_start["lane"], "bg");
-    assert_eq!(task_start["delegation_id"], delegation_id);
-    assert_eq!(task_start["source"], "a2a");
-
     // The result is where the completion said it was, and nowhere else.
     let result = std::fs::read_to_string(child.workdir.join("out").join("result.txt"))
         .expect("the child wrote the file the completion named");
     assert!(result.contains(MARKER), "{result}");
 
+    // A completion is never turned into a task. Give the parent a moment to have done so wrongly.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !parent.heard_of(&delegation_id),
+        "the parent must start no task for a completion and record nothing of it; trace:\n{}",
+        std::fs::read_to_string(parent.trace_path()).unwrap_or_default()
+    );
     let trace = std::fs::read_to_string(parent.trace_path()).unwrap_or_default();
     assert!(
         !trace.contains(MARKER),
         "the child's own output must not reach the parent's trace:\n{trace}"
     );
-    assert!(
-        task_start["message_parts_bytes"].as_u64().unwrap_or(0) > 0,
-        "a completion task carries a message"
-    );
-    parent.wait_for_task_end(task_start["task_id"].as_str().unwrap());
-    // The parent captures what it sent the model, so the completion's own text is on disk: it
-    // names the path and carries nothing the child wrote.
-    assert!(
-        parent_sent(&parent, "out/result.txt"),
-        "the completion's message names where the result is"
-    );
-    assert!(
-        !parent_sent(&parent, MARKER),
-        "the completion's message must name the result, never carry it"
-    );
-
-    // What an operator reads: the task row names the lane the completion waited in and the
-    // delegation it reports on.
-    let steps = Command::new(mur_binary())
-        .args(["trace", "steps", parent.trace_path().to_str().unwrap()])
-        .output()
-        .expect("mur trace steps runs");
-    let rendered = String::from_utf8_lossy(&steps.stdout).to_string();
-    let row = rendered
-        .lines()
-        .find(|line| line.contains("completion/trusted"))
-        .unwrap_or_else(|| panic!("no completion task row in:\n{rendered}"));
-    assert!(row.contains("lane bg"), "{row}");
-    assert!(
-        row.contains(&format!("delegation {delegation_id}")),
-        "{row}"
-    );
-}
-
-/// Whether `needle` appears anywhere in what the parent recorded of this session — its trace and,
-/// because the parent capsule declares `trace.capture: content`, the driver request bodies behind
-/// it. That is where a completion's message text is observable after the task has run.
-fn parent_sent(parent: &RunningParent, needle: &str) -> bool {
-    common::find_in_files(
-        &parent
-            .workdir
-            .path()
-            .join(".murmur")
-            .join(&parent.session_id),
-        needle,
-    )
-    .is_some()
 }
 
 // ── 4b. A child whose task failed ─────────────────────────────────────────────
@@ -754,7 +696,7 @@ fn an_agent_child_whose_task_failed_reports_error() {
             parent_dir.path(),
             "failing-worker",
             &[],
-            Some(parent.spawner(TrustClass::Trusted)),
+            Some(parent.spawner()),
         )
     };
     let sent = common::request(
@@ -793,7 +735,8 @@ fn an_agent_child_whose_task_failed_reports_error() {
 // ── 5. A child that crashes without reporting ─────────────────────────────────
 
 /// The launcher reports for a child that could not: the delegation is recorded as `crashed`, with
-/// the exit status and the child's own stderr, and the parent is told.
+/// the exit status and the child's own stderr, and posted to the parent's door — which refuses it,
+/// because no task of the parent's made this delegation.
 #[test]
 fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
     if capsule_runtime::skip_without_host_support(
@@ -810,7 +753,7 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
             parent_dir.path(),
             "slow-worker",
             &[],
-            Some(parent.spawner(TrustClass::Trusted)),
+            Some(parent.spawner()),
         )
     };
     let delegation_id = child
@@ -841,21 +784,15 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
     let completion = wait_for_completion(&child);
     assert_eq!(completion["status"], DelegationStatus::Crashed.as_str());
     assert_eq!(completion["reported_by"], Reporter::Launcher.as_str());
-    assert_eq!(completion["delivered"], true, "{completion}");
+    assert_refused_as_unwaited(&completion, &delegation_id);
     let detail = completion["detail"]
         .as_str()
         .expect("a crash carries detail");
     assert!(detail.contains("signal: 9"), "{detail}");
     assert!(detail.contains("manifest requires mur 0.0.1"), "{detail}");
-
-    let task_start = parent.wait_for_completion_task(&delegation_id);
-    assert_eq!(task_start["origin"], "completion");
-    assert_eq!(task_start["lane"], "bg");
-    assert_eq!(task_start["delegation_id"], delegation_id);
-    parent.wait_for_task_end(task_start["task_id"].as_str().unwrap());
     assert!(
-        parent_sent(&parent, "status: crashed"),
-        "the completion's message says what happened"
+        !parent.heard_of(&delegation_id),
+        "the parent must start no task for a completion"
     );
 
     // The handle is still alive, and ending it now is not an error.
@@ -875,7 +812,7 @@ fn a_completion_with_no_parent_left_is_recorded_rather_than_dropped() {
     }
     let mut parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
-    let spawner = parent.spawner(TrustClass::Trusted);
+    let spawner = parent.spawner();
     let children_dir = parent_dir.path().join(".murmur").join("children");
     let before = dirs_under(&children_dir);
 
@@ -946,7 +883,6 @@ fn a_completion_addressed_to_another_session_is_refused_and_recorded() {
         context_id: format!("ctx_{}", uuid_hex()),
         report_to: Some(CompletionAddress {
             url: addressed.url.clone(),
-            trust: TrustClass::Trusted,
         }),
     };
     let child = launch(
@@ -986,57 +922,51 @@ fn a_completion_addressed_to_another_session_is_refused_and_recorded() {
     );
 }
 
-// ── 7. Trust inherits from the delegating task ────────────────────────────────
+// ── 7. A child is told where to report, and no trust class ────────────────────
 
-/// Two delegations of one worker from one parent, one untrusted and one trusted, produce two
-/// completion tasks whose classes are the classes the delegations carried. Nothing decides trust
-/// a second time.
+/// The handle a reporting child is handed names the parent's session, the conversation, the
+/// delegation and the address, and no trust class: the outcome enters the delegating task under
+/// that task's own provenance, so a class carried by the completion would decide nothing. The
+/// child reads the handle it was handed and reports through it.
 #[test]
-fn a_completions_trust_is_the_delegating_tasks_trust() {
-    if capsule_runtime::skip_without_host_support(
-        "a_completions_trust_is_the_delegating_tasks_trust",
-    ) {
+fn a_childs_spawner_handle_carries_no_trust_class() {
+    if capsule_runtime::skip_without_host_support("a_childs_spawner_handle_carries_no_trust_class")
+    {
         return;
     }
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
-    let mut observed = Vec::new();
-    for trust in [TrustClass::Untrusted, TrustClass::Trusted] {
-        let child = launch(
-            parent_dir.path(),
-            "worker",
-            &[MARKER_VAR],
-            Some(parent.spawner(trust)),
-        );
-        let delegation_id = child.delegation_id.clone().expect("a delegated launch");
-        let completion = wait_for_completion(&child);
-        assert_eq!(completion["delivered"], true, "{completion}");
-        let task_start = parent.wait_for_completion_task(&delegation_id);
-        parent.wait_for_task_end(task_start["task_id"].as_str().unwrap());
-        observed.push((
-            task_start["origin"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            task_start["trust"].as_str().unwrap_or_default().to_string(),
-        ));
-    }
-
+    let child = launch(
+        parent_dir.path(),
+        "worker",
+        &[MARKER_VAR],
+        Some(parent.spawner()),
+    );
+    let delegation_id = child.delegation_id.clone().expect("a delegated launch");
+    let recorded = child
+        .env
+        .iter()
+        .find(|(key, _)| key == SPAWNER_ENV)
+        .map(|(_, value)| value.clone())
+        .expect("a delegated child is handed a spawner handle");
+    let keys: Vec<String> = serde_json::from_str::<Value>(&recorded)
+        .expect("the handle is JSON")
+        .as_object()
+        .expect("the handle is an object")
+        .keys()
+        .cloned()
+        .collect();
     assert_eq!(
-        observed,
-        vec![
-            ("completion".to_string(), "untrusted".to_string()),
-            ("completion".to_string(), "trusted".to_string()),
-        ]
+        keys,
+        ["context_id", "delegation_id", "session_id", "url"],
+        "{recorded}"
     );
 
-    // The untrusted one's payload is fenced by the same rule every untrusted task's is, and by
-    // the same marker: the parent's captured wire body carries it.
-    assert!(
-        parent_sent(&parent, "<untrusted-content source=task:completion>"),
-        "an untrusted completion must be fenced like every other untrusted task"
-    );
+    // The child read that handle and reported through it, to the address it names.
+    let completion = wait_for_completion(&child);
+    assert_eq!(completion["status"], DelegationStatus::Ok.as_str());
+    assert_refused_as_unwaited(&completion, &delegation_id);
 }
 
 // ── The launcher reports once, and only for a child that did not ──────────────
@@ -1059,7 +989,7 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
             parent_dir.path(),
             "slow-worker",
             &[],
-            Some(parent.spawner(TrustClass::Trusted)),
+            Some(parent.spawner()),
         )
     };
     let delegation_id = child.delegation_id.clone().expect("a delegated launch");
@@ -1082,21 +1012,20 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
     assert_eq!(completion["delivered"], false, "{completion}");
     assert!(completion["delivery_error"].is_null(), "{completion}");
 
-    // Nothing was posted, so the parent has no task for it.
+    // Nothing was posted, so the parent has heard nothing of it.
     std::thread::sleep(Duration::from_secs(2));
     assert!(
-        !parent
-            .trace()
-            .iter()
-            .any(|event| event["delegation_id"] == delegation_id.as_str()),
+        !parent.heard_of(&delegation_id),
         "a terminated delegation is announced to nobody"
     );
 }
 
 // ── 8. A started child that never ends ────────────────────────────────────────
 
-/// A child that outruns the delegation deadline is ended by its watcher, and the parent is told —
-/// which is the only thing that stops a wedged sub-capsule running for as long as its parent does.
+/// A child that outruns the delegation deadline is ended by its watcher, which posts a
+/// `terminated` outcome — the only thing that stops a wedged sub-capsule running for as long as its
+/// parent does, and what a delegating task continues with. Here no task is waiting, so the door
+/// refuses it, and the child's record says so.
 ///
 /// Unlike an ending the parent chose by hand, this one is posted: the delegating agent asked for
 /// an outcome, and this is the outcome.
@@ -1111,30 +1040,20 @@ fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
     let parent_dir = TempDir::new().unwrap();
 
     // `slow-worker` binds a port and sleeps between tasks, so nothing it does ever ends its
-    // session. Released, exactly as a started delegation releases its child, so the watcher is
-    // the only thing left observing it.
-    let (delegation_id, workdir, pid) = {
-        let _slot = agent_child_slot();
-        let child = launch_bounded(
-            parent_dir.path(),
-            "slow-worker",
-            &[],
-            Some(parent.spawner(TrustClass::Untrusted)),
-            Some(Duration::from_secs(5)),
-        );
-        let named = (
-            child.delegation_id.clone().expect("a delegated launch"),
-            child.workdir.clone(),
-            child.pid(),
-        );
-        child.release();
-        named
-    };
+    // session. The handle is held throughout, as a delegating task holds it, so the watcher's
+    // deadline is what ends the child.
+    let _slot = agent_child_slot();
+    let child = launch_bounded(
+        parent_dir.path(),
+        "slow-worker",
+        &[],
+        Some(parent.spawner()),
+        Some(Duration::from_secs(5)),
+    );
+    let delegation_id = child.delegation_id.clone().expect("a delegated launch");
+    let pid = child.pid();
 
-    // Waited for on `delivered` rather than through `is_settled`, which reads a `terminated`
-    // outcome as settled on sight — true of an ending the parent chose, which is posted to nobody,
-    // and false of this one, which is written once before the post and rewritten after it.
-    let completion = wait_for_delivered_completion(&workdir);
+    let completion = wait_for_refused_completion(&child.workdir);
     assert_eq!(completion["status"], DelegationStatus::Terminated.as_str());
     assert_eq!(completion["reported_by"], Reporter::Launcher.as_str());
     let detail = completion["detail"].as_str().unwrap_or_default();
@@ -1142,13 +1061,14 @@ fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
         detail.contains("5s") && detail.contains("deadline"),
         "the detail names the bound in seconds: {completion}"
     );
+    assert_refused_as_unwaited(&completion, &delegation_id);
+    assert!(
+        child.has_exited(),
+        "the watcher ended the child while its handle was still held"
+    );
+    assert!(!parent.heard_of(&delegation_id));
 
-    // The parent files it as a `completion`-origin task in the background lane, joined by the id.
-    let start = parent.wait_for_completion_task(&delegation_id);
-    assert_eq!(start["origin"], "completion", "{start}");
-    assert_eq!(start["lane"], "bg", "{start}");
-
-    // And the process is gone, reaped by the watcher and by nothing else.
+    // And the process is gone, reaped by the watcher before the handle is let go.
     #[cfg(target_os = "linux")]
     wait_for(
         "the ended child to be reaped",
@@ -1156,4 +1076,5 @@ fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
         || !Path::new(&format!("/proc/{pid}")).exists(),
     );
     let _ = pid;
+    drop(child);
 }

@@ -1,4 +1,4 @@
-//! Printing what a capsule left running.
+//! Printing what a cancel found in flight.
 //!
 //! One printer for both commands that ask. `mur cancel` ends a task and `mur stop` ends a session,
 //! and the two reach the same registries through different methods — but a detached shell command
@@ -7,40 +7,38 @@
 
 use serde_json::Value;
 
-/// One `running:` line per thing the capsule left going, in the order the capsule listed them.
+/// One line per thing the cancel found in flight, in the order the capsule listed them.
 ///
-/// Nothing here was stopped. A detached shell command keeps its own lifecycle and a delegated
-/// child is still running, and naming them is the whole point: whoever cancelled or stopped now
-/// knows what is still out there under no capsule's supervision.
+/// A detached shell command keeps its own lifecycle, so it is printed `running:`: whoever
+/// cancelled or stopped now knows what is still out there under no capsule's supervision. A
+/// delegation is printed `ended:`, because the cancelled task that started it ends its child once
+/// the residue has named it.
 ///
 /// A part is either the residue item itself — the shape `session/stop` returns — or an A2A
 /// artifact part wrapping it as JSON text, which is how `tasks/cancel` carries it. Both spellings
 /// describe the same item, so both are read here rather than at each caller.
 pub(crate) fn print_residue(parts: &[Value]) {
-    for part in parts {
-        let Some(item) = unwrap_item(part) else {
-            continue;
-        };
-        let kind = item
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        match kind {
-            "detached_shell" => println!(
-                "running: {}  detached shell  {}",
-                item.get("work_id").and_then(Value::as_str).unwrap_or("?"),
-                item.get("command").and_then(Value::as_str).unwrap_or("")
-            ),
-            "delegation" => println!(
-                "running: {}  delegation  {}@{}",
-                item.get("delegation_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?"),
-                item.get("capsule").and_then(Value::as_str).unwrap_or("?"),
-                item.get("version").and_then(Value::as_str).unwrap_or("?")
-            ),
-            other => println!("running: {other}"),
-        }
+    for item in parts.iter().filter_map(unwrap_item) {
+        println!("{}", residue_line(&item));
+    }
+}
+
+/// The line [`print_residue`] prints for one item.
+fn residue_line(item: &Value) -> String {
+    let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("?");
+    match field("kind") {
+        "detached_shell" => format!(
+            "running: {}  detached shell  {}",
+            field("work_id"),
+            item.get("command").and_then(Value::as_str).unwrap_or("")
+        ),
+        "delegation" => format!(
+            "ended:   {}  delegation  {}@{}",
+            field("delegation_id"),
+            field("capsule"),
+            field("version")
+        ),
+        other => format!("running: {other}"),
     }
 }
 
@@ -84,6 +82,23 @@ mod tests {
         let wrapped = json!({"text": item.to_string()});
         assert_eq!(unwrap_item(&wrapped).unwrap(), item);
         assert_eq!(unwrap_item(&item).unwrap(), item);
+    }
+
+    /// A detached shell command outlives the cancel and reads `running:`; a delegation is ended
+    /// by the task the cancel stopped and reads `ended:`.
+    #[test]
+    fn a_delegation_reads_ended_and_a_detached_shell_reads_running() {
+        let shell = json!({"kind": "detached_shell", "work_id": "wrk_1", "command": "sleep 30"});
+        assert_eq!(
+            residue_line(&shell),
+            "running: wrk_1  detached shell  sleep 30"
+        );
+        let delegation = json!({"kind": "delegation", "delegation_id": "dlg_1",
+                                "capsule": "worker", "version": "0.1.0"});
+        assert_eq!(
+            residue_line(&delegation),
+            "ended:   dlg_1  delegation  worker@0.1.0"
+        );
     }
 
     #[test]
