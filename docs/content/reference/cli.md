@@ -265,7 +265,7 @@ The provider comes from `inference.provider`, `inference.endpoint` and `inferenc
 | `inference.provider` | Driver | Default endpoint | Default model | `gateway.api_key` |
 |---|---|---|---|---|
 | `anthropic`, empty, or no `inference:` block | `murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}` | `https://api.anthropic.com` | `claude-haiku-4-5-20251001` | `${ANTHROPIC_API_KEY}` |
-| `openai` | `murmur-driver-openai@{{ v.murmur_driver_openai }}` | `https://api.openai.com` | `gpt-4o-mini` | `${OPENAI_API_KEY}` |
+| `openai` | `murmur-driver-openai@{{ v.murmur_driver_openai }}` | `https://api.openai.com/v1` | `gpt-4o-mini` | `${OPENAI_API_KEY}` |
 | Any other value | Refused with `E-NEW-004` | — | — | — |
 
 A configured `inference.endpoint` must pass [`gateway.endpoint` validation](manifest.md#gateway-endpoint-validation),
@@ -283,18 +283,18 @@ Scaffolded formation 'crew' in ./crew
   crew/worker/murmur.yaml   capsule crew-worker@0.1.0, serves peers
 
 Next:
+  mur config set -g credentials.ANTHROPIC_API_KEY <your key>
   mur install -g murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
-  export ANTHROPIC_API_KEY=...
   mur run --roster crew --task "<your task>"
 ```
 
 | Step | Does |
 |---|---|
+| `mur config set -g credentials.<KEY> <your key>` | Stores the key `gateway.api_key` references in `~/.murmur/config.yaml`, where `mur run` re-reads it at launch — see [`gateway.api_key` resolution](manifest.md#gateway-api-key). Run it first: with no `~/.murmur/config.yaml`, `mur install` has no registry to install from, and the file this step writes names the default one |
 | `mur install -g <driver>@<version>` | Installs the driver both members declare |
 | `mur build <NAME>/<member> && mur install -g …` | Packs each member and installs it into the global store, where admission finds it |
-| `export <KEY>=...` | Supplies the key `gateway.api_key` references. `mur config set -g credentials.<KEY> <key>` stores it instead — see [`gateway.api_key` resolution](manifest.md#gateway-api-key) |
 | `mur run --roster <NAME> --task "…"` | Admits and launches the formation, with `lead` as the entry member |
 
 None of the steps changes a generated file.
@@ -713,7 +713,7 @@ murmur-tool-git          {{ v.murmur_tool_git }}    tool     darwin-aarch64  mur
 
 ## `mur doctor`
 
-Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store, current-platform resolution `mur run` performs before staging.
+Check that every artifact declared in the current project's `murmur.yaml` is available to a session — the same project-store-then-global-store, current-platform resolution `mur run` performs before staging. In a formation directory, check that its `roster.yaml` is admitted.
 
 ```bash
 mur doctor [--bind <ADDR>]
@@ -723,7 +723,14 @@ mur doctor [--bind <ADDR>]
 |---|---|---|
 | `--bind` | `127.0.0.1` | The address `mur run --bind` would bind the capsule's door on. With an address off loopback and no [`network.authentication`](manifest.md#field-network-authentication), prints [`W-SEC-032`](diagnostics.md#w-sec-032) |
 
-It walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints one checklist line per declared artifact:
+What it checks depends on the current directory:
+
+| Current directory | Checks |
+|---|---|
+| Holds `roster.yaml` and no `murmur.yaml` | The formation: the [`Roster`](#doctor-roster) block only. It does not walk up |
+| Anything else | The project: walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints everything below |
+
+In a project, it prints one checklist line per declared artifact:
 
 | Line | Meaning |
 |---|---|
@@ -939,6 +946,18 @@ store and then the global store, and checks each one against `murmur.lock`, as d
 [Admission order](roster.md#admission). Nothing is launched and no file is written. Without a
 `roster.yaml` there is no block.
 
+In a formation directory, one holding `roster.yaml` and no `murmur.yaml`, the `Roster` block is
+the whole check. It admits the roster exactly as `mur run --roster <dir>` does, from the
+directory's own `.murmur/artifacts` store, then the global store, and against the directory's
+`murmur.lock`:
+
+1. One line, `No murmur.yaml in <dir>: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.`, then a blank line.
+2. The `Roster` block.
+3. `All checks passed.` and exit code `0`, or, for a refused roster, `0 checks passed, 1 error found.`, a blank line, `Fix: <hint>` and exit code `1`.
+
+No member's artifacts, environment requirements, door or host checks are reported, and `--bind`
+changes nothing.
+
 | Line | Meaning |
 |---|---|
 | `file: <path>` | The roster admitted |
@@ -1063,7 +1082,7 @@ Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
 
 | Code | Meaning |
 |---|---|
-| `E-IO-001` | No `murmur.yaml` found in the current directory or any parent |
+| `E-IO-001` | No `murmur.yaml` found in the current directory or any parent, and the current directory holds no `roster.yaml` |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
 | `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 2, which is refused rather than migrated |
 | `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
@@ -1073,7 +1092,7 @@ Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
 | `W-REG-002` | A capsule in the spawn closure could not be inspected, so what it declares is missing from the report — a warning; the exit code is unchanged |
 | `W-REG-003` | An installed artifact this project does not declare speaks an interface version this `mur` does not serve — a warning; the exit code is unchanged |
 
-A setup failure (no project found, the manifest fails to load, or the lockfile fails to parse) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest or lockfile couldn't be read.
+A setup failure (no project or formation directory found, the manifest fails to load, or the lockfile fails to parse) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest or lockfile couldn't be read.
 
 ---
 

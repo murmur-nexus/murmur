@@ -63,7 +63,7 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     capabilities:

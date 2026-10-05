@@ -84,7 +84,7 @@ Six manifest fields work together to make the recursive pattern possible. Create
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"

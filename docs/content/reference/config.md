@@ -66,7 +66,7 @@ An empty `endpoint` resolves per provider:
 | Provider | Default endpoint |
 |---|---|
 | `anthropic` | `https://api.anthropic.com` |
-| `openai` | `https://api.openai.com` |
+| `openai` | `https://api.openai.com/v1` |
 
 #### `inference.api_key` is always global
 

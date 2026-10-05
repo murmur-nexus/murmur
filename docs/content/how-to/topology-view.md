@@ -120,7 +120,7 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     inference:
@@ -288,7 +288,7 @@ Create `worker/murmur.yaml`:
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     inference:

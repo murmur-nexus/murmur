@@ -484,6 +484,9 @@ fn doctor_fails_with_e_io_001_when_no_project_root_is_found() {
         .failure()
         .stderr(predicate::str::contains("error[E-IO-001]"))
         .stderr(predicate::str::contains("no project root found"))
+        .stderr(predicate::str::contains(
+            "or from a formation directory holding `roster.yaml`",
+        ))
         .stdout(predicate::str::contains("All checks passed.").not());
 }
 

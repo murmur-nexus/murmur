@@ -80,7 +80,7 @@ Create `worker/murmur.yaml`:
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     network:
@@ -217,7 +217,7 @@ Create `orchestrator/murmur.yaml`:
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     capabilities:

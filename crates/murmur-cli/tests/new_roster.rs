@@ -82,7 +82,12 @@ impl Scratch {
     }
 
     fn run(&self, args: &[&str]) -> Finished {
-        let output = self.command(args).output().unwrap();
+        self.run_in(self.path(), args)
+    }
+
+    /// `mur <args>` as [`Scratch::command`] runs it, from `dir`.
+    fn run_in(&self, dir: &Path, args: &[&str]) -> Finished {
+        let output = self.command(args).current_dir(dir).output().unwrap();
         Finished {
             code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -170,6 +175,59 @@ fn assert_no_key_written(scratch: &Scratch, stdout: &str, key: &str) {
     assert!(!stdout.contains(key), "stdout holds the key");
 }
 
+/// The test key the printed key step stores in place of `<your key>`.
+const TEST_KEY: &str = "test-key";
+
+/// Run the printed key step as printed, `<your key>` replaced by `TEST_KEY`, and check it stored
+/// the key in the scratch config without echoing it.
+fn store_key(scratch: &Scratch, step: &str, key_var: &str) {
+    assert_eq!(
+        step,
+        format!("mur config set -g credentials.{key_var} <your key>")
+    );
+    let typed = step.replace("<your key>", TEST_KEY);
+    let words: Vec<&str> = typed.split_whitespace().collect();
+    assert_eq!(words[0], "mur", "{step}");
+    let set = scratch.run(&words[1..]);
+    set.assert_code(0);
+    assert!(
+        set.stdout.contains(&format!(
+            "Set credentials.{key_var} in ~/.murmur/config.yaml"
+        )),
+        "{}",
+        set.stdout
+    );
+    assert!(!set.stdout.contains(TEST_KEY) && !set.stderr.contains(TEST_KEY));
+}
+
+/// Run the printed key, driver and build-and-install steps, `steps[0..4]`, as printed. The driver
+/// step is served by the fixture driver, published locally under the name and version the step
+/// prints, the version label being metadata only.
+fn install_as_printed(scratch: &Scratch, steps: &[String]) {
+    store_key(scratch, &steps[0], "ANTHROPIC_API_KEY");
+    let (driver_name, driver_version) = steps[1]
+        .strip_prefix("mur install -g ")
+        .unwrap_or_else(|| panic!("the second step installs the driver: {}", steps[1]))
+        .split_once('@')
+        .unwrap();
+    assert_eq!(driver_name, "murmur-driver-anthropic");
+    let artifacts = tempfile::tempdir().unwrap();
+    let driver_zip = common::create_driver_artifact(
+        artifacts.path(),
+        driver_name,
+        driver_version,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&scratch.home, &driver_zip).success();
+    for step in &steps[2..4] {
+        for command in step.split("&&") {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(words[0], "mur", "{step}");
+            scratch.run(&words[1..]).assert_code(0);
+        }
+    }
+}
+
 // ── S1: the scaffold launches unedited ───────────────────────────────────────
 
 #[test]
@@ -189,30 +247,8 @@ fn the_scaffold_installs_and_launches_as_printed() {
         .map(|file| sha256(&scratch.path().join(file)))
         .collect();
 
-    // The driver step names the driver and version the members pin; the fixture driver is
-    // published under that name and version, the version label being metadata only.
-    let driver = steps[0]
-        .strip_prefix("mur install -g ")
-        .unwrap_or_else(|| panic!("the first step installs the driver: {}", steps[0]));
-    let (driver_name, driver_version) = driver.split_once('@').unwrap();
-    assert_eq!(driver_name, "murmur-driver-anthropic");
-    let artifacts = tempfile::tempdir().unwrap();
-    let driver_zip = common::create_driver_artifact(
-        artifacts.path(),
-        driver_name,
-        driver_version,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&scratch.home, &driver_zip).success();
-
-    // The build-and-install steps, run as printed.
-    for step in &steps[1..3] {
-        for command in step.split("&&") {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            assert_eq!(words[0], "mur", "{step}");
-            scratch.run(&words[1..]).assert_code(0);
-        }
-    }
+    // The key reaches the members only through the config the key step writes.
+    install_as_printed(&scratch, &steps);
     // In `tree`'s order: sorted by path.
     let expected = [
         "crew",
@@ -231,14 +267,12 @@ fn the_scaffold_installs_and_launches_as_printed() {
         "the formation directory holds its files and the two built zips"
     );
 
-    assert_eq!(steps[3], "export ANTHROPIC_API_KEY=...");
     assert_eq!(steps[4], "mur run --roster crew --task \"<your task>\"");
     assert_eq!(steps.len(), 5, "{steps:?}");
 
     let _lock = launch_lock();
     let mut launcher = scratch
         .command(&["run", "--roster", "crew", "--json", "--task", "hello"])
-        .env("ANTHROPIC_API_KEY", "test-key")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -278,10 +312,18 @@ fn the_scaffold_installs_and_launches_as_printed() {
     while let Ok(line) = lines.recv_timeout(Duration::from_secs(2)) {
         stdout.push(serde_json::from_str(&line).unwrap_or_else(|_| panic!("not JSON: {line}")));
     }
+    let mut stderr_lines: Vec<String> = Vec::new();
+    while let Ok(line) = stderr.recv_timeout(Duration::from_millis(500)) {
+        stderr_lines.push(line);
+    }
+    let stderr = stderr_lines.join("\n");
     assert!(
         status.success(),
-        "the launcher failed: {status}; stderr:\n{}",
-        stderr.try_iter().collect::<Vec<_>>().join("\n")
+        "the launcher failed: {status}; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("W-SEC-027"),
+        "the stored key drew W-SEC-027:\n{stderr}"
     );
 
     let formation = &stdout[0];
@@ -385,25 +427,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
         .iter()
         .map(|file| sha256(&scratch.path().join(file)))
         .collect();
-    let (driver_name, driver_version) = steps[0]
-        .strip_prefix("mur install -g ")
-        .unwrap()
-        .split_once('@')
-        .unwrap();
-    let artifacts = tempfile::tempdir().unwrap();
-    let driver_zip = common::create_driver_artifact(
-        artifacts.path(),
-        driver_name,
-        driver_version,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&scratch.home, &driver_zip).success();
-    for step in &steps[1..3] {
-        for command in step.split("&&") {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            scratch.run(&words[1..]).assert_code(0);
-        }
-    }
+    install_as_printed(&scratch, &steps);
 
     let _lock = launch_lock();
     let run = scratch
@@ -415,7 +439,6 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
             "--task",
             "Get worker's token.",
         ])
-        .env("ANTHROPIC_API_KEY", "test-key")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -425,6 +448,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
         Some(0),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    assert!(!stderr.contains("W-SEC-027"), "{stderr}");
     for (file, hash) in CREW_FILES.iter().zip(&hashes) {
         assert_eq!(&sha256(&scratch.path().join(file)), hash, "{file} changed");
     }
@@ -555,6 +579,72 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
     assert_no_member_remains(scratch.path(), &pids, Duration::from_secs(30));
 }
 
+// ── mur doctor in the formation directory ────────────────────────────────────
+
+/// The `error[…]: …` line on `stderr`, from `error[` on.
+fn error_line(stderr: &str) -> &str {
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("error[E-"))
+        .unwrap_or_else(|| panic!("no error line in\n{stderr}"));
+    &line[line.find("error[").unwrap()..]
+}
+
+/// `mur doctor` in `crew/` checks the formation: before the members are installed it refuses with
+/// the error `mur run --roster crew` gives, and once the printed steps have run it prints the
+/// admitted roster and passes.
+#[test]
+fn doctor_in_the_scaffolded_formation_checks_its_roster() {
+    let scratch = Scratch::new();
+    let new = scratch.run(&["new", "--roster", "crew"]);
+    new.assert_code(0);
+    let steps = next_steps(&new.stdout);
+    let crew = scratch.path().join("crew").canonicalize().unwrap();
+    let doctor = || scratch.run_in(&crew, &["doctor"]);
+    let preamble = format!(
+        "No murmur.yaml in {}: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.\n\nRoster\n  file: {}\n",
+        crew.display(),
+        crew.join("roster.yaml").display()
+    );
+
+    // Nothing installed: the launcher's refusal, as doctor's one error.
+    let refused = doctor();
+    refused.assert_code(1);
+    let run = scratch.run(&["run", "--roster", "crew", "--task", "x"]);
+    assert_ne!(run.code, Some(0), "{}", run.stderr);
+    let refusal = error_line(&run.stderr);
+    assert!(refusal.starts_with("error[E-ROS-"), "{refusal}");
+    assert_eq!(error_line(&refused.stderr), refusal);
+    assert!(refused.stdout.starts_with(&preamble), "{}", refused.stdout);
+    let lines: Vec<&str> = refused.stdout.lines().collect();
+    assert!(lines[4].starts_with("  \u{2717}  "), "{}", refused.stdout);
+    let tally = lines
+        .iter()
+        .position(|line| *line == "0 checks passed, 1 error found.");
+    let tally = tally.unwrap_or_else(|| panic!("no tally in\n{}", refused.stdout));
+    assert_eq!(lines[tally + 1], "");
+    assert!(lines[tally + 2].starts_with("Fix: "), "{}", refused.stdout);
+    assert_eq!(lines.len(), tally + 3, "{}", refused.stdout);
+    assert!(!refused.stderr.contains("E-IO-001"), "{}", refused.stderr);
+
+    // The printed steps run: the formation is admitted.
+    install_as_printed(&scratch, &steps);
+    let admitted = doctor();
+    admitted.assert_code(0);
+    assert_eq!(
+        admitted.stdout,
+        format!(
+            "{preamble}  lead     crew-lead@0.1.0     entry   refuses peers   authenticated door
+  worker   crew-worker@0.1.0           serves peers    authenticated door
+  reachability: lead \u{2192} worker
+
+All checks passed.
+"
+        )
+    );
+    assert!(!admitted.stderr.contains("error["), "{}", admitted.stderr);
+}
+
 // ── S3: the provider ─────────────────────────────────────────────────────────
 
 #[test]
@@ -579,12 +669,41 @@ fn with_no_config_the_members_name_anthropic() {
             "claude-haiku-4-5-20251001"
         );
     }
-    assert!(new.stdout.contains("export ANTHROPIC_API_KEY=..."));
+    assert!(new
+        .stdout
+        .contains("mur config set -g credentials.ANTHROPIC_API_KEY <your key>"));
     assert!(
         !scratch.config_path().exists(),
         "mur new --roster wrote a config"
     );
     assert!(!scratch.home.path().join(".murmur").exists());
+}
+
+/// With no `~/.murmur/config.yaml`, `mur install -g <name>@<version>` has no registry source. The
+/// printed key step runs before the driver install, and the config it writes names the default
+/// source the install then resolves from.
+#[test]
+fn the_key_step_comes_first_and_writes_the_default_registry_source() {
+    let scratch = Scratch::new();
+    let new = scratch.run(&["new", "--roster", "crew"]);
+    new.assert_code(0);
+    let steps = next_steps(&new.stdout);
+    assert!(steps[1].starts_with("mur install -g "), "{steps:?}");
+    assert!(!scratch.config_path().exists());
+    store_key(&scratch, &steps[0], "ANTHROPIC_API_KEY");
+    let config: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(scratch.config_path()).unwrap()).unwrap();
+    let sources = config["registry"]["sources"].as_sequence().unwrap();
+    assert!(
+        sources
+            .iter()
+            .any(|source| source["repo"].as_str() == Some("murmur-nexus/default-artifacts")),
+        "{config:?}"
+    );
+    assert_eq!(
+        config["credentials"]["ANTHROPIC_API_KEY"].as_str(),
+        Some(TEST_KEY)
+    );
 }
 
 #[test]
@@ -602,7 +721,7 @@ fn an_openai_config_names_the_openai_driver_and_key() {
         let driver = &manifest.artifacts[0];
         assert_eq!(driver.name, "murmur-driver-openai");
         let gateway = driver.gateway.as_ref().unwrap();
-        assert_eq!(gateway.endpoint, "https://api.openai.com");
+        assert_eq!(gateway.endpoint, "https://api.openai.com/v1");
         assert_eq!(
             gateway.api_key,
             Some(ApiKeyReference::Environment("OPENAI_API_KEY".to_string()))
@@ -610,8 +729,8 @@ fn an_openai_config_names_the_openai_driver_and_key() {
         assert_eq!(manifest.inference.unwrap().model, "gpt-4o-mini");
     }
     let steps = next_steps(&new.stdout);
-    assert!(steps[0].starts_with("mur install -g murmur-driver-openai@"));
-    assert!(steps.contains(&"export OPENAI_API_KEY=...".to_string()));
+    assert!(steps[1].starts_with("mur install -g murmur-driver-openai@"));
+    assert!(steps.contains(&"mur config set -g credentials.OPENAI_API_KEY <your key>".to_string()));
     assert!(!new.stdout.contains("ANTHROPIC_API_KEY"));
     assert_eq!(
         std::fs::read_to_string(scratch.config_path()).unwrap(),

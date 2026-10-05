@@ -23,7 +23,8 @@ use murmur_artifact::{
     wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader, ArtifactImplementation,
     ArtifactMeta, ArtifactRuntime, ContractDirection, LocalRegistry, LockOrigin, MurmurLock,
     NativeBinaryVerdict, PlatformMatch, Registry, ResolvedArtifact, RosterReachability,
-    RuntimeManifest, UnservedInterface, WitContracts, W_REG_001, W_REG_002, W_REG_003,
+    RuntimeManifest, UnservedInterface, WitContracts, MANIFEST_FILENAME, ROSTER_FILENAME,
+    W_REG_001, W_REG_002, W_REG_003,
 };
 
 use crate::commands::install::find_project_root;
@@ -36,7 +37,7 @@ use crate::env_requirements::{
 };
 use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
-    E_RUN_019,
+    E_IO_003, E_RUN_019,
 };
 use crate::registry_client::FallbackRegistry;
 
@@ -1082,10 +1083,9 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
     );
 }
 
-/// Print the `Roster` block when `roster.yaml` sits beside the project's `murmur.yaml`: the roster
-/// admitted through [`capsule_runtime::admit_roster_file`], with each member's peer posture and the
-/// expanded reachability. Returns the `Fix:` entries; a refusal is
-/// one, and it fails the exit code.
+/// Print the `Roster` block when `roster.yaml` sits in `project_root`: the roster admitted through
+/// [`capsule_runtime::admit_roster_file`], with each member's peer posture and the expanded
+/// reachability. Returns the `Fix:` entries; a refusal is one, and it fails the exit code.
 ///
 /// Prints nothing, and finds nothing, when there is no `roster.yaml`.
 fn report_roster(
@@ -1171,12 +1171,86 @@ fn report_door(runtime_manifest: &RuntimeManifest, bind_addr: &str) {
     }
 }
 
+/// Check a formation directory, one holding `roster.yaml` and no `murmur.yaml`: admit its roster
+/// from the stores, and against the lock, that `mur run --roster <dir>` uses, and close with
+/// doctor's tally. A formation directory has no artifacts of its own, so nothing else is checked.
+fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "No {MANIFEST_FILENAME} in {}: checking its {ROSTER_FILENAME}. Run mur doctor in a member's source directory to check that member's artifacts.",
+        formation_dir.display()
+    );
+    println!();
+    let lock = read_optional_lockfile(formation_dir)?;
+    let fixes = report_roster(
+        formation_dir,
+        &FallbackRegistry {
+            primary: LocalRegistry::new(formation_dir.join(".murmur").join("artifacts")),
+            secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
+        },
+        lock.as_ref(),
+    );
+    print_tally(0, &fixes, &[]);
+    Ok(())
+}
+
+/// Print doctor's closing lines: `All checks passed.` when nothing was found, or else the tally
+/// and one `Fix:` line per fix, then per warning. Exits the process with status 1 when `fixes` is
+/// not empty; a warning alone returns.
+fn print_tally(total_pass: u32, fixes: &[String], warnings: &[String]) {
+    if fixes.is_empty() && warnings.is_empty() {
+        println!("All checks passed.");
+        return;
+    }
+
+    let total_fail = fixes.len();
+    let total_warn = warnings.len();
+    let ps = if total_pass == 1 { "" } else { "s" };
+    let es = if total_fail == 1 { "" } else { "s" };
+    let warn_tail = if total_warn == 0 {
+        String::new()
+    } else {
+        let ws = if total_warn == 1 { "" } else { "s" };
+        format!(", {total_warn} warning{ws}")
+    };
+    println!("{total_pass} check{ps} passed, {total_fail} error{es} found{warn_tail}.");
+    println!();
+
+    for fix in fixes.iter().chain(warnings.iter()) {
+        println!("Fix: {fix}");
+    }
+
+    // A warning is a report, not a failure: the artifact resolves and a session would run it.
+    if fixes.is_empty() {
+        return;
+    }
+
+    // Non-zero so `mur doctor` works as a CI pre-flight check. `process::exit` runs no
+    // destructors, so every line must already be printed.
+    std::process::exit(1);
+}
+
 /// Check every artifact the current project declares against the stores a session
 /// resolves from. The checklist is the manifest — editing `murmur.yaml` changes what
 /// is checked, with no change here.
+///
+/// A current directory holding `roster.yaml` and no `murmur.yaml` is a formation directory, and
+/// is checked as one by [`run_formation_doctor`] without walking up; `bind_addr` has nothing to
+/// check there.
 pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to determine current directory: {e}"),
+        )
+    })?;
+    if resolve_roster_path(&cwd).exists() && !resolve_manifest_path(&cwd).exists() {
+        return run_formation_doctor(&cwd);
+    }
     let project_root = find_project_root().map_err(|mut error| {
-        error.hint = Some("run `mur doctor` from inside a project directory".to_string());
+        error.hint = Some(
+            "run `mur doctor` from inside a project directory, or from a formation directory holding `roster.yaml`"
+                .to_string(),
+        );
         error
     })?;
     let manifest_path = resolve_manifest_path(&project_root);
@@ -1666,37 +1740,8 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
 
     println!();
 
-    if fixes.is_empty() && warnings.is_empty() {
-        println!("All checks passed.");
-        return Ok(());
-    }
-
-    let total_fail = fixes.len();
-    let total_warn = warnings.len();
-    let ps = if total_pass == 1 { "" } else { "s" };
-    let es = if total_fail == 1 { "" } else { "s" };
-    let warn_tail = if total_warn == 0 {
-        String::new()
-    } else {
-        let ws = if total_warn == 1 { "" } else { "s" };
-        format!(", {total_warn} warning{ws}")
-    };
-    println!("{total_pass} check{ps} passed, {total_fail} error{es} found{warn_tail}.");
-    println!();
-
-    for fix in fixes.iter().chain(warnings.iter()) {
-        println!("Fix: {fix}");
-    }
-
-    // A warning is a report, not a failure: the artifact resolves and a session would run it.
-    if fixes.is_empty() {
-        return Ok(());
-    }
-
-    // Exit non-zero so `mur doctor` can be used in CI pre-flight checks.
-    // std::process::exit terminates the process immediately; no destructors run,
-    // which is acceptable here because we are done with all I/O.
-    std::process::exit(1);
+    print_tally(total_pass, &fixes, &warnings);
+    Ok(())
 }
 
 #[cfg(test)]

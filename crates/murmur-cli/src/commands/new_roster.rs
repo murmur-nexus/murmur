@@ -32,7 +32,9 @@ pub(crate) struct Provider {
     /// The driver version a scaffolded member pins: the `extra.v` entry `docs/mkdocs.yml` holds
     /// for this driver, which a unit test keeps equal.
     pub(crate) driver_version: &'static str,
-    /// `gateway.endpoint` when `inference.endpoint` is empty.
+    /// `gateway.endpoint` when `inference.endpoint` is empty. The driver appends its own path to
+    /// the endpoint: `/v1/messages` for the Anthropic driver, `chat/completions` or `responses`
+    /// for the OpenAI driver. The default therefore holds everything before that path.
     pub(crate) default_endpoint: &'static str,
     /// `inference.model` when the config's `inference.model` is empty.
     pub(crate) default_model: &'static str,
@@ -43,7 +45,7 @@ pub(crate) struct Provider {
 pub(crate) const ANTHROPIC: Provider = Provider {
     name: "anthropic",
     driver: "murmur-driver-anthropic",
-    driver_version: "1.0.0",
+    driver_version: "0.10.0",
     default_endpoint: "https://api.anthropic.com",
     default_model: "claude-haiku-4-5-20251001",
     key_var: "ANTHROPIC_API_KEY",
@@ -52,8 +54,8 @@ pub(crate) const ANTHROPIC: Provider = Provider {
 pub(crate) const OPENAI: Provider = Provider {
     name: "openai",
     driver: "murmur-driver-openai",
-    driver_version: "1.0.0",
-    default_endpoint: "https://api.openai.com",
+    driver_version: "0.9.0",
+    default_endpoint: "https://api.openai.com/v1",
     default_model: "gpt-4o-mini",
     key_var: "OPENAI_API_KEY",
 };
@@ -405,7 +407,9 @@ pub(crate) fn render_scaffold(name: &str, choice: &ProviderChoice) -> Scaffold {
 }
 
 /// What `mur new --roster` prints on success: the files written, then the commands that install
-/// and launch the formation.
+/// and launch the formation. The key step comes first: on a host with no `~/.murmur/config.yaml`,
+/// `mur install -g <name>@<version>` has no registry source to fall back to, and the file
+/// `mur config set` writes carries the default one.
 pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
     let rules = REACHABILITY
         .iter()
@@ -441,6 +445,10 @@ pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
     }
     out.push_str("\nNext:\n");
     out.push_str(&format!(
+        "  mur config set -g credentials.{} <your key>\n",
+        choice.provider.key_var
+    ));
+    out.push_str(&format!(
         "  mur install -g {}@{}\n",
         choice.provider.driver, choice.provider.driver_version
     ));
@@ -451,7 +459,6 @@ pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
             capsule_name(name, member.name)
         ));
     }
-    out.push_str(&format!("  export {}=...\n", choice.provider.key_var));
     out.push_str(&format!(
         "  mur run --roster {name} --task \"<your task>\"\n"
     ));
@@ -1213,10 +1220,10 @@ mod tests {
   crew/worker/murmur.yaml   capsule crew-worker@0.1.0, serves peers
 
 Next:
-  mur install -g murmur-driver-anthropic@1.0.0
+  mur config set -g credentials.ANTHROPIC_API_KEY <your key>
+  mur install -g murmur-driver-anthropic@0.10.0
   mur build crew/lead && mur install -g crew/lead/crew-lead-0.1.0.mur.zip
   mur build crew/worker && mur install -g crew/worker/crew-worker-0.1.0.mur.zip
-  export ANTHROPIC_API_KEY=...
   mur run --roster crew --task \"<your task>\"
 "
         );

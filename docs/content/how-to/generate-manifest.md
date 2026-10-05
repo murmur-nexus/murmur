@@ -189,7 +189,7 @@ The generator picks one of two shapes based on the task description.
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
       - name: murmur-tool-git
         version: "{{ v.murmur_tool_git }}"
@@ -275,7 +275,7 @@ The generator picks one of two shapes based on the task description.
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
         gateway:
-          endpoint: https://api.openai.com
+          endpoint: https://api.openai.com/v1
           api_key: ${OPENAI_API_KEY}
 
     capabilities:
