@@ -155,6 +155,27 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
             "{text}"
         );
     }
+    // A stream connection forwards every task's frames on the door, so a formation token is
+    // refused `message/stream` before any task starts or any event stream opens.
+    let streamed = rpc(
+        &coder.addr,
+        Some(&token),
+        "message/stream",
+        message("m-s", "hi"),
+    );
+    assert_eq!(streamed.status, 403, "{streamed:?}");
+    let body = streamed.json();
+    assert_eq!(body["error"], "insufficient_scope", "{streamed:?}");
+    let text = body["message"].as_str().unwrap();
+    assert!(
+        text.contains("member:planner") && text.contains("message/stream"),
+        "{text}"
+    );
+    assert_eq!(
+        streamed.header("www-authenticate"),
+        Some("Bearer realm=\"coder\", error=\"insufficient_scope\", scope=\"message/stream\"")
+    );
+    assert_eq!(streamed.header("content-type"), Some("application/json"));
 
     // (b) The same token at a door it was not issued for: 403 not_permitted, naming only the
     // member that presented it.

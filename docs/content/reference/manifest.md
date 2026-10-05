@@ -954,7 +954,7 @@ token.
 | Scope | Reaches |
 |---|---|
 | `message/send` | Starting a task with `message/send` |
-| `message/stream` | Starting a task with `message/stream` |
+| `message/stream` | Starting a task with `message/stream`; the connection carries [every task's frames](streaming-protocol.md#endpoints) while it is open |
 | `stream/watch` | Watching every task on the session |
 | `tasks/get` | Reading any task on the session |
 | `tasks/cancel` | Cancelling any task on the session |
