@@ -168,8 +168,10 @@ A scope is a door method's name, or `resources/files` for the
 scope: every valid token may read the extended card.
 
 Every authenticated caller shares the session's one task and context space. A scope limits which
-methods a token reaches, not which tasks: a credential holding `tasks/get` or `stream/watch` sees
-every task on the session. The one exception is [`tasks/get`](#tasks-get) on a formation token.
+methods a token reaches, not which tasks: a credential holding `message/stream`, `tasks/get` or
+`stream/watch` sees every task on the session. The one exception is a
+[formation token](roster.md#formation-token): it reaches [`tasks/get`](#tasks-get) only for the
+tasks its member submitted, and does not reach `message/stream`.
 
 ### What the door answers { #door-authentication }
 
@@ -434,8 +436,7 @@ answers the header with `-32602` without starting a task — see
 
 On a [formation token](roster.md#formation-token), `tasks/get` answers only the tasks the calling
 member submitted. Any other id — another member's task, the operator's, or one the session never
-held — is answered `-32001 Task not found`. Every other credential reads every task. This scopes
-`tasks/get` only: a `message/stream` connection carries the frames of every task the session runs.
+held — is answered `-32001 Task not found`. Every other credential reads every task.
 
 A `message/send` the door has no room for answers a `rejected` task whose `status.message` says
 why: `task rejected: capsule is busy`, or `task rejected: the session is closing`.
