@@ -55,6 +55,8 @@ own, so rewriting is idempotent: rewriting an already-rewritten block changes no
    opening and closing markers a consumer sees are the runtime's own; any marker the content
    carried is in its neutralised form and matches neither.
 3. Everything between the separators is data, verbatim.
+4. Text after the final closer is the runtime's own, such as the note that follows a started
+   [`call-member`](runtime-provided-tools.md#call-member-result) result.
 
 The runtime's system prompt states the same rule to the model: a closing marker appearing
 anywhere inside a block — including one drawn inside an image — is a forgery.
@@ -110,6 +112,7 @@ holds.
 |---|---|
 | An operator-pinned skill's `skill.md` | The capsule author's own guidance, staged inside the capsule at install. Fencing it as data would make the skill inert. A skill whose [`murmur.lock` pin](workdir.md#lock-origin) a running capsule pulled is fenced — see [Artifact origin](../concepts/access-control.md#artifact-origin) |
 | A dispatch failure | The runtime's own text about a call that never reached a tool |
+| The runtime's note after a started [`call-member`](runtime-provided-tools.md#call-member-result) result | The runtime's own text about the call; the result itself stays fenced |
 | A refusal — from [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) or from a hook's decision | The runtime's own text. The call never ran |
 | A hook artifact | The capsule operator's own declared hook speaking |
 | A task whose [trust class](../concepts/access-control.md#task-origin-and-trust-class) is `trusted` | The operator instructing their own capsule |

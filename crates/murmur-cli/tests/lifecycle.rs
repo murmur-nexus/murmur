@@ -1226,23 +1226,6 @@ fn mur_run(
         .expect("mur run should execute")
 }
 
-/// The text of the last `user` message in a recorded driver request.
-fn last_user_text(request: &Value) -> String {
-    let last_user = request["messages"]
-        .as_array()
-        .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "user"))
-        .unwrap_or_else(|| panic!("the request carries a user message: {request}"));
-    match &last_user["content"] {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => panic!("unexpected user content: {other}"),
-    }
-}
-
 /// Milliseconds from `task_end` to `session_end`, which is how long the session held on after its
 /// task. Read off the trace rather than a clock around the process, so the time spent compiling
 /// the capsule before the task can neither hide nor fake a wait.
@@ -1296,7 +1279,7 @@ fn lifecycle_queue_exit_ends_as_soon_as_its_task_md_task_does() {
     let requests = server.requests();
     assert_eq!(requests.len(), 1, "one task, one request: {requests:?}");
     assert!(
-        !last_user_text(&requests[0]).trim().is_empty(),
+        !common::last_user_text(&requests[0]).trim().is_empty(),
         "the request carries the task: {}",
         requests[0]
     );

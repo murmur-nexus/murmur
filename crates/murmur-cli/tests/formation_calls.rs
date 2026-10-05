@@ -74,15 +74,16 @@ impl Model {
 
     /// A callee's model: every request is held until `release` is sent or dropped, then
     /// answered with `reply`.
-    fn held(reply: &'static str) -> (Self, mpsc::Sender<()>) {
+    fn held(reply: impl Into<String>) -> (Self, mpsc::Sender<()>) {
         let (release, released) = mpsc::channel::<()>();
         let released = Mutex::new(released);
+        let reply = reply.into();
         let model = Self::new(move |_| {
             let _ = released
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(120));
-            end_turn(1, reply)
+            end_turn(1, &reply)
         });
         (model, release)
     }
@@ -150,6 +151,22 @@ struct Project {
 
 impl Project {
     fn new(members: Vec<Member>, reachability: &str) -> Self {
+        Self::with_manifests(members, reachability, |member| {
+            manifest(
+                &member.model.server.endpoint,
+                member.entry,
+                member.allow,
+                member.max_turns,
+            )
+        })
+    }
+
+    /// [`Self::new`], each member's manifest body written by `body`.
+    fn with_manifests(
+        members: Vec<Member>,
+        reachability: &str,
+        body: impl Fn(&Member) -> String,
+    ) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("formation-calls-")
             .tempdir()
@@ -158,12 +175,7 @@ impl Project {
         let store = dir.path().join(".murmur").join("artifacts");
         let mut roster = String::from("roster_version: 1\nmembers:\n");
         for member in &members {
-            let body = manifest(
-                &member.model.server.endpoint,
-                member.entry,
-                member.allow,
-                member.max_turns,
-            );
+            let body = body(member);
             publish_to_store(&store, member.name, "0.1.0", "capsule", &body, None);
             roster.push_str(&format!(
                 "  - name: {name}\n    capsule: {name}\n    version: 0.1.0\n{entry}",
@@ -672,6 +684,431 @@ fn a_call_left_out_on_the_last_turn_is_abandoned_without_waiting() {
     assert_eq!(ends.len(), 1, "{lead_trace:?}");
     assert_eq!(ends[0]["status"], "abandoned");
     assert_eq!(ends[0]["delivered"], false);
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
+// ── One pending call per member ───────────────────────────────────────────────
+
+/// What the runtime says after a started call's fenced result: the answer is not in it, and the
+/// next step is to end the turn.
+const STARTED_NOTE: &str = "Its answer is not in this result and no tool fetches it: the runtime \
+     adds it to this conversation after you end your turn. Unless you still have work to hand to a \
+     different member, end your turn now by replying without calling a tool. Calling worker again \
+     before its answer arrives is refused.";
+
+/// The runtime's last line on a delivery once no call is left out.
+const EVERY_CALL_ENDED: &str = "[call-member] Every call this task made has ended, and the \
+     answers are above. Answer the task with them now; call a member again only to give it new \
+     work.";
+
+/// A two-member roster, `lead` calling `worker`, each on its own scripted model.
+fn lead_and_worker(lead: Model, worker: Model) -> Project {
+    Project::new(
+        vec![
+            Member {
+                name: "lead",
+                entry: true,
+                allow: Some("localhost"),
+                max_turns: None,
+                model: lead,
+            },
+            Member {
+                name: "worker",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: worker,
+            },
+        ],
+        "reachability:\n  - from: lead\n    to: [worker]\n",
+    )
+}
+
+/// The `call-member` `tool_call` records of `trace`, in order.
+fn call_member_tool_calls(trace: &[Value]) -> Vec<&Value> {
+    records(trace, "tool_call")
+        .into_iter()
+        .filter(|record| record["tool_name"] == "call-member")
+        .collect()
+}
+
+/// Lead calls worker, then calls worker again before the answer arrives. The second call is a
+/// tool error that sends nothing and names the first call; the started result carries the
+/// runtime's note after its fence; worker runs one task, and its answer still reaches lead with
+/// the runtime's line that every call has ended.
+#[test]
+fn a_repeated_call_is_refused_and_the_answer_still_arrives() {
+    const TASK: &str = "Write one line about the sea.";
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let lead = Model::new(|n| match n {
+        1 => common::tool_use_response(
+            "toolu_first",
+            "call-member",
+            json!({"member": "worker", "task": TASK}),
+        ),
+        2 => common::tool_use_response(
+            "toolu_repeat",
+            "call-member",
+            json!({"member": "worker", "task": TASK}),
+        ),
+        3 => end_turn(3, "waiting"),
+        _ => end_turn(n, "worker answered"),
+    });
+    let answer = format!("WORKER-{nonce}");
+    let (worker, release_worker) = Model::held(answer.clone());
+    let project = lead_and_worker(lead, worker);
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("ask worker", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    // Worker answers only once lead has been refused, so the refusal is the not-yet-answered one.
+    project.await_requests("lead", 3);
+    release_worker.send(()).unwrap();
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let starts = records(&lead_trace, "member_call_start");
+    assert_eq!(starts.len(), 1, "{lead_trace:?}");
+    let call_id = starts[0]["call_id"].as_str().unwrap();
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 1, "{lead_trace:?}");
+    assert_eq!(ends[0]["status"], "completed");
+    assert_eq!(ends[0]["delivered"], true);
+    let tool_calls = call_member_tool_calls(&lead_trace);
+    assert_eq!(tool_calls.len(), 2, "{tool_calls:?}");
+    assert_ne!(tool_calls[0]["status"], "error", "{}", tool_calls[0]);
+    assert_eq!(tool_calls[1]["status"], "error", "{}", tool_calls[1]);
+    assert_eq!(records(&lead_trace, "task_end")[0]["exit_status"], "ok");
+
+    let requests = project.model("lead").requests();
+    assert_eq!(requests.len(), 4, "{requests:?}");
+
+    // Request 2: the started JSON inside the fence, the note after its closing marker.
+    let started = common::find_tool_result(&requests[1..2], "toolu_first").unwrap();
+    let started = common::extract_result_text(&started);
+    let (fenced, note) = started.split_once("\n</untrusted-content>\n").unwrap();
+    let fenced = fenced
+        .strip_prefix("<untrusted-content source=tool:call-member>\n")
+        .unwrap_or_else(|| panic!("{started}"));
+    let data: Value = serde_json::from_str(fenced).unwrap();
+    assert_eq!(data["status"], "started", "{data}");
+    assert_eq!(data["call_id"], call_id, "{data}");
+    assert!(!fenced.contains("[call-member]"), "{started}");
+    assert_eq!(
+        note,
+        format!("[call-member] worker is now working on call {call_id}. {STARTED_NOTE}")
+    );
+
+    // Request 3: the repeat, a tool error with no fence, naming the first call. The runtime
+    // marks it `is_error: true`; the Anthropic driver fixture does not carry that flag onto the
+    // wire block, so the error is asserted on the `tool_call` record above.
+    let repeat = common::find_tool_result(&requests[2..3], "toolu_repeat").unwrap();
+    let refusal = common::extract_result_text(&repeat);
+    assert_eq!(
+        refusal,
+        format!(
+            "worker has not yet answered call {call_id} from this task, so nothing was sent. Its \
+             answer reaches you only after you end your turn: end your turn now by replying \
+             without calling a tool. Once that answer has arrived you may call worker again with \
+             new work."
+        )
+    );
+
+    // Request 4: worker's answer under its member, then the runtime's line.
+    let delivered = common::last_user_text(&requests[3]);
+    assert!(
+        delivered.contains(&format!(
+            "<untrusted-content source=member:worker>\n{answer}"
+        )),
+        "{delivered}"
+    );
+    assert!(delivered.ends_with(EVERY_CALL_ENDED), "{delivered}");
+
+    let worker_trace = project.trace_of(&formation_id, "worker");
+    assert_eq!(records(&worker_trace, "a2a_task_received").len(), 1);
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
+/// Once worker's answer has been delivered, a second call to worker is new work: it starts as a
+/// call of its own and is answered like the first.
+#[test]
+fn a_follow_up_after_the_answer_is_a_new_call() {
+    let lead = Model::new(|n| match n {
+        1 => common::tool_use_response(
+            "toolu_first",
+            "call-member",
+            json!({"member": "worker", "task": "Draft a line."}),
+        ),
+        2 => end_turn(2, "waiting"),
+        3 => common::tool_use_response(
+            "toolu_second",
+            "call-member",
+            json!({"member": "worker", "task": "Now shorten it."}),
+        ),
+        4 => end_turn(4, "waiting again"),
+        _ => end_turn(n, "done"),
+    });
+    let worker = Model::new(|n| end_turn(n, &format!("WORKER-ANSWER-{n}")));
+    let project = lead_and_worker(lead, worker);
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("ask worker twice", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let starts = records(&lead_trace, "member_call_start");
+    assert_eq!(starts.len(), 2, "{lead_trace:?}");
+    assert_ne!(starts[0]["call_id"], starts[1]["call_id"]);
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 2, "{lead_trace:?}");
+    assert!(ends
+        .iter()
+        .all(|end| end["status"] == "completed" && end["delivered"] == true));
+    assert!(call_member_tool_calls(&lead_trace)
+        .iter()
+        .all(|call| call["status"] != "error"));
+    assert_eq!(project.model("lead").arrived(), 5);
+    let worker_trace = project.trace_of(&formation_id, "worker");
+    assert_eq!(records(&worker_trace, "a2a_task_received").len(), 2);
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
+/// Two calls to worker in one response start once: the first is started, the second refused,
+/// and worker runs only the first task.
+#[test]
+fn one_member_twice_in_one_response_starts_once() {
+    let lead = Model::new(|n| match n {
+        1 => call_members(&[("worker", "TASK-A"), ("worker", "TASK-B")]),
+        2 => end_turn(2, "waiting"),
+        _ => end_turn(n, "done"),
+    });
+    let worker = Model::new(|n| end_turn(n, "WORKER-ANSWER"));
+    let project = lead_and_worker(lead, worker);
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("ask worker", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let requests = project.model("lead").requests();
+    let first = common::find_tool_result(&requests, "toolu_call_0").unwrap();
+    let first = common::extract_result_text(&first);
+    assert!(first.contains("\"status\":\"started\""), "{first}");
+    assert!(first.contains("is now working on call"), "{first}");
+    let second = common::find_tool_result(&requests, "toolu_call_1").unwrap();
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let tool_calls = call_member_tool_calls(&lead_trace);
+    assert_eq!(tool_calls.len(), 2, "{tool_calls:?}");
+    assert_ne!(tool_calls[0]["status"], "error", "{}", tool_calls[0]);
+    assert_eq!(tool_calls[1]["status"], "error", "{}", tool_calls[1]);
+    let starts = records(&lead_trace, "member_call_start");
+    assert_eq!(starts.len(), 1, "{lead_trace:?}");
+    let call_id = starts[0]["call_id"].as_str().unwrap();
+    let refusal = common::extract_result_text(&second);
+    assert!(
+        refusal.starts_with(&format!(
+            "worker has not yet answered call {call_id} from this task, so nothing was sent."
+        )) || refusal.starts_with(&format!("worker has already answered call {call_id},")),
+        "{refusal}"
+    );
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 1, "{lead_trace:?}");
+    assert_eq!(ends[0]["delivered"], true);
+
+    let worker_requests = project.model("worker").requests();
+    assert_eq!(worker_requests.len(), 1, "{worker_requests:?}");
+    let told = worker_requests[0].to_string();
+    assert!(
+        told.contains("TASK-A") && !told.contains("TASK-B"),
+        "{told}"
+    );
+    let worker_trace = project.trace_of(&formation_id, "worker");
+    assert_eq!(records(&worker_trace, "a2a_task_received").len(), 1);
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
+// ── A process lead ────────────────────────────────────────────────────────────
+
+/// The fixture process driver, run by every `transport: process` lead here.
+const PROCESS_DRIVER: &str = "fixture-process-driver";
+
+/// A `transport: process` lead whose harness calls worker through the bridged `call-member`
+/// and ends its turn. The bridged result carries the runtime's note after its fence; the answer
+/// reaches the harness as the prompt of a resume of the same session, ending with the runtime's
+/// line that every call has ended.
+#[test]
+fn a_process_lead_gets_the_answer_in_its_resumed_session() {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let answer = format!("WORKER-{nonce}");
+    let worker = Model::new({
+        let answer = answer.clone();
+        move |n| end_turn(n, &answer)
+    });
+    // Lead's inference runs in the harness; its scripted model is never asked.
+    let lead = Model::new(|n| end_turn(n, "unused"));
+    let project = Project::with_manifests(
+        vec![
+            Member {
+                name: "lead",
+                entry: true,
+                allow: Some("localhost"),
+                max_turns: None,
+                model: lead,
+            },
+            Member {
+                name: "worker",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: worker,
+            },
+        ],
+        "reachability:\n  - from: lead\n    to: [worker]\n",
+        |member| {
+            if member.entry {
+                format!(
+                    "artifacts:\n  - name: {PROCESS_DRIVER}\n    version: {DRIVER_VERSION}\n    \
+                     runtime: driver\n\
+                     capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n  \
+                     network:\n    allow: [localhost]\n\
+                     lifecycle:\n  task_acceptance: single\n  after_task: exit\n\
+                     inference:\n  transport: process\n  driver:\n    artifact: {PROCESS_DRIVER}\n\
+                     network:\n  authentication:\n    scheme: bearer\n"
+                )
+            } else {
+                manifest(
+                    &member.model.server.endpoint,
+                    member.entry,
+                    member.allow,
+                    member.max_turns,
+                )
+            }
+        },
+    );
+
+    // The process driver beside the http one, and the fake harness as `fixture-cli` on a `PATH`
+    // of lead's own.
+    let artifacts = tempfile::tempdir().unwrap();
+    let driver = common::create_driver_artifact_with_auth(
+        artifacts.path(),
+        PROCESS_DRIVER,
+        DRIVER_VERSION,
+        &common::fixture_path("process-driver/tool/process-driver.wasm"),
+        "",
+    );
+    common::publish_local(&project.home, &driver).success();
+    let bin_dir = project.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harness = bin_dir.join("fixture-cli");
+    std::fs::copy(
+        common::fixture_path("process-driver/fake-harness"),
+        &harness,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&harness).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&harness, perms).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string())
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch(
+        "Get worker's token.",
+        &[
+            ("PATH", path.as_str()),
+            ("FIXTURE_HARNESS_PROFILE", "member-call"),
+        ],
+    );
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let harness_starts = records(&lead_trace, "harness_start");
+    assert_eq!(harness_starts.len(), 2, "{harness_starts:?}");
+    assert_eq!(harness_starts[0]["session_mode"], "new");
+    assert_eq!(harness_starts[1]["session_mode"], "resume");
+    assert_eq!(
+        harness_starts[0]["harness_session_id"],
+        harness_starts[1]["harness_session_id"]
+    );
+    let starts = records(&lead_trace, "member_call_start");
+    assert_eq!(starts.len(), 1, "{lead_trace:?}");
+    let call_id = starts[0]["call_id"].as_str().unwrap();
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 1, "{lead_trace:?}");
+    assert_eq!(ends[0]["status"], "completed");
+    assert_eq!(ends[0]["delivered"], true);
+    assert_eq!(records(&lead_trace, "task_end")[0]["exit_status"], "ok");
+
+    // What the harness read back from the bridge: the started JSON fenced, the note after.
+    let bridged = std::fs::read_to_string(
+        project
+            .home
+            .path()
+            .join("fake-harness-sessions/call-member-answer"),
+    )
+    .unwrap();
+    let bridged: Value = serde_json::from_str(&bridged).unwrap();
+    let text = bridged
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{bridged}"));
+    let (fenced, note) = text.split_once("\n</untrusted-content>\n").unwrap();
+    let fenced = fenced
+        .strip_prefix("<untrusted-content source=tool:call-member>\n")
+        .unwrap_or_else(|| panic!("{text}"));
+    let data: Value = serde_json::from_str(fenced).unwrap();
+    assert_eq!(data["status"], "started", "{data}");
+    assert_eq!(data["call_id"], call_id, "{data}");
+    assert_eq!(
+        note,
+        format!("[call-member] worker is now working on call {call_id}. {STARTED_NOTE}")
+    );
+
+    // What the resumed harness was told, as it answered with it.
+    let lead_session = &session_dirs(&project.path().join(".murmur"))[0];
+    let result = std::fs::read_to_string(lead_session.join("out/result.txt")).unwrap();
+    for said in [
+        format!("[call-member] call {call_id} to worker ended completed:"),
+        "<untrusted-content source=member:worker>".to_string(),
+        answer.clone(),
+        EVERY_CALL_ENDED.to_string(),
+    ] {
+        assert!(result.contains(&said), "{said}: {result}");
+    }
+
     assert_no_member_remains(
         project.path(),
         &reported_pids(&formation, Some(&readiness)),

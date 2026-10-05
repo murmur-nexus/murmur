@@ -142,6 +142,7 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `interrupt-honours` | Reads stdin until the driver's `interrupt` line arrives, then `fail canceled interrupted by the runtime` and exit `0` |
 | `interrupt-ignores` | Never reads stdin and sleeps 600 s, so the interrupt grace runs out and the runtime kills it |
 | `interrupt-signal` | Traps `INT`, then `fail canceled interrupted by SIGINT` and exit `0` |
+| `member-call` | A formation lead. On a `new` session: one bridged `call-member` to `worker`, the bridge's answer saved to `$HOME/fake-harness-sessions/call-member-answer`, then `end waiting`. On `resume`: reads the prompt up to the first line starting `[call-member] Every call` or `[call-member] Still working`, and ends with the whole prompt on one line |
 | `parity` | One `text`, one bridge tool call and its result, then the answer and `end PARITY-ANSWER` |
 | `tool-progress` | `parity`, with `tstart c1`, `tprogress c1 12` and `tprogress c1 40` before the `tool` line, whose input is `{"msg":"QXZJ-WKVR-MPLT-YNGH"}` while the bridge is called with the default ping, so the input appears nowhere but the call |
 | `tool-progress-large` | `tool-progress`, with 350 `tprogress c1` lines in steps of 20, ending at `7000`, printed back to back |

@@ -53,6 +53,14 @@ pub(crate) struct DispatchOutcome {
     /// boundary stopped being establishable is the silent-degradation failure mode the whole
     /// containment-class mechanism exists to prevent.
     pub fatal: Option<crate::errors::RuntimeError>,
+    /// The runtime's own words about this call, appended by
+    /// [`crate::runtime::CapsuleStoreState::dispatch_agent_tool_async`] after the fence's closing
+    /// marker, so the model reads them as the runtime's rather than as the tool's data.
+    ///
+    /// `Some` only on a `call-member` call that started, carrying
+    /// [`crate::member_call::started_note`]; `None` on every other outcome. The unfenced route of
+    /// [`crate::runtime::CapsuleStoreState::dispatch_submit_plan`] never reads it.
+    pub runtime_note: Option<String>,
 }
 
 impl DispatchOutcome {
@@ -64,6 +72,7 @@ impl DispatchOutcome {
             is_skill: false,
             fence_source: None,
             fatal: None,
+            runtime_note: None,
         }
     }
 
@@ -75,6 +84,7 @@ impl DispatchOutcome {
             is_skill: true,
             fence_source: None,
             fatal: None,
+            runtime_note: None,
         }
     }
 }

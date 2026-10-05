@@ -245,7 +245,7 @@ section of this reference.
 | [`inference.transport`](manifest.md#field-inference) | `http` | `http` |
 | [`inference.model`](manifest.md#field-inference) | The provider's model | The same |
 | [`inference.driver.artifact`](manifest.md#field-inference) | The provider's driver | The same |
-| [`inference.system_prompt`](manifest.md#field-inference) | Names the member and the formation, and the hand-off: give the task to `worker` with [`call-member`](runtime-provided-tools.md#call-member), end the turn while it works, and answer with the result when its answer arrives | One sentence naming the member and the formation |
+| [`inference.system_prompt`](manifest.md#field-inference) | Names the member and the formation, and the hand-off: `lead` does not do the task itself, its first reply hands the task to `worker` with [`call-member`](runtime-provided-tools.md#call-member), it ends the turn while `worker` works, and it answers with `worker`'s answer when it arrives | One sentence naming the member and the formation |
 | [`lifecycle.task_acceptance`](manifest.md#field-lifecycle) | `single`: the formation's one task | `queue` |
 | [`lifecycle.after_task`](manifest.md#field-lifecycle) | `exit`, which stops the formation | `sleep`: it waits at its door while the formation runs |
 | [`capabilities.network.allow`](manifest.md#field-capabilities) | `[localhost]`, the entry through which `call-member` reaches `worker`'s door — see [Giving a member work](roster.md#member-calls) | Absent: `worker` declares no `capabilities` |
