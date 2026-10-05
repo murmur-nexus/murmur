@@ -1107,9 +1107,6 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         &DelegationOrigin {
             context_id: ctx.current_context_id.clone().unwrap_or_default(),
             launched,
-            // `delegate` waits on the connection it holds, so nothing this delegation does posts
-            // a completion and there is no trust for one to inherit.
-            trust: None,
         },
     );
 

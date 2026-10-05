@@ -454,19 +454,31 @@ fn a_capsule_that_does_not_consent_still_serves_events_completions_planes_and_it
     // The card answers a caller carrying peer headers.
     assert_eq!(peer_tasks_param(&capsule.card()), &json!(false));
 
-    // A completion addressed to this session is a child reporting back, not a peer task.
+    // A completion addressed to this session is a child reporting back, not a peer task: it
+    // passes the consent gate and reaches the door's completion route, which answers that no task
+    // here is waiting for this delegation.
     let completion = send(
         &capsule.addr,
         &[
             (PEER_ORIGIN_HEADER, "completion"),
-            (PEER_TRUST_HEADER, "trusted"),
             (DELEGATION_ID_HEADER, "dlg_0000000000000001"),
             (COMPLETION_SESSION_HEADER, capsule.session_id.as_str()),
         ],
         "m-completion",
     );
-    let task_id = submitted_id(&completion);
-    assert_eq!(capsule.task_start(&task_id)["origin"], "completion");
+    assert_eq!(completion.status, 200, "{completion:?}");
+    assert!(
+        !completion.body.contains("peer_not_accepted"),
+        "{completion:?}"
+    );
+    let answer = completion.json();
+    assert_eq!(answer["error"]["code"], -32004, "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("dlg_0000000000000001")),
+        "{answer}"
+    );
 
     // The peer file plane answers with its own authoriser, whatever the origin claim.
     let peer_plane = request(&capsule.addr, "GET", "/resources/peer/garbage", &PEER, "");

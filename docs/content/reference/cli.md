@@ -1483,8 +1483,9 @@ A cancelled task's ending is its `task_end` record, or, for a task cancelled bef
 its `task_canceled` record with `phase: "queued"`.
 
 The door step is the only moment anything can ask the capsule what it leaves running. A detached
-shell command keeps its own lifecycle and a delegated sub-capsule is still going, and the record of
-both dies with the process, so the question is asked while the capsule is still answering.
+shell command keeps its own lifecycle, and the record of it dies with the process, so the question
+is asked while the capsule is still answering. A delegated sub-capsule is ended by the cancelled
+task that started it, and is named too.
 
 ```text
 stopped: ses_019f01a940ce7761854e768ecbe3d399
@@ -1492,17 +1493,17 @@ capsule: my-worker@0.1.0
 signal:  SIGTERM
 canceled: tsk_019ed5211c827f63a8fe4be623277c55
 running: wrk_9f2a1c  detached shell  sleep 30
-running: dlg_7b31de  delegation  worker@0.1.0
+ended:   dlg_7b31de  delegation  worker@0.1.0
 ```
 
-The `running:` lines are the ones [`mur cancel`](#mur-cancel) prints for the same items. Nothing on
-them was stopped.
+The `running:` and `ended:` lines are the ones [`mur cancel`](#mur-cancel) prints for the same
+items.
 
 ### The three answers about what it left behind { #mur-stop-residue }
 
 | Line | Means |
 |---|---|
-| `running: …`, one per item | The capsule answered and named these |
+| `running: …` or `ended: …`, one per item | The capsule answered and named these: `running:` for a detached shell command, which keeps running; `ended:` for a delegation, whose sub-capsule the cancelled task ended |
 | `residue: nothing else was left running` | The capsule answered and had nothing to name |
 | `residue: unknown — the capsule could not be asked: …` | The door did not answer, and the reason says why |
 
@@ -1652,14 +1653,18 @@ A door that answers `401` or `403` fails the command with `E-IO-003`, naming the
 `MURMUR_DOOR_TOKEN`.
 
 The in-flight inference call is dropped rather than waited out, and the task reaches the terminal
-state `canceled`. Nothing else is stopped: a detached shell command keeps its own lifecycle and a
-delegated sub-capsule keeps running. Both are named in the output instead, one line each.
+state `canceled`. What the task had in flight is named in the output, one line each:
+
+| Line | Item | What the cancel did to it |
+|---|---|---|
+| `running:` | A detached shell command | Nothing: it keeps its own lifecycle |
+| `ended:` | A sub-capsule the task delegated to | Ended it, with the task |
 
 ```text
 task:    tsk_0199c4e2f1b7712a9d3e4f5061728394
 state:   canceled
 running: wrk_9f2a1c  detached shell  sleep 30
-running: dlg_7b31de  delegation  worker@0.1.0
+ended:   dlg_7b31de  delegation  worker@0.1.0
 ```
 
 Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` reports
@@ -2073,7 +2078,7 @@ Output sections, in the order they are printed:
 | Pulled at runtime | one or more [`artifact_pulled`](observability-schemas.md#session-trace-tracejsonl) records | One `<name>@<version>  <runtime>  <origin>/<trust>` row per pull, in file order |
 | Shell calls | always | Count, exit code distribution, average latency |
 | Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
-| Cancelled | one or more [`task_canceled`](observability-schemas.md#task-canceled) records | One `task_canceled  at <phase>` row per cancel, naming what was still running |
+| Cancelled | one or more [`task_canceled`](observability-schemas.md#task-canceled) records | One `task_canceled  at <phase>` row per cancel, naming the detached shell commands still running and the delegations in flight |
 | Rejected | one or more [`task_rejected`](observability-schemas.md#task-rejected) records | One `task_rejected  <task id>  <cause>  source <source>` row per refused task, in file order |
 | Failed | one or more [`task_failed`](observability-schemas.md#task-failed) records | One `task_failed  <cause>  <task id>  at turn <n>` row per failed attempt, followed by its `reason:` |
 | Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, whether the next attempt `continued` the task's conversation or `restarted` it, the turns it had left, and the hook's feedback — `reopen 1  by gatekeeper  continued, 7 turns left  “…”` |

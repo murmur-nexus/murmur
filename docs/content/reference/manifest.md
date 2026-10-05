@@ -1245,7 +1245,7 @@ caller can read it before sending.
 |---|---|
 | `x-murmur-task-origin: peer`, any method or path on the door | yes |
 | No origin header, or any origin but `peer` and `completion` | no — classified `event` and governed by [`network.authentication`](#field-network-authentication) alone |
-| A completion a [delegated child](roost-api.md#the-delegation-tool) posts back to this session | no |
+| A completion a [delegated child](roost-api.md#the-delegation-tool) posts back to this session | no — handed to the task that made the delegation |
 | A task delivered to this capsule as a delegated child | no — it carries no origin header |
 | `/resources/peer/` | no — governed by [`exports.peer_files`](#field-exports-peer-files) and the handle |
 | The [control surface](control-surface.md) | no — governed by the control token |
@@ -2254,7 +2254,7 @@ It covers every wait on handed-off work, one per caller:
 
 | Caller | What the deadline bounds |
 |---|---|
-| [`delegate-task`](runtime-provided-tools.md) | How long the started sub-capsule is watched. On expiry the sub-capsule is ended and a `terminated` outcome is posted to the delegating capsule |
+| [`delegate-task`](runtime-provided-tools.md) | How long the started sub-capsule is watched. On expiry the sub-capsule is ended and the delegating task continues with a `terminated` outcome |
 | A plan's `capsule` step | How long the step waits for the sub-capsule's answer. On expiry the step fails and the sub-capsule is stopped |
 | [`call-member`](runtime-provided-tools.md#call-member) | How long a call waits for the formation member's answer. On expiry the calling task gets a `timed_out` answer; the member is not stopped |
 
@@ -2269,27 +2269,17 @@ bound for a whole process when it names a positive integer; the declared value a
 and `600` when neither is given. Getting the sub-capsule *started* is bounded separately — see
 [Bounds](roost-api.md#bounds) — so a slow host does not spend this window on staging.
 
-**Reaching the deadline ends the sub-capsule.** Under `delegate-task` the delegating capsule is
-told, in a task of its own: a `completion`-origin task in the `bg` lane carrying the delegation's
-`dlg_` id, `status: terminated` and a `detail` naming the bound in seconds. That task is the same
-shape every delegation outcome takes — see [The completion path](roost-api.md#the-completion-path).
-
-An outcome reaches only a capsule that outlives the task which made the delegation. Under the
-default `after_task: exit` the session ends when the task does, and nothing arrives; a capsule that
-delegates and leaves its `lifecycle` block that way is warned at launch with
-[`W-SEC-020`](diagnostics.md#w-sec-020). A capsule that means to receive outcomes declares:
+**Reaching the deadline ends the sub-capsule.** Under `delegate-task` the delegating task, which
+waits for every sub-capsule it started on any `lifecycle`, continues with an outcome carrying the
+delegation's `dlg_` id, `status: terminated` and a `detail` naming the bound in seconds — the same
+shape every delegation outcome takes, described in
+[How the outcome arrives](roost-api.md#how-the-outcome-arrives). A task that has heard nothing 30
+seconds past the deadline ends the sub-capsule itself.
 
 ```yaml
 lifecycle:
-  task_acceptance: queue
-  queue_depth: 4
-  after_task: sleep
   delegation_deadline_secs: 120
 ```
-
-An outcome that arrives when the delegating capsule's task loop has already ended is recorded
-rather than dropped: the sub-capsule's own `completion.json` is written with `delivered: false` and
-the reason, and a line goes to stderr.
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
 

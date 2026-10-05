@@ -2,8 +2,9 @@
 //!
 //! Every tool result the runtime hands the model, every skill result whose `murmur.lock` origin
 //! derives [`crate::origin::TrustClass::Untrusted`] (see [`crate::origin::artifact_trust`]), every
-//! task payload whose derived trust class is untrusted, and every formation member's answer to a
-//! `call-member` call, arrives wrapped between
+//! task payload whose derived trust class is untrusted, every formation member's answer to a
+//! `call-member` call, and every sub-capsule's outcome delivered into the task that delegated to
+//! it, arrives wrapped between
 //! [`open_marker`]'s output and [`FENCE_CLOSE`]. The fence is a *marker*, not a capability
 //! control: nothing is refused, delayed or reordered for being fenced, no grant is widened or
 //! narrowed by it, and the model is free to act on what it reads. It gives the model a stable
@@ -68,6 +69,13 @@ pub(crate) fn member_source(member: &str) -> String {
     format!("member:{member}")
 }
 
+/// The source name for a sub-capsule's outcome delivered into the task that delegated to it:
+/// `delegation:<capsule>`, e.g. `delegation:worker`. Every outcome is fenced under it, whatever the
+/// delegating task's trust.
+pub(crate) fn delegation_source(capsule: &str) -> String {
+    format!("delegation:{capsule}")
+}
+
 /// The source name for a task payload: `task:<origin>`, e.g. `task:event`.
 pub(crate) fn task_source(origin: TaskOrigin) -> String {
     format!("task:{}", origin.as_str())
@@ -128,9 +136,11 @@ mod tests {
     use crate::agent::count_tokens;
 
     /// Every non-test call site of [`wrap_untrusted`] in this crate, as file names relative to
-    /// `src/`. The fence is applied once, at the tool-result boundary, the task-payload boundary
-    /// and the member-answer boundary, and another application would fence a fenced block.
-    const PERMITTED_FENCE_CALL_SITES: [&str; 3] = ["runtime.rs", "agent.rs", "member_call.rs"];
+    /// `src/`. The fence is applied once, at the tool-result boundary, the task-payload boundary,
+    /// the member-answer boundary and the delegation-outcome boundary, and another application
+    /// would fence a fenced block.
+    const PERMITTED_FENCE_CALL_SITES: [&str; 4] =
+        ["runtime.rs", "agent.rs", "member_call.rs", "delegation.rs"];
 
     #[test]
     fn fence_names_its_source_and_closes_once() {
@@ -257,7 +267,7 @@ mod tests {
         );
     }
 
-    /// The source guard: [`wrap_untrusted`] is called from exactly the three boundaries the fence
+    /// The source guard: [`wrap_untrusted`] is called from exactly the four boundaries the fence
     /// exists for. Another call site — a second application in a dispatch branch, a re-fence in
     /// a hook or in the A2A path — fails here rather than reaching a model as a doubled fence.
     ///
@@ -265,7 +275,7 @@ mod tests {
     /// and counts occurrences of the call. `fence.rs` itself is excluded: its own tests call the
     /// function by design.
     #[test]
-    fn fence_is_applied_from_exactly_three_call_sites() {
+    fn fence_is_applied_from_exactly_four_call_sites() {
         let mut found: Vec<(String, usize)> = Vec::new();
 
         for (name, text) in crate::source_scan::crate_sources() {
@@ -294,10 +304,10 @@ mod tests {
         };
         assert_eq!(
             found, expected,
-            "`fence::wrap_untrusted` may be called from exactly three places: the tool-result \
+            "`fence::wrap_untrusted` may be called from exactly four places: the tool-result \
 boundary in runtime.rs (`dispatch_agent_tool_async`), the task-payload boundary in agent.rs \
-(`fence_task_payload`) and the member-answer boundary in member_call.rs (`answers_message`). \
-Found: {found:?}. Route new content through one of those rather than adding another \
+(`fence_task_payload`), the member-answer boundary in member_call.rs (`answers_message`) and the \
+delegation-outcome boundary in delegation.rs (`outcomes_message`). Found: {found:?}. Route new content through one of those rather than adding another \
 application site."
         );
     }

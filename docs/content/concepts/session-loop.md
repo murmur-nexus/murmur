@@ -232,8 +232,10 @@ order; lanes matter in proportion to how many sources a capsule takes work from 
 
 Only `peer` and `completion` are accepted from an inbound request's `x-murmur-task-origin` header,
 so an HTTP caller cannot put itself in the `user` lane — a request claiming `user` is read as
-`event` and waits in `bg`. The lane each task ran in is on its `task_start` record and on the task
-row of `mur trace steps`.
+`event` and waits in `bg`. An inbound `completion` is a sub-capsule's outcome, which the door
+hands to the task that delegated rather than queueing — see
+[How the outcome arrives](../reference/roost-api.md#how-the-outcome-arrives). The lane each task ran
+in is on its `task_start` record and on the task row of `mur trace steps`.
 
 ### Detached shell
 

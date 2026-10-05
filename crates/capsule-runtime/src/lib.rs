@@ -150,7 +150,7 @@ pub use delegation::{CompletionAddress, Spawner, SpawnerHandle};
 // reader of a trace or a tool result needs, plus the bound and its override.
 pub use delegation_plane::{
     DelegationLaunch, DelegationOrigin, DelegationPlane, DelegationRequest, DelegationResult,
-    DELEGATION_RESULT_TIMEOUT, DELEGATION_TIMEOUT_ENV,
+    StartedDelegation, DELEGATION_RESULT_TIMEOUT, DELEGATION_TIMEOUT_ENV,
 };
 // `reachability` is a private module, but both of its entry points are consumed from
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the

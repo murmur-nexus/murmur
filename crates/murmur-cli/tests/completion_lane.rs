@@ -1,9 +1,10 @@
-//! Where a completion sits in a real capsule's queue, and what a capsule that never delegates
-//! does about any of it.
+//! What a real capsule's door does with a completion no task of its is waiting for, and what a
+//! capsule that never delegates does about any of it.
 //!
+//! A delegation's outcome is delivered into the task that made it, never queued as a task of its
+//! own, so a completion naming a delegation nobody here started is refused and queues nothing.
 //! Every case runs a real `launch_session` or a real `mur run`, with a scripted inference
-//! endpoint and a real queue. Ordering is read out of the capsule's own `trace.jsonl` — an
-//! assertion about `LaneQueue` in isolation would say nothing about the queue an operator has.
+//! endpoint and a real queue. What ran is read out of the capsule's own `trace.jsonl`.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -43,8 +44,8 @@ fn reply(index: usize, text: &str) -> String {
     .to_string()
 }
 
-/// A project whose capsule accepts a queue of tasks and sleeps between them — the shape a parent
-/// holding a delegation has, and the only shape a completion can arrive at.
+/// A project whose capsule accepts a queue of tasks and sleeps between them, so its door stays up
+/// and its queue would take a completion if anything still queued one.
 fn queue_sleep_project(endpoint: &str) -> (TempDir, PathBuf) {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();
@@ -161,7 +162,6 @@ impl Running {
     fn completion_headers<'a>(&'a self, delegation_id: &'a str) -> Vec<(&'a str, &'a str)> {
         vec![
             (PEER_ORIGIN_HEADER, "completion"),
-            (PEER_TRUST_HEADER, "trusted"),
             (DELEGATION_ID_HEADER, delegation_id),
             (COMPLETION_SESSION_HEADER, self.session_id.as_str()),
         ]
@@ -200,6 +200,18 @@ fn post_json(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
     serde_json::from_str(&response).unwrap_or_else(|_| serde_json::json!({"_raw": response}))
 }
 
+/// The refusal a door gives a completion for a delegation no task here is waiting for: JSON-RPC
+/// `-32004`, naming the delegation.
+fn assert_refused_as_unwaited(response: &Value, delegation_id: &str) {
+    assert_eq!(response["error"]["code"], -32004, "{response}");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(delegation_id) && message.contains("no task"),
+        "{response}"
+    );
+    assert!(response.get("result").is_none(), "{response}");
+}
+
 fn submitted(response: &Value, label: &str) -> String {
     assert_eq!(
         response["result"]["status"]["state"], "submitted",
@@ -211,19 +223,17 @@ fn submitted(response: &Value, label: &str) -> String {
         .to_string()
 }
 
-// ── 3. A completion lands in the background lane and preempts nothing ─────────
+// ── 3. A completion nobody waits for is refused, and queues nothing ───────────
 
-/// A completion posted *before* a peer task still runs after it, and only after the task already
-/// running has ended. The order comes out of the real queue's own trace.
+/// A completion posted while a person's task runs, naming a delegation no task here started, is
+/// refused with `-32004` and never queued: the peer task posted after it is the only other task
+/// that runs, after the person's.
 ///
-/// The first task arrives as `task.md`, which is the only way a task reaches the `user` lane: the
-/// door accepts `peer` and `completion` from the wire and nothing else, so the highest lane an
-/// inbound request can claim is `peer`. Both lanes are above the completion's, which is the
-/// property under test — a completion waits behind everything anyone is waiting for.
+/// The first task arrives as `task.md`, which is the only way a task reaches the `user` lane.
 #[test]
-fn a_completion_waits_behind_everything_anyone_is_waiting_for() {
+fn a_completion_nobody_waits_for_is_refused_and_queues_behind_nothing() {
     let server = common::ScriptedServer::start_with_delay(
-        (1..=3)
+        (1..=2)
             .map(|i| reply(i, &format!("task {i} done")))
             .collect(),
         Duration::from_secs(2),
@@ -239,13 +249,13 @@ fn a_completion_waits_behind_everything_anyone_is_waiting_for() {
     assert_eq!(first[0]["lane"], "user");
     let first_id = first[0]["task_id"].as_str().unwrap().to_string();
 
-    let completion = submitted(
+    assert_refused_as_unwaited(
         &running.post(
             "m-completion",
             "Delegated capsule finished.\ndelegation_id: dlg_lane0001\nstatus: ok",
             &running.completion_headers("dlg_lane0001"),
         ),
-        "completion",
+        "dlg_lane0001",
     );
     let waiting_peer = submitted(
         &running.post(
@@ -256,50 +266,31 @@ fn a_completion_waits_behind_everything_anyone_is_waiting_for() {
         "peer",
     );
 
-    let starts = running.wait_for("task_start", 3);
+    running.wait_for("task_end", 2);
+    let starts = running.events("task_start");
     let order: Vec<&str> = starts
         .iter()
         .map(|event| event["task_id"].as_str().unwrap())
         .collect();
     assert_eq!(
         order,
-        vec![
-            first_id.as_str(),
-            waiting_peer.as_str(),
-            completion.as_str()
-        ],
-        "the peer task posted after the completion still runs first; trace:\n{}",
+        vec![first_id.as_str(), waiting_peer.as_str()],
+        "the refused completion started no task; trace:\n{}",
         fs::read_to_string(&running.trace_path).unwrap_or_default()
     );
-
-    let lanes: Vec<&str> = starts
-        .iter()
-        .map(|event| event["lane"].as_str().unwrap())
-        .collect();
-    assert_eq!(lanes, vec!["user", "peer", "bg"]);
-
-    let completion_start = &starts[2];
-    assert_eq!(completion_start["origin"], "completion");
-    assert_eq!(completion_start["delegation_id"], "dlg_lane0001");
-
-    let first_end = running
-        .events("task_end")
-        .into_iter()
-        .find(|event| event["task_id"] == first_id.as_str())
-        .expect("the first task ended");
-    assert!(
-        completion_start["timestamp"].as_u64().unwrap() >= first_end["timestamp"].as_u64().unwrap(),
-        "the completion started only after the running task ended: {completion_start} / {first_end}"
-    );
+    for start in &starts {
+        assert_ne!(start["origin"], "completion", "{start}");
+        assert!(start.get("delegation_id").is_none(), "{start}");
+    }
 }
 
-// ── 4. A parent asleep when a child finishes is woken ─────────────────────────
+// ── 4. A parent asleep when a stray completion arrives stays asleep ───────────
 
-/// Idle, with no task in flight and nothing else delivered: one completion is enough to wake the
-/// loop and run a task.
+/// Idle, with no task in flight: a completion naming no delegation of this session is refused and
+/// wakes nothing, and a person's task sent afterwards still runs.
 #[test]
-fn a_completion_wakes_a_sleeping_parent() {
-    let server = common::ScriptedServer::start(vec![reply(1, "completion handled")]);
+fn a_completion_nobody_waits_for_does_not_wake_a_sleeping_parent() {
+    let server = common::ScriptedServer::start(vec![reply(1, "the person's task handled")]);
     let (home, manifest_path) = queue_sleep_project(&server.endpoint);
     let running = launch(stage(&home, &manifest_path));
 
@@ -310,21 +301,25 @@ fn a_completion_wakes_a_sleeping_parent() {
         "nothing may have run before the completion arrived"
     );
 
-    let task = submitted(
+    assert_refused_as_unwaited(
         &running.post(
             "m-only",
             "Delegated capsule finished.\ndelegation_id: dlg_wake0001\nstatus: ok",
             &running.completion_headers("dlg_wake0001"),
         ),
-        "completion",
+        "dlg_wake0001",
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        running.events("task_start").is_empty(),
+        "a refused completion must not wake the loop"
     );
 
+    let task = submitted(&running.post("m-person", "do the thing", &[]), "person");
     let starts = running.wait_for("task_start", 1);
-    assert_eq!(starts.len(), 1, "only the completion was delivered");
+    assert_eq!(starts.len(), 1, "only the person's task ran");
     assert_eq!(starts[0]["task_id"], task);
-    assert_eq!(starts[0]["origin"], "completion");
-    assert_eq!(starts[0]["lane"], "bg");
-    assert_eq!(starts[0]["delegation_id"], "dlg_wake0001");
+    assert_ne!(starts[0]["origin"], "completion");
 
     running.wait_for("task_end", 1);
     assert!(

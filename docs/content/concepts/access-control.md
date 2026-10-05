@@ -170,7 +170,11 @@ class.
 | `system` | The runtime enqueuing work for itself, with no person in the loop | `trusted` |
 | `event` | A webhook, a chat message, a PR comment — third-party text | `untrusted` |
 | `peer` | A message from another capsule | The sending capsule's own class |
-| `completion` | A sub-capsule or detached shell reporting that its work finished | The sending capsule's own class |
+| `completion` | A detached shell command reporting that it finished | The class of the task that started it |
+
+A sub-capsule's outcome also arrives marked `completion`, and starts no task of its own: it is
+delivered into the task that made the delegation, fenced as `delegation:<capsule>`, under that
+task's own class — see [How the outcome arrives](../reference/roost-api.md#how-the-outcome-arrives).
 
 `peer` and `completion` inherit, so untrust cannot launder itself at the first hop: an untrusted
 webhook payload that reaches capsule A and is forwarded to capsule B arrives at B still

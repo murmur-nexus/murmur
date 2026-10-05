@@ -15,8 +15,8 @@ use crate::{a2a::IncomingTask, origin::TaskOrigin};
 /// Ordering classes the queue chooses between. Declared lowest to highest, so `Ord` is precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaskLane {
-    /// Work with nobody waiting on it: a timer, a webhook, a finished sub-capsule, the runtime's
-    /// own housekeeping.
+    /// Work with nobody waiting on it: a timer, a webhook, a finished background shell command, the
+    /// runtime's own housekeeping.
     Bg,
     /// A message from another capsule, which has a task of its own blocked on the answer.
     Peer,
@@ -124,7 +124,6 @@ mod tests {
             traceparent: None,
             provenance: TaskProvenance::derive(origin, None),
             source: crate::a2a::SOURCE_A2A,
-            delegation_id: None,
             forget_session: false,
             caller_member: None,
         }

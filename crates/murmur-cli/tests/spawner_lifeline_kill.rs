@@ -1,10 +1,12 @@
-//! A delegating capsule killed outright takes its delegated children with it.
+//! A delegating capsule killed outright takes its delegated children with it, and one that ends
+//! on its own ends them first.
 //!
 //! Every case runs the real thing: `mur-roost` on a loopback port over a real registry, the
 //! delegating capsule as its own `mur run` process — alone, or as a formation's entry member under
 //! `mur run --roster` — and its children launched by its own runtime. The delegating process is
-//! then ended by `SIGKILL`, or by its own clean exit, and what is measured is how long its
-//! children take to notice through their spawner lifelines and go.
+//! then ended by `SIGKILL`, by `SIGTERM`, or by its own clean exit, and what is measured is how
+//! long its children take to go: through their spawner lifelines when the parent is killed, and
+//! through the delegating task itself otherwise.
 //!
 //! Every child's directory is unique and is on its command line as `--workdir`, so "the child is
 //! gone" is "no process on the host names that directory".
@@ -38,6 +40,13 @@ const VERSION: &str = "0.1.0";
 const MUTE: &str = "mute-worker";
 /// The sub-capsule that delegates to [`MUTE`] in its turn.
 const RELAY: &str = "relay";
+/// The sub-capsule that answers, after [`SLOW_ANSWER_DELAY`], and exits.
+const SLOW: &str = "slow-worker";
+/// How long [`SLOW`]'s model takes to answer.
+const SLOW_ANSWER_DELAY: Duration = Duration::from_secs(3);
+/// What [`SLOW`]'s model answers: it lands in the child's result file and nowhere in its parent's
+/// context.
+const SLOW_ANSWER: &str = "SLOW-WORKER-ANSWER-7Q2X";
 
 /// How long a child may take to go once its spawner has: the runtime's teardown deadline, with
 /// room for a loaded host.
@@ -466,7 +475,7 @@ fn assert_wound_down_by_spawner(delegation: &Delegation, spawned_by: &str) {
     assert!(log.contains(SPAWNER_CLOSED), "{log}");
 }
 
-// ── S2: a parent in no formation ──────────────────────────────────────────────
+// ── A parent in no formation ──────────────────────────────────────────────────
 
 /// `SIGKILL` of a delegating capsule in no formation, mid-task: its child — mid-task too — is gone
 /// within one teardown deadline, its trace saying why.
@@ -490,7 +499,7 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
     parent.proc.kill();
     let took = gone_within(&delegation, killed, ONE_LEVEL);
     eprintln!(
-        "[measure] S2 parent SIGKILL to child exit: {} ms",
+        "[measure] parent SIGKILL to child exit: {} ms",
         took.as_millis()
     );
     assert_wound_down_by_spawner(&delegation, &parent.session_id());
@@ -499,10 +508,11 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
     assert!(start.get("formation_id").is_none(), "{start}");
 }
 
-// ── S3: a child of a child ────────────────────────────────────────────────────
+// ── A child of a child ────────────────────────────────────────────────────────
 
 /// Parent → relay → mute worker, at the daemon's default depth bound. `SIGKILL` of the parent
-/// ends the relay through its lifeline, and the relay's exit ends the grandchild through its own.
+/// ends the relay through its lifeline; the relay's wind-down cancels its task, and the task ends
+/// the grandchild before the relay exits.
 #[test]
 fn a_grandchild_winds_down_once_its_parent_has() {
     if common::skip_without_host_support("a_grandchild_winds_down_once_its_parent_has") {
@@ -543,65 +553,342 @@ fn a_grandchild_winds_down_once_its_parent_has() {
     let relay_took = gone_within(&relay, killed, ONE_LEVEL);
     let grandchild_took = gone_within(&grandchild, killed, TWO_LEVELS);
     eprintln!(
-        "[measure] S3 parent SIGKILL to relay exit: {} ms; to grandchild exit: {} ms",
+        "[measure] parent SIGKILL to relay exit: {} ms; to grandchild exit: {} ms",
         relay_took.as_millis(),
         grandchild_took.as_millis()
     );
     assert_wound_down_by_spawner(&relay, &parent.session_id());
-    assert_wound_down_by_spawner(&grandchild, &relay_session);
+    assert_ended_by_its_parents_task(&grandchild, &relay);
 }
 
-// ── S4: a parent that exits on its own ────────────────────────────────────────
+/// A child its parent's task ended because the task was cancelled: the parent's trace closes the
+/// delegation `terminated` with that reason, after the cancel; the child's own record says its
+/// launcher ended it; and the child never heard its spawner lifeline close.
+fn assert_ended_by_its_parents_task(child: &Delegation, parent: &Delegation) {
+    let events = parent.trace();
+    let canceled = events
+        .iter()
+        .position(|event| event["event_type"] == "task_canceled")
+        .unwrap_or_else(|| panic!("the parent's task was not cancelled: {:?}", kinds(&events)));
+    let ended = events
+        .iter()
+        .position(|event| {
+            event["event_type"] == "delegation"
+                && event["delegation_id"] == child.delegation_id.as_str()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the parent never closed the delegation: {:?}",
+                kinds(&events)
+            )
+        });
+    assert!(canceled < ended, "{:?}", kinds(&events));
+    assert_eq!(events[ended]["outcome"], "terminated", "{}", events[ended]);
+    assert_eq!(
+        events[ended]["reason"], "the delegating task was cancelled",
+        "{}",
+        events[ended]
+    );
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(child.child_dir().join("completion.json"))
+            .expect("the ended child's outcome is recorded"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "terminated", "{completion}");
+    assert_eq!(completion["reported_by"], "launcher", "{completion}");
+    let child_kinds = kinds_of(&child.trace());
+    assert!(
+        !child_kinds.iter().any(|kind| kind == "spawner_ended"),
+        "{child_kinds:?}"
+    );
+}
 
-/// A capsule on the default lifecycle delegates, finishes its task and exits, as it always has.
-/// `W-SEC-020` says its sub-capsules end with it, and they do.
+// ── A parent that exits on its own ────────────────────────────────────────────
+
+/// The delegating session's own trace, in file order.
+fn parent_trace(parent: &Parent) -> Vec<Value> {
+    let session = find_dir(parent.project.path(), &parent.session_id())
+        .expect("the parent's session directory");
+    read_trace(&session.join("trace.jsonl"))
+}
+
+/// The last user message's text in one provider request.
+fn last_user_text(request: &Value) -> String {
+    let messages = request["messages"].as_array().cloned().unwrap_or_default();
+    let last = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap_or_else(|| panic!("no user message in {request}"));
+    match &last["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("unreadable content: {other}"),
+    }
+}
+
+/// Wait for the process to exit, returning its status and the instant it was seen gone.
+fn await_exit(proc: &mut Proc, limit: Duration) -> (std::process::ExitStatus, Instant) {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = proc.child.try_wait().unwrap() {
+            return (status, Instant::now());
+        }
+        assert!(Instant::now() < deadline, "the parent never exited");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A capsule on the default lifecycle — no `lifecycle` block at all — delegates to a sub-capsule
+/// that takes a few seconds, and ends its turn. Its task waits, continues with the sub-capsule's
+/// outcome, and only then ends; `mur run` exits 0 with the sub-capsule already gone, and nothing
+/// warns about a lifecycle that cannot hear back.
 #[test]
-fn a_parent_that_exits_after_its_task_ends_its_child() {
-    if common::skip_without_host_support("a_parent_that_exits_after_its_task_ends_its_child") {
+fn a_parent_that_exits_after_its_task_has_its_childs_answer_first() {
+    if common::skip_without_host_support(
+        "a_parent_that_exits_after_its_task_has_its_childs_answer_first",
+    ) {
         return;
     }
     let world = World::new(&["exiting-parent"]);
-    let model = delegating_model(
-        MUTE,
-        Some(common::door_capsule::end_turn(2, "delegated; done")),
+    let slow_model = ScriptedServer::start_with_delay(
+        vec![common::door_capsule::end_turn(1, SLOW_ANSWER)],
+        SLOW_ANSWER_DELAY,
     );
-    let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), "", "");
+    world.publish(
+        SLOW,
+        &agent_body(
+            &slow_model.endpoint,
+            "",
+            "lifecycle:\n  task_acceptance: single\n  after_task: exit\n",
+            "",
+        ),
+    );
+    // Delegate, end the turn, then answer the continuation — recording when each request came.
+    let arrivals = Arc::new(Mutex::new(Vec::<Instant>::new()));
+    let seen = Arc::clone(&arrivals);
+    let model = ScriptedServer::start_answering(8, move |_| {
+        let mut seen = seen.lock().unwrap();
+        seen.push(Instant::now());
+        match seen.len() {
+            1 => tool_use_response(
+                "toolu_delegate",
+                "delegate-task",
+                json!({"capsule": SLOW, "version": VERSION, "task": "answer slowly"}),
+            ),
+            2 => common::door_capsule::end_turn(2, "delegated"),
+            _ => common::door_capsule::end_turn(3, "the worker has answered"),
+        }
+    });
+    let body = agent_body(&model.endpoint, &spawn_allow(&[SLOW]), "", "");
     let mut parent = Parent::start(&world, "exiting-parent", &body, model, |_| {});
     parent.submit();
 
-    let deadline = Instant::now() + START_LIMIT;
-    let status = loop {
-        if let Some(status) = parent.proc.child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "the parent never exited");
-        thread::sleep(Duration::from_millis(50));
-    };
-    let exited = Instant::now();
+    let (status, exited) = await_exit(&mut parent.proc, START_LIMIT);
     assert!(status.success(), "{status}: {}", parent.proc.stderr());
-    let stderr = parent.proc.stderr();
-    let warning = stderr
-        .lines()
-        .find(|line| line.contains("warning[W-SEC-020]"))
-        .unwrap_or_else(|| panic!("no W-SEC-020: {stderr}"));
+    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let running = delegation.processes();
+    eprintln!(
+        "[measure] processes naming the child dir {} ms after the parent exited: {}",
+        exited.elapsed().as_millis(),
+        running.len()
+    );
     assert!(
-        warning.contains(
-            "Every sub-capsule this capsule delegated to also winds down when this capsule \
-             exits, finished or not."
-        ),
-        "{warning}"
+        running.is_empty(),
+        "the child outlived the parent that had its answer: {running:?}"
+    );
+    let stderr = parent.proc.stderr();
+    assert!(!stderr.contains("W-SEC-020"), "{stderr}");
+
+    // One task, which waited for the delegation and closed it before it ended.
+    let trace = parent_trace(&parent);
+    let kinds = kinds(&trace);
+    let started = kinds.iter().position(|kind| *kind == "delegation_start");
+    let ended = trace
+        .iter()
+        .position(|event| event["event_type"] == "delegation");
+    let task_ends: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == "task_end")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(task_ends.len(), 1, "{kinds:?}");
+    match (started, ended) {
+        (Some(started), Some(ended)) => {
+            assert!(started < ended && ended < task_ends[0], "{kinds:?}")
+        }
+        _ => panic!("the delegation is not recorded start to end: {kinds:?}"),
+    }
+    let line = &trace[ended.unwrap()];
+    assert_eq!(line["outcome"], "ok", "{line}");
+    assert_eq!(line["reason"], Value::Null, "{line}");
+    assert_eq!(line["delegation_id"], delegation.delegation_id.as_str());
+    assert_eq!(
+        trace[task_ends[0]]["exit_status"], "ok",
+        "{}",
+        trace[task_ends[0]]
+    );
+    assert!(
+        !trace
+            .iter()
+            .any(|event| event["event_type"] == "task_start" && event["origin"] == "completion"),
+        "the outcome became a task of its own: {kinds:?}"
     );
 
-    let delegation = await_delegation(parent.project.path(), &parent.session_id());
-    let took = gone_within(&delegation, exited, ONE_LEVEL);
-    eprintln!(
-        "[measure] S4 parent exit to child exit: {} ms",
-        took.as_millis()
+    // The continuation: the runtime's line, the fenced outcome, a path and not the answer.
+    let requests = parent._model.requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    let continued = last_user_text(&requests[2]);
+    for said in [
+        format!(
+            "[delegate-task] delegation {} to {SLOW}@{VERSION} ended ok:",
+            delegation.delegation_id
+        ),
+        format!("source=delegation:{SLOW}"),
+        "result: ".to_string(),
+        "status: ok".to_string(),
+    ] {
+        assert!(continued.contains(&said), "missing {said:?}: {continued}");
+    }
+    assert!(
+        !continued.contains(SLOW_ANSWER),
+        "the child's answer stays in its file: {continued}"
     );
-    assert_wound_down_by_spawner(&delegation, &parent.session_id());
+    let arrivals = arrivals.lock().unwrap().clone();
+    let waited = arrivals[2].duration_since(arrivals[1]);
+    eprintln!(
+        "[measure] child answer delay (second to third parent request): {} ms",
+        waited.as_millis()
+    );
+    assert!(
+        waited >= Duration::from_millis(2500),
+        "the continuation came {waited:?} after the turn ended, before the child could answer"
+    );
+
+    // The child finished on its own, reported, and was not wound down by its spawner.
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(delegation.child_dir().join("completion.json"))
+            .expect("the child recorded its outcome"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "ok", "{completion}");
+    assert_eq!(completion["reported_by"], "child", "{completion}");
+    assert_eq!(completion["delivered"], true, "{completion}");
+    let child_kinds: Vec<String> = kinds_of(&delegation.trace());
+    assert!(
+        child_kinds.iter().any(|kind| kind == "session_end"),
+        "{child_kinds:?}"
+    );
+    assert!(
+        !child_kinds.iter().any(|kind| kind == "spawner_ended"),
+        "{child_kinds:?}"
+    );
+    drop(slow_model);
 }
 
-// ── S1: a formation member killed outright ────────────────────────────────────
+/// Every event's kind, owned.
+fn kinds_of(events: &[Value]) -> Vec<String> {
+    kinds(events).into_iter().map(str::to_string).collect()
+}
+
+// ── A parent stopped while it waits ───────────────────────────────────────────
+
+/// `SIGTERM` to a default-lifecycle capsule whose task is waiting on a sub-capsule. Termination
+/// cancels the task, the task ends its delegation, and only then does the process go: by the time
+/// it has exited, no process names the child's directory, and the child was ended by its parent
+/// rather than by its lifeline.
+#[test]
+fn a_parent_stopped_while_it_waits_ends_its_child_first() {
+    if common::skip_without_host_support("a_parent_stopped_while_it_waits_ends_its_child_first") {
+        return;
+    }
+    let world = World::new(&["stopped-parent"]);
+    let calls = AtomicUsize::new(0);
+    let model =
+        ScriptedServer::start_answering(8, move |_| match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => tool_use_response(
+                "toolu_delegate",
+                "delegate-task",
+                json!({"capsule": MUTE, "version": VERSION, "task": "hold the line"}),
+            ),
+            _ => common::door_capsule::end_turn(2, "delegated"),
+        });
+    let body = agent_body(&model.endpoint, &spawn_allow(&[MUTE]), "", "");
+    let mut parent = Parent::start(&world, "stopped-parent", &body, model, |_| {});
+    parent.submit();
+    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    let deadline = Instant::now() + START_LIMIT;
+    while parent._model.requests().len() < 2 {
+        assert!(Instant::now() < deadline, "the turn never ended");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The turn has been answered; give the task a moment to reach its wait.
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        !delegation.processes().is_empty(),
+        "the child is not running"
+    );
+
+    let stopped = Instant::now();
+    signal(parent.proc.pid(), libc::SIGTERM);
+    let (_, exited) = await_exit(&mut parent.proc, ONE_LEVEL);
+    let running = delegation.processes();
+    eprintln!(
+        "[measure] parent SIGTERM to parent exit: {} ms; processes naming the child dir \
+         then: {}",
+        exited.duration_since(stopped).as_millis(),
+        running.len()
+    );
+    assert!(
+        running.is_empty(),
+        "the child outlived its stopped parent: {running:?}"
+    );
+
+    let trace = parent_trace(&parent);
+    let canceled = trace
+        .iter()
+        .position(|event| event["event_type"] == "task_canceled")
+        .unwrap_or_else(|| panic!("no task_canceled: {:?}", kinds(&trace)));
+    assert!(
+        trace[canceled]["delegation_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == delegation.delegation_id.as_str())),
+        "{}",
+        trace[canceled]
+    );
+    let ended = trace
+        .iter()
+        .position(|event| event["event_type"] == "delegation")
+        .unwrap_or_else(|| panic!("no delegation line: {:?}", kinds(&trace)));
+    assert!(canceled < ended, "{:?}", kinds(&trace));
+    assert_eq!(trace[ended]["outcome"], "terminated", "{}", trace[ended]);
+    assert_eq!(
+        trace[ended]["reason"], "the delegating task was cancelled",
+        "{}",
+        trace[ended]
+    );
+
+    let child_kinds = kinds_of(&delegation.trace());
+    assert!(
+        !child_kinds.iter().any(|kind| kind == "spawner_ended"),
+        "the child was wound down by its lifeline rather than ended by its parent: \
+         {child_kinds:?}"
+    );
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(delegation.child_dir().join("completion.json"))
+            .expect("the ended child's outcome is recorded"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "terminated", "{completion}");
+    assert_eq!(completion["reported_by"], "launcher", "{completion}");
+}
+
+// ── A formation member killed outright ────────────────────────────────────────
 
 /// `mur run --roster` whose entry member delegates to the mute worker; `SIGKILL` of that member
 /// leaves the child to its spawner lifeline, and it goes, joined to the formation and recording
@@ -676,7 +963,7 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     signal(entry_pid, libc::SIGKILL);
     let took = gone_within(&delegation, killed, ONE_LEVEL);
     eprintln!(
-        "[measure] S1 entry member SIGKILL to child exit: {} ms",
+        "[measure] entry member SIGKILL to child exit: {} ms",
         took.as_millis()
     );
     assert_wound_down_by_spawner(&delegation, &entry_session);
@@ -687,7 +974,7 @@ fn a_formation_member_killed_outright_takes_its_child_with_it() {
     drop((planner_model, coder_model));
 }
 
-// ── S8: a kernel without CLOSE_RANGE_CLOEXEC ──────────────────────────────────
+// ── A kernel without CLOSE_RANGE_CLOEXEC ──────────────────────────────────────
 
 /// A seccomp filter that answers `close_range` with `ENOSYS` and allows everything else: the view
 /// a process has of a kernel older than 5.11. Built once, before any fork, and never freed.
@@ -774,7 +1061,7 @@ fn close_range_in_a_process(filter: Option<&'static [libc::sock_filter]>) -> std
     command.status().map(|_| ())
 }
 
-/// The S2 flow on a host that, as far as the parent and its child can tell, has no
+/// The parent-in-no-formation flow on a host that, as far as the parent and its child can tell, has no
 /// `close_range`: the child is still launched — the parent-to-child path calls no `close_range` —
 /// and still ends when its parent is killed.
 #[test]
@@ -809,7 +1096,7 @@ fn without_close_range_a_child_is_launched_and_still_ends_with_its_parent() {
     parent.proc.kill();
     let took = gone_within(&delegation, killed, ONE_LEVEL);
     eprintln!(
-        "[measure] S8 (close_range -> ENOSYS) parent SIGKILL to child exit: {} ms",
+        "[measure] (close_range -> ENOSYS) parent SIGKILL to child exit: {} ms",
         took.as_millis()
     );
     assert_wound_down_by_spawner(&delegation, &parent.session_id());

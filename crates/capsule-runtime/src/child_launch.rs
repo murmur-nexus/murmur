@@ -161,9 +161,9 @@ struct ChildProcess {
     /// The exit status, once anyone has observed it.
     status: Option<ExitStatus>,
     /// The write end of the child's spawner lifeline, open for as long as the child is this
-    /// process's to end. Closed once the child is observed ended, when it is ended deliberately,
-    /// or when this process exits; [`LaunchedChild::release`] of a child no watcher observes
-    /// moves it out to be held until then. Nothing writes to it.
+    /// process's to end. Closed once the child is observed ended, when it is ended deliberately
+    /// — by [`LaunchedChild::shutdown`], `Drop` or the completion watcher's deadline — or when
+    /// this process exits. Nothing writes to it.
     #[cfg(unix)]
     lifeline: Option<crate::lifeline::ChildLifeline>,
 }
@@ -186,8 +186,8 @@ impl ChildProcess {
             return Some(Ending::Deliberate);
         }
         let Some(child) = self.child.as_mut() else {
-            // Reaped by neither `shutdown` nor `Drop`, which both set `deliberate` first: this
-            // is unreachable, and reporting the exit is the harmless reading of it.
+            // Reaped by `Drop` after [`LaunchedChild::has_exited`] had already seen the exit:
+            // the child ended on its own.
             return Some(Ending::Exited(self.status));
         };
         let ending = match child.try_wait() {
@@ -255,12 +255,8 @@ pub struct LaunchedChild {
     stderr_tail: Arc<StderrTail>,
     /// When the child process was started, for the completion's `duration_ms`.
     started: Instant,
-    /// Set by [`LaunchedChild::release`]. The one thing that stops [`Drop`] signalling the child:
-    /// a released process is no longer this handle's to end.
-    released: bool,
-    /// Whether a completion watcher observes this child, and so will close its lifeline once it
-    /// sees the child end.
-    watched: bool,
+    /// The completion watcher's thread, for a launch whose spawner names an address.
+    watcher: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for LaunchedChild {
@@ -311,45 +307,38 @@ impl LaunchedChild {
         })
     }
 
-    /// Stop owning the child's lifetime without signalling it, and let this handle go.
+    /// Whether the completion watcher behind this child has finished: it has seen the child end
+    /// and recorded, and posted, whatever it records and posts. `true` for a child no watcher
+    /// observes.
     ///
-    /// The one escape from [`Drop`]'s kill. After this the process keeps running and **only the
-    /// completion watcher started by [`launch_child_capsule`] will ever observe or reap it** — a
-    /// child released from a launch that named no [`CompletionAddress`] is a process nothing will
-    /// ever wait on.
+    /// A delegating task that ends a child asks this before it lets the child's handle go, so the
+    /// child's `completion.json` says how it ended before the parent's own process can exit.
+    pub fn watcher_finished(&self) -> bool {
+        self.watcher
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Whether the child's process has ended, by its own exit or by being ended. The completion
+    /// watcher's own poll: a process that exited on its own is reaped and its lifeline closed.
     ///
-    /// This is how a delegation outlives the call that made it: `delegate-task` returns as soon as
-    /// the child is running and holding its task, and what the child eventually did arrives at the
-    /// parent as a completion the watcher either forwards or writes itself.
-    ///
-    /// It does not outlive this process. The write end of the child's spawner lifeline stays open
-    /// for as long as this process runs: with the watcher holding it, until the watcher sees the
-    /// child end; with no watcher, until this process exits, since nothing would ever close it
-    /// sooner. Either way the child winds down once this process has gone.
-    pub fn release(mut self) {
-        self.released = true;
-        #[cfg(unix)]
-        if !self.watched {
-            if let Some(lifeline) = lock(&self.process).lifeline.take() {
-                lifeline.hold_until_exit();
-            }
-        }
+    /// Never blocks: a delegating task asks this while it gives a child that has just reported
+    /// its outcome a moment to finish exiting.
+    pub fn has_exited(&self) -> bool {
+        lock(&self.process).poll().is_some()
     }
 }
 
 impl Drop for LaunchedChild {
     /// Terminates and reaps, so a parent that returns early — including by panicking — leaves no
     /// orphaned capsule process behind holding a port and a directory. Deliberate on the same
-    /// terms as [`LaunchedChild::shutdown`].
-    ///
-    /// A released child is left alone: its lifetime stopped being this handle's the moment
-    /// [`LaunchedChild::release`] was called.
+    /// terms as [`LaunchedChild::shutdown`]. A child that has already exited is only reaped.
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
         let mut process = lock(&self.process);
-        process.deliberate = true;
+        // A child already seen exited ended on its own, and the watcher reports it as such.
+        if process.status.is_none() {
+            process.deliberate = true;
+        }
         let _ = process.end();
     }
 }
@@ -496,8 +485,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         })),
         stderr_tail: Arc::clone(&stderr_tail),
         started,
-        released: false,
-        watched: false,
+        watcher: None,
     };
     if let Err(reason) = write_result {
         return Err(RuntimeError::Runtime(reason));
@@ -541,8 +529,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     // no watcher behind it and posts nothing anywhere.
     if let Some(handle) = handle {
         if let Some(address) = handle.report_to.clone() {
-            launched.watched = true;
-            watch_for_completion(
+            launched.watcher = watch_for_completion(
                 &launched,
                 handle,
                 address,
@@ -570,8 +557,9 @@ pub(crate) fn readiness_door_token(
 /// Report for a child that ended without reporting for itself, and stop one that never ends.
 ///
 /// Polls the shared process handle rather than blocking on `wait`, so it never contends with
-/// [`LaunchedChild::shutdown`] or `Drop` for ownership of the `Child`. For a released child this
-/// thread is the process's only remaining observer, and the only thing that will ever reap it.
+/// [`LaunchedChild::shutdown`] or `Drop` for ownership of the `Child`. The handle stays with the
+/// delegating task, which ends the child through it; this thread observes, and reaps a child that
+/// exits on its own.
 ///
 /// `deadline` bounds how long the child is watched, from the instant this watcher starts — which
 /// is the instant the child reported itself ready, not the instant its process was spawned.
@@ -601,7 +589,7 @@ fn watch_for_completion(
     capsule_name: &str,
     capsule_version: &str,
     deadline: Option<Duration>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let process = Arc::clone(&launched.process);
     let stderr_tail = Arc::clone(&launched.stderr_tail);
     let workdir = launched.workdir.clone();
@@ -611,7 +599,7 @@ fn watch_for_completion(
     let started = launched.started;
 
     let watching_from = Instant::now();
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().spawn(move || {
         let expires_at = deadline.map(|bound| watching_from + bound);
         // Set here and read nowhere else: `ChildProcess::deliberate` is about to be set too, by
         // this thread, so it can no longer say who chose the ending.
@@ -716,6 +704,17 @@ fn watch_for_completion(
             }
         }
     });
+    match spawned {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            crate::runtime_err!(
+                "[capsule-runtime] delegation {}: the child's completion watcher could not be \
+                 started: {error}",
+                launched.delegation_id.as_deref().unwrap_or_default()
+            );
+            None
+        }
+    }
 }
 
 /// The child's complete environment, built from a cleared one.
@@ -1206,7 +1205,6 @@ mod tests {
             context_id: "ctx_parent".to_string(),
             report_to: Some(CompletionAddress {
                 url: "http://127.0.0.1:7000".to_string(),
-                trust: crate::origin::TrustClass::Trusted,
             }),
         }
     }
@@ -1396,8 +1394,7 @@ mod tests {
                 drained: Condvar::new(),
             }),
             started: Instant::now(),
-            released: true,
-            watched: false,
+            watcher: None,
         };
         let debug = format!("{child:?}");
         assert!(!debug.contains("secretpayload"), "{debug}");
@@ -1492,15 +1489,16 @@ mod tests {
         assert!(process.lifeline.is_none());
     }
 
-    /// A released child nothing watches keeps its lifeline's write end open in this process,
-    /// which is what lets it run until this process exits. A watched one leaves the write end
-    /// with the watcher.
+    /// A delegated child lives exactly as long as its handle or its own run. Dropping the handle
+    /// of a running child kills it and closes the write end of its lifeline; a child that exits on
+    /// its own is seen exited by [`LaunchedChild::has_exited`], which closes the write end too,
+    /// and its handle's drop then only reaps it.
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
-    fn releasing_an_unwatched_child_holds_its_lifeline_until_exit() {
-        let launched = |watched: bool| {
-            let (process, write) = process_with_lifeline("sleep", &["30"]);
+    fn a_childs_lifeline_closes_when_its_handle_drops_or_its_end_is_seen() {
+        let launched = |program: &str, args: &[&str]| {
+            let (process, write) = process_with_lifeline(program, args);
             let process = Arc::new(Mutex::new(process));
             let child = LaunchedChild {
                 workdir: PathBuf::from("/tmp/child"),
@@ -1517,8 +1515,7 @@ mod tests {
                     drained: Condvar::new(),
                 }),
                 started: Instant::now(),
-                released: false,
-                watched,
+                watcher: None,
             };
             (child, process, write)
         };
@@ -1527,22 +1524,37 @@ mod tests {
             unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
         };
 
-        let (child, process, write) = launched(false);
-        child.release();
-        assert!(lock(&process).lifeline.is_none(), "moved out to be held");
-        assert!(is_open(write), "the write end stays open");
-        // This test's stand-in for the process exiting.
-        // SAFETY: `write` was leaked by `hold_until_exit` and is owned by nothing.
-        drop(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(write) });
-        lock(&process).end().unwrap();
-
-        let (child, process, _) = launched(true);
-        child.release();
+        // Held: the child runs and the write end stays open for as long as the handle does.
+        let (child, process, write) = launched("sleep", &["30"]);
+        assert!(!child.has_exited());
+        assert!(is_open(write), "a held child's write end is open");
+        drop(child);
         assert!(
-            lock(&process).lifeline.is_some(),
-            "the watcher's to close once it sees the child end"
+            lock(&process).lifeline.is_none(),
+            "dropping the handle closes it"
         );
-        lock(&process).end().unwrap();
-        assert!(lock(&process).lifeline.is_none());
+        assert!(
+            lock(&process).deliberate,
+            "a running child's drop is deliberate"
+        );
+        // A status is set only by a `wait` that returned, so the child is reaped and gone.
+        assert!(lock(&process).status.is_some(), "and reaps the child");
+
+        // Ran to its end: seen exited, the write end closes without the handle being dropped.
+        let (child, process, _) = launched("true", &[]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !child.has_exited() {
+            assert!(Instant::now() < deadline, "`true` never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            lock(&process).lifeline.is_none(),
+            "seeing the end closes it"
+        );
+        drop(child);
+        assert!(
+            !lock(&process).deliberate,
+            "a child that ended on its own is not recorded as ended by its parent"
+        );
     }
 }
