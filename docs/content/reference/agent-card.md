@@ -436,9 +436,7 @@ answers the header with `-32602` without starting a task — see
 
 On a [formation token](roster.md#formation-token), `tasks/get` answers only the tasks the calling
 member submitted. Any other id — another member's task, the operator's, or one the session never
-held — is answered `-32001 Task not found`. Every other credential reads every task. A formation
-token does not reach `message/stream`, whose connection carries the frames of every task the
-session runs.
+held — is answered `-32001 Task not found`. Every other credential reads every task.
 
 A `message/send` the door has no room for answers a `rejected` task whose `status.message` says
 why: `task rejected: capsule is busy`, or `task rejected: the session is closing`.

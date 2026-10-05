@@ -291,7 +291,7 @@ A formation token carries exactly these scopes:
 | Scope | Lets the caller |
 |---|---|
 | `message/send` | Start a task |
-| `tasks/get` | Read a task's state |
+| `tasks/get` | Read the state of a task the calling member started; any other id is `-32001 Task not found`, as [Agent Card: `tasks/get`](agent-card.md#tasks-get) describes |
 
 A formation token does not reach `message/stream`: a `message/stream` connection carries the frames
 of every task the door runs, other members' included, as
