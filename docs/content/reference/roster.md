@@ -283,7 +283,7 @@ A member's door checks the `Authorization` header before anything else, in this 
 | No `Authorization` header | `401` | `unauthenticated` |
 | A formation token that does not verify: forged, altered, another formation's, or any formation token at a door in no formation | `401` | `invalid_token` — the same body as any other invalid token |
 | A valid formation token issued for another member's door | `403` | `not_permitted` — the message names only the member that presented it |
-| A valid formation token issued for this door, calling a method outside its three scopes | `403` | `insufficient_scope`, naming the credential `member:<caller>` |
+| A valid formation token issued for this door, calling a method outside its two scopes | `403` | `insufficient_scope`, naming the credential `member:<caller>` |
 | A valid formation token issued for this door, within its scopes | Served, as the credential `member:<caller>` | — |
 
 A formation token carries exactly these scopes:
@@ -291,8 +291,11 @@ A formation token carries exactly these scopes:
 | Scope | Lets the caller |
 |---|---|
 | `message/send` | Start a task |
-| `message/stream` | Start a task and stream it |
 | `tasks/get` | Read a task's state |
+
+A formation token does not reach `message/stream`: a `message/stream` connection carries the frames
+of every task the door runs, other members' included, as
+[Streaming Protocol: Endpoints](streaming-protocol.md#endpoints) describes.
 
 The operator token and declared credentials work as they do outside a formation. A peer task is
 still refused with `403 peer_not_accepted` by a member that does not declare
