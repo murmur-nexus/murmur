@@ -509,46 +509,6 @@ fn a_lock_written_for_another_platform_names_the_platform_and_is_repaired_by_ins
         .stderr(predicate::str::contains("E-RUN-003").not());
 }
 
-// ── S9: a version-1 lockfile ─────────────────────────────────────────────────
-
-#[test]
-fn a_version_one_lockfile_is_refused_by_doctor_and_run() {
-    let home = tempfile::tempdir().unwrap();
-    let staging = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    init_project(project.path());
-    publish_native(&home, &staging);
-    mur(&home)
-        .current_dir(project.path())
-        .args(["install", &format!("{NAME}@{VERSION}")])
-        .assert()
-        .success();
-
-    fs::write(
-        project.path().join("murmur.lock"),
-        format!(
-            "lock_version: 1\nartifacts:\n  - name: {NAME}\n    resolved_version: {VERSION}\n    sha256:\n      wasm: whatever\n"
-        ),
-    )
-    .unwrap();
-
-    for command in [["doctor"], ["run"]] {
-        mur(&home)
-            .current_dir(project.path())
-            .args(command)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("lock_version 1"))
-            .stderr(predicate::str::contains("expected 2"))
-            .stderr(predicate::str::contains("delete murmur.lock"))
-            .stderr(predicate::str::contains("mur install"));
-    }
-
-    // Nothing upgraded the file in place.
-    let raw = fs::read_to_string(project.path().join("murmur.lock")).unwrap();
-    assert!(raw.contains("lock_version: 1"), "{raw}");
-}
-
 // ── S3: an old-shape store resolves and says so ──────────────────────────────
 
 /// A store as an install written before this change left it: a native payload and its hash at

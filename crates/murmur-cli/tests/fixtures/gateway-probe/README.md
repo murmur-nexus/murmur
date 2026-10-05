@@ -16,8 +16,8 @@ told the key marker, hex-encoded, through its tool input — bare, or as the `ma
 JSON object — never through its environment, and reports only whether any environment value
 contains it.
 
-`murmur.yaml` is the bundled manifest the tests pack with the tool. It declares
-`upstream_auth: {header: Authorization, value: "Bearer {key}"}`.
+The tests write the bundled manifest themselves (`publish_tool` in `tests/credential_gateway.rs`),
+each with the `upstream_auth` block its case needs.
 
 `capsule/capsule-gateway-probe.wasm` is built against `world capsule`. It passes the task text
 (`task.md`, the hex-encoded marker) as input to `gateway-probe` and `gateway-probe-b` and writes

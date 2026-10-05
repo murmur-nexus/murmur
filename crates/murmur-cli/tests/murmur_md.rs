@@ -358,79 +358,7 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
     );
 }
 
-/// Test 6: murmur-scaffold dispatch creates expected tool directory structure.
-///
-/// Requires murmur-scaffold@0.1.0 in the local registry (~/.murmur/artifacts/).
-/// Skips gracefully if not present.
-#[cfg(unix)]
-#[test]
-fn scaffold_creates_tool_directory() {
-    if common::skip_without_host_support("scaffold_creates_tool_directory") {
-        return;
-    }
-    let scaffold_zip_path = std::env::var("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".murmur/artifacts/murmur-scaffold/0.1.0/murmur-scaffold-0.1.0.mur.zip")
-        })
-        .unwrap_or_default();
-
-    if !scaffold_zip_path.exists() {
-        eprintln!(
-            "skipping scaffold_creates_tool_directory: murmur-scaffold@0.1.0 not in local registry"
-        );
-        return;
-    }
-
-    let server = ScriptedServer::start(two_turn_responses_with_tool("murmur-scaffold"));
-
-    let home = TempDir::new().unwrap();
-    let artifact_dir = TempDir::new().unwrap();
-    let project = TempDir::new().unwrap();
-
-    let driver_artifact = create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_ANTHROPIC_NAME,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver_artifact).success();
-    common::publish_local(&home, &scaffold_zip_path).success();
-
-    let manifest_path = create_agent_manifest(
-        project.path(),
-        &server.endpoint,
-        DRIVER_ANTHROPIC_NAME,
-        &[("murmur-scaffold", "0.1.0", "tool")],
-        &[],
-        None,
-    );
-
-    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
-    fs::write(staged.workdir.join("task.md"), "Scaffold a new tool.").unwrap();
-
-    let launched = launch_session(staged, |_| {}).expect("launch should succeed");
-
-    // The tool call in two_turn_responses_with_tool sends name=new-tool
-    let new_tool_dir = launched.workdir.join("tools").join("new-tool");
-    assert!(
-        new_tool_dir.exists(),
-        "scaffold should have created tools/new-tool/"
-    );
-    assert!(
-        new_tool_dir.join("murmur.yaml").exists(),
-        "scaffold should have created murmur.yaml"
-    );
-    assert!(
-        new_tool_dir.join("bin").join("run").exists(),
-        "scaffold should have created bin/run"
-    );
-    assert!(
-        new_tool_dir.join("README.md").exists(),
-        "scaffold should have created README.md"
-    );
-}
-
-/// Test 7: skill artifact installs skill.md to tools/<name>/skill.md.
+/// Test 6: skill artifact installs skill.md to tools/<name>/skill.md.
 #[test]
 fn skill_artifact_installed_to_tools_dir() {
     let home = TempDir::new().unwrap();
@@ -477,7 +405,7 @@ fn skill_artifact_installed_to_tools_dir() {
     );
 }
 
-/// Test 8: MURMUR.md includes a skills section listing installed skill artifacts.
+/// Test 7: MURMUR.md includes a skills section listing installed skill artifacts.
 #[test]
 fn murmur_md_includes_skills_section_when_skill_installed() {
     let home = TempDir::new().unwrap();

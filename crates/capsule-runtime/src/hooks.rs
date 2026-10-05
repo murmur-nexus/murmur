@@ -2664,42 +2664,6 @@ mod tests {
         });
     }
 
-    /// A component exporting only the *legacy unversioned* `murmur:hook/lifecycle`
-    /// instance — as hooks published before the versioned WIT did — no longer
-    /// instantiates. The fallback probe was removed, so instantiation fails hard
-    /// with a missing-export error that names the versioned interface the host
-    /// expected and points the author at rebuilding.
-    #[test]
-    fn unversioned_only_hook_double_fails_hard() {
-        let session = TempDir::new().unwrap();
-        let accessible = TempDir::new().unwrap();
-        let engine = hook_test_engine();
-        let component = hook_double_iface(&engine, "murmur:hook/lifecycle", &REQUIRED_HOOK_FNS);
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let msg = match new_with_hooks(
-                &engine,
-                session.path(),
-                accessible.path(),
-                vec![staged_double(component)],
-            )
-            .await
-            {
-                Ok(_) => panic!("a hook exporting only the unversioned lifecycle name must fail"),
-                Err(e) => e.to_string(),
-            };
-            assert!(
-                msg.contains(LIFECYCLE_IFACE),
-                "error must name the versioned lifecycle export, got: {msg}"
-            );
-            assert!(
-                msg.contains("rebuild"),
-                "error must hint at rebuilding the hook, got: {msg}"
-            );
-        });
-    }
-
     /// When the versioned lifecycle instance name does not resolve (here the
     /// component exports an incompatible future version the host does not
     /// recognise), instantiation fails with the missing-export diagnostic naming

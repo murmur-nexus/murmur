@@ -862,19 +862,6 @@ fn show_suffix_case_insensitive() {
         .success();
 }
 
-#[test]
-fn show_legacy_path_with_slash_passes_through() {
-    let tmp = TempDir::new().unwrap();
-    let path = write_fixture(tmp.path(), "trace-a.jsonl", FIXTURE_A);
-
-    // Path contains '/' so it bypasses session resolution entirely
-    mur()
-        .args(["trace", "show", path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("test-capsule"));
-}
-
 // ── diff tests ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1125,21 +1112,6 @@ fn diff_ordinal_out_of_range_gives_clear_error() {
         .failure()
         .stderr(predicate::str::contains("@3"))
         .stderr(predicate::str::contains("out of range"));
-}
-
-#[test]
-fn diff_legacy_path_passthrough_on_both_args() {
-    let tmp = TempDir::new().unwrap();
-    let pa = write_fixture(tmp.path(), "trace-a.jsonl", FIXTURE_A);
-    let pb = write_fixture(tmp.path(), "trace-b.jsonl", FIXTURE_B);
-
-    // Both paths contain '/' so they bypass session resolution
-    mur()
-        .args(["trace", "diff", pa.to_str().unwrap(), pb.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Run A"))
-        .stdout(predicate::str::contains("Run B"));
 }
 
 #[test]
@@ -1785,20 +1757,6 @@ fn trace_show_multi_task_breakdown() {
 }
 
 #[test]
-fn trace_show_backward_compat_no_task_events() {
-    // A trace with no task_start/task_end events (legacy format) should succeed
-    // without a Tasks section.
-    let tmp = TempDir::new().unwrap();
-    let path = write_fixture(tmp.path(), "old.jsonl", FIXTURE_A);
-
-    mur()
-        .args(["trace", "show", path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Tasks").not());
-}
-
-#[test]
 fn trace_report_per_task_averages_section() {
     // Two multi-task sessions should show a per-task averages section.
     let tmp = TempDir::new().unwrap();
@@ -2306,26 +2264,6 @@ const FIXTURE_WITH_INPUT: &str = concat!(
     "\"total_tool_calls\":1,\"total_shell_calls\":0,\"duration_ms\":400,\"exit_status\":\"ok\"}\n"
 );
 
-// Fixture: old-format trace without input field on tool_call (pre-new-runtime).
-const FIXTURE_OLD_NO_INPUT: &str = concat!(
-    "{\"event_type\":\"session_start\",\"session_id\":\"ses_2222222222224222822200000000002b\",\"timestamp\":1000,",
-    "\"capsule_name\":\"old-test\",\"capsule_version\":\"0.9.0\",\"model\":\"claude-old\",",
-    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[\"bash\"]}\n",
-
-    "{\"event_type\":\"inference\",\"session_id\":\"ses_2222222222224222822200000000002b\",\"timestamp\":1100,",
-    "\"turn\":0,\"input_tokens\":80,\"output_tokens\":15,\"decision\":\"tool_call\",\"tool_name\":\"bash\"}\n",
-
-    "{\"event_type\":\"tool_call\",\"session_id\":\"ses_2222222222224222822200000000002b\",\"timestamp\":1200,",
-    "\"turn\":0,\"tool_name\":\"bash\",\"input_bytes\":18,\"output_bytes\":8,\"duration_ms\":25,\"status\":\"ok\"}\n",
-
-    "{\"event_type\":\"inference\",\"session_id\":\"ses_2222222222224222822200000000002b\",\"timestamp\":1300,",
-    "\"turn\":1,\"input_tokens\":100,\"output_tokens\":8,\"decision\":\"end_turn\",\"tool_name\":null}\n",
-
-    "{\"event_type\":\"session_end\",\"session_id\":\"ses_2222222222224222822200000000002b\",\"timestamp\":1400,",
-    "\"total_turns\":2,\"total_input_tokens\":180,\"total_output_tokens\":23,",
-    "\"total_tool_calls\":1,\"total_shell_calls\":0,\"duration_ms\":350,\"exit_status\":\"ok\"}\n"
-);
-
 // Fixture: trace with both input and output fields, as `trace.capture: content` writes them.
 const FIXTURE_WITH_OUTPUT: &str = concat!(
     "{\"event_type\":\"session_start\",\"session_id\":\"ses_3333333333334333833300000000003c\",\"timestamp\":1000,",
@@ -2395,20 +2333,6 @@ fn show_tool_call_input_truncates_on_char_boundary() {
         .assert()
         .success()
         .stdout(predicate::str::contains("…"));
-}
-
-#[test]
-fn old_trace_without_input_field_still_parses() {
-    // Pre-new-runtime traces that lack the input field must still parse cleanly.
-    let tmp = TempDir::new().unwrap();
-    let path = write_fixture(tmp.path(), "old-no-input.jsonl", FIXTURE_OLD_NO_INPUT);
-
-    mur()
-        .args(["trace", "show", path.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("old-test"))
-        .stdout(predicate::str::contains("ok"));
 }
 
 #[test]

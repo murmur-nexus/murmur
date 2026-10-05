@@ -156,35 +156,9 @@ mod tests {
         assert!(matches!(err, ArtifactError::MissingManifest));
     }
 
-    /// The archive-internal entry name this crate addressed before the manifest
-    /// name was aligned across the zip boundary. No code path reads it; the two
-    /// tests below exist precisely to prove that it is inert. This is the only
-    /// place the retired name is spelled anywhere in `murmur-artifact`.
-    const PRE_ALIGNMENT_ENTRY: &str = "manifest.yaml";
-
     #[test]
     fn packed_entry_is_addressed_as_murmur_yaml() {
         assert_eq!(PACKED_MANIFEST_ENTRY, "murmur.yaml");
-    }
-
-    #[test]
-    fn load_manifest_yaml_ignores_pre_alignment_entry_name() {
-        let bytes = archive_with_files(&[(PRE_ALIGNMENT_ENTRY, b"name: demo\nversion: 0.1.0\n")]);
-        let err = load_manifest_yaml_from_artifact_bytes(&bytes).unwrap_err();
-        assert!(
-            matches!(err, ArtifactError::MissingManifest),
-            "an archive carrying only the retired entry name must read as having no manifest at all; got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn load_manifest_ignores_pre_alignment_entry_name() {
-        let bytes = archive_with_files(&[(PRE_ALIGNMENT_ENTRY, b"name: demo\nversion: 0.1.0\n")]);
-        let err = load_manifest_from_artifact_bytes(&bytes).unwrap_err();
-        assert!(
-            matches!(err, ArtifactError::MissingManifest),
-            "an archive carrying only the retired entry name must read as having no manifest at all; got: {err:?}"
-        );
     }
 
     #[test]

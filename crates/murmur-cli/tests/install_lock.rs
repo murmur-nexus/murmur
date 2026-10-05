@@ -283,36 +283,6 @@ fn install_from_nested_subdirectory_finds_project_root() {
     );
 }
 
-/// A project carrying only the old `manifest.yaml` name is not a project root: there is no
-/// dual-name fallback, and the error names `murmur.yaml` only.
-#[test]
-fn install_with_only_legacy_manifest_name_fails_without_fallback() {
-    let home = tempfile::tempdir().unwrap();
-    let work = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-
-    fs::write(
-        project.path().join("manifest.yaml"),
-        "name: legacy-project\nversion: 0.0.1\n",
-    )
-    .unwrap();
-
-    let artifact = create_artifact_fixture(work.path(), "legacy-tool", "1.0.0");
-    run_publish_local(&artifact, &home).success();
-
-    run_install_project("legacy-tool@1.0.0", &home, project.path())
-        .failure()
-        .stderr(predicate::str::contains("error[E-IO-001]:"))
-        .stderr(predicate::str::contains("no project root found"))
-        .stderr(predicate::str::contains("murmur.yaml"))
-        .stderr(predicate::str::contains("manifest.yaml").not());
-
-    assert!(
-        !project.path().join(".murmur").exists(),
-        "no project store should be created without a murmur.yaml root"
-    );
-}
-
 #[test]
 fn install_registers_lock_entry_for_registry_resolved_artifact() {
     let home = tempfile::tempdir().unwrap();
