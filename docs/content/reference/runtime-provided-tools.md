@@ -94,7 +94,7 @@ member. A member the roster lets call nobody, and a session in no formation, has
 | Aspect | Behaviour |
 |---|---|
 | Input | `{"member": "<name>", "task": "<text>"}`, both required. The schema's `member` is an `enum` of the members this one may call, in roster order |
-| Description | Tells the model that `task` is the whole of what the member is told, so any file content it needs goes in the task text; that the call returns once the member holds the task; and that the answer arrives in the conversation after the turn ends, so it should not wait or poll |
+| Description | Tells the model that `task` is the whole of what the member is told, so any file content it needs goes in the task text; that the call returns once the member holds the task; that the answer arrives in the conversation after the turn ends, so it should not wait or poll; and that a second call to a member before its answer has arrived is refused |
 | Sent | One `message/send` to the member's door, carrying `task` as one text part, the formation token, and the calling task's trust class with origin `peer`. The model never sees the door's address or the token |
 | Egress | The member's door is checked against this capsule's own [`capabilities.network.allow`](manifest.md#network-allow-entries), which must list `localhost` — see [Giving a member work](roster.md#member-calls). Without it, every call fails and staging prints [`W-RUN-008`](diagnostics.md#w-run-008) |
 | Trace | [`member_call_start`](observability-schemas.md#member-call-start) when the member holds the task, and one [`member_call`](observability-schemas.md#member-call) per call once it is accounted for |
@@ -108,12 +108,31 @@ A call ends its tool call in one of two ways:
 | `passed`, summary `Called <member>: started` | The member's door answered with a task id and a state that is not terminal | `{"call_id": "mcl_…", "member": "<name>", "status": "started", "task_id": "<the member's task id>"}` |
 | `failed`, summary `Called <member>: failed` | The call was refused, the door could not be reached, the door answered an error status or a JSON-RPC error, or the member answered with a terminal state such as `rejected` | `{"call_id": "mcl_…", "member": "<name>", "status": "failed", "output": "<why>"}` |
 
-Two calls are refused as a tool error, with nothing sent:
+`data` reaches the model [fenced](untrusted-fence.md) under `tool:call-member`. A started call adds the runtime's own note on the line after the closing
+marker, outside the fence:
+
+```text
+<untrusted-content source=tool:call-member>
+{"call_id":"mcl_01a1…","member":"worker","status":"started","task_id":"tsk_…"}
+</untrusted-content>
+[call-member] worker is now working on call mcl_01a1…. Its answer is not in this result and no tool fetches it: the runtime adds it to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling worker again before its answer arrives is refused.
+```
+
+Three calls are refused as a tool error, with nothing sent and nothing recorded as a member call:
 
 | Call | Error |
 |---|---|
 | A `member` the roster does not let this capsule call | Names the members it may call |
 | A call made while no task is running | Says the tool is answered only while a task runs |
+| A `member` that already holds a call from this task whose answer has not been delivered | One of the two texts below, naming the earlier call |
+
+| The earlier call's answer | Error text |
+|---|---|
+| Has not arrived | `<member> has not yet answered call <call_id> from this task, so nothing was sent. Its answer reaches you only after you end your turn: end your turn now by replying without calling a tool. Once that answer has arrived you may call <member> again with new work.` |
+| Has arrived and waits for the turn to end | `<member> has already answered call <call_id>, so nothing was sent. The answer reaches you as soon as you end your turn: end your turn now by replying without calling a tool.` |
+
+Once its answer has been delivered, a member can be called again with new work. Calls to
+different members in one turn never refuse each other.
 
 ### How the answer arrives { #call-member-answer }
 
@@ -125,14 +144,22 @@ Two calls are refused as a tool error, with nothing sent:
 4. The model reads the answers and answers in turn, or calls again.
 
 Each answer in that message is one line naming the call id, the member and how the call ended,
-then the member's output fenced under `member:<name>`, whatever the calling task's trust:
+then the member's output fenced under `member:<name>`, whatever the calling task's trust. The
+message ends with one line of the runtime's own, outside every fence:
 
 ```text
 [call-member] call mcl_01a1… to worker ended completed:
 <untrusted-content source=member:worker>
 WORKER-0123
 </untrusted-content>
+
+[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.
 ```
+
+| Calls still outstanding | Last line |
+|---|---|
+| None | `[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.` |
+| One or more | `[call-member] Still working: <member> (call <call_id>), <member> (call <call_id>). Their answers arrive after you end your turn; do not call them again before then.` |
 
 | Ending | Output |
 |---|---|

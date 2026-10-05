@@ -930,6 +930,23 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+/// The text of the last `user` message in a recorded driver request.
+pub fn last_user_text(request: &Value) -> String {
+    let last_user = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "user"))
+        .unwrap_or_else(|| panic!("the request carries a user message: {request}"));
+    match &last_user["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("unexpected user content: {other}"),
+    }
+}
+
 /// The `tool_result` block a scripted server saw posted back for one `tool_use` id.
 ///
 /// Scans every request in order, so the first post of a given id wins — a session that retries a

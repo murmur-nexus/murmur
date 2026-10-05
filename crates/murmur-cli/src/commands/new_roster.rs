@@ -848,12 +848,14 @@ fn callees_of(member: &str) -> Vec<&'static str> {
 fn system_prompt(name: &str, member: &MemberTemplate) -> String {
     let callees = callees_of(member.name);
     if member.entry && !callees.is_empty() {
+        let callees = callees.join(" or ");
         format!(
-            "You are '{}', the entry member of the formation '{name}'. Hand the task you are \
-             given to {} with the call-member tool, stating it in full, then end your turn while \
-             it works. When its answer arrives in this conversation, answer with the result.",
+            "You are '{}', the entry member of the formation '{name}'. You do not do the task \
+             yourself: {callees} does it. Your first reply is a call-member tool call that hands \
+             {callees} the task you are given, stated in full. Then end your turn while \
+             {callees} works. When {callees}'s answer arrives in this conversation, answer with \
+             it.",
             member.name,
-            callees.join(" or "),
         )
     } else if member.entry {
         format!(
@@ -1011,19 +1013,19 @@ mod tests {
         }
     }
 
-    /// Lead's prompt names the hand-off: call-member to worker, end the turn, answer with what
-    /// comes back.
+    /// Lead's prompt names the hand-off: lead does not do the task, its first reply is a
+    /// call-member call to worker, then it ends the turn and answers with what comes back.
     #[test]
     fn the_lead_prompt_hands_the_task_to_worker() {
         let (_, lead, worker, _) = files(&default_choice());
         let prompt = lead.inference.unwrap().system_prompt.unwrap();
-        for said in [
-            "to worker with the call-member tool",
-            "end your turn",
-            "answer with the result",
-        ] {
-            assert!(prompt.contains(said), "{said}: {prompt}");
-        }
+        assert_eq!(
+            prompt,
+            "You are 'lead', the entry member of the formation 'crew'. You do not do the task \
+             yourself: worker does it. Your first reply is a call-member tool call that hands \
+             worker the task you are given, stated in full. Then end your turn while worker \
+             works. When worker's answer arrives in this conversation, answer with it."
+        );
         let worker_prompt = worker.inference.unwrap().system_prompt.unwrap();
         assert!(!worker_prompt.contains("call-member"), "{worker_prompt}");
     }

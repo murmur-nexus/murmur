@@ -34,7 +34,8 @@ A member gives another member work with the runtime-provided
 [`call-member`](../reference/runtime-provided-tools.md#call-member) tool, which a member has only
 when the roster lets it call another. The call returns as soon as the other member holds the task.
 The other member runs the task in its own directory, and its answer comes back into the caller's
-same task, marked as coming from that member. Members share no files, so whatever the other member
+same task, marked as coming from that member. A second call to a member before its answer has
+arrived is refused, with nothing sent. Members share no files, so whatever the other member
 needs goes in the task text. The roster grants the name and the credential, not the network: the
 caller's own `capabilities.network.allow` must list `localhost`. See
 [Giving a member work](../reference/roster.md#member-calls).

@@ -343,6 +343,43 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "note the work above is out"
     await_interrupt
     ;;
+  member-call)
+    # A formation lead. On a new session it hands worker one task through the bridged
+    # `call-member`, keeps the bridge's answer in its store as `call-member-answer`, and ends the
+    # turn. On a resume the prompt is the runtime's delivery of the answers, several lines ending
+    # at the runtime's last `[call-member]` line; stdin stays open, so it reads up to that line
+    # and no further, and answers with the whole prompt on one line.
+    if [ "$MODE" = "resume" ]; then
+      echo "started $SESSION"
+      PROMPT="$TASK"
+      line="$TASK"
+      while :; do
+        case "$line" in
+          '[call-member] Every call'*|'[call-member] Still working'*) break ;;
+        esac
+        IFS= read -r line || break
+        PROMPT="$PROMPT $line"
+      done
+      echo "end $PROMPT"
+    else
+      unfence_task
+      mkdir -p "$SESSION_STORE"
+      echo "started $SESSION"
+      QUALIFIED="call-member"
+      for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+        case "$candidate" in
+          *"__call-member") QUALIFIED="$candidate"; break ;;
+        esac
+      done
+      ARGS='{"member":"worker","task":"Reply with your token and nothing else."}'
+      echo "tool c1 $QUALIFIED $ARGS"
+      answer="$(call_bridge call-member "$ARGS")"
+      printf '%s' "$answer" > "$SESSION_STORE/call-member-answer"
+      echo "result c1 ok $answer"
+      echo "text waiting"
+      echo "end waiting"
+    fi
+    ;;
   parity)
     # The http capsule's provider script, in harness events: one turn that says something and
     # calls a tool, then one that answers. Its A2A frames must match that capsule's exactly.
