@@ -6,13 +6,13 @@
 
 | Form | Example | Resolved against |
 |---|---|---|
-| Name and version | `murmur-tool-git@1.0.0` | The registry first, then the configured sources |
+| Name and version | `murmur-tool-git@{{ v.murmur_tool_git }}` | The registry first, then the configured sources |
 | Bare name | `murmur-tool-git` | The configured sources, latest release |
 | GitHub release | `github:<owner>/<repo>@<tag>` | That release, directly |
-| Local file | `./murmur-tool-git-1.0.0.mur.zip` | A path on disk. A reference counts as a path when it starts with `./`, `../` or `/`, or contains `/` and ends in `.mur.zip` |
+| Local file | `./murmur-tool-git-{{ v.murmur_tool_git }}.mur.zip` | A path on disk. A reference counts as a path when it starts with `./`, `../` or `/`, or contains `/` and ends in `.mur.zip` |
 
 ```bash
-mur install murmur-tool-git@1.0.0
+mur install murmur-tool-git@{{ v.murmur_tool_git }}
 ```
 
 ## Which assets an install pulls

@@ -517,7 +517,7 @@ refuses at staging, before any component runs or any request is sent. The refusa
 or not `gateway.api_key` is set, and to the inference driver, tools and hooks alike.
 
 ```text
-error[E-RUN-025]: artifact 'murmur-driver-anthropic@1.0.0' declares no usable upstream_auth: block
+error[E-RUN-025]: artifact 'murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}' declares no usable upstream_auth: block
   hint: the runtime presents the key itself and needs the artifact to say how; update the artifact to a version whose murmur.yaml declares upstream_auth:, or remove gateway: from its entry
 ```
 
