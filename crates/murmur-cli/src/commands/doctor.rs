@@ -1083,10 +1083,9 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
     );
 }
 
-/// Print the `Roster` block when `roster.yaml` sits in `project_root`: the roster
-/// admitted through [`capsule_runtime::admit_roster_file`], with each member's peer posture and the
-/// expanded reachability. Returns the `Fix:` entries; a refusal is
-/// one, and it fails the exit code.
+/// Print the `Roster` block when `roster.yaml` sits in `project_root`: the roster admitted through
+/// [`capsule_runtime::admit_roster_file`], with each member's peer posture and the expanded
+/// reachability. Returns the `Fix:` entries; a refusal is one, and it fails the exit code.
 ///
 /// Prints nothing, and finds nothing, when there is no `roster.yaml`.
 fn report_roster(
@@ -1225,9 +1224,8 @@ fn print_tally(total_pass: u32, fixes: &[String], warnings: &[String]) {
         return;
     }
 
-    // Exit non-zero so `mur doctor` can be used in CI pre-flight checks.
-    // std::process::exit terminates the process immediately; no destructors run,
-    // which is acceptable here because we are done with all I/O.
+    // Non-zero so `mur doctor` works as a CI pre-flight check. `process::exit` runs no
+    // destructors, so every line must already be printed.
     std::process::exit(1);
 }
 

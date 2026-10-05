@@ -82,7 +82,12 @@ impl Scratch {
     }
 
     fn run(&self, args: &[&str]) -> Finished {
-        let output = self.command(args).output().unwrap();
+        self.run_in(self.path(), args)
+    }
+
+    /// `mur <args>` as [`Scratch::command`] runs it, from `dir`.
+    fn run_in(&self, dir: &Path, args: &[&str]) -> Finished {
+        let output = self.command(args).current_dir(dir).output().unwrap();
         Finished {
             code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -195,6 +200,34 @@ fn store_key(scratch: &Scratch, step: &str, key_var: &str) {
     assert!(!set.stdout.contains(TEST_KEY) && !set.stderr.contains(TEST_KEY));
 }
 
+/// Run the printed key, driver and build-and-install steps, `steps[0..4]`, as printed. The driver
+/// step is served by the fixture driver, published locally under the name and version the step
+/// prints, the version label being metadata only.
+fn install_as_printed(scratch: &Scratch, steps: &[String]) {
+    store_key(scratch, &steps[0], "ANTHROPIC_API_KEY");
+    let (driver_name, driver_version) = steps[1]
+        .strip_prefix("mur install -g ")
+        .unwrap_or_else(|| panic!("the second step installs the driver: {}", steps[1]))
+        .split_once('@')
+        .unwrap();
+    assert_eq!(driver_name, "murmur-driver-anthropic");
+    let artifacts = tempfile::tempdir().unwrap();
+    let driver_zip = common::create_driver_artifact(
+        artifacts.path(),
+        driver_name,
+        driver_version,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&scratch.home, &driver_zip).success();
+    for step in &steps[2..4] {
+        for command in step.split("&&") {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(words[0], "mur", "{step}");
+            scratch.run(&words[1..]).assert_code(0);
+        }
+    }
+}
+
 // ── S1: the scaffold launches unedited ───────────────────────────────────────
 
 #[test]
@@ -214,33 +247,8 @@ fn the_scaffold_installs_and_launches_as_printed() {
         .map(|file| sha256(&scratch.path().join(file)))
         .collect();
 
-    // The key step, run as printed: the key reaches the members only through the config.
-    store_key(&scratch, &steps[0], "ANTHROPIC_API_KEY");
-
-    // The driver step names the driver and version the members pin; the fixture driver is
-    // published under that name and version, the version label being metadata only.
-    let driver = steps[1]
-        .strip_prefix("mur install -g ")
-        .unwrap_or_else(|| panic!("the second step installs the driver: {}", steps[1]));
-    let (driver_name, driver_version) = driver.split_once('@').unwrap();
-    assert_eq!(driver_name, "murmur-driver-anthropic");
-    let artifacts = tempfile::tempdir().unwrap();
-    let driver_zip = common::create_driver_artifact(
-        artifacts.path(),
-        driver_name,
-        driver_version,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&scratch.home, &driver_zip).success();
-
-    // The build-and-install steps, run as printed.
-    for step in &steps[2..4] {
-        for command in step.split("&&") {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            assert_eq!(words[0], "mur", "{step}");
-            scratch.run(&words[1..]).assert_code(0);
-        }
-    }
+    // The key reaches the members only through the config the key step writes.
+    install_as_printed(&scratch, &steps);
     // In `tree`'s order: sorted by path.
     let expected = [
         "crew",
@@ -419,26 +427,7 @@ fn the_scaffolded_lead_hands_the_worker_a_task() {
         .iter()
         .map(|file| sha256(&scratch.path().join(file)))
         .collect();
-    store_key(&scratch, &steps[0], "ANTHROPIC_API_KEY");
-    let (driver_name, driver_version) = steps[1]
-        .strip_prefix("mur install -g ")
-        .unwrap()
-        .split_once('@')
-        .unwrap();
-    let artifacts = tempfile::tempdir().unwrap();
-    let driver_zip = common::create_driver_artifact(
-        artifacts.path(),
-        driver_name,
-        driver_version,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&scratch.home, &driver_zip).success();
-    for step in &steps[2..4] {
-        for command in step.split("&&") {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            scratch.run(&words[1..]).assert_code(0);
-        }
-    }
+    install_as_printed(&scratch, &steps);
 
     let _lock = launch_lock();
     let run = scratch
@@ -611,18 +600,7 @@ fn doctor_in_the_scaffolded_formation_checks_its_roster() {
     new.assert_code(0);
     let steps = next_steps(&new.stdout);
     let crew = scratch.path().join("crew").canonicalize().unwrap();
-    let doctor = || {
-        let output = scratch
-            .command(&["doctor"])
-            .current_dir(&crew)
-            .output()
-            .unwrap();
-        Finished {
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }
-    };
+    let doctor = || scratch.run_in(&crew, &["doctor"]);
     let preamble = format!(
         "No murmur.yaml in {}: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.\n\nRoster\n  file: {}\n",
         crew.display(),
@@ -650,26 +628,7 @@ fn doctor_in_the_scaffolded_formation_checks_its_roster() {
     assert!(!refused.stderr.contains("E-IO-001"), "{}", refused.stderr);
 
     // The printed steps run: the formation is admitted.
-    store_key(&scratch, &steps[0], "ANTHROPIC_API_KEY");
-    let (driver_name, driver_version) = steps[1]
-        .strip_prefix("mur install -g ")
-        .unwrap()
-        .split_once('@')
-        .unwrap();
-    let artifacts = tempfile::tempdir().unwrap();
-    let driver_zip = common::create_driver_artifact(
-        artifacts.path(),
-        driver_name,
-        driver_version,
-        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&scratch.home, &driver_zip).success();
-    for step in &steps[2..4] {
-        for command in step.split("&&") {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            scratch.run(&words[1..]).assert_code(0);
-        }
-    }
+    install_as_printed(&scratch, &steps);
     let admitted = doctor();
     admitted.assert_code(0);
     assert_eq!(

@@ -144,7 +144,7 @@ artifacts:
       endpoint: https://api.tavily.com
       api_key: ${TAVILY_API_KEY}   # optional; literal value or ${ENV_VAR}
   - name: murmur-driver-anthropic
-    version: "1.0.0"
+    version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:       # required on the transport: http driver
       endpoint: https://api.anthropic.com
@@ -665,10 +665,10 @@ behind the inference driver:
 ```yaml
 artifacts:
   - name: murmur-driver-openai
-    version: "1.0.0"
+    version: "{{ v.murmur_driver_openai }}"
     runtime: driver
     gateway:
-      endpoint: http://localhost:11434
+      endpoint: http://localhost:11434/v1
       keyless: true
 ```
 
@@ -1031,11 +1031,11 @@ driver is an `artifacts:` entry.
 ```yaml
 artifacts:
   - name: murmur-driver-anthropic
-    version: 1.0.0
+    version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway: { endpoint: https://api.anthropic.com, api_key: ${ANTHROPIC_API_KEY} }
   - name: murmur-driver-openai
-    version: 1.0.0
+    version: "{{ v.murmur_driver_openai }}"
     runtime: driver
     gateway: { endpoint: https://api.openai.com/v1, api_key: ${OPENAI_API_KEY} }
 inference:
@@ -1336,7 +1336,7 @@ key names illustrate the question; each driver documents the keys it reads.
 ```yaml
 artifacts:
   - name: murmur-driver-anthropic
-    version: 1.0.0
+    version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     config:
       prompt_cache: enabled
@@ -1383,7 +1383,7 @@ fails with `E-RUN-006`.
 ```yaml
 artifacts:
   - name: murmur-driver-anthropic
-    version: "1.0.0"
+    version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
     gateway:
       endpoint: https://api.anthropic.com

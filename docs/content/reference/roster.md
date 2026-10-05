@@ -2,7 +2,7 @@
 
 A `roster.yaml` declares a formation: the capsules that run together as its **members**, the one
 **entry member** that receives the formation's task, and which members may call which. It sits in
-the project directory, beside `murmur.yaml`.
+the project directory `mur run --roster` names, which needs no `murmur.yaml` of its own.
 
 ```yaml
 roster_version: 1

@@ -11,7 +11,7 @@ with A2A messaging](../how-to/capsules-a2a-messaging.md) for the full protocol a
 
 ## Rosters
 
-A formation is declared in a `roster.yaml` beside the project's `murmur.yaml`: its members, each a
+A formation is declared in a `roster.yaml` in its project directory: its members, each a
 capsule at an exact version, the entry member that receives the formation's task, and which
 members may call which. [`mur doctor`](../reference/cli.md#doctor-roster) checks a roster against
 the installed capsules. See the [Roster Schema](../reference/roster.md).
