@@ -876,10 +876,15 @@ The run ends with [`E-RUN-033`](diagnostics.md#e-run-033) naming the same kind.
 | `attempt` | u32 | Which attempt the harness is on |
 | `reason` | string | Why it is retrying |
 
-**`harness_note`** — written for anything else the harness said, for a tool result that matched no
-call, once per tool call the run ended without a result for, for an interrupt that could not be
-delivered, for a `classify-exit` call the driver never answered, for a bridged tool call the harness
-closed its connection on, and for a call refused because the concurrent-call limit was reached
+**`harness_note`** — written for:
+
+- anything else the harness said;
+- a tool result that matched no call;
+- each tool call the run ended without a result for;
+- an interrupt that could not be delivered;
+- a `classify-exit` call the driver never answered;
+- a tool call whose connection the harness closed before the call returned;
+- a tool call refused at the [concurrent tool call limit](../how-to/run-capsule-on-subscription.md#step-7-know-the-three-fixed-limits).
 
 | Field | Type | Notes |
 |---|---|---|

@@ -1574,7 +1574,9 @@ mod tests {
         let started = Instant::now();
         let outcome = run_shell(
             "bash",
-            &["-c", "echo $$ > sleeper.pid; exec sleep 30"],
+            // Outlives the abandonment by seconds and then ends on its own, so nothing has to
+            // kill it; without the demotion the call would return only when it exited.
+            &["-c", "sleep 5"],
             &[],
             temp.path(),
             temp.path(),
@@ -1583,7 +1585,7 @@ mod tests {
             Some(DetachPolicy {
                 grace: Duration::from_secs(60),
                 registry: Arc::clone(&registry),
-                command: "sleep 30".to_string(),
+                command: "sleep 5".to_string(),
                 context_id: "ctx_abandon_test".to_string(),
                 provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
                 abandoned: Some(abandon),
@@ -1592,17 +1594,6 @@ mod tests {
         .expect("a declared binary runs");
         let elapsed = started.elapsed();
         raiser.join().unwrap();
-
-        // Leave nothing running: the pid file is written before `exec`, so it names the sleep.
-        let pid: i32 = std::fs::read_to_string(temp.path().join("sleeper.pid"))
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
-            .expect("the command wrote its pid before sleeping");
-        #[allow(unsafe_code)]
-        // SAFETY: `kill` takes a pid and a signal number and touches no memory of ours.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
 
         let ShellOutcome::Detached(info) = outcome else {
             panic!("an abandoned command must demote, got {outcome:?}");

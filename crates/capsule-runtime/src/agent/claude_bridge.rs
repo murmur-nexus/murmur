@@ -69,11 +69,11 @@ pub(super) const MAX_IN_FLIGHT_CALLS: usize = 16;
 /// accept backlog. At most [`MAX_IN_FLIGHT_CALLS`] of them can be long-running; every other one
 /// is answered at once or dropped after [`REQUEST_READ_TIMEOUT`], so a waiting connection waits
 /// about one read timeout, never for a tool call.
-pub(super) const MAX_OPEN_CONNECTIONS: usize = 64;
+const MAX_OPEN_CONNECTIONS: usize = 64;
 
 /// How long a connection has to deliver its whole request — request line, headers and body. A
 /// connection that sends nothing in that time is closed without a response.
-pub(super) const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many bytes a connection may send after its request while its call runs. They are read
 /// and discarded so a close behind them can be seen; past this, the connection is no longer read.
@@ -439,9 +439,8 @@ impl BridgeHandle {
                     &decided,
                 );
                 // A client that half-closes its write side after sending its request reads here
-                // as one that went away, and its call is abandoned. Neither the fixture harness
-                // nor Claude Code's HTTP client does that: both keep the connection open until
-                // the response arrives.
+                // as one that went away, and its call is abandoned: a client must keep the
+                // connection open until the response arrives.
                 let result = tokio::select! {
                     result = dispatch => Some(result),
                     () = peer_closed(&mut reader) => None,

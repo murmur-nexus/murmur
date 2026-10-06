@@ -139,7 +139,9 @@ Two kinds of entry reach the model this way:
 
 `runtime: driver` and `runtime: hook` artifacts are not offered to the model, on this transport as on the other.
 
-Murmur runs the harness's tool calls concurrently, so a long shell command does not hold up the other calls the harness makes while it runs.
+Murmur runs the harness's tool calls concurrently, up to the [concurrent tool call limit](#step-7-know-the-three-fixed-limits), so a long shell command does not hold up the other calls the harness makes while it runs.
+
+If the harness stops waiting for a call and closes its connection, a shell command that call started moves to the background at once, as if it had run past [lifecycle.shell_grace_secs](../reference/manifest.md#lifecycle-shell-grace-secs), and its result arrives later as a `completion` task. `trace.jsonl` records a `harness_note` for the call.
 
 Every call the harness makes is checked before it runs, in the same order as on `transport: http`:
 
