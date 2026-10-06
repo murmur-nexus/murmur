@@ -429,6 +429,9 @@ fn max_age_removes_an_ended_formation_and_keeps_a_live_one() {
         started_at: "2026-01-01T00:00:00Z".to_string(),
         door_token: None,
         formation_id: Some(FormationId::parse(&old_record).unwrap()),
+        formation_lifeline: false,
+        formation_launcher: None,
+        spawned_by: None,
     };
     let record_path = running.join(format!("{session_id}.json"));
     let record_json = serde_json::to_string(&record).unwrap();

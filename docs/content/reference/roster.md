@@ -263,6 +263,9 @@ it, or when the launcher's process dies by any means, `SIGKILL` and the OOM kill
 | A peer did not come up | Closes the lifeline of every member already started |
 | The launcher was killed | Is gone; the kernel closes every lifeline |
 
+[`mur stop <formation-id>`](cli.md#mur-stop-formation) ends a formation by sending its launcher
+`SIGTERM`, so the launcher closes every lifeline, the entry member's included.
+
 The launcher sends no member `SIGTERM`. A member whose lifeline closes winds down:
 
 1. It appends one [`formation_ended`](observability-schemas.md#formation-ended) record to its
@@ -296,7 +299,8 @@ to the stderr it shares with the launcher.
 **A member started by hand.** A `mur run` whose environment carries `MURMUR_FORMATION_ID` but no
 lifeline, and which is not a delegated child, runs as any other `mur run` does: nothing winds it
 down when its formation ends. It prints [`W-RUN-007`](diagnostics.md#w-run-007) once at launch.
-End it with [`mur stop`](cli.md#mur-stop). A delegated child carries its parent's formation id and
+End it with [`mur stop`](cli.md#mur-stop); `mur stop <formation-id>` also stops it, as one
+session, beside the members the launcher ends. A delegated child carries its parent's formation id and
 no formation lifeline, and prints nothing. It holds a
 [spawner lifeline](roost-api.md#spawner-lifeline) instead, so it winds down when the
 member that delegated to it ends, however that member ends.

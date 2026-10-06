@@ -70,6 +70,7 @@ use crate::formation_credentials::{
 };
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::roster::AdmittedRoster;
+use crate::running::ProcessIdentity;
 use serde::{Deserialize, Serialize};
 
 /// How long a member has, from its spawn, to report itself and have its door answer.
@@ -222,10 +223,18 @@ impl FormationPlan {
             .unwrap_or_default()
     }
 
-    /// `member`'s channel first line, signed by `authority`.
-    fn first_line(&self, authority: &FormationAuthority, member: &str) -> String {
+    /// `member`'s channel first line, signed by `authority` and naming `launcher` as the process
+    /// that started it.
+    fn first_line(
+        &self,
+        authority: &FormationAuthority,
+        launcher: Option<&ProcessIdentity>,
+        member: &str,
+    ) -> String {
         let callees: Vec<&str> = self.callees_of(member).iter().map(String::as_str).collect();
-        authority.member_bundle(member, &callees).render_line()
+        let mut bundle = authority.member_bundle(member, &callees);
+        bundle.launcher = launcher.cloned();
+        bundle.render_line()
     }
 }
 
@@ -1433,10 +1442,14 @@ pub(crate) fn launch_plan(
             })
         }
     };
+    // Read once, so every member, the entry member included, records the same launcher. A
+    // launcher that cannot read its own start time names none, and `mur stop` then cannot reach
+    // it through its members.
+    let launcher = ProcessIdentity::of_this_process();
     let first_lines: Vec<String> = plan
         .peers
         .iter()
-        .map(|member| plan.first_line(&authority, &member.name))
+        .map(|member| plan.first_line(&authority, launcher.as_ref(), &member.name))
         .collect();
     // Before any peer's directory exists, so no formation directory a launch made is without one.
     // A launch with no peers makes no formation directory, and so no marker.
@@ -1548,6 +1561,7 @@ pub(crate) fn launch_plan(
         binary,
         options,
         authority,
+        launcher,
     })
 }
 
@@ -1608,6 +1622,8 @@ pub struct RunningFormation {
     binary: PathBuf,
     options: FormationLaunchOptions,
     authority: FormationAuthority,
+    /// This process, as every member's first line names it.
+    launcher: Option<ProcessIdentity>,
 }
 
 impl std::fmt::Debug for RunningFormation {
@@ -1652,21 +1668,25 @@ impl RunningFormation {
     pub fn start_entry(&mut self) -> Result<u32, MemberLaunchFailure> {
         let args = entry_args(&self.entry, &self.options);
         // Its whole channel is written before it starts: every address it may need is known.
-        let channel = Channel::open(&self.plan.first_line(&self.authority, &self.entry.name))
-            .and_then(|mut channel| {
-                let addresses = addresses_of(&self.peers, self.plan.callees_of(&self.entry.name));
-                if !addresses.is_empty() {
-                    channel
-                        .writer
-                        .write_all(format!("{}\n", render_address_line(&addresses)).as_bytes())
-                        .map_err(|error| {
-                            not_started(&format!(
-                                "its formation channel could not be written: {error}"
-                            ))
-                        })?;
-                }
-                Ok(channel)
-            });
+        let channel = Channel::open(&self.plan.first_line(
+            &self.authority,
+            self.launcher.as_ref(),
+            &self.entry.name,
+        ))
+        .and_then(|mut channel| {
+            let addresses = addresses_of(&self.peers, self.plan.callees_of(&self.entry.name));
+            if !addresses.is_empty() {
+                channel
+                    .writer
+                    .write_all(format!("{}\n", render_address_line(&addresses)).as_bytes())
+                    .map_err(|error| {
+                        not_started(&format!(
+                            "its formation channel could not be written: {error}"
+                        ))
+                    })?;
+            }
+            Ok(channel)
+        });
         let channel = match channel {
             Ok(channel) => channel,
             Err(reason) => {
@@ -2242,9 +2262,14 @@ mod tests {
         assert_eq!(names(&coder_bundle), ["reviewer"]);
         assert_eq!(names(&planner_bundle), ["coder"]);
         assert!(names(&reviewer_bundle).is_empty());
+        // Every member, the entry member included, is told the one launcher that started it:
+        // this test process.
+        let launcher = crate::running::ProcessIdentity::of_this_process();
+        assert!(launcher.is_some());
         for bundle in [&coder_bundle, &planner_bundle, &reviewer_bundle] {
             assert_eq!(bundle.formation_id, id);
             assert_eq!(bundle.verify_key, coder_bundle.verify_key);
+            assert_eq!(bundle.launcher, launcher, "{}", bundle.member);
         }
         assert!(!planner.join("\n").contains("reviewer"), "{planner:?}");
         let addresses = |line: &str| -> Vec<(String, String)> {
@@ -2559,6 +2584,9 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
             formation_id: formation.cloned(),
+            formation_lifeline: false,
+            formation_launcher: None,
+            spawned_by: None,
         }
     }
 

@@ -17,7 +17,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur ps` | List the capsules running on this machine |
 | `mur watch` | Stream live events from a running capsule's output to stdout |
 | `mur cancel` | Stop one running task on a capsule, leaving the session running |
-| `mur stop` | End one running capsule, and report what it left behind |
+| `mur stop` | End one running capsule, or every member of a formation, and report what was left behind |
 | `mur control` | Show or change what a running capsule's `control:` block lets a controller change |
 | `mur deploy run` | Upload a capsule to an existing VM and return its public URL |
 | `mur deploy ls` | List all deployed capsules |
@@ -113,6 +113,19 @@ A session that is a [member of a formation](#mur-run-formation) also records its
 `formation_id`. A session in no formation writes no such key. The id groups records; it grants
 nothing. A record whose `formation_id` is not a formation id is unreadable, and is removed on the
 next read like any other unreadable record.
+
+Three more keys say what ends the session other than `mur stop`. Each is written only when it
+applies, so a standalone session's record carries none of them.
+
+| Key | Written when | Value |
+|---|---|---|
+| `formation_lifeline` | The session holds a formation lifeline: [`mur run --roster`](#mur-run-formation) started it | `true` |
+| `formation_launcher` | The session holds a formation lifeline and its formation channel named the launcher | `{"pid": <pid>, "process_start": "<start time>"}` — the launcher's process id and start time, read the same way as the record's own |
+| `spawned_by` | The session is a delegated sub-capsule | The session id of the session that delegated to it |
+
+[`mur stop <formation-id>`](#mur-stop-formation) reads these keys to find the launcher and to
+decide which members it stops itself. A `formation_launcher` that is not an object with an integer
+`pid` and a string `process_start` makes the record unreadable.
 
 A session whose manifest declares [`network.authentication`](manifest.md#field-network-authentication)
 also records its operator token, as `door_token`. [`mur ps`](#mur-ps), [`mur stop`](#mur-stop),
@@ -1471,15 +1484,16 @@ A member that ran under another root and has no record is not counted.
 
 ## `mur stop`
 
-End one running capsule, and report what it left behind.
+End one running capsule, or every member of a formation, and report what was left behind.
 
 ```bash
 mur stop <SESSION> [--timeout <SECONDS>]
+mur stop <FORMATION-ID> [--timeout <SECONDS>]
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `SESSION` | — | A [session address](#session-addresses) naming a running capsule |
+| `SESSION` | — | A [session address](#session-addresses) naming a running capsule, or a formation id (`frm_…`) to stop every member — see [Stopping a formation](#mur-stop-formation) |
 | `--timeout` | `10` | Seconds to wait after `SIGTERM` before escalating to `SIGKILL`. `0` escalates immediately, with no grace period |
 
 Three steps, in this order:
@@ -1552,6 +1566,96 @@ Exit codes:
 |---|---|---|
 | Started at another time than the host reports — the number was inherited | `E-RUN-022` | Unlinked |
 | Start time could not be read | `E-RUN-024` | Kept |
+
+### Stopping a formation { #mur-stop-formation }
+
+An argument starting `frm_` is a formation id, the full id in the `FORMATION` column of
+[`mur ps`](#mur-ps). `mur stop` ends the formation the way it ends itself: it sends `SIGTERM` to the
+formation's launcher, the [`mur run --roster`](#mur-run-formation) process, which closes every
+member's lifeline. Every member, the entry member included, records `formation_ended` and winds
+down. No member holding a lifeline is sent a signal or called through its door.
+
+The launcher writes no record. `mur stop` finds it through the `formation_launcher` key of its
+members' [records](#running-capsule-records), and verifies its process id and start time
+immediately before each signal, as for a session.
+
+Each running member is one of three kinds:
+
+| Member | Its record | `mur stop` |
+|---|---|---|
+| Started by the launcher | `formation_lifeline: true` | Signals nothing; the launcher's teardown ends it |
+| Delegated sub-capsule | `spawned_by` | Signals nothing; it ends with the session that delegated to it |
+| Started by hand with `MURMUR_FORMATION_ID` (warned [`W-RUN-007`](diagnostics.md#w-run-007)) | Neither key | Stops it as `mur stop <session>` would: door, `SIGTERM`, `SIGKILL` after `--timeout` |
+
+The steps, in order:
+
+| Step | What it does |
+|---|---|
+| 1. Read the records | Every record with this `formation_id` whose process is running is a member. A record whose process is gone is removed and not listed |
+| 2. Signal the launcher | `SIGTERM` to the one launcher the members record, then `SIGKILL` to its process id alone after `--timeout` seconds |
+| 3. Stop each member started by hand | One at a time, newest first |
+| 4. Wait | Up to 25 seconds, the grace the launcher gives its own members, for every member's process to be gone. Each record is removed as its process goes |
+
+The report, on stdout:
+
+```text
+stopped:  frm_019f01a93ff27c1e9a3b5d0c4e8f2a61
+launcher: pid 48190, SIGTERM
+member:   ses_019f01a95a2c7d10b3e4f5a6b7c8d9e0  coder@0.1.0  started by hand — stopped as one session below
+member:   ses_019f01a940ce7761854e768ecbe3d399  planner@0.1.0  formation_ended
+member:   ses_019f01a93ff27c1e9a3b5d0c4e8f2a62  reviewer@0.1.0  formation_ended
+
+stopped: ses_019f01a95a2c7d10b3e4f5a6b7c8d9e0
+capsule: coder@0.1.0
+signal:  SIGTERM
+residue: nothing else was left running
+```
+
+One `member:` line per member, newest session first. Each member started by hand then gets the
+block `mur stop <session>` prints, after a blank line, or `error: <message>` when it could not be
+ended.
+
+| `launcher:` line | Means |
+|---|---|
+| `pid <pid>, SIGTERM` | The launcher exited within `--timeout` seconds of `SIGTERM` |
+| `pid <pid>, SIGKILL after <timeout>s` | The launcher was still running after `--timeout` seconds and was sent `SIGKILL` |
+| `none — pid <pid> had already exited, so every lifeline was already closed` | The recorded launcher had exited; nothing was signalled |
+| `none — no running member records one` | No running member names a launcher: every member was started by hand or delegated |
+
+A member's ending is the first row that applies:
+
+| Ending | Means |
+|---|---|
+| `started by hand — stopped as one session below` | A member started by hand; its block follows |
+| `still running` | Its process was still running when the wait ran out |
+| `formation_ended` | Its trace records `formation_ended` |
+| `spawner_ended` | Its trace records `spawner_ended` |
+| `session_end <exit_status>` | Its trace records `session_end`, with that exit status, and neither of the above |
+| `no session_end` | Its trace records no ending |
+
+`--timeout` is the grace between `SIGTERM` and `SIGKILL` for each process `mur stop` signals
+itself: the launcher, and each member started by hand. It never applies to a member holding a
+lifeline. `--timeout 0` sends the launcher `SIGKILL` at once; the kernel then closes every lifeline
+it held, and every member still records `formation_ended`.
+
+Exit codes:
+
+- `0` — every member's process is gone
+- `1` — one of these:
+
+| Code | Message | Signalled |
+|---|---|---|
+| [`E-RUN-022`](diagnostics.md#e-run-022) | `'<arg>' is not a formation id: …` | Nothing |
+| `E-RUN-022` | `no member of formation <id> is running on this machine`, or `formation <id> is not running: <n> member record(s) named processes that are gone, and were removed` | Nothing |
+| [`E-RUN-024`](diagnostics.md#e-run-024) | `formation <id> could not be ended: its members record <n> different launchers (pid <a>, pid <b>)` | Nothing |
+| `E-RUN-024` | `formation <id> could not be ended: SIGTERM to its launcher, pid <pid>, was refused: …` | Nothing |
+| `E-RUN-024` | `formation <id> could not be ended: its launcher, pid <pid>, was still running 5 seconds after SIGKILL`, or `… SIGKILL to its launcher, pid <pid>, was refused: …` | The launcher |
+| `E-RUN-024` | `formation <id> could not be ended: <n> of its members were still running 25 seconds later: <session>, …` | The launcher and each member started by hand; the records of the members still running are kept |
+| [`E-RUN-028`](diagnostics.md#e-run-028) | The running-capsule records could not be read | Nothing |
+
+An error that follows the launcher's signal is printed after the report.
+
+A formation id is matched in full; a part of one names nothing.
 
 ---
 
