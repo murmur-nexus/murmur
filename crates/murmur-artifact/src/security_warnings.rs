@@ -316,12 +316,9 @@ pub const W_SEC_031: &str = "W-SEC-031";
 /// `mur doctor --bind`, and from `mur deploy`.
 pub const W_SEC_032: &str = "W-SEC-032";
 
-const DIAGNOSTICS_DOC_URL: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
-
 /// Builds the doc link for a `W-SEC-*` code, e.g. `.../diagnostics/#w-sec-001`.
 pub fn security_warning_link(code: &str) -> String {
-    format!("{DIAGNOSTICS_DOC_URL}#{}", code.to_lowercase())
+    crate::diagnostic_link(code)
 }
 
 #[cfg(test)]
@@ -352,7 +349,7 @@ mod tests {
     fn link_lowercases_the_code_into_the_anchor() {
         assert_eq!(
             security_warning_link(W_SEC_001),
-            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-001"
+            "https://docs.murmur.nexus/reference/diagnostics/#w-sec-001"
         );
     }
 }

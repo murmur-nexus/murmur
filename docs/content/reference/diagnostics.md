@@ -922,7 +922,7 @@ stopped, the entry member is never started, and no formation line is printed:
 ```text
 error[E-RUN-045]: the formation could not be launched
   'broken' (broken@0.1.0): its process exited with status 1 before reporting; its last stderr lines were:
-      [capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key is written literally in murmur.yaml, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.<NAME> <key>` to have it re-read (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027)
+      [capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key is written literally in murmur.yaml, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.<NAME> <key>` to have it re-read (https://docs.murmur.nexus/reference/diagnostics/#w-sec-027)
       error[E-RUN-008]: missing artifacts: murmur-driver-anthropic@9.9.9
         hint: run `mur install` to install all manifest dependencies
   stopped: coder (pid 529088), reviewer (pid 529091)
@@ -1672,7 +1672,7 @@ the exit code of `mur doctor`.
 ```text
 warning[W-REG-001]: murmur-tool-git@0.4.2 is a native artifact with no recorded platform — it resolved from the generic store path, where every host resolves the same payload
   Fix: mur install murmur-tool-git@0.4.2
-  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-001)
+  (https://docs.murmur.nexus/reference/diagnostics/#w-reg-001)
 ```
 
 A native tool is a different binary per platform, so the store files it at
@@ -1697,7 +1697,7 @@ pre-flight check.
 ```text
 warning[W-REG-002]: 1 capsule in the spawn closure could not be inspected, so what it declares is absent from the report above: ghost-worker
   The walk not being able to read a capsule is not evidence that a run fails, so this does not change the exit code.
-  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-002)
+  (https://docs.murmur.nexus/reference/diagnostics/#w-reg-002)
 ```
 
 [`mur doctor`](cli.md#mur-doctor) walks a capsule's `capabilities.spawn.allow` closure to report
@@ -1726,7 +1726,7 @@ into the report.
 ```text
 Interface versions
   ⚠  stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
-  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-003)
+  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 ```
 
 An artifact is built against one version of each Murmur interface it uses, and this `mur` serves
@@ -1845,7 +1845,7 @@ which is over by the time a turn happens.
 
 ```text
 [capsule-runtime] warning[W-RUN-001]: this turn stopped at the inference.max_tokens output cap of 256 tokens, so out/result.txt holds a fragment rather than a finished answer
-  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-001)
+  (https://docs.murmur.nexus/reference/diagnostics/#w-run-001)
 ```
 
 The provider reported `stop_reason: "max_tokens"`: it generated the whole budget
@@ -1869,7 +1869,7 @@ finish; a task whose answer is genuinely long is better split across turns the a
 
 ```text
 [capsule-runtime] warning[W-RUN-002]: the harness reports version 'my-cli 0.9.0', which this process driver was not tested against (tested against 1.0.0)
-  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-002)
+  (https://docs.murmur.nexus/reference/diagnostics/#w-run-002)
 ```
 
 Before each run, `mur run` runs the harness binary with the version arguments the
@@ -1893,7 +1893,7 @@ Nothing is refused: the run proceeds on the driver as written. The trace carries
 
 ```text
 [capsule-runtime] warning[W-RUN-003]: driver choice 'gpt' (driver murmur-driver-openai, model gpt-5) is unavailable: its credential OPENAI_API_KEY was found in neither the global config's credentials: nor the environment, so a switch to it will be refused; the session runs on the primary
-  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-003)
+  (https://docs.murmur.nexus/reference/diagnostics/#w-run-003)
 ```
 
 The gateway of an [`inference.alternates`](manifest.md#inference-alternates) driver is keyed by a
@@ -1912,7 +1912,7 @@ run time goes in [`control.secrets`](manifest.md#field-control) instead of the e
 ### W-RUN-004 — a malformed `input_schema` { #w-run-004 }
 
 ```text
-[capsule-runtime] warning[W-RUN-004]: the tool 'my-tool' declares an input_schema whose `required` is not an array of strings, so its calls are dispatched without the required-field check (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-004)
+[capsule-runtime] warning[W-RUN-004]: the tool 'my-tool' declares an input_schema whose `required` is not an array of strings, so its calls are dispatched without the required-field check (https://docs.murmur.nexus/reference/diagnostics/#w-run-004)
 ```
 
 A tool's [`input_schema`](manifest.md#input-schema) cannot be read where the runtime checks a
@@ -1931,7 +1931,7 @@ is missing.
 ### W-RUN-007 — a formation member with no lifeline { #w-run-007 }
 
 ```text
-warning[W-RUN-007]: this session is a member of formation frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b but was handed no lifeline, so it will not wind down when that formation ends; end it with `mur stop` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-007)
+warning[W-RUN-007]: this session is a member of formation frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b but was handed no lifeline, so it will not wind down when that formation ends; end it with `mur stop` (https://docs.murmur.nexus/reference/diagnostics/#w-run-007)
 ```
 
 A `mur run` launched with `MURMUR_FORMATION_ID` set and no `MURMUR_FORMATION_LIFELINE`, other than
@@ -1943,7 +1943,7 @@ Nothing is refused. See [How a formation ends](roster.md#launch-stop).
 ### W-RUN-008 — a caller that cannot reach a member's door { #w-run-008 }
 
 ```text
-[capsule-runtime] warning[W-RUN-008]: roster.yaml lets 'lead' call 'worker', but its capabilities.network.allow reaches no loopback http door at an unpinned port, so every call-member call will be refused; declare "localhost" (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-008)
+[capsule-runtime] warning[W-RUN-008]: roster.yaml lets 'lead' call 'worker', but its capabilities.network.allow reaches no loopback http door at an unpinned port, so every call-member call will be refused; declare "localhost" (https://docs.murmur.nexus/reference/diagnostics/#w-run-008)
 ```
 
 A member that `roster.yaml` lets call another has the
@@ -1977,7 +1977,7 @@ this page:
 [capsule-runtime] warning[W-SEC-001]: capabilities.shell.allow is non-empty but this platform
 has no kernel-level subprocess sandbox (Landlock/seccomp are Linux-only) — enforcement is
 environment-only (synthetic HOME + credential env-stripping). This is permanent on this
-platform. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-001)
+platform. (https://docs.murmur.nexus/reference/diagnostics/#w-sec-001)
 ```
 
 Where a warning is written depends on whether a session workdir exists yet:
@@ -2453,7 +2453,7 @@ nothing: no directory is created and no `state` path exists for anybody. Without
 only signal is a store that never appears.
 
 ```text
-[capsule-runtime] warning[W-SEC-014]: capsule-wide capabilities.state is declared, but a durable state store is granted per artifact — nothing reads a top-level declaration, so no store was created and no 'state' preopen exists. Move the block onto the tool, driver or hook entry that needs it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-014)
+[capsule-runtime] warning[W-SEC-014]: capsule-wide capabilities.state is declared, but a durable state store is granted per artifact — nothing reads a top-level declaration, so no store was created and no 'state' preopen exists. Move the block onto the tool, driver or hook entry that needs it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-014)
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The block is
@@ -2489,7 +2489,7 @@ rather than per-artifact, so no `MURMUR_ARTIFACT_CONFIG` is delivered anywhere. 
 warning the only signal is a tool that behaves as though it were never configured.
 
 ```text
-[capsule-runtime] warning[W-SEC-015]: artifact 'murmur-tool-fixture' declares 'config:' but ships a native implementation — a native tool runs as a host subprocess and reads no per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-015)
+[capsule-runtime] warning[W-SEC-015]: artifact 'murmur-tool-fixture' declares 'config:' but ships a native implementation — a native tool runs as a host subprocess and reads no per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered (https://docs.murmur.nexus/reference/diagnostics/#w-sec-015)
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes, exactly as for a
@@ -2514,7 +2514,7 @@ artifact grant and compiles against a world with no such import, so a top-level 
 nothing and no artifact can read the [conversation record](workdir.md#the-conversation-record).
 
 ```text
-[capsule-runtime] warning[W-SEC-016]: capsule-wide capabilities.conversation is declared, but the murmur:conversation/read grant is per artifact — nothing reads a top-level declaration, so no artifact can read the conversation record. Move the block onto the hook entry that needs it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-016)
+[capsule-runtime] warning[W-SEC-016]: capsule-wide capabilities.conversation is declared, but the murmur:conversation/read grant is per artifact — nothing reads a top-level declaration, so no artifact can read the conversation record. Move the block onto the hook entry that needs it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-016)
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes, on the same terms
@@ -2549,7 +2549,7 @@ recognized verb. The interpreter can construct a write into a declared read-only
 will not be refused.
 
 ```text
-[capsule-runtime] warning[W-SEC-017]: capabilities.filesystem.read_only is declared and capabilities.shell.allow includes 'python3', an interpreter that can construct a write the dispatch check cannot read — the declaration is advisory for that binary. It still holds for every tool call and for every shell command whose write the dispatch check can identify (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-017)
+[capsule-runtime] warning[W-SEC-017]: capabilities.filesystem.read_only is declared and capabilities.shell.allow includes 'python3', an interpreter that can construct a write the dispatch check cannot read — the declaration is advisory for that binary. It still holds for every tool call and for every shell command whose write the dispatch check can identify (https://docs.murmur.nexus/reference/diagnostics/#w-sec-017)
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The declaration
@@ -2588,7 +2588,7 @@ note the tool merely stores, carrying a `{file, text}` pair, is refused as a wri
 destination under a name no table carries is never checked.
 
 ```text
-[capsule-runtime] warning[W-SEC-018]: capabilities.filesystem.read_only is declared and the tool 'guessed-tool' declares the property 'file_path' with no murmur annotation in effect — calls naming it are judged by key name. Annotate a destination property with "format": "murmur-destination", any object the tool only stores with "format": "murmur-opaque", and a destination derived from another property — or the absence of any — with the schema-root "murmur-destinations" list (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-018)
+[capsule-runtime] warning[W-SEC-018]: capabilities.filesystem.read_only is declared and the tool 'guessed-tool' declares the property 'file_path' with no murmur annotation in effect — calls naming it are judged by key name. Annotate a destination property with "format": "murmur-destination", any object the tool only stores with "format": "murmur-opaque", and a destination derived from another property — or the absence of any — with the schema-root "murmur-destinations" list (https://docs.murmur.nexus/reference/diagnostics/#w-sec-018)
 ```
 
 With more than one such property the line names them all: `declares the properties 'file', 'path'
@@ -2632,20 +2632,20 @@ The wording distinguishes the two causes. A key within edit distance of one the 
 recognize is a spelling problem:
 
 ```text
-[murmur-artifact] warning[W-SEC-019]: unrecognized key 'read-only' in capabilities.filesystem — did you mean 'read_only'? The manifest has a spelling problem here: the key was parsed and ignored, so whatever it declared is not in effect. Correct it in murmur.yaml (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-019)
+[murmur-artifact] warning[W-SEC-019]: unrecognized key 'read-only' in capabilities.filesystem — did you mean 'read_only'? The manifest has a spelling problem here: the key was parsed and ignored, so whatever it declared is not in effect. Correct it in murmur.yaml (https://docs.murmur.nexus/reference/diagnostics/#w-sec-019)
 ```
 
 A key with no near neighbour is one this build does not know, which a newer `mur` may:
 
 ```text
-[murmur-artifact] warning[W-SEC-019]: unrecognized key 'quantum_teleport' at the top level — this build of mur does not recognize it and no key it does recognize there is close to it, so the key may come from a newer mur. It was parsed and ignored; nothing here says the manifest is misspelled (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-019)
+[murmur-artifact] warning[W-SEC-019]: unrecognized key 'quantum_teleport' at the top level — this build of mur does not recognize it and no key it does recognize there is close to it, so the key may come from a newer mur. It was parsed and ignored; nothing here says the manifest is misspelled (https://docs.murmur.nexus/reference/diagnostics/#w-sec-019)
 ```
 
 A higher `mur_version` pin names the cause directly rather than leaving it to be inferred from
 unfamiliar key names:
 
 ```text
-[murmur-artifact] warning[W-SEC-019]: this manifest pins mur 99.0.0, you are running 0.2.0; 2 keys in it are not recognized by this build (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-019)
+[murmur-artifact] warning[W-SEC-019]: this manifest pins mur 99.0.0, you are running 0.2.0; 2 keys in it are not recognized by this build (https://docs.murmur.nexus/reference/diagnostics/#w-sec-019)
 ```
 
 | Part of the line | What it names |
@@ -2680,7 +2680,7 @@ see [How the outcome arrives](roost-api.md#how-the-outcome-arrives).
 scope did not succeed. Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max and cpu.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-021)
+[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max and cpu.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/reference/diagnostics/#w-sec-021)
 ```
 
 **Why it matters:** `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block
@@ -2706,7 +2706,7 @@ or [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) is anyth
 Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-022]: this capsule declares capabilities.shell.allow, but its lifecycle block cannot receive a background command's completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, and its exit code and output path arrive afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every command this capsule demotes will be discarded at session end and reported to the operator instead of to the agent. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-022)
+[capsule-runtime] warning[W-SEC-022]: this capsule declares capabilities.shell.allow, but its lifecycle block cannot receive a background command's completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, and its exit code and output path arrive afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every command this capsule demotes will be discarded at session end and reported to the operator instead of to the agent. (https://docs.murmur.nexus/reference/diagnostics/#w-sec-022)
 ```
 
 **Why it matters:** every shell command starts in the foreground, and one that outruns
@@ -2744,7 +2744,7 @@ declaring `capabilities.shell.allow` on a capsule that runs no commands.
 stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL it announces: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-023)
+[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL it announces: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/reference/diagnostics/#w-sec-023)
 ```
 
 **Why it matters:** the record is what lets [`mur watch`](cli.md#mur-watch) and
@@ -2789,7 +2789,7 @@ as `DATABASE_URL` yourself.
 A credential-shaped name:
 
 ```text
-[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it: for as long as the capsule runs, the capsule holds it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
+[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it: for as long as the capsule runs, the capsule holds it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-024)
 ```
 
 A credential-shaped name on a capsule whose resolved [`lifecycle.after_task`](manifest.md#lifecycle-after-task)
@@ -2797,7 +2797,7 @@ is `sleep` gets one further sentence, because the capsule holds the value after 
 launched it is gone:
 
 ```text
-[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: sleep keeps this capsule alive past the task that launched it, so it holds that value with nothing left waiting on it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
+[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: sleep keeps this capsule alive past the task that launched it, so it holds that value with nothing left waiting on it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-024)
 ```
 
 **Why it matters:** `capabilities.env.allow` is the one grant whose value murmur never issues, sees
@@ -2828,7 +2828,7 @@ naming the entry and the artifact, on stderr, from `mur run` (including `mur run
 and from `mur doctor`.
 
 ```text
-[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the gateway.endpoint host of artifact 'murmur-driver-anthropic'; the gateway does not use it — the runtime reaches that upstream itself — so the entry only grants tools, subprocesses and artifacts direct reach to that host without the key (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025)
+[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the gateway.endpoint host of artifact 'murmur-driver-anthropic'; the gateway does not use it — the runtime reaches that upstream itself — so the entry only grants tools, subprocesses and artifacts direct reach to that host without the key (https://docs.murmur.nexus/reference/diagnostics/#w-sec-025)
 ```
 
 For an entry on an artifact's own `capabilities:`, the warning begins
@@ -2858,7 +2858,7 @@ supplies. It fires once per such key, naming the artifact, on stderr, from `mur 
 `mur run --explain-scope`) and from `mur doctor`.
 
 ```text
-[capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027)
+[capsule-runtime] warning[W-SEC-027]: artifact 'murmur-driver-anthropic' gateway.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/reference/diagnostics/#w-sec-027)
 ```
 
 For a literal, the warning names `artifact '<name>' gateway.api_key is written literally in
@@ -2885,11 +2885,11 @@ that. It fires from two places, on stderr:
 | `mur doctor` | Every owner-only entry in [the `~/.murmur` modes table](config.md#murmur-home-permissions) wider than its mode, and every directory wider than `0700` or file wider than `0600` beneath one — under `formations/`, down to each member's directory only | Once per path |
 
 ```text
-[capsule-runtime] warning[W-SEC-028]: the credential credentials.ANTHROPIC_API_KEY is read from /home/alice/.murmur/config.yaml, which is mode 0644 and readable by other accounts on this host; run `chmod 600 /home/alice/.murmur/config.yaml` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
+[capsule-runtime] warning[W-SEC-028]: the credential credentials.ANTHROPIC_API_KEY is read from /home/alice/.murmur/config.yaml, which is mode 0644 and readable by other accounts on this host; run `chmod 600 /home/alice/.murmur/config.yaml` (https://docs.murmur.nexus/reference/diagnostics/#w-sec-028)
 ```
 
 ```text
-[capsule-runtime] warning[W-SEC-028]: /home/alice/.murmur/deploy_keys/dep_x/id_ed25519 holds SSH private keys and is mode 0644, which other accounts on this host can read; run `chmod 600 /home/alice/.murmur/deploy_keys/dep_x/id_ed25519` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
+[capsule-runtime] warning[W-SEC-028]: /home/alice/.murmur/deploy_keys/dep_x/id_ed25519 holds SSH private keys and is mode 0644, which other accounts on this host can read; run `chmod 600 /home/alice/.murmur/deploy_keys/dep_x/id_ed25519` (https://docs.murmur.nexus/reference/diagnostics/#w-sec-028)
 ```
 
 **Why it matters:** any account on the host can read the provider key, deploy key or record the
@@ -2916,7 +2916,7 @@ before the driver answers. It fires once per `shell.allow` entry, on stderr, at 
 | The driver was killed by a signal before it answered | `terminated by signal N` |
 
 ```text
-[capsule-runtime] warning[W-SEC-029]: capabilities.shell.allow grants the compiler driver 'cc', but running /home/alice/bin/cc -print-prog-name=<helper> failed (Permission denied (os error 13)), so W-SEC-012 was not evaluated for its helpers [cc1, cc1plus, as, ld, collect2] and they may have no Execute grant under the 'sealed' composed root; check that /home/alice/bin/cc can be executed by this user and re-run `mur doctor` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-029)
+[capsule-runtime] warning[W-SEC-029]: capabilities.shell.allow grants the compiler driver 'cc', but running /home/alice/bin/cc -print-prog-name=<helper> failed (Permission denied (os error 13)), so W-SEC-012 was not evaluated for its helpers [cc1, cc1plus, as, ld, collect2] and they may have no Execute grant under the 'sealed' composed root; check that /home/alice/bin/cc can be executed by this user and re-run `mur doctor` (https://docs.murmur.nexus/reference/diagnostics/#w-sec-029)
 ```
 
 The bracketed list names the helpers that were not checked. Helpers checked before the failure
@@ -2939,7 +2939,7 @@ the next `mur doctor`.
 driver.
 
 ```text
-[capsule-runtime] warning[W-SEC-030]: artifact 'murmur-tool-web-search' reaches api.tavily.com through the credential gateway, unmetered — murmur neither counts nor limits what its calls spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not cover it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-030)
+[capsule-runtime] warning[W-SEC-030]: artifact 'murmur-tool-web-search' reaches api.tavily.com through the credential gateway, unmetered — murmur neither counts nor limits what its calls spend, and inference.max_session_tokens and spend.machine_tokens_per_day do not cover it (https://docs.murmur.nexus/reference/diagnostics/#w-sec-030)
 ```
 
 **Why it matters:** only the configured driver's calls count toward the spend ceilings. This
@@ -2955,7 +2955,7 @@ own quota.
 ### W-SEC-031 — a harness that is not on a subscription { #w-sec-031 }
 
 ```text
-[capsule-runtime] warning[W-SEC-031]: the harness session reports auth 'api-key', not 'subscription' — this run's spend may be billed to an API key rather than to the subscription this transport exists for (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-031)
+[capsule-runtime] warning[W-SEC-031]: the harness session reports auth 'api-key', not 'subscription' — this run's spend may be billed to an API key rather than to the subscription this transport exists for (https://docs.murmur.nexus/reference/diagnostics/#w-sec-031)
 ```
 
 **Why it matters:** a [`transport: process`](manifest.md#transport-process) capsule runs on a
@@ -2988,7 +2988,7 @@ address or hostname are off it. A capsule with no `inference:` block serves no d
 warns. `mur run` and `mur doctor` print the same bytes for the same manifest and address.
 
 ```text
-warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call message/send, message/stream, stream/watch, tasks/get, tasks/cancel, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-032)
+warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call message/send, message/stream, stream/watch, tasks/get, tasks/cancel, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
 ```
 
 **Why it matters:** a public door answers every caller that reaches the port. Anyone on the network
