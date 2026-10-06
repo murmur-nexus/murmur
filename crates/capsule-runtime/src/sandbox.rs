@@ -1851,18 +1851,15 @@ pub(crate) struct ShellEnforcement {
     /// so macOS gets the per-process bounds even though it can never get the aggregate (cgroup)
     /// half. See [`crate::resources`].
     pub(crate) resource_limits: crate::resources::HostResourceLimits,
-    /// The runtime's own uid task count, measured once here in the parent by
-    /// `crate::resources::uid_task_count`, in whichever unit this platform's `RLIMIT_NPROC` is
-    /// enforced against. `RLIMIT_NPROC` is a per-uid limit, so `resource_limits.max_processes` is
-    /// applied as headroom above this rather than as an absolute ceiling — see
-    /// `crate::resources::apply_hard_rlimits`. `0` when the host cannot be asked, which makes the
-    /// declared value apply literally (the tighter reading).
-    pub(crate) nproc_baseline: u64,
     /// The session's cgroup v2 scope, when the host could delegate one (Linux only, and only
     /// for capsules that can actually spawn a native subprocess). `None` on macOS always, and on
     /// Linux only for capsules with no subprocess capability at all — a Linux capsule that *can*
     /// spawn one and could not be given a scope never reaches here, because the launch is
     /// refused first with `RuntimeError::CgroupDelegationUnavailable`.
+    ///
+    /// Its presence decides each spawn's `RLIMIT_NPROC` ([`Self::nproc_bound`]): a spawn that
+    /// joins it is bounded by `pids.max` alone. A native tool can still be dispatched on a
+    /// session whose policy required no scope, so a spawn path never assumes one is here.
     pub(crate) cgroup_scope: Option<Arc<crate::cgroup::CgroupScope>>,
     /// The session's periodic workdir-size check. Consulted before every subprocess spawn, so a
     /// disk filler stops writing at the first spawn after the ceiling is crossed rather than
@@ -1931,7 +1928,6 @@ impl ShellEnforcement {
             sealed_bind_dirs,
             staged_runtime_dirs,
             resource_limits: policy.resources,
-            nproc_baseline: crate::resources::uid_task_count().unwrap_or(0),
             cgroup_scope: None,
             workdir_guard: None,
         })
@@ -1953,6 +1949,28 @@ impl ShellEnforcement {
         self.cgroup_scope = cgroup_scope;
         self.workdir_guard = workdir_guard;
         self
+    }
+
+    /// The `RLIMIT_NPROC` decision for one spawn, made in the parent before its `pre_exec`
+    /// closure is installed.
+    ///
+    /// [`crate::resources::NprocBound::CgroupPidsMax`] when the spawn will join a scope that
+    /// places it, because both closures that receive this run the join fatally before `execve`.
+    /// Otherwise [`crate::resources::NprocBound::Headroom`], with a baseline measured by
+    /// `crate::resources::uid_task_count` on this call — a `/proc` walk on Linux — so call it
+    /// once per spawn and never from inside `pre_exec`.
+    pub(crate) fn nproc_bound(&self) -> crate::resources::NprocBound {
+        if self
+            .cgroup_scope
+            .as_ref()
+            .is_some_and(|scope| scope.places_subprocesses())
+        {
+            crate::resources::NprocBound::CgroupPidsMax
+        } else {
+            crate::resources::NprocBound::Headroom {
+                baseline: crate::resources::uid_task_count().unwrap_or(0),
+            }
+        }
     }
 
     /// The latched workdir-size breach, if the guard has seen one.
@@ -1996,7 +2014,6 @@ impl ShellEnforcement {
             // Defaults, not "no limits": the rlimit ceilings apply unchanged on this tier, so
             // zeroing them out here would misrepresent what a real macOS host does.
             resource_limits: crate::resources::HostResourceLimits::default(),
-            nproc_baseline: crate::resources::uid_task_count().unwrap_or(0),
             cgroup_scope: None,
             workdir_guard: None,
         }
@@ -2338,7 +2355,7 @@ pub(crate) fn attach_process_limits(
     use std::os::unix::process::CommandExt;
 
     let limits = enforcement.resource_limits;
-    let nproc_baseline = enforcement.nproc_baseline;
+    let nproc = enforcement.nproc_bound();
     let cgroup_scope = enforcement.cgroup_scope.clone();
 
     // SAFETY: the closure runs in the forked child before `execve`, where only async-signal-safe
@@ -2348,7 +2365,7 @@ pub(crate) fn attach_process_limits(
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
-            crate::resources::apply_hard_rlimits(&limits, nproc_baseline)?;
+            crate::resources::apply_hard_rlimits(&limits, nproc)?;
             if let Some(scope) = cgroup_scope.as_ref() {
                 scope.join_current_process()?;
             }
@@ -2571,11 +2588,12 @@ pub(crate) fn prepare_enforcement(
     // socketpair above is created in the *parent*, before fork, so the child's own `sendmsg` over
     // it is unaffected by a filter that denies `socket(AF_UNIX, ...)`.
     let unix_sockets_allowed = enforcement.unix_sockets_allowed;
-    // Same clone-before-move shape. `HostResourceLimits` is `Copy`; the cgroup scope is an `Arc`
-    // whose `cgroup.procs` descriptor was opened in the parent at scope-creation time, so the
-    // child performs no path lookup to join it.
+    // Same clone-before-move shape. `HostResourceLimits` and `NprocBound` are `Copy`, and the
+    // `RLIMIT_NPROC` decision is made here because its baseline is a `/proc` walk; the cgroup scope
+    // is an `Arc` whose `cgroup.procs` descriptor was opened in the parent at scope-creation time,
+    // so the child performs no path lookup to join it.
     let resource_limits = enforcement.resource_limits;
-    let nproc_baseline = enforcement.nproc_baseline;
+    let nproc = enforcement.nproc_bound();
     let cgroup_scope = enforcement.cgroup_scope.clone();
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
@@ -2596,9 +2614,7 @@ pub(crate) fn prepare_enforcement(
             // Ordered first, before any seccomp filter is installed: these are the bounds that
             // must hold even if a later step in this closure fails, and `prlimit64`/`setrlimit`
             // plus `write` are all already in `SECCOMP_SYSCALL_ALLOWLIST` either way.
-            if let Err(error) =
-                crate::resources::apply_hard_rlimits(&resource_limits, nproc_baseline)
-            {
+            if let Err(error) = crate::resources::apply_hard_rlimits(&resource_limits, nproc) {
                 linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
                 return Err(error);
             }
@@ -5356,6 +5372,230 @@ mod tests {
         assert!(enforcement.network_allow_ips.is_empty());
     }
 
+    /// With no scope a spawn's `RLIMIT_NPROC` is headroom over a real count. A `0` baseline
+    /// would turn `max_processes` into an absolute per-uid ceiling that an interactive account
+    /// is already past, failing the subprocess's first `fork()`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn nproc_bound_without_a_scope_is_headroom_over_a_live_count() {
+        match ShellEnforcement::environment_only().nproc_bound() {
+            crate::resources::NprocBound::Headroom { baseline } => assert!(
+                baseline > 0,
+                "the test process is owned by this uid, so the count cannot be zero"
+            ),
+            other => panic!("no scope must give headroom, got {other:?}"),
+        }
+    }
+
+    /// The baseline is taken on each call, not when the enforcement was built: threads the host
+    /// starts in between are counted by the next spawn.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nproc_bound_without_a_scope_is_measured_on_each_call() {
+        let _lock = crate::resources::test_support::host_threads_lock();
+        let enforcement = ShellEnforcement::environment_only();
+        let baseline = |bound| match bound {
+            crate::resources::NprocBound::Headroom { baseline } => baseline,
+            other => panic!("no scope must give headroom, got {other:?}"),
+        };
+
+        let first = baseline(enforcement.nproc_bound());
+        let holders = crate::resources::test_support::HeldThreads::start(200);
+        let second = baseline(enforcement.nproc_bound());
+        drop(holders);
+
+        assert!(
+            second > first,
+            "200 threads started between the calls must raise the baseline: {first} then {second}"
+        );
+    }
+
+    /// A spawn that will join a live scope leaves `RLIMIT_NPROC` to `pids.max`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nproc_bound_with_a_scope_leaves_rlimit_nproc_to_pids_max() {
+        if !crate::cgroup::cgroup_delegation_available() {
+            crate::runtime_err!(
+                "[SKIP-HOST] nproc_bound_with_a_scope_leaves_rlimit_nproc_to_pids_max: this host \
+                 cannot delegate a cgroup v2 scope"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let limits = crate::resources::HostResourceLimits::default();
+        let scope = crate::cgroup::prepare_scope(true, &limits, "ses_nproc_bound", temp.path())
+            .expect("this host delegates a cgroup scope")
+            .scope;
+        let enforcement = ShellEnforcement::environment_only().with_host_bounding(scope, None);
+
+        assert_eq!(
+            enforcement.nproc_bound(),
+            crate::resources::NprocBound::CgroupPidsMax
+        );
+    }
+
+    /// A Linux capsule with a cgroup scope gets no `RLIMIT_NPROC` from the runtime, so threads the
+    /// rest of the host starts after the enforcement was resolved cannot spend its fork headroom.
+    /// The 400 holders put the uid well past any `RLIMIT_NPROC` derived from a count taken before
+    /// they started, which fails the first `fork()` in the subprocess with `EAGAIN`. The 40
+    /// concurrent `sleep`s and the concurrent `node` children each need headroom well past the
+    /// declared `max_processes` of 32.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scoped_capsule_keeps_spawning_after_the_host_adds_threads() {
+        const TEST: &str = "a_scoped_capsule_keeps_spawning_after_the_host_adds_threads";
+        if !crate::cgroup::cgroup_delegation_available() {
+            crate::runtime_err!("[SKIP-HOST] {TEST}: this host cannot delegate a cgroup v2 scope");
+            return;
+        }
+        let _lock = crate::resources::test_support::host_threads_lock();
+
+        let temp = tempfile::tempdir().unwrap();
+        let limits = crate::resources::HostResourceLimits {
+            max_processes: 32,
+            max_open_files: 256,
+            ..crate::resources::HostResourceLimits::default()
+        };
+        let scope = crate::cgroup::prepare_scope(true, &limits, "ses_nproc_race", temp.path())
+            .expect("this host delegates a cgroup scope")
+            .scope;
+        assert!(
+            scope.is_some(),
+            "a required scope on Linux is always created"
+        );
+        let node_available = crate::sandbox::resolve_invoked_binary_path("node") != "node";
+        let mut shell_allow = vec!["bash".to_string()];
+        if node_available {
+            shell_allow.push("node".to_string());
+        }
+        let policy = CapabilityPolicy {
+            shell_allow,
+            resources: limits,
+            ..CapabilityPolicy::default()
+        };
+        let mut enforcement = ShellEnforcement::environment_only();
+        enforcement.resource_limits = limits;
+        let enforcement = enforcement.with_host_bounding(scope, None);
+
+        let holders = crate::resources::test_support::HeldThreads::start(400);
+
+        let result = crate::shell::execute_shell(
+            "bash",
+            &[
+                "-c",
+                "for i in $(seq 1 40); do sleep 0.2 & done; wait; ulimit -Hu; ulimit -Hn",
+            ],
+            &[],
+            temp.path(),
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("bash must run");
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        assert_eq!(result.resource_limit_hit, None);
+        let (_, own_hard) = crate::resources::test_support::own_rlimit_nproc();
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                crate::resources::test_support::rendered_rlimit(own_hard).as_str(),
+                "256"
+            ],
+            "RLIMIT_NPROC is inherited unchanged and RLIMIT_NOFILE is the declared ceiling",
+        );
+
+        if node_available {
+            let script = "const { spawn } = require('child_process');\n\
+                const runs = Array.from({ length: 8 }, () => new Promise((resolve) => {\n\
+                  const child = spawn(process.execPath, ['-e', 'process.exit(0)']);\n\
+                  child.once('error', (error) => resolve(error.message));\n\
+                  child.once('exit', (code) => resolve(code === 0 ? null : `exit ${code}`));\n\
+                }));\n\
+                Promise.all(runs).then((outcomes) => {\n\
+                  const failures = outcomes.filter((outcome) => outcome !== null);\n\
+                  if (failures.length > 0) { console.error(failures.join('\\n')); process.exit(1); }\n\
+                });\n";
+            let result = crate::shell::execute_shell(
+                "node",
+                &["-e", script],
+                &[],
+                temp.path(),
+                temp.path(),
+                &policy,
+                &enforcement,
+            )
+            .expect("node must run");
+            assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        } else {
+            crate::runtime_err!("[SKIP-HOST] {TEST}: no node on PATH, skipping the node half");
+        }
+
+        drop(holders);
+    }
+
+    /// Without a scope `RLIMIT_NPROC` is the only process bound, so its baseline has to follow the
+    /// host: 300 threads started after the enforcement was resolved raise the next spawn's
+    /// ceiling, and releasing them lowers the one after.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_scope_the_nproc_baseline_is_measured_per_spawn() {
+        const TEST: &str = "without_a_scope_the_nproc_baseline_is_measured_per_spawn";
+        let _lock = crate::resources::test_support::host_threads_lock();
+
+        let temp = tempfile::tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: crate::resources::HostResourceLimits {
+                max_processes: 64,
+                ..crate::resources::HostResourceLimits::default()
+            },
+            ..CapabilityPolicy::default()
+        };
+        let mut enforcement = ShellEnforcement::environment_only();
+        enforcement.resource_limits = policy.resources;
+
+        let before = crate::resources::uid_task_count().expect("Linux can count the uid's tasks");
+        let (_, own_hard) = crate::resources::test_support::own_rlimit_nproc();
+        if own_hard != libc::RLIM_INFINITY && own_hard < before + 664 {
+            crate::runtime_err!(
+                "[SKIP-HOST] {TEST}: the inherited hard RLIMIT_NPROC is {own_hard}, too close to \
+                 the uid's {before} tasks for 300 more threads to show in a child's ceiling"
+            );
+            return;
+        }
+
+        let hard_nproc = || -> u64 {
+            let result = crate::shell::execute_shell(
+                "bash",
+                &["-c", "ulimit -Hu"],
+                &[],
+                temp.path(),
+                temp.path(),
+                &policy,
+                &enforcement,
+            )
+            .expect("bash must run");
+            assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+            result.stdout.trim().parse().expect("a finite ceiling")
+        };
+
+        let holders = crate::resources::test_support::HeldThreads::start(300);
+        let held = hard_nproc();
+        assert!(
+            held >= before + 64 + 150,
+            "the ceiling must count the holder threads started after the enforcement was \
+             resolved: {held} with {before} tasks before them"
+        );
+
+        drop(holders);
+        let released = hard_nproc();
+        assert!(
+            released < held,
+            "the ceiling must drop once the holders exit: {released} after, {held} while held"
+        );
+    }
+
     fn make_executable(path: &Path, contents: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, contents).unwrap();
@@ -6413,17 +6653,18 @@ mod linux_integration_tests {
 
     use super::*;
 
-    /// Spread-base supplying the four *host-bounding* fields (`resource_limits`,
-    /// `nproc_baseline`, `cgroup_scope`, `workdir_guard`) to the enforcement literals below,
-    /// which spell out the policy half by hand because they need to pin `tier` explicitly.
+    /// Spread-base supplying the three *host-bounding* fields (`resource_limits`,
+    /// `cgroup_scope`, `workdir_guard`) to the enforcement literals below, which spell out the
+    /// policy half by hand because they need to pin `tier` explicitly.
     ///
     /// These tests exercise seccomp, Landlock and the network allowlist — not rlimits or
     /// cgroups — so they take exactly what `ShellEnforcement::resolve` produces before
     /// `with_host_bounding` attaches a live session's handles: the real default ceilings (not
     /// "unbounded" — zeroing them would misrepresent what a real host does, and the rlimit half
-    /// of the child `pre_exec` runs on every tier), the real uid baseline, and no cgroup scope
-    /// or workdir guard. The `tier` it carries is always overridden by the literal that spreads
-    /// it; only the host-bounding tail is ever consumed from here.
+    /// of the child `pre_exec` runs on every tier), and no cgroup scope or workdir guard, so each
+    /// spawn gets `RLIMIT_NPROC` headroom over the uid's count at that spawn. The `tier` it
+    /// carries is always overridden by the literal that spreads it; only the host-bounding tail
+    /// is ever consumed from here.
     fn host_bounding_base() -> ShellEnforcement {
         ShellEnforcement::environment_only()
     }

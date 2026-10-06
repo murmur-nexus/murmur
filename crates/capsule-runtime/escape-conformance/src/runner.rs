@@ -138,13 +138,11 @@ pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, Stri
 }
 
 /// The tight `capabilities.resources` block from `resource-limits-manual-verification.md`'s test
-/// capsule, with two deliberate divergences noted inline.
+/// capsule, with the divergences noted inline. `max_processes` is left out: every case here runs
+/// in a cgroup scope, where the runtime sets no `RLIMIT_NPROC` and `cgroup_pids_max` is the only
+/// process bound.
 fn tight_resources_yaml() -> &'static str {
     "  resources:\n\
-    \x20   # 512 rather than the document's 64, so the fork-bomb case's stopping point is\n\
-    \x20   # attributable: RLIMIT_NPROC headroom well above cgroup_pids_max means a tree that\n\
-    \x20   # stops in the low tens stopped because of pids.max and nothing else.\n\
-    \x20   max_processes: 512\n\
     \x20   # 128 rather than the document's 16, and the difference is a finding rather than a\n\
     \x20   # preference. `apply_hard_rlimits` runs first in the child's pre_exec window, so every\n\
     \x20   # later step in that window lives under this ceiling — and the Landlock grant fds, the\n\
@@ -737,7 +735,7 @@ mod tests {
         // `SEALED_ETC_PATHS` grants are counted. Pinned here so the value
         // cannot drift back down without the reason being re-read.
         assert!(yaml.contains("max_open_files: 128"));
-        assert!(yaml.contains("max_processes: 512"));
+        assert!(!yaml.contains("max_processes"));
     }
 
     #[test]

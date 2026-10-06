@@ -6,8 +6,7 @@
     themselves containerised, their cgroup subtree is not delegated, and the enforcement tier they
     resolve to is not the one being verified. A green CI run says nothing about any claim on this
     page — the same gap `crates/capsule-runtime/src/sandbox.rs` already documents for its
-    Landlock/seccomp enforcement. The repository's own crate code lives on a `darwin/aarch64`
-    machine, which structurally cannot run any of this either.
+    Landlock/seccomp enforcement.
 
     **No automated test asserts that a fork bomb was contained, that `memory.max` was enforced, or
     that the host stayed responsive.** Those claims are true only when a person has run the
@@ -115,7 +114,7 @@ runtime:
    from inside its `pre_exec`, before `execve`.
 
 Wrapping `mur` itself in an outer delegated scope still works and is harmless — `mur` still asks
-for its own scope inside it — but is no longer necessary for the launch to succeed:
+for its own scope inside it — but is not required for the launch to succeed:
 
 ```bash
 systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.yaml
@@ -187,28 +186,24 @@ The host staying responsive throughout is part of every expected result, and is 
 mur run --manifest murmur-defaults.yaml --task 'run this shell command and report its exact output: ulimit -Hn; ulimit -Hu; ulimit -Ht'
 ```
 
-**Expected:** `1024` (`max_open_files`), `3600` (`cpu_seconds`), and for `ulimit -Hu` **the
-uid's current thread count plus 128** — not a bare `128`. `RLIMIT_NPROC` is per-uid, and on Linux
-the unit it counts is threads, not processes (`setrlimit(2)`: "the maximum number of processes (or,
-more precisely on Linux, threads) that can be created for the real user ID"), so `max_processes` is
-applied as headroom above the runtime's own live *thread* baseline; a literal `128` on an account
-already past that would make the subprocess's first `fork()` fail. Compare against
+**Expected:**
 
-```bash
-ps -u "$(id -un)" -L --no-headers | wc -l
-```
-
-on the same host — `-L` lists one row per LWP (thread), which is the quantity the kernel checks.
-A plain `ps -u "$(id -un)" | wc -l` counts *processes* and will read far lower than the reported
-`ulimit -Hu`; that discrepancy is expected and is not a finding. On macOS the comparator is the
-process count (`ps -u "$(id -un)" | wc -l`), because that platform's `RLIMIT_NPROC` genuinely
-counts one entry per process.
+| Line | Linux | macOS |
+|---|---|---|
+| `ulimit -Hn` | `1024` (`max_open_files`) | `1024` |
+| `ulimit -Hu` | The value `ulimit -Hu` prints in the shell that launched `mur`. A subprocess in a cgroup scope keeps the `RLIMIT_NPROC` `mur` inherited, and `cgroup_pids_max` bounds it instead | The account's process count at that spawn plus 128 (`max_processes`). Compare against `ps -u "$(id -un)" \| wc -l` run just before |
+| `ulimit -Ht` | `3600` (`cpu_seconds`) | `3600` |
 
 All three come from a manifest that declares no `resources:` block at all.
 
-**Failure to watch for:** `unlimited` on any line. That would mean the defaulting path was skipped
-and the subprocess is unbounded — the exact failure mode `capabilities.limits` already guards
-against and this block must match.
+**Failures to watch for:**
+
+- `unlimited` on the `-Hn` or `-Ht` line. That would mean the defaulting path was skipped and the
+  subprocess is unbounded — the exact failure mode `capabilities.limits` already guards against
+  and this block must match.
+- On Linux, a `-Hu` line that differs from the launching shell's value. That means `mur` set
+  `RLIMIT_NPROC` on a subprocess in a cgroup scope, where threads the rest of the host starts
+  during the session would fail its `fork()` calls.
 
 Confirm the cgroup scope exists for this run too:
 
@@ -262,9 +257,9 @@ runtime leaves it rather than guessing.
 
 ## Scenario 2 — fork bomb: stopped by the cgroup, not by `RLIMIT_NPROC` { #scenario-2 }
 
-This is the scenario that justifies cgroups existing in this slice at all. `RLIMIT_NPROC` is a
-per-**uid** ceiling; a tree of distinct, rapidly-forking, short-lived processes evades it in
-practice even when set correctly. `pids.max` is per-cgroup and does not.
+This scenario is why the cgroup scope exists. `RLIMIT_NPROC` is a per-**uid** ceiling counted over every thread the account owns on the host, so it cannot bound one
+tree. `pids.max` is per-cgroup, and on Linux it is the only process bound on a capsule's
+subprocesses.
 
 ```bash
 mur run --manifest murmur.yaml --task 'run this shell command: :(){ :|:& };:'
@@ -279,9 +274,9 @@ mur run --manifest murmur.yaml --task 'run this shell command: bomb() { bomb | b
 **Expected:**
 
 - the host stays responsive throughout — no login delay, no OOM, no need for a reset;
-- the shell reports `fork: retry: Resource temporarily unavailable` (`EAGAIN`) — note this is
-  the cgroup's `pids.max` refusing the fork, not `RLIMIT_NPROC`, which sits at the uid baseline
-  plus `max_processes` and is the looser of the two by construction;
+- the shell reports `fork: retry: Resource temporarily unavailable` (`EAGAIN`) — the cgroup's
+  `pids.max` refusing the fork. `mur` sets no `RLIMIT_NPROC` on a subprocess in a cgroup scope, so
+  the subprocess runs with the value `mur` inherited and `max_processes` plays no part;
 - `mur trace show` names the limit:
 
 ```bash
@@ -415,20 +410,14 @@ error[E-RUN-013]: session workdir grew to 57671680 bytes, past the 52428800 byte
 
 - `workdir/<session_id>/logs/bootstrap.log` carries the same wording from the watcher thread.
 
-**Scope note, stated so it is not read as a missed requirement.** This slice ships the *periodic
-check*, not a structurally-bounded (tmpfs-backed, size-mounted) workdir. The structural version
-needs a mount namespace, which the runtime could not create when this was written.
+**Scope note.** The workdir ceiling is enforced by the *periodic check*, on every containment
+class including `sealed`; the workdir is not a size-mounted tmpfs. The watcher runs in the parent
+process against host paths, before any `pivot_root`, so the
+[sealed](sealed-containment-manual-verification.md) composed root does not affect it. Expect the
+one-interval detection lag described above.
 
-That dependency has since landed — see [sealed containment](sealed-containment-manual-verification.md) —
-but the periodic check is what still enforces the ceiling, on every class including `sealed`, and it
-is unaffected by the composed root: the watcher runs in the parent process against host paths,
-before any `pivot_root`. A tmpfs-backed workdir remains available and unbuilt. The one-interval
-detection lag is the honest cost of the mechanism that *is* wired up, and it is stated rather than
-hidden.
-
-One thing the composed root does change here: a `sealed` capsule's `/tmp` is backed by
-`<workdir>/.mur-tmp`, so temporary files now count against `workdir_max_bytes` where previously they
-landed on the host's `/tmp` and counted against nothing.
+A `sealed` capsule's `/tmp` is backed by `<workdir>/.mur-tmp`, so its temporary files count against
+`workdir_max_bytes`.
 
 ---
 
@@ -477,8 +466,8 @@ Restore the delegation drop-in afterwards.
 
 ## Scenario 8 — native-implementation tool artifacts are bounded too { #scenario-8 }
 
-Before this slice, `dispatch_native_tool` spawned with no `pre_exec` hook of any kind, so a native
-artifact ran completely unbounded while `capabilities.shell.allow` subprocesses did not.
+A native-implementation tool artifact gets the same rlimits and cgroup scope as a
+`capabilities.shell.allow` subprocess.
 
 With a native tool artifact installed (e.g. `murmur-tool-git`), run any task that invokes it and,
 while it runs, confirm it is inside the scope:
@@ -487,12 +476,15 @@ while it runs, confirm it is inside the scope:
 CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
 cat "$CG"/murmur-*/cgroup.procs        # the native tool's pid must appear here
 grep -E '^Max (open files|processes)' /proc/<pid>/limits
-# expected: the configured ceilings in BOTH the soft and hard columns
 ```
 
-**Known and deliberate gap:** this path still installs no seccomp filter and no Landlock scope.
-That asymmetry is pre-existing and separately tracked; this slice closed only the rlimit/cgroup
-half of it. Do not record the missing seccomp/Landlock here as a regression.
+**Expected:** `Max open files` shows the configured `max_open_files` in both the soft and hard
+columns. `Max processes` shows the value `mur` inherited, unchanged: a subprocess in a cgroup scope
+gets no `RLIMIT_NPROC`, and `cgroup_pids_max` bounds it instead.
+
+**Known and deliberate gap:** this path installs no seccomp filter and no Landlock scope; only the
+rlimits and the cgroup scope apply. Do not record the missing seccomp/Landlock here as a
+regression.
 
 ---
 

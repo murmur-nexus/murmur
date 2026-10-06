@@ -62,19 +62,24 @@ Three mechanisms enforce the block, in descending order of portability:
 
 | Mechanism | Fields | Platforms | Notes |
 |---|---|---|---|
-| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field |
-| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `RLIMIT_NPROC` is a per-user ceiling, so a fork bomb of distinct, short-lived processes evades it; a cgroup's `pids.max` does not |
+| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field. `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
+| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host |
 | A periodic workdir-size check | `workdir_max_bytes` | Every platform | The workdir is walked every 10 seconds, and the cadence has no manifest field, so a breach is caught within one interval rather than at the moment it happens. It ends the session with `E-RUN-013` and blocks any further subprocess |
 
-### `max_processes` is headroom, not a ceiling { #max-processes-headroom }
+### `max_processes` by platform { #max-processes-headroom }
 
-`RLIMIT_NPROC` counts everything the user account already owns rather than the processes in the
-capsule's tree, and the unit it counts differs by platform: threads on Linux, processes on macOS.
-The runtime measures the account's live count in that unit once at launch and sets the limit to
-that baseline plus `max_processes`, so the field means how much a capsule's tree may add to what
-the host is already using. `cgroup_pids_max` needs no such adjustment — it counts only the tasks in
-the capsule's own scope, which is why it, and not `max_processes`, is the bound that stops a fork
-bomb.
+`RLIMIT_NPROC` counts everything the user account owns on the host rather than the processes in the
+capsule's tree, so `max_processes` is headroom above that count, and only where no cgroup scope
+bounds the tree:
+
+| Subprocess | Process bound | Effect of `max_processes` |
+|---|---|---|
+| Linux, in a cgroup scope (every capsule that can spawn a subprocess) | `cgroup_pids_max`, counted over the capsule's own tree | None. The subprocess keeps the `RLIMIT_NPROC` that `mur` inherited |
+| Linux, with no cgroup scope | `RLIMIT_NPROC` | The account's thread count at that spawn, plus `max_processes` |
+| macOS | `RLIMIT_NPROC` | The account's process count at that spawn, plus `max_processes` |
+
+The count is taken at each spawn, so threads and processes the rest of the host starts during a
+session do not use up the capsule's headroom.
 
 ### Platform behavior { #platform-behavior }
 
@@ -158,7 +163,7 @@ one limit, the `shell` event in `trace.jsonl` carries a `resource_limit` field:
 | `cgroup_pids_max` | The scope's `pids.events` `max` counter moved, and no other shell command or native tool ran in the scope while this one did |
 
 Every other case is left unnamed rather than guessed at: `memory_bytes` surfaces as an allocation
-failure inside the process, `max_processes` as a `fork()` failing with `EAGAIN`, and
-`max_open_files` as an `open()` failing with `EMFILE` — none of which kills anything the runtime can
-attribute. An absent `resource_limit` means the limit could not be identified, not that no limit
+failure inside the process, `max_processes`, where it applies, as a `fork()` failing with
+`EAGAIN`, and `max_open_files` as an `open()` failing with `EMFILE` — none of which kills anything
+the runtime can attribute. An absent `resource_limit` means the limit could not be identified, not that no limit
 was involved.
