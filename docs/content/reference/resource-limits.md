@@ -154,8 +154,8 @@ one limit, the `shell` event in `trace.jsonl` carries a `resource_limit` field:
 |---|---|
 | `cpu_seconds` | The process was killed by `SIGXCPU` |
 | `max_file_size_bytes` | The process was killed by `SIGXFSZ` |
-| `cgroup_memory_bytes` | The scope's `memory.events` `oom_kill` counter moved |
-| `cgroup_pids_max` | The scope's `pids.events` `max` counter moved |
+| `cgroup_memory_bytes` | The scope's `memory.events` `oom_kill` counter moved, and no other shell command or native tool ran in the scope while this one did |
+| `cgroup_pids_max` | The scope's `pids.events` `max` counter moved, and no other shell command or native tool ran in the scope while this one did |
 
 Every other case is left unnamed rather than guessed at: `memory_bytes` surfaces as an allocation
 failure inside the process, `max_processes` as a `fork()` failing with `EAGAIN`, and

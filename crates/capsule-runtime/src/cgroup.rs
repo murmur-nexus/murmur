@@ -57,7 +57,10 @@
 //! Nothing is hidden behind a module-level `cfg`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -102,6 +105,67 @@ pub(crate) struct CgroupScope {
     /// than opening paths inside `pre_exec`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     procs_fd: Option<std::os::fd::OwnedFd>,
+    /// Who is inside the scope right now, which decides whether a counter delta can be pinned on
+    /// one call. Behind its own `Arc` so a [`ScopeOccupancy`] can outlive the borrow it was
+    /// taken from and move to a demoted command's thread.
+    occupancy: Arc<Occupancy>,
+}
+
+/// The scope's occupancy counters.
+///
+/// The scope's kill/denial counters are shared by every process in it, so a delta read across one
+/// call's window is evidence about that call only when nothing else ran in the scope during the
+/// window. These two counters are what answer that.
+#[derive(Debug, Default)]
+struct Occupancy {
+    /// Shell commands and native tools inside the scope now.
+    occupants: AtomicU64,
+    /// Entries since the scope was created. Never decremented: a later entry is visible as a
+    /// higher number even after it has left.
+    entries: AtomicU64,
+}
+
+impl Occupancy {
+    /// Mark one spawn as inside the scope until the returned guard drops.
+    fn enter(self: &Arc<Self>) -> ScopeOccupancy {
+        // Every access is `SeqCst`, and `entries` is read on both sides of the `occupants`
+        // increment. An entry that raced in between the two increments — counted in one, not yet
+        // in the other — moves `entries` past what was read first, so neither call can think it
+        // was alone while the other was already on its way in.
+        let entries_before = self.entries.load(Ordering::SeqCst);
+        let others_inside = self.occupants.fetch_add(1, Ordering::SeqCst) > 0;
+        let sequence = self.entries.fetch_add(1, Ordering::SeqCst);
+        ScopeOccupancy {
+            occupancy: Arc::clone(self),
+            alone_at_entry: !others_inside && sequence == entries_before,
+            sequence,
+        }
+    }
+}
+
+/// One spawn's stay inside a [`CgroupScope`]. Leaves the scope on drop.
+///
+/// Held for as long as the process it was taken for runs — a demoted command carries it to its
+/// own thread — so a sibling's window overlaps it exactly when the two processes did.
+#[derive(Debug)]
+pub(crate) struct ScopeOccupancy {
+    occupancy: Arc<Occupancy>,
+    alone_at_entry: bool,
+    sequence: u64,
+}
+
+impl ScopeOccupancy {
+    /// Whether this spawn had the scope to itself from entry until now: nobody was inside when it
+    /// entered, and nobody has entered since.
+    pub(crate) fn exclusive(&self) -> bool {
+        self.alone_at_entry && self.occupancy.entries.load(Ordering::SeqCst) == self.sequence + 1
+    }
+}
+
+impl Drop for ScopeOccupancy {
+    fn drop(&mut self) {
+        self.occupancy.occupants.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Snapshot of the kernel-maintained kill/denial counters on a scope.
@@ -123,6 +187,11 @@ impl CgroupEventCounters {
     /// name, so a nonzero delta is evidence rather than inference — the property that makes
     /// these two safe to report where a bare `SIGKILL` is not (see
     /// [`crate::resources::limit_from_signal`]).
+    ///
+    /// The evidence is about the scope, not about any one process in it. A delta read across one
+    /// call's window is about that call only when the call was alone in the scope for the whole
+    /// window ([`ScopeOccupancy::exclusive`]); `shell::attribute_resource_limit` is where that
+    /// rule is applied.
     pub(crate) fn attribution_since(&self, before: Self) -> Option<&'static str> {
         if self.oom_kill > before.oom_kill {
             return Some("cgroup_memory_bytes");
@@ -440,6 +509,12 @@ impl CgroupScope {
         Ok(())
     }
 
+    /// Mark one spawn as inside this scope until the returned guard drops. Taken before the
+    /// counter snapshot a call's attribution is read against.
+    pub(crate) fn enter(&self) -> ScopeOccupancy {
+        self.occupancy.enter()
+    }
+
     /// Current `memory.events`/`pids.events` counters.
     ///
     /// Must be read while the scope directory still exists — the files vanish with it, which is
@@ -648,6 +723,7 @@ impl CgroupScope {
         let scope = Self {
             path,
             procs_fd: None,
+            occupancy: Arc::default(),
         };
 
         scope.write_limit("memory.max", &limits.cgroup_memory_bytes.to_string())?;
@@ -674,6 +750,7 @@ impl CgroupScope {
             Self {
                 path: scope.take_path(),
                 procs_fd: Some(procs_fd),
+                occupancy: Arc::default(),
             },
             io_max,
         ))
@@ -1811,6 +1888,72 @@ mod tests {
             .attribution_since(before),
             Some("cgroup_pids_max")
         );
+    }
+
+    /// A scope with no directory behind it: occupancy needs no kernel, and `Drop` skips the
+    /// `rmdir` for an empty path.
+    fn scope_without_kernel() -> CgroupScope {
+        CgroupScope {
+            path: PathBuf::new(),
+            procs_fd: None,
+            occupancy: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn occupancy_alone_is_exclusive() {
+        let scope = scope_without_kernel();
+        let call = scope.enter();
+        assert!(call.exclusive());
+    }
+
+    #[test]
+    fn occupancy_entering_beside_another_is_not_exclusive() {
+        let scope = scope_without_kernel();
+        let first = scope.enter();
+        let second = scope.enter();
+        assert!(!second.exclusive(), "someone was already inside");
+        drop(first);
+        assert!(
+            !second.exclusive(),
+            "the sibling leaving does not clean the window it shared"
+        );
+    }
+
+    #[test]
+    fn occupancy_someone_entering_during_the_window_makes_it_shared() {
+        let scope = scope_without_kernel();
+        let first = scope.enter();
+        assert!(first.exclusive());
+        drop(scope.enter());
+        assert!(
+            !first.exclusive(),
+            "a call that entered and left inside this window could have moved the counters"
+        );
+    }
+
+    #[test]
+    fn occupancy_drop_releases_the_scope() {
+        let scope = scope_without_kernel();
+        drop(scope.enter());
+        let next = scope.enter();
+        assert!(
+            next.exclusive(),
+            "an earlier call that has left does not share this window"
+        );
+    }
+
+    /// The guard is owned: it moves to a demoted command's thread and keeps the scope occupied
+    /// there after the scope's borrow has ended.
+    #[test]
+    fn occupancy_guard_outlives_its_borrow_on_another_thread() {
+        let scope = scope_without_kernel();
+        let demoted = scope.enter();
+        let held = std::thread::spawn(move || demoted);
+        let demoted = held.join().unwrap();
+        let foreground = scope.enter();
+        assert!(!foreground.exclusive());
+        assert!(!demoted.exclusive());
     }
 
     #[test]

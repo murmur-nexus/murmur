@@ -1031,11 +1031,15 @@ async fn drive_harness(
     // Every bridged call crosses the decision point, because the required-field check applies to
     // every capsule. A run with no bridge never sends on the channel, and the receiver parks.
     let (gate_tx, mut gate_rx) = mpsc::unbounded_channel::<claude_bridge::GateRequest>();
+    // What the bridge saw that belongs in the trace: calls the harness walked away from, and
+    // calls refused at the in-flight bound.
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel::<claude_bridge::BridgeNote>();
 
     // One long-lived future: re-creating it per iteration would drop a connection mid tool call.
+    // Dropping it when this function returns is what ends every call still in flight.
     let bridge_future = async {
         match bridge {
-            Some(handle) => handle.serve(store_state, &gate_tx, &bump).await,
+            Some(handle) => handle.serve(store_state, &gate_tx, &note_tx, &bump).await,
             None => std::future::pending::<()>().await,
         }
     };
@@ -1071,13 +1075,19 @@ async fn drive_harness(
                 grace_deadline = Some(tokio::time::Instant::now() + grace);
                 continue;
             }
-            // Ahead of the output arm: the harness is blocked on the bridge's response for as
-            // long as one of these is outstanding, so nothing it might say can arrive until this
-            // is answered. The bridge waits for that answer in the arm below, and everything
-            // this arm touches — the store, the hooks, the trace — is owned here, so neither
-            // half waits on the other.
+            // Ahead of the output arm: a call parked here is waiting on this answer, and the
+            // harness may be waiting on that call. Everything this arm touches — the store, the
+            // hooks, the trace — is owned here, so neither half waits on the other. Requests are
+            // answered one at a time, in arrival order, each on its own `reply`; while this body
+            // awaits a policy hook the bridge is not polled, so finished calls' responses wait
+            // for the next turn of the loop, though the commands behind them keep running.
             request = next_gate_request(&mut gate_rx) => {
                 let claude_bridge::GateRequest { tool_name, input_json, reply } = request;
+                // Its connection closed while it waited, and the bridge has noted that. Nobody
+                // is waiting on a verdict, so no check or hook runs for it.
+                if reply.is_closed() {
+                    continue;
+                }
                 // Arguments that are not JSON have no keys, so they miss every required field.
                 let input = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
                 let mut gate = CallGate::new(hooks, trace, workdir, sink.current_turn());
@@ -1111,10 +1121,18 @@ async fn drive_harness(
                 bump();
                 continue;
             }
-            line = line_rx.recv() => line,
+            // Ahead of the output arm: polling the bridge is what accepts connections and writes
+            // finished calls' responses, and the arm itself resolves only when `serve` ends. A
+            // harness streaming output would otherwise hold a finished call's response back for
+            // as long as it kept talking.
             () = &mut bridge_future => break RunEnd::Failed(RuntimeError::AgentLoopFailed(
                 "the tool bridge stopped accepting connections".to_string(),
             )),
+            note = next_bridge_note(&mut note_rx) => {
+                let _ = trace.write_harness_note(&note.text()).await;
+                continue;
+            }
+            line = line_rx.recv() => line,
             () = tokio::time::sleep_until(deadline) => {
                 if grace_deadline.is_some() {
                     break RunEnd::Interrupted;
@@ -1272,6 +1290,17 @@ async fn drive_harness(
                 }),
             }
         }
+    }
+}
+
+/// The note arm's future: the next thing the bridge saw that belongs in the trace.
+async fn next_bridge_note(
+    notes: &mut mpsc::UnboundedReceiver<claude_bridge::BridgeNote>,
+) -> claude_bridge::BridgeNote {
+    // Parks rather than returning on a closed channel, for the reason `next_gate_request` gives.
+    match notes.recv().await {
+        Some(note) => note,
+        None => std::future::pending().await,
     }
 }
 

@@ -13,7 +13,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -244,6 +247,31 @@ pub(crate) struct DetachPolicy {
     /// `TaskProvenance::derive(TaskOrigin::Completion, Some(that trust))`, so untrust survives
     /// the round trip instead of being reset by the runtime enqueuing its own task.
     pub provenance: Option<TaskProvenance>,
+    /// Raised when whoever was waiting for the foreground result has gone away. The command is
+    /// then demoted at once, exactly as if it had outrun `grace`. `None` for every caller that
+    /// cannot go away mid-call; the process-transport tool bridge is the one that can.
+    pub abandoned: Option<AbandonSignal>,
+}
+
+/// Set once by a caller that stopped waiting for a call's result.
+///
+/// Clones share one flag. Raising it never stops anything already running: a shell command still
+/// in the foreground reads it and demotes, which is the only effect it has.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AbandonSignal(Arc<AtomicBool>);
+
+impl AbandonSignal {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn raise(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_raised(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl DetachPolicy {
@@ -534,6 +562,7 @@ mod tests {
                 command: script.to_string(),
                 context_id: "ctx_detached_tests".to_string(),
                 provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                abandoned: None,
             }),
         )
         .expect("a declared binary runs");

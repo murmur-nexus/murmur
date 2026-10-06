@@ -229,6 +229,28 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     echo "text $answer"
     echo "end $answer"
     ;;
+  bridge-parallel)
+    # A long shell call on its own connection, and a quick tool call on another while it runs. The
+    # quick one's `result` line comes first when the bridge serves the two concurrently. The wait
+    # is a bash builtin: the shell tool's sandbox does not let it exec `/usr/bin/sleep`.
+    echo "started fixture-session-1"
+    BASH_TOOL="" ECHO_TOOL=""
+    for candidate in $(printf '%s' "$FIXTURE_BRIDGE_TOOLS" | tr ',' ' '); do
+      case "$candidate" in
+        *__bash) BASH_TOOL="$candidate" ;;
+        *__echo-tool) ECHO_TOOL="$candidate" ;;
+      esac
+    done
+    echo "tool c1 $BASH_TOOL {\"command\":\"read -t 8 <> <(:)\"}"
+    ( call_bridge bash '{"command":"read -t 8 <> <(:)"}' > parallel-c1.answer ) &
+    sleep 0.5
+    echo "tool c2 $ECHO_TOOL {\"msg\":\"ping-7\"}"
+    answer="$(call_bridge)"
+    echo "result c2 ok $answer"
+    wait
+    echo "result c1 ok $(cat parallel-c1.answer)"
+    echo "end PARALLEL-RESULT"
+    ;;
   bridge-busy)
     # Says nothing on stdout while it works, and keeps the bridge busy instead.
     echo "started fixture-session-1"

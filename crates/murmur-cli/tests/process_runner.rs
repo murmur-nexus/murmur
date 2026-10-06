@@ -95,6 +95,10 @@ struct Built {
     /// The driver component published as the capsule's driver. The default build reports usage;
     /// [`Built::reporting_no_usage`] picks the one that does not.
     driver_wasm: PathBuf,
+    /// `capabilities.shell.allow`, each entry a bridged shell tool.
+    shell: Vec<String>,
+    /// `lifecycle.shell_grace_secs`.
+    shell_grace_secs: Option<u64>,
 }
 
 impl Built {
@@ -108,6 +112,8 @@ impl Built {
             model: None,
             hook: None,
             driver_wasm: fixture_wasm(),
+            shell: Vec::new(),
+            shell_grace_secs: None,
         }
     }
 
@@ -129,6 +135,17 @@ impl Built {
 
     fn with_tool(mut self) -> Self {
         self.tool = true;
+        self
+    }
+
+    /// Declare `binaries` under `capabilities.shell.allow`.
+    fn shell(mut self, binaries: &[&str]) -> Self {
+        self.shell = binaries.iter().map(|b| b.to_string()).collect();
+        self
+    }
+
+    fn shell_grace_secs(mut self, secs: u64) -> Self {
+        self.shell_grace_secs = Some(secs);
         self
     }
 
@@ -210,15 +227,24 @@ impl Built {
             .config
             .map(|c| format!("    config:\n      mode: {c}\n"))
             .unwrap_or_default();
+        let shell = if self.shell.is_empty() {
+            String::new()
+        } else {
+            format!("  shell:\n    allow: [{}]\n", self.shell.join(", "))
+        };
+        let lifecycle = self
+            .shell_grace_secs
+            .map(|secs| format!("lifecycle:\n  shell_grace_secs: {secs}\n"))
+            .unwrap_or_default();
 
         let manifest = project.path().join("murmur.yaml");
         fs::write(
             &manifest,
             format!(
                 "name: process-runner\nversion: 0.1.0\nartifacts:\n{entries}\
-                 capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n\
+                 capabilities:\n  env:\n    allow: [HOME, PATH, FIXTURE_HARNESS_PROFILE]\n{shell}\
                  inference:\n  transport: process\n  driver:\n    artifact: {DRIVER}\n{config}\
-                 {command}{model}{max_turns}"
+                 {command}{model}{max_turns}{lifecycle}"
             ),
         )
         .unwrap();
@@ -478,6 +504,57 @@ fn s3_the_harness_calls_a_capsule_tool_through_the_bridge() {
     let shown = capsule.trace_show(&run.workdir);
     assert!(shown.contains(TOOL), "{shown}");
     assert!(shown.contains("ok"), "{shown}");
+}
+
+// ── S14: concurrent bridged calls ─────────────────────────────────────────────
+
+#[test]
+fn s14_a_long_shell_call_does_not_hold_up_a_second_tool_call() {
+    println!("S14: a bridged call is answered while a long shell call on the bridge still runs");
+    if common::skip_without_host_support(
+        "s14_a_long_shell_call_does_not_hold_up_a_second_tool_call",
+    ) {
+        return;
+    }
+    let capsule = Built::new()
+        .with_tool()
+        .shell(&["bash"])
+        .shell_grace_secs(5)
+        .build();
+    let run = capsule.run("bridge-parallel", &[]).succeeded();
+    assert!(
+        run.result().contains("PARALLEL-RESULT"),
+        "{}\n{}",
+        run.result(),
+        run.text
+    );
+
+    let calls = run.of_type("tool_call");
+    let position = |id: &str| {
+        calls
+            .iter()
+            .position(|call| call["tool_call_id"] == id)
+            .unwrap_or_else(|| panic!("no tool_call {id}: {calls:#?}"))
+    };
+    let (c1, c2) = (position("c1"), position("c2"));
+    assert!(
+        c2 < c1,
+        "the echo call returned while the shell call still ran: {calls:#?}"
+    );
+    let duration = |index: usize| calls[index]["duration_ms"].as_u64().unwrap();
+    println!(
+        "S14: c1 (bash) {} ms, c2 (echo-tool) {} ms",
+        duration(c1),
+        duration(c2)
+    );
+    assert!(
+        duration(c2) < 2000,
+        "the echo call waited behind the shell call: {calls:#?}"
+    );
+    assert!(
+        duration(c1) >= 4000,
+        "the shell call ran for its grace period: {calls:#?}"
+    );
 }
 
 // ── S4: every failure kind ────────────────────────────────────────────────────
