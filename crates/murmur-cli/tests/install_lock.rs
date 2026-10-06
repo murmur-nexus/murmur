@@ -1,3 +1,6 @@
+#[path = "common/mod.rs"]
+mod common;
+
 use std::{
     fs,
     io::Write,
@@ -154,6 +157,7 @@ fn assert_installed_and_pinned(project: &Path, name: &str, version: &str, sha256
 #[test]
 fn install_partial_failure_pins_successes_and_names_failure() {
     let home = tempfile::tempdir().unwrap();
+    common::write_no_source_config(home.path());
     let work = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
@@ -189,6 +193,7 @@ fn install_partial_failure_pins_successes_and_names_failure() {
 #[test]
 fn install_multi_failure_reports_every_failing_artifact() {
     let home = tempfile::tempdir().unwrap();
+    common::write_no_source_config(home.path());
     let work = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
@@ -225,6 +230,7 @@ fn install_multi_failure_reports_every_failing_artifact() {
 #[test]
 fn install_total_failure_writes_no_lock_and_names_every_failure() {
     let home = tempfile::tempdir().unwrap();
+    common::write_no_source_config(home.path());
     let project = tempfile::tempdir().unwrap();
 
     write_manifest_with_deps(

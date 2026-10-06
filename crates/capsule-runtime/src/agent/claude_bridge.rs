@@ -142,7 +142,7 @@ struct InFlightSlot<'a>(&'a AtomicUsize);
 impl<'a> InFlightSlot<'a> {
     fn claim(in_flight: &'a AtomicUsize, limit: usize) -> Option<Self> {
         in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < limit).then_some(n + 1)
             })
             .ok()

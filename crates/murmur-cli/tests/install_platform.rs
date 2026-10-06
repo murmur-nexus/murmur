@@ -10,13 +10,11 @@ mod common;
 
 use std::{
     fs,
-    io::{Read, Write},
-    net::TcpListener,
     path::{Path, PathBuf},
-    thread,
 };
 
 use assert_cmd::Command;
+use common::github_release::{wasm_tool_zip, MockRelease};
 use murmur_artifact::{
     current_platform, read_lockfile, sha256_hex, write_lockfile_atomic, LocalRegistry, LockOrigin,
     LockedArtifact, LockedSha256, MurmurLock, PlatformMatch, Registry, RuntimeType, LOCK_VERSION,
@@ -54,19 +52,6 @@ fn native_zip(dir: &Path, file_name: &str, filler: &str) -> PathBuf {
     target
 }
 
-fn wasm_zip(dir: &Path, name: &str, version: &str) -> PathBuf {
-    let path = dir.join(format!("{name}-{version}.mur.zip"));
-    let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
-    let options: zip::write::SimpleFileOptions =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    zip.start_file("murmur.yaml", options).unwrap();
-    writeln!(zip, "name: {name}\nversion: {version}\nruntime: tool").unwrap();
-    zip.start_file("tool.wasm", options).unwrap();
-    zip.write_all(b"\0asm\x01\0\0\0").unwrap();
-    zip.finish().unwrap();
-    path
-}
-
 fn write_registry_source_config(home: &Path) {
     let config_dir = home.join(".murmur");
     fs::create_dir_all(&config_dir).unwrap();
@@ -81,109 +66,6 @@ fn mur(home: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path()).env_remove("NEXUS_API_KEY");
     cmd
-}
-
-// ── Mock GitHub release ──────────────────────────────────────────────────────
-
-/// Serves one `releases/latest` payload and the asset bytes behind it, and 404s every tag
-/// lookup so resolution takes the latest-release path. Runs until the test binary exits.
-struct MockRelease {
-    api_base: String,
-}
-
-impl MockRelease {
-    fn start(assets: Vec<(String, Vec<u8>)>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let api_base = format!("http://{address}");
-
-        let asset_json: Vec<String> = assets
-            .iter()
-            .enumerate()
-            .map(|(index, (name, _))| format!("{{\"id\":{},\"name\":\"{name}\"}}", index + 1))
-            .collect();
-        let release_body = format!(
-            "{{\"tag_name\":\"v{VERSION}\",\"assets\":[{}]}}",
-            asset_json.join(",")
-        );
-
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let Some(path) = read_request_path(&mut stream) else {
-                    continue;
-                };
-
-                if path.ends_with("/releases/latest") {
-                    let _ = write_response(
-                        &mut stream,
-                        200,
-                        "application/json",
-                        release_body.as_bytes(),
-                    );
-                } else if let Some(id) = path.rsplit_once("/releases/assets/").map(|(_, id)| id) {
-                    match id.parse::<usize>() {
-                        Ok(id) if id >= 1 && id <= assets.len() => {
-                            let _ = write_response(
-                                &mut stream,
-                                200,
-                                "application/octet-stream",
-                                &assets[id - 1].1,
-                            );
-                        }
-                        _ => {
-                            let _ =
-                                write_response(&mut stream, 404, "text/plain", b"no such asset");
-                        }
-                    }
-                } else {
-                    let _ = write_response(&mut stream, 404, "text/plain", b"not found");
-                }
-            }
-        });
-
-        Self { api_base }
-    }
-}
-
-fn read_request_path(stream: &mut std::net::TcpStream) -> Option<String> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let request = String::from_utf8_lossy(&buffer);
-    Some(
-        request
-            .lines()
-            .next()?
-            .split_whitespace()
-            .nth(1)?
-            .to_string(),
-    )
-}
-
-fn write_response(
-    stream: &mut std::net::TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body)?;
-    stream.flush()
 }
 
 // ── S1: two platforms, one store ─────────────────────────────────────────────
@@ -206,16 +88,19 @@ fn all_platforms_install_files_each_platform_beside_the_other() {
     );
     let linux_bytes = fs::read(&linux).unwrap();
     let darwin_bytes = fs::read(&darwin).unwrap();
-    let release = MockRelease::start(vec![
-        (
-            format!("{NAME}-{VERSION}-linux-x86_64.mur.zip"),
-            linux_bytes.clone(),
-        ),
-        (
-            format!("{NAME}-{VERSION}-darwin-aarch64.mur.zip"),
-            darwin_bytes.clone(),
-        ),
-    ]);
+    let release = MockRelease::start(
+        &format!("v{VERSION}"),
+        vec![
+            (
+                format!("{NAME}-{VERSION}-linux-x86_64.mur.zip"),
+                linux_bytes.clone(),
+            ),
+            (
+                format!("{NAME}-{VERSION}-darwin-aarch64.mur.zip"),
+                darwin_bytes.clone(),
+            ),
+        ],
+    );
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
@@ -288,9 +173,12 @@ fn a_wasm_artifact_installs_untagged_and_resolves_for_any_platform() {
     .unwrap();
     write_registry_source_config(home.path());
 
-    let artifact = wasm_zip(staging.path(), "wasmtool", VERSION);
+    let artifact = wasm_tool_zip(staging.path(), "wasmtool", VERSION);
     let bytes = fs::read(&artifact).unwrap();
-    let release = MockRelease::start(vec![(format!("wasmtool-{VERSION}.mur.zip"), bytes.clone())]);
+    let release = MockRelease::start(
+        &format!("v{VERSION}"),
+        vec![(format!("wasmtool-{VERSION}.mur.zip"), bytes.clone())],
+    );
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)
@@ -347,10 +235,13 @@ fn a_release_without_this_platforms_asset_fails_naming_the_platform() {
         &format!("{NAME}-{VERSION}-{other}.mur.zip"),
         "foreign",
     );
-    let release = MockRelease::start(vec![(
-        format!("{NAME}-{VERSION}-{other}.mur.zip"),
-        fs::read(&artifact).unwrap(),
-    )]);
+    let release = MockRelease::start(
+        &format!("v{VERSION}"),
+        vec![(
+            format!("{NAME}-{VERSION}-{other}.mur.zip"),
+            fs::read(&artifact).unwrap(),
+        )],
+    );
 
     mur(&home)
         .env("MUR_GITHUB_API_BASE", &release.api_base)

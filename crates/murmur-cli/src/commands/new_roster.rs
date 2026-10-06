@@ -407,9 +407,8 @@ pub(crate) fn render_scaffold(name: &str, choice: &ProviderChoice) -> Scaffold {
 }
 
 /// What `mur new --roster` prints on success: the files written, then the commands that install
-/// and launch the formation. The key step comes first: on a host with no `~/.murmur/config.yaml`,
-/// `mur install -g <name>@<version>` has no registry source to fall back to, and the file
-/// `mur config set` writes carries the default one.
+/// and launch the formation. The key step comes first because the key is the one value only the
+/// operator can supply, and `mur run --roster` fails without it.
 pub(crate) fn render_summary(name: &str, choice: &ProviderChoice) -> String {
     let rules = REACHABILITY
         .iter()

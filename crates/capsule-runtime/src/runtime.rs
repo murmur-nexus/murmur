@@ -1321,7 +1321,7 @@ fn check_resume_launchable(
             "the capsule declares context.record: off and kept nothing to continue".to_string(),
         ));
     };
-    let root = crate::conversation::record_root(&record).map_err(&missing)?;
+    let root = crate::conversation::record_root(&record).map_err(missing)?;
     if process {
         let path = crate::harness_session::entry_file(&root, &context_id);
         if !path.is_file() {

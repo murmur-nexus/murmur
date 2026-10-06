@@ -309,8 +309,10 @@ pub fn load_effective_mur_config() -> Result<MurConfig, CliError> {
 }
 
 /// Same as `load_effective_mur_config`, but returns `None` when neither the global nor
-/// the project-level file exists (mirrors `load_mur_config_if_exists`'s None/Some contract
-/// for call sites that skip building a source-chain fallback when there is no config at all).
+/// the project-level file exists (mirrors `load_mur_config_if_exists`'s None/Some contract),
+/// for call sites that must not read the built-in default's values as settings the operator
+/// chose. Registry lookups use `load_effective_mur_config`, so a machine with no config file
+/// still installs from the built-in source.
 pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, CliError> {
     let global_opt = load_mur_config_if_exists()?;
     let project_opt = load_project_mur_config_if_exists()?;

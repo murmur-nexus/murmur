@@ -1,3 +1,6 @@
+#[path = "common/mod.rs"]
+mod common;
+
 use std::{
     fs,
     io::Write,
@@ -108,6 +111,7 @@ fn local_publish_rejects_duplicate_but_install_overwrites() {
 #[test]
 fn local_install_missing_artifact_returns_not_found_error() {
     let home = tempfile::tempdir().unwrap();
+    common::write_no_source_config(home.path());
 
     run_install_local("missing-local@0.0.2", &home)
         .failure()
