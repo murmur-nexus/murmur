@@ -2275,6 +2275,8 @@ fn a_formation_is_accounted_for_after_its_members_end() {
     // `mur stop` ends a member cleanly, and its row carries that `session_end.exit_status`.
     assert!(member_rows[1].ends_with("  ok"), "{shown}");
     assert!(member_rows[2].ends_with("  ok"), "{shown}");
+    // These members made no `call-member` call, so there is no call list.
+    assert!(!shown.lines().any(|l| l.starts_with("calls:")), "{shown}");
 
     let shown = mur(home.path())
         .args(["trace", "show", &survivor.session_id(), "--workdir"])

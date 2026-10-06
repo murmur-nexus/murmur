@@ -1316,6 +1316,37 @@ fn two_tier_formation_trace_names_every_call() {
     let mut expected: Vec<&str> = project.members.iter().map(|member| member.name).collect();
     expected.sort();
     assert_eq!(named, expected, "{stdout}");
+    let chief_row = lines
+        .iter()
+        .find(|line| line.starts_with("ses_") && line.split_whitespace().nth(1) == Some("chief"))
+        .unwrap();
+    assert!(chief_row.ends_with("  may call lead-a, lead-b"), "{stdout}");
+
+    // Each call's start, as its caller recorded it: the `member_call_start`, or for a call its
+    // callee never held, the `member_call` less its duration.
+    let mut started: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for caller in ["chief", "lead-a", "lead-b"] {
+        for record in project.trace_of(&formation_id, caller) {
+            let call_id = record["call_id"].as_str().unwrap_or_default().to_string();
+            let at = record["timestamp"].as_u64().unwrap_or_default();
+            match record["event_type"].as_str() {
+                Some("member_call_start") => {
+                    started.insert(call_id, at);
+                }
+                Some("member_call") => {
+                    let took = record["duration_ms"].as_u64().unwrap_or_default();
+                    started.entry(call_id).or_insert(at - took);
+                }
+                _ => {}
+            }
+        }
+    }
+    let start_of = |line: &str| -> u64 {
+        let call_id = line.split_whitespace().next().unwrap();
+        *started
+            .get(call_id)
+            .unwrap_or_else(|| panic!("no recorded start for {call_id}"))
+    };
 
     let at = lines
         .iter()
@@ -1346,10 +1377,13 @@ fn two_tier_formation_trace_names_every_call() {
                 worker
             })
             .collect();
+        let starts: Vec<u64> = tier[1..].iter().map(|line| start_of(line)).collect();
+        assert!(starts.is_sorted(), "{starts:?}\n{stdout}");
         called.sort();
         assert_eq!(called, workers, "{stdout}");
     }
     assert_ne!(row(rows[0]).2, row(rows[5]).2, "{stdout}");
+    assert!(start_of(rows[0]) <= start_of(rows[5]), "{stdout}");
     let completed = rows
         .iter()
         .filter(|line| {

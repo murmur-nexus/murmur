@@ -445,7 +445,8 @@ pub(crate) struct FormationCall {
 /// that handed over the task it was made from: the row whose `member_task_id` is its calling task
 /// and whose callee is its caller. Calls with no parent come first by `(started_ms, call id)`,
 /// each followed by its children, ordered the same way, one level deeper. Calls whose parents form
-/// a cycle are listed once each after every other, as if they had none.
+/// a cycle have no root to be reached from: they follow every other call, each cycle starting at
+/// its earliest call with the rest nested beneath it, so every call is listed exactly once.
 pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> {
     // Each received task's callee and how it ended, by task id.
     let mut received: HashMap<&str, (&RecordedMember, &ReceivedMemberTask)> = HashMap::new();
@@ -973,7 +974,7 @@ mod tests {
         json!({"event_type": "task_end", "task_id": task, "exit_status": status}).to_string()
     }
 
-    /// Every row's `(depth, caller → callee, status or ending)` and its note.
+    /// Every row's depth, `caller→callee` and gap note.
     fn summary(calls: &[FormationCall]) -> Vec<(usize, String, String)> {
         calls
             .iter()
@@ -1195,6 +1196,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some("mcl_01a10645751c70229f533dfd881ee485"), None]
         );
+        assert_eq!(
+            calls.iter().map(|call| call.started_ms).collect::<Vec<_>>(),
+            [60, 70]
+        );
         assert!(calls.iter().all(|call| call.ending == CallEnding::Unknown));
         assert_eq!(
             summary(&calls),
@@ -1240,7 +1245,7 @@ mod tests {
             &[
                 member_start(&a, &formation, Some("a"), &[], "worker"),
                 received("tsk_a", "msg_mcl_a", Some("lead"), 55),
-                task_end("tsk_a", "failed"),
+                task_end("tsk_a", "canceled"),
             ],
         );
         write_trace(
@@ -1258,7 +1263,7 @@ mod tests {
         assert_eq!(
             summary(&calls),
             [
-                (0, "lead→a".into(), "a's task ended failed".into()),
+                (0, "lead→a".into(), "a's task ended canceled".into()),
                 (0, "lead→b".into(), "b's task has no task_end".into()),
                 (0, "lead→c".into(), "c's trace not found".into()),
             ]
