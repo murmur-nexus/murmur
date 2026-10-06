@@ -365,8 +365,9 @@ struct InferenceEvent {
     /// `input_tokens_actual` is absent: there is one measurement on that transport and it is
     /// recorded once.
     ///
-    /// Absent means no count was made at all, which only a `process` driver reporting no usage
-    /// produces. Never conflate it with `0`, which is a count of none.
+    /// Absent means no count was made at all: a `process` driver reporting no usage, or a failed
+    /// call that is not counted (see [`TraceWriter::write_failed_inference`]). Never conflate it
+    /// with `0`, which is a count of none.
     #[serde(skip_serializing_if = "Option::is_none")]
     input_tokens: Option<u64>,
     /// The output this turn cost, on the same terms as [`Self::input_tokens`]: the runtime's own
@@ -377,9 +378,10 @@ struct InferenceEvent {
     decision: String,
     /// The provider's own stop reason for this turn, verbatim as the agent loop dispatched on
     /// it. Present on every agent-loop turn, including one whose driver reported nothing — an
-    /// empty string then, because that is what the loop dispatched on. Absent means no driver
-    /// response was parsed at all: a hook's `run-inference` and the `process` transport both
-    /// name their `decision` locally and never saw a provider stop reason.
+    /// empty string then, because that is what the loop dispatched on. `"error"` on every failed
+    /// call, on either transport and for a hook's `run-inference`. Otherwise absent means no
+    /// driver response was parsed at all: a hook's `run-inference` and the `process` transport
+    /// both name their `decision` locally and never saw a provider stop reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_reason: Option<String>,
     tool_name: Option<String>,
@@ -445,6 +447,21 @@ struct InferenceEvent {
     /// the two prompts stopped agreeing — the divergence index is the first unequal position.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     message_shas: Vec<String>,
+    /// Why the call failed, from the `INFERENCE_ERROR_*` vocabulary. Present exactly on a record
+    /// whose `decision` and `stop_reason` are both `"error"`; absent on every call that returned
+    /// an answer, however unusable the loop then found it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    /// The failure in words, present exactly when `error_code` is. Every credential value the
+    /// session holds is already replaced with `[redacted]`, and the text is capped at
+    /// [`MAX_TASK_FAILURE_REASON_BYTES`] on a character boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// The HTTP status the runtime's credential gateway received for the failed call. Absent when
+    /// no request reached the provider, on the `process` transport, and for a driver whose
+    /// gateway the runtime does not own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_status: Option<u16>,
 }
 
 /// The bodies one driver request put on the wire, split into the pieces an `inference` event
@@ -1016,6 +1033,83 @@ pub(crate) const TASK_FAILED_REOPEN_BUDGET_EXHAUSTED: &str = "reopen_budget_exha
 /// `task_failed.cause` for an attempt that ended in a runtime error no other cause names. The
 /// reason is the error's own text.
 pub(crate) const TASK_FAILED_RUNTIME_ERROR: &str = "runtime_error";
+
+/// `inference.error_code` when the provider refused the inference credential: it answered `401`
+/// and the gateway's re-read and resend were refused too. The record's `error` is the runtime's
+/// own `E-RUN-027` message, never the provider's body.
+pub(crate) const INFERENCE_ERROR_CREDENTIAL_REJECTED: &str = TASK_FAILED_CREDENTIAL_REJECTED;
+
+/// `inference.error_code` when the driver reported the call failed and no credential rejection is
+/// pending: a provider HTTP error, the driver's own error, a gateway refusal surfaced to the
+/// driver, or a response whose `stop_reason` is `"error"`.
+pub(crate) const INFERENCE_ERROR_DRIVER_ERROR: &str = TASK_FAILED_DRIVER_ERROR;
+
+/// `inference.error_code` when the driver component could not be invoked or trapped:
+/// instantiation or import failure, the execution deadline, or a memory limit.
+pub(crate) const INFERENCE_ERROR_DRIVER_FAILED: &str = "driver_failed";
+
+/// `inference.error_code` when the driver reported success but returned no body, or a body that
+/// is not JSON.
+pub(crate) const INFERENCE_ERROR_MALFORMED_RESPONSE: &str = TASK_FAILED_MALFORMED_RESPONSE;
+
+/// `inference.error_code` when a `process` harness reported a `turn-failed` of kind `auth`.
+pub(crate) const INFERENCE_ERROR_HARNESS_AUTH: &str = "harness_auth";
+
+/// `inference.error_code` when a `process` harness reported a `turn-failed` of kind `quota`.
+pub(crate) const INFERENCE_ERROR_HARNESS_QUOTA: &str = "harness_quota";
+
+/// `inference.error_code` when a `process` harness reported a `turn-failed` of kind
+/// `harness-error`.
+pub(crate) const INFERENCE_ERROR_HARNESS_ERROR: &str = "harness_error";
+
+/// `inference.error_code` when a `process` harness reported a `turn-failed` of kind `other`.
+pub(crate) const INFERENCE_ERROR_HARNESS_OTHER: &str = "harness_other";
+
+/// `inference.error_code` when a `process` harness went silent past the inactivity timeout.
+pub(crate) const INFERENCE_ERROR_HARNESS_INACTIVE: &str = "harness_inactive";
+
+/// One model call that failed, as [`TraceWriter::write_failed_inference`] records it.
+pub(crate) struct FailedInference<'a> {
+    pub(crate) turn: u32,
+    /// One of the `INFERENCE_ERROR_*` constants.
+    pub(crate) error_code: &'static str,
+    /// The failure in words, already redacted. Capped by the writer.
+    pub(crate) error: &'a str,
+    /// The HTTP status the credential gateway received for this call, when it received one.
+    pub(crate) provider_status: Option<u16>,
+    /// What the provider itself reported, when the failure carried a `usage` block.
+    pub(crate) usage: Option<&'a DriverUsage>,
+    /// `Some` for a hook's `run-inference`; `None` for an agent-loop call.
+    pub(crate) origin: Option<&'a InferenceOrigin>,
+    /// The driver choice the call was dispatched to, on a capsule that declares alternates.
+    pub(crate) choice: Option<&'a crate::driver_choice::DriverChoice>,
+    /// The messages the failed request embedded.
+    pub(crate) message_ids: Vec<String>,
+    pub(crate) tool_name: Option<String>,
+    /// `(input_tokens, output_tokens)` this call counts toward the turn and token totals. `None`
+    /// is a call that is not counted at all — no turn, no tokens, and neither key on the record.
+    pub(crate) spent: Option<(Option<u64>, Option<u64>)>,
+}
+
+/// One `inference` line, as the writers that share [`TraceWriter::write_inference_event`] hand
+/// it over.
+struct InferenceLine<'a> {
+    turn: u32,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    decision: String,
+    stop_reason: Option<&'a str>,
+    tool_name: Option<String>,
+    origin: Option<&'a InferenceOrigin>,
+    usage: Option<&'a DriverUsage>,
+    message_ids: Vec<String>,
+    wire: Option<&'a WireCapture>,
+    choice: Option<&'a crate::driver_choice::DriverChoice>,
+    /// `(error_code, error, provider_status)` for a failed call.
+    failure: Option<(&'static str, String, Option<u16>)>,
+    /// Whether the line advances the turn and token counters.
+    counted: bool,
+}
 
 /// The most `task_failed.reason` carries, in bytes. A driver's error text is provider-supplied
 /// and unbounded; the whole of it stays in `out/result.txt`.
@@ -2018,7 +2112,7 @@ impl TraceWriter {
         message_ids: Vec<String>,
         wire: Option<&WireCapture>,
     ) -> std::io::Result<()> {
-        self.write_inference_event(
+        self.write_inference_event(InferenceLine {
             turn,
             input_tokens,
             output_tokens,
@@ -2029,8 +2123,10 @@ impl TraceWriter {
             usage,
             message_ids,
             wire,
-            None,
-        )
+            choice: None,
+            failure: None,
+            counted: true,
+        })
         .await
     }
 
@@ -2051,37 +2147,77 @@ impl TraceWriter {
         wire: Option<&WireCapture>,
         choice: Option<&crate::driver_choice::DriverChoice>,
     ) -> std::io::Result<()> {
-        self.write_inference_event(
+        self.write_inference_event(InferenceLine {
             turn,
             input_tokens,
             output_tokens,
             decision,
             stop_reason,
             tool_name,
-            None,
+            origin: None,
             usage,
             message_ids,
             wire,
             choice,
-        )
+            failure: None,
+            counted: true,
+        })
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn write_inference_event(
+    /// Record a model call that failed: `decision` and `stop_reason` `"error"`, the failure's
+    /// `error_code`, `error` (capped at [`MAX_TASK_FAILURE_REASON_BYTES`]) and `provider_status`.
+    ///
+    /// Never hashes or stores a wire body, whatever `trace.capture` is. Writes `input_tokens` and
+    /// `output_tokens` only from `failed.spent`, and advances the turn and token counters only
+    /// when `spent` is `Some`, by exactly its counts. Parents like any other `inference`: an
+    /// agent-loop record becomes the turn node, a hook's hangs off the turn.
+    pub(crate) async fn write_failed_inference(
         &mut self,
-        turn: u32,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        decision: String,
-        stop_reason: Option<&str>,
-        tool_name: Option<String>,
-        origin: Option<&InferenceOrigin>,
-        usage: Option<&DriverUsage>,
-        message_ids: Vec<String>,
-        wire: Option<&WireCapture>,
-        choice: Option<&crate::driver_choice::DriverChoice>,
+        failed: FailedInference<'_>,
     ) -> std::io::Result<()> {
+        let error =
+            crate::agent::truncate_on_char_boundary(failed.error, MAX_TASK_FAILURE_REASON_BYTES)
+                .to_string();
+        let (input_tokens, output_tokens) = failed.spent.unwrap_or((None, None));
+        self.write_inference_event(InferenceLine {
+            turn: failed.turn,
+            input_tokens,
+            output_tokens,
+            decision: "error".to_string(),
+            stop_reason: Some("error"),
+            tool_name: failed.tool_name,
+            origin: failed.origin,
+            usage: failed.usage,
+            message_ids: failed.message_ids,
+            wire: None,
+            choice: failed.choice,
+            failure: Some((failed.error_code, error, failed.provider_status)),
+            counted: failed.spent.is_some(),
+        })
+        .await
+    }
+
+    async fn write_inference_event(&mut self, line: InferenceLine<'_>) -> std::io::Result<()> {
+        let InferenceLine {
+            turn,
+            input_tokens,
+            output_tokens,
+            decision,
+            stop_reason,
+            tool_name,
+            origin,
+            usage,
+            message_ids,
+            wire,
+            choice,
+            failure,
+            counted,
+        } = line;
+        let (error_code, error, provider_status) = match failure {
+            Some((code, error, status)) => (Some(code.to_string()), Some(error), status),
+            None => (None, None, None),
+        };
         let event_id = new_event_id();
         // The agent loop's own inference *is* the turn node — there is no separate turn line —
         // so it hangs off the task and everything the turn goes on to produce hangs off it. A
@@ -2126,8 +2262,14 @@ impl TraceWriter {
             tools_sha,
             response_sha,
             message_shas,
+            error_code,
+            error,
+            provider_status,
         };
         self.write_event(&event).await?;
+        if !counted {
+            return Ok(());
+        }
         // A turn nothing counted contributes nothing to the totals. The totals are plain `u64`
         // because a session's spend is a sum, and the sum of no measurements is zero; the
         // absent/zero distinction lives on the record itself.
@@ -5088,6 +5230,162 @@ mod tests {
         assert_eq!(e["cached_tokens"], 0, "a reported zero is written");
         assert!(e.get("output_tokens_actual").is_none());
         assert!(e.get("cache_write_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_inference_writes_its_keys_and_counts_only_what_it_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+            .await
+            .unwrap();
+        let usage = DriverUsage {
+            input_tokens: Some(7),
+            ..DriverUsage::default()
+        };
+        let long = "é".repeat(MAX_TASK_FAILURE_REASON_BYTES);
+        w.write_failed_inference(FailedInference {
+            turn: 0,
+            error_code: INFERENCE_ERROR_CREDENTIAL_REJECTED,
+            error: &long,
+            provider_status: Some(401),
+            usage: Some(&usage),
+            origin: None,
+            choice: None,
+            message_ids: vec!["msg_1".to_string()],
+            tool_name: None,
+            spent: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(w.task_turns(), 0, "an uncounted record moves no counter");
+        assert_eq!((w.total_turns, w.total_input_tokens), (0, 0));
+        assert_eq!((w.task_input_tokens, w.task_output_tokens), (0, 0));
+
+        w.write_failed_inference(FailedInference {
+            turn: 1,
+            error_code: INFERENCE_ERROR_HARNESS_AUTH,
+            error: "bad login",
+            provider_status: None,
+            usage: None,
+            origin: None,
+            choice: None,
+            message_ids: Vec::new(),
+            tool_name: None,
+            spent: Some((Some(10), Some(5))),
+        })
+        .await
+        .unwrap();
+        assert_eq!(w.task_turns(), 1);
+        assert_eq!(w.total_turns, 1);
+        assert_eq!((w.total_input_tokens, w.total_output_tokens), (10, 5));
+        assert_eq!((w.task_input_tokens, w.task_output_tokens), (10, 5));
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let failed: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["event_type"] == "inference")
+            .collect();
+        let keys = |e: &Value| {
+            let mut keys: Vec<String> = e.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(failed[0]),
+            [
+                "decision",
+                "error",
+                "error_code",
+                "event_id",
+                "event_type",
+                "input_tokens_actual",
+                "message_ids",
+                "parent_id",
+                "provider_status",
+                "session_id",
+                "stop_reason",
+                "task_id",
+                "timestamp",
+                "tool_name",
+                "turn",
+            ]
+        );
+        assert_eq!(failed[0]["decision"], "error");
+        assert_eq!(failed[0]["stop_reason"], "error");
+        assert_eq!(failed[0]["error_code"], "credential_rejected");
+        assert_eq!(failed[0]["provider_status"], 401);
+        assert_eq!(failed[0]["input_tokens_actual"], 7);
+        let error = failed[0]["error"].as_str().unwrap();
+        assert!(error.len() <= MAX_TASK_FAILURE_REASON_BYTES);
+        assert!(error.len() > MAX_TASK_FAILURE_REASON_BYTES - 2);
+
+        assert_eq!(failed[1]["error_code"], "harness_auth");
+        assert_eq!(failed[1]["error"], "bad login");
+        assert_eq!(failed[1]["input_tokens"], 10);
+        assert_eq!(failed[1]["output_tokens"], 5);
+        assert!(failed[1].get("provider_status").is_none());
+        assert!(
+            !dir.path().join("blobs").exists(),
+            "a failed record stores no blob, even under trace.capture: content"
+        );
+        // The agent-loop failed record is the turn node, parented to the task.
+        let task_start = events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .unwrap();
+        assert_eq!(failed[0]["parent_id"], task_start["event_id"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_hook_record_hangs_off_the_turn_and_keeps_hook_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_inference(
+            0,
+            Some(10),
+            Some(5),
+            "end_turn".to_string(),
+            Some("end_turn"),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let origin = InferenceOrigin {
+            source: "hook:compactor".to_string(),
+            model: "m".to_string(),
+        };
+        w.write_failed_inference(FailedInference {
+            turn: 0,
+            error_code: INFERENCE_ERROR_DRIVER_ERROR,
+            error: "HTTP 500: boom",
+            provider_status: Some(500),
+            usage: None,
+            origin: Some(&origin),
+            choice: None,
+            message_ids: Vec::new(),
+            tool_name: None,
+            spent: Some((Some(40), None)),
+        })
+        .await
+        .unwrap();
+        assert_eq!(w.total_turns, 2);
+        assert_eq!((w.total_input_tokens, w.total_output_tokens), (50, 5));
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let turn = events.iter().find(|e| e["decision"] == "end_turn").unwrap();
+        let hook = events.iter().find(|e| e["decision"] == "error").unwrap();
+        assert_eq!(hook["parent_id"], turn["event_id"]);
+        assert_eq!(hook["origin"], "hook:compactor");
+        assert_eq!(hook["model"], "m");
+        assert_eq!(hook["input_tokens"], 40);
+        assert!(hook.get("output_tokens").is_none());
     }
 
     #[tokio::test]

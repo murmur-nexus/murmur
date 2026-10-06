@@ -36,6 +36,9 @@ use crate::{
 /// The diagnostic code a session fails with when the provider keeps rejecting its credential.
 pub(crate) const E_RUN_027: &str = "E-RUN-027";
 
+/// What [`GatewayCredential::redact`] puts where a credential value stood.
+pub(crate) const REDACTED: &str = "[redacted]";
+
 /// Where a gateway credential comes from. Carries names and paths, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
@@ -454,6 +457,27 @@ impl GatewayCredential {
             );
         }
         message
+    }
+
+    /// `text` with every occurrence of the value this credential attaches replaced by
+    /// [`REDACTED`]: the injected secret's current value for an injected credential, the last
+    /// value read for every other source. Reads no source, so it records nothing and rotates
+    /// nothing. An empty or absent value redacts nothing.
+    pub(crate) fn redact(&self, text: &str) -> String {
+        let value = match (&self.injected, &self.source) {
+            (Some(secrets), CredentialSource::Injected { name }) => secrets.value(name),
+            _ => Some(
+                self.state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .value
+                    .clone(),
+            ),
+        };
+        match value.filter(|value| !value.is_empty()) {
+            Some(value) => text.replace(&value, REDACTED),
+            None => text.to_string(),
+        }
     }
 
     /// The message a keyed request refused for want of an injected value carries back to the
@@ -975,5 +999,44 @@ mod tests {
         crate::control_plane::tests_support::forget(&secrets, NAME);
         assert_eq!(credential.refresh_locked(false), (None, unreadable));
         assert_eq!(credential.refresh_locked(false), (None, None));
+    }
+
+    #[test]
+    fn redact_replaces_every_occurrence_of_the_held_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, credential) = config_credential(&dir);
+        let text = format!("Incorrect API key provided: {OLD}. x-api-key: {OLD}");
+        let redacted = credential.redact(&text);
+        assert_eq!(
+            redacted,
+            "Incorrect API key provided: [redacted]. x-api-key: [redacted]"
+        );
+        let reads = credential.reads.load(Ordering::SeqCst);
+        credential.redact(&text);
+        assert_eq!(
+            credential.reads.load(Ordering::SeqCst),
+            reads,
+            "redaction reads no source"
+        );
+    }
+
+    #[test]
+    fn redact_uses_the_injected_value_and_redacts_nothing_without_one() {
+        let (secrets, credential) = injected_credential();
+        let text = format!("echo {NEW} and {NEW}");
+        assert_eq!(
+            credential.redact(&text),
+            text,
+            "nothing held, nothing redacted"
+        );
+        crate::control_plane::tests_support::set(&secrets, NAME, NEW);
+        assert_eq!(credential.redact(&text), "echo [redacted] and [redacted]");
+    }
+
+    #[test]
+    fn redact_with_an_empty_value_changes_nothing() {
+        let credential =
+            GatewayCredential::new("driver", CredentialSource::ManifestLiteral, String::new());
+        assert_eq!(credential.redact("unchanged text"), "unchanged text");
     }
 }

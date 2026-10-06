@@ -77,6 +77,9 @@ pub(crate) struct CredentialGateway {
     /// `gateway.api_key`, resolved at staging. `None` attaches nothing.
     credential: Option<Arc<GatewayCredential>>,
     pub(crate) metering: GatewayMetering,
+    /// The status of the last response [`Self::send`] returned, until
+    /// [`Self::take_upstream_status`] takes it.
+    last_status: std::sync::Mutex<Option<u16>>,
 }
 
 impl std::fmt::Debug for CredentialGateway {
@@ -143,6 +146,17 @@ impl GatewayTable {
     /// through tool dispatch is not metered, so it gets none.
     pub(crate) fn for_artifact(&self, name: &str) -> Option<&Arc<CredentialGateway>> {
         self.by_artifact.get(name)
+    }
+
+    /// `text` with every value a credential in the table attaches replaced by
+    /// [`crate::gateway_credential::REDACTED`]: the inference gateway's, every alternate's and
+    /// every other artifact's, an injected credential's included.
+    pub(crate) fn redact(&self, text: &str) -> String {
+        self.iter()
+            .filter_map(|gateway| gateway.credential())
+            .fold(text.to_string(), |text, credential| {
+                credential.redact(&text)
+            })
     }
 
     /// Every gateway: the inference gateway first, then the alternates' by artifact name, then
@@ -229,12 +243,33 @@ impl CredentialGateway {
             auth,
             credential,
             metering,
+            last_status: std::sync::Mutex::new(None),
         })
     }
 
     /// The artifact's credential, when `gateway.api_key` is set.
     pub(crate) fn credential(&self) -> Option<&Arc<GatewayCredential>> {
         self.credential.as_ref()
+    }
+
+    /// Takes the status of the last response this gateway returned to a guest — the resend's,
+    /// when it resent — leaving `None`. `None` when no request reached the upstream since the
+    /// last take.
+    ///
+    /// A caller takes (and discards) it immediately before dispatching a call and takes it again
+    /// after, so the value belongs to that call. The gateway is shared, so a request another call
+    /// sends in between — an async hook's `run-inference` on the inference gateway — can replace
+    /// it: the last response wins, as it does for a pending credential rejection.
+    pub(crate) fn take_upstream_status(&self) -> Option<u16> {
+        self.last_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    fn note_status(&self, response: &http::Response<WasiBody>) {
+        *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(response.status().as_u16());
     }
 
     /// Whether this is the inference gateway, admitted against the spend meter.
@@ -277,7 +312,9 @@ impl CredentialGateway {
         options: Option<RequestOptions>,
     ) -> Result<(http::Response<WasiBody>, ConnectionIo), WasiHttpError> {
         let Some(credential) = self.credential.clone() else {
-            return send_direct(self.rewrite(request, None)?, options).await;
+            let response = send_direct(self.rewrite(request, None)?, options).await?;
+            self.note_status(&response.0);
+            return Ok(response);
         };
 
         let (parts, body) = request.into_parts();
@@ -301,6 +338,7 @@ impl CredentialGateway {
             options,
         )
         .await?;
+        self.note_status(&response.0);
         if response.0.status() != StatusCode::UNAUTHORIZED {
             credential.clear_rejection();
             return Ok(response);
@@ -316,6 +354,7 @@ impl CredentialGateway {
         drop(response);
 
         let resent = send_direct(self.rewrite(head.request(body), Some(&reread))?, options).await?;
+        self.note_status(&resent.0);
         if resent.0.status() == StatusCode::UNAUTHORIZED {
             credential
                 .record_rejection(StatusCode::UNAUTHORIZED.as_u16(), true)
@@ -619,13 +658,19 @@ mod tests {
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let status = rt.block_on(async {
-            let (response, _io) = gateway
+            let (response, _io) = Arc::clone(&gateway)
                 .send(request("http://127.0.0.1:9/v1/probe", &[]), Some(options))
                 .await
                 .unwrap();
             response.status()
         });
         assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(gateway.take_upstream_status(), Some(307));
+        assert_eq!(
+            gateway.take_upstream_status(),
+            None,
+            "a take leaves nothing"
+        );
 
         let head = first.join().unwrap();
         assert!(head.contains(&format!("x-api-key: {KEY}")), "{head}");
@@ -639,6 +684,102 @@ mod tests {
             elsewhere.accept().is_err(),
             "the redirect target must receive no connection"
         );
+    }
+
+    /// A keyed request an injected credential cannot key is refused before anything is sent, so
+    /// the gateway holds no upstream status for the failed call to record.
+    #[test]
+    fn a_refused_request_leaves_no_upstream_status() {
+        use std::net::TcpListener;
+
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", upstream.local_addr().unwrap());
+        let secrets = Arc::new(crate::control_plane::InjectedSecrets::new(&[
+            "UNIT_SECRET".to_string()
+        ]));
+        let credential = Arc::new(GatewayCredential::injected(
+            "driver",
+            "UNIT_SECRET",
+            secrets,
+        ));
+        let gateway = Arc::new(
+            CredentialGateway::new(
+                "driver",
+                &endpoint,
+                auth("x-api-key", "{key}"),
+                Some(credential),
+                GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
+            )
+            .unwrap(),
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let refused = rt.block_on(async {
+            Arc::clone(&gateway)
+                .send(request("http://127.0.0.1:9/v1/messages", &[]), None)
+                .await
+        });
+        let Err(WasiHttpError::InternalError(Some(message))) = refused else {
+            panic!("an uninjected credential refuses the request");
+        };
+        assert!(message.contains("has not been injected"), "{message}");
+        assert_eq!(gateway.take_upstream_status(), None);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(upstream.accept().is_err(), "nothing reached the upstream");
+    }
+
+    #[test]
+    fn gateway_table_redacts_every_credential_it_holds() {
+        let mut table = GatewayTable::default();
+        table.insert(gateway(
+            "https://api.example.com",
+            auth("x-api-key", "{key}"),
+            Some(KEY),
+        ));
+        let alternate = Arc::new(
+            GatewayCredential::resolve(
+                "alt-driver",
+                &ApiKeyReference::Literal("sk-unit-alternate-marker".to_string()),
+                None,
+            )
+            .unwrap(),
+        );
+        table.insert_alternate(
+            CredentialGateway::new(
+                "alt-driver",
+                "https://alt.example.com",
+                auth("authorization", "Bearer {key}"),
+                Some(alternate),
+                GatewayMetering::Inference(Arc::new(SpendMeter::unlimited())),
+            )
+            .unwrap(),
+        );
+        let search = Arc::new(
+            GatewayCredential::resolve(
+                "web-search",
+                &ApiKeyReference::Literal("sk-unit-search-marker".to_string()),
+                None,
+            )
+            .unwrap(),
+        );
+        table.insert(
+            CredentialGateway::new(
+                "web-search",
+                "https://search.example.com",
+                auth("x-api-key", "{key}"),
+                Some(search),
+                GatewayMetering::Unmetered,
+            )
+            .unwrap(),
+        );
+        let text = format!(
+            "x-api-key: {KEY} / Bearer sk-unit-alternate-marker / sk-unit-search-marker / {KEY}"
+        );
+        assert_eq!(
+            table.redact(&text),
+            "x-api-key: [redacted] / Bearer [redacted] / [redacted] / [redacted]"
+        );
+        assert_eq!(GatewayTable::default().redact(&text), text);
     }
 
     #[test]

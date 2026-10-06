@@ -86,16 +86,16 @@ before the first task begins
 | `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `read_only_paths` (the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects; `[]` when the manifest declares none), `read_only_advisory_for` (the entries of `shell_allow` that protection is only advisory against; `[]` when it is enforced for every call the runtime can read as a write), `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `install_skill` and `install_tool` (the entries of [`capabilities.install`](manifest.md#field-install); `[]` when the manifest declares none), `interpreter_runtime_grants`, `staged_runtime_grants`, `preopens` (one entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry — `artifact`, `role`, the declared `scope` or `null`, and a `surface` of `whole-workdir`, `scoped-subtree` or `nothing`; `[]` when the capsule declares only skills), `state_stores` (`[]` when no artifact declares [`capabilities.state`](manifest.md#field-capabilities)), `configured_artifacts` (`[]` when no artifact declares [`config:`](manifest.md#artifact-config)), `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)), `peer_tasks` (`true` only when the manifest declares [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks); `false` otherwise), `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)), `runtime_writes`, `filesystem_boundary` (always present; a `restriction` of `advisory`, `enforced` or `absent` naming the filesystem mechanism this session installs rather than the class this host can back, and `not_protected`, the statements `mur run --explain-scope` prints under `Not protected here` — `[]` at `absent`, and two statements otherwise, one about the filesystem and one about the `HOME` rewrite; see [Testing containment honestly](containment.md#testing-containment)) and `io_max` (always present; `declared_bytes_per_sec`, a `status` of `enforced`, `unavailable`, `not-required` or `not-probed`, and a `reason` absent only when the status is `enforced` — see [Whether the I/O ceiling applied](resource-limits.md#io-max-report)). Where `capabilities` above names categories, this names the actual destinations, binaries, capsule names and paths |
 | `effective_grants.runtime_writes` | array of object | Every path the runtime itself writes inside the accessible workdir, so a consumer for whom that workdir is the deliverable can subtract them and be left with what the capsule changed. One object per path, with `path`, `kind` (`"file"` \| `"directory"`), `scope` (`"accessible"` \| `"session"`) and `condition` (`"always"`, `"workdir-provided"`, `"agent-session"`, `"script-session"`, `"shell"`, `"peer-fetch"`, `"spawn"`, `"delegated"` or `"sealed"`). Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which `session_id` on this same line supplies. The `"sealed"` rows are present exactly when this session composes a sealed root, which needs both a host that reaches the sealed tier and a containment class that asked for it — so a sealed-capable host running an `advisory` capsule reports the sealed `enforcement_tier` with no `"sealed"` rows. Every other condition names when the path appears rather than deciding whether the row is listed. See [Session workdir](workdir.md) |
 
-**`inference`** — written after each driver response is parsed
+**`inference`**{ #inference } — written after each driver call, including one that failed
 
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | Zero-based turn index |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
-| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn, which only a process driver reporting no usage produces — never the same fact as `0` |
+| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn: a process driver reporting no usage, or a [failed call](#inference-failed) that is not counted — never the same fact as `0` |
 | `output_tokens` | u64 | What this turn's output cost, on the same terms as `input_tokens` |
-| `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` — what the loop does next. A turn the provider cut off at the output cap reads `"text"`; `stop_reason` beside it is the field that says it was cut off |
-| `stop_reason` | string | The provider's own stop reason, verbatim as the loop dispatched on it — `"max_tokens"` for a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens). Written on every agent-loop turn, and as `""` when the driver reported none. Absent on a record no driver response was parsed for: a hook's `run-inference` and the `process` transport |
+| `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` \| `"error"` — what the loop does next. A turn the provider cut off at the output cap reads `"text"`; `stop_reason` beside it is the field that says it was cut off. `"error"` is a [failed call](#inference-failed) |
+| `stop_reason` | string | The provider's own stop reason, verbatim as the loop dispatched on it — `"max_tokens"` for a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens). Written on every agent-loop turn, and as `""` when the driver reported none. `"error"` on every failed call, on both transports and for a hook's `run-inference`. Absent on any other record no driver response was parsed for: a hook's successful `run-inference` and a `process` turn that ended |
 | `tool_name` | string \| null | The tool the response asked for; `null` when it asked for none |
 | `input_tokens_actual` | u64 | The provider's own count of the request, from the driver's [`usage`](wit-interfaces.md#driver-usage) block. `transport: http` only: on `process` the harness's own count is already `input_tokens`, and writing it twice would invent a second measurement |
 | `output_tokens_actual` | u64 | The provider's own count of the completion, on the same terms |
@@ -110,6 +110,9 @@ before the first task begins
 | `tools_sha` | string | SHA-256 (lowercase hex) of this request's serialized `tools` array |
 | `response_sha` | string | SHA-256 (lowercase hex) of the raw driver response body, as the runtime read it before parsing |
 | `message_shas` | array of string | SHA-256 (lowercase hex) of each message this request embedded, in send order — one entry per `message_ids` entry, over the same messages once the runtime's own identity keys are stripped |
+| `error_code` | string | Why the call failed — one of the [`error_code` values](#inference-error-code). Present exactly when `decision` is `"error"` |
+| `error` | string | The failure in words, present exactly when `error_code` is. Every credential value the session holds is replaced with `[redacted]`, and the text is capped at 2,000 bytes. For `credential_rejected` it is the runtime's own `E-RUN-027` message, never the provider's reply |
+| `provider_status` | u16 | The HTTP status the runtime's credential gateway received for the failed call. Absent when the request reached no provider, on the `process` transport, and for a driver with no `gateway:` |
 
 The five provider-reported fields are written only when the driver reported that member, and are
 absent otherwise — never `0`. See [Reported token usage](wit-interfaces.md#driver-usage) for what a
@@ -122,6 +125,42 @@ of measurements:
 |---|---|---|---|
 | `http` | The runtime's own estimate, always present | The provider's own counts, beside the estimate so drift is a subtraction on one line | Present when the driver reported them |
 | `process` | The harness's own reported counts, absent when its driver reports none | Always absent: there is one count on this transport and it is recorded once | Present when the driver reported them |
+
+#### Failed calls { #inference-failed }
+
+A model call that fails writes one `inference` record with `decision` and `stop_reason` `"error"`,
+`error_code`, `error` and, when the gateway saw one, `provider_status`. It never carries
+`system_sha`, `tools_sha`, `response_sha` or `message_shas`, and stores no blob, at any
+`trace.capture`. Its provider counts appear only when the driver's error payload carried a `usage`
+block. Whether it counts as a turn depends on where it failed:
+
+| Failed call | `input_tokens` / `output_tokens` | Counted in `task_end.turns`, `session_end.total_turns` and the token totals |
+|---|---|---|
+| Agent loop, `transport: http` | Absent | No |
+| `transport: process`, with a turn open when the harness failed | The harness's own counts, as for any turn | Yes |
+| `transport: process`, with no turn open | Absent | No |
+| A hook's `run-inference` | `input_tokens` only: the runtime's count of the request it sent | Yes, as every hook record is |
+
+A call that returned an answer the loop could not act on — `stop_reason: "tool_call"` with no tool
+call, or an unsupported stop reason — succeeded, and is recorded with the provider's own
+`stop_reason` before the [`task_failed`](#task-failed) that ends the attempt.
+
+##### `error_code` { #inference-error-code }
+
+| Value | Written when |
+|---|---|
+| `credential_rejected` | The provider answered `401` and the key, re-read and resent, was refused too |
+| `driver_error` | The driver reported the call failed: a provider HTTP error, the driver's own error, a request the runtime refused before sending it, or a response whose `stop_reason` is `"error"` |
+| `driver_failed` | The driver component could not be run, or stopped partway: it failed to load, hit `capabilities.limits.deadline_seconds`, or exceeded its memory limit |
+| `malformed_response` | The driver reported success with no response body, or a body that is not JSON |
+| `harness_auth` | A `process` harness reported a `turn-failed` of kind `auth` |
+| `harness_quota` | A `process` harness reported a `turn-failed` of kind `quota` |
+| `harness_error` | A `process` harness reported a `turn-failed` of kind `harness-error` |
+| `harness_other` | A `process` harness reported a `turn-failed` of kind `other` |
+| `harness_inactive` | A `process` harness produced no output for the inactivity limit and was stopped ([`E-RUN-035`](diagnostics.md#e-run-035)) |
+
+A spend ceiling that refuses a call before it is sent, a canceled call, and a `process` harness
+failure of kind `max-turns` or `canceled` write no failed record.
 
 ### `inference_credential` { #inference-credential }
 
@@ -686,7 +725,7 @@ terminal `task_end`
 | `task_id` | string | The task in progress. Absent for the run a launch makes from `input.txt` when no task arrived, which has no `task_start` |
 | `turn` | u32 | The turn that failed, 0-based. Absent when the failure is the task's rather than one turn's: `reopen_budget_exhausted` and `runtime_error` |
 | `cause` | string | Why the attempt failed, from the table below |
-| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. At most 2,000 bytes; the whole text is in `out/result.txt`. For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
+| `reason` | string | What went wrong, in words: the driver's or provider's error text, the refusal, the runtime error. A `driver_error` reason has every credential value the session holds replaced with `[redacted]`, as `out/result.txt` does. At most 2,000 bytes; the whole text is in `out/result.txt`. For a launch that ends `failed`, this is the reason [`E-RUN-040`](diagnostics.md#e-run-040) prints |
 
 | `cause` | Written when |
 |---|---|

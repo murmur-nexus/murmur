@@ -980,3 +980,177 @@ fn environment_sourced_key_does_not_warn_w_sec_028_about_a_wide_config() {
     assert!(run.lines("W-SEC-028").is_empty(), "{}", run.context());
     assert_eq!(run.lines("W-SEC-027").len(), 1, "{}", run.context());
 }
+
+impl Capsule {
+    /// `mur trace show` for the latest session, from the project.
+    fn trace_show(&self) -> Run {
+        Run::of(self.mur(None).args(["trace", "show"]).output().unwrap())
+    }
+
+    /// Every file under the project and `HOME`, the config aside, that holds `key`.
+    fn files_holding(&self, key: &str) -> Vec<PathBuf> {
+        let config = self.config_path();
+        let mut found = files_containing(self.project.path(), key.as_bytes(), &config);
+        found.extend(files_containing(self.home.path(), key.as_bytes(), &config));
+        found
+    }
+}
+
+impl Run {
+    fn of_type(&self, event_type: &str) -> Vec<Value> {
+        self.trace()
+            .into_iter()
+            .filter(|event| event["event_type"] == event_type)
+            .collect()
+    }
+
+    /// The one `inference` record of a session whose only call failed, asserted to come before
+    /// the attempt's `task_failed` and to carry no estimate and no hash.
+    fn the_failed_call(&self) -> Value {
+        let trace = self.trace();
+        let records: Vec<&Value> = trace
+            .iter()
+            .filter(|event| event["event_type"] == "inference")
+            .collect();
+        assert_eq!(records.len(), 1, "{trace:#?}");
+        let record = records[0].clone();
+        let position = |event_type: &str| {
+            trace
+                .iter()
+                .position(|event| event["event_type"] == event_type)
+                .unwrap_or_else(|| panic!("no {event_type}"))
+        };
+        assert!(position("inference") < position("task_failed"));
+        assert_eq!(record["turn"], 0, "{record}");
+        assert_eq!(record["decision"], "error", "{record}");
+        assert_eq!(record["stop_reason"], "error", "{record}");
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "system_sha",
+            "tools_sha",
+            "response_sha",
+            "message_shas",
+        ] {
+            assert!(record.get(key).is_none(), "{key} on {record}");
+        }
+        record
+    }
+}
+
+/// A key the provider rejects leaves one failed `inference` record naming the rejection, its
+/// `401` and the credential's source — never the key — at every `trace.capture`, and `mur trace
+/// show` lists it under Turns.
+#[test]
+fn a_rejected_key_leaves_a_failed_inference_record() {
+    for capture in ["none", "meta", "content"] {
+        let upstream = Upstream::start(&[], |_, _| (401, UNAUTHORIZED));
+        let capsule = Capsule::new(
+            &upstream,
+            ApiKey::Reference,
+            &format!("trace:\n  capture: {capture}\n"),
+        );
+        capsule.set_credential(OLD);
+        let run = capsule.run(None);
+
+        assert!(!run.output.status.success(), "{capture}: {}", run.context());
+        assert_eq!(
+            run.lines("E-RUN-027").len(),
+            1,
+            "{capture}: {}",
+            run.context()
+        );
+
+        let record = run.the_failed_call();
+        println!("trace.capture={capture}: {record}");
+        assert_eq!(record["error_code"], "credential_rejected", "{record}");
+        assert_eq!(record["provider_status"], 401, "{record}");
+        let error = record["error"].as_str().unwrap();
+        assert!(
+            error.contains(&format!(
+                "the provider rejected the inference credential credentials.{NAME}"
+            )),
+            "{error}"
+        );
+        assert_eq!(
+            run.of_type("task_failed")[0]["cause"],
+            "credential_rejected"
+        );
+        assert_eq!(run.of_type("task_end")[0]["turns"], 0);
+        assert_eq!(run.of_type("session_end")[0]["total_turns"], 0);
+
+        let show = capsule.trace_show();
+        let turns: Vec<&str> = show
+            .stdout
+            .lines()
+            .skip_while(|line| !line.starts_with("── Turns"))
+            .take_while(|line| !line.is_empty())
+            .collect();
+        println!(
+            "trace.capture={capture}: mur trace show\n{}",
+            turns.join("\n")
+        );
+        let failed = turns
+            .iter()
+            .position(|line| *line == "failed:     turn 0  credential_rejected  HTTP 401")
+            .unwrap_or_else(|| panic!("{capture}: {}", show.context()));
+        assert!(
+            turns[failed + 1].starts_with(&format!(
+                "            the provider rejected the inference credential credentials.{NAME} in "
+            )),
+            "{}",
+            turns[failed + 1]
+        );
+
+        let leaks = capsule.files_holding(OLD);
+        assert!(leaks.is_empty(), "{capture}: {leaks:?}");
+        for output in [&run, &show] {
+            assert!(!output.stdout.contains(OLD), "{capture}: stdout");
+            assert!(!output.stderr.contains(OLD), "{capture}: stderr");
+        }
+    }
+}
+
+/// A provider error that echoes the key back — in its body and as a rendered header — is
+/// recorded as a `driver_error` with the key redacted, and the key reaches no file and no output.
+#[test]
+fn a_provider_error_echoing_the_key_is_recorded_redacted() {
+    let upstream = Upstream::start(&[], |_, request| {
+        let key = request.key();
+        let body = format!(
+            "{{\"type\":\"error\",\"error\":{{\"type\":\"rate_limit_error\",\"message\":\"slow \
+             down {key}\\nx-api-key: {key}\"}}}}"
+        );
+        (429, Box::leak(body.into_boxed_str()))
+    });
+    let capsule = Capsule::new(&upstream, ApiKey::Reference, "trace:\n  capture: content\n");
+    capsule.set_credential(OLD);
+    let run = capsule.run(None);
+
+    assert_eq!(upstream.requests().len(), 1, "{}", run.context());
+    let record = run.the_failed_call();
+    println!("{record}");
+    assert_eq!(record["error_code"], "driver_error", "{record}");
+    assert_eq!(record["provider_status"], 429, "{record}");
+    let error = record["error"].as_str().unwrap();
+    assert!(error.contains("[redacted]"), "{error}");
+    assert!(error.contains("HTTP 429"), "{error}");
+    let task_failed = &run.of_type("task_failed")[0];
+    assert_eq!(task_failed["cause"], "driver_error");
+    assert!(
+        task_failed["reason"]
+            .as_str()
+            .unwrap()
+            .contains("[redacted]"),
+        "{task_failed}"
+    );
+    assert_eq!(run.of_type("task_end")[0]["turns"], 0);
+
+    let show = capsule.trace_show();
+    let leaks = capsule.files_holding(OLD);
+    assert!(leaks.is_empty(), "{leaks:?}");
+    for output in [&run, &show] {
+        assert!(!output.stdout.contains(OLD), "stdout: {}", output.context());
+        assert!(!output.stderr.contains(OLD), "stderr: {}", output.context());
+    }
+}

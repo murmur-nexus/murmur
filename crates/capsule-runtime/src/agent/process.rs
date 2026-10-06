@@ -67,7 +67,7 @@ use crate::{
     shell,
     spend::SpendRefusal,
     streaming::{SseBroadcast, SseEventBuffer},
-    trace::{HarnessExit, HarnessStart, TraceWriter},
+    trace::{HarnessExit, HarnessStart, TraceWriter, INFERENCE_ERROR_HARNESS_INACTIVE},
     types::{ResumeMode, StagedProcessDriver},
     CapabilityPolicy,
 };
@@ -866,6 +866,7 @@ async fn run_harness(
         session,
         Arc::clone(&store_state.spend),
         a2a,
+        store_state.gateways.clone(),
     );
     let outcome = drive_harness(
         store_state,
@@ -1246,10 +1247,20 @@ async fn drive_harness(
             Ok(AgentLoopExit::SpendCeilingReached)
         }
         RunEnd::Inactive => {
-            write_harness_exit(trace, &exit, "inactivity", spawned_at).await;
-            Err(RuntimeError::ProcessHarnessInactive {
+            let error = RuntimeError::ProcessHarnessInactive {
                 seconds: inactivity.as_secs(),
-            })
+            };
+            let _ = sink
+                .record_failed_call(
+                    hooks,
+                    trace,
+                    otel,
+                    INFERENCE_ERROR_HARNESS_INACTIVE,
+                    &error.to_string(),
+                )
+                .await;
+            write_harness_exit(trace, &exit, "inactivity", spawned_at).await;
+            Err(error)
         }
         // Only an interrupt ends the loop this way, and an interrupted run has already returned.
         RunEnd::Interrupted => {

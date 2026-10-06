@@ -41,8 +41,10 @@ use crate::{
         StreamStatus, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
     },
     trace::{
-        TraceWriter, WireCapture, TASK_FAILED_COMPACTION_HOOK, TASK_FAILED_CREDENTIAL_REJECTED,
-        TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT, TASK_FAILED_MALFORMED_RESPONSE,
+        FailedInference, TraceWriter, WireCapture, INFERENCE_ERROR_DRIVER_FAILED,
+        INFERENCE_ERROR_MALFORMED_RESPONSE, TASK_FAILED_COMPACTION_HOOK,
+        TASK_FAILED_CREDENTIAL_REJECTED, TASK_FAILED_DRIVER_ERROR, TASK_FAILED_INPUT_TIMEOUT,
+        TASK_FAILED_MALFORMED_RESPONSE,
     },
     types::ResumeMode,
 };
@@ -1167,6 +1169,12 @@ pub(crate) async fn run_agent_loop(
             }
         };
 
+        // The status the gateway receives during this dispatch belongs to this call; whatever an
+        // earlier request left behind is discarded first.
+        let gateway = store_state.gateways.inference_for(&choice.driver).cloned();
+        if let Some(gateway) = &gateway {
+            gateway.take_upstream_status();
+        }
         let inference_started = Instant::now();
         // Raced rather than awaited: a cancel must stop the provider call in flight rather than
         // wait it out. Losing the race drops the `call_async` future, which disposes the guest
@@ -1226,11 +1234,27 @@ pub(crate) async fn run_agent_loop(
             &store_state.a2a_tool_calls,
             Instant::now(),
         );
+        let provider_status = gateway
+            .as_ref()
+            .and_then(|gateway| gateway.take_upstream_status());
+        let failed_call = |error_code: &'static str, error: String| FailedTurnCall {
+            turn: turn_u32,
+            error_code,
+            error,
+            provider_status,
+            choice: has_alternates.then_some(&choice),
+        };
         let driver_result = match dispatched {
             Ok(r) => r,
             Err(e) => {
                 // Driver dispatch failed (e.g. WASM instantiation error, import mismatch).
                 let msg = format!("driver invocation failed: {e}");
+                failed_call(
+                    INFERENCE_ERROR_DRIVER_FAILED,
+                    store_state.gateways.redact(&msg),
+                )
+                .write(trace, None, message_ids)
+                .await;
                 *ending = Some(AttemptEnding::failed(msg.clone()));
                 return Err(RuntimeError::AgentLoopFailed(msg));
             }
@@ -1251,16 +1275,24 @@ pub(crate) async fn run_agent_loop(
         }
 
         if !matches!(driver_result.status, Status::Passed) {
+            let data = driver_result.data.or(driver_result.summary);
             let (cause, error_text) = match credential_failure(store_state, &choice) {
                 Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
                 None => (
                     TASK_FAILED_DRIVER_ERROR,
-                    driver_result
-                        .data
-                        .or(driver_result.summary)
-                        .unwrap_or_else(|| "driver returned error".to_string()),
+                    store_state
+                        .gateways
+                        .redact(data.as_deref().unwrap_or("driver returned error")),
                 ),
             };
+            // A failed call's payload is read only for a `usage` block the provider reported.
+            let usage = data
+                .as_deref()
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                .and_then(|response| parse_driver_usage(&response));
+            failed_call(cause, error_text.clone())
+                .write(trace, usage.as_ref(), message_ids)
+                .await;
             return finish_failed_turn(
                 hooks,
                 trace,
@@ -1275,19 +1307,35 @@ pub(crate) async fn run_agent_loop(
             .await;
         }
 
-        let raw = driver_result
+        let Some(raw) = driver_result
             .data
             .as_deref()
             .or(driver_result.summary.as_deref())
-            .ok_or_else(|| RuntimeError::AgentLoopFailed("driver returned no data".to_string()))?;
+        else {
+            let msg = "driver returned no data";
+            failed_call(INFERENCE_ERROR_MALFORMED_RESPONSE, msg.to_string())
+                .write(trace, None, message_ids)
+                .await;
+            return Err(RuntimeError::AgentLoopFailed(msg.to_string()));
+        };
 
         let output_tokens = count_tokens(raw);
         session_tokens = session_tokens.saturating_add(output_tokens);
         admission.settle(u64::from(input_tokens), u64::from(output_tokens));
 
-        let response: Value = serde_json::from_str(raw).map_err(|e| {
-            RuntimeError::AgentLoopFailed(format!("failed to parse driver response: {e}"))
-        })?;
+        let response: Value = match serde_json::from_str(raw) {
+            Ok(response) => response,
+            Err(e) => {
+                let msg = format!("failed to parse driver response: {e}");
+                failed_call(
+                    INFERENCE_ERROR_MALFORMED_RESPONSE,
+                    store_state.gateways.redact(&msg),
+                )
+                .write(trace, None, message_ids)
+                .await;
+                return Err(RuntimeError::AgentLoopFailed(msg));
+            }
+        };
 
         // The provider's own counts, when the driver reported them. Recorded alongside the
         // estimate, never in place of it and never fed back into `session_tokens`.
@@ -1345,6 +1393,50 @@ pub(crate) async fn run_agent_loop(
         // handling the event just emitted above — flush whatever it buffered
         // before writing this turn's own record.
         flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+        // A response that says the call failed is recorded as the failed call it is: no estimate,
+        // no wire hash, and no turn counted, the same record every other failed call writes.
+        if stop_reason == "error" {
+            let (cause, error) = match credential_failure(store_state, &choice) {
+                Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
+                None => {
+                    let error = store_state.gateways.redact(
+                        response
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("driver returned error"),
+                    );
+                    crate::runtime_err!("inference error from driver: {error}");
+                    (TASK_FAILED_DRIVER_ERROR, error)
+                }
+            };
+            failed_call(cause, error.clone())
+                .write(trace, driver_usage.as_ref(), message_ids)
+                .await;
+            otel.emit_inference(
+                turn_u32,
+                Some(u64::from(input_tokens)),
+                Some(u64::from(output_tokens)),
+                decision,
+                Some(stop_reason),
+                hook_tool_name.as_deref(),
+                inference_duration_ms,
+                None,
+                driver_usage.as_ref(),
+            )
+            .await;
+            return finish_failed_turn(
+                hooks,
+                trace,
+                otel,
+                workdir,
+                ending,
+                turn_u32,
+                cause,
+                &error,
+                SESSION_ENDED_STATUS_MESSAGE,
+            )
+            .await;
+        }
         // What this turn actually put on the wire, taken back out of the payload that was
         // serialized and dispatched above rather than rebuilt beside it — a second construction
         // is a second thing to drift. `None` under `trace.capture: none`, the one mode that
@@ -1381,32 +1473,6 @@ pub(crate) async fn run_agent_loop(
             driver_usage.as_ref(),
         )
         .await;
-        if stop_reason == "error" {
-            let (cause, error) = match credential_failure(store_state, &choice) {
-                Some(message) => (TASK_FAILED_CREDENTIAL_REJECTED, message),
-                None => {
-                    let error = response
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("driver returned error")
-                        .to_string();
-                    crate::runtime_err!("inference error from driver: {error}");
-                    (TASK_FAILED_DRIVER_ERROR, error)
-                }
-            };
-            return finish_failed_turn(
-                hooks,
-                trace,
-                otel,
-                workdir,
-                ending,
-                turn_u32,
-                cause,
-                &error,
-                SESSION_ENDED_STATUS_MESSAGE,
-            )
-            .await;
-        }
 
         // Persist (or drop) the driver's continuation state for this Turn BEFORE the compaction
         // check. A non-empty id establishes/renews the continuation scoped to this context, with
@@ -1987,6 +2053,46 @@ async fn finish_failed_turn(
     Ok(AgentLoopExit::Failed)
 }
 
+/// An agent-loop driver call that failed, as its `inference` record names it.
+struct FailedTurnCall<'a> {
+    turn: u32,
+    /// One of the `INFERENCE_ERROR_*` constants.
+    error_code: &'static str,
+    /// Already redacted, or the runtime's own credential rejection message.
+    error: String,
+    provider_status: Option<u16>,
+    choice: Option<&'a DriverChoice>,
+}
+
+impl FailedTurnCall<'_> {
+    /// Write the call's failed `inference` record. The call is not counted as a turn and carries
+    /// no token estimate: `usage` is what the provider reported, when it reported anything.
+    ///
+    /// A write error is dropped, as `task_failed`'s is: the failure the record describes is what
+    /// the attempt ends on, not the trace.
+    async fn write(
+        self,
+        trace: &mut TraceWriter,
+        usage: Option<&DriverUsage>,
+        message_ids: Vec<String>,
+    ) {
+        let _ = trace
+            .write_failed_inference(FailedInference {
+                turn: self.turn,
+                error_code: self.error_code,
+                error: &self.error,
+                provider_status: self.provider_status,
+                usage,
+                origin: None,
+                choice: self.choice,
+                message_ids,
+                tool_name: None,
+                spent: None,
+            })
+            .await;
+    }
+}
+
 /// The final status message of an attempt that completed, or that [`finish_failed_turn`] ended
 /// other than on an input-wait timeout.
 pub(crate) const SESSION_ENDED_STATUS_MESSAGE: &str = "session ended";
@@ -2301,29 +2407,11 @@ async fn flush_hook_inference_records(
         refusals.push(refused.refusal);
     }
     for record in hooks.drain_inference_records() {
-        let _ = trace
-            .write_inference(
-                turn,
-                Some(record.input_tokens),
-                Some(record.output_tokens),
-                record.decision.clone(),
-                // A hook names its own `decision` from its own completion and never saw a
-                // provider stop reason, so there is none to record.
-                None,
-                None,
-                Some(&record.origin),
-                record.usage.as_ref(),
-                // A hook's own completion sent a message list the runtime never held, so there
-                // are no runtime message ids to name — and, for the same reason, no payload the
-                // runtime built and could hash.
-                Vec::new(),
-                None,
-            )
-            .await;
+        let _ = write_hook_inference_record(trace, turn, &record).await;
         otel.emit_inference(
             turn,
             Some(record.input_tokens),
-            Some(record.output_tokens),
+            Some(record.output_tokens.unwrap_or(0)),
             &record.decision,
             None,
             None,
@@ -2334,6 +2422,55 @@ async fn flush_hook_inference_records(
         .await;
     }
     refusals
+}
+
+/// Write one buffered hook `run-inference` record as its `inference` line. A failed call is
+/// written as one, counted like every hook record with the input the runtime sent and no output,
+/// since none came back.
+async fn write_hook_inference_record(
+    trace: &mut TraceWriter,
+    turn: u32,
+    record: &crate::inference_import::HookInferenceRecord,
+) -> std::io::Result<()> {
+    match &record.failure {
+        Some(failure) => {
+            trace
+                .write_failed_inference(FailedInference {
+                    turn,
+                    error_code: failure.code,
+                    error: &failure.error,
+                    provider_status: failure.provider_status,
+                    usage: record.usage.as_ref(),
+                    origin: Some(&record.origin),
+                    choice: None,
+                    message_ids: Vec::new(),
+                    tool_name: None,
+                    spent: Some((Some(record.input_tokens), None)),
+                })
+                .await
+        }
+        None => {
+            trace
+                .write_inference(
+                    turn,
+                    Some(record.input_tokens),
+                    record.output_tokens,
+                    record.decision.clone(),
+                    // A hook names its own `decision` from its own completion and never saw a
+                    // provider stop reason, so there is none to record.
+                    None,
+                    None,
+                    Some(&record.origin),
+                    record.usage.as_ref(),
+                    // A hook's own completion sent a message list the runtime never held, so
+                    // there are no runtime message ids to name — and, for the same reason, no
+                    // payload the runtime built and could hash.
+                    Vec::new(),
+                    None,
+                )
+                .await
+        }
+    }
 }
 
 /// The session's pre-dispatch decision point, in one place so every route to a call reaches the
@@ -4811,6 +4948,48 @@ forgery: {prompt}"
         )
         .await
         .unwrap()
+    }
+
+    /// A hook's failed `run-inference` is written with its origin, model and failure, keeps the
+    /// input every hook record carries, and writes no output count.
+    #[tokio::test]
+    async fn a_failed_hook_inference_record_names_its_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trace = content_capture_writer(dir.path()).await;
+        let record = crate::inference_import::HookInferenceRecord {
+            origin: crate::trace::InferenceOrigin {
+                source: "hook:compactor".to_string(),
+                model: "test-model".to_string(),
+            },
+            input_tokens: 42,
+            output_tokens: None,
+            decision: "error".to_string(),
+            duration_ms: 3,
+            usage: None,
+            failure: Some(crate::inference_import::HookInferenceFailure {
+                code: crate::trace::INFERENCE_ERROR_DRIVER_ERROR,
+                message: "inference driver returned an error: HTTP 500: boom".to_string(),
+                error: "inference driver returned an error: HTTP 500: boom".to_string(),
+                provider_status: Some(500),
+                usage: None,
+            }),
+        };
+        write_hook_inference_record(&mut trace, 2, &record)
+            .await
+            .unwrap();
+        trace.flush().await.unwrap();
+
+        let event = read_one_event(dir.path());
+        assert_eq!(event["origin"], "hook:compactor");
+        assert_eq!(event["model"], "test-model");
+        assert_eq!(event["turn"], 2);
+        assert_eq!(event["decision"], "error");
+        assert_eq!(event["stop_reason"], "error");
+        assert_eq!(event["error_code"], "driver_error");
+        assert_eq!(event["provider_status"], 500);
+        assert!(event["error"].as_str().unwrap().contains("HTTP 500: boom"));
+        assert_eq!(event["input_tokens"], 42);
+        assert!(event.get("output_tokens").is_none());
     }
 
     /// The single event a byte-fidelity test's writer produced.
