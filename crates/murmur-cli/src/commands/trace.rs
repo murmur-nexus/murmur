@@ -223,7 +223,59 @@ struct InferenceEvent {
     response_sha: Option<String>,
     #[serde(default)]
     message_shas: Vec<String>,
+    /// Why the call failed, on a record whose `decision` is `"error"`. Absent on every call that
+    /// returned an answer.
+    #[serde(default)]
+    error_code: Option<String>,
+    /// The failure in words, credentials already redacted by the runtime.
+    #[serde(default)]
+    error: Option<String>,
+    /// The HTTP status the runtime's credential gateway received for the failed call.
+    #[serde(default)]
+    provider_status: Option<u16>,
 }
+
+impl InferenceEvent {
+    /// The call's failure, when the record says it failed.
+    fn failure(&self) -> Option<FailedCall> {
+        self.error_code.as_ref().map(|code| FailedCall {
+            error_code: code.clone(),
+            error: self.error.clone().unwrap_or_default(),
+            provider_status: self.provider_status,
+        })
+    }
+
+    /// A failed call of the agent loop's own: recorded on its turn, never counted as one.
+    fn is_failed_agent_loop_call(&self) -> bool {
+        self.origin.is_none() && self.error_code.is_some()
+    }
+
+    /// Whether `mur trace steps` counts this record as one of the session's turns.
+    fn is_steps_turn(&self) -> bool {
+        self.origin.is_none() && !self.is_failed_agent_loop_call()
+    }
+}
+
+/// One model call that failed, as its `inference` record names it.
+#[derive(Debug, Clone)]
+struct FailedCall {
+    error_code: String,
+    error: String,
+    provider_status: Option<u16>,
+}
+
+impl FailedCall {
+    /// `credential_rejected  HTTP 401`: the code, then the status when the provider answered.
+    fn label(&self) -> String {
+        match self.provider_status {
+            Some(status) => format!("{}  HTTP {status}", self.error_code),
+            None => self.error_code.clone(),
+        }
+    }
+}
+
+/// The most of a failed call's `error` the Turns section prints, in characters.
+const FAILED_CALL_ERROR_CHARS: usize = 200;
 
 #[derive(Debug, Deserialize)]
 struct ToolCallEvent {
@@ -881,9 +933,30 @@ struct InferenceRecord {
     /// The driver choice and model that served an agent-loop turn, on a capsule that declares
     /// alternates. `None` on every other record.
     served_by: Option<(String, String)>,
+    /// Why the call failed, on a record that says it did.
+    failure: Option<FailedCall>,
 }
 
 impl InferenceRecord {
+    fn from_event(e: InferenceEvent) -> Self {
+        let served_by = e
+            .driver_choice
+            .clone()
+            .map(|choice| (choice, e.model.clone().unwrap_or_default()));
+        let failure = e.failure();
+        InferenceRecord {
+            turn: e.turn,
+            decision: e.decision,
+            origin: e.origin,
+            system_sha: e.system_sha,
+            tools_sha: e.tools_sha,
+            response_sha: e.response_sha,
+            message_shas: e.message_shas,
+            served_by,
+            failure,
+        }
+    }
+
     /// This record belongs to the agent loop's own turn sequence rather than to a hook.
     fn is_agent_loop(&self) -> bool {
         self.origin.is_none()
@@ -1734,20 +1807,7 @@ fn compute_metrics(
                         .get_or_insert_with(ProviderTokens::default)
                         .add(&e);
                 }
-                let served_by = e
-                    .driver_choice
-                    .clone()
-                    .map(|choice| (choice, e.model.clone().unwrap_or_default()));
-                inference_records.push(InferenceRecord {
-                    turn: e.turn,
-                    decision: e.decision,
-                    origin: e.origin,
-                    system_sha: e.system_sha,
-                    tools_sha: e.tools_sha,
-                    response_sha: e.response_sha,
-                    message_shas: e.message_shas,
-                    served_by,
-                });
+                inference_records.push(InferenceRecord::from_event(e));
             }
             TraceEvent::ToolCall(e) => {
                 tool_latencies.push(e.duration_ms);
@@ -2483,6 +2543,9 @@ fn print_show(m: &TraceMetrics) {
 
     println!("── Turns ────────────────────────────────────────");
     println!("count:      {}  (max: {})", m.total_turns, m.max_turns);
+    for line in failed_call_lines(&m.inference_records) {
+        println!("{line}");
+    }
     println!();
 
     println!("── Tokens ───────────────────────────────────────");
@@ -3064,7 +3127,8 @@ impl WireIndex {
                 TraceEvent::SessionStart(e) => {
                     note(e.system_prompt_sha256.as_ref(), &mut known_hashes);
                 }
-                TraceEvent::Inference(e) => {
+                // A failed call sent no body the runtime kept, so `--turn` never offers it.
+                TraceEvent::Inference(e) if !e.is_failed_agent_loop_call() => {
                     let record = InferenceRecord {
                         turn: e.turn,
                         decision: e.decision,
@@ -3074,6 +3138,7 @@ impl WireIndex {
                         response_sha: e.response_sha,
                         message_shas: e.message_shas,
                         served_by: None,
+                        failure: None,
                     };
                     note(record.system_sha.as_ref(), &mut known_hashes);
                     note(record.tools_sha.as_ref(), &mut known_hashes);
@@ -3607,8 +3672,20 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
         TraceEvent::Inference(e) => match &e.origin {
             // A hook's completion is not a turn of the agent loop; it hangs off the turn it
             // ran inside.
-            Some(origin) => format!("{}{}  {}", kind("inference"), origin, e.decision),
+            Some(origin) => match e.failure() {
+                Some(failure) => format!(
+                    "{}{}  {}  {}",
+                    kind("inference"),
+                    origin,
+                    e.decision,
+                    failure.label()
+                ),
+                None => format!("{}{}  {}", kind("inference"), origin, e.decision),
+            },
             None => {
+                if let Some(failure) = e.failure() {
+                    return Some(format!("turn {}  error  {}", e.turn, failure.label()));
+                }
                 // A turn the provider cut off at the output cap, named on the line rather than
                 // left to be read out of the raw event.
                 let capped = match e.stop_reason.as_deref() {
@@ -3897,7 +3974,7 @@ fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
                 tasks += 1;
                 task_nodes.insert(e.task_id.as_str(), i);
             }
-            TraceEvent::Inference(e) if e.origin.is_none() => turns += 1,
+            TraceEvent::Inference(e) if e.is_steps_turn() => turns += 1,
             _ => {}
         }
     }
@@ -4321,6 +4398,40 @@ fn print_diff(a: &TraceMetrics, b: &TraceMetrics) {
         b.exit_status.as_str(),
         "—"
     );
+}
+
+/// The Turns section's lines for every failed call, in trace order: the turn, the hook that made
+/// it, its code and status, then its error, cut to [`FAILED_CALL_ERROR_CHARS`], on a line of its
+/// own under the value column.
+fn failed_call_lines(records: &[InferenceRecord]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for rec in records {
+        let Some(failure) = &rec.failure else {
+            continue;
+        };
+        let origin = rec
+            .origin
+            .as_deref()
+            .map(|origin| format!("{origin}  "))
+            .unwrap_or_default();
+        lines.push(format!(
+            "failed:     turn {}  {origin}{}",
+            rec.turn,
+            failure.label()
+        ));
+        let mut error: String = failure
+            .error
+            .chars()
+            .take(FAILED_CALL_ERROR_CHARS)
+            .collect();
+        if failure.error.chars().count() > FAILED_CALL_ERROR_CHARS {
+            error.push('…');
+        }
+        if !error.is_empty() {
+            lines.push(format!("            {error}"));
+        }
+    }
+    lines
 }
 
 /// The agent loop's own turns that recorded wire hashes, in file order.
@@ -4860,6 +4971,81 @@ mod tests {
             event: serde_json::from_str::<TraceEvent>(line).expect("the record should parse"),
         };
         steps_row(&record, false).expect("the record renders a row")
+    }
+
+    const FAILED_REJECTION: &str = r#"{"event_type":"inference","event_id":"evt_2","session_id":"s","timestamp":1,"turn":0,"task_id":"tsk_1","decision":"error","stop_reason":"error","tool_name":null,"error_code":"credential_rejected","error":"the provider rejected the inference credential credentials.KEY in /h/config.yaml (HTTP 401)","provider_status":401}"#;
+    const FAILED_TRAP: &str = r#"{"event_type":"inference","event_id":"evt_3","session_id":"s","timestamp":1,"turn":1,"task_id":"tsk_1","decision":"error","stop_reason":"error","tool_name":null,"error_code":"driver_failed","error":"driver invocation failed: wasm trap: unreachable"}"#;
+    const FAILED_HOOK: &str = r#"{"event_type":"inference","event_id":"evt_4","session_id":"s","timestamp":1,"turn":2,"task_id":"tsk_1","input_tokens":40,"decision":"error","stop_reason":"error","tool_name":null,"origin":"hook:compactor","model":"m","error_code":"driver_error","error":"inference driver returned an error: HTTP 500: boom","provider_status":500}"#;
+    const ANSWERED_TURN: &str = r#"{"event_type":"inference","event_id":"evt_5","session_id":"s","timestamp":1,"turn":0,"task_id":"tsk_1","input_tokens":10,"output_tokens":5,"decision":"end_turn","stop_reason":"end_turn","tool_name":null}"#;
+
+    fn inference_event(line: &str) -> InferenceEvent {
+        match serde_json::from_str::<TraceEvent>(line).unwrap() {
+            TraceEvent::Inference(e) => e,
+            other => panic!("expected an inference event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_turns_section_lists_each_failed_call_in_trace_order() {
+        let records: Vec<InferenceRecord> =
+            [ANSWERED_TURN, FAILED_REJECTION, FAILED_TRAP, FAILED_HOOK]
+                .into_iter()
+                .map(|line| InferenceRecord::from_event(inference_event(line)))
+                .collect();
+        assert_eq!(
+            failed_call_lines(&records),
+            [
+                "failed:     turn 0  credential_rejected  HTTP 401",
+                "            the provider rejected the inference credential credentials.KEY in /h/config.yaml (HTTP 401)",
+                "failed:     turn 1  driver_failed",
+                "            driver invocation failed: wasm trap: unreachable",
+                "failed:     turn 2  hook:compactor  driver_error  HTTP 500",
+                "            inference driver returned an error: HTTP 500: boom",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_failed_call_error_is_cut_to_two_hundred_characters() {
+        let line = FAILED_TRAP.replace(
+            "driver invocation failed: wasm trap: unreachable",
+            &"é".repeat(250),
+        );
+        let lines = failed_call_lines(&[InferenceRecord::from_event(inference_event(&line))]);
+        assert_eq!(lines[1], format!("            {}…", "é".repeat(200)));
+    }
+
+    #[test]
+    fn a_failed_call_renders_its_code_and_status_on_its_steps_row() {
+        assert_eq!(
+            row(FAILED_REJECTION),
+            "turn 0  error  credential_rejected  HTTP 401"
+        );
+        assert_eq!(row(FAILED_TRAP), "turn 1  error  driver_failed");
+        assert!(
+            row(FAILED_HOOK).ends_with("hook:compactor  error  driver_error  HTTP 500"),
+            "{}",
+            row(FAILED_HOOK)
+        );
+        assert_eq!(row(ANSWERED_TURN), "turn 0  end_turn");
+    }
+
+    #[test]
+    fn a_failed_agent_loop_call_is_neither_a_steps_turn_nor_a_wire_turn() {
+        assert!(!inference_event(FAILED_REJECTION).is_steps_turn());
+        assert!(!inference_event(FAILED_HOOK).is_steps_turn());
+        assert!(inference_event(ANSWERED_TURN).is_steps_turn());
+
+        let events = [FAILED_REJECTION, FAILED_TRAP]
+            .into_iter()
+            .map(|line| serde_json::from_str::<TraceEvent>(line).unwrap())
+            .collect();
+        let index = WireIndex::build(events);
+        assert!(
+            index.turn(0).is_none(),
+            "--turn 0 does not offer a failed call"
+        );
+        assert!(index.turns.is_empty());
     }
 
     #[test]

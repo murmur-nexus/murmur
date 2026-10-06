@@ -17363,6 +17363,14 @@ inference:
     }
 
     impl ReopenRun {
+        /// Every trace event of `event_type`, in order.
+        fn of_type(&self, event_type: &str) -> Vec<&serde_json::Value> {
+            self.events
+                .iter()
+                .filter(|event| event["event_type"] == event_type)
+                .collect()
+        }
+
         /// The data of every `status` frame with `"final":true`.
         fn final_statuses(&self) -> Vec<&serde_json::Value> {
             self.frames
@@ -17663,6 +17671,10 @@ inference:
         max_task_reopens: u32,
         /// The body the driver double answers every call with.
         driver_response: &'static str,
+        /// The `tool-result.status` the driver double answers with: `0` passed, `2` error.
+        driver_status: u32,
+        /// Whether the driver double traps on every call instead of answering.
+        driver_traps: bool,
         /// Whether `tsk_1` runs as an A2A task whose frames are collected in [`ReopenRun::frames`].
         streamed: bool,
     }
@@ -17683,6 +17695,8 @@ inference:
                 max_turns: 10,
                 max_task_reopens: 5,
                 driver_response: HTTP_REOPEN_RESPONSE,
+                driver_status: 0,
+                driver_traps: false,
                 streamed: false,
             }
         }
@@ -17702,15 +17716,19 @@ inference:
         );
         if let Some(metadata) = scenario.driver_metadata.as_deref() {
             fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
-            state.tool_components.insert(
-                "mock-driver".to_string(),
+            let driver = if scenario.driver_traps {
+                crate::inference_import::test_support::trapping_driver_double(&state.engine)
+            } else {
                 crate::inference_import::test_support::driver_double_with_metadata(
                     &state.engine,
-                    0,
+                    scenario.driver_status,
                     scenario.driver_response,
                     metadata,
-                ),
-            );
+                )
+            };
+            state
+                .tool_components
+                .insert("mock-driver".to_string(), driver);
         }
         let inference = InferenceConfig {
             transport: "http".into(),
@@ -18642,6 +18660,137 @@ inference:
         let last = the_one_final_status(&run);
         assert_eq!(last["status"]["state"], "failed");
         assert_eq!(last["status"]["message"], error.as_str());
+    }
+
+    /// The `inference` records of a run that are failed calls.
+    fn failed_inference_records(run: &ReopenRun) -> Vec<&serde_json::Value> {
+        run.events
+            .iter()
+            .filter(|e| e["event_type"] == "inference" && e.get("error_code").is_some())
+            .collect()
+    }
+
+    /// Asserts `record` is a failed agent-loop call that carries no estimate and no hash.
+    fn assert_uncounted_failed_record(record: &serde_json::Value, error_code: &str) {
+        assert_eq!(record["decision"], "error", "{record}");
+        assert_eq!(record["stop_reason"], "error", "{record}");
+        assert_eq!(record["error_code"], error_code, "{record}");
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "system_sha",
+            "tools_sha",
+            "response_sha",
+            "message_shas",
+            "origin",
+        ] {
+            assert!(record.get(key).is_none(), "{key} on {record}");
+        }
+    }
+
+    /// A driver that reports its call failed — by `status: error`, or by `passed` with a
+    /// `stop_reason: "error"` response — leaves one failed `inference` record per attempt, and
+    /// the failed call spends none of the task's turns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_driver_call_is_recorded_and_not_counted() {
+        for status in [2, 0] {
+            let run = run_http_reopen(HttpReopen {
+                reopen_limit: 1,
+                max_turns: 10,
+                driver_response: r#"{"stop_reason":"error","error":"HTTP 503: upstream down"}"#,
+                driver_status: status,
+                ..HttpReopen::answering(ConversationMode::Stateless)
+            })
+            .await;
+            let failed = failed_inference_records(&run);
+            assert_eq!(failed.len(), 2, "status {status}: {:#?}", run.events);
+            for record in &failed {
+                assert_uncounted_failed_record(record, "driver_error");
+                assert!(
+                    record["error"].as_str().unwrap().contains("HTTP 503"),
+                    "{record}"
+                );
+                assert!(record.get("provider_status").is_none(), "{record}");
+            }
+            assert_eq!(
+                run.events
+                    .iter()
+                    .filter(|e| e["event_type"] == "inference")
+                    .count(),
+                2,
+                "status {status}: no other inference record"
+            );
+            let reopened = run.of_type("task_reopened");
+            assert_eq!(reopened.len(), 1, "status {status}");
+            assert_eq!(reopened[0]["turns_remaining"], 10, "status {status}");
+            let task_end = run.of_type("task_end");
+            assert_eq!(task_end[0]["turns"], 0, "status {status}");
+            let causes: Vec<_> = run
+                .of_type("task_failed")
+                .iter()
+                .map(|e| e["cause"].clone())
+                .collect();
+            assert_eq!(causes, ["driver_error", "driver_error"], "status {status}");
+            // The record comes before the attempt's `task_failed`.
+            let position = |predicate: &dyn Fn(&serde_json::Value) -> bool| {
+                run.events.iter().position(predicate).unwrap()
+            };
+            assert!(
+                position(&|e| e.get("error_code").is_some())
+                    < position(&|e| e["event_type"] == "task_failed")
+            );
+        }
+    }
+
+    /// A driver that answers `passed` with no usable body leaves a `malformed_response` record,
+    /// and the attempt ends as it always has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_driver_response_is_recorded() {
+        for (response, text) in [
+            ("not json", "failed to parse driver response"),
+            ("", "failed to parse driver response"),
+        ] {
+            let run = run_http_reopen(HttpReopen {
+                reopen_limit: 0,
+                driver_response: response,
+                ..HttpReopen::answering(ConversationMode::Stateless)
+            })
+            .await;
+            assert!(run.result.is_err(), "{:?}", run.result);
+            let failed = failed_inference_records(&run);
+            assert_eq!(failed.len(), 1, "{response:?}: {:#?}", run.events);
+            assert_uncounted_failed_record(failed[0], "malformed_response");
+            assert!(
+                failed[0]["error"].as_str().unwrap().contains(text),
+                "{}",
+                failed[0]
+            );
+            let task_failed = run.of_type("task_failed");
+            assert_eq!(task_failed.len(), 1);
+            assert_eq!(task_failed[0]["cause"], "runtime_error");
+        }
+    }
+
+    /// A driver that traps leaves a `driver_failed` record naming the trap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trapping_driver_is_recorded_as_driver_failed() {
+        let run = run_http_reopen(HttpReopen {
+            reopen_limit: 0,
+            driver_traps: true,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        assert!(run.result.is_err(), "{:?}", run.result);
+        let failed = failed_inference_records(&run);
+        assert_eq!(failed.len(), 1, "{:#?}", run.events);
+        assert_uncounted_failed_record(failed[0], "driver_failed");
+        let error = failed[0]["error"].as_str().unwrap();
+        assert!(error.starts_with("driver invocation failed:"), "{error}");
+        assert!(
+            error.contains("unreachable") || error.contains("trap"),
+            "{error}"
+        );
+        assert_eq!(run.of_type("task_failed")[0]["cause"], "runtime_error");
     }
 
     /// A process task a hook reopens once streams one boundary frame between its two attempts

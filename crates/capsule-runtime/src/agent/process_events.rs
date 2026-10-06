@@ -33,13 +33,17 @@ use serde_json::Value;
 
 use crate::{
     agent::DriverUsage,
+    credential_gateway::GatewayTable,
     errors::RuntimeError,
     hooks::{HookArtifact, HookEvent, HookRuntime},
     otel::OtelEmitter,
     process_driver::{Event, FailureKind, Usage},
     spend::{SpendMeter, SpendRefusal},
     streaming::StreamArtifact,
-    trace::TraceWriter,
+    trace::{
+        FailedInference, TraceWriter, INFERENCE_ERROR_HARNESS_AUTH, INFERENCE_ERROR_HARNESS_ERROR,
+        INFERENCE_ERROR_HARNESS_OTHER, INFERENCE_ERROR_HARNESS_QUOTA,
+    },
 };
 
 use super::process::RunSession;
@@ -202,6 +206,8 @@ pub(super) struct ProcessEventSink<'a> {
     /// The A2A half of the same events. Borrowed rather than owned, because the attempt reads its
     /// ending from it after this sink is done with the run.
     a2a: &'a mut A2aStream,
+    /// The session's gateways, whose credentials are redacted out of a failed call's `error`.
+    gateways: GatewayTable,
 }
 
 impl<'a> ProcessEventSink<'a> {
@@ -211,6 +217,7 @@ impl<'a> ProcessEventSink<'a> {
         session: RunSession,
         spend: Arc<SpendMeter>,
         a2a: &'a mut A2aStream,
+        gateways: GatewayTable,
     ) -> Self {
         Self {
             workdir: workdir.to_path_buf(),
@@ -227,6 +234,7 @@ impl<'a> ProcessEventSink<'a> {
             produced: false,
             session_gone: false,
             a2a,
+            gateways,
         }
     }
 
@@ -547,8 +555,15 @@ impl<'a> ProcessEventSink<'a> {
             Event::TurnFailed(failure) => {
                 // The failure is the run's own account of itself and outranks a ceiling the same
                 // turn reached: the harness said why it stopped, and that is what is reported. A
-                // failed attempt forwards no hook artifact.
-                let _ = self.close_turn(hooks, trace, otel).await;
+                // failed attempt forwards no hook artifact. A budget or a cancel is no failed
+                // model call, so its open turn closes as an ordinary one.
+                let _ = match failed_call_code(failure.kind) {
+                    Some(code) => {
+                        self.record_failed_call(hooks, trace, otel, code, &failure.message)
+                            .await
+                    }
+                    None => self.close_turn(hooks, trace, otel).await,
+                };
                 self.a2a.turn_failed();
                 let kind = failure_kind_name(failure.kind);
                 let _ = trace
@@ -637,10 +652,61 @@ impl<'a> ProcessEventSink<'a> {
         trace: &mut TraceWriter,
         otel: &mut OtelEmitter,
     ) -> Result<Vec<HookArtifact>, SinkOutcome> {
+        self.close_turn_as(hooks, trace, otel, None).await
+    }
+
+    /// Record a model call the harness failed, with `error_code` from the `INFERENCE_ERROR_*`
+    /// vocabulary and `message` with the session's credentials redacted.
+    ///
+    /// A turn that is open closes exactly as [`Self::close_turn`] closes it — counted, with the
+    /// harness's own counts, its OTel span, its `on-inference` hook and its spend charge — except
+    /// that its record and its `decision` say it failed. With no turn open the record is written
+    /// at the turn that would open next and counts nothing.
+    pub(super) async fn record_failed_call(
+        &mut self,
+        hooks: &mut HookRuntime,
+        trace: &mut TraceWriter,
+        otel: &mut OtelEmitter,
+        error_code: &'static str,
+        message: &str,
+    ) -> Result<Vec<HookArtifact>, SinkOutcome> {
+        let error = self.gateways.redact(message);
+        if self.open.is_none() {
+            let _ = trace
+                .write_failed_inference(FailedInference {
+                    turn: self.turns,
+                    error_code,
+                    error: &error,
+                    provider_status: None,
+                    usage: None,
+                    origin: None,
+                    choice: None,
+                    message_ids: Vec::new(),
+                    tool_name: None,
+                    spent: None,
+                })
+                .await;
+            return Ok(Vec::new());
+        }
+        self.close_turn_as(hooks, trace, otel, Some((error_code, &error)))
+            .await
+    }
+
+    /// [`Self::close_turn`], recording the turn as a failed call when `failure` names one as
+    /// `(error_code, error)`.
+    async fn close_turn_as(
+        &mut self,
+        hooks: &mut HookRuntime,
+        trace: &mut TraceWriter,
+        otel: &mut OtelEmitter,
+        failure: Option<(&'static str, &str)>,
+    ) -> Result<Vec<HookArtifact>, SinkOutcome> {
         let Some(open) = self.open.take() else {
             return Ok(Vec::new());
         };
-        let decision = if open.first_tool.is_some() {
+        let decision = if failure.is_some() {
+            "error"
+        } else if open.first_tool.is_some() {
             "tool_call"
         } else {
             "end_turn"
@@ -655,22 +721,43 @@ impl<'a> ProcessEventSink<'a> {
             cache_write_tokens: spent.cache_creation,
             thinking_tokens: spent.thinking,
         });
-        let _ = trace
-            .write_inference(
-                open.index,
-                spent.input,
-                spent.output,
-                decision.to_string(),
-                // The runtime reads no driver response of its own on this transport, so there is
-                // no provider stop reason and no request payload to hash.
-                None,
-                open.first_tool.clone(),
-                None,
-                reported.as_ref(),
-                Vec::new(),
-                None,
-            )
-            .await;
+        let _ = match failure {
+            Some((error_code, error)) => {
+                trace
+                    .write_failed_inference(FailedInference {
+                        turn: open.index,
+                        error_code,
+                        error,
+                        // A harness reports no HTTP status.
+                        provider_status: None,
+                        usage: reported.as_ref(),
+                        origin: None,
+                        choice: None,
+                        message_ids: Vec::new(),
+                        tool_name: open.first_tool.clone(),
+                        spent: Some((spent.input, spent.output)),
+                    })
+                    .await
+            }
+            None => {
+                trace
+                    .write_inference(
+                        open.index,
+                        spent.input,
+                        spent.output,
+                        decision.to_string(),
+                        // The runtime reads no driver response of its own on this transport, so
+                        // there is no provider stop reason and no request payload to hash.
+                        None,
+                        open.first_tool.clone(),
+                        None,
+                        reported.as_ref(),
+                        Vec::new(),
+                        None,
+                    )
+                    .await
+            }
+        };
         otel.emit_inference(
             open.index,
             spent.input,
@@ -744,6 +831,18 @@ fn produces_observable_work(event: &Event) -> bool {
             | Event::ToolCallProgress(_)
             | Event::TurnEnd(_)
     )
+}
+
+/// The `inference.error_code` a harness failure of `kind` records, or `None` for a kind that is
+/// a budget or a cancel rather than a failed model call.
+fn failed_call_code(kind: FailureKind) -> Option<&'static str> {
+    match kind {
+        FailureKind::Auth => Some(INFERENCE_ERROR_HARNESS_AUTH),
+        FailureKind::Quota => Some(INFERENCE_ERROR_HARNESS_QUOTA),
+        FailureKind::HarnessError => Some(INFERENCE_ERROR_HARNESS_ERROR),
+        FailureKind::Other => Some(INFERENCE_ERROR_HARNESS_OTHER),
+        FailureKind::MaxTurns | FailureKind::Canceled => None,
+    }
 }
 
 /// The WIT spelling of a `failure-kind`, which is what the error and the trace both name.
@@ -971,6 +1070,7 @@ mod tests {
                 session,
                 Arc::clone(&self.spend),
                 &mut self.a2a,
+                GatewayTable::default(),
             );
             let outcome = sink
                 .consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
@@ -978,6 +1078,34 @@ mod tests {
             self.turn = sink.current_turn();
             self.carried = sink.finish(&mut self.trace).await;
             outcome
+        }
+
+        /// [`Self::feed`], then the harness goes silent past the inactivity timeout before the
+        /// run reads another line: the sink records the failed call as `process.rs`'s
+        /// `RunEnd::Inactive` arm does.
+        async fn feed_then_go_quiet(&mut self, events: Vec<Event>) {
+            let session = RunSession::new(&self.plan, &self.policy, HARNESS, "fixture-driver");
+            let mut sink = ProcessEventSink::new(
+                &self.workdir,
+                self.max_turns,
+                session,
+                Arc::clone(&self.spend),
+                &mut self.a2a,
+                GatewayTable::default(),
+            );
+            sink.consume(events, &mut self.hooks, &mut self.trace, &mut self.otel)
+                .await;
+            let _ = sink
+                .record_failed_call(
+                    &mut self.hooks,
+                    &mut self.trace,
+                    &mut self.otel,
+                    crate::trace::INFERENCE_ERROR_HARNESS_INACTIVE,
+                    "the harness went quiet",
+                )
+                .await;
+            self.turn = sink.current_turn();
+            self.carried = sink.finish(&mut self.trace).await;
         }
 
         /// Each frame the A2A stream wrote, labelled by kind, in order.
@@ -1386,6 +1514,101 @@ mod tests {
             !h.workdir.join("out/result.txt").exists(),
             "a failed turn produces no result"
         );
+    }
+
+    /// A harness `auth` failure with a turn open records that turn as the failed call it was,
+    /// counted with the harness's own counts, ahead of the `harness_failed` line.
+    #[tokio::test]
+    async fn an_auth_failure_records_the_open_turn_as_a_failed_call() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![
+            text("partial"),
+            usage(&[("in", 10), ("out", 5)]),
+            Event::TurnFailed(TurnFailure {
+                kind: FailureKind::Auth,
+                message: "not signed in".into(),
+            }),
+        ])
+        .await;
+        let events = h.events().await;
+        let inference = h.of_type("inference").await;
+        assert_eq!(inference.len(), 1);
+        let record = &inference[0];
+        assert_eq!(record["turn"], 0);
+        assert_eq!(record["decision"], "error");
+        assert_eq!(record["stop_reason"], "error");
+        assert_eq!(record["error_code"], "harness_auth");
+        assert_eq!(record["error"], "not signed in");
+        assert_eq!(record["input_tokens"], 10);
+        assert_eq!(record["output_tokens"], 5);
+        assert!(record.get("provider_status").is_none());
+        assert_eq!(h.trace.task_turns(), 1, "the open turn stays counted");
+        let position = |event_type: &str| {
+            events
+                .iter()
+                .position(|event| event["event_type"] == event_type)
+                .unwrap()
+        };
+        assert!(position("inference") < position("harness_failed"));
+        assert_eq!(h.of_type("harness_failed").await[0]["kind"], "auth");
+    }
+
+    /// A harness failure with no turn open records one failed call that counts nothing.
+    #[tokio::test]
+    async fn a_quota_failure_with_no_open_turn_records_an_uncounted_call() {
+        let mut h = Harness::new(10).await;
+        h.feed(vec![Event::TurnFailed(TurnFailure {
+            kind: FailureKind::Quota,
+            message: "out of credit".into(),
+        })])
+        .await;
+        let inference = h.of_type("inference").await;
+        assert_eq!(inference.len(), 1);
+        assert_eq!(inference[0]["turn"], 0);
+        assert_eq!(inference[0]["error_code"], "harness_quota");
+        assert!(inference[0].get("input_tokens").is_none());
+        assert!(inference[0].get("output_tokens").is_none());
+        assert!(inference[0].get("provider_status").is_none());
+        assert_eq!(h.trace.task_turns(), 0);
+        assert_eq!(h.of_type("harness_failed").await.len(), 1);
+    }
+
+    /// A budget or a cancel is not a failed model call: its open turn closes as an ordinary one.
+    #[tokio::test]
+    async fn max_turns_and_canceled_failures_record_no_failed_call() {
+        for kind in [FailureKind::MaxTurns, FailureKind::Canceled] {
+            let mut h = Harness::new(10).await;
+            h.feed(vec![
+                text("partial"),
+                Event::TurnFailed(TurnFailure {
+                    kind,
+                    message: "stopped".into(),
+                }),
+            ])
+            .await;
+            let inference = h.of_type("inference").await;
+            assert_eq!(inference.len(), 1, "{kind:?}");
+            assert_eq!(inference[0]["decision"], "end_turn", "{kind:?}");
+            assert!(inference[0].get("error_code").is_none(), "{kind:?}");
+            assert!(inference[0].get("provider_status").is_none(), "{kind:?}");
+        }
+    }
+
+    /// A harness that goes quiet mid-turn leaves its open turn recorded as a failed call.
+    #[tokio::test]
+    async fn an_inactive_harness_records_its_open_turn_as_a_failed_call() {
+        let mut h = Harness::new(10).await;
+        h.feed_then_go_quiet(vec![text("thinking"), usage(&[("in", 4), ("out", 2)])])
+            .await;
+        let inference = h.of_type("inference").await;
+        assert_eq!(inference.len(), 1);
+        assert_eq!(inference[0]["turn"], 0);
+        assert_eq!(inference[0]["decision"], "error");
+        assert_eq!(inference[0]["error_code"], "harness_inactive");
+        assert_eq!(inference[0]["error"], "the harness went quiet");
+        assert_eq!(inference[0]["input_tokens"], 4);
+        assert!(inference[0].get("provider_status").is_none());
+        assert_eq!(h.trace.task_turns(), 1);
     }
 
     /// Nothing after the first terminal event in a batch is acted on: the run is over.

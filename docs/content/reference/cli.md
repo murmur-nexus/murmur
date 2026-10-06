@@ -2343,6 +2343,15 @@ Every `--body` failure exits non-zero with [`E-TRC-001`](diagnostics.md):
 
 The **Tasks** section appears only for sessions that ran more than one task.
 
+The **Turns** section lists every [failed model call](observability-schemas.md#inference-failed) under `count:`, in trace order. Each gets two lines: `failed:` with the turn, the hook that made the call (for a hook's `run-inference`), the [`error_code`](observability-schemas.md#inference-error-code) and the provider's HTTP status when there was one; then the call's `error`, cut to 200 characters with a trailing `…`. A failed agent-loop call is not counted in `count:`. For a capsule whose provider rejected its key:
+
+```text
+── Turns ────────────────────────────────────────
+count:      0  (max: 10)
+failed:     turn 0  credential_rejected  HTTP 401
+            the provider rejected the inference credential credentials.OPENAI_API_KEY in /home/me/.murmur/config.yaml (HTTP 401)
+```
+
 Below the **Tool calls** summary line, each turn that made at least one tool call gets its own row: tool name, duration, a `✓`/`✗` status icon, and — when the call carried an `input` — its compact-JSON input, truncated to 120 characters with a trailing `…` if longer. A call with no recorded input shows no input segment at all.
 
 Example (single-task session — no Tasks section):
@@ -2495,6 +2504,19 @@ A failed attempt renders as a `task_failed` row under its task, naming the
 ```text
 task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
   task_failed driver_error  {"error":"driver: failed to parse Anthropic response JSON: EOF while parsing a string at line 1 column 38","stop_reason"
+```
+
+A [failed model call](observability-schemas.md#inference-failed) renders on its turn row as
+`error`, its [`error_code`](observability-schemas.md#inference-error-code) and the provider's HTTP
+status when there was one; a hook's failed `run-inference` adds the same to its `inference` row. A
+failed agent-loop call is not counted in the header's turns:
+
+```text
+Session ses_019f01a940ce7761854e768ecbe3d399  (1 task, 0 turns)
+
+task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
+  turn 0  error  credential_rejected  HTTP 401
+  task_failed credential_rejected  the provider rejected the inference credential credentials.OPENAI_API_KEY in /home/me/.murmur/config.yaml…
 ```
 
 A task the session refused when it stopped taking work renders as a `task_rejected` row under the

@@ -27,7 +27,10 @@ use crate::{
     network_policy::{NetworkAllowRule, ToolCapabilityGrant},
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
     spend::{SpendMeter, SpendRefusal},
-    trace::InferenceOrigin,
+    trace::{
+        InferenceOrigin, INFERENCE_ERROR_CREDENTIAL_REJECTED, INFERENCE_ERROR_DRIVER_ERROR,
+        INFERENCE_ERROR_DRIVER_FAILED, INFERENCE_ERROR_MALFORMED_RESPONSE,
+    },
     types::CapabilityPolicy,
 };
 
@@ -47,15 +50,35 @@ pub(crate) struct HookInferenceRecord {
     /// span, distinguishing this from an agent-loop turn.
     pub(crate) origin: InferenceOrigin,
     pub(crate) input_tokens: u64,
-    pub(crate) output_tokens: u64,
+    /// The runtime's tiktoken count of the completion. `None` for a failed call, which
+    /// returned none.
+    pub(crate) output_tokens: Option<u64>,
     /// `"end_turn"` when the driver returned a usable completion, `"error"`
     /// otherwise.
     pub(crate) decision: String,
     pub(crate) duration_ms: u64,
     /// The provider's own counts, when the driver reported them. Recorded beside
     /// `input_tokens`/`output_tokens` — which stay this runtime's tiktoken counts —
-    /// and never substituted for them. `None` for a failed call, which has no response
-    /// to read a `usage` block from.
+    /// and never substituted for them. For a failed call, only a `usage` block the
+    /// driver's error payload carried.
+    pub(crate) usage: Option<DriverUsage>,
+    /// Why the call failed. `Some` exactly when `decision` is `"error"`.
+    pub(crate) failure: Option<HookInferenceFailure>,
+}
+
+/// Why one `run-inference` call failed: what the guest is told, and what the trace records.
+#[derive(Debug, Clone)]
+pub(crate) struct HookInferenceFailure {
+    /// One of the `INFERENCE_ERROR_*` constants.
+    pub(crate) code: &'static str,
+    /// The `err` string handed back to the guest.
+    pub(crate) message: String,
+    /// The `inference.error` text: the rejection message for a credential rejection, otherwise
+    /// `message` with the context gateway's credential redacted.
+    pub(crate) error: String,
+    /// The HTTP status the context's gateway received for the call, when it received one.
+    pub(crate) provider_status: Option<u16>,
+    /// A `usage` block the driver's error payload carried.
     pub(crate) usage: Option<DriverUsage>,
 }
 
@@ -163,7 +186,7 @@ impl HookInferenceCtx {
         let outcome = self.dispatch(payload_json).await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
-        let (output_tokens, usage, result) = match outcome {
+        let (output_tokens, usage, failure, result) = match outcome {
             Ok((raw, text, usage)) => {
                 // `input-tokens`/`output-tokens` on the WIT response are documented as the
                 // runtime's own tiktoken counts, so a driver-reported `usage` never lands
@@ -171,8 +194,9 @@ impl HookInferenceCtx {
                 let output_tokens = u64::from(count_tokens(&raw));
                 admission.settle(input_tokens, output_tokens);
                 (
-                    output_tokens,
+                    Some(output_tokens),
                     usage,
+                    None,
                     Ok(InferenceResponse {
                         text,
                         // Echoed, not driver-confirmed — the response never
@@ -183,9 +207,10 @@ impl HookInferenceCtx {
                     }),
                 )
             }
-            Err(err) => {
+            Err(failure) => {
                 drop(admission);
-                (0, None, Err(err))
+                let message = failure.message.clone();
+                (None, failure.usage.clone(), Some(failure), Err(message))
             }
         };
 
@@ -199,6 +224,7 @@ impl HookInferenceCtx {
             decision: if result.is_ok() { "end_turn" } else { "error" }.to_string(),
             duration_ms,
             usage,
+            failure,
         });
 
         result
@@ -210,7 +236,35 @@ impl HookInferenceCtx {
     async fn dispatch(
         &self,
         payload_json: String,
-    ) -> Result<(String, String, Option<DriverUsage>), String> {
+    ) -> Result<(String, String, Option<DriverUsage>), HookInferenceFailure> {
+        // The status the gateway receives during this dispatch belongs to this call.
+        if let Some(gateway) = &self.gateway {
+            gateway.take_upstream_status();
+        }
+        let outcome = self.dispatch_driver(payload_json).await;
+        let provider_status = self
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.take_upstream_status());
+        outcome.map_err(|(code, message, usage)| HookInferenceFailure {
+            code,
+            error: match code {
+                INFERENCE_ERROR_CREDENTIAL_REJECTED => message.clone(),
+                _ => self.redact(&message),
+            },
+            message,
+            provider_status,
+            usage,
+        })
+    }
+
+    /// [`Self::dispatch`] without the status bookkeeping. `Err` is `(error_code, guest message,
+    /// usage the failed payload carried)`.
+    async fn dispatch_driver(
+        &self,
+        payload_json: String,
+    ) -> Result<(String, String, Option<DriverUsage>), (&'static str, String, Option<DriverUsage>)>
+    {
         let result = invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
@@ -236,30 +290,61 @@ impl HookInferenceCtx {
             },
         )
         .await
-        .map_err(|e| format!("inference driver '{}' failed: {e}", self.driver_name))?;
+        .map_err(|e| {
+            (
+                INFERENCE_ERROR_DRIVER_FAILED,
+                format!("inference driver '{}' failed: {e}", self.driver_name),
+                None,
+            )
+        })?;
 
-        let raw = result
-            .data
-            .or(result.summary)
-            .ok_or_else(|| "inference driver returned no data".to_string())?;
-        if !matches!(result.status, Status::Passed) {
+        let passed = matches!(result.status, Status::Passed);
+        let raw = result.data.or(result.summary).ok_or_else(|| {
+            (
+                if passed {
+                    INFERENCE_ERROR_MALFORMED_RESPONSE
+                } else {
+                    INFERENCE_ERROR_DRIVER_ERROR
+                },
+                "inference driver returned no data".to_string(),
+                None,
+            )
+        })?;
+        if !passed {
             if let Some(message) = self.credential_failure() {
-                return Err(message);
+                return Err((INFERENCE_ERROR_CREDENTIAL_REJECTED, message, None));
             }
-            return Err(format!("inference driver returned an error: {raw}"));
+            let usage = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|response| parse_driver_usage(&response));
+            return Err((
+                INFERENCE_ERROR_DRIVER_ERROR,
+                format!("inference driver returned an error: {raw}"),
+                usage,
+            ));
         }
 
-        let response: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("failed to parse inference driver response: {e}"))?;
+        let response: Value = serde_json::from_str(&raw).map_err(|e| {
+            (
+                INFERENCE_ERROR_MALFORMED_RESPONSE,
+                format!("failed to parse inference driver response: {e}"),
+                None,
+            )
+        })?;
         if response.get("stop_reason").and_then(Value::as_str) == Some("error") {
+            let usage = parse_driver_usage(&response);
             if let Some(message) = self.credential_failure() {
-                return Err(message);
+                return Err((INFERENCE_ERROR_CREDENTIAL_REJECTED, message, usage));
             }
             let err = response
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("driver returned error");
-            return Err(format!("inference driver returned an error: {err}"));
+            return Err((
+                INFERENCE_ERROR_DRIVER_ERROR,
+                format!("inference driver returned an error: {err}"),
+                usage,
+            ));
         }
 
         let text = response_text(&response);
@@ -279,6 +364,18 @@ impl HookInferenceCtx {
             crate::runtime_err!("{err}");
         }
         Some(message)
+    }
+
+    /// `text` with the context gateway's credential redacted.
+    fn redact(&self, text: &str) -> String {
+        match self
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.credential())
+        {
+            Some(credential) => credential.redact(text),
+            None => text.to_string(),
+        }
     }
 
     fn record(&self, record: HookInferenceRecord) {
@@ -429,6 +526,46 @@ pub(crate) mod test_support {
         response: &str,
     ) -> Component {
         driver_double_with_metadata(engine, status, response, &[])
+    }
+
+    /// A `murmur:tool/run@0.1.0` component whose `run` executes `unreachable`: a driver that
+    /// traps on every call.
+    pub(crate) fn trapping_driver_double(engine: &wasmtime::Engine) -> Component {
+        let wat = r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (i32.const 1024))
+    (func (export "run") (param i32 i32 i32 i32 i32 i32) (result i32)
+      unreachable)
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $status (enum "passed" "failed" "error"))
+  (type $tool-input (record
+    (field "data" (option string))
+    (field "log-path" (option string))))
+  (type $tool-result (record
+    (field "status" $status)
+    (field "summary" (option string))
+    (field "data" (option string))
+    (field "data-path" (option string))
+    (field "truncated" bool)
+    (field "metadata" (list (tuple string string)))))
+  (type $ft (func (param "input" $tool-input) (result $tool-result)))
+  (func $run (type $ft)
+    (canon lift (core func $i "run") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (instance $ti
+    (export "status" (type $status))
+    (export "tool-input" (type $tool-input))
+    (export "tool-result" (type $tool-result))
+    (export "run" (func $run)))
+  (export "murmur:tool/run@0.1.0" (instance $ti))
+)"#;
+        let bytes = wat::parse_str(wat).expect("trapping driver double WAT parses");
+        Component::new(engine, &bytes).expect("trapping driver double compiles")
     }
 
     /// [`driver_double`], answering with `metadata` on every call — a `continuation_id` entry
@@ -829,6 +966,46 @@ mod tests {
             assert_eq!(meter.used(), 0, "{case}: nothing was charged");
             assert!(!meter.has_open_admission(), "{case}");
         }
+    }
+
+    /// A driver `status: error` reporting a provider error buffers a failed record naming its
+    /// code and error, with no output count, while the guest's `err` is the text it always was.
+    #[test]
+    fn run_inference_driver_error_status_records_its_failure() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+        let response = r#"{"stop_reason":"error","error":"HTTP 500: boom"}"#;
+        let ctx = ctx(&engine, dir.path(), driver_double(&engine, 2, response));
+
+        let err = block_on(ctx.run("hook:compactor", request(None))).expect_err("an error");
+        assert_eq!(
+            err,
+            format!("inference driver returned an error: {response}")
+        );
+
+        let records = ctx.drain_records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.origin.source, "hook:compactor");
+        assert_eq!(record.origin.model, "manifest-model");
+        assert_eq!(record.decision, "error");
+        assert_eq!(record.input_tokens, expected_input_tokens("manifest-model"));
+        assert_eq!(record.output_tokens, None);
+        let failure = record
+            .failure
+            .as_ref()
+            .expect("a failed call names its failure");
+        assert_eq!(failure.code, "driver_error");
+        assert_eq!(failure.message, err);
+        assert!(
+            failure.error.contains("HTTP 500: boom"),
+            "{}",
+            failure.error
+        );
+        assert_eq!(
+            failure.provider_status, None,
+            "the context holds no gateway"
+        );
     }
 
     /// A non-`passed` tool status from the driver is also an `Err`.
