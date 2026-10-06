@@ -17,7 +17,7 @@ The relevant manifest options are:
 | [inference.system_prompt](../reference/manifest.md#inference-system-prompt) | What each member is told it is for |
 
 The output below is from one real run with OpenAI as the provider and `HOME` set to a scratch
-directory, `/tmp/crew-run-6ad9/attempt1/home`. Your ids, ports, pids, timings and paths will differ.
+directory, `/tmp/crew-run-d078/home`. Your ids, ports, pids, timings and paths will differ.
 
 ---
 
@@ -225,10 +225,10 @@ cd ..
 ```
 
 ```text
-No murmur.yaml in /tmp/crew-run-6ad9/attempt1/work/crew: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.
+No murmur.yaml in /tmp/crew-run-d078/work/crew: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.
 
 Roster
-  file: /tmp/crew-run-6ad9/attempt1/work/crew/roster.yaml
+  file: /tmp/crew-run-d078/work/crew/roster.yaml
   lead     crew-lead@0.1.0     entry   refuses peers   authenticated door
   worker   crew-worker@0.1.0           serves peers    authenticated door
   reachability: lead → worker
@@ -248,14 +248,14 @@ mur run --roster crew --task "Write a four-line poem about a lighthouse keeper."
 
 ```text
 …
-formation: frm_01a10ef7dc157711be1b4edae2068392
-  peer   worker  crew-worker@0.1.0  pid 2111819  ses_01a10ef7dc8f74f1b54f350429d2f28f  http://localhost:40023
-                 workdir /tmp/crew-run-6ad9/attempt1/home/.murmur/formations/frm_01a10ef7dc157711be1b4edae2068392/worker
+formation: frm_01a1100295f47ea3b227ddf4612759f3
+  peer   worker  crew-worker@0.1.0  pid 2768649  ses_01a11002968476428a785ab0b3ae4fbb  http://localhost:39151
+                 workdir /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker
   entry  lead    starting
 …
-murmur: url localhost:45907
+murmur: url localhost:42759
 …
-session: ses_01a10ef7dd337c33a0c23e71a86950b4
+session: ses_01a11002984c7bd0ad3a7b1927d94d5d
 status:  ok
 [worker] [capsule-runtime] formation lifeline closed — the formation has ended; cancelling live tasks and ending the session
 ```
@@ -292,12 +292,48 @@ as `worker`'s door holds the task, and `lead`'s model ends its turn. `worker` ru
 own directory and answers. `lead`'s same task then continues with one new message holding
 `worker`'s answer, fenced as coming from `member:worker`, and `lead` answers with it.
 
-In `lead`'s trace, `crew/.murmur/<lead session>/trace.jsonl`, the call and its outcome are two
-records:
+From here on, work in the `crew` directory. Name the formation by its id. `mur trace show`
+searches `lead`'s sessions and every member's directory under `~/.murmur/formations/`:
+
+```bash
+cd crew
+mur trace show frm_01a1100295f47ea3b227ddf4612759f3
+```
+
+--8<-- "includes/mur-trace-show-info.md"
+
+--8<-- "includes/mur-trace-explore.md"
+
+```text
+── Formation ────────────────────────────────────
+formation:  frm_01a1100295f47ea3b227ddf4612759f3
+searched:   /tmp/crew-run-d078/work/crew/workdir
+searched:   /tmp/crew-run-d078/work/crew/.murmur
+searched:   /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+ses_01a11002968476428a785ab0b3ae4fbb  worker  crew-worker@0.1.0  ok
+ses_01a11002984c7bd0ad3a7b1927d94d5d  lead    crew-lead@0.1.0    ok  may call worker
+calls:      1
+mcl_01a11002a5d57021b9017e9e2e31a465  lead → worker  completed  2.0s  delivered
+```
+
+| Line | Means |
+|---|---|
+| `searched:` | Each session root searched: the roster directory's, then each peer's own |
+| `worker …` | `worker`'s session: its roster name, its capsule, and how it ended |
+| `lead … may call worker` | `lead`'s session, and the member the roster lets it call |
+| `calls:      1` | The formation made one `call-member` call |
+| `mcl_… lead → worker …` | The call: its id, who called whom, `completed`, how long `worker` took to answer, and `delivered` because the answer reached `lead`'s task |
+
+In a larger formation each call made inside a handed-over task is nested under the call that
+handed it over, and a call one side of which was not found carries a note saying which. See
+[Listing a formation](../reference/cli.md#mur-trace-show-formation).
+
+The call row comes from three records. In `lead`'s trace,
+`.murmur/<lead session>/trace.jsonl`, the call and its outcome:
 
 ```json
-{"event_type":"member_call_start","event_id":"evt_01a10ef7ec767c12bf1fa580cdd42074","parent_id":"evt_01a10ef7dd537631bcba4c8ff3646c06","session_id":"ses_01a10ef7dd337c33a0c23e71a86950b4","timestamp":1791252491382,"task_id":"tsk_01a10ef7dd5c73a3bbc8938fdbd4aed5","call_id":"mcl_01a10ef7ec687f62b54d2914c5d81e85","member":"worker","member_task_id":"tsk_01a10ef7ec6b7e008be4474317266baf"}
-{"event_type":"member_call","event_id":"evt_01a10ef7f6d47703bb490e966f4659eb","parent_id":"evt_01a10ef7dd537631bcba4c8ff3646c06","session_id":"ses_01a10ef7dd337c33a0c23e71a86950b4","timestamp":1791252494036,"task_id":"tsk_01a10ef7dd5c73a3bbc8938fdbd4aed5","call_id":"mcl_01a10ef7ec687f62b54d2914c5d81e85","member":"worker","member_task_id":"tsk_01a10ef7ec6b7e008be4474317266baf","status":"completed","duration_ms":2525,"output":"He tends the lamp where restless black waves roll,  \nA steady star to sailors lost at sea.  \nThrough wind and night, he guards each drifting soul,  \nAnd keeps the dawn alive for you and me.","truncated":false,"delivered":true}
+{"event_type":"member_call_start","event_id":"evt_01a11002a5e27232b8c9a161b0aa15e5","parent_id":"evt_01a1100298c178d1a950c189b9b5a2c0","session_id":"ses_01a11002984c7bd0ad3a7b1927d94d5d","timestamp":1791269971426,"task_id":"tsk_01a1100298c57060b6d732feee045060","call_id":"mcl_01a11002a5d57021b9017e9e2e31a465","member":"worker","member_task_id":"tsk_01a11002a5db7fe0a98b4e4e743aa444"}
+{"event_type":"member_call","event_id":"evt_01a11002adcb7e2394fcf3c1d0e04cd9","parent_id":"evt_01a1100298c178d1a950c189b9b5a2c0","session_id":"ses_01a11002984c7bd0ad3a7b1927d94d5d","timestamp":1791269973451,"task_id":"tsk_01a1100298c57060b6d732feee045060","call_id":"mcl_01a11002a5d57021b9017e9e2e31a465","member":"worker","member_task_id":"tsk_01a11002a5db7fe0a98b4e4e743aa444","status":"completed","duration_ms":2037,"output":"He tends the lamp while black waves climb,  \nA steady star against the night,  \nThrough salt and storm, he keeps his time,  \nGuiding lost sails toward the light.","truncated":false,"delivered":true}
 ```
 
 | Field | Here |
@@ -312,109 +348,105 @@ records:
 In `worker`'s trace, the task arrives named for the member that sent it:
 
 ```json
-{"event_type":"a2a_task_received","event_id":"evt_01a10ef7ec6b7e008be44762f2430fd8","parent_id":"evt_01a10ef7dca87682be084f7dffd77c90","session_id":"ses_01a10ef7dc8f74f1b54f350429d2f28f","timestamp":1791252491371,"task_id":"tsk_01a10ef7ec6b7e008be4474317266baf","context_id":"ctx_01a10ef7ec6b7e008be4475e8e8d1800","message_id":"msg_mcl_01a10ef7ec687f62b54d2914c5d81e85","traceparent_from_caller":null,"caller_member":"lead"}
+{"event_type":"a2a_task_received","event_id":"evt_01a11002a5dc79e2bd4a5bf91768acba","parent_id":"evt_01a11002969c75d28c8244f84ad1425f","session_id":"ses_01a11002968476428a785ab0b3ae4fbb","timestamp":1791269971420,"task_id":"tsk_01a11002a5db7fe0a98b4e4e743aa444","context_id":"ctx_01a11002a5db7fe0a98b4e57a39f2e8a","message_id":"msg_mcl_01a11002a5d57021b9017e9e2e31a465","traceparent_from_caller":null,"caller_member":"lead"}
 ```
 
-Its `task_id` is the call's `member_task_id`, and `caller_member` is `lead`. See
+`mur trace show` matches this record to the call by its `task_id`, the call's `member_task_id`.
+`caller_member` is `lead`, and the message id carries the call id. See
 [`call-member`](../reference/runtime-provided-tools.md#call-member) and the
 [`member_call`](../reference/observability-schemas.md#member-call) record.
 
-`lead`'s answer, and so the formation's, is in its session's `out/result.txt`. From here on, work
-in the `crew` directory:
+`lead`'s answer, and so the formation's, is in its session's `out/result.txt`:
 
 ```bash
-cd crew
-cat .murmur/ses_01a10ef7dd337c33a0c23e71a86950b4/out/result.txt
+cat .murmur/ses_01a11002984c7bd0ad3a7b1927d94d5d/out/result.txt
 ```
 
 ```text
-He tends the lamp where restless black waves roll,  
-A steady star to sailors lost at sea.  
-Through wind and night, he guards each drifting soul,  
-And keeps the dawn alive for you and me.
+He tends the lamp while black waves climb,  
+A steady star against the night,  
+Through salt and storm, he keeps his time,  
+Guiding lost sails toward the light.
 ```
 
 ---
 
-## Step 7 — find both members in the trace
-
-From the `crew` directory, name the formation by its id. `mur trace show` searches `lead`'s
-sessions and every member's directory under `~/.murmur/formations/`:
-
-```bash
-mur trace show frm_01a10ef7dc157711be1b4edae2068392
-```
-
---8<-- "includes/mur-trace-show-info.md"
-
---8<-- "includes/mur-trace-explore.md"
-
-```text
-── Formation ────────────────────────────────────
-formation:  frm_01a10ef7dc157711be1b4edae2068392
-searched:   /tmp/crew-run-6ad9/attempt1/work/crew/workdir
-searched:   /tmp/crew-run-6ad9/attempt1/work/crew/.murmur
-searched:   /tmp/crew-run-6ad9/attempt1/home/.murmur/formations/frm_01a10ef7dc157711be1b4edae2068392/worker/.murmur
-ses_01a10ef7dc8f74f1b54f350429d2f28f  crew-worker@0.1.0         ok
-ses_01a10ef7dd337c33a0c23e71a86950b4  crew-lead@0.1.0           ok
-```
+## Step 7 — read each member's own trace
 
 Show `lead`'s session from its root, `.murmur`:
 
 ```bash
-mur trace show ses_01a10ef7dd337c33a0c23e71a86950b4 --workdir .murmur
+mur trace show ses_01a11002984c7bd0ad3a7b1927d94d5d --workdir .murmur
 ```
 
 ```text
 ── Session ──────────────────────────────────────
-session:    ses_01a10ef7dd337c33a0c23e71a86950b4
-formation:  frm_01a10ef7dc157711be1b4edae2068392
+session:    ses_01a11002984c7bd0ad3a7b1927d94d5d
+formation:  frm_01a1100295f47ea3b227ddf4612759f3
 capsule:    crew-lead v0.1.0
 model:      gpt-5.6-luna
 status:     ok
-duration:   7.9s
+duration:   7.1s
 capabilities: network
 tools:      call-member
 …
 ── Tool calls ───────────────────────────────────
 count:      1  (1 ok, 0 error)  success 100.0%
-latency:    avg 15ms
-  turn 0  call-member 15ms ✓  {"member":"worker","task":"Write a four-line poem about a lighthouse keeper. Return only the four poetic lines."}
+latency:    avg 13ms
+  turn 0  call-member 13ms ✓  {"member":"worker","task":"Write a four-line poem about a lighthouse keeper. Return only the four-line poem, with exactl…
   turn 1  end_turn
 …
 ── Member calls ─────────────────────────────────
-mcl_01a10ef7ec687f62b54d2914c5d81e85  worker  tsk_01a10ef7ec6b7e008be4474317266baf  completed in 2.5s
-…
+mcl_01a11002a5d57021b9017e9e2e31a465  worker  tsk_01a11002a5db7fe0a98b4e4e743aa444  completed in 2.0s
+
+── Formation ────────────────────────────────────
+formation:  frm_01a1100295f47ea3b227ddf4612759f3
+searched:   .murmur
+searched:   /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+ses_01a11002968476428a785ab0b3ae4fbb  worker  crew-worker@0.1.0  ok
+ses_01a11002984c7bd0ad3a7b1927d94d5d  lead    crew-lead@0.1.0    ok  may call worker
+calls:      1
+mcl_01a11002a5d57021b9017e9e2e31a465  lead → worker  completed  2.0s  delivered
 ```
 
 `tools: call-member` is there because the roster lets `lead` call `worker`. The **Member calls**
-section lists each call with the member, its task id, and how it ended.
+section lists each call this session made with the member, its task id, and how it ended. The
+**Formation** section is the listing from Step 6.
 
 Show `worker`'s session from its own directory:
 
 ```bash
-mur trace show ses_01a10ef7dc8f74f1b54f350429d2f28f --workdir ~/.murmur/formations/frm_01a10ef7dc157711be1b4edae2068392/worker/.murmur
+mur trace show ses_01a11002968476428a785ab0b3ae4fbb --workdir ~/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
 ```
 
 ```text
 ── Session ──────────────────────────────────────
-session:    ses_01a10ef7dc8f74f1b54f350429d2f28f
-formation:  frm_01a10ef7dc157711be1b4edae2068392
+session:    ses_01a11002968476428a785ab0b3ae4fbb
+formation:  frm_01a1100295f47ea3b227ddf4612759f3
 capsule:    crew-worker v0.1.0
 model:      gpt-5.6-luna
 status:     ok
-duration:   8.2s
+duration:   7.7s
 …
 ── Formation ended ──────────────────────────────
-formation_ended  frm_01a10ef7dc157711be1b4edae2068392  the formation ended; this session wound down
+formation_ended  frm_01a1100295f47ea3b227ddf4612759f3  the formation ended; this session wound down
 
 ── A2A ──────────────────────────────────────────
 received:   1 task
 sent:       0 messages
-…
+
+── Formation ────────────────────────────────────
+formation:  frm_01a1100295f47ea3b227ddf4612759f3
+searched:   /tmp/crew-run-d078/home/.murmur/formations/frm_01a1100295f47ea3b227ddf4612759f3/worker/.murmur
+ses_01a11002968476428a785ab0b3ae4fbb  worker  crew-worker@0.1.0  ok
+calls:      1
+mcl_01a11002a5d57021b9017e9e2e31a465  lead → worker  unknown  -    lead's trace not found; worker's task ended ok
 ```
 
-`worker` has no `tools:` line: the roster lets it call nobody, so it has no `call-member`.
+`worker` has no `tools:` line: the roster lets it call nobody, so it has no `call-member`. Its
+Formation section searches its own root and the peers' roots, not the `crew` directory where
+`lead` records, so the call reads `unknown` with `lead's trace not found`. The formation id, run
+from `crew` as in Step 6, finds both sides.
 
 ---
 
@@ -426,7 +458,7 @@ other member's lifeline, and the formation is over:
 1. `worker` appends `formation_ended` to its trace, before anything else its wind-down writes:
 
     ```json
-    {"event_type":"formation_ended","event_id":"evt_01a10ef7fca77141b7c9e8cf78fc1833","parent_id":"evt_01a10ef7dca87682be084f7dffd77c90","session_id":"ses_01a10ef7dc8f74f1b54f350429d2f28f","timestamp":1791252495527,"formation_id":"frm_01a10ef7dc157711be1b4edae2068392"}
+    {"event_type":"formation_ended","event_id":"evt_01a11002b48f78b1ad023e951090a20d","parent_id":"evt_01a11002969c75d28c8244f84ad1425f","session_id":"ses_01a11002968476428a785ab0b3ae4fbb","timestamp":1791269975183,"formation_id":"frm_01a1100295f47ea3b227ddf4612759f3"}
     ```
 
 2. `worker` cancels anything still in flight, ends its session and exits.
@@ -463,5 +495,5 @@ session resumed by hand belongs to no formation. See
 | Key | `mur config set -g credentials.<KEY_VAR> <your key>`, first of the `Next:` steps |
 | Launch | `mur run --roster crew --task "…"` starts the peers, waits for each door, then starts the entry member |
 | Hand-off | `call-member` returns once the callee holds the task; the answer comes back into the caller's same task |
-| Trace | `mur trace show frm_<id>` from the roster's directory lists every member's session; `member_call` in the caller's trace, `a2a_task_received` with `caller_member` in the callee's |
+| Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name and every call: who called whom, how it ended, and whether the answer was delivered. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller_member` in the callee's |
 | End | The entry member exits after its task; every other member records `formation_ended` and exits; the launcher exits with the entry member's status |

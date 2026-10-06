@@ -8466,11 +8466,13 @@ impl CapsuleStoreState {
                 };
                 Ok((result, Some(note)))
             }
-            Err(reason) => {
+            Err(failure) => {
                 drop(claim);
-                let (output, truncated) = bounded(reason);
+                let (output, truncated) = bounded(failure.reason);
+                // The trace tells a busy door's refusal from every other failure to start; the
+                // model reads both as `failed`.
                 if let Some(trace) = &self.peer_trace {
-                    let outcome = unstarted(MemberCallStatus::Failed, output.clone(), truncated);
+                    let outcome = unstarted(failure.status, output.clone(), truncated);
                     trace.write_member_call(&task_id, &outcome, true).await;
                 }
                 let result = murmur::tool::run::ToolResult {
@@ -19756,15 +19758,17 @@ mod member_call_tests {
 
     /// A call the callee's door does not take fails in the same turn: the door's status and
     /// message come back as a failed tool result, no watcher starts, and the one trace line is a
-    /// failed `member_call`. The door saw one bearer token and the stamped provenance.
+    /// `member_call` with no `member_task_id`, `rejected` for a `rejected` answer and `failed`
+    /// otherwise. The door saw one bearer token and the stamped provenance.
     #[tokio::test(flavor = "multi_thread")]
     async fn call_member_refusals_fail_in_the_same_turn() {
-        let answers: Vec<(&'static str, String, &'static str)> = vec![
+        let answers: Vec<(&'static str, String, &'static str, &'static str)> = vec![
             (
                 "403 Forbidden",
                 r#"{"error":"not_permitted","message":"this token is for another door"}"#
                     .to_string(),
                 "403 not_permitted: this token is for another door",
+                "failed",
             ),
             (
                 "200 OK",
@@ -19774,12 +19778,14 @@ mod member_call_tests {
                                 "parts": [{"text": "task rejected: capsule is busy"}]}}}})
                 .to_string(),
                 "rejected: task rejected: capsule is busy",
+                "rejected",
             ),
             (
                 "200 OK",
                 r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params"}}"#
                     .to_string(),
                 "JSON-RPC error -32602: Invalid params",
+                "failed",
             ),
             (
                 "200 OK",
@@ -19787,9 +19793,10 @@ mod member_call_tests {
                     "id": "tsk_r", "contextId": "ctx", "status": {"state": "rejected"}}})
                 .to_string(),
                 "answered the task rejected",
+                "rejected",
             ),
         ];
-        for (status, body, expected) in answers {
+        for (status, body, expected, recorded) in answers {
             let (port, seen) = stand_in_door(vec![(status, body)]);
             let dir = tempfile::tempdir().unwrap();
             let state = calling_state(
@@ -19817,7 +19824,7 @@ mod member_call_tests {
             let lines = trace_lines(dir.path());
             assert_eq!(lines.len(), 1, "{lines:?}");
             assert_eq!(lines[0]["event_type"], "member_call");
-            assert_eq!(lines[0]["status"], "failed");
+            assert_eq!(lines[0]["status"], recorded, "{expected}");
             assert_eq!(lines[0]["delivered"], true);
             assert_eq!(lines[0]["member"], "worker");
             assert_eq!(lines[0]["task_id"], "tsk_caller");
@@ -19853,6 +19860,62 @@ mod member_call_tests {
             assert_eq!(
                 message["messageId"],
                 format!("msg_{}", lines[0]["call_id"].as_str().unwrap())
+            );
+        }
+    }
+
+    /// A busy door's `rejected` answer is recorded `rejected` and a JSON-RPC error `failed`, each
+    /// never held and delivered; the model reads the same failed result for both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_call_a_busy_door_rejected_is_recorded_rejected_not_failed() {
+        let busy = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "id": "tsk_busy", "contextId": "ctx", "status": {"state": "rejected",
+            "message": {"messageId": "m", "role": "agent",
+                        "parts": [{"text": "task rejected: capsule is busy"}]}}}})
+        .to_string();
+        let error =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"#;
+        for (body, recorded, output) in [
+            (
+                busy,
+                "rejected",
+                "worker answered the task rejected: task rejected: capsule is busy",
+            ),
+            (
+                error.to_string(),
+                "failed",
+                "worker's door refused the task with JSON-RPC error -32603: Internal error",
+            ),
+        ] {
+            let (port, _seen) = stand_in_door(vec![("200 OK", body)]);
+            let dir = tempfile::tempdir().unwrap();
+            let state = calling_state(
+                dir.path(),
+                member(&["worker"], &format!("http://localhost:{port}")),
+                &["localhost"],
+            )
+            .await;
+            let (result, note) = state
+                .dispatch_call_member(call("worker", "add 2 and 2"))
+                .await
+                .unwrap();
+            assert!(note.is_none());
+            let lines = trace_lines(dir.path());
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let line = &lines[0];
+            assert_eq!(line["event_type"], "member_call");
+            assert_eq!(line["status"], recorded);
+            assert!(line.get("member_task_id").is_none(), "{line}");
+            assert_eq!(line["delivered"], true);
+            assert_eq!(line["output"], output);
+
+            assert_eq!(result.status, murmur::tool::run::Status::Failed);
+            assert_eq!(result.summary.as_deref(), Some("Called worker: failed"));
+            let data: serde_json::Value = serde_json::from_str(&result.data.unwrap()).unwrap();
+            assert_eq!(
+                data,
+                serde_json::json!({"call_id": line["call_id"], "member": "worker",
+                                   "status": "failed", "output": output})
             );
         }
     }

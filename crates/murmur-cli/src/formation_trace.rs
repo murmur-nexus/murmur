@@ -14,7 +14,7 @@
 //! not found under a searched root is counted, not chased.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -33,6 +33,11 @@ pub(crate) struct RecordedMember {
     pub(crate) session_id: String,
     /// `name@version` from `session_start`.
     pub(crate) capsule: String,
+    /// The roster name, `session_start.formation_member`. `None` for a member's delegated child,
+    /// which the formation launcher handed no credentials.
+    pub(crate) member: Option<String>,
+    /// The members this one may call, `session_start.formation_callees`, in roster order.
+    pub(crate) callees: Vec<String>,
     /// The session that delegated this one, from `session_start`.
     pub(crate) spawned_by: Option<String>,
     /// `exit_status` of the first `session_end`; `None` for a session that wrote none — one still
@@ -40,6 +45,18 @@ pub(crate) struct RecordedMember {
     pub(crate) exit_status: Option<String>,
     /// `child_session_id` of every `delegation_start`, in file order.
     pub(crate) delegated_children: Vec<String>,
+    /// Every `call-member` call this session made, in the order its first line was written.
+    pub(crate) calls_made: Vec<MemberCallRecord>,
+    /// Every task a formation token let in, in the order received. A task with no
+    /// `caller_member` — an operator's, or a plain A2A peer's — is not here.
+    pub(crate) tasks_received: Vec<ReceivedMemberTask>,
+}
+
+impl RecordedMember {
+    /// The roster name, or the session id for a session that has none.
+    fn name(&self) -> &str {
+        self.member.as_deref().unwrap_or(&self.session_id)
+    }
 }
 
 /// What one session root records about a formation.
@@ -52,11 +69,124 @@ pub(crate) struct RecordedMembers {
     pub(crate) children_elsewhere: Vec<String>,
 }
 
-/// The few fields of a trace line this reader needs. Every field defaults, so any JSON object
-/// parses and only the event type decides what is read from it.
+/// One `call-member` call, as its `member_call_start` and `member_call` lines join up on the call
+/// id. A call with no start was never held by its callee; one with no ending is still outstanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberCallRecord {
+    pub(crate) call_id: String,
+    /// The callee's roster name.
+    pub(crate) member: String,
+    /// The caller's task the call was made from.
+    pub(crate) calling_task_id: String,
+    /// The callee's task, `None` for a call it never held.
+    pub(crate) member_task_id: Option<String>,
+    /// The `member_call_start` timestamp, or for a call with none, the `member_call` timestamp
+    /// less its duration.
+    pub(crate) started_ms: u64,
+    /// `None` while the call is outstanding.
+    pub(crate) status: Option<String>,
+    pub(crate) duration_ms: u64,
+    pub(crate) delivered: bool,
+}
+
+/// One `member_call_start` line: a `call-member` call whose callee holds the task.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemberCallStartLine {
+    #[serde(default)]
+    pub(crate) task_id: String,
+    pub(crate) call_id: String,
+    pub(crate) member: String,
+    pub(crate) member_task_id: String,
+    #[serde(default)]
+    pub(crate) timestamp: u64,
+}
+
+/// One `member_call` line: how a `call-member` call ended. A call the callee never held names no
+/// task.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemberCallLine {
+    #[serde(default)]
+    pub(crate) task_id: String,
+    pub(crate) call_id: String,
+    pub(crate) member: String,
+    #[serde(default)]
+    pub(crate) member_task_id: Option<String>,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) duration_ms: u64,
+    #[serde(default)]
+    pub(crate) delivered: bool,
+    #[serde(default)]
+    pub(crate) timestamp: u64,
+}
+
+/// Fold one `member_call_start` line into `calls`.
+///
+/// With [`fold_member_call`], the one rule a call's lines join by, for `mur trace show`'s Member
+/// calls section and for the formation's call list alike.
+pub(crate) fn fold_member_call_start(calls: &mut Vec<MemberCallRecord>, line: MemberCallStartLine) {
+    calls.push(MemberCallRecord {
+        call_id: line.call_id,
+        member: line.member,
+        calling_task_id: line.task_id,
+        member_task_id: Some(line.member_task_id),
+        started_ms: line.timestamp,
+        status: None,
+        duration_ms: 0,
+        delivered: false,
+    });
+}
+
+/// Fold one `member_call` line into `calls`: it ends the first call with its call id that has no
+/// ending yet, or is a call of its own, one its callee never held.
+pub(crate) fn fold_member_call(calls: &mut Vec<MemberCallRecord>, line: MemberCallLine) {
+    match calls
+        .iter_mut()
+        .find(|call| call.call_id == line.call_id && call.status.is_none())
+    {
+        Some(call) => {
+            call.status = Some(line.status);
+            call.duration_ms = line.duration_ms;
+            call.delivered = line.delivered;
+        }
+        None => calls.push(MemberCallRecord {
+            call_id: line.call_id,
+            member: line.member,
+            calling_task_id: line.task_id,
+            member_task_id: line.member_task_id,
+            started_ms: line.timestamp.saturating_sub(line.duration_ms),
+            status: Some(line.status),
+            duration_ms: line.duration_ms,
+            delivered: line.delivered,
+        }),
+    }
+}
+
+/// One task another member handed this one with `call-member`, from its `a2a_task_received`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceivedMemberTask {
+    pub(crate) task_id: String,
+    /// The `mcl_` call id the caller minted, read from the message id `msg_<call id>`; `None`
+    /// for a message id of any other shape.
+    pub(crate) call_id: Option<String>,
+    /// The calling member's roster name, `caller_member`.
+    pub(crate) caller: String,
+    pub(crate) received_ms: u64,
+    /// `exit_status` of the task's `task_end`; `None` while it has none.
+    pub(crate) ending: Option<String>,
+}
+
+/// The call id a `call-member` message id carries: `msg_mcl_…` is call `mcl_…`.
+fn call_id_of_message(message_id: &str) -> Option<String> {
+    message_id
+        .strip_prefix("msg_")
+        .filter(|rest| rest.starts_with("mcl_"))
+        .map(str::to_string)
+}
+
+/// What one `session_start` line says about a session.
 #[derive(Deserialize)]
-struct Line {
-    event_type: String,
+struct SessionStartLine {
     #[serde(default)]
     formation_id: Option<String>,
     #[serde(default)]
@@ -66,9 +196,46 @@ struct Line {
     #[serde(default)]
     spawned_by: Option<String>,
     #[serde(default)]
-    exit_status: Option<String>,
+    formation_member: Option<String>,
     #[serde(default)]
-    child_session_id: Option<String>,
+    formation_callees: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct A2aTaskReceivedLine {
+    task_id: String,
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    caller_member: Option<String>,
+    #[serde(default)]
+    timestamp: u64,
+}
+
+/// The trace lines this reader reads, by `event_type`. Each type reads its own fields only, so a
+/// field one event spells differently never makes another event's line fail to parse.
+#[derive(Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+enum Line {
+    SessionStart(SessionStartLine),
+    SessionEnd {
+        #[serde(default)]
+        exit_status: Option<String>,
+    },
+    DelegationStart {
+        #[serde(default)]
+        child_session_id: Option<String>,
+    },
+    MemberCallStart(MemberCallStartLine),
+    MemberCall(MemberCallLine),
+    A2aTaskReceived(A2aTaskReceivedLine),
+    TaskEnd {
+        task_id: String,
+        #[serde(default)]
+        exit_status: Option<String>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 /// The formation `<session_dir>/trace.jsonl` names on its first line, or `None` when it names
@@ -79,15 +246,16 @@ pub(crate) fn session_formation_id(session_dir: &Path) -> Option<String> {
 }
 
 /// The first non-empty line of a session's trace, if it is a `session_start`.
-fn first_line(session_dir: &Path) -> Option<Line> {
+fn first_line(session_dir: &Path) -> Option<SessionStartLine> {
     let file = fs::File::open(session_dir.join("trace.jsonl")).ok()?;
     let line = BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .find(|line| !line.trim().is_empty())?;
-    serde_json::from_str::<Line>(line.trim())
-        .ok()
-        .filter(|line| line.event_type == "session_start")
+    match serde_json::from_str::<Line>(line.trim()).ok()? {
+        Line::SessionStart(start) => Some(start),
+        _ => None,
+    }
 }
 
 /// Every session under `root` whose `session_start` names `formation`.
@@ -201,35 +369,274 @@ pub(crate) fn search_formation(
     })
 }
 
-/// A member's whole trace, read for its identity, its ending and its delegations.
+/// How one row of a formation's call list ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallEnding {
+    /// The caller recorded a `member_call`.
+    Ended {
+        status: String,
+        duration_ms: u64,
+        delivered: bool,
+    },
+    /// The caller recorded a `member_call_start` and no `member_call`.
+    Outstanding,
+    /// No caller trace was found, so nothing says how the call ended.
+    Unknown,
+}
+
+/// The side of a call the found traces are missing, at most one per call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallGap {
+    /// The call ended without the callee's door ever holding it.
+    NeverHeld,
+    /// The callee's door held a task no found trace received.
+    CalleeTraceNotFound,
+    /// An outstanding call whose callee task was found: how that task ended, `None` for one with
+    /// no `task_end`.
+    CalleeTaskEnded(Option<String>),
+    /// The callee received the task and no caller trace records the call: how the callee's task
+    /// ended, `None` for one with no `task_end`.
+    CallerTraceNotFound(Option<String>),
+}
+
+impl CallGap {
+    /// The note a call row carries for this gap.
+    pub(crate) fn note(&self, caller: &str, callee: &str) -> String {
+        let task_ended = |ending: &Option<String>| match ending {
+            Some(status) => format!("{callee}'s task ended {status}"),
+            None => format!("{callee}'s task has no task_end"),
+        };
+        match self {
+            Self::NeverHeld => format!("never held by {callee}"),
+            Self::CalleeTraceNotFound => format!("{callee}'s trace not found"),
+            Self::CalleeTaskEnded(ending) => task_ended(ending),
+            Self::CallerTraceNotFound(ending) => {
+                format!("{caller}'s trace not found; {}", task_ended(ending))
+            }
+        }
+    }
+}
+
+/// One `call-member` call in a formation, joined from whichever of its two sides was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormationCall {
+    /// How many calls this one is nested under: 0 for a call no found call handed its task over.
+    pub(crate) depth: usize,
+    /// The `mcl_` id; `None` for a received task whose message id carries none.
+    pub(crate) call_id: Option<String>,
+    /// The caller's roster name, or its session id when it has none.
+    pub(crate) caller: String,
+    /// The callee's roster name.
+    pub(crate) callee: String,
+    pub(crate) started_ms: u64,
+    pub(crate) ending: CallEnding,
+    pub(crate) gap: Option<CallGap>,
+    /// The caller's task the call was made from; `None` for a call only its callee recorded.
+    pub(crate) calling_task_id: Option<String>,
+    /// The callee's task, `None` for a call it never held.
+    pub(crate) member_task_id: Option<String>,
+}
+
+/// Every `call-member` call `members` record, once each, in display order.
+///
+/// A call's caller side is its caller's [`MemberCallRecord`]; its callee side is the
+/// [`ReceivedMemberTask`] whose task id is the call's `member_task_id`. Every caller-side call is a
+/// row, and so is every received task no caller-side call matched. A row's parent is the call
+/// that handed over the task it was made from: the row whose `member_task_id` is its calling task
+/// and whose callee is its caller. Calls with no parent come first by `(started_ms, call id)`,
+/// each followed by its children, ordered the same way, one level deeper. Calls whose parents form
+/// a cycle have no root to be reached from: they follow every other call, each cycle starting at
+/// its earliest call with the rest nested beneath it, so every call is listed exactly once.
+pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> {
+    // Each received task's callee and how it ended, by task id.
+    let mut received: HashMap<&str, (&RecordedMember, &ReceivedMemberTask)> = HashMap::new();
+    for member in members {
+        for task in &member.tasks_received {
+            received
+                .entry(task.task_id.as_str())
+                .or_insert((member, task));
+        }
+    }
+    let mut matched: BTreeSet<&str> = BTreeSet::new();
+    let mut rows: Vec<FormationCall> = Vec::new();
+    for member in members {
+        for call in &member.calls_made {
+            let callee_task = call
+                .member_task_id
+                .as_deref()
+                .and_then(|task_id| received.get(task_id));
+            if let Some((_, task)) = callee_task {
+                matched.insert(task.task_id.as_str());
+            }
+            let gap = match (&call.status, &call.member_task_id, callee_task) {
+                (Some(_), None, _) => Some(CallGap::NeverHeld),
+                (_, Some(_), None) => Some(CallGap::CalleeTraceNotFound),
+                (None, _, Some((_, task))) => Some(CallGap::CalleeTaskEnded(task.ending.clone())),
+                (Some(_), Some(_), Some(_)) | (None, None, _) => None,
+            };
+            rows.push(FormationCall {
+                depth: 0,
+                call_id: Some(call.call_id.clone()),
+                caller: member.name().to_string(),
+                callee: call.member.clone(),
+                started_ms: call.started_ms,
+                ending: match &call.status {
+                    Some(status) => CallEnding::Ended {
+                        status: status.clone(),
+                        duration_ms: call.duration_ms,
+                        delivered: call.delivered,
+                    },
+                    None => CallEnding::Outstanding,
+                },
+                gap,
+                calling_task_id: Some(call.calling_task_id.clone()),
+                member_task_id: call.member_task_id.clone(),
+            });
+        }
+    }
+    for member in members {
+        for task in &member.tasks_received {
+            if matched.contains(task.task_id.as_str()) {
+                continue;
+            }
+            rows.push(FormationCall {
+                depth: 0,
+                call_id: task.call_id.clone(),
+                caller: task.caller.clone(),
+                callee: member.name().to_string(),
+                started_ms: task.received_ms,
+                ending: CallEnding::Unknown,
+                gap: Some(CallGap::CallerTraceNotFound(task.ending.clone())),
+                calling_task_id: None,
+                member_task_id: Some(task.task_id.clone()),
+            });
+        }
+    }
+    nest(rows)
+}
+
+/// `rows` in display order, each with its depth: see [`formation_calls`].
+fn nest(rows: Vec<FormationCall>) -> Vec<FormationCall> {
+    let by_task: HashMap<(&str, &str), usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| Some(((row.member_task_id.as_deref()?, row.callee.as_str()), i)))
+        .collect();
+    let parent: Vec<Option<usize>> = rows
+        .iter()
+        .map(|row| {
+            let task = row.calling_task_id.as_deref()?;
+            by_task.get(&(task, row.caller.as_str())).copied()
+        })
+        .collect();
+    let key = |i: &usize| (rows[*i].started_ms, rows[*i].call_id.clone());
+    let mut children: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut roots = Vec::new();
+    for (i, parent) in parent.iter().enumerate() {
+        match parent {
+            Some(parent) => children.entry(*parent).or_default().push(i),
+            None => roots.push(i),
+        }
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by_key(key);
+    }
+    roots.sort_by_key(key);
+    // A cycle has no root to be reached from; its rows are listed after the rest, from the first
+    // of them in order.
+    let mut rest: Vec<usize> = (0..rows.len()).collect();
+    rest.sort_by_key(key);
+
+    let mut order: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
+    let mut visited = vec![false; rows.len()];
+    for start in roots.into_iter().chain(rest) {
+        let mut stack = vec![(start, 0)];
+        while let Some((i, depth)) = stack.pop() {
+            if std::mem::replace(&mut visited[i], true) {
+                continue;
+            }
+            order.push((i, depth));
+            if let Some(siblings) = children.get(&i) {
+                stack.extend(siblings.iter().rev().map(|child| (*child, depth + 1)));
+            }
+        }
+    }
+    let mut rows: Vec<Option<FormationCall>> = rows.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|(i, depth)| {
+            let mut row = rows[i].take()?;
+            row.depth = depth;
+            Some(row)
+        })
+        .collect()
+}
+
+/// A member's whole trace, read once for its identity, its ending, its delegations, the calls it
+/// made and the member tasks it received.
 fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
     let mut member = RecordedMember {
         session_id,
         capsule: String::new(),
+        member: None,
+        callees: Vec::new(),
         spawned_by: None,
         exit_status: None,
         delegated_children: Vec::new(),
+        calls_made: Vec::new(),
+        tasks_received: Vec::new(),
     };
     let Ok(file) = fs::File::open(session_dir.join("trace.jsonl")) else {
         return member;
     };
+    let mut started = false;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(line) = serde_json::from_str::<Line>(line.trim()) else {
             continue;
         };
-        match line.event_type.as_str() {
-            "session_start" if member.capsule.is_empty() => {
+        match line {
+            Line::SessionStart(start) if !started => {
+                started = true;
                 member.capsule = format!(
                     "{}@{}",
-                    line.capsule_name.unwrap_or_default(),
-                    line.capsule_version.unwrap_or_default()
+                    start.capsule_name.unwrap_or_default(),
+                    start.capsule_version.unwrap_or_default()
                 );
-                member.spawned_by = line.spawned_by;
+                member.spawned_by = start.spawned_by;
+                member.member = start.formation_member;
+                member.callees = start.formation_callees;
             }
-            "session_end" if member.exit_status.is_none() => {
-                member.exit_status = Some(line.exit_status.unwrap_or_default());
+            Line::SessionEnd { exit_status } if member.exit_status.is_none() => {
+                member.exit_status = Some(exit_status.unwrap_or_default());
             }
-            "delegation_start" => member.delegated_children.extend(line.child_session_id),
+            Line::DelegationStart { child_session_id } => {
+                member.delegated_children.extend(child_session_id)
+            }
+            Line::MemberCallStart(start) => fold_member_call_start(&mut member.calls_made, start),
+            Line::MemberCall(end) => fold_member_call(&mut member.calls_made, end),
+            Line::A2aTaskReceived(received) => {
+                if let Some(caller) = received.caller_member {
+                    member.tasks_received.push(ReceivedMemberTask {
+                        call_id: call_id_of_message(&received.message_id),
+                        task_id: received.task_id,
+                        caller,
+                        received_ms: received.timestamp,
+                        ending: None,
+                    });
+                }
+            }
+            Line::TaskEnd {
+                task_id,
+                exit_status,
+            } => {
+                if let Some(task) = member
+                    .tasks_received
+                    .iter_mut()
+                    .find(|task| task.task_id == task_id && task.ending.is_none())
+                {
+                    task.ending = Some(exit_status.unwrap_or_default());
+                }
+            }
             _ => {}
         }
     }
@@ -436,23 +843,35 @@ mod tests {
                 RecordedMember {
                     session_id: ended.clone(),
                     capsule: "member@0.1.0".to_string(),
+                    member: None,
+                    callees: Vec::new(),
                     spawned_by: None,
                     exit_status: Some("completed".to_string()),
                     delegated_children: vec![child_here.clone(), child_away.clone()],
+                    calls_made: Vec::new(),
+                    tasks_received: Vec::new(),
                 },
                 RecordedMember {
                     session_id: killed.clone(),
                     capsule: "member@0.1.0".to_string(),
+                    member: None,
+                    callees: Vec::new(),
                     spawned_by: None,
                     exit_status: None,
                     delegated_children: Vec::new(),
+                    calls_made: Vec::new(),
+                    tasks_received: Vec::new(),
                 },
                 RecordedMember {
                     session_id: child_here.clone(),
                     capsule: "member@0.1.0".to_string(),
+                    member: None,
+                    callees: Vec::new(),
                     spawned_by: Some(ended.clone()),
                     exit_status: Some("completed".to_string()),
                     delegated_children: Vec::new(),
+                    calls_made: Vec::new(),
+                    tasks_received: Vec::new(),
                 },
             ]
         );
@@ -482,5 +901,557 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("trace.jsonl"), "\n\n{\"event_type\":\"session_sta").unwrap();
         assert_eq!(session_formation_id(&dir), None);
+    }
+
+    // ── Calls ─────────────────────────────────────────────────────────────────
+
+    /// A member's `session_start`: its roster name, its callees and its capsule.
+    fn member_start(
+        session_id: &str,
+        formation: &FormationId,
+        member: Option<&str>,
+        callees: &[&str],
+        capsule: &str,
+    ) -> String {
+        let mut line = json!({
+            "event_type": "session_start",
+            "event_id": "evt_0",
+            "session_id": session_id,
+            "timestamp": 1,
+            "capsule_name": capsule,
+            "capsule_version": "0.1.0",
+            "formation_id": formation.as_str(),
+        });
+        if let Some(member) = member {
+            line["formation_member"] = member.into();
+            line["formation_callees"] = callees.into();
+        }
+        line.to_string()
+    }
+
+    fn call_start(task: &str, call: &str, member: &str, member_task: &str, at: u64) -> String {
+        json!({
+            "event_type": "member_call_start", "timestamp": at, "task_id": task,
+            "call_id": call, "member": member, "member_task_id": member_task,
+        })
+        .to_string()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_end(
+        task: &str,
+        call: &str,
+        member: &str,
+        member_task: Option<&str>,
+        status: &str,
+        duration_ms: u64,
+        delivered: bool,
+        at: u64,
+    ) -> String {
+        let mut line = json!({
+            "event_type": "member_call", "timestamp": at, "task_id": task, "call_id": call,
+            "member": member, "status": status, "duration_ms": duration_ms, "output": "x",
+            "truncated": false, "delivered": delivered,
+        });
+        if let Some(member_task) = member_task {
+            line["member_task_id"] = member_task.into();
+        }
+        line.to_string()
+    }
+
+    fn received(task: &str, message_id: &str, caller: Option<&str>, at: u64) -> String {
+        let mut line = json!({
+            "event_type": "a2a_task_received", "timestamp": at, "task_id": task,
+            "context_id": "ctx", "message_id": message_id, "traceparent_from_caller": null,
+        });
+        if let Some(caller) = caller {
+            line["caller_member"] = caller.into();
+        }
+        line.to_string()
+    }
+
+    fn task_end(task: &str, status: &str) -> String {
+        json!({"event_type": "task_end", "task_id": task, "exit_status": status}).to_string()
+    }
+
+    /// Every row's depth, `caller→callee` and gap note.
+    fn summary(calls: &[FormationCall]) -> Vec<(usize, String, String)> {
+        calls
+            .iter()
+            .map(|call| {
+                (
+                    call.depth,
+                    format!("{}→{}", call.caller, call.callee),
+                    call.gap
+                        .as_ref()
+                        .map(|gap| gap.note(&call.caller, &call.callee))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// Each session's roster name and callees come from its `session_start`, never from its
+    /// capsule: two members sharing one capsule keep their own names, and a member's delegated
+    /// child has none.
+    #[test]
+    fn members_are_named_by_their_roster_name_not_their_capsule() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let lead = session_after(&formation, 10, "1");
+        let (w1, w2) = (
+            session_after(&formation, 20, "2"),
+            session_after(&formation, 30, "3"),
+        );
+        let child = session_after(&formation, 40, "4");
+        write_trace(
+            root.path(),
+            &lead,
+            &[member_start(
+                &lead,
+                &formation,
+                Some("lead"),
+                &["w1", "w2"],
+                "lead",
+            )],
+        );
+        for (session, name) in [(&w1, "w1"), (&w2, "w2")] {
+            write_trace(
+                root.path(),
+                session,
+                &[member_start(session, &formation, Some(name), &[], "worker")],
+            );
+        }
+        write_trace(
+            root.path(),
+            &child,
+            &[member_start(&child, &formation, None, &[], "helper")],
+        );
+        let found = recorded_members(root.path(), &formation).unwrap().members;
+        let named: Vec<(Option<&str>, &str, Vec<&str>)> = found
+            .iter()
+            .map(|m| {
+                (
+                    m.member.as_deref(),
+                    m.capsule.as_str(),
+                    m.callees.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (Some("lead"), "lead@0.1.0", vec!["w1", "w2"]),
+                (Some("w1"), "worker@0.1.0", vec![]),
+                (Some("w2"), "worker@0.1.0", vec![]),
+                (None, "helper@0.1.0", vec![]),
+            ]
+        );
+    }
+
+    /// A call the callee's door never held — refused busy, or failing any other way — is a row
+    /// noting so, with its status and no callee side.
+    #[test]
+    fn a_never_held_call_is_a_row_of_its_own_whether_rejected_or_failed() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let lead = session_after(&formation, 10, "1");
+        write_trace(
+            root.path(),
+            &lead,
+            &[
+                member_start(&lead, &formation, Some("lead"), &["busy", "gone"], "lead"),
+                call_end("tsk_l", "mcl_1", "busy", None, "rejected", 4, true, 104),
+                call_end("tsk_l", "mcl_2", "gone", None, "failed", 7, true, 207),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        assert_eq!(members[0].calls_made[0].started_ms, 100);
+        let calls = formation_calls(&members);
+        assert_eq!(
+            summary(&calls),
+            [
+                (0, "lead→busy".into(), "never held by busy".into()),
+                (0, "lead→gone".into(), "never held by gone".into()),
+            ]
+        );
+        let statuses: Vec<&CallEnding> = calls.iter().map(|call| &call.ending).collect();
+        assert_eq!(
+            statuses,
+            [
+                &CallEnding::Ended {
+                    status: "rejected".into(),
+                    duration_ms: 4,
+                    delivered: true
+                },
+                &CallEnding::Ended {
+                    status: "failed".into(),
+                    duration_ms: 7,
+                    delivered: true
+                },
+            ]
+        );
+    }
+
+    /// The lead's trace, in `lead_root`, calls `worker`, whose root is `worker_root`.
+    fn lead_calling_worker(formation: &FormationId, lead_root: &Path) {
+        let lead = session_after(formation, 10, "1");
+        write_trace(
+            lead_root,
+            &lead,
+            &[
+                member_start(&lead, formation, Some("lead"), &["worker"], "lead"),
+                call_start("tsk_l", "mcl_1", "worker", "tsk_w", 50),
+                call_end(
+                    "tsk_l",
+                    "mcl_1",
+                    "worker",
+                    Some("tsk_w"),
+                    "completed",
+                    90,
+                    true,
+                    140,
+                ),
+            ],
+        );
+    }
+
+    /// A callee whose root is missing keeps the caller's row, noting the callee's trace was not
+    /// found.
+    #[test]
+    fn a_callee_whose_root_is_absent_keeps_the_call_row() {
+        let formation = FormationId::mint();
+        let home = tempfile::tempdir().unwrap();
+        let lead_root = home.path().join("lead");
+        lead_calling_worker(&formation, &lead_root);
+        let search =
+            search_formation(&lead_root, vec![home.path().join("worker")], &formation).unwrap();
+        assert_eq!(
+            summary(&formation_calls(&search.found.members)),
+            [(0, "lead→worker".into(), "worker's trace not found".into())]
+        );
+    }
+
+    /// A callee whose root cannot be listed keeps the caller's row, and the root is reported.
+    #[test]
+    fn a_callee_whose_root_is_unreadable_keeps_the_call_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let formation = FormationId::mint();
+        let home = tempfile::tempdir().unwrap();
+        let lead_root = home.path().join("lead");
+        lead_calling_worker(&formation, &lead_root);
+        let worker_root = home.path().join("worker");
+        let worker = session_after(&formation, 20, "2");
+        write_trace(
+            &worker_root,
+            &worker,
+            &[
+                member_start(&worker, &formation, Some("worker"), &[], "worker"),
+                received("tsk_w", "msg_mcl_1", Some("lead"), 60),
+            ],
+        );
+        fs::set_permissions(&worker_root, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&worker_root).is_ok() {
+            fs::set_permissions(&worker_root, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: this user lists a 0o000 directory (running as uid 0)");
+            return;
+        }
+        let search = search_formation(&lead_root, vec![worker_root.clone()], &formation).unwrap();
+        fs::set_permissions(&worker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(search.searched[1].unreadable.is_some());
+        assert_eq!(
+            summary(&formation_calls(&search.found.members)),
+            [(0, "lead→worker".into(), "worker's trace not found".into())]
+        );
+    }
+
+    /// A task received from a member whose trace was not found is a row of its own, its call id
+    /// read from the message id, its status unknown.
+    #[test]
+    fn a_call_only_the_callee_recorded_takes_its_call_id_from_the_message_id() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let worker = session_after(&formation, 20, "2");
+        write_trace(
+            root.path(),
+            &worker,
+            &[
+                member_start(&worker, &formation, Some("worker"), &[], "worker"),
+                received(
+                    "tsk_w",
+                    "msg_mcl_01a10645751c70229f533dfd881ee485",
+                    Some("lead"),
+                    60,
+                ),
+                task_end("tsk_w", "completed"),
+                received("tsk_v", "msg_other", Some("lead"), 70),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        let calls = formation_calls(&members);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("mcl_01a10645751c70229f533dfd881ee485"), None]
+        );
+        assert_eq!(
+            calls.iter().map(|call| call.started_ms).collect::<Vec<_>>(),
+            [60, 70]
+        );
+        assert!(calls.iter().all(|call| call.ending == CallEnding::Unknown));
+        assert_eq!(
+            summary(&calls),
+            [
+                (
+                    0,
+                    "lead→worker".into(),
+                    "lead's trace not found; worker's task ended completed".into()
+                ),
+                (
+                    0,
+                    "lead→worker".into(),
+                    "lead's trace not found; worker's task has no task_end".into()
+                ),
+            ]
+        );
+    }
+
+    /// An outstanding call names how its callee's task ended, or that it has no `task_end`, or
+    /// that the callee's trace was not found.
+    #[test]
+    fn an_outstanding_call_says_what_its_callee_recorded() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let lead = session_after(&formation, 10, "1");
+        let (a, b) = (
+            session_after(&formation, 20, "2"),
+            session_after(&formation, 30, "3"),
+        );
+        write_trace(
+            root.path(),
+            &lead,
+            &[
+                member_start(&lead, &formation, Some("lead"), &["a", "b", "c"], "lead"),
+                call_start("tsk_l", "mcl_a", "a", "tsk_a", 50),
+                call_start("tsk_l", "mcl_b", "b", "tsk_b", 51),
+                call_start("tsk_l", "mcl_c", "c", "tsk_c", 52),
+            ],
+        );
+        write_trace(
+            root.path(),
+            &a,
+            &[
+                member_start(&a, &formation, Some("a"), &[], "worker"),
+                received("tsk_a", "msg_mcl_a", Some("lead"), 55),
+                task_end("tsk_a", "canceled"),
+            ],
+        );
+        write_trace(
+            root.path(),
+            &b,
+            &[
+                member_start(&b, &formation, Some("b"), &[], "worker"),
+                received("tsk_b", "msg_mcl_b", Some("lead"), 56),
+            ],
+        );
+        let calls = formation_calls(&recorded_members(root.path(), &formation).unwrap().members);
+        assert!(calls
+            .iter()
+            .all(|call| call.ending == CallEnding::Outstanding));
+        assert_eq!(
+            summary(&calls),
+            [
+                (0, "lead→a".into(), "a's task ended canceled".into()),
+                (0, "lead→b".into(), "b's task has no task_end".into()),
+                (0, "lead→c".into(), "c's trace not found".into()),
+            ]
+        );
+    }
+
+    /// A member that received `tasks` (task id, caller) and made `calls` (calling task, call id,
+    /// callee, callee task, started at).
+    fn joined_member(
+        name: &str,
+        tasks: &[(&str, &str)],
+        calls: &[(&str, &str, &str, &str, u64)],
+    ) -> RecordedMember {
+        RecordedMember {
+            session_id: format!("ses_{name}"),
+            capsule: "c@0.1.0".to_string(),
+            member: Some(name.to_string()),
+            callees: Vec::new(),
+            spawned_by: None,
+            exit_status: None,
+            delegated_children: Vec::new(),
+            calls_made: calls
+                .iter()
+                .map(|(task, call, callee, callee_task, at)| MemberCallRecord {
+                    call_id: call.to_string(),
+                    member: callee.to_string(),
+                    calling_task_id: task.to_string(),
+                    member_task_id: Some(callee_task.to_string()),
+                    started_ms: *at,
+                    status: Some("completed".to_string()),
+                    duration_ms: 1,
+                    delivered: true,
+                })
+                .collect(),
+            tasks_received: tasks
+                .iter()
+                .map(|(task, caller)| ReceivedMemberTask {
+                    task_id: task.to_string(),
+                    call_id: None,
+                    caller: caller.to_string(),
+                    received_ms: 0,
+                    ending: Some("completed".to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Each lead's calls sit under the call that handed the lead its task, in start order, and the
+    /// leads' calls are in start order among themselves.
+    #[test]
+    fn calls_nest_under_the_call_that_handed_over_their_task_in_start_order() {
+        let members = [
+            joined_member(
+                "entry",
+                &[],
+                &[
+                    ("tsk_e", "mcl_lb", "lead-b", "tsk_lb", 20),
+                    ("tsk_e", "mcl_la", "lead-a", "tsk_la", 10),
+                ],
+            ),
+            joined_member(
+                "lead-a",
+                &[("tsk_la", "entry")],
+                &[
+                    ("tsk_la", "mcl_w1", "w1", "tsk_w1", 40),
+                    ("tsk_la", "mcl_w2", "w2", "tsk_w2", 30),
+                ],
+            ),
+            joined_member(
+                "lead-b",
+                &[("tsk_lb", "entry")],
+                &[("tsk_lb", "mcl_w3", "w3", "tsk_w3", 25)],
+            ),
+            joined_member("w1", &[("tsk_w1", "lead-a")], &[]),
+            joined_member("w2", &[("tsk_w2", "lead-a")], &[]),
+            joined_member("w3", &[("tsk_w3", "lead-b")], &[]),
+        ];
+        assert_eq!(
+            summary(&formation_calls(&members)),
+            [
+                (0, "entry→lead-a".into(), String::new()),
+                (1, "lead-a→w2".into(), String::new()),
+                (1, "lead-a→w1".into(), String::new()),
+                (0, "entry→lead-b".into(), String::new()),
+                (1, "lead-b→w3".into(), String::new()),
+            ]
+        );
+    }
+
+    /// Calls whose parents form a cycle, and a call that is its own parent, end the list with
+    /// every row exactly once.
+    #[test]
+    fn a_cycle_of_calls_terminates_with_every_row_once() {
+        let members = [
+            joined_member(
+                "a",
+                &[("tsk_x", "b")],
+                &[("tsk_x", "mcl_ab", "b", "tsk_y", 20)],
+            ),
+            joined_member(
+                "b",
+                &[("tsk_y", "a")],
+                &[("tsk_y", "mcl_ba", "a", "tsk_x", 10)],
+            ),
+            joined_member(
+                "c",
+                &[("tsk_z", "c")],
+                &[
+                    ("tsk_z", "mcl_cc", "c", "tsk_z", 5),
+                    ("tsk_q", "mcl_cd", "d", "tsk_d", 50),
+                ],
+            ),
+            joined_member("d", &[("tsk_d", "c")], &[]),
+        ];
+        let calls = formation_calls(&members);
+        let ids: Vec<&str> = calls
+            .iter()
+            .map(|call| call.call_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(ids, ["mcl_cd", "mcl_cc", "mcl_ba", "mcl_ab"]);
+        assert_eq!(
+            calls.iter().map(|call| call.depth).collect::<Vec<_>>(),
+            [0, 0, 0, 1]
+        );
+    }
+
+    /// A task an operator or a plain A2A peer sent carries no `caller_member` and is no call.
+    #[test]
+    fn an_operator_task_makes_no_call_row() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let worker = session_after(&formation, 20, "2");
+        write_trace(
+            root.path(),
+            &worker,
+            &[
+                member_start(&worker, &formation, Some("worker"), &[], "worker"),
+                received("tsk_op", "msg_mcl_looks_like_a_call", None, 60),
+                task_end("tsk_op", "completed"),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        assert!(members[0].tasks_received.is_empty());
+        assert!(formation_calls(&members).is_empty());
+    }
+
+    /// A torn line costs only itself, and a field another event spells with another type makes
+    /// no call line fail to parse.
+    #[test]
+    fn a_torn_line_and_a_foreign_field_drop_nothing() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let lead = session_after(&formation, 10, "1");
+        let worker = session_after(&formation, 20, "2");
+        write_trace(
+            root.path(),
+            &lead,
+            &[
+                member_start(&lead, &formation, Some("lead"), &["worker"], "lead"),
+                json!({"event_type": "tool_call", "exit_status": 3, "member": ["x"],
+                       "call_id": 7, "child_session_id": false})
+                .to_string(),
+                call_start("tsk_l", "mcl_1", "worker", "tsk_w", 50),
+                r#"{"event_type":"member_call","call_id":"mcl_1","sta"#.to_string(),
+                json!({"event_type": "session_end", "exit_status": "completed",
+                       "status": 9, "task_id": 4})
+                .to_string(),
+            ],
+        );
+        write_trace(
+            root.path(),
+            &worker,
+            &[
+                member_start(&worker, &formation, Some("worker"), &[], "worker"),
+                json!({"event_type": "inference", "task_id": 12, "caller_member": 1}).to_string(),
+                received("tsk_w", "msg_mcl_1", Some("lead"), 55),
+                task_end("tsk_w", "completed"),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        assert_eq!(members[0].exit_status.as_deref(), Some("completed"));
+        assert_eq!(
+            summary(&formation_calls(&members)),
+            [(
+                0,
+                "lead→worker".into(),
+                "worker's task ended completed".into()
+            )]
+        );
     }
 }

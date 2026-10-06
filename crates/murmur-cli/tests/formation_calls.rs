@@ -1115,3 +1115,298 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
         Duration::from_secs(30),
     );
 }
+
+// ── Who called whom ───────────────────────────────────────────────────────────
+
+/// Block until some session under `root` has a trace line containing every one of `needles`.
+fn await_trace_line(root: &Path, needles: &[&str]) {
+    let deadline = Instant::now() + LAUNCH_LIMIT;
+    loop {
+        let found = session_dirs(root).iter().any(|session| {
+            std::fs::read_to_string(session.join("trace.jsonl")).is_ok_and(|trace| {
+                trace
+                    .lines()
+                    .any(|line| needles.iter().all(|needle| line.contains(needle)))
+            })
+        });
+        if found {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no line under {root:?} holds {needles:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A two-tier formation: `chief` calls two leads in one response, and each lead calls its four
+/// workers in one response. `worker-b4`'s door is full of operator tasks when `lead-b` calls it,
+/// so that call is refused. `mur trace show <frm>`, run from the roster's directory, lists every
+/// member by roster name and every call nested under the call that handed over its task, the
+/// refused one `rejected` and never held, and no row for the operator's tasks.
+#[test]
+fn two_tier_formation_trace_names_every_call() {
+    const A_WORKERS: [&str; 4] = ["worker-a1", "worker-a2", "worker-a3", "worker-a4"];
+    const B_WORKERS: [&str; 4] = ["worker-b1", "worker-b2", "worker-b3", "worker-b4"];
+    let (open_gate, gate) = mpsc::channel::<()>();
+    let gate = Mutex::new(gate);
+    let chief = Model::new(move |n| match n {
+        1 => {
+            let _ = gate.lock().unwrap().recv_timeout(LAUNCH_LIMIT);
+            call_members(&[("lead-a", "LEAD-A-TASK"), ("lead-b", "LEAD-B-TASK")])
+        }
+        _ => end_turn(n, "both leads answered"),
+    });
+    let lead = |workers: [&'static str; 4]| {
+        Model::new(move |n| match n {
+            1 => call_members(&workers.map(|worker| (worker, "WORKER-TASK"))),
+            _ => end_turn(n, "my workers answered"),
+        })
+    };
+    let (busy, release_busy) = Model::held("BUSY-ANSWER");
+    let mut members = vec![
+        Member {
+            name: "chief",
+            entry: true,
+            allow: Some("localhost"),
+            max_turns: None,
+            model: chief,
+        },
+        Member {
+            name: "lead-a",
+            entry: false,
+            allow: Some("localhost"),
+            max_turns: None,
+            model: lead(A_WORKERS),
+        },
+        Member {
+            name: "lead-b",
+            entry: false,
+            allow: Some("localhost"),
+            max_turns: None,
+            model: lead(B_WORKERS),
+        },
+    ];
+    for name in A_WORKERS.iter().chain(&B_WORKERS[..3]) {
+        members.push(Member {
+            name,
+            entry: false,
+            allow: None,
+            max_turns: None,
+            model: Model::new(|n| end_turn(n, "WORKER-ANSWER")),
+        });
+    }
+    members.push(Member {
+        name: "worker-b4",
+        entry: false,
+        allow: None,
+        max_turns: None,
+        model: busy,
+    });
+    let project = Project::new(
+        members,
+        &format!(
+            "reachability:\n  - from: chief\n    to: [lead-a, lead-b]\n  - from: lead-a\n    \
+             to: [{}]\n  - from: lead-b\n    to: [{}]\n",
+            A_WORKERS.join(", "),
+            B_WORKERS.join(", ")
+        ),
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("CHIEF-TASK", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+
+    // Fill worker-b4's door with operator tasks, its model holding the first, until it refuses.
+    let peer = formation["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|peer| peer["name"] == "worker-b4")
+        .unwrap();
+    let token = project.door_token(peer["session_id"].as_str().unwrap());
+    let addr = peer["url"].as_str().unwrap().trim_start_matches("http://");
+    let mut sent = 0;
+    loop {
+        sent += 1;
+        assert!(sent <= 8, "worker-b4's door never refused a task");
+        let answer = rpc(
+            addr,
+            Some(&token),
+            "message/send",
+            common::door_capsule::message(&format!("m-op-{sent}"), "OPERATOR-TASK"),
+        )
+        .json();
+        if answer["result"]["status"]["state"] == "rejected" {
+            break;
+        }
+        if sent == 1 {
+            project.await_requests("worker-b4", 1);
+        }
+    }
+
+    open_gate.send(()).unwrap();
+    let lead_b_root = project.member_dir(&formation_id, "lead-b").join(".murmur");
+    await_trace_line(
+        &lead_b_root,
+        &["\"event_type\":\"member_call\"", "\"member\":\"worker-b4\""],
+    );
+    drop(release_busy);
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let lead_b = project.trace_of(&formation_id, "lead-b");
+    let refused: Vec<&Value> = records(&lead_b, "member_call")
+        .into_iter()
+        .filter(|record| record["member"] == "worker-b4")
+        .collect();
+    assert_eq!(refused.len(), 1, "{lead_b:?}");
+    assert_eq!(refused[0]["status"], "rejected", "{}", refused[0]);
+    assert!(refused[0].get("member_task_id").is_none(), "{}", refused[0]);
+    println!("lead-b's member_call for worker-b4:\n{}", refused[0]);
+
+    let mut trace_bytes = 0;
+    let mut roots = vec![project.path().join(".murmur")];
+    for member in project.members.iter().filter(|member| !member.entry) {
+        roots.push(
+            project
+                .member_dir(&formation_id, member.name)
+                .join(".murmur"),
+        );
+    }
+    for root in &roots {
+        for session in session_dirs(root) {
+            trace_bytes += std::fs::metadata(session.join("trace.jsonl"))
+                .unwrap()
+                .len();
+        }
+    }
+
+    let began = Instant::now();
+    let shown = Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["trace", "show", &formation_id])
+        .current_dir(project.path())
+        .env("HOME", project.home.path())
+        .output()
+        .unwrap();
+    let took = began.elapsed();
+    let stdout = String::from_utf8_lossy(&shown.stdout).to_string();
+    assert!(
+        shown.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    println!("{stdout}");
+    println!(
+        "cost: {} member traces, {trace_bytes} bytes; mur trace show took {} ms",
+        roots.len(),
+        took.as_millis()
+    );
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut named: Vec<&str> = lines
+        .iter()
+        .filter(|line| line.starts_with("ses_"))
+        .map(|line| line.split_whitespace().nth(1).unwrap())
+        .collect();
+    named.sort();
+    let mut expected: Vec<&str> = project.members.iter().map(|member| member.name).collect();
+    expected.sort();
+    assert_eq!(named, expected, "{stdout}");
+    let chief_row = lines
+        .iter()
+        .find(|line| line.starts_with("ses_") && line.split_whitespace().nth(1) == Some("chief"))
+        .unwrap();
+    assert!(chief_row.ends_with("  may call lead-a, lead-b"), "{stdout}");
+
+    // Each call's start, as its caller recorded it: the `member_call_start`, or for a call its
+    // callee never held, the `member_call` less its duration.
+    let mut started: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for caller in ["chief", "lead-a", "lead-b"] {
+        for record in project.trace_of(&formation_id, caller) {
+            let call_id = record["call_id"].as_str().unwrap_or_default().to_string();
+            let at = record["timestamp"].as_u64().unwrap_or_default();
+            match record["event_type"].as_str() {
+                Some("member_call_start") => {
+                    started.insert(call_id, at);
+                }
+                Some("member_call") => {
+                    let took = record["duration_ms"].as_u64().unwrap_or_default();
+                    started.entry(call_id).or_insert(at - took);
+                }
+                _ => {}
+            }
+        }
+    }
+    let start_of = |line: &str| -> u64 {
+        let call_id = line.split_whitespace().next().unwrap();
+        *started
+            .get(call_id)
+            .unwrap_or_else(|| panic!("no recorded start for {call_id}"))
+    };
+
+    let at = lines
+        .iter()
+        .position(|line| *line == "calls:      10")
+        .unwrap_or_else(|| panic!("no `calls:      10` line:\n{stdout}"));
+    let rows = &lines[at + 1..];
+    assert_eq!(rows.len(), 10, "{stdout}");
+    // `<call id>  <caller> → <callee>  …`, at its depth.
+    let row = |line: &str| -> (usize, String, String) {
+        let depth = (line.len() - line.trim_start().len()) / 2;
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(words[2], "→", "{line}");
+        (depth, words[1].to_string(), words[3].to_string())
+    };
+    for tier in [&rows[..5], &rows[5..]] {
+        let (depth, caller, lead) = row(tier[0]);
+        assert_eq!((depth, caller.as_str()), (0, "chief"), "{stdout}");
+        let workers = if lead == "lead-a" {
+            A_WORKERS
+        } else {
+            B_WORKERS
+        };
+        let mut called: Vec<String> = tier[1..]
+            .iter()
+            .map(|line| {
+                let (depth, caller, worker) = row(line);
+                assert_eq!((depth, caller.as_str()), (1, lead.as_str()), "{stdout}");
+                worker
+            })
+            .collect();
+        let starts: Vec<u64> = tier[1..].iter().map(|line| start_of(line)).collect();
+        assert!(starts.is_sorted(), "{starts:?}\n{stdout}");
+        called.sort();
+        assert_eq!(called, workers, "{stdout}");
+    }
+    assert_ne!(row(rows[0]).2, row(rows[5]).2, "{stdout}");
+    assert!(start_of(rows[0]) <= start_of(rows[5]), "{stdout}");
+    let completed = rows
+        .iter()
+        .filter(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words[4] == "completed" && words[6] == "delivered" && words.len() == 7
+        })
+        .count();
+    assert_eq!(completed, 9, "{stdout}");
+    let refused_rows: Vec<&&str> = rows
+        .iter()
+        .filter(|line| line.contains("→ worker-b4"))
+        .collect();
+    assert_eq!(refused_rows.len(), 1, "{stdout}");
+    let words: Vec<&str> = refused_rows[0].split_whitespace().collect();
+    assert_eq!(words[4], "rejected", "{stdout}");
+    assert!(
+        refused_rows[0].ends_with("never held by worker-b4"),
+        "{stdout}"
+    );
+
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
