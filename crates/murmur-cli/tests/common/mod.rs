@@ -124,6 +124,17 @@ pub fn assert_dead_within(pid: i32, limit: std::time::Duration) {
     panic!("the harness (pid {pid}) was still alive after {limit:?}");
 }
 
+/// Write `home/.murmur/config.yaml` with `registry.sources: []`, the config that names no remote
+/// source. A `name@version` missing from the local store then fails with `E-REG-001` without
+/// building a source, where a home with no config file at all falls back to the built-in
+/// `official` GitHub source.
+#[allow(dead_code)]
+pub fn write_no_source_config(home: &Path) {
+    let dir = home.join(".murmur");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.yaml"), "registry:\n  sources: []\n").unwrap();
+}
+
 pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())

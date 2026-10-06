@@ -16,9 +16,7 @@ use murmur_artifact::{
 use rayon::prelude::*;
 
 use crate::{
-    config::{
-        load_effective_mur_config, load_effective_mur_config_if_any_exists, resolve_registry,
-    },
+    config::{load_effective_mur_config, resolve_registry},
     error::{CliError, E_IO_001, E_IO_003, E_REG_001, E_REG_005},
     source::{SourceChain, SourceChainError},
 };
@@ -368,6 +366,16 @@ fn determine_store(global: bool) -> Result<(LocalRegistry, Option<PathBuf>), Cli
     }
 }
 
+/// The remote source chain a `name@version` registry miss falls back to, or `None` when it
+/// names no source.
+///
+/// With no config file at all this is the `official` source from `MurConfig::default()`. A
+/// config file that exists is taken at its word, so `registry.sources: []` yields `None`.
+fn configured_source_chain() -> Result<Option<SourceChain>, CliError> {
+    let chain = SourceChain::from_config(&load_effective_mur_config()?);
+    Ok((!chain.is_empty()).then_some(chain))
+}
+
 fn install_single(
     artifact_ref: &str,
     registry_override: Option<&str>,
@@ -429,37 +437,24 @@ fn install_single(
             }
             resolved.bytes
         }
-        Err(RegistryError::NotFound { .. }) => {
-            let source_chain = match load_effective_mur_config_if_any_exists()? {
-                Some(config) => {
-                    let chain = SourceChain::from_config(&config);
-                    if chain.is_empty() {
-                        None
-                    } else {
-                        Some(chain)
-                    }
-                }
-                None => None,
-            };
-            match source_chain {
-                Some(chain) => {
-                    let resolved = chain
-                        .resolve_bare(name, Some(version))
-                        .map_err(source_chain_error_to_cli)?;
-                    let lock_path = project_root.map(|r| r.join("murmur.lock"));
-                    let precompiler = build_precompiler(no_precompile, project_root);
-                    install_resolved(store, resolved, lock_path.as_deref(), precompiler.as_ref())?;
-                    return Ok(());
-                }
-                None => {
-                    return Err(CliError::with_hint(
-                        E_REG_001,
-                        format!("artifact {name}@{version} not found in registry"),
-                        "configure a registry.sources entry in ~/.murmur/config.yaml",
-                    ));
-                }
+        Err(RegistryError::NotFound { .. }) => match configured_source_chain()? {
+            Some(chain) => {
+                let resolved = chain
+                    .resolve_bare(name, Some(version))
+                    .map_err(source_chain_error_to_cli)?;
+                let lock_path = project_root.map(|r| r.join("murmur.lock"));
+                let precompiler = build_precompiler(no_precompile, project_root);
+                install_resolved(store, resolved, lock_path.as_deref(), precompiler.as_ref())?;
+                return Ok(());
             }
-        }
+            None => {
+                return Err(CliError::with_hint(
+                    E_REG_001,
+                    format!("artifact {name}@{version} not found in registry"),
+                    "configure a registry.sources entry in ~/.murmur/config.yaml",
+                ));
+            }
+        },
         Err(e) => return Err(CliError::from(e)),
     };
 
@@ -503,17 +498,7 @@ fn install_manifest_deps(
     }
 
     let registry = resolve_registry(registry_override)?;
-    let source_chain = match load_effective_mur_config_if_any_exists()? {
-        Some(config) => {
-            let chain = SourceChain::from_config(&config);
-            if chain.is_empty() {
-                None
-            } else {
-                Some(chain)
-            }
-        }
-        None => None,
-    };
+    let source_chain = configured_source_chain()?;
 
     // Pre-check which artifacts are already in the project store.
     let cached_flags: Vec<bool> = artifacts

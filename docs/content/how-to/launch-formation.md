@@ -159,8 +159,8 @@ network:
 
 ## Step 3 — store the key and install the members
 
-Store the provider key in the global config. This comes first because, on a machine with no
-`~/.murmur/config.yaml`, the config it writes carries the registry source the driver install needs:
+Store the provider key in the global config. The key is the one value only you can supply, and
+`mur run --roster` fails without it:
 
 === "Anthropic"
 

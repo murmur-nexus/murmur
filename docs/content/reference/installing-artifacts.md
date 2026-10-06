@@ -98,7 +98,7 @@ registry:
 
 ## Default source
 
-With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `mur install` uses one built-in source: the public GitHub repository `murmur-nexus/default-artifacts`, which needs no token. Once `~/.murmur/config.yaml` exists, its `registry.sources` list is the whole chain — see [Merge rules](config.md#merge-rules).
+With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `mur install` uses one built-in source: the public GitHub repository `murmur-nexus/default-artifacts`, which needs no token. Once `~/.murmur/config.yaml` exists, its `registry.sources` list is the whole chain — see [Merge rules](config.md#merge-rules). To install from local stores only, set `registry.sources: []` in that file: a `name@version` missing from the store then fails with `E-REG-001`.
 
 ## Local artifact cache
 
