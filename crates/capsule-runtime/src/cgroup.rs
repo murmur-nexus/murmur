@@ -1,12 +1,13 @@
 //! Linux cgroup v2 scoping for a capsule's whole native-subprocess tree.
 //!
 //! `resources::apply_hard_rlimits` bounds each spawned process individually. That is necessary
-//! and not sufficient: `RLIMIT_NPROC` is a **per-uid** ceiling, so a tree of distinct,
-//! short-lived processes that fork and exit faster than the count is observed slips past it,
-//! and no rlimit bounds *aggregate* memory or CPU across a tree at all. A cgroup v2 scope does
-//! exactly what rlimits structurally cannot: `pids.max`, `memory.max` and `cpu.max` apply to
-//! every task in the scope together, and the kernel enforces them at fork/allocate time rather
-//! than after the fact.
+//! and not sufficient: `RLIMIT_NPROC` is a **per-uid** ceiling, checked against every thread the
+//! uid owns on the host, so it cannot bound one tree, and no rlimit bounds *aggregate* memory or
+//! CPU across a tree at all. A cgroup v2 scope does exactly what rlimits structurally cannot:
+//! `pids.max`, `memory.max` and `cpu.max` apply to every task in the scope together, and the
+//! kernel enforces them at fork/allocate time rather than after the fact. A spawn that joins a
+//! scope therefore gets no `RLIMIT_NPROC` at all, and `pids.max` is its only process bound — see
+//! `resources::NprocBound`.
 //!
 //! ## Install requirement: systemd user cgroup delegation
 //!
@@ -513,6 +514,15 @@ impl CgroupScope {
     /// counter snapshot a call's attribution is read against.
     pub(crate) fn enter(&self) -> ScopeOccupancy {
         self.occupancy.enter()
+    }
+
+    /// Whether [`Self::join_current_process`] moves the caller into this scope, which it does
+    /// exactly when the `cgroup.procs` descriptor is open; without it a join returns `Ok(())` and
+    /// moves nothing. Every scope [`prepare_scope`] hands out has one. The `RLIMIT_NPROC` decision
+    /// keys on this, not on the scope's presence, so a join that places nothing never leaves a
+    /// spawn without its process bound.
+    pub(crate) fn places_subprocesses(&self) -> bool {
+        self.procs_fd.is_some()
     }
 
     /// Current `memory.events`/`pids.events` counters.

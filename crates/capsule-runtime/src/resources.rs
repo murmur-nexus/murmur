@@ -15,9 +15,10 @@
 //!   `pre_exec` window on every Unix platform. Per-process, POSIX-portable, no configuration
 //!   required of the host.
 //! * **a cgroup v2 scope** ([`crate::cgroup`]) around the whole subprocess *tree*, Linux only.
-//!   This is what rlimits structurally cannot do: `RLIMIT_NPROC` is a **per-uid** ceiling, so a
-//!   tree of distinct, rapidly-forking, short-lived processes evades it in practice even when
-//!   set correctly. `pids.max` on a cgroup is per-cgroup and does not.
+//!   This is what rlimits structurally cannot do: `RLIMIT_NPROC` is a **per-uid** ceiling,
+//!   checked against every thread the uid owns on the host, so it bounds neither this tree nor
+//!   anything else in particular. `pids.max` on a cgroup counts only the scope's own tasks, and
+//!   a spawn that joins a scope gets no `RLIMIT_NPROC` from this module at all ([`NprocBound`]).
 //! * **a periodic workdir-size check** ([`WorkdirGuard`]), on every platform. A plain filesystem
 //!   walk on a fixed cadence, so a breach is caught within one poll interval — not instantly.
 //!
@@ -47,10 +48,10 @@ use std::{
     time::Duration,
 };
 
-/// Default `RLIMIT_NPROC` headroom — how much past the runtime's own uid baseline a subprocess
-/// tree may add, in whichever unit this platform's `RLIMIT_NPROC` is checked against. See
-/// [`apply_hard_rlimits`] for why this is headroom rather than an absolute ceiling, and
-/// [`uid_task_count`] for the per-platform unit and how the baseline is measured.
+/// Default `RLIMIT_NPROC` headroom for a spawn with no cgroup scope — how much past the uid's
+/// count at that spawn a subprocess tree may add, in whichever unit this platform's
+/// `RLIMIT_NPROC` is checked against. Unused for a spawn that joins a scope. See [`NprocBound`]
+/// for which spawns get it and [`uid_task_count`] for the per-platform unit.
 pub const DEFAULT_MAX_PROCESSES: u64 = 128;
 
 /// Default `RLIMIT_NOFILE` hard ceiling — open descriptors per spawned subprocess.
@@ -94,11 +95,10 @@ pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// block with every omitted field replaced by its `DEFAULT_*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostResourceLimits {
-    /// `RLIMIT_NPROC` headroom above the runtime's own uid baseline. Per-**uid**, not
-    /// per-process-tree, and counted in the unit that uid's kernel enforces against
-    /// ([`uid_task_count`]). See the module docs for why the cgroup `pids.max` below exists
-    /// alongside it rather than duplicating it, and [`apply_hard_rlimits`] for why it is applied
-    /// as headroom.
+    /// `RLIMIT_NPROC` headroom above the uid's count at each spawn, applied only to a spawn
+    /// with no cgroup scope ([`NprocBound::Headroom`]) and counted in the unit that uid's kernel
+    /// enforces against ([`uid_task_count`]). A spawn that joins a scope is bounded by
+    /// `cgroup_pids_max` instead and ignores this field.
     pub max_processes: u64,
     /// `RLIMIT_NOFILE` hard ceiling.
     pub max_open_files: u64,
@@ -206,8 +206,37 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
     }
 }
 
+/// What one spawn's `RLIMIT_NPROC` is, decided in the parent before its `pre_exec` closure is
+/// installed — the closure only receives this `Copy` value.
+///
+/// `RLIMIT_NPROC` is checked against **everything the uid owns on the host**, not against the
+/// tasks in this tree, and on Linux the unit it counts is *threads*: `setrlimit(2)` calls it "the
+/// maximum number of processes (or, more precisely on Linux, threads) that can be created for the
+/// real user ID". On macOS, whose BSD-derived limit is per-process, it counts processes. Either
+/// way an interactive account is already deep into that number before the capsule starts, and the
+/// number moves with every thread the desktop, the harness or anything else on the host starts or
+/// stops. A limit set from a count taken at launch therefore loses headroom to the rest of the
+/// host for the whole session, and a `fork()` in the subprocess fails with `EAGAIN` once enough
+/// unrelated threads have started.
+///
+/// Produced by `sandbox::ShellEnforcement::nproc_bound` once per spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NprocBound {
+    /// Leave `RLIMIT_NPROC` at the value the runtime inherited. The child joins a cgroup scope in
+    /// the same `pre_exec` closure, fatally on failure, and the scope's `pids.max`
+    /// ([`HostResourceLimits::cgroup_pids_max`]) bounds its tree: it counts only the scope's own
+    /// tasks, so nothing else on the host can spend it.
+    CgroupPidsMax,
+    /// `baseline + max_processes`, where `baseline` is [`uid_task_count`] measured in the parent
+    /// for this spawn, so `max_processes` means "how much past the host's usage at this spawn this
+    /// tree may add". `0` when the count cannot be taken, which applies the declared value
+    /// literally and errs toward the tighter bound.
+    Headroom { baseline: u64 },
+}
+
 /// Sets every [`HostResourceLimits`] rlimit field as a **hard** limit (`rlim_cur == rlim_max`),
-/// plus `RLIMIT_CORE = 0`.
+/// plus `RLIMIT_CORE = 0`. `RLIMIT_NPROC` is set only for [`NprocBound::Headroom`]; for
+/// [`NprocBound::CgroupPidsMax`] no `RLIMIT_NPROC` call is made at all.
 ///
 /// Called from inside a forked child's `pre_exec` closure, so everything here is restricted to
 /// async-signal-safe operations: two syscalls per limit and no allocation, no locking, and no
@@ -223,29 +252,17 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 /// is the real ceiling either way, and failing the spawn would replace an unwidenable bound with
 /// no subprocess at all.
 ///
-/// ## Why `max_processes` is headroom, not an absolute ceiling
+/// ## `RLIMIT_NPROC`: headroom without a scope, untouched with one
 ///
-/// `RLIMIT_NPROC` is checked against **everything the uid already owns**, not against the ones in
-/// this tree — and on Linux the unit it counts is *threads*, not processes: `setrlimit(2)` calls
-/// it "the maximum number of processes (or, more precisely on Linux, threads) that can be created
-/// for the real user ID". On macOS, whose BSD-derived limit is genuinely per-process, it counts
-/// processes. Either way an interactive account is already deep into that number before the
-/// capsule starts — and far deeper in threads than in processes — so a hard `RLIMIT_NPROC` of 128
-/// does not bound the capsule at 128; it makes the first `fork()` in the subprocess fail with
-/// `EAGAIN`. That is a broken runtime, not a bound.
+/// A per-uid count cannot be turned into a bound on one tree, only into headroom above whatever
+/// the uid owns. Without a cgroup scope that headroom is the only process bound there is, so it
+/// is set from a baseline measured in the unit the kernel checks: a *process* count fed to a
+/// Linux kernel counting threads yields a ceiling below the uid's live usage, which is the same
+/// `EAGAIN` the headroom exists to prevent.
 ///
-/// So `nproc_baseline` — the uid's live count *in that platform's own unit*, measured once in the
-/// parent at launch by [`uid_task_count`] — is added to the declared `max_processes`, making the
-/// manifest field mean "how much past the host's existing usage this capsule's tree may add".
-/// This only holds if the baseline is measured in the unit the kernel checks: a *process* count
-/// fed to a Linux kernel counting threads yields a ceiling below the uid's live usage, i.e. the
-/// same `EAGAIN` the headroom design exists to prevent. When the count cannot be measured the
-/// caller passes `0` and the declared value applies literally, which errs toward the tighter
-/// bound.
-///
-/// This is why the Linux cgroup `pids.max` is not redundant with this: it counts only the tasks
-/// in the capsule's own scope, so it needs no baseline and cannot be evaded by the uid's other
-/// processes.
+/// With a scope, `pids.max` bounds the tree exactly and headroom adds nothing but a way for an
+/// unrelated thread elsewhere on the host to fail a `fork()` here, so the inherited value is left
+/// in place.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 // The `as u32` on each `RLIMIT_*` below is redundant on Linux, where the constants are already
@@ -255,12 +272,14 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 #[allow(clippy::unnecessary_cast)]
 pub(crate) fn apply_hard_rlimits(
     limits: &HostResourceLimits,
-    nproc_baseline: u64,
+    nproc: NprocBound,
 ) -> std::io::Result<()> {
-    set_hard_rlimit(
-        libc::RLIMIT_NPROC as u32,
-        nproc_baseline.saturating_add(limits.max_processes),
-    )?;
+    if let NprocBound::Headroom { baseline } = nproc {
+        set_hard_rlimit(
+            libc::RLIMIT_NPROC as u32,
+            baseline.saturating_add(limits.max_processes),
+        )?;
+    }
     set_hard_rlimit(libc::RLIMIT_NOFILE as u32, limits.max_open_files)?;
     set_hard_rlimit(libc::RLIMIT_FSIZE as u32, limits.max_file_size_bytes)?;
     set_hard_rlimit(libc::RLIMIT_CPU as u32, limits.cpu_seconds)?;
@@ -333,9 +352,9 @@ fn set_hard_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
 ///   - **macOS**: processes. The BSD-derived `RLIMIT_NPROC` there genuinely counts one entry per
 ///     process, so `proc_listpids` is already the matching unit.
 ///
-/// Measured once per launch **in the parent** — it walks `/proc` (Linux) or calls into libproc
-/// (macOS), neither of which is async-signal-safe, so it must never be called from `pre_exec`.
-/// Its one consumer is the `RLIMIT_NPROC` baseline in [`apply_hard_rlimits`]; see there for why a
+/// Measured **in the parent** once per spawn that has no cgroup scope — it walks `/proc` (Linux)
+/// or calls into libproc (macOS), neither of which is async-signal-safe, so it must never be
+/// called from `pre_exec`. Its one consumer is [`NprocBound::Headroom`]; see there for why a
 /// per-uid limit is meaningless without it.
 ///
 /// The Linux walk is inherently racy — a process can exit between the `read_dir("/proc")` and the
@@ -554,6 +573,98 @@ pub(crate) fn directory_size_bytes(root: &Path) -> u64 {
     }
 
     total
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_support {
+    use std::fs::{File, OpenOptions};
+    use std::sync::{Arc, Barrier};
+
+    /// Serializes the tests that start [`HeldThreads`] or assert on how the uid's task count
+    /// moves, so one test's holders never land inside another's before/after window. Held until
+    /// the returned file is dropped. Other processes the uid owns still move the count; the
+    /// margins in those tests absorb that.
+    ///
+    /// An exclusive lock on a file in the temp directory, not a static mutex: cargo-nextest runs
+    /// every test in its own process, where a static serializes nothing. Each call opens its own
+    /// file description, so the lock also excludes other threads of the same `cargo test` binary.
+    pub(crate) fn host_threads_lock() -> File {
+        let path = std::env::temp_dir().join("murmur-capsule-runtime-host-threads.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("opening {}: {error}", path.display()));
+        file.lock()
+            .unwrap_or_else(|error| panic!("locking {}: {error}", path.display()));
+        file
+    }
+
+    /// `count` threads in the test process, each parked on a barrier, standing in for threads the
+    /// rest of the host starts while a session runs. [`Self::start`] returns only once every
+    /// one of them is running, so the uid's task count already includes them; dropping the value
+    /// releases and joins them.
+    pub(crate) struct HeldThreads {
+        release: Arc<Barrier>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldThreads {
+        pub(crate) fn start(count: usize) -> Self {
+            let started = Arc::new(Barrier::new(count + 1));
+            let release = Arc::new(Barrier::new(count + 1));
+            let handles = (0..count)
+                .map(|_| {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    std::thread::Builder::new()
+                        .stack_size(64 * 1024)
+                        .spawn(move || {
+                            started.wait();
+                            release.wait();
+                        })
+                        .expect("a holder thread must start")
+                })
+                .collect();
+            started.wait();
+            Self { release, handles }
+        }
+    }
+
+    impl Drop for HeldThreads {
+        fn drop(&mut self) {
+            self.release.wait();
+            for handle in self.handles.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// This process's own `(soft, hard)` `RLIMIT_NPROC`, the values a child inherits when
+    /// `apply_hard_rlimits` leaves the limit alone.
+    #[allow(unsafe_code)]
+    pub(crate) fn own_rlimit_nproc() -> (libc::rlim_t, libc::rlim_t) {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a plain `getrlimit` read into a live stack `rlimit`.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut current) },
+            0
+        );
+        (current.rlim_cur, current.rlim_max)
+    }
+
+    /// An rlimit as `ulimit` prints it: `unlimited` for `RLIM_INFINITY`, the number otherwise.
+    pub(crate) fn rendered_rlimit(value: libc::rlim_t) -> String {
+        if value == libc::RLIM_INFINITY {
+            "unlimited".to_string()
+        } else {
+            value.to_string()
+        }
+    }
 }
 
 #[cfg(test)]

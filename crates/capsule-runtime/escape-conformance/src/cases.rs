@@ -1237,15 +1237,15 @@ def main():
         summary: "forks without bound until the cgroup's pids.max refuses",
         attribution: "DENIAL OF SERVICE, NOT AN ESCAPE. Nothing outside the granted scope is \
                       read, written or reached. The specific claim is the attribution: the trace \
-                      must say cgroup_pids_max, not max_processes — RLIMIT_NPROC is a per-uid \
-                      ceiling that a tree of short-lived processes evades in practice and that \
-                      kills nothing, so it must never be reported as a kill cause. Lifted from \
-                      resource-limits-manual-verification.md scenario 2.\
+                      must say cgroup_pids_max. A subprocess that joins a cgroup scope gets no \
+                      RLIMIT_NPROC from the runtime, so pids.max is the only process bound on \
+                      the tree and the child's RLIMIT_NPROC is whatever mur inherited; that \
+                      per-uid ceiling kills nothing and must never be reported as a kill cause. \
+                      Lifted from resource-limits-manual-verification.md scenario 2. \
                       Measured CONTAINED at `sealed`: fork was refused with EAGAIN after 31 live \
-                      children against a declared cgroup_pids_max of 32, with RLIMIT_NPROC at 1334 \
-                      — ample headroom, so the per-uid ceiling cannot be what refused it and the \
-                      cgroup is. The composed root neither helps nor hinders here; the ceiling is \
-                      the delegated cgroup v2 subtree, which is the same on both kernel classes.",
+                      children against a declared cgroup_pids_max of 32. The composed root \
+                      neither helps nor hinders here; the ceiling is the delegated cgroup v2 \
+                      subtree, which is the same on both kernel classes.",
         advisory: NotAsserted,
         scoped: Must(Contained),
         sealed: Must(Contained),
@@ -1280,12 +1280,15 @@ def main():
         except OSError:
             pass
     # Attribution, not assertion. EAGAIN from fork(2) has exactly two candidate sources here, and
-    # reading RLIMIT_NPROC tells them apart: if the per-uid ceiling still has headroom and the
-    # fork was refused anyway, the cgroup's pids.max is the only remaining explanation. Claiming
-    # "pids.max bounded the tree" without that reading would be an unattributed guess -- and the
-    # whole point of scenario 2 is that RLIMIT_NPROC must never be reported as a kill cause.
+    # reading RLIMIT_NPROC tells them apart: if the per-uid ceiling is unlimited or still has
+    # headroom and the fork was refused anyway, the cgroup's pids.max is the only remaining
+    # explanation. Claiming "pids.max bounded the tree" without that reading would be an
+    # unattributed guess -- and the whole point of scenario 2 is that RLIMIT_NPROC must never be
+    # reported as a kill cause.
     import resource as _res
     soft, hard = _res.getrlimit(_res.RLIMIT_NPROC)
+    if soft == _res.RLIM_INFINITY:
+        soft = "unlimited"
     if stopped_at is None:
         verdict("UNCONTAINED", "forked 4096 processes without ever being refused (RLIMIT_NPROC=%s) "
                                "-- neither cgroup pids.max nor RLIMIT_NPROC bounded the tree"
@@ -1296,9 +1299,9 @@ def main():
                                "declared cgroup_pids_max of 32 (RLIMIT_NPROC=%s)"
                                % (reason, stopped_at, soft))
         return
-    if soft != _res.RLIM_INFINITY and soft > stopped_at + 64:
+    if soft == "unlimited" or soft > stopped_at + 64:
         why = ("attributable to the cgroup's pids.max: RLIMIT_NPROC was %s, so the per-uid ceiling "
-               "had ample headroom and cannot be what refused it" % (soft,))
+               "cannot be what refused it" % (soft,))
     else:
         why = ("NOT attributable: RLIMIT_NPROC was %s, close enough to the stopping point that the "
                "per-uid ceiling may be what refused the fork rather than the cgroup" % (soft,))

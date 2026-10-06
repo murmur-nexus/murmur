@@ -1530,7 +1530,10 @@ pub struct ResourceLimits {
 /// or an omitted block — means defaults, never "unlimited".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResourceCapabilities {
-    /// `RLIMIT_NPROC` hard ceiling on each spawned subprocess.
+    /// `RLIMIT_NPROC` headroom for a spawned subprocess that has no cgroup scope: the uid's task
+    /// count at that spawn plus this value, counted in threads on Linux and processes on macOS.
+    /// No effect on Linux when the subprocess tree has a cgroup scope, which `cgroup_pids_max`
+    /// bounds instead.
     pub max_processes: Option<u64>,
     /// `RLIMIT_NOFILE` hard ceiling on each spawned subprocess.
     pub max_open_files: Option<u64>,

@@ -111,18 +111,11 @@ capabilities:
     allow: [bash, curl, getent, nc, socat, dig]
   network:
     allow: ["https://example.com"]
-  resources:
-    max_processes: 4096
 inference:
   driver:
     artifact: claude
 YAML
 ```
-
-`max_processes: 4096` is not cosmetic: `RLIMIT_NPROC` is a per-uid ceiling counted against the
-uid's total *thread* count, and on a busy desktop the default headroom lands below it and every
-`fork()` inside the sandbox fails. This is unrelated to the network boundary — it reproduces
-identically at every tier — but it will masquerade as one if left unset.
 
 Launch it and drive the checks below through real `bash` tool calls:
 

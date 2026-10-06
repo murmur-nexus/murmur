@@ -953,6 +953,85 @@ mod tests {
         assert_eq!(result.resource_limit_hit, None);
     }
 
+    /// With `RLIMIT_NPROC` left alone, `pids.max` is the only process bound on a scoped capsule,
+    /// and it has to stop a fork bomb by itself and be named as what did. The children sleep
+    /// rather than exit so every one of them holds a task in the scope until the loop gives up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fork_bomb_in_a_scoped_capsule_is_stopped_by_pids_max() {
+        const TEST: &str = "a_fork_bomb_in_a_scoped_capsule_is_stopped_by_pids_max";
+        if !crate::cgroup::cgroup_delegation_available() {
+            crate::runtime_err!("[SKIP-HOST] {TEST}: this host cannot delegate a cgroup v2 scope");
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let limits = crate::resources::HostResourceLimits {
+            cgroup_pids_max: 16,
+            ..crate::resources::HostResourceLimits::default()
+        };
+        let scope = crate::cgroup::prepare_scope(true, &limits, "ses_fork_bomb", temp.path())
+            .expect("this host delegates a cgroup scope")
+            .scope;
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["python3".to_string()],
+            resources: limits,
+            ..CapabilityPolicy::default()
+        };
+        let mut enforcement = ShellEnforcement::environment_only();
+        enforcement.resource_limits = limits;
+        let enforcement = enforcement.with_host_bounding(scope, None);
+
+        let script = "import os, resource, signal, time\n\
+            children = []\n\
+            for _ in range(4096):\n\
+            \x20   try:\n\
+            \x20       pid = os.fork()\n\
+            \x20   except OSError:\n\
+            \x20       break\n\
+            \x20   if pid == 0:\n\
+            \x20       time.sleep(30)\n\
+            \x20       os._exit(0)\n\
+            \x20   children.append(pid)\n\
+            for pid in children:\n\
+            \x20   os.kill(pid, signal.SIGKILL)\n\
+            for pid in children:\n\
+            \x20   os.waitpid(pid, 0)\n\
+            soft = resource.getrlimit(resource.RLIMIT_NPROC)[0]\n\
+            print(len(children))\n\
+            print('unlimited' if soft == resource.RLIM_INFINITY else soft)\n";
+        let result = execute_shell(
+            "python3",
+            &["-c", script],
+            &[],
+            temp.path(),
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("python3 must run");
+
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        let mut lines = result.stdout.lines();
+        let reached: u64 = lines.next().unwrap().parse().unwrap();
+        let soft = lines.next().unwrap();
+        assert!(
+            reached < 16,
+            "pids.max is 16 and the python process holds one task, so at most 15 children can \
+             be live; reached {reached}"
+        );
+        assert_eq!(
+            result.resource_limit_hit,
+            Some("cgroup_pids_max".to_string())
+        );
+        let (own_soft, _) = crate::resources::test_support::own_rlimit_nproc();
+        assert_eq!(
+            soft,
+            crate::resources::test_support::rendered_rlimit(own_soft),
+            "a scoped spawn inherits RLIMIT_NPROC unchanged"
+        );
+    }
+
     /// Under `--workdir` the two workdirs are different directories, and each of the three things
     /// `execute_shell` does with one has to pick the right one: the subprocess runs in the
     /// accessible workdir, `$HOME` resolves into the session workdir, and the truncated-output log
