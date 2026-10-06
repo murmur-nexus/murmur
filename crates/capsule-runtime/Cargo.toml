@@ -23,6 +23,9 @@ print_stderr = "deny"
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# `FuturesUnordered`: the process-transport tool bridge serves its connections concurrently on
+# one task, without spawning.
+futures-util = "0.3"
 getrandom = "0.4"
 hickory-resolver = "0.26"
 hmac = "0.12"
