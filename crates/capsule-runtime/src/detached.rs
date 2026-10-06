@@ -88,6 +88,9 @@ pub(crate) struct DetachedCompletion {
 impl DetachedCompletion {
     /// The `IncomingTask.message_text` the agent reads: the work id, the command, the exit code,
     /// the duration and the output path. Never the output itself.
+    ///
+    /// An attributed limit adds the [`crate::resources::resource_limit_line`] a foreground call
+    /// would get, naming the limit and what to do about it.
     pub(crate) fn message_text(&self) -> String {
         let mut text = format!(
             "Background shell command finished.\n\
@@ -108,7 +111,8 @@ impl DetachedCompletion {
             self.output_bytes,
         );
         if let Some(limit) = &self.resource_limit {
-            text.push_str(&format!("\nresource_limit: {limit}"));
+            text.push('\n');
+            text.push_str(&crate::resources::resource_limit_line(limit));
         }
         if let Some(error) = &self.error {
             text.push_str(&format!("\nwait_error: {error}"));
@@ -642,6 +646,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A demoted command's limit reaches the model in the same words a foreground call's does,
+    /// without displacing the opening line or the closing pointer at the output file.
+    #[test]
+    fn a_completion_names_its_limit_in_the_shared_wording() {
+        let completion = DetachedCompletion {
+            work_id: "wrk_0001".to_string(),
+            binary: "bash".to_string(),
+            command: "make -j64".to_string(),
+            exit_code: 1,
+            duration_ms: 3_000,
+            output_path: "logs/wrk_0001.log".to_string(),
+            output_bytes: 0,
+            resource_limit: Some("cgroup_pids_max".into()),
+            context_id: "ctx_1".to_string(),
+            provenance: completion_provenance(),
+            error: None,
+        };
+        let text = completion.message_text();
+        let expected = crate::resources::resource_limit_line("cgroup_pids_max");
+
+        assert!(
+            text.lines().any(|line| line == expected),
+            "no limit line in:\n{text}"
+        );
+        assert_eq!(
+            text.lines().next(),
+            Some("Background shell command finished.")
+        );
+        assert_eq!(completion.status(), "error");
+        assert!(text.ends_with("are not reproduced here."), "{text}");
     }
 
     /// The whole argument of demotion: the call returns long before the command does, and the

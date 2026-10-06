@@ -206,6 +206,45 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
     }
 }
 
+/// The line that tells the model which `capabilities.resources` limit stopped a shell command,
+/// and what to do about it: `resource_limit: <name> — <what happened>. <what to do>.`
+///
+/// One line, no trailing newline. `limit` is a name a call was attributed to — one of
+/// [`limit_from_signal`]'s or [`crate::cgroup::CgroupEventCounters::attribution_since`]'s. A name
+/// with no line of its own gets a generic one that still names its `capabilities.resources` field.
+///
+/// The `cgroup_*` lines say "the capsule … while this command ran" because the cgroup scope is
+/// shared by everything the session runs: a counter delta proves the capsule hit the ceiling
+/// during the call, not which process did. The signal lines say "this command" because the kernel
+/// delivered the signal to that process.
+///
+/// Every place the model reads an attributed limit renders it through this function.
+pub(crate) fn resource_limit_line(limit: &str) -> String {
+    let explanation = match limit {
+        "cgroup_pids_max" => "the capsule reached its process limit while this command ran, so \
+             starting a new process failed (EAGAIN). Retry with fewer parallel processes"
+            .to_string(),
+        "cgroup_memory_bytes" => "the capsule reached its memory limit while this command ran, \
+             and the kernel killed a process in it to free memory. Retry using less memory at \
+             once (smaller inputs, fewer parallel jobs)"
+            .to_string(),
+        "cpu_seconds" => "this command used up its CPU-time limit and was stopped. Retry with \
+             less work per command"
+            .to_string(),
+        "max_file_size_bytes" => "this command tried to write a file larger than the capsule's \
+             file-size limit and was stopped. Retry writing smaller files"
+            .to_string(),
+        other => format!(
+            "this command was stopped by the capsule's capabilities.resources.{other} limit. \
+             Retry with less work"
+        ),
+    };
+    format!(
+        "resource_limit: {limit} — {explanation}, or ask the operator to raise \
+         capabilities.resources.{limit}."
+    )
+}
+
 /// What one spawn's `RLIMIT_NPROC` is, decided in the parent before its `pre_exec` closure is
 /// installed — the closure only receives this `Copy` value.
 ///
@@ -734,6 +773,82 @@ mod tests {
                 "signal {ambiguous} has more than one possible cause and must stay unattributed"
             );
         }
+    }
+
+    /// Each name is taken from the producer that attributes it, so renaming an attribution
+    /// without giving the new name its line fails here rather than falling through to the generic
+    /// wording.
+    #[test]
+    fn every_attributable_limit_has_its_own_line() {
+        use crate::cgroup::CgroupEventCounters;
+
+        let cpu = limit_from_signal(libc::SIGXCPU).unwrap();
+        let fsize = limit_from_signal(libc::SIGXFSZ).unwrap();
+        let memory = CgroupEventCounters {
+            oom_kill: 1,
+            pids_max: 0,
+        }
+        .attribution_since(CgroupEventCounters::default())
+        .unwrap();
+        let pids = CgroupEventCounters {
+            oom_kill: 0,
+            pids_max: 1,
+        }
+        .attribution_since(CgroupEventCounters::default())
+        .unwrap();
+
+        let expected = [
+            (
+                pids,
+                "resource_limit: cgroup_pids_max — the capsule reached its process limit while \
+                 this command ran, so starting a new process failed (EAGAIN). Retry with fewer \
+                 parallel processes, or ask the operator to raise \
+                 capabilities.resources.cgroup_pids_max.",
+            ),
+            (
+                memory,
+                "resource_limit: cgroup_memory_bytes — the capsule reached its memory limit while \
+                 this command ran, and the kernel killed a process in it to free memory. Retry \
+                 using less memory at once (smaller inputs, fewer parallel jobs), or ask the \
+                 operator to raise capabilities.resources.cgroup_memory_bytes.",
+            ),
+            (
+                cpu,
+                "resource_limit: cpu_seconds — this command used up its CPU-time limit and was \
+                 stopped. Retry with less work per command, or ask the operator to raise \
+                 capabilities.resources.cpu_seconds.",
+            ),
+            (
+                fsize,
+                "resource_limit: max_file_size_bytes — this command tried to write a file larger \
+                 than the capsule's file-size limit and was stopped. Retry writing smaller files, \
+                 or ask the operator to raise capabilities.resources.max_file_size_bytes.",
+            ),
+        ];
+        for (name, text) in expected {
+            let line = resource_limit_line(name);
+            assert_eq!(line, text);
+            assert!(line.starts_with(&format!("resource_limit: {name} — ")));
+            assert!(line.contains(&format!("capabilities.resources.{name}")));
+            assert!(line.contains("ask the operator to raise"));
+            assert!(!line.contains('\n'), "{line:?} must be a single line");
+        }
+
+        for cgroup in [pids, memory] {
+            let line = resource_limit_line(cgroup);
+            assert!(line.contains("the capsule"), "{line}");
+            assert!(line.contains("while this command ran"), "{line}");
+        }
+        for signal in [cpu, fsize] {
+            assert!(resource_limit_line(signal).contains("this command"));
+        }
+
+        assert_eq!(
+            resource_limit_line("some_future_limit"),
+            "resource_limit: some_future_limit — this command was stopped by the capsule's \
+             capabilities.resources.some_future_limit limit. Retry with less work, or ask the \
+             operator to raise capabilities.resources.some_future_limit."
+        );
     }
 
     #[test]

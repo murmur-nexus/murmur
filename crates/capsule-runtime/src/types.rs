@@ -57,8 +57,13 @@ pub(crate) struct DispatchOutcome {
     /// [`crate::runtime::CapsuleStoreState::dispatch_agent_tool_async`] after the fence's closing
     /// marker, so the model reads them as the runtime's rather than as the tool's data.
     ///
-    /// `Some` only on a `call-member` call that started, carrying
-    /// [`crate::member_call::started_note`]; `None` on every other outcome. The unfenced route of
+    /// `Some` on exactly two outcomes:
+    ///
+    /// * a `call-member` call that started, carrying [`crate::member_call::started_note`];
+    /// * a shell call that finished and whose failure was attributed to a
+    ///   `capabilities.resources` limit, carrying [`crate::resources::resource_limit_line`].
+    ///
+    /// `None` on every other outcome. The unfenced route of
     /// [`crate::runtime::CapsuleStoreState::dispatch_submit_plan`] never reads it.
     pub runtime_note: Option<String>,
 }

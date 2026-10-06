@@ -167,3 +167,20 @@ failure inside the process, `max_processes`, where it applies, as a `fork()` fai
 `EAGAIN`, and `max_open_files` as an `open()` failing with `EMFILE` — none of which kills anything
 the runtime can attribute. An absent `resource_limit` means the limit could not be identified, not that no limit
 was involved.
+
+The model reads the same attribution as a `resource_limit:` line that names the field and what to
+do about it:
+
+| How the command ended | Where the line appears |
+|---|---|
+| Finished within the shell call | After the fenced tool output, on its own line |
+| Moved to the background | In the completion message for that command |
+
+For `cgroup_pids_max` the line reads:
+
+```text
+resource_limit: cgroup_pids_max — the capsule reached its process limit while this command ran, so starting a new process failed (EAGAIN). Retry with fewer parallel processes, or ask the operator to raise capabilities.resources.cgroup_pids_max.
+```
+
+The `cgroup_*` lines speak of the capsule rather than the command, because the scope is shared by
+everything the capsule runs. The tool result's status is the same with or without the line.
