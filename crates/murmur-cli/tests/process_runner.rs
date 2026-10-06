@@ -635,6 +635,12 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
     let exit = run.one("harness_exit");
     assert_eq!(exit["cause"], "inactivity");
     assert_eq!(exit["killed"], true);
+    // The silence is recorded as the failed model call it ended.
+    let failed = run.one("inference");
+    assert_eq!(failed["decision"], "error", "{failed}");
+    assert_eq!(failed["stop_reason"], "error", "{failed}");
+    assert_eq!(failed["error_code"], "harness_inactive", "{failed}");
+    assert!(failed.get("provider_status").is_none(), "{failed}");
 
     // Three seconds of output, in half-second steps: each line resets the window.
     let capsule = Built::new().build();

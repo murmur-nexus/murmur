@@ -562,13 +562,21 @@ fn trace_session_end_written_on_failed_exit() {
         .iter()
         .map(|e| e["event_type"].as_str().unwrap())
         .collect();
-    let inference_count = types.iter().filter(|&&t| t == "inference").count() as u64;
     let tool_count = types.iter().filter(|&&t| t == "tool_call").count() as u64;
     let shell_count = types.iter().filter(|&&t| t == "shell").count() as u64;
 
     assert_eq!(se["total_tool_calls"].as_u64().unwrap(), tool_count);
     assert_eq!(se["total_shell_calls"].as_u64().unwrap(), shell_count);
-    assert_eq!(se["total_turns"].as_u64().unwrap(), inference_count);
+
+    // Turn 1's failed driver call is recorded, and an agent-loop call that failed is not a turn.
+    let (failed, answered): (Vec<&Value>, Vec<&Value>) = events
+        .iter()
+        .filter(|e| e["event_type"] == "inference")
+        .partition(|e| e.get("error_code").is_some());
+    assert_eq!(failed.len(), 1, "{failed:#?}");
+    assert_eq!(failed[0]["turn"], 1);
+    assert_eq!(failed[0]["error_code"], "driver_error");
+    assert_eq!(se["total_turns"].as_u64().unwrap(), answered.len() as u64);
 }
 
 /// Verify that session_id in trace.jsonl equals the session_id from StagedSession.
