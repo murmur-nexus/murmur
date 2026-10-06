@@ -10,17 +10,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{
-    fs,
-    io::{ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::Path,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::{fs, io::ErrorKind, net::TcpListener, path::Path, time::Duration};
 
 use assert_cmd::Command;
+use common::github_release::{wasm_tool_zip, MockRelease};
 use murmur_artifact::{read_lockfile, sha256_hex};
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -28,19 +21,6 @@ use tempfile::TempDir;
 const NAME: &str = "default-source-tool";
 const VERSION: &str = "0.3.0";
 const ABSENT: &str = "absent-artifact@1.0.0";
-
-fn wasm_zip(dir: &Path) -> Vec<u8> {
-    let path = dir.join(format!("{NAME}-{VERSION}.mur.zip"));
-    let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
-    let options: zip::write::SimpleFileOptions =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    zip.start_file("murmur.yaml", options).unwrap();
-    writeln!(zip, "name: {NAME}\nversion: {VERSION}\nruntime: tool").unwrap();
-    zip.start_file("tool.wasm", options).unwrap();
-    zip.write_all(b"\0asm\x01\0\0\0").unwrap();
-    zip.finish().unwrap();
-    fs::read(path).unwrap()
-}
 
 /// `mur` under the scratch `home`, run from `cwd`, with no GitHub token in reach.
 fn mur(home: &TempDir, cwd: &Path, api_base: &str) -> Command {
@@ -65,91 +45,14 @@ fn write_project(dir: &Path, name: &str, version: &str) {
     .unwrap();
 }
 
-/// Serves one `releases/latest` payload holding `asset`, and 404s every tag lookup so
-/// resolution takes the latest-release path. Records every request path it is sent.
-struct MockRelease {
-    api_base: String,
-    paths: Arc<Mutex<Vec<String>>>,
+fn asset_name() -> String {
+    format!("{NAME}-{VERSION}.mur.zip")
 }
 
-impl MockRelease {
-    fn start(asset: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let api_base = format!("http://{}", listener.local_addr().unwrap());
-        let paths = Arc::new(Mutex::new(Vec::new()));
-        let release_body = format!(
-            "{{\"tag_name\":\"v{VERSION}\",\"assets\":[{{\"id\":1,\"name\":\"{NAME}-{VERSION}.mur.zip\"}}]}}"
-        );
-
-        let recorded = Arc::clone(&paths);
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let Some(path) = read_request_path(&mut stream) else {
-                    continue;
-                };
-                recorded.lock().unwrap().push(path.clone());
-                let _ = if path.ends_with("/releases/latest") {
-                    write_response(
-                        &mut stream,
-                        200,
-                        "application/json",
-                        release_body.as_bytes(),
-                    )
-                } else if path.ends_with("/releases/assets/1") {
-                    write_response(&mut stream, 200, "application/octet-stream", &asset)
-                } else {
-                    write_response(&mut stream, 404, "text/plain", b"not found")
-                };
-            }
-        });
-
-        Self { api_base, paths }
-    }
-
-    fn paths(&self) -> Vec<String> {
-        self.paths.lock().unwrap().clone()
-    }
-}
-
-fn read_request_path(stream: &mut TcpStream) -> Option<String> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let request = String::from_utf8_lossy(&buffer);
-    Some(
-        request
-            .lines()
-            .next()?
-            .split_whitespace()
-            .nth(1)?
-            .to_string(),
-    )
-}
-
-fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body)?;
-    stream.flush()
+/// A release publishing `NAME@VERSION` as its only asset, built under `staging`.
+fn published_release(staging: &Path) -> MockRelease {
+    let bytes = fs::read(wasm_tool_zip(staging, NAME, VERSION)).unwrap();
+    MockRelease::start(&format!("v{VERSION}"), vec![(asset_name(), bytes)])
 }
 
 fn assert_asked_default_artifacts(release: &MockRelease) {
@@ -192,7 +95,7 @@ fn a_global_install_with_no_config_file_uses_the_built_in_source() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let release = MockRelease::start(wasm_zip(staging.path()));
+    let release = published_release(staging.path());
 
     mur(&home, cwd.path(), &release.api_base)
         .args(["install", "-g", &format!("{NAME}@{VERSION}")])
@@ -217,9 +120,8 @@ fn a_manifest_install_with_no_config_file_uses_the_built_in_source() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let bytes = wasm_zip(staging.path());
-    let sha256 = sha256_hex(&bytes);
-    let release = MockRelease::start(bytes);
+    let release = published_release(staging.path());
+    let sha256 = sha256_hex(&fs::read(staging.path().join(asset_name())).unwrap());
     write_project(project.path(), NAME, VERSION);
 
     mur(&home, project.path(), &release.api_base)
@@ -256,6 +158,9 @@ fn a_global_install_with_an_empty_source_list_fails_without_a_lookup() {
         .stderr(predicate::str::contains(format!(
             "artifact {ABSENT} not found in registry"
         )))
+        .stderr(predicate::str::contains(
+            "hint: configure a registry.sources entry",
+        ))
         .stderr(predicate::str::contains("E-REG-006").not());
 
     assert!(!was_connected(&listener), "no source was asked");

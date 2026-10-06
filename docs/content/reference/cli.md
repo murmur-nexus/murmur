@@ -305,7 +305,7 @@ Next:
 
 | Step | Does |
 |---|---|
-| `mur config set -g credentials.<KEY> <your key>` | Stores the key `gateway.api_key` references in `~/.murmur/config.yaml`, where `mur run` re-reads it at launch — see [`gateway.api_key` resolution](manifest.md#gateway-api-key). Run it first: with no `~/.murmur/config.yaml`, `mur install` has no registry to install from, and the file this step writes names the default one |
+| `mur config set -g credentials.<KEY> <your key>` | Stores the key `gateway.api_key` references in `~/.murmur/config.yaml`, where `mur run` re-reads it at launch — see [`gateway.api_key` resolution](manifest.md#gateway-api-key). `mur run --roster` fails without it |
 | `mur install -g <driver>@<version>` | Installs the driver both members declare |
 | `mur build <NAME>/<member> && mur install -g …` | Packs each member and installs it into the global store, where admission finds it |
 | `mur run --roster <NAME> --task "…"` | Admits and launches the formation, with `lead` as the entry member |
