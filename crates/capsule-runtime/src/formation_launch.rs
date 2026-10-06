@@ -1285,8 +1285,11 @@ fn start_peer(
                 }),
             );
         }
-        match crate::running::probe_door_session_id(&report.url, report.door_token.as_ref()) {
-            Ok(session_id) if session_id == report.session_id => {
+        match door_answers_as(
+            crate::running::probe_door_session_id(&report.url, report.door_token.as_ref()),
+            &report.session_id,
+        ) {
+            Ok(()) => {
                 let pid = process.pid;
                 return (
                     Some(process),
@@ -1302,8 +1305,7 @@ fn start_peer(
                     }),
                 );
             }
-            Ok(other) => last_error = format!("the door answers as session {other}"),
-            Err(error) => last_error = error,
+            Err(why) => last_error = why,
         }
         let now = Instant::now();
         if now >= deadline {
@@ -1318,6 +1320,17 @@ fn start_peer(
             );
         }
         std::thread::sleep(READY_PROBE_INTERVAL.min(deadline - now));
+    }
+}
+
+/// Whether a door probe's answer counts as the reported session being ready: `Ok` only when the
+/// card names `reported`. A card naming another session, or a failed probe, is the `Err` that
+/// becomes the refusal's `last_error` if the deadline passes.
+fn door_answers_as(probed: Result<String, String>, reported: &str) -> Result<(), String> {
+    match probed {
+        Ok(session_id) if session_id == reported => Ok(()),
+        Ok(other) => Err(format!("the door answers as session {other}")),
+        Err(error) => Err(error),
     }
 }
 
@@ -1782,6 +1795,23 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    /// How long a launch that is expected to succeed may take before the test gives up on it: a
+    /// guard against a launch that never completes on a loaded host, not a claim about how fast
+    /// one does.
+    const LIVENESS_BOUND: Duration = Duration::from_secs(120);
+
+    /// The host's 1-, 5- and 15-minute load averages, for failure messages that may be load.
+    fn load_average() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .unwrap_or_default()
+            .split(' ')
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 
     /// The production bounds, stated: the readiness deadline a delegated child also gets, and a
     /// grace that outlasts the runtime's own teardown deadline.
@@ -1960,15 +1990,25 @@ mod tests {
 
     #[test]
     fn a_door_nothing_answers_on_is_refused_at_the_deadline() {
+        let deadline = Duration::from_secs(10);
         let port = silent_port();
         let started = Instant::now();
         let (failure, _) = refused(
             Some(&format!(
                 r#"{{"formation_id":"{{formation}}","session_id":"ses_standin","url":"localhost:{port}"}}"#
             )),
-            Duration::from_millis(800),
+            deadline,
         );
-        assert!(started.elapsed() >= Duration::from_millis(800));
+        assert!(started.elapsed() >= deadline);
+        // One deadline covers the readiness line and the door, so a stand-in that is not
+        // scheduled in time is refused before its door is ever probed.
+        if let MemberFailureReason::DidNotReport { .. } = only_reason(&failure) {
+            panic!(
+                "the stand-in's readiness line did not arrive within {deadline:?} (load average {}); \
+                 host load is the likely cause, since the stand-in prints it at once: {failure:?}",
+                load_average()
+            );
+        }
         match only_reason(&failure) {
             MemberFailureReason::DoorDidNotAnswer {
                 url, session_id, ..
@@ -1987,29 +2027,27 @@ mod tests {
         assert_reaped(&failure);
     }
 
-    /// A one-route door: `GET /.well-known/agent-card.json` answered with a card naming
-    /// `session_id`, from `answer_after` on; refused connections before then are emulated by not
-    /// accepting.
-    fn door(session_id: &'static str, answer_after: Duration) -> u16 {
+    /// A one-route door on `127.0.0.1`, served forever: each connection's request is read, then
+    /// `GET /.well-known/agent-card.json` is answered with a card naming the session `answer`
+    /// returns for that request, or with `{}` when it returns `None`.
+    fn card_door(mut answer: impl FnMut() -> Option<&'static str> + Send + 'static) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let opened = Instant::now();
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
                 let mut buffer = [0u8; 4096];
                 let _ = stream.read(&mut buffer);
-                let body = if opened.elapsed() >= answer_after {
-                    serde_json::json!({
+                let body = match answer() {
+                    Some(session_id) => serde_json::json!({
                         "name": "coder",
                         "capabilities": {"extensions": [{
                             "uri": crate::identity::CAPSULE_EXTENSION_URI,
                             "params": {"sessionId": session_id},
                         }]},
                     })
-                    .to_string()
-                } else {
-                    "{}".to_string()
+                    .to_string(),
+                    None => "{}".to_string(),
                 };
                 let _ = write!(
                     stream,
@@ -2022,22 +2060,94 @@ mod tests {
         port
     }
 
+    /// A door answering with a card naming `session_id` from `answer_after` on, and with a card
+    /// naming no session before then.
+    fn door(session_id: &'static str, answer_after: Duration) -> u16 {
+        let opened = Instant::now();
+        card_door(move || (opened.elapsed() >= answer_after).then_some(session_id))
+    }
+
+    /// How many card requests [`door_naming_another_session_first`] answers as another session.
+    const WRONG_ANSWERS: usize = 3;
+
+    /// A door that answers as `ses_somebody_else` to its first [`WRONG_ANSWERS`] card requests and
+    /// as `ses_standin` to every one after, with the count of requests it has read. The count is
+    /// raised before the answer is written, so it covers every answer a client has seen.
+    fn door_naming_another_session_first() -> (u16, Arc<AtomicUsize>) {
+        let served = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&served);
+        let port = card_door(move || {
+            if counted.fetch_add(1, Ordering::SeqCst) < WRONG_ANSWERS {
+                Some("ses_somebody_else")
+            } else {
+                Some("ses_standin")
+            }
+        });
+        (port, served)
+    }
+
+    /// The launcher probes past every answer naming another session and is ready only on the one
+    /// naming the reported session. Accepting any answer would stop at the door's first request.
     #[test]
     fn a_door_naming_another_session_is_not_ready() {
-        let port = door("ses_somebody_else", Duration::ZERO);
-        let (failure, _) = refused(
-            Some(&format!(
-                r#"{{"formation_id":"{{formation}}","session_id":"ses_standin","url":"localhost:{port}"}}"#
-            )),
-            Duration::from_millis(800),
+        let _guard = binary_guard();
+        let (port, served) = door_naming_another_session_first();
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(LIVENESS_BOUND);
+        let line = format!(
+            r#"{{"formation_id":"{}","session_id":"ses_standin","url":"localhost:{port}"}}"#,
+            options.formation_id
         );
-        match only_reason(&failure) {
-            MemberFailureReason::DoorDidNotAnswer { last_error, .. } => {
-                assert!(last_error.contains("ses_somebody_else"), "{last_error}")
-            }
-            other => panic!("{other:?}"),
+        std::env::set_var(
+            child_launch::MUR_BINARY_ENV,
+            stand_in(dir.path(), Some(&line)),
+        );
+        let result = launch_plan(plan_of("coder"), options);
+        std::env::remove_var(child_launch::MUR_BINARY_ENV);
+        let formation = match result {
+            Ok(formation) => formation,
+            Err(failure) => panic!(
+                "the launch was refused within the {LIVENESS_BOUND:?} liveness bound \
+                 (load average {}): {failure}. On a loaded host this means the stand-in or its \
+                 door was never scheduled, not that the session check is wrong. {failure:?}",
+                load_average()
+            ),
+        };
+        let peer = &formation.peers()[0];
+        assert_eq!(peer.session_id, "ses_standin");
+        let served = served.load(Ordering::SeqCst);
+        assert!(
+            served > WRONG_ANSWERS,
+            "an answer naming another session was counted as ready: the door served {served} \
+             request(s), and its first {WRONG_ANSWERS} named ses_somebody_else"
+        );
+        let pid = peer.pid;
+        drop(formation);
+        assert!(
+            !crate::running::pid_is_alive(pid),
+            "dropping the owner stops the peer"
+        );
+    }
+
+    #[test]
+    fn a_door_counts_as_ready_only_when_it_answers_as_the_reported_session() {
+        let port = door("ses_somebody_else", Duration::ZERO);
+        let probed = crate::running::probe_door_session_id(&format!("localhost:{port}"), None);
+        match door_answers_as(probed, "ses_standin") {
+            Err(why) => assert!(
+                why.contains("the door answers as session ses_somebody_else"),
+                "{why}"
+            ),
+            Ok(()) => panic!("a door answering as ses_somebody_else counted as ses_standin"),
         }
-        assert_reaped(&failure);
+        assert_eq!(
+            door_answers_as(Ok("ses_standin".to_string()), "ses_standin"),
+            Ok(())
+        );
+        assert_eq!(
+            door_answers_as(Err("connection refused".to_string()), "ses_standin"),
+            Err("connection refused".to_string())
+        );
     }
 
     #[test]
