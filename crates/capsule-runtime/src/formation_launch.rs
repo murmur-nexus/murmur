@@ -2000,15 +2000,6 @@ mod tests {
             deadline,
         );
         assert!(started.elapsed() >= deadline);
-        // One deadline covers the readiness line and the door, so a stand-in that is not
-        // scheduled in time is refused before its door is ever probed.
-        if let MemberFailureReason::DidNotReport { .. } = only_reason(&failure) {
-            panic!(
-                "the stand-in's readiness line did not arrive within {deadline:?} (load average {}); \
-                 host load is the likely cause, since the stand-in prints it at once: {failure:?}",
-                load_average()
-            );
-        }
         match only_reason(&failure) {
             MemberFailureReason::DoorDidNotAnswer {
                 url, session_id, ..
@@ -2016,6 +2007,13 @@ mod tests {
                 assert_eq!(url, &format!("http://localhost:{port}"));
                 assert_eq!(session_id, "ses_standin");
             }
+            // One deadline covers the readiness line and the door, so a stand-in that is not
+            // scheduled in time is refused before its door is ever probed.
+            MemberFailureReason::DidNotReport { .. } => panic!(
+                "the stand-in's readiness line did not arrive within {deadline:?} (load average {}); \
+                 host load is the likely cause, since the stand-in prints it at once: {failure:?}",
+                load_average()
+            ),
             other => panic!("{other:?}"),
         }
         let message = failure.to_string();
@@ -2106,12 +2104,18 @@ mod tests {
         std::env::remove_var(child_launch::MUR_BINARY_ENV);
         let formation = match result {
             Ok(formation) => formation,
-            Err(failure) => panic!(
-                "the launch was refused within the {LIVENESS_BOUND:?} liveness bound \
-                 (load average {}): {failure}. On a loaded host this means the stand-in or its \
-                 door was never scheduled, not that the session check is wrong. {failure:?}",
-                load_average()
-            ),
+            Err(failure) => match only_reason(&failure) {
+                MemberFailureReason::DidNotReport { .. } => panic!(
+                    "the stand-in's readiness line did not arrive within {LIVENESS_BOUND:?} \
+                     (load average {}); host load is the likely cause: {failure:?}",
+                    load_average()
+                ),
+                _ => panic!(
+                    "the launch was refused although the door answered as ses_standin from its \
+                     request {} on: {failure:?}",
+                    WRONG_ANSWERS + 1
+                ),
+            },
         };
         let peer = &formation.peers()[0];
         assert_eq!(peer.session_id, "ses_standin");
