@@ -87,9 +87,9 @@ section that explains it.
 | `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
 | `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle, or `MURMUR_SPAWNER_LIFELINE` to something that is not this session's spawner lifeline | [E-RUN-020](#e-run-020) |
 | `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
-| `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
+| `E-RUN-022` | A session address or formation id names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
-| `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
+| `E-RUN-024` | The session or formation named could not be ended and is still running | [E-RUN-024](#e-run-024) |
 | `E-RUN-025` | An artifact whose entry declares `gateway:` has no usable `upstream_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
@@ -461,6 +461,20 @@ error[E-RUN-022]: 'localhost:41235' is not a session address
 
 To reach a capsule by address rather than by name, pass `--url <host:port>`.
 
+[`mur stop <formation-id>`](cli.md#mur-stop-formation) refuses with this code, and signals nothing,
+when the formation id is malformed or names no running member:
+
+```text
+error[E-RUN-022]: no member of formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61 is running on this machine
+  hint: `mur ps` lists the formations running here
+```
+
+| Message | Means |
+|---|---|
+| `'<arg>' is not a formation id: …` | The argument starts `frm_` and is not a whole formation id |
+| `no member of formation <id> is running on this machine` | No record names that formation |
+| `formation <id> is not running: N member record(s) named processes that are gone, and were removed` | Every record naming it was stale |
+
 ### E-RUN-023 — the capsule did not answer { #e-run-023 }
 
 The address named a capsule whose process is alive, and the capsule's agent card did not come back:
@@ -506,6 +520,20 @@ The record is **not** removed. Unlike [`E-RUN-022`](#e-run-022), the capsule it 
 running, so unlinking the record would remove the only handle anyone has on it. Every task the
 session held was cancelled before the signalling started, so the capsule is idle even though it is
 still there.
+
+[`mur stop <formation-id>`](cli.md#mur-stop-formation) reports a formation it could not end with
+the same code, as `formation <id> could not be ended: <reason>`:
+
+| Reason | Means |
+|---|---|
+| `its members record N different launchers (pid A, pid B)` | The members disagree about which process launched them; nothing was signalled. End each member with `mur stop <session>` |
+| `SIGTERM to its launcher, pid N, was refused: …` | The launcher could not be confirmed or may not be signalled by this user; nothing was signalled and every member is still running |
+| `SIGKILL to its launcher, pid N, was refused: …` | The same, at the escalation step |
+| `its launcher, pid N, was still running 5 seconds after SIGKILL` | The kernel accepted the signal and the launcher has not gone |
+| `N of its members were still running 25 seconds later: <session>, …` | Those members' processes outlived the wait; their records are kept |
+
+A member started by hand that could not be ended is reported as `error: …` in the
+[report](cli.md#mur-stop-formation) and counted among the members still running.
 
 ### E-RUN-025 — an artifact with a gateway declares no usable `upstream_auth:` block { #e-run-025 }
 

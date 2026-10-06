@@ -2486,6 +2486,10 @@ fn launch(
     #[cfg(unix)]
     let formation_lifeline = staged.formation_lifeline.take();
     #[cfg(unix)]
+    let holds_formation_lifeline = formation_lifeline.is_some();
+    #[cfg(not(unix))]
+    let holds_formation_lifeline = false;
+    #[cfg(unix)]
     if formation_lifeline.is_some() {
         if !handle_sigterm {
             return Err(RuntimeError::FormationLifelineUnreadable {
@@ -2679,7 +2683,8 @@ fn launch(
 
         // Built while `staged` is still whole. It is written, and the URL announced, inside the
         // task `LocalSet` below, once the door has been spawned.
-        let running_record = running_record_for(&staged, &session_id, &capsule_url);
+        let running_record =
+            running_record_for(&staged, &session_id, &capsule_url, holds_formation_lifeline);
 
         // The control token is minted here, from a key generated for this session alone, and
         // written beside where the running record will be before that record exists. The guard
@@ -4464,10 +4469,16 @@ async fn drain_script_trace_buffers(
 /// `door_token` is the operator token of a session declaring `network.authentication`, and the
 /// only one written anywhere: it is how `mur ps`, `mur stop`, `mur cancel` and `mur watch` call
 /// an authenticated door.
+///
+/// `holds_formation_lifeline` is whether this session holds a formation lifeline, which its
+/// launcher ends it by closing. Only such a member records the launcher its channel named, which
+/// is how `mur stop <formation id>` finds a launcher that writes no record of its own.
+/// `spawned_by` is the delegating session's id, for a delegated child that ends with its spawner.
 fn running_record_for(
     staged: &StagedSession,
     session_id: &str,
     capsule_url: &str,
+    holds_formation_lifeline: bool,
 ) -> running::RunningRecord {
     let pid = std::process::id();
     running::RunningRecord {
@@ -4487,6 +4498,17 @@ fn running_record_for(
             .as_ref()
             .map(|auth| auth.operator_token().clone()),
         formation_id: staged.formation_id.clone(),
+        formation_lifeline: holds_formation_lifeline,
+        formation_launcher: staged
+            .formation_member
+            .as_ref()
+            .and_then(|member| member.launcher())
+            .filter(|_| holds_formation_lifeline)
+            .cloned(),
+        spawned_by: staged
+            .spawner
+            .as_ref()
+            .map(|spawner| spawner.session_id.clone()),
     }
 }
 
