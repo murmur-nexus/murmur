@@ -17363,14 +17363,6 @@ inference:
     }
 
     impl ReopenRun {
-        /// Every trace event of `event_type`, in order.
-        fn of_type(&self, event_type: &str) -> Vec<&serde_json::Value> {
-            self.events
-                .iter()
-                .filter(|event| event["event_type"] == event_type)
-                .collect()
-        }
-
         /// The data of every `status` frame with `"final":true`.
         fn final_statuses(&self) -> Vec<&serde_json::Value> {
             self.frames
@@ -17673,8 +17665,9 @@ inference:
         driver_response: &'static str,
         /// The `tool-result.status` the driver double answers with: `0` passed, `2` error.
         driver_status: u32,
-        /// Whether the driver double traps on every call instead of answering.
-        driver_traps: bool,
+        /// A bare driver double used in place of the answering one: one that traps, or one that
+        /// answers no data.
+        bare_driver: Option<fn(&wasmtime::Engine) -> wasmtime::component::Component>,
         /// Whether `tsk_1` runs as an A2A task whose frames are collected in [`ReopenRun::frames`].
         streamed: bool,
     }
@@ -17696,7 +17689,7 @@ inference:
                 max_task_reopens: 5,
                 driver_response: HTTP_REOPEN_RESPONSE,
                 driver_status: 0,
-                driver_traps: false,
+                bare_driver: None,
                 streamed: false,
             }
         }
@@ -17716,15 +17709,14 @@ inference:
         );
         if let Some(metadata) = scenario.driver_metadata.as_deref() {
             fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
-            let driver = if scenario.driver_traps {
-                crate::inference_import::test_support::trapping_driver_double(&state.engine)
-            } else {
-                crate::inference_import::test_support::driver_double_with_metadata(
+            let driver = match scenario.bare_driver {
+                Some(bare) => bare(&state.engine),
+                None => crate::inference_import::test_support::driver_double_with_metadata(
                     &state.engine,
                     scenario.driver_status,
                     scenario.driver_response,
                     metadata,
-                )
+                ),
             };
             state
                 .tool_components
@@ -18720,13 +18712,12 @@ inference:
                 2,
                 "status {status}: no other inference record"
             );
-            let reopened = run.of_type("task_reopened");
+            let reopened = of_type(&run.events, "task_reopened");
             assert_eq!(reopened.len(), 1, "status {status}");
             assert_eq!(reopened[0]["turns_remaining"], 10, "status {status}");
-            let task_end = run.of_type("task_end");
+            let task_end = of_type(&run.events, "task_end");
             assert_eq!(task_end[0]["turns"], 0, "status {status}");
-            let causes: Vec<_> = run
-                .of_type("task_failed")
+            let causes: Vec<_> = of_type(&run.events, "task_failed")
                 .iter()
                 .map(|e| e["cause"].clone())
                 .collect();
@@ -18742,30 +18733,35 @@ inference:
         }
     }
 
-    /// A driver that answers `passed` with no usable body leaves a `malformed_response` record,
-    /// and the attempt ends as it always has.
+    /// A driver that answers `passed` with no usable body — one that is not JSON, an empty one,
+    /// or neither `data` nor `summary` — leaves a `malformed_response` record, and the attempt
+    /// ends as it always has.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_malformed_driver_response_is_recorded() {
-        for (response, text) in [
-            ("not json", "failed to parse driver response"),
-            ("", "failed to parse driver response"),
+        let no_data: fn(&wasmtime::Engine) -> wasmtime::component::Component =
+            crate::inference_import::test_support::no_data_driver_double;
+        for (bare_driver, response, text) in [
+            (None, "not json", "failed to parse driver response"),
+            (None, "", "failed to parse driver response"),
+            (Some(no_data), "", "driver returned no data"),
         ] {
             let run = run_http_reopen(HttpReopen {
                 reopen_limit: 0,
                 driver_response: response,
+                bare_driver,
                 ..HttpReopen::answering(ConversationMode::Stateless)
             })
             .await;
             assert!(run.result.is_err(), "{:?}", run.result);
             let failed = failed_inference_records(&run);
-            assert_eq!(failed.len(), 1, "{response:?}: {:#?}", run.events);
+            assert_eq!(failed.len(), 1, "{response:?} {text}: {:#?}", run.events);
             assert_uncounted_failed_record(failed[0], "malformed_response");
             assert!(
                 failed[0]["error"].as_str().unwrap().contains(text),
                 "{}",
                 failed[0]
             );
-            let task_failed = run.of_type("task_failed");
+            let task_failed = of_type(&run.events, "task_failed");
             assert_eq!(task_failed.len(), 1);
             assert_eq!(task_failed[0]["cause"], "runtime_error");
         }
@@ -18776,7 +18772,7 @@ inference:
     async fn a_trapping_driver_is_recorded_as_driver_failed() {
         let run = run_http_reopen(HttpReopen {
             reopen_limit: 0,
-            driver_traps: true,
+            bare_driver: Some(crate::inference_import::test_support::trapping_driver_double),
             ..HttpReopen::answering(ConversationMode::Stateless)
         })
         .await;
@@ -18790,7 +18786,10 @@ inference:
             error.contains("unreachable") || error.contains("trap"),
             "{error}"
         );
-        assert_eq!(run.of_type("task_failed")[0]["cause"], "runtime_error");
+        assert_eq!(
+            of_type(&run.events, "task_failed")[0]["cause"],
+            "runtime_error"
+        );
     }
 
     /// A process task a hook reopens once streams one boundary frame between its two attempts

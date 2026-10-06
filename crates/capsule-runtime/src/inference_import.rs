@@ -531,13 +531,27 @@ pub(crate) mod test_support {
     /// A `murmur:tool/run@0.1.0` component whose `run` executes `unreachable`: a driver that
     /// traps on every call.
     pub(crate) fn trapping_driver_double(engine: &wasmtime::Engine) -> Component {
-        let wat = r#"(component
+        bare_driver_double(engine, "unreachable")
+    }
+
+    /// A `murmur:tool/run@0.1.0` component whose `run` answers `status: passed` with neither
+    /// `data` nor `summary`. The result is the zeroed memory at offset 128, which the canonical
+    /// ABI reads as `passed`, every option `none`, and an empty `metadata` list.
+    pub(crate) fn no_data_driver_double(engine: &wasmtime::Engine) -> Component {
+        bare_driver_double(engine, "(i32.const 128)")
+    }
+
+    /// A driver component whose core `run` is `run_body`, which must leave an `i32` result
+    /// pointer on the stack or trap.
+    fn bare_driver_double(engine: &wasmtime::Engine, run_body: &str) -> Component {
+        let wat = format!(
+            r#"(component
   (core module $m
     (memory (export "memory") 1)
     (func (export "realloc") (param i32 i32 i32 i32) (result i32)
       (i32.const 1024))
     (func (export "run") (param i32 i32 i32 i32 i32 i32) (result i32)
-      unreachable)
+      {run_body})
   )
   (core instance $i (instantiate $m))
   (alias core export $i "memory" (core memory $mem))
@@ -563,9 +577,10 @@ pub(crate) mod test_support {
     (export "tool-result" (type $tool-result))
     (export "run" (func $run)))
   (export "murmur:tool/run@0.1.0" (instance $ti))
-)"#;
-        let bytes = wat::parse_str(wat).expect("trapping driver double WAT parses");
-        Component::new(engine, &bytes).expect("trapping driver double compiles")
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("bare driver double WAT parses");
+        Component::new(engine, &bytes).expect("bare driver double compiles")
     }
 
     /// [`driver_double`], answering with `metadata` on every call — a `continuation_id` entry

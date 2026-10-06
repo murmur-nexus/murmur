@@ -92,7 +92,7 @@ before the first task begins
 |---|---|---|
 | `turn` | u32 | Zero-based turn index |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
-| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn, which only a process driver reporting no usage produces — never the same fact as `0` |
+| `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn: a process driver reporting no usage, or a [failed call](#inference-failed) that is not counted — never the same fact as `0` |
 | `output_tokens` | u64 | What this turn's output cost, on the same terms as `input_tokens` |
 | `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` \| `"error"` — what the loop does next. A turn the provider cut off at the output cap reads `"text"`; `stop_reason` beside it is the field that says it was cut off. `"error"` is a [failed call](#inference-failed) |
 | `stop_reason` | string | The provider's own stop reason, verbatim as the loop dispatched on it — `"max_tokens"` for a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens). Written on every agent-loop turn, and as `""` when the driver reported none. `"error"` on every failed call, on both transports and for a hook's `run-inference`. Absent on any other record no driver response was parsed for: a hook's successful `run-inference` and a `process` turn that ended |
@@ -157,7 +157,7 @@ call, or an unsupported stop reason — succeeded, and is recorded with the prov
 | `harness_quota` | A `process` harness reported a `turn-failed` of kind `quota` |
 | `harness_error` | A `process` harness reported a `turn-failed` of kind `harness-error` |
 | `harness_other` | A `process` harness reported a `turn-failed` of kind `other` |
-| `harness_inactive` | A `process` harness produced no output for the inactivity timeout and was stopped |
+| `harness_inactive` | A `process` harness produced no output for the inactivity limit and was stopped ([`E-RUN-035`](diagnostics.md#e-run-035)) |
 
 A spend ceiling that refuses a call before it is sent, a canceled call, and a `process` harness
 failure of kind `max-turns` or `canceled` write no failed record.

@@ -2343,7 +2343,7 @@ Every `--body` failure exits non-zero with [`E-TRC-001`](diagnostics.md):
 
 The **Tasks** section appears only for sessions that ran more than one task.
 
-The **Turns** section lists every [failed model call](observability-schemas.md#inference-failed) under `count:`, in trace order. Each gets two lines: `failed:` with the turn, the hook that made the call (for a hook's `run-inference`), the [`error_code`](observability-schemas.md#inference-error-code) and the provider's HTTP status when there was one; then the call's `error`, cut to 200 characters with a trailing `…`. A failed agent-loop call is not counted in `count:`. For a capsule whose provider rejected its key:
+The **Turns** section lists every [failed model call](observability-schemas.md#inference-failed) under `count:`, in trace order. Each gets two lines: `failed:` with the turn, the hook that made the call (for a hook's `run-inference`), the [`error_code`](observability-schemas.md#inference-error-code) and the provider's HTTP status when there was one; then the call's `error`, cut to 200 characters with a trailing `…`. Whether a failed call adds to `count:` follows the [failed-call table](observability-schemas.md#inference-failed). For a capsule whose provider rejected its key:
 
 ```text
 ── Turns ────────────────────────────────────────
@@ -2508,8 +2508,9 @@ task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
 
 A [failed model call](observability-schemas.md#inference-failed) renders on its turn row as
 `error`, its [`error_code`](observability-schemas.md#inference-error-code) and the provider's HTTP
-status when there was one; a hook's failed `run-inference` adds the same to its `inference` row. A
-failed agent-loop call is not counted in the header's turns:
+status when there was one; a hook's failed `run-inference` adds the same to its `inference` row.
+The header's turn count leaves out every failed call outside a hook, so for a `process` turn that
+failed while open it reads one lower than `mur trace show`'s `count:`:
 
 ```text
 Session ses_019f01a940ce7761854e768ecbe3d399  (1 task, 0 turns)
