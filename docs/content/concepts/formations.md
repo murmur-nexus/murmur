@@ -41,8 +41,8 @@ when the roster lets it call another:
 4. Its answer comes back into the caller's same task, fenced as coming from that member, and the
    caller's model continues with it.
 
-A second call to a member before its answer has arrived is refused, with nothing sent. A call
-carries text only, so whatever the other member needs goes in the task text. See
+A second call to a member is refused, with nothing sent, until the first call's answer has been
+delivered. A call carries text only, so whatever the other member needs goes in the task text. See
 [Giving a member work](../reference/roster.md#member-calls).
 
 ## Reachability: three layers, each closed by default { #reachability }
@@ -102,8 +102,8 @@ wire two capsules together by hand, with a pinned port and `curl`, see
   virtual address — see
   [What a member's components are handed](../reference/roster.md#formation-peers). A
   `transport: process` harness still calls members with `call-member`, which the runtime serves to
-  it through its tool bridge; the answer reaches it when the runtime resumes the harness's session
-  — see [`call-member`](../reference/runtime-provided-tools.md#call-member).
+  it through its loopback tool server; the answer reaches it when the runtime resumes the
+  harness's session — see [How the answer arrives](../reference/runtime-provided-tools.md#call-member-answer).
 - **Credential rotation.** A formation credential has no expiry, rotation or revocation; the
   credentials end with the formation's one task — see
   [Why a formation credential never expires](../reference/roster.md#enforcement-lifetime).
