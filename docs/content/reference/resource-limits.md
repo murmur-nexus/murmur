@@ -182,5 +182,4 @@ For `cgroup_pids_max` the line reads:
 resource_limit: cgroup_pids_max — the capsule reached its process limit while this command ran, so starting a new process failed (EAGAIN). Retry with fewer parallel processes, or ask the operator to raise capabilities.resources.cgroup_pids_max.
 ```
 
-The `cgroup_*` lines speak of the capsule rather than the command, because the scope is shared by
-everything the capsule runs. The tool result's status is the same with or without the line.
+The tool result's status is the same with or without the line.

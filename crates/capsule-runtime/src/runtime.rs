@@ -15673,8 +15673,8 @@ inference:
         assert!(data.contains("capabilities.resources.cgroup_pids_max"));
     }
 
-    /// A call nothing was attributed to renders exactly as it did before limit lines existed:
-    /// no note, no metadata, and no limit guessed from a non-zero exit.
+    /// A call nothing was attributed to carries no note and no `resource_limit` metadata, and no
+    /// limit is guessed from a non-zero exit.
     #[test]
     fn a_shell_result_with_no_attributed_limit_renders_exactly_as_before() {
         let tmp = TempDir::new().unwrap();
