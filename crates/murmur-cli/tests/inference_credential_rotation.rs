@@ -32,8 +32,7 @@ const OLD: &str = "sk-rotation-old-7a41c9e2";
 const NEW: &str = "sk-rotation-new-3d82e0b5";
 const NEW2: &str = "sk-rotation-newer-b61f07d4";
 const LITERAL: &str = "sk-rotation-literal-c9e5a310";
-const W_SEC_027_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027";
+const W_SEC_027_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-027";
 const WAIT: Duration = Duration::from_secs(120);
 
 const TOOL_USE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"test-model","content":[{"type":"tool_use","id":"toolu_skill","name":"rotation-skill","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}"#;

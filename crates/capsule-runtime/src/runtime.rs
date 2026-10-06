@@ -18970,7 +18970,7 @@ inference:
             "[capsule-runtime] warning[W-RUN-004]: the tool 'my-tool' declares an input_schema \
              whose `required` is not an array of strings, so its calls are dispatched without \
              the required-field check \
-             (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-004)"
+             (https://docs.murmur.nexus/reference/diagnostics/#w-run-004)"
         );
         assert!(
             malformed_schema_warning("my-tool", MalformedSchema::RootNotObject).contains(

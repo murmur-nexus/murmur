@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod artifact_ref;
 pub mod build;
 pub mod build_lints;
+pub mod docs_url;
 pub mod dotenv;
 pub mod install_pattern;
 pub mod lockfile;
@@ -37,6 +38,7 @@ pub use build_lints::{
     build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
     W_BLD_002, W_BLD_003,
 };
+pub use docs_url::{diagnostic_link, DOCS_REFERENCE_URL};
 pub use dotenv::{dotenv_variable_names, load_dotenv_non_override, DotenvError};
 pub use lockfile::{
     read_lockfile, write_lockfile_atomic, LockOrigin, LockedArtifact, LockedSha256, LockfileError,

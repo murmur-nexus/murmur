@@ -257,8 +257,7 @@ fn upstream_request_matches_recording() {
 
 const ENV_REPORT_DRIVER: &str = "env-report-driver";
 const MARKER: &str = "sk-gateway-test-marker";
-const W_SEC_025_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025";
+const W_SEC_025_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-025";
 
 fn env_report_wasm() -> PathBuf {
     common::fixture_path("env-report-driver/tool/env-report-driver.wasm")

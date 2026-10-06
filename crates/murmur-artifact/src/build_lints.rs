@@ -36,12 +36,9 @@ pub const W_BLD_003: &str = "W-BLD-003";
 /// which is what [`W_BLD_001`] and [`W_BLD_002`] report.
 pub const RESERVED_ROOT_ENTRIES: [&str; 2] = [PACKED_MANIFEST_ENTRY, CAPSULE_WASM_ENTRY];
 
-const DIAGNOSTICS_DOC_URL: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
-
 /// Builds the doc link for a `W-BLD-*` code, e.g. `.../diagnostics/#w-bld-001`.
 pub fn build_warning_link(code: &str) -> String {
-    format!("{DIAGNOSTICS_DOC_URL}#{}", code.to_lowercase())
+    crate::diagnostic_link(code)
 }
 
 /// One thing worth telling the author about an otherwise successful build.
@@ -197,7 +194,7 @@ mod tests {
     fn link_lowercases_the_code_into_the_anchor() {
         assert_eq!(
             build_warning_link(W_BLD_001),
-            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-bld-001"
+            "https://docs.murmur.nexus/reference/diagnostics/#w-bld-001"
         );
     }
 

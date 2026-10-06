@@ -281,18 +281,18 @@ pub(crate) struct DoorGate {
 /// URI of the agent-card extension that lists every JSON-RPC method the door answers, murmur's
 /// own methods among them. It is the address of that extension's section in the reference docs.
 pub(crate) const DOOR_EXTENSION_URI: &str =
-    "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1";
+    murmur_artifact::docs_reference_url!("agent-card/#murmur-door-v1");
 
 /// URI of the agent-card extension that carries the extended-card material: the session id and
 /// what the capsule may do. It is the address of that extension's section in the reference docs.
 pub(crate) const CAPSULE_EXTENSION_URI: &str =
-    "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1";
+    murmur_artifact::docs_reference_url!("agent-card/#murmur-capsule-v1");
 
 /// URI of the agent-card extension that lists every SSE event type the capsule's stream can write.
 /// It is the address of that extension's section in the reference docs, on the streaming protocol
 /// page beside the frames it names.
 pub(crate) const STREAM_EXTENSION_URI: &str =
-    "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
+    murmur_artifact::docs_reference_url!("streaming-protocol/#murmur-stream-v1");
 
 /// What the door extension says about itself.
 const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.";
@@ -1917,6 +1917,24 @@ mod tests {
         streams_text: true,
         kind: TransportKind::Http,
     };
+
+    /// Clients match on the extension URIs as identifiers, so a change to the docs reference base
+    /// that would rename one fails here.
+    #[test]
+    fn extension_uris_keep_their_identifier_values() {
+        assert_eq!(
+            DOOR_EXTENSION_URI,
+            "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1"
+        );
+        assert_eq!(
+            CAPSULE_EXTENSION_URI,
+            "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1"
+        );
+        assert_eq!(
+            STREAM_EXTENSION_URI,
+            "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1"
+        );
+    }
 
     /// The stream extension's `params.frames` a capsule on each transport serves under each
     /// acceptance. Written once per transport, so a frame one transport alone writes is an edit to

@@ -1035,7 +1035,7 @@ interface list, it is read from the installed payload. The check never writes to
 Interface versions
   ⚠  stale-hook@0.3.0   global    exports murmur:hook/lifecycle@0.8.0 — this mur serves murmur:hook@0.9.0
   ⚠  stale-hook@0.3.0   global    imports murmur:runtime/inference@0.3.0 — this mur serves murmur:runtime@0.4.0
-  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-003)
+  mur run refuses these at launch (warning[W-REG-003], https://docs.murmur.nexus/reference/diagnostics/#w-reg-003)
 
 Checking /path/to/murmur.yaml for linux-x86_64...
 

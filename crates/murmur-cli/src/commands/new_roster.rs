@@ -122,7 +122,7 @@ const MEMBERS: [&MemberTemplate; 2] = [&LEAD, &WORKER];
 /// The formation's reachability rules: each `from` may call every member in its `to`.
 const REACHABILITY: &[(&str, &[&str])] = &[("lead", &["worker"])];
 
-const DOCS: &str = "https://docs.murmur.nexus/reference";
+const DOCS: &str = murmur_artifact::DOCS_REFERENCE_URL;
 
 /// The column trailing comments start at, when the line before them is short enough.
 const COMMENT_COLUMN: usize = 36;
