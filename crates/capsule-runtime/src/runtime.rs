@@ -8207,21 +8207,18 @@ impl CapsuleStoreState {
                     // never happens.
                     live.register(
                         notice.delegation_id.clone(),
-                        crate::cancel::LiveDelegation {
-                            task_id: task_id.clone(),
-                            workdir: child_root.join(&notice.child_workdir),
-                            capsule: notice.capsule.clone(),
-                            version: notice.version.clone(),
-                            child_session_id: notice.child_session_id.clone(),
-                            child_workdir: notice.child_workdir.clone(),
-                            started: std::time::Instant::now(),
-                            child: None,
-                            arrived: false,
-                        },
+                        crate::cancel::LiveDelegation::launched(
+                            task_id.clone(),
+                            &child_root,
+                            &notice,
+                        ),
                     );
                     let _ = launch_tx.send(notice);
                 },
             )),
+            // The launch is raced against the task's cancel below, and the child's handle is the
+            // task's once it is up.
+            stop: None,
         };
         // A cancel that lands mid-launch must not queue behind it: the child is already in the
         // task's set, which ends it, and the person who stopped the task is waiting on an answer.
@@ -8659,6 +8656,18 @@ impl CapsuleStoreState {
         let plan_trace = self.plan_trace.clone();
         let registry = Arc::clone(&self.registry);
         let gate_tx = request_tx.clone();
+        // The task this plan runs for: its cancel stops the plan, and its delegation set accounts
+        // for every `capsule` step's child, as it does for a `delegate-task` child.
+        let cancel = self.task_cancel_signal();
+        let plan_task = self
+            .live_delegations
+            .task_id()
+            .map(|task_id| SubmittingTask {
+                task_id,
+                cancel: cancel.clone(),
+                live: Arc::clone(&self.live_delegations),
+                child_root: self.accessible_workdir.clone(),
+            });
         let mut scheduling = tokio::task::spawn_blocking(move || {
             let gate_step = move |call: &crate::plan::PlannedCall<'_>| -> Option<String> {
                 if !gates {
@@ -8706,13 +8715,32 @@ impl CapsuleStoreState {
                 trace: plan_trace.as_deref(),
                 gate_step: &gate_step,
                 invoke_tool: &invoke_tool,
+                task: plan_task
+                    .as_ref()
+                    .map(|task| task as &dyn crate::plan::PlanTask),
             };
             crate::plan::execute(&plan_path, &ctx)
         });
 
         let mut requests_open = true;
+        let mut cancel_armed = cancel.is_some();
+        // The join is never abandoned on a cancel: the scheduler's threads end their steps'
+        // children and write those children's records, and the task's own accounting for the
+        // rows they leave must come after both.
         let joined = loop {
             tokio::select! {
+                biased;
+                () = async {
+                    match &cancel {
+                        Some(signal) => signal.canceled().await,
+                        None => std::future::pending().await,
+                    }
+                }, if cancel_armed => {
+                    if let Some(signal) = &cancel {
+                        signal.note_phase(crate::cancel::PHASE_PLAN);
+                    }
+                    cancel_armed = false;
+                }
                 request = request_rx.recv(), if requests_open => match request {
                     Some(request) => self.answer_plan_request(request, gate.as_deref_mut()).await,
                     // The senders live in the blocking closure, so this is that closure ending.
@@ -8751,13 +8779,19 @@ impl CapsuleStoreState {
         let data = serde_json::json!({
             "plan_id": plan_id,
             "completed": report.completed,
+            "canceled": report.canceled,
             "failed_step": report.failed_step,
             "steps": steps,
         });
-        let summary = format!(
-            "Plan '{plan_id}': {} steps, {succeeded} succeeded, {failed} failed, {skipped} skipped",
+        let counts = format!(
+            "{} steps, {succeeded} succeeded, {failed} failed, {skipped} skipped",
             report.results.len()
         );
+        let summary = if report.canceled {
+            format!("Plan '{plan_id}' was cancelled: {counts}")
+        } else {
+            format!("Plan '{plan_id}': {counts}")
+        };
 
         Ok(murmur::tool::run::ToolResult {
             // The status carries the plan's outcome so the model is told the plan did not
@@ -9863,6 +9897,44 @@ enum PlanRequest {
         murmur::tool::run::ToolInput,
         tokio::sync::oneshot::Sender<Result<murmur::tool::run::ToolResult, String>>,
     ),
+}
+
+/// The A2A task a `submit-plan` call runs its plan for, handed to the scheduler as its
+/// [`crate::plan::PlanTask`].
+///
+/// Owned, so it moves onto the blocking thread the scheduler runs on: the signal is a clone of
+/// the task's own and the set is the session's, so a cancel the door raises and a row a step
+/// registers are the ones the task loop reads.
+struct SubmittingTask {
+    /// The task in scope when the plan was submitted, which every row a step registers names.
+    task_id: String,
+    /// The task's cancel flag, or `None` for a task that cannot be cancelled.
+    cancel: Option<crate::cancel::CancelSignal>,
+    live: Arc<crate::cancel::LiveDelegations>,
+    /// The parent's accessible workdir, which a launch notice's relative child directory is
+    /// joined to.
+    child_root: PathBuf,
+}
+
+impl crate::plan::PlanTask for SubmittingTask {
+    fn is_canceled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(crate::cancel::CancelSignal::is_canceled)
+    }
+
+    /// Registered as a `delegate-task` child is, with no handle: the step's blocking
+    /// `DelegationPlane::delegate` call keeps it, and ends the child itself on a cancel.
+    fn delegation_started(&self, launch: &crate::delegation_plane::DelegationLaunch) {
+        self.live.register(
+            launch.delegation_id.clone(),
+            crate::cancel::LiveDelegation::launched(self.task_id.clone(), &self.child_root, launch),
+        );
+    }
+
+    fn delegation_settled(&self, delegation_id: &str) -> bool {
+        self.live.discard(delegation_id)
+    }
 }
 
 /// An owned [`crate::plan::PlannedCall`], because the gate's answer comes from another thread.
@@ -20694,5 +20766,82 @@ mod member_call_tests {
         assert_eq!(starts.len(), 1);
         assert!(events(dir.path(), "member_call").is_empty());
         assert_eq!(calls.counts(), (0, 1));
+    }
+}
+
+#[cfg(test)]
+mod submitting_task_tests {
+    use super::*;
+    use crate::plan::PlanTask;
+
+    fn launch(delegation_id: &str) -> crate::delegation_plane::DelegationLaunch {
+        crate::delegation_plane::DelegationLaunch {
+            delegation_id: delegation_id.to_string(),
+            capsule: "worker".to_string(),
+            version: "0.1.0".to_string(),
+            child_session_id: "ses_child".to_string(),
+            child_workdir: ".murmur/children/worker-1".to_string(),
+        }
+    }
+
+    fn submitting(
+        live: &Arc<crate::cancel::LiveDelegations>,
+        cancel: Option<crate::cancel::CancelSignal>,
+    ) -> SubmittingTask {
+        SubmittingTask {
+            task_id: "tsk_plan".to_string(),
+            cancel,
+            live: Arc::clone(live),
+            child_root: PathBuf::from("/work"),
+        }
+    }
+
+    /// A step that settles on its own takes its row back, so a plan nobody cancels leaves the
+    /// task's set as it found it.
+    #[test]
+    fn a_settled_step_leaves_the_set_empty() {
+        let live = Arc::new(crate::cancel::LiveDelegations::new());
+        let _scope = live.scope_task("tsk_plan");
+        let task = submitting(&live, None);
+
+        task.delegation_started(&launch("dlg_a"));
+        let rows = live.live();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id(), "dlg_a");
+
+        assert!(task.delegation_settled("dlg_a"));
+        assert!(live.live().is_empty());
+        assert_eq!(live.counts(), (0, 0));
+    }
+
+    /// A row the task has already taken to account for is the task's to close, so the step is
+    /// told not to write the terminal line.
+    #[test]
+    fn a_row_the_task_took_is_not_the_steps_to_close() {
+        let live = Arc::new(crate::cancel::LiveDelegations::new());
+        let _scope = live.scope_task("tsk_plan");
+        let task = submitting(&live, None);
+
+        task.delegation_started(&launch("dlg_a"));
+        let taken = live.take_all();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            taken[0].1.workdir,
+            PathBuf::from("/work/.murmur/children/worker-1")
+        );
+        assert!(taken[0].1.child.is_none());
+        assert!(!task.delegation_settled("dlg_a"));
+    }
+
+    /// The task reads the signal the door raises.
+    #[test]
+    fn the_task_is_cancelled_when_its_signal_is() {
+        let live = Arc::new(crate::cancel::LiveDelegations::new());
+        let signal = crate::cancel::CancelSignal::new();
+        let task = submitting(&live, Some(signal.clone()));
+        assert!(!task.is_canceled());
+        signal.cancel();
+        assert!(task.is_canceled());
+        assert!(!submitting(&live, None).is_canceled());
     }
 }

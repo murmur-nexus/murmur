@@ -392,8 +392,9 @@ and usually well under a second per level. With the default [`--max-depth`](#the
 | The delegating task ends any other way while the child is still running | The task kills the child, and records it `terminated` |
 | The [delegation deadline](#bounds) passes | The child is killed, and the task continues with a `terminated` outcome |
 
-A plan `capsule` step's child is killed when the step returns, and otherwise ends with the parent's
-process.
+A plan `capsule` step's child is killed when the step returns, which it does within about a second
+of the delegating task being cancelled, and otherwise ends with the parent's process. See
+[When the task is cancelled](plans.md#when-the-task-is-cancelled).
 
 On macOS a child can occasionally outlive its parent: if the parent starts another process at the
 instant it creates the child's lifeline, that process can hold the lifeline open, and the child

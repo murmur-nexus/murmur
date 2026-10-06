@@ -96,6 +96,36 @@ the plan:
 `retries` is applied first: a step with retries left is dispatched again, and `on_error` applies
 only once the last attempt has failed.
 
+## When the task is cancelled { #when-the-task-is-cancelled }
+
+A plan runs inside the task that called `submit-plan`, and stops when that task is cancelled — by
+`tasks/cancel`, [`mur cancel`](cli.md#mur-cancel), or [`mur stop`](cli.md#mur-stop) and `SIGTERM`
+ending the session. The capsule itself keeps running.
+
+| Step, when the cancel lands | What happens |
+|---|---|
+| A `capsule` step whose sub-capsule is running | The sub-capsule is ended within about a second. The step settles `failed` with the error `the task running this plan was cancelled; this step's sub-capsule was ended with it`, and is not retried |
+| A `capsule` step whose launch is still being approved or started | The same, as soon as the sub-capsule is up |
+| A `tool` or `shell` step already running | Runs to its own bound and settles with its own result |
+| A step that has not been dispatched | Never runs. It settles `skipped` with the error `the task running this plan was cancelled before this step ran` |
+
+No `on_error` policy is applied once the task is cancelled, and no step is retried. The
+[report](#the-report) has `canceled: true`, `completed: false` and
+`failed_step: null`, and `plan_end` records the outcome `canceled`.
+
+An ended sub-capsule is closed the way a cancelled task closes a
+[`delegate-task`](roost-api.md#the-delegation-tool) child:
+
+1. Its directory gets a `completion.json` with `status: terminated`, `reported_by: launcher` and
+   the detail `the parent ended this delegation`.
+2. The parent's trace writes `task_canceled`, whose `delegation_ids` names the step's delegation.
+3. The parent's trace then writes the delegation's terminal `delegation` line, with `outcome:
+   terminated` and `reason: the delegating task was cancelled`, followed by `task_end`.
+
+A parent killed outright, with `SIGKILL` or by a crash, ends nothing itself. Its plan step's
+sub-capsule goes when its spawner lifeline closes, records `spawner_ended` in its own trace, and
+leaves no `completion.json`.
+
 ## What is refused before anything runs
 
 The plan is validated as a whole before the first step is dispatched, so a plan with any of these
@@ -123,7 +153,8 @@ registered grant, not checked here.
 |---|---|---|
 | `plan_id` | string | The plan's own `id` |
 | `completed` | bool | `true` when every step settled without stopping the plan |
-| `failed_step` | string \| null | The step that stopped the plan, `null` when none did |
+| `canceled` | bool | `true` when the plan stopped because its task was cancelled. See [When the task is cancelled](#when-the-task-is-cancelled) |
+| `failed_step` | string \| null | The step that stopped the plan, `null` when none did or the plan was cancelled |
 | `steps` | list | One entry per settled step, in the order they settled |
 | `steps[].step_id` | string | |
 | `steps[].status` | `success` \| `failed` \| `skipped` | |
@@ -131,7 +162,8 @@ registered grant, not checked here.
 | `steps[].error` | string \| null | Why the step failed, `null` otherwise |
 
 A plan that did not complete comes back as a failed tool result, so the model is told the outcome
-rather than having to read the body for it.
+rather than having to read the body for it. Its summary reads `Plan '<id>': N steps, S succeeded,
+F failed, K skipped`, or `Plan '<id>' was cancelled: …` with the same counts.
 
 ## What a plan may reach
 
@@ -167,7 +199,9 @@ A plan run writes `plan_start`, one `plan_step_start` and one `plan_step` per di
 steps` renders them as rows and `mur trace show` gives them their own section.
 
 A `capsule` step also writes `delegation_start` when its child comes up and `delegation` when the
-delegation ends, and `mur trace show` lists those under Delegations. Both records, and how they
+delegation ends, and `mur trace show` lists those under Delegations. The step writes its own
+`delegation` line, except when its task is cancelled while the child runs: the task then writes it,
+after `task_canceled`. See [When the task is cancelled](#when-the-task-is-cancelled). Both records, and how they
 line up against the step's own `plan_step` line, are described in the
 [session trace schema](observability-schemas.md#session-trace-tracejsonl).
 

@@ -65,6 +65,11 @@ pub const DELEGATION_ID_PREFIX: &str = "dlg_";
 /// The child's own record of how it ended, in the child's directory.
 pub const COMPLETION_FILE: &str = "completion.json";
 
+/// The `detail` a launcher records in [`COMPLETION_FILE`] for a child its parent ended on
+/// purpose: through the handle a `delegate-task` call left with its task, or from inside a plan
+/// `capsule` step whose task was cancelled.
+pub const PARENT_ENDED_DETAIL: &str = "the parent ended this delegation";
+
 /// Ceiling on [`DelegationOutcome::detail`], the one field built from something a child wrote.
 ///
 /// `child_launch` already bounds the stderr tail to its last 20 lines; this bounds the bytes, so
@@ -784,7 +789,7 @@ mod tests {
         let mut ended = outcome();
         ended.status = DelegationStatus::Terminated;
         ended.reported_by = Reporter::Launcher;
-        ended.detail = Some("the parent ended this delegation".to_string());
+        ended.detail = Some(PARENT_ENDED_DETAIL.to_string());
 
         let recorded = record_terminated(dir.path(), ended);
         assert!(!recorded.delivered);

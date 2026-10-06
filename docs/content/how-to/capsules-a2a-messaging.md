@@ -411,7 +411,9 @@ that state and changes nothing. A task id the capsule never held is the one erro
 ### What the cancel names { #what-the-cancel-left-running }
 
 A detached shell command keeps its own lifecycle. A sub-capsule the task delegated to is ended by
-the cancelled task before its `task_end`. When either was in flight at the moment the cancel was
+the cancelled task before its `task_end`, whether `delegate-task` started it or a
+[plan's `capsule` step](../reference/plans.md#when-the-task-is-cancelled) did; a plan stops with
+its task and runs none of its remaining steps. When either was in flight at the moment the cancel was
 answered, the response carries an artifact named `residue` with one part per item, each part's
 `text` a JSON object:
 

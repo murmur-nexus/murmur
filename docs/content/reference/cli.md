@@ -1509,8 +1509,9 @@ its `task_canceled` record with `phase: "queued"`.
 
 The door step is the only moment anything can ask the capsule what it leaves running. A detached
 shell command keeps its own lifecycle, and the record of it dies with the process, so the question
-is asked while the capsule is still answering. A delegated sub-capsule is ended by the cancelled
-task that started it, and is named too.
+is asked while the capsule is still answering. A delegated sub-capsule — one started by
+`delegate-task` or by a [plan's `capsule` step](plans.md#when-the-task-is-cancelled) — is ended by
+the cancelled task that started it, and is named too.
 
 ```text
 stopped: ses_019f01a940ce7761854e768ecbe3d399
@@ -1773,7 +1774,7 @@ state `canceled`. What the task had in flight is named in the output, one line e
 | Line | Item | What the cancel did to it |
 |---|---|---|
 | `running:` | A detached shell command | Nothing: it keeps its own lifecycle |
-| `ended:` | A sub-capsule the task delegated to | Ended it, with the task |
+| `ended:` | A sub-capsule the task delegated to, through `delegate-task` or a [plan's `capsule` step](plans.md#when-the-task-is-cancelled) | Ended it, with the task. A plan stops with it, and runs none of its remaining steps |
 
 ```text
 task:    tsk_0199c4e2f1b7712a9d3e4f5061728394

@@ -13,7 +13,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use crate::{
     a2a::{A2aArtifact, ArtifactPart},
     child_launch::LaunchedChild,
+    delegation_plane::DelegationLaunch,
     detached::DetachedRegistry,
 };
 
@@ -52,6 +53,8 @@ pub(crate) const PHASE_MEMBER_CALL: &str = "member_call";
 /// Cancelled while a `transport: process` harness was running the turn. The runtime interrupts
 /// the harness it spawned, and kills it when the interrupt is refused or unavailable.
 pub(crate) const PHASE_HARNESS: &str = "harness";
+/// Cancelled while a `submit-plan` call was running its steps.
+pub(crate) const PHASE_PLAN: &str = "plan";
 
 /// What the terminal `canceled` status frame says. One constant for every transport: a client
 /// cannot tell from the frame which one ran the task.
@@ -164,13 +167,35 @@ pub(crate) struct LiveDelegation {
     /// When the launch was recorded: the start of the backstop's bound, and the duration of a
     /// row closed without the child's own record.
     pub(crate) started: Instant,
-    /// The handle that ends the child. `None` from the launch notice until
-    /// [`LiveDelegations::adopt`] attaches it, which is the length of the task's delivery to the
-    /// child; dropping it kills and reaps a child still running.
+    /// The handle that ends the child; dropping it kills and reaps a child still running.
+    ///
+    /// For a `delegate-task` child, `None` from the launch notice until [`LiveDelegations::adopt`]
+    /// attaches it, which is the length of the task's delivery to the child. Always `None` for a
+    /// plan `capsule` step's child: the step's blocking `DelegationPlane::delegate` call holds
+    /// that handle and is the only thing polling the child, so it is the one that ends it.
     pub(crate) child: Option<LaunchedChild>,
     /// Whether the child's completion has reached the door. An arrived outcome is delivered at the
     /// task's next wake, or closed from its record if the task ends first.
     pub(crate) arrived: bool,
+}
+
+impl LiveDelegation {
+    /// The row for a child `task_id` has just launched, from its launch notice: no handle yet, no
+    /// outcome, and `child_root` (the parent's accessible workdir) joined to the notice's relative
+    /// child directory.
+    pub(crate) fn launched(task_id: String, child_root: &Path, notice: &DelegationLaunch) -> Self {
+        Self {
+            task_id,
+            workdir: child_root.join(&notice.child_workdir),
+            capsule: notice.capsule.clone(),
+            version: notice.version.clone(),
+            child_session_id: notice.child_session_id.clone(),
+            child_workdir: notice.child_workdir.clone(),
+            started: Instant::now(),
+            child: None,
+            arrived: false,
+        }
+    }
 }
 
 /// What the door is to answer a completion naming one delegation.
@@ -265,11 +290,17 @@ impl LiveDelegations {
         drop(orphan);
     }
 
-    /// Drop a delegation that will never produce an outcome: one announced by the launcher whose
-    /// start then failed, and whose child the failed start has already ended.
-    pub(crate) fn discard(&self, delegation_id: &str) {
+    /// Drop a delegation whose caller closes it itself: one announced by the launcher whose start
+    /// then failed, or a plan `capsule` step's that ended without its task being cancelled.
+    ///
+    /// `true` when a row was removed. The caller that removed it writes the terminal `delegation`
+    /// line; `false` means the row is gone already — the task took it to account for — and the
+    /// task writes that line instead.
+    pub(crate) fn discard(&self, delegation_id: &str) -> bool {
         let entry = self.lock().entries.remove(delegation_id);
+        let removed = entry.is_some();
         drop(entry);
+        removed
     }
 
     /// Record that `delegation_id`'s completion reached the door, and wake the task loop.
@@ -596,8 +627,11 @@ mod tests {
             PHASE_INPUT,
             PHASE_DELEGATION,
             PHASE_HARNESS,
+            PHASE_MEMBER_CALL,
+            PHASE_PLAN,
         ];
         assert_eq!(phases[5], "harness");
+        assert_eq!(PHASE_PLAN, "plan");
         assert_eq!(
             phases
                 .iter()
@@ -626,14 +660,23 @@ mod tests {
         assert!(live.take_all().is_empty());
     }
 
+    /// Discarding says whether it removed the row, because whoever removes a row writes its
+    /// terminal `delegation` line, and a row the task already took is the task's to close.
     #[test]
-    fn discarding_drops_a_delegation_that_will_never_report() {
+    fn discarding_reports_whether_it_removed_the_row() {
         let (live, _scope) = scoped();
         live.register("dlg_one".to_string(), live_delegation("worker"));
-        live.discard("dlg_one");
+        assert!(live.discard("dlg_one"));
         assert!(live.live().is_empty());
-        // Discarding an id that is not there is the same nothing, not a panic.
-        live.discard("dlg_missing");
+        assert!(!live.discard("dlg_one"), "a second discard removes nothing");
+        assert!(!live.discard("dlg_missing"));
+
+        live.register("dlg_two".to_string(), live_delegation("worker"));
+        assert_eq!(live.take_all().len(), 1);
+        assert!(
+            !live.discard("dlg_two"),
+            "a row the task took to account for is not the caller's to close"
+        );
     }
 
     #[test]

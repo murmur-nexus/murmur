@@ -675,7 +675,7 @@ fn watch_for_completion(
                     &workdir,
                     outcome(
                         DelegationStatus::Terminated,
-                        "the parent ended this delegation".to_string(),
+                        delegation::PARENT_ENDED_DETAIL.to_string(),
                     ),
                 );
             }
@@ -1555,6 +1555,55 @@ mod tests {
         assert!(
             !lock(&process).deliberate,
             "a child that ended on its own is not recorded as ended by its parent"
+        );
+    }
+
+    /// A child its parent ends on purpose is recorded `terminated` by the launcher, in the words
+    /// every such record uses, and posted to nobody: the address here answers nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_its_parent_ends_is_recorded_in_the_shared_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let (process, _) = process_with_lifeline("sleep", &["30"]);
+        let mut child = LaunchedChild {
+            workdir: dir.path().to_path_buf(),
+            session_id: "ses_child".to_string(),
+            capsule_url: String::new(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            delegation_id: Some("dlg_watched".to_string()),
+            formation_id: None,
+            door_token: None,
+            process: Arc::new(Mutex::new(process)),
+            stderr_tail: Arc::new(StderrTail {
+                state: Mutex::new(StderrState::default()),
+                drained: Condvar::new(),
+            }),
+            started: Instant::now(),
+            watcher: None,
+        };
+        let watcher = watch_for_completion(
+            &child,
+            SpawnerHandle::for_delegation(&spawner(), "dlg_watched".to_string()),
+            CompletionAddress {
+                url: "http://127.0.0.1:1".to_string(),
+            },
+            "worker",
+            "0.1.0",
+            None,
+        )
+        .expect("the watcher starts");
+
+        child.shutdown().unwrap();
+        watcher.join().unwrap();
+
+        let recorded = delegation::read_completion(dir.path()).expect("the ending is recorded");
+        assert_eq!(recorded.status, DelegationStatus::Terminated);
+        assert_eq!(recorded.reported_by, Reporter::Launcher);
+        assert!(!recorded.delivered);
+        assert_eq!(
+            recorded.detail.as_deref(),
+            Some(delegation::PARENT_ENDED_DETAIL)
         );
     }
 }
