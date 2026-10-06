@@ -256,6 +256,24 @@ fn write_record(home: &Path, session_id: &str, url: &str, pid: u32, process_star
     .unwrap();
 }
 
+/// A record of a member of `formation_id` that holds a formation lifeline and names `launcher` as
+/// the process that started it: the keys a formation member's runtime writes beside the nine.
+fn write_launched_member_record(
+    home: &Path,
+    session_id: &str,
+    member: (u32, &str),
+    formation_id: &str,
+    launcher: (u32, &str),
+) {
+    write_record(home, session_id, "127.0.0.1:1", member.0, member.1);
+    let path = record_for(home, session_id);
+    let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["formation_id"] = json!(formation_id);
+    record["formation_lifeline"] = json!(true);
+    record["formation_launcher"] = json!({"pid": launcher.0, "process_start": launcher.1});
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
 /// A 36-character session id ending in `suffix`, so a fabricated record sorts predictably against
 /// its siblings.
 fn fabricated_id(suffix: &str) -> String {
@@ -2354,4 +2372,128 @@ fn trace_show_refuses_a_formation_it_cannot_find() {
         .clone();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert!(stderr.contains("E-TRC-001"), "{stderr}");
+}
+
+// ── Stopping a formation: refusals ────────────────────────────────────────────
+
+/// A formation id that is not one, and one no running member names, are both `E-RUN-022`, and
+/// neither reads a record into anything it could signal.
+#[test]
+fn a_formation_id_that_is_malformed_or_names_nothing_running_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let stderr_of = |id: &str| {
+        let output = mur(home.path())
+            .args(["stop", id])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty(), "{output:?}");
+        String::from_utf8_lossy(&output.stderr).to_string()
+    };
+
+    let malformed = stderr_of("frm_xyz");
+    assert!(malformed.contains("E-RUN-022"), "{malformed}");
+    assert!(
+        malformed.contains("'frm_xyz' is not a formation id:"),
+        "{malformed}"
+    );
+    assert!(
+        malformed.contains("FORMATION column of mur ps"),
+        "{malformed}"
+    );
+
+    let unused = capsule_runtime::FormationId::mint();
+    let nothing = stderr_of(unused.as_str());
+    assert!(nothing.contains("E-RUN-022"), "{nothing}");
+    assert!(
+        nothing.contains(&format!("no member of formation {unused}")),
+        "{nothing}"
+    );
+}
+
+/// Members recording two launchers name no one launcher to end: nothing is signalled.
+#[test]
+fn members_naming_two_launchers_are_refused_and_nothing_is_signalled() {
+    let home = tempfile::tempdir().unwrap();
+    let formation = capsule_runtime::FormationId::mint();
+    let mut sleeps = [
+        Stray::sleeping(),
+        Stray::sleeping(),
+        Stray::sleeping(),
+        Stray::sleeping(),
+    ];
+    let tokens: Vec<String> = sleeps.iter().map(Stray::token).collect();
+    for (index, suffix) in ["aaa1", "aaa2"].into_iter().enumerate() {
+        write_launched_member_record(
+            home.path(),
+            &fabricated_id(suffix),
+            (sleeps[index].pid(), &tokens[index]),
+            formation.as_str(),
+            (sleeps[index + 2].pid(), &tokens[index + 2]),
+        );
+    }
+
+    let output = mur(home.path())
+        .args(["stop", formation.as_str()])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-RUN-024"), "{stderr}");
+    assert!(stderr.contains("2 different launchers"), "{stderr}");
+    assert!(stderr.contains("nothing was signalled"), "{stderr}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    thread::sleep(Duration::from_millis(300));
+    for sleep in &mut sleeps {
+        assert!(sleep.is_alive(), "pid {} was signalled", sleep.pid());
+    }
+    for suffix in ["aaa1", "aaa2"] {
+        assert!(record_for(home.path(), &fabricated_id(suffix)).exists());
+    }
+}
+
+/// A launcher this user may not signal is `E-RUN-024`, and no member is signalled in its place.
+#[test]
+fn a_launcher_that_cannot_be_signalled_is_refused_and_no_member_is_signalled() {
+    let home = tempfile::tempdir().unwrap();
+    let formation = capsule_runtime::FormationId::mint();
+    let mut member = Stray::sleeping();
+    let token = member.token();
+    let Some(init_token) = capsule_runtime::running::process_start_token(1) else {
+        eprintln!("[SKIP-HOST] ps_stop: pid 1's start time is unreadable here");
+        return;
+    };
+    let session_id = fabricated_id("ccc1");
+    write_launched_member_record(
+        home.path(),
+        &session_id,
+        (member.pid(), &token),
+        formation.as_str(),
+        (1, &init_token),
+    );
+    // Root may signal pid 1, so the refusal this case is about cannot happen, and nothing here may
+    // risk sending pid 1 a signal.
+    if running_as_root() {
+        eprintln!("[SKIP-HOST] ps_stop: running as root, pid 1 is signallable");
+        return;
+    }
+
+    let output = mur(home.path())
+        .args(["stop", formation.as_str()])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(stderr.contains("E-RUN-024"), "{stderr}");
+    assert!(
+        stderr.contains("SIGTERM to its launcher, pid 1, was refused"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("every member is still running"), "{stderr}");
+    thread::sleep(Duration::from_millis(300));
+    assert!(member.is_alive(), "the member was signalled");
+    assert!(record_for(home.path(), &session_id).exists());
 }

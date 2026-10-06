@@ -450,9 +450,9 @@ enum Commands {
     },
     /// List the capsules running on this machine
     Ps,
-    /// Stop one running capsule, ending its session and everything it still holds
+    /// Stop one running capsule, or a whole formation, ending everything it still holds
     Stop {
-        /// Running session to stop: @1, a ses_ id, or a 4-character suffix of one
+        /// Running session to stop: @1, a ses_ id, or a 4-character suffix of one; or a formation id (frm_…) to stop every member
         #[arg(value_name = "SESSION")]
         session: String,
         /// Seconds to wait after SIGTERM before SIGKILL; 0 escalates immediately

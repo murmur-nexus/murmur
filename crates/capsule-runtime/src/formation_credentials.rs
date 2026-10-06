@@ -227,6 +227,7 @@ impl FormationAuthority {
         FormationBundle {
             formation_id: self.formation_id.clone(),
             member: member.to_string(),
+            launcher: None,
             verify_key: self.verify_key(),
             calls: callees
                 .iter()
@@ -355,14 +356,18 @@ impl FormationVerifier {
 /// One member's credentials, as its channel's first line carries them:
 ///
 /// ```json
-/// {"formation_id":"frm_…","member":"coder","verify_key":"<b64url>","calls":[{"name":"reviewer","token":"mft1.…"}]}
+/// {"formation_id":"frm_…","member":"coder","launcher":{"pid":4242,"process_start":"…"},"verify_key":"<b64url>","calls":[{"name":"reviewer","token":"mft1.…"}]}
 /// ```
 ///
-/// Every field is required; `calls` is empty for a member that may call nobody.
+/// Every field but `launcher` is required; `calls` is empty for a member that may call nobody.
 #[derive(Clone)]
 pub struct FormationBundle {
     pub formation_id: FormationId,
     pub member: String,
+    /// The launcher that started this member, which the member writes into its running record so
+    /// `mur stop` can find the launcher from it. `None` when the launcher could not read its own
+    /// start time, and the line then carries no `launcher` key.
+    pub launcher: Option<crate::running::ProcessIdentity>,
     pub verify_key: FormationVerifyKey,
     /// One token per callee, in roster order.
     pub calls: Vec<(String, FormationToken)>,
@@ -373,6 +378,7 @@ impl std::fmt::Debug for FormationBundle {
         f.debug_struct("FormationBundle")
             .field("formation_id", &self.formation_id.as_str())
             .field("member", &self.member)
+            .field("launcher", &self.launcher)
             .field(
                 "calls",
                 &self
@@ -411,8 +417,19 @@ impl FormationBundle {
                 )
             })
             .collect();
+        let launcher = self
+            .launcher
+            .as_ref()
+            .map(|launcher| {
+                format!(
+                    ",\"launcher\":{{\"pid\":{},\"process_start\":{}}}",
+                    launcher.pid,
+                    json_string(&launcher.process_start)
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "{{\"formation_id\":{},\"member\":{},\"verify_key\":{},\"calls\":[{}]}}",
+            "{{\"formation_id\":{},\"member\":{}{launcher},\"verify_key\":{},\"calls\":[{}]}}",
             json_string(self.formation_id.as_str()),
             json_string(&self.member),
             json_string(&self.verify_key.render()),
@@ -450,6 +467,7 @@ impl FormationBundle {
                 "its first line's member is not a member name: it {problem}"
             )));
         }
+        let launcher = object.get("launcher").map(parse_launcher).transpose()?;
         let verify_key = FormationVerifyKey::parse(string("verify_key")?).map_err(|why| {
             channel_unreadable(format!(
                 "its first line's verify_key is not a formation key: {why}"
@@ -497,10 +515,39 @@ impl FormationBundle {
         Ok(Self {
             formation_id,
             member,
+            launcher,
             verify_key,
             calls,
         })
     }
+}
+
+/// A first line's `launcher`: an object with a `pid` in `1..=i32::MAX` and a non-empty string
+/// `process_start`. A pid outside that range names no single process `kill(2)` could reach, so a
+/// line carrying one is refused rather than handed on to a running record.
+fn parse_launcher(value: &Value) -> Result<crate::running::ProcessIdentity, RuntimeError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| channel_unreadable("its first line's launcher is not a JSON object"))?;
+    let pid = object
+        .get("pid")
+        .and_then(Value::as_u64)
+        .filter(|pid| (1..=i32::MAX as u64).contains(pid))
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| {
+            channel_unreadable("its first line's launcher has no positive integer pid")
+        })?;
+    let process_start = object
+        .get("process_start")
+        .and_then(Value::as_str)
+        .filter(|start| !start.is_empty())
+        .ok_or_else(|| {
+            channel_unreadable("its first line's launcher has no non-empty string process_start")
+        })?;
+    Ok(crate::running::ProcessIdentity {
+        pid,
+        process_start: process_start.to_string(),
+    })
 }
 
 /// One address line: `{"addresses":[{"name":"coder","url":"http://127.0.0.1:41873"}]}`.
@@ -590,6 +637,8 @@ struct AddressBook {
 /// it may call, and the door URLs of those members as the channel delivers them.
 pub struct FormationMember {
     verifier: FormationVerifier,
+    /// The launcher its first line named, if it named one.
+    launcher: Option<crate::running::ProcessIdentity>,
     /// Roster order.
     calls: Vec<(String, FormationToken)>,
     book: Mutex<AddressBook>,
@@ -613,6 +662,7 @@ impl FormationMember {
     pub fn from_bundle(bundle: FormationBundle) -> Self {
         Self {
             verifier: FormationVerifier::new(bundle.formation_id, bundle.member, bundle.verify_key),
+            launcher: bundle.launcher,
             calls: bundle.calls,
             book: Mutex::new(AddressBook::default()),
             arrived: Condvar::new(),
@@ -723,6 +773,12 @@ impl FormationMember {
 
     pub fn formation_id(&self) -> &FormationId {
         &self.verifier.formation_id
+    }
+
+    /// The formation launcher that started this member, as its first line named it. `None` for a
+    /// line that named none.
+    pub fn launcher(&self) -> Option<&crate::running::ProcessIdentity> {
+        self.launcher.as_ref()
     }
 
     /// What this member's door checks a formation token with.
@@ -1079,6 +1135,110 @@ mod tests {
             .is_empty());
     }
 
+    /// A launcher's identity is written after `member` and read back whole; a line without one
+    /// reads as naming no launcher.
+    #[test]
+    fn a_first_line_carries_its_launcher_when_one_is_named() {
+        let (authority, _) = chain_roster();
+        let launcher = crate::running::ProcessIdentity {
+            pid: 4242,
+            process_start: "987654".to_string(),
+        };
+        let mut bundle = authority.member_bundle("coder", &["reviewer"]);
+        assert_eq!(bundle.launcher, None);
+        bundle.launcher = Some(launcher.clone());
+        let line = bundle.render_line();
+        assert!(
+            line.starts_with(&format!(
+                "{{\"formation_id\":\"{}\",\"member\":\"coder\",\
+                 \"launcher\":{{\"pid\":4242,\"process_start\":\"987654\"}},\"verify_key\":\"",
+                authority.formation_id()
+            )),
+            "{line}"
+        );
+        let back = FormationBundle::parse_line(&line).unwrap();
+        assert_eq!(back.launcher, Some(launcher.clone()));
+        assert_eq!(back.calls, bundle.calls);
+        assert_eq!(
+            FormationMember::from_bundle(back).launcher(),
+            Some(&launcher)
+        );
+
+        let without = authority
+            .member_bundle("coder", &["reviewer"])
+            .render_line();
+        assert!(!without.contains("launcher"), "{without}");
+        let back = FormationBundle::parse_line(&without).unwrap();
+        assert_eq!(back.launcher, None);
+        assert_eq!(FormationMember::from_bundle(back).launcher(), None);
+    }
+
+    #[test]
+    fn a_malformed_launcher_is_refused_naming_launcher() {
+        let (authority, _) = chain_roster();
+        let good: Value = serde_json::from_str(
+            &authority
+                .member_bundle("coder", &["reviewer"])
+                .render_line(),
+        )
+        .unwrap();
+        let cases = [
+            (serde_json::json!(4242), "launcher is not a JSON object"),
+            (Value::Null, "launcher is not a JSON object"),
+            (
+                serde_json::json!({"process_start": "1"}),
+                "launcher has no positive integer pid",
+            ),
+            (
+                serde_json::json!({"pid": 0, "process_start": "1"}),
+                "launcher has no positive integer pid",
+            ),
+            (
+                serde_json::json!({"pid": -5, "process_start": "1"}),
+                "launcher has no positive integer pid",
+            ),
+            (
+                serde_json::json!({"pid": 2_147_483_648_u64, "process_start": "1"}),
+                "launcher has no positive integer pid",
+            ),
+            (
+                serde_json::json!({"pid": 1.5, "process_start": "1"}),
+                "launcher has no positive integer pid",
+            ),
+            (
+                serde_json::json!({"pid": "42", "process_start": "1"}),
+                "launcher has no positive integer pid",
+            ),
+            (
+                serde_json::json!({"pid": 42}),
+                "launcher has no non-empty string process_start",
+            ),
+            (
+                serde_json::json!({"pid": 42, "process_start": ""}),
+                "launcher has no non-empty string process_start",
+            ),
+            (
+                serde_json::json!({"pid": 42, "process_start": 7}),
+                "launcher has no non-empty string process_start",
+            ),
+        ];
+        for (launcher, wording) in cases {
+            let mut line = good.clone();
+            line["launcher"] = launcher.clone();
+            let message = line_refusal(&line.to_string());
+            assert!(message.contains(wording), "{launcher}: {message}");
+        }
+        let mut largest = good.clone();
+        largest["launcher"] = serde_json::json!({"pid": i32::MAX, "process_start": "1"});
+        assert_eq!(
+            FormationBundle::parse_line(&largest.to_string())
+                .unwrap()
+                .launcher
+                .map(|launcher| launcher.pid),
+            Some(i32::MAX as u32)
+        );
+    }
+
     fn line_refusal(line: &str) -> String {
         match FormationBundle::parse_line(line) {
             Err(error @ RuntimeError::FormationChannelUnreadable { .. }) => error.to_string(),
@@ -1371,7 +1531,8 @@ mod tests {
     #[test]
     fn no_debug_output_carries_a_token_or_key() {
         let (authority, _) = chain_roster();
-        let bundle = authority.member_bundle("coder", &["reviewer"]);
+        let mut bundle = authority.member_bundle("coder", &["reviewer"]);
+        bundle.launcher = crate::running::ProcessIdentity::of_this_process();
         let token = bundle.calls[0].1.clone();
         let signature = token.expose().split('.').nth(2).unwrap().to_string();
         let key = authority.verify_key().render();

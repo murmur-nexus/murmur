@@ -60,7 +60,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field but `door_token` and `formation_id` is required. There is no version field: a
+/// Every field but `door_token`, `formation_id`, `formation_lifeline`, `formation_launcher` and
+/// `spawned_by` is required, and each of those five is omitted when it does not apply, so a
+/// standalone session's record carries the nine required keys alone. There is no version field: a
 /// record that does not deserialize names no process that could be checked, and is pruned, which
 /// is what "the record is a hint" already means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +99,40 @@ pub struct RunningRecord {
     /// id makes the whole record unreadable, which [`list`] prunes like any other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formation_id: Option<crate::formation::FormationId>,
+    /// The session holds a formation lifeline: its launcher ends it by closing that lifeline, and
+    /// nothing else needs to. Absent when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub formation_lifeline: bool,
+    /// The formation launcher that started this session, as the launcher named itself on the
+    /// member's formation channel. Absent for a session no launcher started, and for a member
+    /// whose launcher could not read its own start time. A value that is not an object with a
+    /// `pid` and a `process_start` makes the whole record unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formation_launcher: Option<ProcessIdentity>,
+    /// The session id of the session that delegated to this one. A delegated child holds its
+    /// spawner's lifeline and ends with it. Absent for a session nothing delegated to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<String>,
+}
+
+/// A process named so that a recycled pid is never mistaken for it: its pid, and its start time as
+/// [`process_start_token`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub process_start: String,
+}
+
+impl ProcessIdentity {
+    /// The calling process. `None` when its own start time cannot be read, because an identity
+    /// with no start time names no process anyone could verify.
+    pub fn of_this_process() -> Option<Self> {
+        let pid = std::process::id();
+        Some(Self {
+            pid,
+            process_start: process_start_token(pid)?,
+        })
+    }
 }
 
 /// The one place a [`crate::door_auth::DoorToken`] is serialized: the running record.
@@ -228,6 +264,21 @@ pub fn process_state(record: &RunningRecord) -> ProcessState {
     process_state_of(record.pid, &record.process_start)
 }
 
+/// Layers 1 and 2 for any process named by pid and start time, record or not.
+pub fn identity_state(identity: &ProcessIdentity) -> ProcessState {
+    process_state_of(identity.pid, &identity.process_start)
+}
+
+impl RunningRecord {
+    /// The process this record names.
+    fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            process_start: self.process_start.clone(),
+        }
+    }
+}
+
 /// Layers 1 and 2 for any process recorded as `pid` with the start token `recorded_start` — a
 /// running record's process, or a formation's launcher as its ownership marker names it.
 pub(crate) fn process_state_of(pid: u32, recorded_start: &str) -> ProcessState {
@@ -315,12 +366,23 @@ pub enum SignalOutcome {
 
 /// `SIGTERM` the process a record names, if it is still that process.
 pub fn signal_term(record: &RunningRecord) -> SignalOutcome {
-    signal(record, libc::SIGTERM)
+    signal(&record.identity(), libc::SIGTERM)
 }
 
 /// `SIGKILL` the process a record names, if it is still that process.
 pub fn signal_kill(record: &RunningRecord) -> SignalOutcome {
-    signal(record, libc::SIGKILL)
+    signal(&record.identity(), libc::SIGKILL)
+}
+
+/// `SIGTERM` the process `identity` names, if it is still that process.
+pub fn signal_term_process(identity: &ProcessIdentity) -> SignalOutcome {
+    signal(identity, libc::SIGTERM)
+}
+
+/// `SIGKILL` the process `identity` names, and that process alone, never its group, if it is
+/// still that process.
+pub fn signal_kill_process(identity: &ProcessIdentity) -> SignalOutcome {
+    signal(identity, libc::SIGKILL)
 }
 
 /// Re-verify layers 1 and 2, then signal — in that order, in this one place.
@@ -331,13 +393,15 @@ pub fn signal_kill(record: &RunningRecord) -> SignalOutcome {
 /// `kill(2)`, so the window between the two is two adjacent syscalls. No userspace program can
 /// close that window; narrowing it to this is the whole of what can be done about it.
 #[allow(unsafe_code)]
-fn signal(record: &RunningRecord, signal: libc::c_int) -> SignalOutcome {
-    if let Some(outcome) = refusal_before_signal(&process_state(record)) {
+fn signal(identity: &ProcessIdentity, signal: libc::c_int) -> SignalOutcome {
+    if let Some(outcome) = refusal_before_signal(&identity_state(identity)) {
         return outcome;
     }
     // SAFETY: `kill` takes a pid and a signal number by value and dereferences no pointer. The
-    // pid is the one the check above just confirmed is held by the process that wrote the record.
-    if unsafe { libc::kill(record.pid as libc::pid_t, signal) } == 0 {
+    // pid is the one the check above just confirmed is held by the process `identity` names, and
+    // `pid_is_alive` reads only a pid in `1..=pid_t::MAX` as held, so the cast names that one
+    // process and never a group.
+    if unsafe { libc::kill(identity.pid as libc::pid_t, signal) } == 0 {
         return SignalOutcome::Sent;
     }
     let err = std::io::Error::last_os_error();
@@ -702,6 +766,9 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
             formation_id: None,
+            formation_lifeline: false,
+            formation_launcher: None,
+            spawned_by: None,
         };
         let token = ControlTokenGuard::write(&record.session_id, "ctl1.token.mac").unwrap();
         let record_guard = RunningGuard::write(&record).unwrap();
@@ -742,6 +809,9 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
             formation_id: None,
+            formation_lifeline: false,
+            formation_launcher: None,
+            spawned_by: None,
         }
     }
 
@@ -872,6 +942,126 @@ mod tests {
         assert_eq!(list().unwrap(), vec![member]);
         assert!(member_path.exists());
         assert!(!malformed_path.exists());
+    }
+
+    fn launched_member() -> RunningRecord {
+        let mut member = record(1, "42");
+        member.formation_id = Some(crate::formation::FormationId::mint());
+        member.formation_lifeline = true;
+        member.formation_launcher = Some(ProcessIdentity {
+            pid: 4242,
+            process_start: "987654".to_string(),
+        });
+        member.spawned_by = Some("ses_0199c4e2f1b7712a9d3e4f5061728390".to_string());
+        member
+    }
+
+    #[test]
+    fn a_launched_members_record_round_trips_its_launcher_and_lineage() {
+        let member = launched_member();
+        let value = serde_json::to_value(&member).unwrap();
+        assert_eq!(value["formation_lifeline"], true);
+        assert_eq!(
+            value["formation_launcher"],
+            serde_json::json!({"pid": 4242, "process_start": "987654"})
+        );
+        assert_eq!(value["spawned_by"], "ses_0199c4e2f1b7712a9d3e4f5061728390");
+        let back: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back, member);
+    }
+
+    /// The three keys are written only when they apply, so a record without them is byte for
+    /// byte the record a standalone session always wrote.
+    #[test]
+    fn a_record_holding_no_lifeline_launcher_or_spawner_omits_all_three_keys() {
+        let mut member = launched_member();
+        member.formation_lifeline = false;
+        member.formation_launcher = None;
+        member.spawned_by = None;
+        let body = serde_json::to_string_pretty(&member).unwrap();
+        for key in ["formation_lifeline", "formation_launcher", "spawned_by"] {
+            assert!(!body.contains(key), "{key} in {body}");
+        }
+        assert_eq!(
+            serde_json::from_str::<RunningRecord>(&body).unwrap(),
+            member
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_malformed_formation_launcher_does_not_parse() {
+        for launcher in [
+            serde_json::json!(4242),
+            serde_json::json!({"pid": 4242}),
+            serde_json::json!({"process_start": "1"}),
+            serde_json::json!({"pid": -1, "process_start": "1"}),
+            serde_json::json!({"pid": "4242", "process_start": "1"}),
+        ] {
+            let mut value = serde_json::to_value(record(1, "42")).unwrap();
+            value["formation_launcher"] = launcher.clone();
+            assert!(
+                serde_json::from_value::<RunningRecord>(value).is_err(),
+                "{launcher}"
+            );
+        }
+    }
+
+    /// An identity and a record naming the same pid and start time are one process to layers 1
+    /// and 2, and to the signal that re-checks them.
+    #[test]
+    fn an_identity_reads_and_signals_as_the_record_naming_the_same_process() {
+        let pid = std::process::id();
+        let token = process_start_token(pid).unwrap();
+        for start in [token.as_str(), "not-this-process", ""] {
+            let record = record(pid, start);
+            let identity = ProcessIdentity {
+                pid,
+                process_start: start.to_string(),
+            };
+            assert_eq!(identity_state(&identity), process_state(&record), "{start}");
+        }
+        // A mismatched start time is the one case safe to signal here: nothing is sent.
+        let stale = ProcessIdentity {
+            pid,
+            process_start: "not-this-process".to_string(),
+        };
+        assert_eq!(
+            signal_term_process(&stale),
+            signal_term(&record(pid, "not-this-process"))
+        );
+        assert_eq!(signal_kill_process(&stale), SignalOutcome::AlreadyGone);
+        let nobody = ProcessIdentity {
+            pid: 0,
+            process_start: "42".to_string(),
+        };
+        assert_eq!(signal_term_process(&nobody), signal_term(&record(0, "42")));
+        assert_eq!(
+            ProcessIdentity::of_this_process(),
+            Some(ProcessIdentity {
+                pid,
+                process_start: token
+            })
+        );
+    }
+
+    /// A live process this test owns, signalled through its identity, is sent the signal and goes.
+    #[test]
+    fn a_term_sent_through_an_identity_reaches_the_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep should start");
+        let pid = child.id();
+        let identity = ProcessIdentity {
+            pid,
+            process_start: process_start_token(pid).unwrap(),
+        };
+        assert_eq!(identity_state(&identity), ProcessState::Alive);
+        assert_eq!(signal_term_process(&identity), SignalOutcome::Sent);
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(matches!(identity_state(&identity), ProcessState::Gone(_)));
     }
 
     /// Every field is required, so a record missing one is unverifiable rather than partly
@@ -1166,6 +1356,9 @@ mod home_tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
             formation_id: None,
+            formation_lifeline: false,
+            formation_launcher: None,
+            spawned_by: None,
         }
     }
 

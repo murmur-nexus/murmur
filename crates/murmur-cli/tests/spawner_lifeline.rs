@@ -322,6 +322,24 @@ fn an_idle_child_winds_down_when_its_spawner_lifeline_closes() {
             },
         );
         assert!(session.door_session_id().contains(&session.session_id()));
+        // The running record names the spawner this child ends with, and no formation.
+        let running: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.path()
+                    .join(".murmur")
+                    .join("running")
+                    .join(format!("{}.json", session.session_id())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        if lineage {
+            assert_eq!(running["spawned_by"], handle().session_id, "{running}");
+        } else {
+            assert!(running.get("spawned_by").is_none(), "{running}");
+        }
+        assert!(running.get("formation_lifeline").is_none(), "{running}");
+        assert!(running.get("formation_launcher").is_none(), "{running}");
 
         let closed = Instant::now();
         session.close_spawner();
@@ -602,6 +620,21 @@ fn with_both_lifelines_only_the_first_closed_is_recorded() {
         let server =
             ScriptedServer::start_with_delay(vec![end_turn(1, "late")], Duration::from_secs(120));
         let mut session = session_with_a_slow_teardown(&home, &server, true);
+        // A lifeline handed with no formation channel: the record says it holds one and names
+        // no launcher, beside the spawner it was delegated by.
+        let running: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.path()
+                    .join(".murmur")
+                    .join("running")
+                    .join(format!("{}.json", session.session_id())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(running["formation_lifeline"], true, "{running}");
+        assert!(running.get("formation_launcher").is_none(), "{running}");
+        assert_eq!(running["spawned_by"], handle().session_id, "{running}");
         if spawner_first {
             session.close_spawner();
             thread::sleep(Duration::from_millis(300));

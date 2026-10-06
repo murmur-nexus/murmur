@@ -1741,3 +1741,622 @@ fn the_hidden_member_flags_are_exactly_what_a_launcher_passes() {
         );
     }
 }
+
+// ── mur stop <formation id> ───────────────────────────────────────────────────
+
+/// What a member prints when it is ended by a `SIGTERM` rather than by its lifeline.
+const SIGTERM_RECEIVED: &str = "SIGTERM received";
+
+/// `<session_id>  <capsule>@<version>` of every member a formation line and the entry member's
+/// readiness line reported, entry member last.
+fn launched_members(formation: &Value, planner: &Value) -> Vec<(String, String)> {
+    let version_of = |name: &str| {
+        [CODER, REVIEWER, PLANNER]
+            .iter()
+            .find(|member| member.name == name)
+            .map(|member| member.version)
+            .unwrap()
+    };
+    let mut members: Vec<(String, String)> = formation["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|peer| {
+            let name = peer["name"].as_str().unwrap();
+            (
+                peer["session_id"].as_str().unwrap().to_string(),
+                format!("{name}@{}", version_of(name)),
+            )
+        })
+        .collect();
+    members.push((
+        planner["session_id"].as_str().unwrap().to_string(),
+        format!("planner@{}", PLANNER.version),
+    ));
+    members
+}
+
+impl Project {
+    /// The running record of `session_id` under the scratch `HOME`.
+    fn running_record(&self, session_id: &str) -> Value {
+        let path = self
+            .home
+            .path()
+            .join(".murmur")
+            .join("running")
+            .join(format!("{session_id}.json"));
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    /// A successful `mur ps`'s stdout.
+    fn ps(&self) -> String {
+        let ps = self.run(&["ps"], &[]);
+        assert!(ps.status.success(), "{}", ps.stderr);
+        ps.stdout
+    }
+
+    /// Fail if any member's diagnostics, on the launcher's stderr or in a bootstrap log, say it
+    /// was ended by a `SIGTERM`.
+    fn assert_no_member_was_sent_sigterm(&self, launcher: &Launcher) {
+        let stderr = launcher.stderr();
+        assert!(!stderr.contains(SIGTERM_RECEIVED), "{stderr}");
+        for capsule in ["coder", "reviewer", "planner"] {
+            let log = self.bootstrap_log_of(capsule);
+            assert!(!log.contains(SIGTERM_RECEIVED), "{capsule}: {log}");
+        }
+    }
+}
+
+/// `mur run --capsule coder` started by hand from the project, outside any launcher: in the
+/// formation `formation_id` names, when one is given, which is what prints `W-RUN-007`.
+struct HandStarted {
+    child: std::process::Child,
+    startup: Value,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl HandStarted {
+    fn start(project: &Project, formation_id: Option<&str>) -> Self {
+        use std::io::BufRead;
+        let mut command = project.command(&[
+            "run",
+            "--capsule",
+            "coder",
+            "--capsule-version",
+            CODER.version,
+            "--json",
+        ]);
+        if let Some(id) = formation_id {
+            command.env(capsule_runtime::formation::FORMATION_ID_ENV, id);
+        }
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let (tx, rx) = mpsc::channel::<Value>();
+        let stdout = child.stdout.take().unwrap();
+        thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+                    if value.get("url").is_some() && value.get("session_id").is_some() {
+                        let _ = tx.send(value);
+                    }
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&stderr);
+        let err = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                eprintln!("[by hand] {line}");
+                let mut sink = sink.lock().unwrap();
+                sink.push_str(&line);
+                sink.push('\n');
+            }
+        });
+        let startup = match rx.recv_timeout(LAUNCH_LIMIT) {
+            Ok(startup) => startup,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the hand-started member printed no readiness line; stderr:\n{}",
+                    stderr.lock().unwrap()
+                );
+            }
+        };
+        Self {
+            child,
+            startup,
+            stderr,
+        }
+    }
+
+    fn session_id(&self) -> String {
+        self.startup["session_id"].as_str().unwrap().to_string()
+    }
+
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+
+    /// Whether the process has exited, reaped through this test's own handle.
+    fn has_exited(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_some()
+    }
+}
+
+impl Drop for HandStarted {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Every `member:` line of a `mur stop <formation id>` report.
+fn member_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("member:   "))
+        .collect()
+}
+
+/// The session ids of `member:` lines, which come newest session first.
+fn assert_members_newest_first(lines: &[&str]) {
+    let sessions: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split_whitespace().nth(1).unwrap())
+        .collect();
+    let mut sorted = sessions.clone();
+    sorted.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(sessions, sorted, "{lines:?}");
+}
+
+/// The started-by-hand member's `member:` line, its blank line, and the per-session block that
+/// follows it, exactly as `mur stop <session>` prints one.
+fn assert_stopped_by_hand(stdout: &str, session_id: &str) {
+    let lines: Vec<&str> = stdout.lines().collect();
+    let member = format!(
+        "member:   {session_id}  coder@{}  started by hand — stopped as one session below",
+        CODER.version
+    );
+    assert!(lines.contains(&member.as_str()), "{stdout}");
+    let block = lines
+        .iter()
+        .position(|line| *line == format!("stopped: {session_id}"))
+        .unwrap_or_else(|| panic!("no block for {session_id}: {stdout}"));
+    assert_eq!(lines[block - 1], "", "{stdout}");
+    assert_eq!(
+        lines[block + 1],
+        format!("capsule: coder@{}", CODER.version),
+        "{stdout}"
+    );
+    assert_eq!(lines[block + 2], "signal:  SIGTERM", "{stdout}");
+    assert!(
+        lines[block + 3..]
+            .iter()
+            .any(|line| line.starts_with("residue: ")),
+        "{stdout}"
+    );
+}
+
+/// The acceptance case: `mur stop <formation id>` sends the launcher `SIGTERM`, the launcher
+/// closes every lifeline, and every member — the entry member mid-task included — records
+/// `formation_ended` and exits. No member is sent a signal. Before the stop, every member's
+/// running record names the launcher and its lifeline, and a standalone session's record carries
+/// none of the formation keys.
+#[test]
+fn mur_stop_ends_a_formation_through_its_launcher() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let launcher_pid = launcher.child.id();
+    let members = launched_members(&formation, &planner);
+
+    let launcher_start = capsule_runtime::running::process_start_token(launcher_pid).unwrap();
+    for (session_id, _) in &members {
+        let record = project.running_record(session_id);
+        assert_eq!(record["formation_id"], id, "{record}");
+        assert_eq!(record["formation_lifeline"], true, "{record}");
+        assert_eq!(
+            record["formation_launcher"]["pid"], launcher_pid,
+            "{record}"
+        );
+        assert_eq!(
+            record["formation_launcher"]["process_start"], launcher_start,
+            "{record}"
+        );
+        assert!(record.get("spawned_by").is_none(), "{record}");
+    }
+    {
+        let standalone = HandStarted::start(&project, None);
+        let record = project.running_record(&standalone.session_id());
+        for key in [
+            "formation_lifeline",
+            "formation_launcher",
+            "spawned_by",
+            "formation_id",
+        ] {
+            assert!(record.get(key).is_none(), "{key}: {record}");
+        }
+    }
+
+    let stopped = project.run(&["stop", id], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    eprintln!("[mur stop]\n{}", stopped.stdout);
+    let lines: Vec<&str> = stopped.stdout.lines().collect();
+    assert_eq!(lines[0], format!("stopped:  {id}"));
+    assert_eq!(lines[1], format!("launcher: pid {launcher_pid}, SIGTERM"));
+    let member_lines = member_lines(&stopped.stdout);
+    assert_eq!(member_lines.len(), 3, "{}", stopped.stdout);
+    for (session_id, capsule) in &members {
+        let line = format!("member:   {session_id}  {capsule}  formation_ended");
+        assert!(member_lines.contains(&line.as_str()), "{}", stopped.stdout);
+    }
+    assert_members_newest_first(&member_lines);
+    assert_eq!(lines.len(), 5, "{}", stopped.stdout);
+
+    assert_eq!(
+        launcher.wait().code(),
+        Some(143),
+        "stderr:\n{}",
+        launcher.stderr()
+    );
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    let ps = project.ps();
+    assert!(!ps.contains(id), "{ps}");
+    for (session_id, _) in &members {
+        assert!(!ps.contains(session_id.as_str()), "{ps}");
+    }
+    for capsule in ["coder", "reviewer", "planner"] {
+        assert_wound_down(&project.trace_of(capsule), id);
+    }
+    assert_task_canceled(&project.trace_of("planner"));
+    project.assert_no_member_was_sent_sigterm(&launcher);
+}
+
+/// `mur stop <session>` on one member is the per-session stop it always was: that member alone
+/// ends, and the rest of the formation runs on until `mur stop <formation id>` ends it.
+#[test]
+fn mur_stop_of_one_member_stops_that_member_alone() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let peer = |name: &str| {
+        formation["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let (coder, reviewer) = (peer("coder"), peer("reviewer"));
+    let coder_session = coder["session_id"].as_str().unwrap();
+
+    let stopped = project.run(&["stop", coder_session], &[]);
+    assert!(stopped.status.success(), "{}", stopped.stderr);
+    let lines: Vec<&str> = stopped.stdout.lines().collect();
+    assert_eq!(lines[0], format!("stopped: {coder_session}"));
+    assert_eq!(lines[1], format!("capsule: coder@{}", CODER.version));
+    assert_eq!(lines[2], "signal:  SIGTERM");
+    assert!(lines[3..].iter().any(|line| line.starts_with("residue: ")));
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("launcher:") || line.starts_with("member:")),
+        "{}",
+        stopped.stdout
+    );
+    assert!(!alive(coder["pid"].as_u64().unwrap() as u32));
+    assert!(alive(reviewer["pid"].as_u64().unwrap() as u32));
+    assert!(alive(planner["pid"].as_u64().unwrap() as u32));
+    let ps = project.ps();
+    assert!(!ps.contains(coder_session), "{ps}");
+    assert!(
+        ps.contains(reviewer["session_id"].as_str().unwrap()),
+        "{ps}"
+    );
+    assert!(ps.contains(planner["session_id"].as_str().unwrap()), "{ps}");
+
+    let stopped = project.run(&["stop", id], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    let member_lines = member_lines(&stopped.stdout);
+    assert_eq!(member_lines.len(), 2, "{}", stopped.stdout);
+    for line in &member_lines {
+        assert!(line.ends_with("  formation_ended"), "{}", stopped.stdout);
+    }
+    launcher.wait();
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+}
+
+/// The entry member is killed, the launcher tears the formation down and exits, and a member
+/// started by hand in the formation is all that is left: it holds no lifeline, so `mur stop
+/// <formation id>` stops it as one session, and names no launcher.
+#[test]
+fn mur_stop_stops_a_hand_started_member_left_behind_as_one_session() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+
+    let mut by_hand = HandStarted::start(&project, Some(id));
+    let by_hand_session = by_hand.session_id();
+    let record = project.running_record(&by_hand_session);
+    assert_eq!(record["formation_id"], id, "{record}");
+    for key in ["formation_lifeline", "formation_launcher", "spawned_by"] {
+        assert!(record.get(key).is_none(), "{key}: {record}");
+    }
+    assert!(
+        by_hand.stderr().contains("W-RUN-007"),
+        "{}",
+        by_hand.stderr()
+    );
+
+    signal(planner["pid"].as_u64().unwrap() as u32, libc::SIGKILL);
+    assert_eq!(
+        launcher.wait().code(),
+        Some(137),
+        "stderr:\n{}",
+        launcher.stderr()
+    );
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    let ps = project.ps();
+    assert!(ps.contains(&by_hand_session), "{ps}");
+    for (session_id, _) in launched_members(&formation, &planner) {
+        assert!(!ps.contains(&session_id), "{ps}");
+    }
+
+    let stopped = project.run(&["stop", id], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    eprintln!("[mur stop]\n{}", stopped.stdout);
+    let lines: Vec<&str> = stopped.stdout.lines().collect();
+    assert_eq!(lines[0], format!("stopped:  {id}"));
+    assert_eq!(lines[1], "launcher: none — no running member records one");
+    assert_eq!(member_lines(&stopped.stdout).len(), 1, "{}", stopped.stdout);
+    assert_stopped_by_hand(&stopped.stdout, &by_hand_session);
+    assert!(by_hand.has_exited());
+    let ps = project.ps();
+    assert!(!ps.contains(id), "{ps}");
+}
+
+/// The launcher is already dead and a member is still winding down on its closed lifeline: `mur
+/// stop` signals nothing, waits for the member, and reports `formation_ended` for every one.
+#[test]
+fn mur_stop_waits_out_members_of_a_dead_launcher_without_signalling_them() {
+    if !cfg!(debug_assertions) {
+        eprintln!(
+            "[SKIP] mur_stop_waits_out_members_of_a_dead_launcher_without_signalling_them: the \
+             task-end delay seam exists only in debug builds"
+        );
+        return;
+    }
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[("MURMUR_DEBUG_TASK_END_DELAY_MS", "5000")]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let launcher_pid = launcher.child.id();
+    let planner_pid = planner["pid"].as_u64().unwrap() as u32;
+
+    launcher.signal(libc::SIGKILL);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(launcher.wait().signal(), Some(libc::SIGKILL));
+    assert!(
+        alive(planner_pid),
+        "the entry member must still be winding down"
+    );
+
+    let stopped = project.run(&["stop", id], &[]);
+    assert!(
+        !alive(planner_pid),
+        "mur stop returned before the entry member exited"
+    );
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    eprintln!("[mur stop]\n{}", stopped.stdout);
+    let lines: Vec<&str> = stopped.stdout.lines().collect();
+    assert_eq!(lines[0], format!("stopped:  {id}"));
+    assert_eq!(
+        lines[1],
+        format!(
+            "launcher: none — pid {launcher_pid} had already exited, so every lifeline was \
+             already closed"
+        )
+    );
+    // An idle peer winds down at once and removes its own record, so it may be gone before the
+    // records are read; the entry member, still holding its task, is listed.
+    let member_lines = member_lines(&stopped.stdout);
+    let planner_line = format!(
+        "member:   {}  planner@{}  formation_ended",
+        planner["session_id"].as_str().unwrap(),
+        PLANNER.version
+    );
+    assert!(
+        member_lines.contains(&planner_line.as_str()),
+        "{}",
+        stopped.stdout
+    );
+    for line in &member_lines {
+        assert!(line.ends_with("  formation_ended"), "{}", stopped.stdout);
+    }
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    let planner_trace = project.trace_of("planner");
+    assert!(
+        planner_trace
+            .iter()
+            .any(|event| event["event_type"] == "task_end" && event["exit_status"] == "canceled"),
+        "{:?}",
+        event_kinds(&planner_trace)
+    );
+    for capsule in ["coder", "reviewer", "planner"] {
+        assert_wound_down(&project.trace_of(capsule), id);
+    }
+    project.assert_no_member_was_sent_sigterm(&launcher);
+    let ps = project.ps();
+    assert!(!ps.contains(id), "{ps}");
+}
+
+/// Both routes in one stop: the launcher's members end on their lifelines, and the member started
+/// by hand is stopped as one session — the only one sent a `SIGTERM`.
+#[test]
+fn mur_stop_ends_launched_and_hand_started_members_together() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let launcher_pid = launcher.child.id();
+    let mut by_hand = HandStarted::start(&project, Some(id));
+    let by_hand_session = by_hand.session_id();
+
+    let stopped = project.run(&["stop", id], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    eprintln!("[mur stop]\n{}", stopped.stdout);
+    let lines: Vec<&str> = stopped.stdout.lines().collect();
+    assert_eq!(lines[1], format!("launcher: pid {launcher_pid}, SIGTERM"));
+    let member_lines = member_lines(&stopped.stdout);
+    assert_eq!(member_lines.len(), 4, "{}", stopped.stdout);
+    assert_members_newest_first(&member_lines);
+    for (session_id, capsule) in launched_members(&formation, &planner) {
+        let line = format!("member:   {session_id}  {capsule}  formation_ended");
+        assert!(member_lines.contains(&line.as_str()), "{}", stopped.stdout);
+    }
+    assert_stopped_by_hand(&stopped.stdout, &by_hand_session);
+
+    assert_eq!(launcher.wait().code(), Some(143));
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    assert!(by_hand.has_exited());
+    project.assert_no_member_was_sent_sigterm(&launcher);
+    assert!(
+        by_hand.stderr().contains(SIGTERM_RECEIVED),
+        "{}",
+        by_hand.stderr()
+    );
+    let ps = project.ps();
+    assert!(!ps.contains(id), "{ps}");
+}
+
+/// `--timeout 0` kills the launcher at once. The kernel closes every lifeline it held, so every
+/// member still records `formation_ended` and none is sent a signal.
+#[test]
+fn mur_stop_with_no_grace_kills_the_launcher_and_every_member_still_winds_down() {
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let launcher_pid = launcher.child.id();
+
+    let stopped = project.run(&["stop", "--timeout", "0", id], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    let lines: Vec<&str> = stopped.stdout.lines().collect();
+    assert_eq!(
+        lines[1],
+        format!("launcher: pid {launcher_pid}, SIGKILL after 0s")
+    );
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(launcher.wait().signal(), Some(libc::SIGKILL));
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+    for capsule in ["coder", "reviewer", "planner"] {
+        assert_wound_down(&project.trace_of(capsule), id);
+    }
+    project.assert_no_member_was_sent_sigterm(&launcher);
+}
