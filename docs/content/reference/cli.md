@@ -123,10 +123,9 @@ applies, so a standalone session's record carries none of them.
 | `formation_launcher` | The session holds a formation lifeline and its formation channel named the launcher | `{"pid": <pid>, "process_start": "<start time>"}` — the launcher's process id and start time, read the same way as the record's own |
 | `spawned_by` | The session is a delegated sub-capsule | The session id of the session that delegated to it |
 
-[`mur stop <formation-id>`](#mur-stop-formation) finds a formation's launcher through
-`formation_launcher`, and never signals a session with `formation_lifeline` or `spawned_by`. A
-`formation_launcher` that is not an object with an integer `pid` and a string `process_start` makes
-the record unreadable.
+[`mur stop <formation-id>`](#mur-stop-formation) reads these keys to find the launcher and to
+decide which members it stops itself. A `formation_launcher` that is not an object with an integer
+`pid` and a string `process_start` makes the record unreadable.
 
 A session whose manifest declares [`network.authentication`](manifest.md#field-network-authentication)
 also records its operator token, as `door_token`. [`mur ps`](#mur-ps), [`mur stop`](#mur-stop),
@@ -1651,7 +1650,7 @@ Exit codes:
 | [`E-RUN-024`](diagnostics.md#e-run-024) | `formation <id> could not be ended: its members record <n> different launchers (pid <a>, pid <b>)` | Nothing |
 | `E-RUN-024` | `formation <id> could not be ended: SIGTERM to its launcher, pid <pid>, was refused: …` | Nothing |
 | `E-RUN-024` | `formation <id> could not be ended: its launcher, pid <pid>, was still running 5 seconds after SIGKILL`, or `… SIGKILL to its launcher, pid <pid>, was refused: …` | The launcher |
-| `E-RUN-024` | `formation <id> could not be ended: <n> of its members were still running 25 seconds later: <session>, …` | As far as the steps went; the records of those members are kept |
+| `E-RUN-024` | `formation <id> could not be ended: <n> of its members were still running 25 seconds later: <session>, …` | The launcher and each member started by hand; the records of the members still running are kept |
 | [`E-RUN-028`](diagnostics.md#e-run-028) | The running-capsule records could not be read | Nothing |
 
 An error that follows the launcher's signal is printed after the report.

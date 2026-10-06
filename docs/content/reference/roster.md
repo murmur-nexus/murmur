@@ -264,7 +264,7 @@ it, or when the launcher's process dies by any means, `SIGKILL` and the OOM kill
 | The launcher was killed | Is gone; the kernel closes every lifeline |
 
 [`mur stop <formation-id>`](cli.md#mur-stop-formation) ends a formation by sending its launcher
-`SIGTERM`, the second row.
+`SIGTERM`, so the launcher closes every lifeline, the entry member's included.
 
 The launcher sends no member `SIGTERM`. A member whose lifeline closes winds down:
 

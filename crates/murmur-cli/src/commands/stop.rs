@@ -240,10 +240,10 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
 
     // One at a time, in member order, each exactly as `mur stop <session>` stops it. A member
     // that could not be ended is reported and counted as still running; the rest still go.
-    let by_hand: Vec<(&RunningRecord, Result<SessionStop, CliError>)> = members
+    let by_hand: Vec<Result<SessionStop, CliError>> = members
         .iter()
         .filter(|member| started_by_hand(member))
-        .map(|member| (member, stop_session(member, grace)))
+        .map(|member| stop_session(member, grace))
         .collect();
 
     let still_running = wait_for_members(&members);
@@ -263,7 +263,7 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
             member.session_id, member.capsule_name, member.capsule_version
         );
     }
-    for (_, stopped) in &by_hand {
+    for stopped in &by_hand {
         println!();
         match stopped {
             Ok(stopped) => print_session_stop(stopped),
@@ -388,7 +388,7 @@ fn end_the_launcher(
         }
         SignalOutcome::Sent => {}
     }
-    if wait_for_identity_exit(launcher, grace) {
+    if wait_for_exit(launcher, grace) {
         return Ok(LauncherEnding::Terminated(pid));
     }
     match running::signal_kill_process(launcher) {
@@ -397,7 +397,7 @@ fn end_the_launcher(
         SignalOutcome::Refused(reason) => return Ok(LauncherEnding::KillRefused(pid, reason)),
         SignalOutcome::Sent => {}
     }
-    if wait_for_identity_exit(launcher, KILL_DEADLINE) {
+    if wait_for_exit(launcher, KILL_DEADLINE) {
         return Ok(LauncherEnding::Killed(pid));
     }
     Ok(LauncherEnding::OutlivedKill(pid))
@@ -468,8 +468,9 @@ fn recorded_ending(trace_path: &Path) -> String {
         .unwrap_or_else(|| "no session_end".to_string())
 }
 
-/// Whether the process `identity` names is gone before `grace` runs out. A zero grace checks once.
-fn wait_for_identity_exit(identity: &ProcessIdentity, grace: Duration) -> bool {
+/// Whether the process `identity` names is gone before `grace` runs out. A zero grace checks once
+/// and returns.
+fn wait_for_exit(identity: &ProcessIdentity, grace: Duration) -> bool {
     let deadline = Instant::now() + grace;
     loop {
         if matches!(running::identity_state(identity), ProcessState::Gone(_)) {
@@ -614,7 +615,8 @@ fn end_the_process(record: &RunningRecord, grace: Duration) -> Result<&'static s
         }
         SignalOutcome::Sent => {}
     }
-    if wait_for_exit(record, grace) {
+    let identity = record.identity();
+    if wait_for_exit(&identity, grace) {
         return Ok("SIGTERM");
     }
 
@@ -629,7 +631,7 @@ fn end_the_process(record: &RunningRecord, grace: Duration) -> Result<&'static s
         }
         SignalOutcome::Sent => {}
     }
-    if wait_for_exit(record, KILL_DEADLINE) {
+    if wait_for_exit(&identity, KILL_DEADLINE) {
         return Ok("SIGKILL");
     }
     Err(unendable(
@@ -640,20 +642,6 @@ fn end_the_process(record: &RunningRecord, grace: Duration) -> Result<&'static s
             KILL_DEADLINE.as_secs()
         ),
     ))
-}
-
-/// Whether the process is gone before `grace` runs out. A zero grace checks once and returns.
-fn wait_for_exit(record: &RunningRecord, grace: Duration) -> bool {
-    let deadline = Instant::now() + grace;
-    loop {
-        if matches!(running::process_state(record), ProcessState::Gone(_)) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(POLL_INTERVAL.min(grace));
-    }
 }
 
 /// The session is still running and this command could not end it.

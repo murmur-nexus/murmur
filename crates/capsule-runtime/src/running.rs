@@ -271,7 +271,7 @@ pub fn identity_state(identity: &ProcessIdentity) -> ProcessState {
 
 impl RunningRecord {
     /// The process this record names.
-    fn identity(&self) -> ProcessIdentity {
+    pub fn identity(&self) -> ProcessIdentity {
         ProcessIdentity {
             pid: self.pid,
             process_start: self.process_start.clone(),

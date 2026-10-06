@@ -2348,6 +2348,11 @@ fn mur_stop_with_no_grace_kills_the_launcher_and_every_member_still_winds_down()
         lines[1],
         format!("launcher: pid {launcher_pid}, SIGKILL after 0s")
     );
+    let member_lines = member_lines(&stopped.stdout);
+    assert_eq!(member_lines.len(), 3, "{}", stopped.stdout);
+    for line in &member_lines {
+        assert!(line.ends_with("  formation_ended"), "{}", stopped.stdout);
+    }
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(launcher.wait().signal(), Some(libc::SIGKILL));
     let _ = project.release.send(());
