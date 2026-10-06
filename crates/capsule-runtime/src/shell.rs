@@ -275,6 +275,10 @@ pub(crate) fn run_shell(
         session_workdir,
     )?;
 
+    // Entered before the snapshot and held until the command exits — carried to the demoted
+    // thread if it gets that far — so a sibling's spawn anywhere inside this window is visible to
+    // attribution.
+    let cgroup_occupancy = enforcement.cgroup_scope.as_ref().map(|scope| scope.enter());
     // Snapshotted before the child runs so attribution keys on this call's delta rather than on
     // a session-cumulative total an earlier call could have moved.
     let cgroup_counters_before = enforcement
@@ -323,7 +327,13 @@ pub(crate) fn run_shell(
                     Some(status) => break status,
                     None => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
+                        // A caller that stopped waiting gets the same demotion the deadline
+                        // gives, at the next poll: nobody is left to read a foreground result.
+                        let abandoned = policy
+                            .abandoned
+                            .as_ref()
+                            .is_some_and(crate::detached::AbandonSignal::is_raised);
+                        if remaining.is_zero() || abandoned {
                             // A zero grace demotes here, at the first poll after the spawn.
                             return Ok(ShellOutcome::Detached(demote(
                                 child,
@@ -338,6 +348,7 @@ pub(crate) fn run_shell(
                                     started,
                                     cgroup_scope: enforcement.cgroup_scope.clone(),
                                     cgroup_counters_before,
+                                    cgroup_occupancy,
                                 },
                             )));
                         }
@@ -355,7 +366,9 @@ pub(crate) fn run_shell(
         &status,
         enforcement.cgroup_scope.as_deref(),
         cgroup_counters_before,
+        cgroup_occupancy.as_ref(),
     );
+    drop(cgroup_occupancy);
     let exit_code = exit_code_of(&status);
 
     let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -491,6 +504,8 @@ struct DemotionContext {
     started: Instant,
     cgroup_scope: Option<std::sync::Arc<crate::cgroup::CgroupScope>>,
     cgroup_counters_before: Option<crate::cgroup::CgroupEventCounters>,
+    /// The command's stay in the scope, held on the background thread until it exits.
+    cgroup_occupancy: Option<crate::cgroup::ScopeOccupancy>,
 }
 
 /// Hand a still-running command to a thread of its own and return the handle for it.
@@ -548,6 +563,7 @@ fn demote(
         started,
         cgroup_scope,
         cgroup_counters_before,
+        cgroup_occupancy,
     } = context;
 
     std::thread::spawn(move || {
@@ -562,7 +578,12 @@ fn demote(
         let (exit_code, resource_limit, mut error) = match waited {
             Ok(status) => (
                 exit_code_of(&status),
-                classify_resource_limit(&status, cgroup_scope.as_deref(), cgroup_counters_before),
+                classify_resource_limit(
+                    &status,
+                    cgroup_scope.as_deref(),
+                    cgroup_counters_before,
+                    cgroup_occupancy.as_ref(),
+                ),
                 None,
             ),
             Err(failure) => (
@@ -571,6 +592,7 @@ fn demote(
                 Some(format!("waiting for the command failed: {failure}")),
             ),
         };
+        drop(cgroup_occupancy);
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
@@ -640,7 +662,8 @@ pub(crate) fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
 ///     (`oom_kill` → `cgroup_memory_bytes`, `max` → `cgroup_pids_max`).
 ///
 /// The signal is checked first: where both fire, it identifies the individual process that died,
-/// which is the more specific claim.
+/// which is the more specific claim. The counter delta is about the whole scope, so it names this
+/// call's limit only when the call had the scope to itself — see [`attribute_resource_limit`].
 ///
 /// The `pids.max` case is reported even when the process exited normally, because that is how it
 /// presents — `pids.max` refuses a `fork()` rather than killing anything, so a fork bomb held by
@@ -654,20 +677,34 @@ fn classify_resource_limit(
     status: &std::process::ExitStatus,
     cgroup_scope: Option<&crate::cgroup::CgroupScope>,
     counters_before: Option<crate::cgroup::CgroupEventCounters>,
+    occupancy: Option<&crate::cgroup::ScopeOccupancy>,
 ) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
 
-    if let Some(limit) = status
+    let signal_limit = status
         .signal()
-        .and_then(crate::resources::limit_from_signal)
-    {
-        return Some(limit.to_string());
-    }
+        .and_then(crate::resources::limit_from_signal);
+    let counter_delta = match (cgroup_scope, counters_before) {
+        (Some(scope), Some(before)) => scope.event_counters().attribution_since(before),
+        _ => None,
+    };
+    let exclusive = occupancy.is_some_and(crate::cgroup::ScopeOccupancy::exclusive);
+    attribute_resource_limit(signal_limit, counter_delta, exclusive)
+}
 
-    let (scope, before) = (cgroup_scope?, counters_before?);
-    scope
-        .event_counters()
-        .attribution_since(before)
+/// The limit a call is reported as having hit, from the two kinds of evidence there are.
+///
+/// The signal names the process that died, so it is this call's whenever there is one. The
+/// cgroup counter delta is about the scope, and every process in the scope moves it: it is this
+/// call's only when the call was `exclusive` — alone in the scope from entry to exit. Otherwise
+/// the delta could be a sibling's, and nothing is attributed.
+pub(crate) fn attribute_resource_limit(
+    signal_limit: Option<&'static str>,
+    counter_delta: Option<&'static str>,
+    exclusive: bool,
+) -> Option<String> {
+    signal_limit
+        .or(counter_delta.filter(|_| exclusive))
         .map(str::to_string)
 }
 
@@ -1506,5 +1543,101 @@ mod tests {
             Some("tool"),
             "non-interpreter manifest must have runtime: tool so inventory picks it up"
         );
+    }
+
+    /// A caller that stops waiting demotes its command at once, through the same path the grace
+    /// period takes, rather than holding a blocking thread for the rest of the grace window.
+    #[test]
+    fn an_abandoned_command_demotes_before_its_grace() {
+        use std::sync::Arc;
+
+        use crate::{
+            detached::{AbandonSignal, DetachPolicy, DetachedRegistry},
+            origin::{TaskOrigin, TaskProvenance},
+        };
+
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let (registry, _reports) = DetachedRegistry::new();
+        let abandon = AbandonSignal::new();
+        let raiser = {
+            let abandon = abandon.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                abandon.raise();
+            })
+        };
+
+        let started = Instant::now();
+        let outcome = run_shell(
+            "bash",
+            &["-c", "echo $$ > sleeper.pid; exec sleep 30"],
+            &[],
+            temp.path(),
+            temp.path(),
+            &policy,
+            &ShellEnforcement::environment_only(),
+            Some(DetachPolicy {
+                grace: Duration::from_secs(60),
+                registry: Arc::clone(&registry),
+                command: "sleep 30".to_string(),
+                context_id: "ctx_abandon_test".to_string(),
+                provenance: Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                abandoned: Some(abandon),
+            }),
+        )
+        .expect("a declared binary runs");
+        let elapsed = started.elapsed();
+        raiser.join().unwrap();
+
+        // Leave nothing running: the pid file is written before `exec`, so it names the sleep.
+        let pid: i32 = std::fs::read_to_string(temp.path().join("sleeper.pid"))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .expect("the command wrote its pid before sleeping");
+        #[allow(unsafe_code)]
+        // SAFETY: `kill` takes a pid and a signal number and touches no memory of ours.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+
+        let ShellOutcome::Detached(info) = outcome else {
+            panic!("an abandoned command must demote, got {outcome:?}");
+        };
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "demotion waited {elapsed:?}, as if the 60 s grace still applied"
+        );
+        assert!(
+            registry
+                .outstanding()
+                .iter()
+                .any(|work| work.work_id == info.work_id),
+            "the demoted command is registered like one that outran its grace"
+        );
+    }
+
+    #[test]
+    fn a_shared_window_attributes_no_cgroup_delta() {
+        assert_eq!(
+            attribute_resource_limit(None, Some("cgroup_memory_bytes"), true).as_deref(),
+            Some("cgroup_memory_bytes"),
+            "a call alone in the scope owns its delta"
+        );
+        assert_eq!(
+            attribute_resource_limit(None, Some("cgroup_memory_bytes"), false),
+            None,
+            "a delta from a shared window could be a sibling's"
+        );
+        assert_eq!(
+            attribute_resource_limit(Some("cpu_seconds"), Some("cgroup_memory_bytes"), false)
+                .as_deref(),
+            Some("cpu_seconds"),
+            "the signal is per-process evidence and needs no exclusive window"
+        );
+        assert_eq!(attribute_resource_limit(None, None, true), None);
     }
 }

@@ -130,6 +130,7 @@ the `old-version` profile) and exits. Otherwise it reads one task line from stdi
 | `chatty` | Six lines half a second apart, then `end CHATTY-RESULT` |
 | `bridge-call` | `FIXTURE_BRIDGE_CALLS` bridged calls to `FIXTURE_BRIDGE_CALL_TOOL` with `FIXTURE_BRIDGE_CALL_ARGS`, each reported as its own tool result, then the last answer and `end` |
 | `bridge-bench` | `FIXTURE_BRIDGE_CALLS` bridged pings back to back inside one turn, then the last answer and `end` |
+| `bridge-parallel` | A bridged `bash` call waiting 8 s in the background, then a bridged echo ping half a second later in the foreground, reported as `c2` before `c1`, then `end PARALLEL-RESULT`. Needs `bash` under `capabilities.shell.allow`. The wait is the bash builtin `read -t 8 <> <(:)`, because the shell tool's sandbox does not let it run `/usr/bin/sleep` |
 | `bridge-busy` | Six bridge requests half a second apart with nothing on stdout, then `end BRIDGE-BUSY-RESULT` |
 | `env` | Notes its environment's variable names and its files directory's mode, then `end ENV-RESULT` |
 | `old-version` | Reports an untested version to `--version`, then `end OLD-VERSION-RESULT` |

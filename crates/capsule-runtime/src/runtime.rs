@@ -7813,7 +7813,36 @@ impl CapsuleStoreState {
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
     ) -> Result<DispatchOutcome, String> {
-        let mut outcome = self.dispatch_agent_tool_unfenced(name, input, gate).await?;
+        self.dispatch_fenced(name, input, gate, None).await
+    }
+
+    /// [`Self::dispatch_agent_tool_async`] for a call the process-transport tool bridge serves,
+    /// whose caller can go away mid-call.
+    ///
+    /// `abandon` is raised by the bridge when the harness closes the connection the call arrived
+    /// on. A shell command still in the foreground then demotes at once, as if it had outrun
+    /// `lifecycle.shell_grace_secs`; with no task context to deliver a completion to, it runs to
+    /// the end on the blocking pool and its result is discarded. No other branch reads the
+    /// signal: the bridge drops their futures instead.
+    pub(crate) async fn dispatch_bridged_tool_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        abandon: crate::detached::AbandonSignal,
+    ) -> Result<DispatchOutcome, String> {
+        self.dispatch_fenced(name, input, None, Some(abandon)).await
+    }
+
+    async fn dispatch_fenced(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        gate: Option<&mut crate::agent::CallGate<'_>>,
+        abandon: Option<crate::detached::AbandonSignal>,
+    ) -> Result<DispatchOutcome, String> {
+        let mut outcome = self
+            .dispatch_agent_tool_unfenced(name, input, gate, abandon)
+            .await?;
         fence_and_label(name, &self.artifact_origin(name), &mut outcome);
         Ok(outcome)
     }
@@ -7828,11 +7857,16 @@ impl CapsuleStoreState {
     /// `gate` is carried through rather than consulted here: this is the branch table, and the
     /// decision point is applied by whoever is about to dispatch a call — the agent loop for its
     /// own turn, and [`crate::plan`] for each step of a submitted plan.
+    ///
+    /// `abandon` reaches the shell branch only, as the [`DetachPolicy`]'s abandon signal. `None`
+    /// for every caller that cannot stop waiting mid-call; see
+    /// [`Self::dispatch_bridged_tool_async`] for the one that can.
     async fn dispatch_agent_tool_unfenced(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
         gate: Option<&mut crate::agent::CallGate<'_>>,
+        abandon: Option<crate::detached::AbandonSignal>,
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
@@ -7884,18 +7918,30 @@ impl CapsuleStoreState {
             && !self.tool_components.contains_key(name)
             && !self.removed_artifacts.contains(name)
         {
-            return enforce_allowlist(&self.allowlisted_tools, name, || {
-                dispatch_native_tool(
-                    name,
-                    input,
-                    &native_bin,
-                    &self.accessible_workdir,
-                    &self.workdir,
-                    &self.capability_policy,
-                    &self.shell_enforcement,
-                )
-            })
-            .map(DispatchOutcome::tool);
+            // On the blocking pool, like the shell branch: the wait on the child is a blocking
+            // wait, and on the calling task it would stall every other future that task polls.
+            let running = enforce_allowlist(&self.allowlisted_tools, name, || {
+                let name = name.to_string();
+                let accessible_workdir = self.accessible_workdir.clone();
+                let session_workdir = self.workdir.clone();
+                let policy = self.capability_policy.clone();
+                let enforcement = self.shell_enforcement.clone();
+                Ok(tokio::task::spawn_blocking(move || {
+                    dispatch_native_tool(
+                        &name,
+                        input,
+                        &native_bin,
+                        &accessible_workdir,
+                        &session_workdir,
+                        &policy,
+                        &enforcement,
+                    )
+                }))
+            })?;
+            return running
+                .await
+                .map_err(|e| format!("native tool panicked: {e}"))?
+                .map(DispatchOutcome::tool);
         }
 
         // Shell tool — run on the blocking pool, since waiting on the child process is a
@@ -7923,6 +7969,7 @@ impl CapsuleStoreState {
                     command: String::new(),
                     context_id: context_id.clone(),
                     provenance: self.current_task_provenance,
+                    abandoned: abandon,
                 }),
                 _ => None,
             };
@@ -8772,7 +8819,7 @@ impl CapsuleStoreState {
                 // futures are mutually recursive and one of them has to be behind a pointer for
                 // either to have a size. `validate_plan` refuses a `submit-plan` step, so the
                 // recursion is one level deep in practice.
-                let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input, gate))
+                let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input, gate, None))
                     .await
                     .map(|outcome| outcome.result);
                 let _ = reply.send(outcome);
@@ -10024,6 +10071,9 @@ fn dispatch_native_tool(
     // native tool subprocesses remains the documented gap it was.
     crate::sandbox::apply_fd_hygiene(&mut command);
 
+    // Held until the tool has exited, so a shell command overlapping it in the scope does not
+    // claim a counter delta this process could have caused.
+    let _occupancy = enforcement.cgroup_scope.as_ref().map(|scope| scope.enter());
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn native tool '{name}': {e}"))?;
@@ -16091,6 +16141,93 @@ inference:
             "trace.jsonl's binary must be the resolved absolute path of what ran, got {binary:?}"
         );
         assert_eq!(shell_event["command"], "echo hi");
+    }
+
+    /// A native tool's wait runs on the blocking pool. On the calling task it would stall every
+    /// other future that task polls — on process transport, every other bridged call, the
+    /// decision point and the harness's output.
+    #[test]
+    fn a_native_tool_does_not_block_the_task_dispatching_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let native_dir = tmp.path().join("tools").join("slow-native");
+        fs::create_dir_all(&native_dir).unwrap();
+        let native_bin = native_dir.join("slow-native");
+        fs::write(
+            &native_bin,
+            "#!/bin/sh\nsleep 3\necho '{\"status\":\"passed\",\"data\":\"slow-done\"}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&native_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let skill_dir = tmp.path().join("tools").join("quick-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("skill.md"), "# quick\n").unwrap();
+
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            tmp.path().to_path_buf(),
+            tmp.path().join("murmur.lock"),
+        );
+        state.allowlisted_tools.insert("slow-native".to_string());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (native, skill_elapsed, native_running) = runtime.block_on(async {
+            let native_done = AtomicBool::new(false);
+            let native = async {
+                let outcome = state
+                    .dispatch_agent_tool_async(
+                        "slow-native",
+                        murmur::tool::run::ToolInput {
+                            data: None,
+                            log_path: None,
+                        },
+                        None,
+                    )
+                    .await;
+                native_done.store(true, Ordering::SeqCst);
+                outcome
+            };
+            let skill = async {
+                // Let the native dispatch start first, so it is the one already running.
+                tokio::task::yield_now().await;
+                let started = std::time::Instant::now();
+                let outcome = state
+                    .dispatch_agent_tool_async(
+                        "quick-skill",
+                        murmur::tool::run::ToolInput {
+                            data: None,
+                            log_path: None,
+                        },
+                        None,
+                    )
+                    .await;
+                assert!(outcome.is_ok(), "the skill dispatches: {:?}", outcome.err());
+                (started.elapsed(), !native_done.load(Ordering::SeqCst))
+            };
+            let (native, (skill_elapsed, native_running)) = tokio::join!(native, skill);
+            (native, skill_elapsed, native_running)
+        });
+
+        assert!(
+            skill_elapsed < std::time::Duration::from_secs(1),
+            "the skill waited {skill_elapsed:?} behind the native tool"
+        );
+        assert!(
+            native_running,
+            "the skill finished while the native tool still ran"
+        );
+        let Ok(native) = native else {
+            panic!("the native tool dispatches: {:?}", native.err());
+        };
+        let data = native.result.data.unwrap_or_default();
+        assert!(
+            data.contains("slow-done"),
+            "the native tool's own result: {data}"
+        );
     }
 
     #[test]

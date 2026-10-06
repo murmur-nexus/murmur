@@ -139,6 +139,8 @@ Two kinds of entry reach the model this way:
 
 `runtime: driver` and `runtime: hook` artifacts are not offered to the model, on this transport as on the other.
 
+Murmur runs the harness's tool calls concurrently, so a long shell command does not hold up the other calls the harness makes while it runs.
+
 Every call the harness makes is checked before it runs, in the same order as on `transport: http`:
 
 1. The tool's [input_schema](../reference/manifest.md#input-schema) — refused if the call's input lacks a field the schema lists in `required`.
@@ -190,14 +192,15 @@ Either way the entry is deleted, the turn runs as a new conversation under the s
 
 Because the harness holds the history, `--resume-mode compact` has nothing to compact and refuses with [`E-RUN-037`](../reference/diagnostics.md#e-run-037). `context.max_tokens` and `inference.compaction` parse but do nothing: the harness manages its own context.
 
-## Step 7 — know the two fixed limits
+## Step 7 — know the three fixed limits
 
-Two timeouts bound a run, and neither is a manifest setting.
+Three limits bound a run, and none is a manifest setting.
 
 | Limit | Value | What it bounds |
 |---|---|---|
 | Inactivity | 600 seconds | How long a run may go with neither a line of harness output nor a tool call before the harness is killed with [`E-RUN-035`](../reference/diagnostics.md#e-run-035). Any output and any tool call start the window again, so a harness that is working is never interrupted for taking a long time. |
 | Interrupt grace | 10 seconds | How long a harness that was asked to stop has to end on its own before it is killed. |
+| Concurrent tool calls | 16 | How many of the harness's tool calls Murmur runs at once. A call beyond that is refused at once with a failed tool result saying nothing ran; it is not queued. |
 
 ---
 

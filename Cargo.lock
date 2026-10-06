@@ -376,6 +376,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "futures-util",
  "getrandom 0.4.2",
  "hickory-resolver",
  "hmac",

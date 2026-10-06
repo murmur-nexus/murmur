@@ -878,7 +878,8 @@ The run ends with [`E-RUN-033`](diagnostics.md#e-run-033) naming the same kind.
 
 **`harness_note`** — written for anything else the harness said, for a tool result that matched no
 call, once per tool call the run ended without a result for, for an interrupt that could not be
-delivered, and for a `classify-exit` call the driver never answered
+delivered, for a `classify-exit` call the driver never answered, for a bridged tool call the harness
+closed its connection on, and for a call refused because the concurrent-call limit was reached
 
 | Field | Type | Notes |
 |---|---|---|
