@@ -196,7 +196,8 @@ chmod 600 ~/.murmur/config.yaml
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
 | `compiled/`, `compiled/<sha256>-<engine>.cwasm` | `0700`, `0600` | Compiled WASM artifacts, so a later launch or `manage.pull()` of the same artifact version skips compiling. An entry not read in 30 days is deleted by the next `mur install`, `mur precompile` or `mur run` that compiles a component; deleting the directory is safe | `mur install`, `mur precompile`, `mur run` at staging, and when a capsule calls `manage.pull()` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
-| `formations/`, `formations/<frm_id>/`, `formations/<frm_id>/<member>/` | `0700` | Each formation peer's [working directory](roster.md#member-directories). What the member's sessions write inside its directory keeps the umask's modes; the owner-only member directory is what keeps it from other accounts | `mur run --roster` |
+| `formations/`, `formations/<frm_id>/`, `formations/<frm_id>/<member>/` | `0700` | Each formation peer's [working directory](roster.md#member-directories). What the member's sessions write inside its directory keeps the umask's modes; the owner-only member directory is what keeps it from other accounts. A formation's directory is kept until the formation has ended and the roster entry member's `trace.retain` [expires it](roster.md#formation-retention); with no `trace.retain`, it is kept forever | `mur run --roster` |
+| `formations/<frm_id>/formation.json` | `0600` | The formation's [ownership marker](roster.md#member-directories): its project directory and its launcher. A formation directory without one is never removed | `mur run --roster`, once, before the first peer starts |
 
 `mur run` uses a file in `compiled/` only when all of these hold, and otherwise compiles the
 artifact again and replaces the file:

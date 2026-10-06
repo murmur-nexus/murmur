@@ -173,6 +173,19 @@ installed. Check 6 takes each member in turn through both rows before the next.
 | Entry member | The roster's project directory | `<project>/.murmur/<ses_id>/` |
 | Each peer | `~/.murmur/formations/<frm_id>/<member>/` | `~/.murmur/formations/<frm_id>/<member>/.murmur/<ses_id>/` |
 
+`~/.murmur/formations/<frm_id>/` also holds `formation.json`, the formation's ownership marker.
+The launcher writes it at mode `0600` before the first peer's directory is made. A roster with no
+peers makes no formation directory and no marker.
+
+| Key | Value |
+|---|---|
+| `project_dir` | The roster's project directory, with symlinks resolved |
+| `launcher_pid` | The launcher's process id |
+| `launcher_start` | When the launcher's process started, as the host reports it. Empty when it could not be read |
+
+A launcher that cannot write the marker launches anyway and prints
+`[mur run] warning: formation <frm_id> has no ownership marker (<reason>); its directory will never be removed automatically`.
+
 - The launcher makes `~/.murmur/formations/` and `~/.murmur/formations/<frm_id>/` owner-only, and
   makes each peer's directory with mode `0700`. A path already there is never reused: the peer is
   refused with [`E-RUN-045`](diagnostics.md#e-run-045) naming it, and nothing is launched.
@@ -182,7 +195,43 @@ installed. Check 6 takes each member in turn through both rows before the next.
   member's `task.md` is its own: two members working at once never touch each other's. A member
   that needs a file's content sends it in the task text.
 - The [formation line](cli.md#mur-run-roster) names each peer's directory as `workdir`.
-- Nothing removes a formation's directories when it ends.
+
+### Removing formation directories { #formation-retention }
+
+The entry member's [`trace.retain`](manifest.md#retention) bounds its roster's formation
+directories, as it bounds the entry member's own sessions. Without it, no formation directory is
+ever removed.
+
+| Key | For formation directories |
+|---|---|
+| `max_sessions` | Keep this many of the project's formation directories, newest first, the current formation's included |
+| `max_age` | Remove a formation directory older than this, measured from the time in its `frm_` id |
+
+Both keys apply together: a directory over either limit is removed, whole. The pass runs at the end
+of every `mur run --roster`, after every member of that launch has stopped, whether the entry
+member ended, the launcher was signalled, or the launch was refused after it started. Each removal
+is one line on stderr, newest first:
+
+```text
+[mur run] retention: removed formation frm_0199c4e2f1b7712a9d3e4f5061728394 (max_sessions)
+```
+
+The reason is `max_age` for a directory over both limits. Nothing is written to stdout.
+
+A formation directory is never removed when:
+
+- it is the current launch's formation, or one minted after it — so a formation's directory always
+  outlives the launch that made it;
+- its launcher is still running, or a [running record](cli.md#mur-ps) names the formation and that
+  member is still running. When `~/.murmur/running/` cannot be read, every formation counts as
+  running;
+- its `formation.json` names another project;
+- it has no `formation.json`, or one that does not parse. Directories made by a `mur` that wrote no
+  marker are in this case.
+
+Removing an ended formation's directory by hand stops nothing that is running, and takes its peers'
+traces with it: [`mur trace show frm_<id>`](cli.md#mur-trace-show) then finds only the entry
+member's session.
 
 ### Readiness { #launch-readiness }
 

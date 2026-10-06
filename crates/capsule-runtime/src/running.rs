@@ -225,29 +225,37 @@ pub enum ProcessState {
 /// record without a single network round trip. The start time is read only for a live pid; see
 /// [`classify`] for how the two readings combine.
 pub fn process_state(record: &RunningRecord) -> ProcessState {
-    let alive = pid_is_alive(record.pid);
-    let token = alive.then(|| process_start_token(record.pid)).flatten();
-    classify(record, alive, token.as_deref())
+    process_state_of(record.pid, &record.process_start)
 }
 
-/// Layers 1 and 2 over readings already taken: whether `record.pid` is held, and its start token
-/// read afterwards, `None` when it could not be read.
+/// Layers 1 and 2 for any process recorded as `pid` with the start token `recorded_start` — a
+/// running record's process, or a formation's launcher as its ownership marker names it.
+pub(crate) fn process_state_of(pid: u32, recorded_start: &str) -> ProcessState {
+    let alive = pid_is_alive(pid);
+    let token = alive.then(|| process_start_token(pid)).flatten();
+    classify(pid, recorded_start, alive, token.as_deref())
+}
+
+/// Layers 1 and 2 over readings already taken: whether `pid` is held, and its start token read
+/// afterwards, `None` when it could not be read.
 ///
-/// A recorded `process_start` of `""` is what a writer that could not read its own start time
-/// stores, and it differs from every token the host reports, so that record reads as `Gone`.
-fn classify(record: &RunningRecord, pid_alive: bool, fresh_token: Option<&str>) -> ProcessState {
+/// A recorded start of `""` is what a writer that could not read its own start time stores, and
+/// it differs from every token the host reports, so that process reads as `Gone`.
+fn classify(
+    pid: u32,
+    recorded_start: &str,
+    pid_alive: bool,
+    fresh_token: Option<&str>,
+) -> ProcessState {
     if !pid_alive {
-        return ProcessState::Gone(format!("no process holds pid {}", record.pid));
+        return ProcessState::Gone(format!("no process holds pid {pid}"));
     }
     match fresh_token {
-        Some(token) if token == record.process_start => ProcessState::Alive,
+        Some(token) if token == recorded_start => ProcessState::Alive,
         Some(_) => ProcessState::Gone(format!(
-            "pid {} is held by a process that started at another time",
-            record.pid
+            "pid {pid} is held by a process that started at another time"
         )),
-        None => {
-            ProcessState::Unverified(format!("pid {}'s start time could not be read", record.pid))
-        }
+        None => ProcessState::Unverified(format!("pid {pid}'s start time could not be read")),
     }
 }
 
@@ -975,7 +983,7 @@ mod tests {
     fn classify_a_dead_pid_is_gone_whatever_the_token() {
         for token in [None, Some("123"), Some("")] {
             assert_eq!(
-                classify(&record(PID, "123"), false, token),
+                classify(PID, "123", false, token),
                 ProcessState::Gone("no process holds pid 4242".to_string()),
                 "token {token:?}"
             );
@@ -984,16 +992,13 @@ mod tests {
 
     #[test]
     fn classify_a_live_pid_with_the_recorded_token_is_alive() {
-        assert_eq!(
-            classify(&record(PID, "123"), true, Some("123")),
-            ProcessState::Alive
-        );
+        assert_eq!(classify(PID, "123", true, Some("123")), ProcessState::Alive);
     }
 
     #[test]
     fn classify_a_live_pid_with_another_token_is_gone() {
         assert_eq!(
-            classify(&record(PID, "123"), true, Some("456")),
+            classify(PID, "123", true, Some("456")),
             ProcessState::Gone("pid 4242 is held by a process that started at another time".into())
         );
     }
@@ -1002,7 +1007,7 @@ mod tests {
     #[test]
     fn classify_a_recorded_empty_token_against_a_fresh_one_is_gone() {
         assert!(matches!(
-            classify(&record(PID, ""), true, Some("123")),
+            classify(PID, "", true, Some("123")),
             ProcessState::Gone(reason) if reason.contains("another time")
         ));
     }
@@ -1010,7 +1015,7 @@ mod tests {
     #[test]
     fn classify_a_live_pid_whose_token_cannot_be_read_is_unverified() {
         assert_eq!(
-            classify(&record(PID, "123"), true, None),
+            classify(PID, "123", true, None),
             ProcessState::Unverified("pid 4242's start time could not be read".into())
         );
     }

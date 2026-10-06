@@ -1139,9 +1139,9 @@ these fields are accepted and inert:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `trace.capture` | `none \| meta \| content` | no | Default: `meta`. How much of each turn's driver request `trace.jsonl` keeps — see the table below. |
-| `trace.retain` { #trace-retain } | block | no | What bounds the [session directories](workdir.md) beside the running one. Omitted, nothing is ever deleted. See [Retention](#retention). |
-| `trace.retain.max_sessions` | integer ≥ 1 | no | Session directories to keep, counting the running session itself. The rest are removed whole, taking their `trace.jsonl` and `blobs/` with them. |
-| `trace.retain.max_age` | duration | no | Age beyond which a session directory is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. |
+| `trace.retain` { #trace-retain } | block | no | What bounds the [session directories](workdir.md) beside the running one. On a roster's entry member, it also bounds the roster's [formation directories](roster.md#formation-retention). Omitted, nothing is ever deleted. See [Retention](#retention). |
+| `trace.retain.max_sessions` | integer ≥ 1 | no | Session directories to keep, counting the running session itself. The rest are removed whole, taking their `trace.jsonl` and `blobs/` with them. On an entry member, also the project's formation directories to keep, counting the current formation's. |
+| `trace.retain.max_age` | duration | no | Age beyond which a session directory is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. On an entry member, also the age beyond which an ended formation directory is removed, measured from its `frm_` id. |
 
 | `trace.capture` | `inference` content hashes | `blobs/` | `tool_call.output` |
 |---|---|---|---|
@@ -2037,19 +2037,21 @@ forms:
 
 ## Retention { #retention }
 
-Two stores grow as a capsule runs: the [session directories](workdir.md) under the workdir, and
-the [conversation records](workdir.md#the-conversation-record) under `~/.murmur/conversations/`.
-`trace.retain` bounds the first, `context.retain` the second. Both blocks are enforced at launch,
-by the runtime, and every deletion is written to the running session's trace as a
-[`retention` event](observability-schemas.md#retention).
+Three stores grow as capsules run:
+
+| Store | Bounded by | Enforced | Each deletion is reported as |
+|---|---|---|---|
+| [Session directories](workdir.md) under the workdir | `trace.retain` | At launch, by the runtime | A [`retention` event](observability-schemas.md#retention) in the running session's trace |
+| [Conversation records](workdir.md#the-conversation-record) under `~/.murmur/conversations/` | `context.retain` | At launch, by the runtime | A `retention` event in the running session's trace |
+| [Formation directories](roster.md#formation-retention) under `~/.murmur/formations/` | The roster entry member's `trace.retain` | At the end of every `mur run --roster`, by the launcher | A `[mur run] retention:` line on the launcher's stderr |
 
 **There are no defaults. A capsule with no `retain:` block deletes nothing, ever.**
 
 | Rule | Effect |
 |---|---|
-| The block is omitted | Nothing is deleted. Both stores grow without bound, as they always have. |
+| The block is omitted | Nothing is deleted. The stores it would bound grow without limit. |
 | The block is present but empty (`retain: {}`, or `retain:` with nothing under it) | Refused at parse time, naming the block. Omitting the block is how a capsule declares no policy. |
-| Both keys are present | ANDed. A session or record survives only if it is inside both limits. |
+| Both keys are present | ANDed. A session, record or formation directory survives only if it is inside both limits. |
 | A key is `0` | Refused at parse time, naming the key. |
 
 Durations are written as an integer optionally suffixed `s`, `m`, `h` or `d`; a bare integer is
@@ -2061,6 +2063,8 @@ seconds.
 |---|---|---|
 | `trace.retain.max_sessions` | — | One session directory, whole |
 | `trace.retain.max_age` | The uuid-v7 timestamp inside the `ses_` id | One session directory, whole |
+| `trace.retain.max_sessions`, on an entry member | — | One formation directory, whole |
+| `trace.retain.max_age`, on an entry member | The uuid-v7 timestamp inside the `frm_` id | One formation directory, whole |
 | `context.retain.max_messages` | — | The oldest messages of one record |
 | `context.retain.max_age` | The last write to `conversation.jsonl` | One context directory, whole |
 
@@ -2074,6 +2078,7 @@ it has always carried, and the [header line](workdir.md#record-header) records w
 | Never removed | Why |
 |---|---|
 | The running session's own directory, or any `ses_` id at or after it | A capsule launched while this one is running is inside the same workdir, and its session is not this session's to delete. |
+| The launch's own formation directory or a later one, one still running, another project's, or one with no `formation.json` | An entry member's policy reaches only its own project's ended formations. See [Removing formation directories](roster.md#formation-retention). |
 | The context the launch is using | Retention must not delete the conversation it is about to continue. |
 | A record whose header names another capsule | Two capsules can share a `context.record_store`; neither prunes the other's history. |
 | A record with no header line | A record written by a capsule that declares no `context.retain` is unowned, and the age sweep never removes it. It is adopted — and the policy starts applying — on the next launch that opens it under `--context`. [`mur conversation rm`](cli.md#mur-conversation-rm) is what reaches an abandoned one. |

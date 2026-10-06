@@ -2213,7 +2213,8 @@ fn door_posture_names_every_credential() {
 }
 
 /// `mur doctor` lists `~/.murmur/formations`, where formation peers run, as an owner-only entry
-/// of its own that is not safe to delete, and flags a member directory wider than owner-only.
+/// of its own, says how long each formation's directory is kept, never calls it safe to delete,
+/// and flags a member directory wider than owner-only.
 #[test]
 fn doctor_reports_the_formations_directory_as_owner_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -2238,12 +2239,15 @@ fn doctor_reports_the_formations_directory_as_owner_only() {
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stdout.contains(
-            "  formations: 0700  formation members' working directories, expected owner-only\n"
-        ),
-        "{stdout}"
-    );
+    let line = "  formations: 0700  formation members' working directories, each kept until its \
+                formation has ended and the entry member's trace.retain expires it, expected \
+                owner-only\n";
+    assert!(stdout.contains(line), "{stdout}");
+    let formations = stdout
+        .lines()
+        .find(|line| line.starts_with("  formations: "))
+        .unwrap();
+    assert!(!formations.contains("safe to delete"), "{formations}");
     assert!(
         stdout.contains("    wider than 0700: formations/frm_x/worker is 0755"),
         "{stdout}"
