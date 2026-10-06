@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -25,6 +25,7 @@ use common::formation::{
     alive, assert_no_member_remains, launch_lock, reported_pids, Launcher, LAUNCH_LIMIT,
 };
 use common::publish_to_store;
+use common::recording_upstream::read_request;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -82,7 +83,7 @@ impl Model {
 }
 
 fn answer(mut stream: TcpStream, counter: &AtomicUsize, gate: &Mutex<Option<mpsc::Receiver<()>>>) {
-    if read_request(&mut stream).is_err() {
+    if read_request(&mut stream).is_none() {
         return;
     }
     let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -98,37 +99,6 @@ fn answer(mut stream: TcpStream, counter: &AtomicUsize, gate: &Mutex<Option<mpsc
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
-}
-
-/// Read one request's headers and its `content-length` body.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<()> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            break index;
-        }
-    };
-    let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
-    let length = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length:"))
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut body = buffer.len() - (header_end + 4);
-    while body < length {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        body += read;
-    }
-    Ok(())
 }
 
 // ── The project ──────────────────────────────────────────────────────────────
