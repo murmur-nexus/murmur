@@ -13,7 +13,7 @@ use assert_cmd::Command;
 use tempfile::TempDir;
 
 const CODE: &str = "W-SEC-024";
-const LINK: &str = "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024";
+const LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-024";
 
 fn project(dir: &Path, manifest: &str) {
     fs::write(dir.join("murmur.yaml"), manifest).unwrap();

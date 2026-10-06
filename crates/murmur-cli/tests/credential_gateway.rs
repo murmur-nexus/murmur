@@ -47,12 +47,9 @@ const ANTHROPIC_AUTH: &str = "upstream_auth:\n  header: x-api-key\n  value: \"{k
 /// What the tool upstream answers every request with.
 const UPSTREAM_REPLY: &str = r#"{"results":["gateway-probe"]}"#;
 
-const W_SEC_025_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025";
-const W_SEC_027_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027";
-const W_SEC_030_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-030";
+const W_SEC_025_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-025";
+const W_SEC_027_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-027";
+const W_SEC_030_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-sec-030";
 
 // ── upstreams ───────────────────────────────────────────────────────────────
 

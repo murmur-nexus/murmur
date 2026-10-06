@@ -854,7 +854,7 @@ mod tests {
             warning,
             "[capsule-runtime] warning[W-SEC-028]: /h/.murmur holds the murmur home and is mode \
              0755, which other accounts on this host can read; run `chmod 700 /h/.murmur` \
-             (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)"
+             (https://docs.murmur.nexus/reference/diagnostics/#w-sec-028)"
         );
     }
 }

@@ -31,12 +31,9 @@ pub const W_REG_002: &str = "W-REG-002";
 /// fails no run; a declared one fails the checklist instead.
 pub const W_REG_003: &str = "W-REG-003";
 
-const DIAGNOSTICS_DOC_URL: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
-
 /// Builds the doc link for a `W-REG-*` code, e.g. `.../diagnostics/#w-reg-001`.
 pub fn registry_warning_link(code: &str) -> String {
-    format!("{DIAGNOSTICS_DOC_URL}#{}", code.to_lowercase())
+    crate::diagnostic_link(code)
 }
 
 #[cfg(test)]
@@ -62,7 +59,7 @@ mod tests {
     fn link_lowercases_the_code_into_the_anchor() {
         assert_eq!(
             registry_warning_link(W_REG_001),
-            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-001"
+            "https://docs.murmur.nexus/reference/diagnostics/#w-reg-001"
         );
     }
 }
