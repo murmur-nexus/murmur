@@ -210,7 +210,7 @@ impl HookInferenceCtx {
             Err(failure) => {
                 drop(admission);
                 let message = failure.message.clone();
-                (None, failure.usage.clone(), Some(failure), Err(message))
+                (None, failure.usage.clone(), Some(*failure), Err(message))
             }
         };
 
@@ -232,11 +232,12 @@ impl HookInferenceCtx {
 
     /// Dispatch the payload through the shared tool-invocation path and pull the
     /// completion text and the optional `usage` block out of the driver's response.
-    /// Returns `(raw, text, usage)`.
+    /// Returns `(raw, text, usage)`. The failure is boxed because it is far larger than the
+    /// success value and is built only on the cold path.
     async fn dispatch(
         &self,
         payload_json: String,
-    ) -> Result<(String, String, Option<DriverUsage>), HookInferenceFailure> {
+    ) -> Result<(String, String, Option<DriverUsage>), Box<HookInferenceFailure>> {
         // The status the gateway receives during this dispatch belongs to this call.
         if let Some(gateway) = &self.gateway {
             gateway.take_upstream_status();
@@ -246,15 +247,17 @@ impl HookInferenceCtx {
             .gateway
             .as_ref()
             .and_then(|gateway| gateway.take_upstream_status());
-        outcome.map_err(|(code, message, usage)| HookInferenceFailure {
-            code,
-            error: match code {
-                INFERENCE_ERROR_CREDENTIAL_REJECTED => message.clone(),
-                _ => self.redact(&message),
-            },
-            message,
-            provider_status,
-            usage,
+        outcome.map_err(|(code, message, usage)| {
+            Box::new(HookInferenceFailure {
+                code,
+                error: match code {
+                    INFERENCE_ERROR_CREDENTIAL_REJECTED => message.clone(),
+                    _ => self.redact(&message),
+                },
+                message,
+                provider_status,
+                usage,
+            })
         })
     }
 
