@@ -2009,7 +2009,9 @@ the same terms. Omit the key to deliver no variable.
   ```
 
   The name on the `$` line is the allowlist entry, so an interpreter's line shows the shell line
-  on its own (`$ echo hi`).
+  on its own (`$ echo hi`). When the runtime attributes the command's failure to one
+  `capabilities.resources` limit, a line naming that limit and what to do follows the result; see
+  [Which limit a subprocess hit](resource-limits.md#which-limit).
 
 ### Install entries { #install-entries }
 
