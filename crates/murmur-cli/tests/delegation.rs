@@ -73,6 +73,10 @@ const THIRSTY_WORKER: &str = "thirsty-worker";
 /// `network.authentication`, so its parent must present its operator token to drive it.
 const AUTH_WORKER: &str = "auth-worker";
 
+/// The sub-capsule that answers as [`WORKER`] does and then stays up for its next task, so a plan
+/// step polling it for its task's state still reaches it after the answer.
+const STAYING_WORKER: &str = "staying-worker";
+
 /// The host variable both the parent and [`WORKER`] declare, and the whole of what a delegated
 /// child is handed beyond the names the runtime owns.
 const PROVIDER_KEY_VAR: &str = "MURMUR_TEST_PROVIDER_KEY";
@@ -550,7 +554,8 @@ fn suite() -> &'static Suite {
                  network:\n    allow: [127.0.0.1]\n  \
                  env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
                  spawn:\n    allow: [{WORKER}, {WORKER_TWO}, {WORKER_THREE}, {GREEDY_WORKER}, \
-                 {MUTE_WORKER}, {DEEP_WORKER}, {THIRSTY_WORKER}, {AUTH_WORKER}]\n"
+                 {MUTE_WORKER}, {DEEP_WORKER}, {THIRSTY_WORKER}, {AUTH_WORKER}, \
+                 {STAYING_WORKER}]\n"
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
@@ -586,6 +591,15 @@ fn suite() -> &'static Suite {
             &format!(
                 "{}network:\n  authentication:\n    scheme: bearer\n",
                 agent_capsule_manifest(&always_replying(WORKER_ANSWER).endpoint)
+            ),
+            None,
+        );
+        roost.publish(
+            STAYING_WORKER,
+            VERSION,
+            &agent_capsule_manifest_with(
+                &always_replying(WORKER_ANSWER).endpoint,
+                "task_acceptance: queue\n  after_task: sleep",
             ),
             None,
         );
@@ -2276,6 +2290,220 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
     let next = parent.submit("msg-after-cancel", "carry on");
     parent.await_task(&next, Duration::from_secs(120));
     assert_eq!(parent.task_state(&next), "completed");
+}
+
+/// A cancel that lands while a plan's `capsule` step is waiting on its sub-capsule ends that
+/// sub-capsule within moments and stops the plan with it, and the parent's trace closes the
+/// delegation the way it closes a `delegate-task` child's: after the cancel, naming it.
+#[test]
+fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
+    if common::skip_without_host_support("a_cancel_mid_plan_ends_the_plan_steps_sub_capsule") {
+        return;
+    }
+    let parent = Parent::launch(PARENT, &format!("{SPAWN_YAML}  plan:\n    submit: true\n"));
+
+    parent.server.push(tool_use_response(
+        "toolu_plan",
+        "submit-plan",
+        json!({"plan": {"id": "p", "steps": [
+            {"id": "slow", "capsule": MUTE_WORKER, "input": "hold the line",
+             "retries": 2, "on_error": "continue"},
+            {"id": "after", "capsule": WORKER, "depends_on": ["slow"], "input": "never sent"}
+        ]}}),
+    ));
+    let task_id = parent.submit("msg-plan-cancel", "plan it");
+
+    let launch =
+        wait_for_events(&parent, "delegation_start", 1, Duration::from_secs(120)).remove(0);
+    let delegation_id = launch["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(delegation_id.starts_with("dlg_"), "{launch}");
+    let child_dir = parent.only_child_dir();
+    let up = Instant::now() + Duration::from_secs(60);
+    while !a_process_is_running_under(&child_dir) {
+        assert!(Instant::now() < up, "the plan step's child never came up");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(parent.task_state(&task_id), "working");
+
+    let started_at = Instant::now();
+    let response = post_json(
+        &parent.url,
+        &json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tasks/cancel", "params": {"id": task_id}
+        })
+        .to_string(),
+    );
+    let took = started_at.elapsed();
+    assert_eq!(
+        response["result"]["status"]["state"], "canceled",
+        "{response}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "the cancel queued behind the plan ({took:?})"
+    );
+    let items: Vec<Value> = response["result"]["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a cancel with a live plan step carries residue: {response}"))
+        .iter()
+        .filter(|artifact| artifact["name"] == "residue")
+        .filter_map(|artifact| artifact["parts"].as_array())
+        .flatten()
+        .filter_map(|part| serde_json::from_str::<Value>(part["text"].as_str()?).ok())
+        .collect();
+    let residue = items
+        .iter()
+        .find(|item| item["kind"] == "delegation")
+        .unwrap_or_else(|| panic!("no delegation residue in {items:?}"));
+    assert_eq!(residue["delegation_id"], json!(delegation_id), "{residue}");
+    assert_eq!(residue["capsule"], MUTE_WORKER, "{residue}");
+
+    // Ended from inside the step, not left to run out the delegation deadline.
+    let gone = Instant::now() + Duration::from_secs(10);
+    while a_process_is_running_under(&child_dir) {
+        assert!(
+            Instant::now() < gone,
+            "the plan step's child is still running 10s after its task was cancelled"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!(
+        "[measure] tasks/cancel to plan child gone: {} ms",
+        started_at.elapsed().as_millis()
+    );
+
+    wait_for_events(&parent, "task_end", 1, Duration::from_secs(60));
+    let trace = parent.trace_events();
+    let at = |event_type: &str, matches: &dyn Fn(&Value) -> bool| {
+        trace
+            .iter()
+            .position(|event| event["event_type"] == event_type && matches(event))
+            .unwrap_or_else(|| panic!("no matching {event_type} line: {trace:?}"))
+    };
+    let names_dlg = |event: &Value| event["delegation_id"] == json!(delegation_id);
+    let started = at("delegation_start", &names_dlg);
+    let slow = at("plan_step", &|event| event["step_id"] == "slow");
+    let plan_end = at("plan_end", &|_| true);
+    let canceled = at("task_canceled", &|_| true);
+    let ended = at("delegation", &names_dlg);
+    let task_end = at("task_end", &|_| true);
+    assert!(
+        started < slow
+            && slow < plan_end
+            && plan_end < canceled
+            && canceled < ended
+            && ended < task_end,
+        "{trace:?}"
+    );
+
+    assert_eq!(trace[slow]["status"], "failed", "{}", trace[slow]);
+    assert_eq!(trace[slow]["attempts"], 1, "{}", trace[slow]);
+    assert_eq!(
+        trace[slow]["error"],
+        "the task running this plan was cancelled; this step's sub-capsule was ended with it",
+        "{}",
+        trace[slow]
+    );
+    let after = &trace[at("plan_step", &|event| event["step_id"] == "after")];
+    assert_eq!(after["status"], "skipped", "{after}");
+    assert_eq!(after["attempts"], 0, "{after}");
+    assert_eq!(
+        after["error"], "the task running this plan was cancelled before this step ran",
+        "{after}"
+    );
+    let summary = &trace[plan_end];
+    assert_eq!(summary["outcome"], "canceled", "{summary}");
+    assert!(summary["failed_step"].is_null(), "{summary}");
+    assert_eq!(
+        summary["reason"], "the task running this plan was cancelled",
+        "{summary}"
+    );
+    assert_eq!(summary["steps_failed"], 1, "{summary}");
+    assert_eq!(summary["steps_skipped"], 1, "{summary}");
+    assert_eq!(trace[canceled]["phase"], "plan", "{}", trace[canceled]);
+    assert!(
+        trace[canceled]["delegation_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!(delegation_id))),
+        "{}",
+        trace[canceled]
+    );
+    assert_eq!(trace[ended]["outcome"], "terminated", "{}", trace[ended]);
+    assert_eq!(
+        trace[ended]["reason"], "the delegating task was cancelled",
+        "{}",
+        trace[ended]
+    );
+    assert_eq!(parent.events("delegation_start").len(), 1);
+    assert_eq!(parent.events("delegation").len(), 1);
+
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(child_dir.join("completion.json"))
+            .expect("the ended child's outcome is recorded"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "terminated", "{completion}");
+    assert_eq!(completion["reported_by"], "launcher", "{completion}");
+    assert_eq!(completion["delivered"], json!(false), "{completion}");
+    assert_eq!(
+        completion["detail"], "the parent ended this delegation",
+        "{completion}"
+    );
+    // Ended by its parent's hand, not by losing its spawner.
+    let child_session_id = launch["child_session_id"].as_str().unwrap_or_default();
+    assert!(
+        !child_events(&child_dir, child_session_id)
+            .iter()
+            .any(|event| event["event_type"] == "spawner_ended"),
+        "the child saw its spawner end"
+    );
+
+    assert_eq!(agent_card_status(&parent.url), 200);
+    parent.server.push(end_turn_response("after the cancel"));
+    let next = parent.submit("msg-after-plan-cancel", "carry on");
+    parent.await_task(&next, Duration::from_secs(120));
+    assert_eq!(parent.task_state(&next), "completed");
+}
+
+/// A plan nobody cancels closes its own `capsule` step's delegation and leaves nothing in the
+/// task's set: the task neither waits on it nor ends it a second time.
+#[test]
+fn a_plan_step_that_completes_closes_its_own_delegation() {
+    if common::skip_without_host_support("a_plan_step_that_completes_closes_its_own_delegation") {
+        return;
+    }
+    let parent = Parent::launch(
+        PARENT,
+        &format!("  spawn:\n    allow: [{STAYING_WORKER}]\n  plan:\n    submit: true\n"),
+    );
+    parent.server.push(tool_use_response(
+        "toolu_plan_ok",
+        "submit-plan",
+        json!({"plan": {"id": "p", "steps": [
+            {"id": "ask", "capsule": STAYING_WORKER, "input": "summarise the report"}
+        ]}}),
+    ));
+    parent.server.push(end_turn_response("planned"));
+    let started_at = Instant::now();
+    let task_id = parent.submit("msg-plan-ok", "plan it");
+    parent.await_task(&task_id, Duration::from_secs(240));
+    assert_eq!(parent.task_state(&task_id), "completed");
+    assert!(
+        started_at.elapsed() < Duration::from_secs(TIMEOUT_SECS),
+        "the task waited on a delegation its plan had already closed"
+    );
+
+    let ended = parent.events("delegation");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0]["outcome"], "completed", "{}", ended[0]);
+    let launched = only_event(&parent.trace_events(), "delegation_start").clone();
+    assert_eq!(ended[0]["delegation_id"], launched["delegation_id"]);
+    let result = tool_result_text(&parent.server.requests(), "toolu_plan_ok")
+        .expect("the plan's result reached the model");
+    assert!(result.contains("\"canceled\":false"), "{result}");
 }
 
 /// A capsule that accepts no tasks over its door still hears from the sub-capsule its `task.md`

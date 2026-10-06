@@ -12,7 +12,7 @@
 //! | Method | Returns when | Statuses it can produce | Who holds the child | Its caller |
 //! |---|---|---|---|---|
 //! | [`DelegationPlane::start`] | the child is running and holding its task | `started`, `failed`, `refused` | the caller, through [`StartedDelegation::child`] | the agent-facing `delegate-task` tool |
-//! | [`DelegationPlane::delegate`] | the child's task reaches a terminal state | `completed`, `timed_out`, `failed`, `refused` | the method, until it returns | a plan's `capsule` step |
+//! | [`DelegationPlane::delegate`] | the child's task reaches a terminal state, or [`DelegationOrigin::stop`] reports the delegating task cancelled | `completed`, `timed_out`, `failed`, `refused`, `canceled` | the method, until it returns | a plan's `capsule` step |
 //!
 //! [`DelegationPlane::start`] is the one an agent reaches. It hands the child's handle back, the
 //! delegating task holds it until the outcome is delivered or the task ends the child, and the
@@ -127,6 +127,13 @@ pub enum DelegationStatus {
     /// The daemon refused, so no child was launched and no child directory exists. Produced by
     /// both methods.
     Refused,
+    /// The task the delegation was made for was cancelled while the child was running, so the
+    /// child was ended and its `completion.json` records `terminated`. Produced only by
+    /// [`DelegationPlane::delegate`], when [`DelegationOrigin::stop`] reports true.
+    ///
+    /// Never written as a `delegation` line's `outcome`: the cancelled task closes that row
+    /// itself, in the sub-capsule vocabulary, as `terminated`.
+    Canceled,
 }
 
 impl DelegationStatus {
@@ -137,6 +144,7 @@ impl DelegationStatus {
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
             Self::Refused => "refused",
+            Self::Canceled => "canceled",
         }
     }
 }
@@ -260,15 +268,24 @@ pub struct DelegationOrigin<'a> {
     /// Invoked in place, both surfaces get the record on disk while the child is still in flight,
     /// which is the whole reason it is a record of its own.
     pub launched: Option<std::sync::Arc<dyn Fn(DelegationLaunch) + Send + Sync + 'a>>,
+    /// Whether the task this delegation was made for has been cancelled, or `None` for a caller
+    /// that cannot be. Polled, so it must be cheap and must never block.
+    ///
+    /// Read only by [`DelegationPlane::delegate`], which ends the child itself when it reports
+    /// true. [`DelegationPlane::start`] ignores it: its caller races its own cancel against the
+    /// launch, and holds the child's handle from then on.
+    pub stop: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync + 'a>>,
 }
 
-/// Hand-written because [`DelegationOrigin::launched`] is a trait object and cannot derive one.
+/// Hand-written because [`DelegationOrigin::launched`] and [`DelegationOrigin::stop`] are trait
+/// objects and cannot derive one.
 /// A callback has no readable identity, so what is printed of it is whether there is one.
 impl std::fmt::Debug for DelegationOrigin<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DelegationOrigin")
             .field("context_id", &self.context_id)
             .field("launched", &self.launched.is_some())
+            .field("stop", &self.stop.is_some())
             .finish()
     }
 }
@@ -635,9 +652,13 @@ impl DelegationPlane {
         }
         let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
         let door_token = child.door_token.clone();
-        if let Err(reason) =
-            deliver_task(&capsule_url, door_token.as_ref(), &delegation_id, request)
-        {
+        if let Err(reason) = deliver_task(
+            &capsule_url,
+            door_token.as_ref(),
+            &delegation_id,
+            request,
+            &|| false,
+        ) {
             return failed(&child.session_id, reason);
         }
 
@@ -669,9 +690,17 @@ impl DelegationPlane {
     /// agent-facing tool calls [`DelegationPlane::start`] instead.
     ///
     /// Blocking from end to end, and never `Err`: every way a delegation can end here is one of
-    /// four [`DelegationStatus`] words — `completed`, `timed_out`, `failed`, `refused` — because
-    /// the step maps all four onto a step result the same way, and a refusal is as much a fact
-    /// about the run as an answer is.
+    /// five [`DelegationStatus`] words — `completed`, `timed_out`, `failed`, `refused`, `canceled`
+    /// — because the step maps them all onto a step result, and a refusal is as much a fact about
+    /// the run as an answer is.
+    ///
+    /// **Cancellation.** [`DelegationOrigin::stop`] is asked once the child is announced, between
+    /// delivery attempts, and on every poll. When it reports true this method ends the child,
+    /// records it `terminated` by the launcher in the child's `completion.json` with
+    /// [`crate::delegation::PARENT_ENDED_DETAIL`], and returns [`DelegationStatus::Canceled`]. The
+    /// daemon's approval and the child's launch are not interruptible, so a cancel that lands
+    /// during either is honoured at the first check after them — the same bound a `delegate-task`
+    /// call's launch has.
     pub fn delegate(
         &self,
         request: &DelegationRequest,
@@ -705,7 +734,8 @@ impl DelegationPlane {
                 )
             }
         };
-        let child = match launch_child_capsule(launch) {
+        let launched_at = Instant::now();
+        let mut child = match launch_child_capsule(launch) {
             Ok(child) => child,
             // A child whose process never started named no delegation, the same as one the daemon
             // refused: the id is minted by the launcher, and this launch reached no launcher.
@@ -722,6 +752,7 @@ impl DelegationPlane {
         let delegation_id = child.delegation_id.clone().unwrap_or_default();
 
         self.announce(request, origin, &child, &delegation_id);
+        let stopped = || origin.stop.as_ref().is_some_and(|stop| stop());
 
         // Every result this call can produce past the launch, built from one place so the
         // delegation id, the capsule and the version cannot disagree between two of them — and so
@@ -741,6 +772,23 @@ impl DelegationPlane {
                 child_workdir: None,
             }
         };
+        // The task this delegation was made for was cancelled: end the child here, where its
+        // handle is, and leave the delegation's row to the task, which closes it after its
+        // `task_canceled`.
+        let canceled = |child: &mut LaunchedChild| {
+            end_for_canceled_task(request, &delegation_id, child, launched_at);
+            outcome(
+                DelegationStatus::Canceled,
+                &child.session_id,
+                format!(
+                    "capsule '{}' was stopped because the task that started it was cancelled",
+                    request.capsule
+                ),
+            )
+        };
+        if stopped() {
+            return canceled(&mut child);
+        }
 
         if child.capsule_url.is_empty() {
             return outcome(
@@ -771,8 +819,10 @@ impl DelegationPlane {
             child.door_token.as_ref(),
             &delegation_id,
             request,
+            &stopped,
         ) {
             Ok(task_id) => task_id,
+            Err(_) if stopped() => return canceled(&mut child),
             Err(reason) => return outcome(DelegationStatus::Failed, &child.session_id, reason),
         };
 
@@ -787,6 +837,9 @@ impl DelegationPlane {
         .to_string();
         let poll_deadline = Instant::now() + self.result_timeout;
         loop {
+            if stopped() {
+                return canceled(&mut child);
+            }
             if Instant::now() >= poll_deadline {
                 // The wait and the child end together. This caller has nowhere for a later outcome
                 // to arrive — that is why it is waiting on this connection at all — so a child left
@@ -804,6 +857,9 @@ impl DelegationPlane {
                 );
             }
             std::thread::sleep(POLL_INTERVAL);
+            if stopped() {
+                return canceled(&mut child);
+            }
 
             let task = match http_json("POST", &capsule_url, Some(&poll_body), &headers) {
                 Ok(task) => task,
@@ -876,12 +932,15 @@ impl DelegationPlane {
 /// the child gave the task it accepted, which is what makes the child's per-task result file
 /// findable; `Err` is the sentence the delegating caller reports, already naming the capsule.
 ///
-/// `door_token` is the child's operator token when it declares `network.authentication`.
+/// `door_token` is the child's operator token when it declares `network.authentication`. `stop`
+/// is asked before every retry, and a send it stops returns `Err` at once rather than backing off
+/// to [`SEND_DEADLINE`].
 fn deliver_task(
     capsule_url: &str,
     door_token: Option<&crate::door_auth::DoorToken>,
     delegation_id: &str,
     request: &DelegationRequest,
+    stop: &dyn Fn() -> bool,
 ) -> Result<String, String> {
     let send_body = json!({
         "jsonrpc": "2.0",
@@ -907,6 +966,13 @@ fn deliver_task(
     let sent = loop {
         match http_json("POST", capsule_url, Some(&send_body), &headers) {
             Ok(response) => break response,
+            Err(error) if stop() => {
+                return Err(format!(
+                    "capsule '{}' was not handed its task: the delegating task was cancelled \
+                     ({error})",
+                    request.capsule
+                ))
+            }
             Err(_) if Instant::now() < send_deadline => {
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(2));
@@ -929,6 +995,39 @@ fn deliver_task(
                 request.capsule
             )
         })
+}
+
+/// End a child [`DelegationPlane::delegate`] holds because the task it was made for was
+/// cancelled, and record that in the child's own `completion.json`.
+///
+/// The record is the one a `delegate-task` child's completion watcher writes when its parent ends
+/// it on purpose: this launch started no watcher, so the launcher writes it here, after the reap.
+fn end_for_canceled_task(
+    request: &DelegationRequest,
+    delegation_id: &str,
+    child: &mut LaunchedChild,
+    launched_at: Instant,
+) {
+    if let Err(error) = child.shutdown() {
+        crate::runtime_err!("[capsule-runtime] delegation {delegation_id}: {error}");
+    }
+    crate::delegation::record_terminated(
+        &child.workdir,
+        crate::delegation::DelegationOutcome {
+            delegation_id: delegation_id.to_string(),
+            capsule_name: request.capsule.clone(),
+            capsule_version: request.version.clone(),
+            session_id: child.session_id.clone(),
+            status: crate::delegation::DelegationStatus::Terminated,
+            result_path: None,
+            workdir: child.workdir.display().to_string(),
+            duration_ms: crate::member_call::elapsed_ms(launched_at),
+            detail: Some(crate::delegation::PARENT_ENDED_DETAIL.to_string()),
+            reported_by: crate::delegation::Reporter::Launcher,
+            delivered: false,
+            delivery_error: None,
+        },
+    );
 }
 
 /// Where a finished child left its answer, and what it says.
@@ -1041,6 +1140,28 @@ mod tests {
         assert_eq!(DelegationStatus::Refused.as_str(), "refused");
     }
 
+    /// The word `delegate` returns for a child it ended because its task was cancelled. A plan
+    /// step reads it to leave the delegation's row to the task, so it is never a `delegation`
+    /// line's `outcome`.
+    #[test]
+    fn a_canceled_delegation_has_its_own_word() {
+        assert_eq!(DelegationStatus::Canceled.as_str(), "canceled");
+    }
+
+    /// A stop predicate is a trait object, so `Debug` says whether there is one.
+    #[test]
+    fn an_origin_prints_whether_it_can_be_stopped() {
+        let stoppable = DelegationOrigin {
+            stop: Some(std::sync::Arc::new(|| false)),
+            ..origin()
+        };
+        assert!(
+            format!("{stoppable:?}").contains("stop: true"),
+            "{stoppable:?}"
+        );
+        assert!(format!("{:?}", origin()).contains("stop: false"));
+    }
+
     fn plane() -> DelegationPlane {
         DelegationPlane::new(
             // Nothing here is reachable: every case below refuses before a request is built.
@@ -1071,7 +1192,7 @@ mod tests {
         let (addr, _shutdown, mut task_rx) = crate::identity::serve_test_door(false).await;
         let url = format!("http://{addr}");
         let delivered = tokio::task::spawn_blocking(move || {
-            deliver_task(&url, None, "dlg_0000000000000001", &request())
+            deliver_task(&url, None, "dlg_0000000000000001", &request(), &|| false)
         })
         .await
         .unwrap()

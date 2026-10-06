@@ -888,6 +888,155 @@ fn a_parent_stopped_while_it_waits_ends_its_child_first() {
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
 }
 
+// ── A parent running a plan ───────────────────────────────────────────────────
+
+/// A model whose first reply submits a one-step plan delegating to `capsule`, and whose every
+/// later request ends the turn.
+fn planning_model(capsule: &str) -> ScriptedServer {
+    let calls = AtomicUsize::new(0);
+    let capsule = capsule.to_string();
+    ScriptedServer::start_answering(8, move |_| match calls.fetch_add(1, Ordering::SeqCst) {
+        0 => tool_use_response(
+            "toolu_plan",
+            "submit-plan",
+            json!({"plan": {"id": "p", "steps": [
+                {"id": "hold", "capsule": capsule, "input": "hold the line"}
+            ]}}),
+        ),
+        _ => common::door_capsule::end_turn(2, "planned"),
+    })
+}
+
+/// The capabilities a planning parent declares beyond the network: the spawn grant its plan's
+/// step delegates under, and the plan grant itself.
+fn plan_capabilities(names: &[&str]) -> String {
+    format!("{}  plan:\n    submit: true\n", spawn_allow(names))
+}
+
+/// `SIGTERM` to a default-lifecycle capsule whose plan is waiting on a `capsule` step's
+/// sub-capsule. Termination cancels the task, the step ends its sub-capsule, and the task closes
+/// the delegation before the process goes: by the time it has exited, no process names the
+/// child's directory, and the child was ended by its parent rather than by its lifeline.
+#[test]
+fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
+    if common::skip_without_host_support(
+        "a_parent_stopped_mid_plan_ends_the_plan_steps_child_first",
+    ) {
+        return;
+    }
+    let world = World::new(&["stopped-planner"]);
+    let model = planning_model(MUTE);
+    let body = agent_body(&model.endpoint, &plan_capabilities(&[MUTE]), "", "");
+    let mut parent = Parent::start(&world, "stopped-planner", &body, model, |_| {});
+    parent.submit();
+    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    assert!(
+        !delegation.processes().is_empty(),
+        "the child is not running"
+    );
+
+    let stopped = Instant::now();
+    signal(parent.proc.pid(), libc::SIGTERM);
+    let (_, exited) = await_exit(&mut parent.proc, Duration::from_secs(20));
+    let running = delegation.processes();
+    eprintln!(
+        "[measure] parent SIGTERM mid-plan to parent exit: {} ms; processes naming the child \
+         dir then: {}",
+        exited.duration_since(stopped).as_millis(),
+        running.len()
+    );
+    assert!(
+        running.is_empty(),
+        "the plan step's child outlived its stopped parent: {running:?}"
+    );
+
+    let trace = parent_trace(&parent);
+    let canceled = trace
+        .iter()
+        .position(|event| event["event_type"] == "task_canceled")
+        .unwrap_or_else(|| panic!("no task_canceled: {:?}", kinds(&trace)));
+    assert!(
+        trace[canceled]["delegation_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == delegation.delegation_id.as_str())),
+        "{}",
+        trace[canceled]
+    );
+    let ended: Vec<usize> = trace
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event_type"] == "delegation")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(ended.len(), 1, "{:?}", kinds(&trace));
+    let ended = ended[0];
+    let task_end = trace
+        .iter()
+        .position(|event| event["event_type"] == "task_end")
+        .unwrap_or_else(|| panic!("no task_end: {:?}", kinds(&trace)));
+    assert!(canceled < ended && ended < task_end, "{:?}", kinds(&trace));
+    assert_eq!(trace[ended]["outcome"], "terminated", "{}", trace[ended]);
+    assert_eq!(
+        trace[ended]["reason"], "the delegating task was cancelled",
+        "{}",
+        trace[ended]
+    );
+
+    let child_kinds = kinds_of(&delegation.trace());
+    assert!(
+        !child_kinds.iter().any(|kind| kind == "spawner_ended"),
+        "the child was wound down by its lifeline rather than ended by its parent: \
+         {child_kinds:?}"
+    );
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(delegation.child_dir().join("completion.json"))
+            .expect("the ended child's outcome is recorded"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "terminated", "{completion}");
+    assert_eq!(completion["reported_by"], "launcher", "{completion}");
+}
+
+/// `SIGKILL` of a capsule whose plan is waiting on a `capsule` step's sub-capsule. Nothing in the
+/// parent runs to end the child, so its spawner lifeline does: the child goes within one teardown
+/// deadline, recording that its spawner ended, and no launcher recorded its ending.
+#[test]
+fn a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it() {
+    if common::skip_without_host_support(
+        "a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it",
+    ) {
+        return;
+    }
+    let world = World::new(&["killed-planner"]);
+    let model = planning_model(MUTE);
+    let body = agent_body(
+        &model.endpoint,
+        &plan_capabilities(&[MUTE]),
+        QUEUE_SLEEP,
+        "",
+    );
+    let mut parent = Parent::start(&world, "killed-planner", &body, model, |_| {});
+    parent.submit();
+    let delegation = await_delegation(parent.project.path(), &parent.session_id());
+    assert!(
+        !delegation.processes().is_empty(),
+        "the child is not running"
+    );
+
+    let killed = Instant::now();
+    parent.proc.kill();
+    let took = gone_within(&delegation, killed, ONE_LEVEL);
+    eprintln!(
+        "[measure] parent SIGKILL mid-plan to child exit: {} ms",
+        took.as_millis()
+    );
+    assert_wound_down_by_spawner(&delegation, &parent.session_id());
+    assert!(
+        !delegation.child_dir().join("completion.json").exists(),
+        "a launcher killed outright recorded nothing, and the child reports to nobody"
+    );
+}
+
 // ── A formation member killed outright ────────────────────────────────────────
 
 /// `mur run --roster` whose entry member delegates to the mute worker; `SIGKILL` of that member

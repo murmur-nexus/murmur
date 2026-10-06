@@ -603,7 +603,7 @@ called [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running
 |---|---|---|
 | `task_id` | string | The task that was stopped |
 | `turn` | u32 | The turn that was in flight, 0-based. Absent for a task cancelled before it ran |
-| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"member_call"` \| `"harness"` — which wait the cancel interrupted. `"delegation"` is a wait on a `delegate-task` delegation: its child coming up, or a finished attempt waiting for its outcome. `"member_call"` is a wait on a [`call-member`](runtime-provided-tools.md#call-member) call: reaching the member's door, or waiting for its answer. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted |
+| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` \| `"member_call"` \| `"harness"` \| `"plan"` — which wait the cancel interrupted. `"delegation"` is a wait on a `delegate-task` delegation: its child coming up, or a finished attempt waiting for its outcome. `"member_call"` is a wait on a [`call-member`](runtime-provided-tools.md#call-member) call: reaching the member's door, or waiting for its answer. `"harness"` is a [`transport: process`](manifest.md#transport-process) run, where the harness itself is interrupted. `"plan"` is a `submit-plan` call running its steps, which stops the plan and ends any `capsule` step's sub-capsule — see [When the task is cancelled](plans.md#when-the-task-is-cancelled) |
 | `detached_work_ids` | array of string | Demoted shell commands still running when the loop stopped |
 | `delegation_ids` | array of string | Delegations in flight when the loop stopped, named before the task ended them |
 
@@ -1067,9 +1067,15 @@ from the parent's side whatever happens next. A delegation the daemon refused wr
 
 ### Which outcome vocabulary applies { #delegation-outcome }
 
-`outcome` is drawn from the sub-capsule's own vocabulary exactly when a
-[`delegate-task`](runtime-provided-tools.md) call started a child. In every other case — a plan [`capsule` step](plans.md), or a `delegate-task`
-call whose child never started — it is drawn from the delegating call's vocabulary.
+`outcome` is drawn from the sub-capsule's own vocabulary whenever the delegating task, rather than
+the call, closes the delegation:
+
+| Delegation | Closed by | Vocabulary |
+|---|---|---|
+| A [`delegate-task`](runtime-provided-tools.md) call whose child started | The task | Sub-capsule |
+| A plan [`capsule` step](plans.md) whose task was cancelled while its child ran | The task | Sub-capsule |
+| Any other plan `capsule` step | The step | Delegating call |
+| A `delegate-task` call whose child never started | The call | Delegating call |
 
 The two vocabularies name different subjects: one names what a child that ran did, the other names
 how far the delegating call got. A delegation that was `refused` never existed; one that `crashed`
@@ -1083,7 +1089,7 @@ The sub-capsule's vocabulary, read out of the child's own
 | `"ok"` | The child's session finished, and reported so itself |
 | `"error"` | The child's session ran and failed, and reported so itself |
 | `"crashed"` | The child's process ended without recording a completion |
-| `"terminated"` | The child was ended: by the delegating task as it ended, at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), or by the task's backstop 30 seconds after it |
+| `"terminated"` | The child was ended: by the delegating task as it ended — including a cancel of the task running a plan, which ends a `capsule` step's child — at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), or by the task's backstop 30 seconds after it |
 | `"unknown"` | A completion arrived, and the parent found no readable `completion.json` behind it. The parent's own word, and reachable on no other path |
 
 The delegating call's vocabulary, read out of the call's result:
@@ -1114,7 +1120,7 @@ child is up while a `capsule` step waits for the answer:
 
 | | `delegate-task` | `capsule` step |
 |---|---|---|
-| Child started | `delegation_start` in the turn that called the tool; `delegation` later in the same task, when the outcome is delivered or the task ends the child | both lines within the step |
+| Child started | `delegation_start` in the turn that called the tool; `delegation` later in the same task, when the outcome is delivered or the task ends the child | both lines within the step; when the task is cancelled while the child runs, `delegation` is written by the task after `task_canceled` |
 | Child never started | `delegation` only, in the same turn, with no `delegation_id` | `delegation` only, within the step, with no `delegation_id` |
 | Repeat launches | one pair per call | one pair per attempt, so a step with `retries` writes several |
 
@@ -1229,17 +1235,17 @@ skipped observed nothing.
 | Field | Type | Notes |
 |---|---|---|
 | `plan_id` | string | The plan's authored `id`. The empty string for a plan file that never parsed |
-| `outcome` | string | `"completed"` or `"failed"` |
-| `failed_step` | string | The step that ended the run. `"plan"` when the run failed before any step could — a file that would not parse or validate, a cgroup scope the host refused. Absent on `"completed"` |
+| `outcome` | string | `"completed"`, `"failed"` or `"canceled"`. `"canceled"` is a run whose task was cancelled — see [When the task is cancelled](plans.md#when-the-task-is-cancelled) |
+| `failed_step` | string | The step that ended the run. `"plan"` when the run failed before any step could — a file that would not parse or validate, a cgroup scope the host refused. Absent on `"completed"` and `"canceled"` |
 | `steps_total` | usize | How many steps the plan declared |
 | `steps_succeeded` | usize | |
 | `steps_failed` | usize | |
 | `steps_skipped` | usize | |
 | `duration_ms` | u64 | Wall-clock time for the whole run, the plan file read included |
-| `reason` | string | Why the run ended when the reason was not a step's own failure. Absent otherwise |
+| `reason` | string | Why the run ended when the reason was not a step's own failure: `the task running this plan was cancelled` on `"canceled"`. Absent otherwise |
 
 The three counts cover the steps that settled, and sum to less than `steps_total` on a run that
-stopped early.
+failed early. A `"canceled"` run settles every step, so its counts sum to `steps_total`.
 
 **Guarantees:**
 

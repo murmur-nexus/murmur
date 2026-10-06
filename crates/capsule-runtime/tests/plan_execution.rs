@@ -75,6 +75,7 @@ fn ctx_gated<'a>(
         trace: None,
         gate_step,
         invoke_tool,
+        task: None,
     }
 }
 
@@ -879,6 +880,16 @@ impl StubMur {
     /// Installs the stub and points [`MUR_BINARY_ENV`] at it. Every caller already holds
     /// [`roost_env_lock`], which is what keeps the process-wide variable to one test at a time.
     fn install(capsule_authority: &str) -> Self {
+        Self::install_with(capsule_authority, "")
+    }
+
+    /// The same stub, staying up as one process after it reports its address — a child that is
+    /// still running when its parent ends it. Its pid is recorded as `pid.txt`.
+    fn install_lingering(capsule_authority: &str) -> Self {
+        Self::install_with(capsule_authority, "exec sleep 300\n")
+    }
+
+    fn install_with(capsule_authority: &str, after_launch_line: &str) -> Self {
         let dir = tempdir().unwrap();
         let record = dir.path().display().to_string();
         let binary = dir.path().join("mur");
@@ -886,12 +897,14 @@ impl StubMur {
             &binary,
             format!(
                 "#!/bin/sh\n\
+                 printf '%s' \"$$\" > '{record}/pid.txt'\n\
                  read -r grant\n\
                  printf '%s' \"$grant\" > '{record}/grant.txt'\n\
                  printf '%s' \"$*\" > '{record}/argv.txt'\n\
                  env > '{record}/env.txt'\n\
                  pwd > '{record}/cwd.txt'\n\
-                 printf '{{\"url\":\"{capsule_authority}/capsule\",\"session_id\":\"ses_stub00000000000000000000000\"}}\\n'\n"
+                 printf '{{\"url\":\"{capsule_authority}/capsule\",\"session_id\":\"ses_stub00000000000000000000000\"}}\\n'\n\
+                 {after_launch_line}"
             ),
         )
         .unwrap();
@@ -947,16 +960,22 @@ struct FakeRoost {
 
 impl FakeRoost {
     fn start() -> Self {
-        Self::start_with(false)
+        Self::start_with(false, true)
     }
 
     /// A fake whose `/spawn` refuses with `403` and echoes the request it received back in the
     /// body, so the client's error path carries as much of the exchange as it ever could.
     fn refusing_spawn() -> Self {
-        Self::start_with(true)
+        Self::start_with(true, true)
     }
 
-    fn start_with(refuse_spawn: bool) -> Self {
+    /// A fake whose child accepts its task and then answers `working` to every `tasks/get`, so
+    /// the delegation never reaches a terminal state on its own.
+    fn never_finishing() -> Self {
+        Self::start_with(false, false)
+    }
+
+    fn start_with(refuse_spawn: bool, finishes: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1027,6 +1046,11 @@ impl FakeRoost {
                                     );
                                     json!({"jsonrpc": "2.0", "id": id, "result": {"id": "task-1"}})
                                 }
+                                Some("tasks/get") if !finishes => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {"id": "task-1", "status": {"state": "working"}}
+                                }),
                                 Some("tasks/get") => json!({
                                     "jsonrpc": "2.0",
                                     "id": id,
@@ -2136,4 +2160,196 @@ fn test_a_plan_with_no_capsule_steps_writes_no_trace_file() {
         };
         assert!(report.completed, "traced={traced}: {report:?}");
     }
+}
+
+// ── The task a plan runs for ──────────────────────────────────────────────────
+
+/// A [`plan::PlanTask`] that records what the scheduler told it and reports cancelled once
+/// `canceled` is raised.
+#[derive(Default)]
+struct RecordingTask {
+    canceled: AtomicBool,
+    started: Mutex<Vec<String>>,
+    settled: Mutex<Vec<String>>,
+}
+
+impl plan::PlanTask for RecordingTask {
+    fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::SeqCst)
+    }
+
+    fn delegation_started(&self, launch: &capsule_runtime::DelegationLaunch) {
+        self.started
+            .lock()
+            .unwrap()
+            .push(launch.delegation_id.clone());
+    }
+
+    /// Always the step's to close: nothing here takes rows the way a task's end does.
+    fn delegation_settled(&self, delegation_id: &str) -> bool {
+        self.settled.lock().unwrap().push(delegation_id.to_string());
+        true
+    }
+}
+
+/// Whether a process with this pid still exists, reaped or not.
+fn process_exists(pid: &str) -> bool {
+    Path::new("/proc").join(pid.trim()).exists()
+}
+
+/// A cancel that lands while a `capsule` step's sub-capsule is running ends that sub-capsule from
+/// inside the step, records it `terminated` in the child's own directory, and stops the plan: the
+/// step is not retried, its dependant never runs, and a step that was already running beside it
+/// keeps its own result. The delegation's row is left to the task, so the step closes nothing.
+#[test]
+fn test_a_cancelled_task_ends_its_capsule_steps_sub_capsule() {
+    if capsule_runtime::skip_without_host_support(
+        "test_a_cancelled_task_ends_its_capsule_steps_sub_capsule",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::never_finishing();
+    let stub = StubMur::install_lingering(fake_roost.authority());
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("side-output".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id": "p",
+            "steps": [
+                {"id": "slow", "capsule": "worker", "input": "hold the line", "retries": 2},
+                {"id": "after", "tool": "echo", "depends_on": ["slow"], "input": {"text": "never"}},
+                {"id": "side", "tool": "echo", "input": {"text": "beside"}}
+            ]
+        }),
+    );
+
+    let task = RecordingTask::default();
+    let ctx = SchedulerContext {
+        task: Some(&task),
+        ..ctx(dir.path().to_path_buf(), &invoke)
+    };
+    let raised_at = Mutex::new(None);
+    let (report, returned_at) = thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while task.started.lock().unwrap().is_empty() {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            thread::sleep(Duration::from_secs(1));
+            *raised_at.lock().unwrap() = Some(std::time::Instant::now());
+            task.canceled.store(true, Ordering::SeqCst);
+        });
+        let report = plan::execute(&plan, &ctx);
+        (report, std::time::Instant::now())
+    });
+    std::env::remove_var("MURMUR_ROOST_URL");
+
+    let raised_at = raised_at
+        .into_inner()
+        .unwrap()
+        .unwrap_or_else(|| panic!("the child never started: {report:?}"));
+    let took = returned_at.duration_since(raised_at);
+    assert!(
+        took < Duration::from_secs(3),
+        "execute returned {took:?} after the cancel"
+    );
+
+    assert!(report.canceled, "{report:?}");
+    assert!(!report.completed);
+    assert_eq!(report.failed_step, None);
+    let slow = find(&report, "slow");
+    assert_eq!(slow.status, StepStatus::Failed);
+    assert_eq!(slow.error.as_deref(), Some(plan::CANCELED_STEP_ERROR));
+    let after = find(&report, "after");
+    assert_eq!(after.status, StepStatus::Skipped);
+    assert_eq!(
+        after.error.as_deref(),
+        Some(plan::CANCELED_BEFORE_STEP_ERROR)
+    );
+    assert_eq!(find(&report, "side").status, StepStatus::Success);
+
+    assert_eq!(task.started.lock().unwrap().len(), 1);
+    assert!(task.settled.lock().unwrap().is_empty());
+
+    let pid = stub.recorded("pid.txt");
+    assert!(!process_exists(&pid), "the stub child {pid} is still there");
+    let children: Vec<PathBuf> = fs::read_dir(dir.path().join(".murmur").join("children"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(children.len(), 1, "{children:?}");
+    let completion: Value = serde_json::from_str(
+        &fs::read_to_string(children[0].join("completion.json"))
+            .expect("the ended child's outcome is recorded"),
+    )
+    .unwrap();
+    assert_eq!(completion["status"], "terminated", "{completion}");
+    assert_eq!(completion["reported_by"], "launcher", "{completion}");
+    assert_eq!(completion["delivered"], json!(false), "{completion}");
+    assert_eq!(
+        completion["detail"],
+        capsule_runtime::delegation::PARENT_ENDED_DETAIL,
+        "{completion}"
+    );
+    assert_eq!(
+        completion["delegation_id"],
+        json!(task.started.lock().unwrap()[0]),
+        "{completion}"
+    );
+}
+
+/// A task nobody cancels is told about its step's child once on launch and once on settling, for
+/// the same id, and the step writes its own terminal `delegation` line as it does with no task.
+#[test]
+fn test_a_capsule_step_that_completes_settles_its_own_delegation() {
+    if capsule_runtime::skip_without_host_support(
+        "test_a_capsule_step_that_completes_settles_its_own_delegation",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let plan = write_plan(
+        dir.path(),
+        json!({"id": "p", "steps": [{"id": "worker", "capsule": "worker", "input": "go"}]}),
+    );
+
+    let trace = appender(dir.path());
+    let task = RecordingTask::default();
+    let report = plan::execute(
+        &plan,
+        &SchedulerContext {
+            task: Some(&task),
+            ..traced_capsule_ctx(dir.path().to_path_buf(), &unused_tool, &trace)
+        },
+    );
+    std::env::remove_var("MURMUR_ROOST_URL");
+
+    assert!(report.completed && !report.canceled, "{report:?}");
+    let started = task.started.lock().unwrap().clone();
+    let settled = task.settled.lock().unwrap().clone();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(settled, started);
+
+    let lines = trace_lines(dir.path());
+    let ended = only(&lines, "delegation");
+    assert_eq!(ended["outcome"], "completed", "{ended}");
+    assert_eq!(ended["delegation_id"], json!(started[0]), "{ended}");
+    assert_eq!(only(&lines, "plan_end")["outcome"], "completed");
 }

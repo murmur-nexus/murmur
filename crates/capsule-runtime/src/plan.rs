@@ -13,7 +13,9 @@ use murmur_artifact::DEFAULT_EXPORT_MAX_BYTES;
 
 use crate::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
-    delegation_plane::{DelegationOrigin, DelegationPlane, DelegationRequest, DelegationStatus},
+    delegation_plane::{
+        DelegationLaunch, DelegationOrigin, DelegationPlane, DelegationRequest, DelegationStatus,
+    },
     errors::RuntimeError,
     resource_plane::{self, SymlinkPolicy},
     sandbox,
@@ -87,7 +89,42 @@ pub struct StepResult {
 pub struct ExecutionReport {
     pub results: Vec<StepResult>,
     pub completed: bool,
+    /// `None` on a cancelled run: no step's failure is what stopped it.
     pub failed_step: Option<String>,
+    /// Whether the run stopped because [`SchedulerContext::task`] reported its task cancelled.
+    /// `completed` is `false` whenever this is `true`.
+    pub canceled: bool,
+}
+
+/// The error a `capsule` step settles with when the task running its plan is cancelled while
+/// its sub-capsule is running.
+pub const CANCELED_STEP_ERROR: &str =
+    "the task running this plan was cancelled; this step's sub-capsule was ended with it";
+
+/// The error every step a cancelled run never dispatched settles `skipped` with.
+pub const CANCELED_BEFORE_STEP_ERROR: &str =
+    "the task running this plan was cancelled before this step ran";
+
+/// The `reason` on a cancelled run's `plan_end`.
+pub const PLAN_CANCELED_REASON: &str = "the task running this plan was cancelled";
+
+/// The task a plan runs for, as the scheduler sees it: whether it has been cancelled, and the set
+/// that accounts for every sub-capsule the task starts.
+///
+/// One rule keeps a `capsule` step's terminal `delegation` line single: whoever takes the step's
+/// row out of the task's set writes it. A step that ends on its own takes the row through
+/// [`PlanTask::delegation_settled`]; a step whose task was cancelled leaves it, and the task
+/// closes it after its `task_canceled`.
+pub trait PlanTask: Sync {
+    /// Whether the task this plan runs for has been cancelled. Polled; cheap, never blocks.
+    fn is_canceled(&self) -> bool;
+    /// A capsule step's child is up: account for it in the task's delegation set before it is
+    /// handed its task.
+    fn delegation_started(&self, launch: &DelegationLaunch);
+    /// The step is closing its row. `true` when the row was still the step's and the step now
+    /// writes the terminal `delegation` line; `false` when the task already holds it.
+    #[must_use]
+    fn delegation_settled(&self, delegation_id: &str) -> bool;
 }
 
 pub struct SchedulerContext<'a> {
@@ -147,6 +184,13 @@ pub struct SchedulerContext<'a> {
     /// delegates to applies its own manifest to whatever it does.
     pub gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
     pub invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+    /// The task this plan runs for, or `None` for a run that cannot be cancelled and whose
+    /// `capsule` steps account for their children in no set beyond their own trace lines.
+    ///
+    /// Once it reports cancelled, a running `capsule` step ends its sub-capsule, no step is
+    /// retried or dispatched, and the run ends `canceled`. A `tool` or `shell` step already
+    /// running finishes on its own bound.
+    pub task: Option<&'a dyn PlanTask>,
 }
 
 /// What a step is about to dispatch, as [`SchedulerContext::gate_step`] is shown it.
@@ -203,6 +247,7 @@ pub fn execute(plan_path: &Path, ctx: &SchedulerContext<'_>) -> ExecutionReport 
                 }],
                 completed: false,
                 failed_step: Some(failed_step),
+                canceled: false,
             }
         }
     }
@@ -258,6 +303,7 @@ fn execute_inner(
             }],
             completed: false,
             failed_step: Some(step_id.clone()),
+            canceled: false,
         });
     }
 
@@ -318,10 +364,43 @@ fn execute_inner(
     let mut results = HashMap::<String, StepResult>::new();
     let mut result_order = Vec::<String>::new();
     let mut failed_step = None;
+    let mut canceled = false;
 
     loop {
+        if canceled {
+            // Nothing is dispatched once the task is cancelled, and nothing is left unsettled:
+            // every step without a result is recorded as never having run.
+            for step in &plan.steps {
+                if results.contains_key(&step.id) {
+                    continue;
+                }
+                trace_undispatched(
+                    ctx,
+                    plan_node.as_deref(),
+                    &plan.id,
+                    step,
+                    "skipped",
+                    Some(CANCELED_BEFORE_STEP_ERROR.to_string()),
+                );
+                insert_result(
+                    &mut results,
+                    &mut result_order,
+                    StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Skipped,
+                        output: None,
+                        error: Some(CANCELED_BEFORE_STEP_ERROR.to_string()),
+                    },
+                );
+            }
+            break;
+        }
         if results.len() == plan.steps.len() || failed_step.is_some() {
             break;
+        }
+        if task_canceled(ctx) {
+            canceled = true;
+            continue;
         }
 
         let mut ready = Vec::new();
@@ -439,6 +518,10 @@ fn execute_inner(
                 }));
             }
         });
+        // A wave that ends with its task cancelled settles each step as it returned. No
+        // `on_error` policy applies: the run stops whatever the steps say, and a policy that
+        // turned a failure into `fail` would name a step as the reason it stopped.
+        canceled = task_canceled(ctx);
 
         for outcome in completed {
             let Some(step) = plan
@@ -464,8 +547,11 @@ fn execute_inner(
                     },
                 );
                 insert_result(&mut results, &mut result_order, outcome.result);
-                failed_step = Some("unknown".to_string());
-                break;
+                if !canceled {
+                    failed_step = Some("unknown".to_string());
+                    break;
+                }
+                continue;
             };
 
             let kind = step_kind_name(step);
@@ -480,7 +566,7 @@ fn execute_inner(
 
             // The `on_error` policy is applied here, before the step is recorded either way, so
             // the trace and the returned report can never disagree about what a step settled as.
-            let (settled, stops) = if result.status == StepStatus::Failed {
+            let (settled, stops) = if result.status == StepStatus::Failed && !canceled {
                 match step.on_error.as_str() {
                     "fail" => (result, true),
                     "skip" => (
@@ -536,12 +622,17 @@ fn execute_inner(
         .filter_map(|id| results.remove(&id))
         .collect::<Vec<_>>();
 
+    if canceled {
+        failed_step = None;
+    }
     trace_plan_end(
         ctx,
         plan_node.as_deref(),
         PlanEndRecord {
             plan_id: plan.id.clone(),
-            outcome: if failed_step.is_none() {
+            outcome: if canceled {
+                "canceled"
+            } else if failed_step.is_none() {
                 "completed"
             } else {
                 "failed"
@@ -552,14 +643,15 @@ fn execute_inner(
             steps_failed: count_status(&ordered_results, StepStatus::Failed),
             steps_skipped: count_status(&ordered_results, StepStatus::Skipped),
             duration_ms: elapsed_ms(started),
-            reason: None,
+            reason: canceled.then(|| PLAN_CANCELED_REASON.to_string()),
         },
     );
 
     Ok(ExecutionReport {
         results: ordered_results,
-        completed: failed_step.is_none(),
+        completed: !canceled && failed_step.is_none(),
         failed_step,
+        canceled,
     })
 }
 
@@ -677,7 +769,13 @@ fn refused_before_any_step(
         }],
         completed: false,
         failed_step: Some("plan".to_string()),
+        canceled: false,
     }
+}
+
+/// Whether the task this run is for has been cancelled. `false` for a run with no task.
+fn task_canceled(ctx: &SchedulerContext<'_>) -> bool {
+    ctx.task.is_some_and(PlanTask::is_canceled)
 }
 
 fn count_status(results: &[StepResult], status: StepStatus) -> usize {
@@ -869,7 +967,8 @@ fn execute_step_with_retries(
         let mut outcome = execute_step_once(step, ctx, results, enforcement);
         outcome.attempts = attempt;
         outcome.duration_ms = elapsed_ms(started);
-        if outcome.result.status != StepStatus::Failed {
+        // A cancelled task's step is not tried again; the attempt that saw the cancel stands.
+        if outcome.result.status != StepStatus::Failed || task_canceled(ctx) {
             return outcome;
         }
         last = Some(outcome);
@@ -1079,17 +1178,29 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     );
     // The launch notice is written where it arrives, on this thread, while the child is still
     // holding its task: `delegate` blocks until the child answers, so a notice parked for later
-    // would only reach disk once there was already a terminal line to write beside it.
-    let launched = ctx.trace.map(|trace| {
-        std::sync::Arc::new(move |notice: crate::delegation_plane::DelegationLaunch| {
-            trace.write_delegation_start(
-                &notice.delegation_id,
-                &notice.capsule,
-                &notice.version,
-                &notice.child_session_id,
-                &notice.child_workdir,
-            );
+    // would only reach disk once there was already a terminal line to write beside it. The task
+    // accounts for the child in the same callback, before the child is handed its task, so a
+    // cancel from then on finds it in the task's set.
+    let (trace, plan_task) = (ctx.trace, ctx.task);
+    let launched = (trace.is_some() || plan_task.is_some()).then(|| {
+        std::sync::Arc::new(move |notice: DelegationLaunch| {
+            if let Some(trace) = trace {
+                trace.write_delegation_start(
+                    &notice.delegation_id,
+                    &notice.capsule,
+                    &notice.version,
+                    &notice.child_session_id,
+                    &notice.child_workdir,
+                );
+            }
+            if let Some(plan_task) = plan_task {
+                plan_task.delegation_started(&notice);
+            }
         }) as std::sync::Arc<dyn Fn(_) + Send + Sync>
+    });
+    let stop = plan_task.map(|plan_task| {
+        std::sync::Arc::new(move || plan_task.is_canceled())
+            as std::sync::Arc<dyn Fn() -> bool + Send + Sync>
     });
     let started = Instant::now();
     let result = plane.delegate(
@@ -1107,10 +1218,24 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         &DelegationOrigin {
             context_id: ctx.current_context_id.clone().unwrap_or_default(),
             launched,
+            stop,
         },
     );
 
-    if let Some(trace) = ctx.trace {
+    // The child is ended and its row is the cancelled task's: the task writes the terminal
+    // `delegation` line after its `task_canceled`, so the step writes none.
+    if result.status == DelegationStatus::Canceled {
+        return failed(&step.id, CANCELED_STEP_ERROR);
+    }
+    // Whoever takes the row out of the task's set writes the terminal line. A step with no task,
+    // or a delegation that named no child, has no row to take.
+    let closes_row = match plan_task {
+        Some(plan_task) if !result.delegation_id.is_empty() => {
+            plan_task.delegation_settled(&result.delegation_id)
+        }
+        _ => true,
+    };
+    if let Some(trace) = ctx.trace.filter(|_| closes_row) {
         trace.write_delegation(
             &result.capsule,
             &result.version,
@@ -1372,6 +1497,7 @@ mod tests {
             trace: None,
             gate_step,
             invoke_tool,
+            task: None,
         }
     }
 
@@ -1782,5 +1908,119 @@ mod tests {
         let report = execute(&plan, &test_ctx(dir.path().to_path_buf(), &invoke));
         assert!(report.completed);
         assert_eq!(report.results[1].status, StepStatus::Skipped);
+    }
+
+    /// A task whose cancel flag a case raises by hand. It holds no delegation set: these cases
+    /// launch no sub-capsule.
+    #[derive(Default)]
+    struct FlaggedTask(std::sync::atomic::AtomicBool);
+
+    impl PlanTask for FlaggedTask {
+        fn is_canceled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn delegation_started(&self, _launch: &DelegationLaunch) {}
+        fn delegation_settled(&self, _delegation_id: &str) -> bool {
+            true
+        }
+    }
+
+    /// A step that fails after its task is cancelled is not tried again, and its `on_error:
+    /// fail` names no failed step: the run stopped because the task did, whatever the step said.
+    #[test]
+    fn a_cancelled_task_tries_no_step_again() {
+        let dir = tempdir().unwrap();
+        let task = FlaggedTask::default();
+        let calls = AtomicUsize::new(0);
+        let invoke = |_name: &str, _input: ToolInput| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            task.0.store(true, Ordering::SeqCst);
+            Ok(tool_result(ToolStatus::Failed, None))
+        };
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [
+                    {"id": "a", "tool": "a", "retries": 2, "on_error": "fail"},
+                    {"id": "b", "tool": "b", "depends_on": ["a"]}
+                ]
+            }),
+        );
+
+        let ctx = SchedulerContext {
+            task: Some(&task),
+            ..test_ctx_unbounded(dir.path().to_path_buf(), &invoke, &UNGATED)
+        };
+        let report = execute(&plan, &ctx);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{report:?}");
+        assert!(report.canceled, "{report:?}");
+        assert!(!report.completed);
+        assert_eq!(report.failed_step, None);
+        assert_eq!(report.results[0].status, StepStatus::Failed);
+        assert_eq!(report.results[1].status, StepStatus::Skipped);
+        assert_eq!(
+            report.results[1].error.as_deref(),
+            Some(CANCELED_BEFORE_STEP_ERROR)
+        );
+    }
+
+    /// A task cancelled before the first wave dispatches nothing at all.
+    #[test]
+    fn a_task_cancelled_before_the_plan_ran_dispatches_nothing() {
+        let dir = tempdir().unwrap();
+        let task = FlaggedTask::default();
+        task.0.store(true, Ordering::SeqCst);
+        let calls = AtomicUsize::new(0);
+        let invoke = |_name: &str, _input: ToolInput| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(tool_result(ToolStatus::Passed, Some("ran".to_string())))
+        };
+        let plan = write_plan(
+            dir.path(),
+            json!({"id": "p", "steps": [{"id": "a", "tool": "a"}, {"id": "b", "tool": "b"}]}),
+        );
+
+        let ctx = SchedulerContext {
+            task: Some(&task),
+            ..test_ctx_unbounded(dir.path().to_path_buf(), &invoke, &UNGATED)
+        };
+        let report = execute(&plan, &ctx);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(report.canceled && !report.completed, "{report:?}");
+        assert!(report
+            .results
+            .iter()
+            .all(|result| result.status == StepStatus::Skipped));
+    }
+
+    /// A run whose task is never cancelled reports exactly what a run with no task does.
+    #[test]
+    fn a_task_nobody_cancels_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let task = FlaggedTask::default();
+        let invoke = |_name: &str, _input: ToolInput| {
+            Ok(tool_result(ToolStatus::Passed, Some("ran".to_string())))
+        };
+        let plan = write_plan(
+            dir.path(),
+            json!({"id": "p", "steps": [{"id": "a", "tool": "a"}, {"id": "b", "tool": "b"}]}),
+        );
+
+        let without = execute(
+            &plan,
+            &test_ctx_unbounded(dir.path().to_path_buf(), &invoke, &UNGATED),
+        );
+        let with = execute(
+            &plan,
+            &SchedulerContext {
+                task: Some(&task),
+                ..test_ctx_unbounded(dir.path().to_path_buf(), &invoke, &UNGATED)
+            },
+        );
+        assert_eq!(with, without);
+        assert!(with.completed && !with.canceled);
     }
 }
