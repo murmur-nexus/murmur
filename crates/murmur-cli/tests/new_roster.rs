@@ -645,6 +645,104 @@ All checks passed.
     assert!(!admitted.stderr.contains("error["), "{}", admitted.stderr);
 }
 
+// ── A resumed member session is in no formation ──────────────────────────────
+
+/// Lead's session resumed by hand with `mur run --resume @1`, after `mur run --roster crew`,
+/// continues lead's conversation and belongs to no formation: no formation id, no `call-member`,
+/// no lifeline.
+#[test]
+fn a_hand_resume_of_a_members_session_joins_no_formation() {
+    let scratch = Scratch::new();
+    let server = ScriptedServer::start(vec![
+        end_turn(1, "lead's first answer"),
+        end_turn(1, "lead's resumed answer"),
+    ]);
+    scratch.write_config(&format!(
+        "inference:\n  provider: anthropic\n  model: test-model\n  endpoint: {}\n",
+        server.endpoint
+    ));
+    let new = scratch.run(&["new", "--roster", "crew"]);
+    new.assert_code(0);
+    install_as_printed(&scratch, &next_steps(&new.stdout));
+
+    let _lock = launch_lock();
+    let launch = scratch.run(&["run", "--roster", "crew", "--json", "--task", "hello"]);
+    launch.assert_code(0);
+    assert!(!launch.stderr.contains("W-SEC-027"), "{}", launch.stderr);
+    let formation: Value = serde_json::from_str(launch.stdout.lines().next().unwrap()).unwrap();
+    let formation_id = formation["formation_id"].as_str().unwrap();
+
+    let lead_root = scratch.path().join("crew/.murmur");
+    let lead = only_trace(&lead_root);
+    let lead_start = records(&lead, "session_start")[0];
+    assert_eq!(lead_start["formation_id"], formation_id, "{lead_start}");
+    assert!(
+        lead_start["tools_declared"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("call-member")),
+        "{lead_start}"
+    );
+    let lead_session = lead_start["session_id"].as_str().unwrap().to_string();
+    let lead_context = records(&lead, "task_start")[0]["context_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let crew = scratch.path().join("crew");
+    let mut resume = scratch.command(&[
+        "run",
+        "--capsule",
+        "crew-lead",
+        "--capsule-version",
+        "0.1.0",
+        "--workdir",
+        crew.to_str().unwrap(),
+        "--resume",
+        "@1",
+        "--json",
+        "--task",
+        "What did you answer last time?",
+    ]);
+    resume.env_remove(capsule_runtime::FORMATION_LIFELINE_ENV);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("MURMUR_FORMATION_") {
+            resume.env_remove(name);
+        }
+    }
+    let resumed = resume.output().unwrap();
+    let stdout = String::from_utf8_lossy(&resumed.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&resumed.stderr).into_owned();
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("W-RUN-007"), "{stderr}");
+    assert!(!stderr.contains("W-SEC-027"), "{stderr}");
+
+    let readiness: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert!(readiness.get("formation_id").is_none(), "{readiness}");
+    let session = readiness["session_id"].as_str().unwrap();
+    assert_ne!(session, lead_session);
+    let trace = common::read_whole_trace(&lead_root.join(session).join("trace.jsonl"));
+    let start = records(&trace, "session_start")[0];
+    assert_eq!(start["resumed_from"], lead_session.as_str(), "{start}");
+    assert_eq!(start["context_id"], lead_context.as_str(), "{start}");
+    for key in ["formation_id", "formation_member", "formation_callees"] {
+        assert!(start.get(key).is_none(), "{key} on {start}");
+    }
+    assert!(
+        !start["tools_declared"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("call-member")),
+        "{start}"
+    );
+    assert!(records(&trace, "formation_ended").is_empty(), "{trace:?}");
+    assert_eq!(server.requests().len(), 2, "lead answered once in each run");
+}
+
 // ── S3: the provider ─────────────────────────────────────────────────────────
 
 #[test]

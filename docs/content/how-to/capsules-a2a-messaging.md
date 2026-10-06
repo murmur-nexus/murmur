@@ -2,6 +2,8 @@
 
 Murmur capsules can send tasks to each other directly — an orchestrator capsule can delegate work to a worker capsule by sending it a message. This guide walks through launching a worker capsule, reading its URL, and calling it from an orchestrator capsule. It also covers the network policy that governs what each capsule is allowed to contact.
 
+This is the hand-wired path: you pin the worker's port, send it work with `curl`, poll it and cancel it yourself. For a group of capsules that hand each other work on their own, launch a formation instead — see [How to launch a formation of capsules](launch-formation.md).
+
 ??? definition "What is A2A?"
     **A2A (Agent-to-Agent)** is a JSON-RPC 2.0 protocol for structured communication between autonomous agents. One capsule sends a message to another over HTTP and receives a task ID in return. It can then poll for results or stream live events while the receiving capsule processes the work — without either side knowing about the other's internal implementation.
 
