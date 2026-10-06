@@ -168,6 +168,10 @@ WORKER-0123
 | `timed_out` | The member did not answer within the bound; it was not cancelled and may still be working |
 | `unreachable` | The member's door stopped answering |
 
+Under [`transport: process`](manifest.md#transport-process), the harness calls `call-member`
+through the runtime's loopback tool server, and the message holding the answers reaches the harness
+as the prompt of a resume of its same session.
+
 Output is cut at 64 KiB. Continuing with answers is not a reopen: it spends no
 [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle), writes no `task_reopened`, and runs
 before the task's `on-task-end` hooks. Its turns count against

@@ -30,7 +30,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 - [Tools](/concepts/tools.md): How murmur defines tool artifacts — both WASM and native — and how the runtime invokes them during a session.
 - [Access Control](/concepts/access-control.md): The `capabilities` block: what a capsule and its artifacts are allowed to reach — filesystem, network, and subprocesses.
 - [Context](/concepts/context.md): Context compaction — how the runtime condenses message history automatically so a long-running session avoids hitting a hard token limit.
-- [Formations](/concepts/formations.md): The HTTP endpoint an active session serves — an Agent Card and a JSON-RPC task interface — so other capsules or agents can discover and address it.
+- [Formations](/concepts/formations.md): A group of capsules on one machine, declared in `roster.yaml` and launched with `mur run --roster` for one task, whose members hand each other work with `call-member`.
 - [Observability](/concepts/observability.md): The structured trace every session writes to `workdir/<session_id>/trace.jsonl`, regardless of whether any hooks are declared.
 - [Registry](/concepts/registry.md): Murmur Nexus, the artifact registry: how capsules discover, install, and publish versioned artifacts.
 
@@ -48,6 +48,7 @@ Read the summary links first. If the page links are not enough, use `/llms-full.
 
 - [Lock down a capsule's capabilities](/how-to/lock-down-capsule.md): Scoping what a capsule can reach so a bug or a prompt injection can't turn into reading files or hosts it shouldn't.
 - [Connect two capsules with A2A messaging](/how-to/capsules-a2a-messaging.md): Having an orchestrator capsule delegate work to a worker capsule directly.
+- [Launch a formation of capsules](/how-to/launch-formation.md): Scaffolding a two-member formation with `mur new --roster`, launching it, and following one member handing the other its task in the trace.
 - [Configure a long-running capsule](/how-to/long-running-capsule.md): Keeping a capsule alive across multiple tasks instead of the default exit-on-completion.
 
 ### Observability & Evaluation

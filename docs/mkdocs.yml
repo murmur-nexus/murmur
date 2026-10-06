@@ -168,6 +168,7 @@ nav:
       - Configure a long-running capsule: how-to/long-running-capsule.md
       - Lock down a capsule's capabilities: how-to/lock-down-capsule.md
       - Connect two capsules with A2A messaging: how-to/capsules-a2a-messaging.md
+      - Launch a formation of capsules with mur run --roster: how-to/launch-formation.md
       - Pause your agent for human input: how-to/hitl-request-input.md
       - Read your agent's trace and compare two runs: how-to/read-trace-and-diff.md
       - Score your agent's behavior with eval: how-to/agent-eval-score.md

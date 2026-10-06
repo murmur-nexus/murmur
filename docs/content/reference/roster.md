@@ -308,6 +308,23 @@ member that delegated to it ends, however that member ends.
 A process that already carries `MURMUR_FORMATION_ID` is a formation member, and refuses
 `mur run --roster` with [`E-RUN-046`](diagnostics.md#e-run-046).
 
+### Resuming a member's session { #launch-resume }
+
+A member's session resumed with [`mur run --resume`](cli.md#mur-run) continues that session's
+conversation and nothing else of its formation. A `mur run` belongs to a formation only when its
+own environment places it in one, so a session resumed by hand never re-adopts a formation:
+
+| Formation part | In a resumed session |
+|---|---|
+| Formation id | None: `session_start` has no `formation_id`, `formation_member` or `formation_callees`, and the `--json` readiness line has no `formation_id` |
+| Credentials and callees' addresses | None: no [formation channel](#formation-channel) is handed to it |
+| [`call-member`](runtime-provided-tools.md#call-member) | Not offered |
+| Lifeline | None: nothing winds it down, and its trace has no `formation_ended` |
+| [`W-RUN-007`](diagnostics.md#w-run-007) | Not printed |
+
+`mur run --roster` refuses `--resume` with exit status 2. A formation lives for one task, so to run
+it again, launch it again with a new task.
+
 ## How reachability is enforced { #enforcement }
 
 In a formation launched by `mur run --roster`, a member can call exactly the members the roster

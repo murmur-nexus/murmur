@@ -42,6 +42,10 @@
 
 *[network.internal_port]: fixed port the worker binds on · OS-assigned when omitted · errors if port already in use
 
+*[exports.peer_tasks.accept]: true: serve tasks other capsules send | false: refuse them 403 · default
+
+*[network.authentication]: door refuses callers without token · bearer only · required on every member of roster with edges
+
 *[lifecycle.task_acceptance]: none: task.md only | single: one task then exit · default | queue: serial task queue
 
 *[lifecycle.after_task]: exit: stop after task · default | sleep: wait for next task · use with queue
