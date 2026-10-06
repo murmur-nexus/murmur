@@ -2204,12 +2204,13 @@ Output sections, in the order they are printed:
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown |
 | Member calls | one or more [`member_call_start`](observability-schemas.md#member-call-start)/[`member_call`](observability-schemas.md#member-call) records | One row per [`call-member`](runtime-provided-tools.md#call-member) call: its `mcl_` id, the member, the member's task id — `(not started)` for a call the member never held — and how it ended with its duration, `outstanding` for a call this trace never saw end, `not delivered` for an answer the task never received |
-| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories |
+| Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories: every member by roster name, and every `call-member` call between them |
 
 #### Listing a formation { #mur-trace-show-formation }
 
 `mur trace show <formation-id>` lists every session whose trace names that formation, by session
-id, with how each ended. It searches these session roots, in order:
+id, with its roster name and how it ended, then every [`call-member`](runtime-provided-tools.md#call-member)
+call between the members. It searches these session roots, in order:
 
 | `--workdir` | Roots searched |
 |---|---|
@@ -2229,19 +2230,67 @@ Run from the roster's directory `/home/me/project`:
 formation:  frm_019f01a93ff27c1e9a3b5d0c4e8f2a61
 searched:   /home/me/project/workdir
 searched:   /home/me/project/.murmur
-searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/writer/.murmur
-ses_019f01a940ce7761854e768ecbe3d399  researcher@0.1.0          ok
-ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0  writer@0.1.0              no session_end
-ses_019f01a9b1d27c3e8f0a4b5c6d7e8f90  checker@0.1.0             ok  spawned by ses_019f01a940ce7761854e768ecbe3d399
-delegated children not under these roots: 1 — `mur trace show <member>` names each child trace
+searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/lead-a/.murmur
+searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/lead-b/.murmur
+searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-a1/.murmur
+searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-a2/.murmur
+searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-b1/.murmur
+searched:   /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/worker-b2/.murmur
+ses_019f01a940ce7761854e768ecbe3d399  chief      chief@0.1.0      ok  may call lead-a, lead-b
+ses_019f01a944a17b2c9d0e1f2a3b4c5d6e  lead-a     team-lead@0.1.0  ok  may call worker-a1, worker-a2
+ses_019f01a945b27c3d0e1f2a3b4c5d6e7f  lead-b     team-lead@0.1.0  ok  may call worker-b1, worker-b2
+ses_019f01a946c37d4e1f2a3b4c5d6e7f80  worker-a1  worker@0.1.0     ok
+ses_019f01a947d47e5f2a3b4c5d6e7f8091  worker-a2  worker@0.1.0     ok
+ses_019f01a948e57f603b4c5d6e7f8091a2  worker-b1  worker@0.1.0     ok
+ses_019f01a949f6807a4c5d6e7f8091a2b3  worker-b2  worker@0.1.0     no session_end
+ses_019f01a9b1d27c3e8f0a4b5c6d7e8f90  -          checker@0.1.0    ok  spawned by ses_019f01a944a17b2c9d0e1f2a3b4c5d6e
+calls:      6
+mcl_019f01a9512a7b3c8d9e0f1a2b3c4d5e    chief → lead-a      completed  48.2s  delivered
+  mcl_019f01a9563b7c4d9e0f1a2b3c4d5e6f  lead-a → worker-a1  completed  21.7s  delivered
+  mcl_019f01a9564c7d5e0f1a2b3c4d5e6f70  lead-a → worker-a2  completed  19.4s  delivered
+mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b      completed  51.0s  delivered
+  mcl_019f01a9575e7f702b3c4d5e6f708192  lead-b → worker-b1  completed  24.9s  delivered
+  mcl_019f01a9576f80813c4d5e6f708192a3  lead-b → worker-b2  rejected   3ms    delivered  never held by worker-b2
 ```
 
 | Row | Carries |
 |---|---|
 | `formation:` | The formation id |
 | `searched:` | One line per session root searched, in the order searched, whether or not it exists. A root after the first that could not be listed ends `could not be read: <why>`, and fails nothing |
-| One per member | Session id, `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to |
+| One per member | Session id, the roster name from [`session_start.formation_member`](observability-schemas.md#session-trace-tracejsonl) — `-` for a member's delegated child, which has none — `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to, and `may call <member>, …` for a member the roster lets call others, its callees in roster order |
 | `delegated children not under these roots` | Members' delegated children whose traces are in another session root. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
+| `calls:` | How many calls follow. Only when the members' traces record at least one call |
+| One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then the note for a missing side when there is one. Columns are aligned |
+
+Each call row carries:
+
+| Field | Value |
+|---|---|
+| Call id | The `mcl_` id the caller's model was given. `(no call id)` for a task received with a message id that names none |
+| `<caller> → <callee>` | Roster names: the caller is the calling session's `formation_member`, or its session id when it has none; the callee is the call's [`member_call.member`](observability-schemas.md#member-call). A call only the callee recorded takes its caller from [`a2a_task_received.caller_member`](observability-schemas.md#session-trace-tracejsonl) |
+| Status | The [`member_call.status`](observability-schemas.md#member-call) — `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned`. `outstanding` for a call with a `member_call_start` and no `member_call`; `unknown` for a call only the callee recorded |
+| Duration | From the tool call to the outcome. `-` for `outstanding` and `unknown` |
+| Delivery | `delivered`, or `not delivered` for an answer the calling task never received. Empty for `outstanding` and `unknown` |
+
+A call whose other side was not found still has its row, with one of these notes:
+
+| Note | The row is |
+|---|---|
+| `never held by <callee>` | A call that ended without the callee's door holding it: refused `rejected` because the callee was busy or closing, or failed to start |
+| `<callee>'s trace not found` | A call whose callee task no searched root records |
+| `<callee>'s task ended <exit status>` | An `outstanding` call: how the callee's task ended, from its `task_end` |
+| `<callee>'s task has no task_end` | An `outstanding` call whose callee task has not ended, or was killed |
+| `<caller>'s trace not found; <callee>'s task ended <exit status>` | A task the callee received from a member no searched root records. `…; <callee>'s task has no task_end` when that task has not ended |
+
+Calls are nested and ordered by these rules:
+
+1. A call made inside a task that another call handed over is nested directly under that call,
+   indented two spaces per level: in a two-tier formation, each lead's calls to its workers sit
+   under the entry member's call to that lead.
+2. Calls with nothing above them come first, by start time, each followed by the calls under it.
+3. The calls under one call are ordered by start time.
+
+A task an operator or an A2A peer sent a member is no call, and has no row.
 
 A member that ran from another project, or with another `--workdir`, is listed by running the
 command against that root.
@@ -2380,7 +2429,7 @@ mur trace steps [<session>] [--verbose] [--workdir <dir>]
 
 | Argument / Flag | Default | Description |
 |---|---|---|
-| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses) |
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses). A formation id (`frm_…`) is refused with [`E-TRC-001`](diagnostics.md): use [`mur trace show <formation-id>`](#mur-trace-show-formation) for a formation's members and calls |
 | `--verbose` | off | Append a truncated summary of each tool call's input |
 | `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
 

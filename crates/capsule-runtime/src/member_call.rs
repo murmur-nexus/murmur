@@ -245,9 +245,14 @@ impl CallRoute {
 /// holds.
 ///
 /// "Holds" means the answer carries `result.id` and a state that is not terminal. Every other
-/// answer is `Err` with a sentence for the model: a refusal, a door that answered with an error
-/// status, a JSON-RPC error, a terminal state such as `rejected`, or a transport failure.
-pub(crate) fn send_task(route: &CallRoute, call_id: &str, task: &str) -> Result<String, String> {
+/// answer is a [`StartFailure`] with a sentence for the model: a refusal, a door that answered
+/// with an error status, a JSON-RPC error, a terminal state such as `rejected`, or a transport
+/// failure.
+pub(crate) fn send_task(
+    route: &CallRoute,
+    call_id: &str,
+    task: &str,
+) -> Result<String, StartFailure> {
     let body = json!({
         "jsonrpc": "2.0",
         "id": call_id,
@@ -262,16 +267,16 @@ pub(crate) fn send_task(route: &CallRoute, call_id: &str, task: &str) -> Result<
     });
     let member = &route.member;
     let answer = door_request(route, &body, crate::http_client::DEFAULT_TIMEOUT)
-        .map_err(DoorRequestError::into_text)?;
+        .map_err(|error| StartFailure::failed(error.into_text()))?;
     if let Some(error) = answer.get("error") {
-        return Err(format!(
+        return Err(StartFailure::failed(format!(
             "{member}'s door refused the task with JSON-RPC error {}: {}",
             error.get("code").map(Value::to_string).unwrap_or_default(),
             error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("no message")
-        ));
+        )));
     }
     let task_id = answer
         .pointer("/result/id")
@@ -284,13 +289,39 @@ pub(crate) fn send_task(route: &CallRoute, call_id: &str, task: &str) -> Result<
         (Some(task_id), Some("submitted" | "working" | "input-required")) => {
             Ok(task_id.to_string())
         }
-        (_, Some(state)) => Err(match status_message(&answer) {
-            Some(message) => format!("{member} answered the task {state}: {message}"),
-            None => format!("{member} answered the task {state}"),
+        (_, Some(state)) => Err(StartFailure {
+            status: if state == "rejected" {
+                MemberCallStatus::Rejected
+            } else {
+                MemberCallStatus::Failed
+            },
+            reason: match status_message(&answer) {
+                Some(message) => format!("{member} answered the task {state}: {message}"),
+                None => format!("{member} answered the task {state}"),
+            },
         }),
-        _ => Err(format!(
+        _ => Err(StartFailure::failed(format!(
             "{member}'s door answered the task with no task id and no state"
-        )),
+        ))),
+    }
+}
+
+/// Why a call did not start: how its `member_call` record ends it, and the sentence for the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartFailure {
+    /// [`MemberCallStatus::Rejected`] when the door answered `message/send` with the state
+    /// `rejected` (busy, or its session closing); [`MemberCallStatus::Failed`] for every other way
+    /// a call fails to start.
+    pub(crate) status: MemberCallStatus,
+    pub(crate) reason: String,
+}
+
+impl StartFailure {
+    fn failed(reason: String) -> Self {
+        Self {
+            status: MemberCallStatus::Failed,
+            reason,
+        }
     }
 }
 
@@ -309,11 +340,12 @@ fn status_message(answer: &Value) -> Option<String> {
 pub(crate) enum MemberCallStatus {
     /// The callee's task completed; the output is its answer.
     Completed,
-    /// The callee's task failed, or the call did not start.
+    /// The callee's task failed, or the call did not start for any reason but a `rejected` answer.
     Failed,
     /// The callee's task was cancelled at the callee.
     Canceled,
-    /// The callee's door refused the task after holding it.
+    /// The callee refused the task: its door answered `message/send` with `rejected` (busy, or its
+    /// session closing) and never held it, or it rejected a task it held.
     Rejected,
     /// The shared bound for handed-off work passed with the callee still working.
     TimedOut,

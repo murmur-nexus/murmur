@@ -665,7 +665,9 @@ delivered to the calling task, or left behind when that task ended
 
 | `status` | Meaning |
 |---|---|
-| `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state. `failed` is also a call that never started, with no `member_task_id` |
+| `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state |
+| `rejected`, with no `member_task_id` | The member's door refused the task without holding it: the member was busy, or its session was closing |
+| `failed`, with no `member_task_id` | Every other call that never started: the caller's `capabilities.network.allow` does not reach the member's door, the door's address never arrived, the door answered an error, or it could not be reached |
 | `timed_out` | The member had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); its task was not cancelled |
 | `unreachable` | The member's door stopped answering |
 | `abandoned` | The calling task ended before the answer arrived, or was cancelled while the member's door was being reached, in which case there is no `member_task_id`. Always `delivered: false` |

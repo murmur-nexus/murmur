@@ -13,7 +13,11 @@ use capsule_runtime::formation_launch::formation_member_roots;
 use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
-use crate::formation_trace::{search_formation, FormationSearch};
+use crate::formation_trace::{
+    fold_member_call, fold_member_call_start, formation_calls, search_formation, CallEnding,
+    FormationCall, FormationSearch, MemberCallLine, MemberCallRecord, MemberCallStartLine,
+    RecordedMember,
+};
 use crate::session_address::{self, ses_entries, SessionQuery};
 
 const E_TRC_001: &str = "E-TRC-001";
@@ -626,29 +630,6 @@ struct DelegationStartEvent {
     child_workdir: String,
 }
 
-/// One `member_call_start` record: a `call-member` call whose callee holds the task.
-#[derive(Debug, Deserialize)]
-struct MemberCallStartEvent {
-    call_id: String,
-    member: String,
-    member_task_id: String,
-}
-
-/// One `member_call` record: how a `call-member` call ended. A call the callee never held names
-/// no task.
-#[derive(Debug, Deserialize)]
-struct MemberCallEvent {
-    call_id: String,
-    member: String,
-    #[serde(default)]
-    member_task_id: Option<String>,
-    status: String,
-    #[serde(default)]
-    duration_ms: u64,
-    #[serde(default)]
-    delivered: bool,
-}
-
 /// One `delegation` record: how a delegation ended. A refusal carries no ids, because it made no
 /// delegation.
 #[derive(Debug, Deserialize)]
@@ -842,8 +823,8 @@ enum TraceEvent {
     A2aSend(A2aSendEvent),
     DelegationStart(DelegationStartEvent),
     Delegation(DelegationEvent),
-    MemberCallStart(MemberCallStartEvent),
-    MemberCall(MemberCallEvent),
+    MemberCallStart(MemberCallStartLine),
+    MemberCall(MemberCallLine),
     PlanStart(PlanStartEvent),
     PlanStepStart(PlanStepStartEvent),
     PlanStep(PlanStepEvent),
@@ -1226,55 +1207,6 @@ struct DelegationRecord {
     /// leaves behind.
     outcome: Option<String>,
     reason: Option<String>,
-}
-
-/// One `call-member` call, as its `member_call_start` and `member_call` lines join up on the call
-/// id. A call with no start never started; one with no ending is still outstanding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MemberCallRecord {
-    call_id: String,
-    member: String,
-    /// The callee's task, `None` for a call it never held.
-    member_task_id: Option<String>,
-    /// `None` while the call is outstanding.
-    status: Option<String>,
-    duration_ms: u64,
-    delivered: bool,
-}
-
-/// Fold one `member_call_start` or `member_call` line into `calls`.
-fn join_member_call(calls: &mut Vec<MemberCallRecord>, event: TraceEvent) {
-    match event {
-        TraceEvent::MemberCallStart(e) => calls.push(MemberCallRecord {
-            call_id: e.call_id,
-            member: e.member,
-            member_task_id: Some(e.member_task_id),
-            status: None,
-            duration_ms: 0,
-            delivered: false,
-        }),
-        TraceEvent::MemberCall(e) => {
-            match calls
-                .iter_mut()
-                .find(|call| call.call_id == e.call_id && call.status.is_none())
-            {
-                Some(call) => {
-                    call.status = Some(e.status);
-                    call.duration_ms = e.duration_ms;
-                    call.delivered = e.delivered;
-                }
-                None => calls.push(MemberCallRecord {
-                    call_id: e.call_id,
-                    member: e.member,
-                    member_task_id: e.member_task_id,
-                    status: Some(e.status),
-                    duration_ms: e.duration_ms,
-                    delivered: e.delivered,
-                }),
-            }
-        }
-        _ => {}
-    }
 }
 
 /// One row of `mur trace show`'s Member calls section: the call id, the member, the callee's
@@ -2044,9 +1976,8 @@ fn compute_metrics(
                     }),
                 }
             }
-            event @ (TraceEvent::MemberCallStart(_) | TraceEvent::MemberCall(_)) => {
-                join_member_call(&mut member_calls, event)
-            }
+            TraceEvent::MemberCallStart(e) => fold_member_call_start(&mut member_calls, e),
+            TraceEvent::MemberCall(e) => fold_member_call(&mut member_calls, e),
             TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
                 plan_id: e.plan_id,
                 step_count: e.step_count,
@@ -3419,8 +3350,8 @@ fn session_root(trace: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The Formation section: a `searched:` line per root, then one row per member found under any of
-/// them, by session id.
+/// The Formation section: a `searched:` line per root, one row per member found under any of
+/// them by session id, then every `call-member` call they record.
 ///
 /// Follows no delegation edge out of the searched roots, so a member's child recorded elsewhere
 /// is counted and pointed at rather than listed.
@@ -3431,16 +3362,8 @@ fn print_formation(formation: &FormationId, search: &FormationSearch) {
         println!("{line}");
     }
     let found = &search.found;
-    for member in &found.members {
-        let ending = member.exit_status.as_deref().unwrap_or("no session_end");
-        let spawned_by = match &member.spawned_by {
-            Some(parent) => format!("  spawned by {parent}"),
-            None => String::new(),
-        };
-        println!(
-            "{:<36}  {:<24}  {ending}{spawned_by}",
-            member.session_id, member.capsule
-        );
+    for line in formation_member_lines(&found.members) {
+        println!("{line}");
     }
     if !found.children_elsewhere.is_empty() {
         println!(
@@ -3448,6 +3371,105 @@ fn print_formation(formation: &FormationId, search: &FormationSearch) {
             found.children_elsewhere.len()
         );
     }
+    let calls = formation_calls(&found.members);
+    if !calls.is_empty() {
+        println!("calls:      {}", calls.len());
+        for line in formation_call_lines(&calls) {
+            println!("{line}");
+        }
+    }
+}
+
+/// One row per formation member: its session id, its roster name (`-` for a session with none),
+/// its capsule and how it ended, then who delegated it and whom it may call, in aligned columns.
+fn formation_member_lines(members: &[RecordedMember]) -> Vec<String> {
+    let name_width = members
+        .iter()
+        .map(|member| member.member.as_deref().unwrap_or("-").chars().count())
+        .max()
+        .unwrap_or(0);
+    let capsule_width = members
+        .iter()
+        .map(|member| member.capsule.chars().count())
+        .max()
+        .unwrap_or(0);
+    members
+        .iter()
+        .map(|member| {
+            let mut line = format!(
+                "{:<36}  {:<name_width$}  {:<capsule_width$}  {}",
+                member.session_id,
+                member.member.as_deref().unwrap_or("-"),
+                member.capsule,
+                member.exit_status.as_deref().unwrap_or("no session_end"),
+            );
+            if let Some(parent) = &member.spawned_by {
+                line.push_str(&format!("  spawned by {parent}"));
+            }
+            if !member.callees.is_empty() {
+                line.push_str(&format!("  may call {}", member.callees.join(", ")));
+            }
+            line
+        })
+        .collect()
+}
+
+/// One row per formation call, indented two spaces per depth: the call id, `caller → callee`, how
+/// it ended, its duration, whether its answer was delivered, and the note for a missing side.
+fn formation_call_lines(calls: &[FormationCall]) -> Vec<String> {
+    let cells: Vec<[String; 6]> = calls
+        .iter()
+        .map(|call| {
+            let id = format!(
+                "{}{}",
+                "  ".repeat(call.depth),
+                call.call_id.as_deref().unwrap_or("(no call id)")
+            );
+            let pair = format!("{} → {}", call.caller, call.callee);
+            let (status, duration, delivery) = match &call.ending {
+                CallEnding::Ended {
+                    status,
+                    duration_ms,
+                    delivered,
+                } => (
+                    status.clone(),
+                    fmt_dur(*duration_ms),
+                    if *delivered {
+                        "delivered"
+                    } else {
+                        "not delivered"
+                    },
+                ),
+                CallEnding::Outstanding => ("outstanding".to_string(), "-".to_string(), ""),
+                CallEnding::Unknown => ("unknown".to_string(), "-".to_string(), ""),
+            };
+            let note = call
+                .gap
+                .as_ref()
+                .map(|gap| gap.note(&call.caller, &call.callee))
+                .unwrap_or_default();
+            [id, pair, status, duration, delivery.to_string(), note]
+        })
+        .collect();
+    let width = |column: usize| {
+        cells
+            .iter()
+            .map(|row| row[column].chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let widths = [width(0), width(1), width(2), width(3), width(4)];
+    cells
+        .iter()
+        .map(|row| {
+            let mut line = String::new();
+            for (cell, width) in row.iter().zip(widths) {
+                line.push_str(&format!("{cell:<width$}  "));
+            }
+            line.push_str(&row[5]);
+            line.trim_end().to_string()
+        })
+        .collect()
 }
 
 /// One `searched:` line per root a formation search read, naming why a root could not be read.
@@ -3465,11 +3487,29 @@ fn searched_lines(search: &FormationSearch) -> Vec<String> {
         .collect()
 }
 
+/// `mur trace steps` with a formation id: it walks one session's turns, and a formation is
+/// several sessions.
+fn steps_refuses_a_formation(formation: &str) -> CliError {
+    CliError::new(
+        E_TRC_001,
+        format!(
+            "mur trace steps reads one session's trace; a formation id names several sessions — \
+             `mur trace show {formation}` lists the formation's members and calls"
+        ),
+    )
+}
+
 pub(crate) fn run_trace_steps(
     session: Option<String>,
     workdir_arg: Option<PathBuf>,
     verbose: bool,
 ) -> Result<(), CliError> {
+    if let Some(formation) = session
+        .as_deref()
+        .filter(|arg| arg.starts_with(FORMATION_ID_PREFIX))
+    {
+        return Err(steps_refuses_a_formation(formation));
+    }
     let workdir = workdir_arg.unwrap_or_else(|| {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -4988,10 +5028,11 @@ mod tests {
 
         let mut calls = Vec::new();
         for line in [start, end, refused] {
-            join_member_call(
-                &mut calls,
-                serde_json::from_str::<TraceEvent>(line).unwrap(),
-            );
+            match serde_json::from_str::<TraceEvent>(line).unwrap() {
+                TraceEvent::MemberCallStart(e) => fold_member_call_start(&mut calls, e),
+                TraceEvent::MemberCall(e) => fold_member_call(&mut calls, e),
+                _ => unreachable!("a member call line"),
+            }
         }
         let rows: Vec<String> = calls.iter().map(member_call_show_row).collect();
         assert_eq!(
@@ -5131,5 +5172,143 @@ mod tests {
         );
         assert_eq!(pins(empty), None);
         assert_eq!(pins(older), None);
+    }
+
+    fn formation_member(
+        session_id: &str,
+        member: Option<&str>,
+        capsule: &str,
+        callees: &[&str],
+    ) -> RecordedMember {
+        RecordedMember {
+            session_id: session_id.to_string(),
+            capsule: capsule.to_string(),
+            member: member.map(str::to_string),
+            callees: callees.iter().map(|c| c.to_string()).collect(),
+            spawned_by: None,
+            exit_status: Some("completed".to_string()),
+            delegated_children: Vec::new(),
+            calls_made: Vec::new(),
+            tasks_received: Vec::new(),
+        }
+    }
+
+    /// A member row names the session, its roster name (`-` for none), its capsule and its
+    /// ending in aligned columns, then who delegated it and whom it may call.
+    #[test]
+    fn formation_member_rows_name_each_member_and_whom_it_may_call() {
+        let lead = formation_member("ses_a", Some("lead"), "team@0.1.0", &["w1", "w2"]);
+        let w1 = formation_member("ses_b", Some("w1"), "worker@0.1.0", &[]);
+        let mut child = formation_member("ses_c", None, "helper@1.2.30", &[]);
+        child.spawned_by = Some("ses_b".to_string());
+        child.exit_status = None;
+        assert_eq!(
+            formation_member_lines(&[lead, w1, child]),
+            [
+                "ses_a                                 lead  team@0.1.0     completed  may call w1, w2",
+                "ses_b                                 w1    worker@0.1.0   completed",
+                "ses_c                                 -     helper@1.2.30  no session_end  spawned by ses_b",
+            ]
+        );
+    }
+
+    fn formation_call(
+        depth: usize,
+        call_id: Option<&str>,
+        pair: (&str, &str),
+        ending: CallEnding,
+        gap: Option<crate::formation_trace::CallGap>,
+    ) -> FormationCall {
+        FormationCall {
+            depth,
+            call_id: call_id.map(str::to_string),
+            caller: pair.0.to_string(),
+            callee: pair.1.to_string(),
+            started_ms: 0,
+            ending,
+            gap,
+            calling_task_id: None,
+            member_task_id: None,
+        }
+    }
+
+    /// A call row reads `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>` and its
+    /// note, indented two spaces per depth with every column aligned; an outstanding or unknown
+    /// call has no duration and no delivery.
+    #[test]
+    fn formation_call_rows_are_nested_aligned_and_carry_their_gap_note() {
+        use crate::formation_trace::CallGap;
+        let ended = |status: &str, duration_ms: u64, delivered: bool| CallEnding::Ended {
+            status: status.to_string(),
+            duration_ms,
+            delivered,
+        };
+        let calls = [
+            formation_call(
+                0,
+                Some("mcl_1"),
+                ("chief", "lead-b"),
+                ended("completed", 12_300, true),
+                None,
+            ),
+            formation_call(
+                1,
+                Some("mcl_2"),
+                ("lead-b", "worker-b4"),
+                ended("rejected", 4, true),
+                Some(CallGap::NeverHeld),
+            ),
+            formation_call(
+                1,
+                Some("mcl_3"),
+                ("lead-b", "w"),
+                ended("abandoned", 900, false),
+                None,
+            ),
+            formation_call(
+                0,
+                Some("mcl_4"),
+                ("chief", "lead-a"),
+                CallEnding::Outstanding,
+                Some(CallGap::CalleeTaskEnded(None)),
+            ),
+            formation_call(
+                0,
+                None,
+                ("ghost", "lead-a"),
+                CallEnding::Unknown,
+                Some(CallGap::CallerTraceNotFound(Some("completed".to_string()))),
+            ),
+        ];
+        assert_eq!(
+            formation_call_lines(&calls),
+            [
+                "mcl_1         chief → lead-b      completed    12.3s  delivered",
+                "  mcl_2       lead-b → worker-b4  rejected     4ms    delivered      never held by worker-b4",
+                "  mcl_3       lead-b → w          abandoned    900ms  not delivered",
+                "mcl_4         chief → lead-a      outstanding  -                     lead-a's task has no task_end",
+                "(no call id)  ghost → lead-a      unknown      -                     ghost's trace not found; lead-a's task ended completed",
+            ]
+        );
+    }
+
+    /// `mur trace steps` refuses a formation id before resolving any session, and points at
+    /// `mur trace show` for it.
+    #[test]
+    fn trace_steps_refuses_a_formation_id_and_points_at_trace_show() {
+        let id = "frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b";
+        let error = run_trace_steps(
+            Some(id.to_string()),
+            Some(PathBuf::from("/nonexistent/workdir")),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, E_TRC_001);
+        assert_eq!(
+            error.message,
+            "mur trace steps reads one session's trace; a formation id names several sessions — \
+             `mur trace show frm_0192a5b3c4d57e6f8a9b0c1d2e3f4a5b` lists the formation's members \
+             and calls"
+        );
     }
 }
