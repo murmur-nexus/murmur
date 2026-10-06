@@ -509,17 +509,24 @@ fn every_kind_of_frame_shares_one_sequence() {
             "expected a frame of {task} carrying {needle}; frames were {replay:#?}"
         );
     }
-    for task in [&first, &third] {
-        let attempts = replay
+    // Two attempts per task: one reopen boundary between them. Turns number straight through
+    // both attempts, so each task has exactly one first turn.
+    let count = |task: &str, needle: &str| {
+        replay
             .iter()
-            .filter(|f| {
-                f.task_id().as_deref() == Some(task.as_str())
-                    && f.data.contains(r#""message":"inference turn 1""#)
-            })
-            .count();
+            .filter(|f| f.task_id().as_deref() == Some(task) && f.data.contains(needle))
+            .count()
+    };
+    for task in [&first, &third] {
         assert_eq!(
-            attempts, 2,
+            count(task, r#""message":"reopened by hook "#),
+            1,
             "{task} should start two attempts; frames were {replay:#?}"
+        );
+        assert_eq!(
+            count(task, r#""message":"inference turn 1""#),
+            1,
+            "{task} should have one first turn across its attempts; frames were {replay:#?}"
         );
     }
 }

@@ -412,8 +412,9 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
         f.event == "text" && f.data["text"] == "Noted, first attempt."
     });
     let boundary = stream.index(0, Frame::is_boundary);
+    // The second attempt's first turn numbers on from the first attempt's one turn.
     let second_turn = stream.index(boundary, |f| {
-        f.is_status() && f.message() == "inference turn 1"
+        f.is_status() && f.message() == "inference turn 2"
     });
     assert!(
         first_text < boundary && boundary < second_turn,

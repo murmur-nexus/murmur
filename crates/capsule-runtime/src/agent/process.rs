@@ -733,10 +733,14 @@ async fn run_harness(
     continuation: Option<super::Continuation>,
     carried_session: &mut Option<String>,
 ) -> Result<AgentLoopExit, RuntimeError> {
+    // A task's turns number straight through its attempts, so this run's first turn carries on
+    // from the last one an earlier attempt recorded.
+    let first_turn = trace.task_agent_turns();
+
     // Nothing is spawned for a task a person already stopped: the probe, the bridge and the
     // driver's `launch` all happen before a harness exists, and none of them is worth doing for a
     // run that would be interrupted on its first breath.
-    if let Some(canceled) = stop_before_start(cancel, 0, store_state, trace).await {
+    if let Some(canceled) = stop_before_start(cancel, first_turn, store_state, trace).await {
         return Ok(canceled);
     }
 
@@ -863,6 +867,7 @@ async fn run_harness(
     let mut sink = ProcessEventSink::new(
         workdir,
         inference.max_turns,
+        first_turn,
         session,
         Arc::clone(&store_state.spend),
         a2a,

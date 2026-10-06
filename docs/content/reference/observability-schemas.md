@@ -90,7 +90,7 @@ before the first task begins
 
 | Field | Type | Notes |
 |---|---|---|
-| `turn` | u32 | Zero-based turn index |
+| `turn` | u32 | Zero-based turn index, counted across every attempt of the task: a task an `on-task-end` hook reopened, or that continued with the outcomes of handed-off work, carries on from its last turn. Starts again at 0 for each task. A hook's `run-inference` record carries the number of the turn it ran inside |
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
 | `input_tokens` | u64 | What this turn's input cost, and the number the task and session totals accumulate. Under `transport: http` the runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before it was sent, and the number the compaction threshold runs on; under `transport: process` the count the harness reported and its driver relayed. Absent when nothing counted the turn: a process driver reporting no usage, or a [failed call](#inference-failed) that is not counted — never the same fact as `0` |
 | `output_tokens` | u64 | What this turn's output cost, on the same terms as `input_tokens` |

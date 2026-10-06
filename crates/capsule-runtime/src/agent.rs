@@ -734,6 +734,10 @@ pub(crate) async fn run_agent_loop(
     }
 
     // ── WASM driver transport (http) ──────────────────────────────────────────
+    // A task's turns number straight through its attempts: this attempt's first turn carries on
+    // from the last one an earlier attempt recorded. Read before this attempt writes anything.
+    let first_turn = trace.task_agent_turns();
+
     let driver = inference
         .driver
         .as_ref()
@@ -871,7 +875,7 @@ pub(crate) async fn run_agent_loop(
                     &mut session_tokens,
                     &occupancy,
                     store_state,
-                    0,
+                    first_turn as usize,
                     run_config.context_window,
                     workdir,
                     hooks,
@@ -897,7 +901,7 @@ pub(crate) async fn run_agent_loop(
                             otel,
                             workdir,
                             ending,
-                            0,
+                            first_turn,
                             &refusal,
                             RefusalLine::AlreadyWritten,
                         )
@@ -944,7 +948,10 @@ pub(crate) async fn run_agent_loop(
     // The trace's `session_start`/`session_end` frame and the `on-session-start`/
     // `on-session-end` hook dispatch both fire once per launch, from runtime.rs around the
     // task loop. This function runs one attempt of one task and writes neither.
-    for turn in 0..max_turns as usize {
+    // `max_turns` is this attempt's remaining budget, so it bounds the loop; `turn` is the
+    // task-wide number every line the turn writes carries.
+    for attempt_turn in 0..max_turns as usize {
+        let turn = first_turn as usize + attempt_turn;
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
         // The turn boundary. A cancel that landed while the previous turn's tools were running is

@@ -3138,14 +3138,21 @@ fn parse_body_selector(arg: &str) -> Result<BodySelector, CliError> {
 /// turns. Built without requiring a `session_end`, so a body can be pulled out of a session
 /// that is still running.
 struct WireIndex {
-    turns: Vec<InferenceRecord>,
+    turns: Vec<WireTurn>,
     /// In file order, deduplicated: `session_start.system_prompt_sha256` first, then each
     /// turn's system, tools, response and message hashes.
     known_hashes: Vec<String>,
 }
 
+/// One agent-loop turn `--turn` can name, with the task its line belongs to.
+struct WireTurn {
+    record: InferenceRecord,
+    /// `None` on a line that carries no `task_id`.
+    task_id: Option<String>,
+}
+
 impl WireIndex {
-    fn build(events: Vec<TraceEvent>) -> Self {
+    fn build(records: Vec<TraceRecord>) -> Self {
         let mut turns = Vec::new();
         let mut known_hashes: Vec<String> = Vec::new();
         fn note(hash: Option<&String>, known: &mut Vec<String>) {
@@ -3155,7 +3162,7 @@ impl WireIndex {
                 }
             }
         }
-        for event in events {
+        for TraceRecord { identity, event } in records {
             match event {
                 TraceEvent::SessionStart(e) => {
                     note(e.system_prompt_sha256.as_ref(), &mut known_hashes);
@@ -3180,7 +3187,10 @@ impl WireIndex {
                         note(Some(sha), &mut known_hashes);
                     }
                     if record.is_agent_loop() {
-                        turns.push(record);
+                        turns.push(WireTurn {
+                            record,
+                            task_id: identity.task_id,
+                        });
                     }
                 }
                 _ => {}
@@ -3192,15 +3202,18 @@ impl WireIndex {
         }
     }
 
-    fn turn(&self, n: u32) -> Option<&InferenceRecord> {
-        self.turns.iter().find(|rec| rec.turn == n)
+    /// Every agent-loop turn numbered `n`, in file order. More than one in a session that ran
+    /// several tasks, each numbered from 0, and in a trace whose runtime numbered a continued
+    /// task's attempts each from 0.
+    fn turns_numbered(&self, n: u32) -> Vec<&WireTurn> {
+        self.turns.iter().filter(|t| t.record.turn == n).collect()
     }
 
     /// `1, 2, 3` — the turns a `--turn` argument can name.
     fn turn_list(&self) -> String {
         self.turns
             .iter()
-            .map(|rec| rec.turn.to_string())
+            .map(|t| t.record.turn.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -3262,12 +3275,17 @@ fn resolve_body_hash(
             format!("--turn is required with --body {arg}; {turns}"),
         ));
     };
-    let record = index.turn(n).ok_or_else(|| {
-        CliError::new(
+    let matches = index.turns_numbered(n);
+    let Some(first) = matches.first() else {
+        return Err(CliError::new(
             E_TRC_001,
             format!("turn {n} has no inference record in this trace"),
-        )
-    })?;
+        ));
+    };
+    if matches.len() > 1 && matches.iter().any(|t| t.record.has_hashes()) {
+        return Err(ambiguous_turn(n, &matches));
+    }
+    let record = &first.record;
     if !record.has_hashes() {
         return Err(CliError::new(
             E_TRC_001,
@@ -3305,11 +3323,43 @@ fn resolve_body_hash(
     Ok((hash.clone(), format!("turn {n} {label} {hash}")))
 }
 
+/// The refusal for a `--turn` that names several agent-loop turns, listing each one's hashes so
+/// the reader can name exactly one with a `<sha256>` selector instead.
+fn ambiguous_turn(n: u32, matches: &[&WireTurn]) -> CliError {
+    let hash = |sha: &Option<String>| sha.clone().unwrap_or_else(|| "-".to_string());
+    let rows = matches
+        .iter()
+        .map(|t| {
+            let task = t
+                .task_id
+                .as_ref()
+                .map(|id| format!("task {id}  "))
+                .unwrap_or_default();
+            format!(
+                "  {task}system {}  response {}",
+                hash(&t.record.system_sha),
+                hash(&t.record.response_sha)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    CliError::new(
+        E_TRC_001,
+        format!(
+            "--turn {n} names {} turns in this trace: turn numbers restart at 0 for each task \
+             in a session that ran several, and a trace written by a runtime that restarted \
+             them when a task continued repeats them within one task\n{rows}\n\
+             pass one of these hashes to --body instead of --turn",
+            matches.len()
+        ),
+    )
+}
+
 /// Print the recorded body behind one hash to stdout, and nothing else — no header, no added
 /// newline — so the output pipes into `sha256sum` and matches the blob's own name.
 fn print_body(path: &Path, arg: &str, turn: Option<u32>) -> Result<(), CliError> {
     let selector = parse_body_selector(arg)?;
-    let index = WireIndex::build(parse_trace_file(path)?);
+    let index = WireIndex::build(parse_trace_records(path)?);
     let blob_dir = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -5095,13 +5145,16 @@ mod tests {
         assert!(!inference_event(FAILED_HOOK).is_steps_turn());
         assert!(inference_event(ANSWERED_TURN).is_steps_turn());
 
-        let events = [FAILED_REJECTION, FAILED_TRAP]
+        let records = [FAILED_REJECTION, FAILED_TRAP]
             .into_iter()
-            .map(|line| serde_json::from_str::<TraceEvent>(line).unwrap())
+            .map(|line| TraceRecord {
+                identity: EventIdentity::default(),
+                event: serde_json::from_str::<TraceEvent>(line).unwrap(),
+            })
             .collect();
-        let index = WireIndex::build(events);
+        let index = WireIndex::build(records);
         assert!(
-            index.turn(0).is_none(),
+            index.turns_numbered(0).is_empty(),
             "--turn 0 does not offer a failed call"
         );
         assert!(index.turns.is_empty());

@@ -892,6 +892,140 @@ fn a_follow_up_after_the_answer_is_a_new_call() {
     );
 }
 
+/// The `turn` of every agent-loop `inference` record of `trace`, in file order.
+fn agent_loop_turns(trace: &[Value]) -> Vec<u64> {
+    records(trace, "inference")
+        .into_iter()
+        .filter(|record| record.get("origin").is_none_or(Value::is_null))
+        .map(|record| record["turn"].as_u64().unwrap())
+        .collect()
+}
+
+/// The lines of `output` from the section headed `── <name>` up to the blank line ending it.
+fn section<'a>(output: &'a str, name: &str) -> Vec<&'a str> {
+    output
+        .lines()
+        .skip_while(|line| !line.starts_with(&format!("── {name} ")))
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .collect()
+}
+
+/// A lead that calls worker, ends its turn to wait, and continues with the answer numbers that
+/// continuation's turn 2: the trace, `mur trace show`, `mur trace steps` and `--turn` all read
+/// turns 0, 1 and 2.
+#[test]
+fn a_continued_lead_numbers_its_turns_straight_through() {
+    let lead = Model::new(|n| match n {
+        1 => common::tool_use_response(
+            "toolu_first",
+            "call-member",
+            json!({"member": "worker", "task": "Draft a line."}),
+        ),
+        2 => end_turn(2, "waiting"),
+        _ => end_turn(n, "done"),
+    });
+    let worker = Model::new(|n| end_turn(n, "WORKER-ANSWER"));
+    let project = Project::with_manifests(
+        vec![
+            Member {
+                name: "lead",
+                entry: true,
+                allow: Some("localhost"),
+                max_turns: None,
+                model: lead,
+            },
+            Member {
+                name: "worker",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: worker,
+            },
+        ],
+        "reachability:\n  - from: lead\n    to: [worker]\n",
+        |member| {
+            let body = manifest(
+                &member.model.server.endpoint,
+                member.entry,
+                member.allow,
+                member.max_turns,
+            );
+            if member.entry {
+                body + "trace:\n  capture: content\n"
+            } else {
+                body
+            }
+        },
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("ask worker", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    assert_eq!(agent_loop_turns(&lead_trace), [0, 1, 2], "{lead_trace:?}");
+    let calls = call_member_tool_calls(&lead_trace);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["turn"], 0);
+    assert_eq!(records(&lead_trace, "task_end")[0]["turns"], 3);
+
+    let workdir = project.path().join(".murmur");
+    let lead_session = &session_dirs(&workdir)[0];
+    let session_id = lead_session.file_name().unwrap().to_str().unwrap();
+    let mur = |args: &[&str]| {
+        let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
+            .arg("trace")
+            .args(args)
+            .args([session_id, "--workdir", workdir.to_str().unwrap()])
+            .env("HOME", project.home.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+
+    let show = String::from_utf8(mur(&["show"])).unwrap();
+    let wire_turns: Vec<&str> = section(&show, "Wire")
+        .into_iter()
+        .filter_map(|line| line.split_once("  system ").map(|(turn, _)| turn))
+        .collect();
+    assert_eq!(wire_turns, ["turn 0", "turn 1", "turn 2"], "{show}");
+    let tool_call_rows: Vec<&str> = section(&show, "Tool calls")
+        .into_iter()
+        .filter_map(|line| line.trim_start().strip_prefix("turn "))
+        .filter_map(|row| row.split("  ").next())
+        .collect();
+    assert_eq!(tool_call_rows, ["0", "1", "2"], "{show}");
+
+    let steps = String::from_utf8(mur(&["steps"])).unwrap();
+    for row in [
+        "turn 0  tool_call  call-member",
+        "turn 1  end_turn",
+        "turn 2  end_turn",
+    ] {
+        assert!(steps.contains(row), "{row}: {steps}");
+    }
+
+    let response = mur(&["show", "--body", "response", "--turn", "2"]);
+    let third = &records(&lead_trace, "inference")
+        .into_iter()
+        .filter(|record| record.get("origin").is_none_or(Value::is_null))
+        .nth(2)
+        .unwrap()["response_sha"];
+    assert_eq!(&json!(murmur_artifact::sha256_hex(&response)), third);
+
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
 /// Two calls to worker in one response start once: the first is started, the second refused,
 /// and worker runs only the first task.
 #[test]
@@ -1071,6 +1205,23 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
     assert_eq!(ends[0]["status"], "completed");
     assert_eq!(ends[0]["delivered"], true);
     assert_eq!(records(&lead_trace, "task_end")[0]["exit_status"], "ok");
+    // The resumed run numbers its turns on from the first run's: one sequence, no repeat.
+    let turns = agent_loop_turns(&lead_trace);
+    assert_eq!(
+        turns,
+        (0..turns.len() as u64).collect::<Vec<_>>(),
+        "{turns:?}"
+    );
+    let resumed_at = lead_trace
+        .iter()
+        .position(|record| record == harness_starts[1])
+        .unwrap();
+    let before = agent_loop_turns(&lead_trace[..resumed_at]);
+    let after = agent_loop_turns(&lead_trace[resumed_at..]);
+    assert!(
+        !before.is_empty() && after.first() > before.iter().max(),
+        "{before:?} then {after:?}"
+    );
 
     // What the harness read back from the bridge: the started JSON fenced, the note after.
     let bridged = std::fs::read_to_string(

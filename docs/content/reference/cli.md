@@ -2196,7 +2196,7 @@ mur trace show <formation-id> [--workdir <dir>]
 | `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), or a formation id (`frm_…`), which prints only the [Formation section](#mur-trace-show-formation) |
 | `--workdir` | `./workdir` | Directory holding the `ses_*` session directories. With a formation id, the first root searched — see [Listing a formation](#mur-trace-show-formation) |
 | `--body` | — | Print the body behind one hash and nothing else. Selectors below |
-| `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name. Required with those four, invalid without `--body` |
+| `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name, as the Wire section numbers it. Must name exactly one turn. Required with those four, invalid without `--body` |
 
 Output sections, in the order they are printed:
 
@@ -2356,6 +2356,7 @@ Every `--body` failure exits non-zero with [`E-TRC-001`](diagnostics.md):
 |---|---|
 | A named selector with no `--turn` | `--turn is required with --body <selector>; this trace has turns 1, 2, 3` |
 | `--turn` names no `inference` record | `turn 7 has no inference record in this trace` |
+| `--turn` names several turns: one per task in a session that ran several tasks, or a trace written by a runtime that restarted the count when a task continued | `--turn 0 names 2 turns in this trace: …`, then each turn's task id, full `system` hash and full `response` hash. Pass one hash to `--body` instead |
 | The turn recorded no hashes | `turn 3 recorded no content hashes — the session ran under trace.capture: none` |
 | `message:<i>` past the end of the list | `turn 2 recorded 4 messages; there is no message 7` |
 | The hash is recorded and the body is not | `turn 1 system prompt <sha>: recorded under capture: meta; no body was stored` |

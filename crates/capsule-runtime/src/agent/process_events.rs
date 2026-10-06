@@ -176,6 +176,9 @@ pub(super) struct ProcessEventSink<'a> {
     max_turns: u32,
     /// How many turns have opened in this run.
     turns: u32,
+    /// The task-wide number this run's first turn takes: the agent-loop turns earlier attempts of
+    /// the task recorded. Every turn this run records is numbered from it.
+    first_turn: u32,
     open: Option<OpenTurn>,
     pending: HashMap<String, PendingToolCall>,
     /// Set by the first terminal event, so the rest of its batch is ignored.
@@ -214,6 +217,7 @@ impl<'a> ProcessEventSink<'a> {
     pub(super) fn new(
         workdir: &Path,
         max_turns: u32,
+        first_turn: u32,
         session: RunSession,
         spend: Arc<SpendMeter>,
         a2a: &'a mut A2aStream,
@@ -223,6 +227,7 @@ impl<'a> ProcessEventSink<'a> {
             workdir: workdir.to_path_buf(),
             max_turns,
             turns: 0,
+            first_turn,
             open: None,
             pending: HashMap::new(),
             finished: false,
@@ -254,11 +259,12 @@ impl<'a> ProcessEventSink<'a> {
         self.a2a.mark_harness_killed();
     }
 
-    /// The turn a record written now belongs to: the open turn, or the last one that closed.
+    /// The turn a record written now belongs to: the open turn, or the last one that closed —
+    /// `first_turn` before any has opened.
     pub(super) fn current_turn(&self) -> u32 {
         match self.open.as_ref() {
             Some(open) => open.index,
-            None => self.turns.saturating_sub(1),
+            None => self.first_turn + self.turns.saturating_sub(1),
         }
     }
 
@@ -596,7 +602,7 @@ impl<'a> ProcessEventSink<'a> {
     fn segment_turn(&self) -> u32 {
         match self.open.as_ref() {
             Some(open) => open.index + 1,
-            None => self.turns + 1,
+            None => self.first_turn + self.turns + 1,
         }
     }
 
@@ -625,7 +631,7 @@ impl<'a> ProcessEventSink<'a> {
             ));
         }
         self.open = Some(OpenTurn {
-            index: self.turns - 1,
+            index: self.first_turn + self.turns - 1,
             text: None,
             first_tool: None,
         });
@@ -674,7 +680,7 @@ impl<'a> ProcessEventSink<'a> {
         if self.open.is_none() {
             let _ = trace
                 .write_failed_inference(FailedInference {
-                    turn: self.turns,
+                    turn: self.first_turn + self.turns,
                     error_code,
                     error: &error,
                     provider_status: None,
@@ -927,6 +933,8 @@ mod tests {
         _dir: tempfile::TempDir,
         workdir: PathBuf,
         max_turns: u32,
+        /// The task-wide number the sink's first turn takes; 0 unless a test continues a task.
+        first_turn: u32,
         /// The session policy and plan this harness runs under. Held rather than the `RunSession`
         /// itself because [`ProcessEventSink::new`] takes one by value, and the sink is rebuilt
         /// per batch; planning once keeps `planned_id` the id every batch is handed.
@@ -958,6 +966,13 @@ mod tests {
                 Arc::new(HarnessSessionMap::new(None, Path::new("/tmp"))),
             )
             .await
+        }
+
+        /// The same harness, running a continued attempt of a task that already recorded
+        /// `first_turn` turns.
+        fn continuing_from(mut self, first_turn: u32) -> Self {
+            self.first_turn = first_turn;
+            self
         }
 
         /// The same harness, metered by `spend` rather than by an unlimited meter.
@@ -1040,6 +1055,7 @@ mod tests {
                 _dir: dir,
                 workdir: workdir.clone(),
                 max_turns,
+                first_turn: 0,
                 policy,
                 plan,
                 spend: Arc::new(SpendMeter::unlimited()),
@@ -1067,6 +1083,7 @@ mod tests {
             let mut sink = ProcessEventSink::new(
                 &self.workdir,
                 self.max_turns,
+                self.first_turn,
                 session,
                 Arc::clone(&self.spend),
                 &mut self.a2a,
@@ -1088,6 +1105,7 @@ mod tests {
             let mut sink = ProcessEventSink::new(
                 &self.workdir,
                 self.max_turns,
+                self.first_turn,
                 session,
                 Arc::clone(&self.spend),
                 &mut self.a2a,
@@ -1421,6 +1439,64 @@ mod tests {
         assert_eq!(calls[0]["tool_call_id"], "c1");
         assert_eq!(calls[0]["status"], "ok");
         assert_eq!(calls[0]["turn"], 0);
+    }
+
+    /// A continued attempt numbers its turns on from the task's earlier ones, on the trace and on
+    /// the A2A stream alike, while its budget still counts only its own turns.
+    #[tokio::test]
+    async fn a_continued_attempt_numbers_its_turns_from_the_task_s_first_turn() {
+        let mut h = Harness::new(2).await.continuing_from(3);
+        h.feed(Vec::new()).await;
+        assert_eq!(
+            h.turn, 3,
+            "before any turn opens, the current turn is the first one"
+        );
+
+        let mut h = Harness::new(2).await.continuing_from(3);
+        h.feed(vec![
+            tool_call("c1", "echo-tool"),
+            tool_result("c1", false),
+            text("all done"),
+            Event::TurnEnd("all done".into()),
+        ])
+        .await;
+        let turns: Vec<Json> = h
+            .of_type("inference")
+            .await
+            .into_iter()
+            .map(|record| record["turn"].clone())
+            .collect();
+        assert_eq!(turns, [3, 4]);
+        assert_eq!(h.of_type("tool_call").await[0]["turn"], 3);
+        assert_eq!(h.turn, 4);
+        let statuses: Vec<String> = h
+            .frame_kinds()
+            .into_iter()
+            .filter(|kind| kind.starts_with("status:working:inference turn"))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                "status:working:inference turn 4",
+                "status:working:inference turn 5"
+            ]
+        );
+
+        let mut h = Harness::new(2).await.continuing_from(3);
+        let outcome = h
+            .feed(vec![
+                tool_call("c1", "t"),
+                tool_result("c1", false),
+                tool_call("c2", "t"),
+                tool_result("c2", false),
+                text("a third turn"),
+            ])
+            .await;
+        assert!(
+            matches!(outcome, SinkOutcome::TurnBudgetExceeded(_)),
+            "the attempt's own budget of two turns still bounds it"
+        );
+        assert_eq!(h.of_type("inference").await.len(), 2);
     }
 
     #[tokio::test]
