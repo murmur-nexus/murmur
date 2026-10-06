@@ -7,7 +7,6 @@
 //! [`assert_survived`] catches both shapes.
 
 use std::fs;
-use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -326,6 +325,8 @@ fn a_failed_command_keeps_exit_one_with_both_streams_closed() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_full_disk_on_stdout_fails_the_command_with_e_io_003() {
+    use std::io::Read;
+
     let scratch = Scratch::new();
     let trace = scratch.file("trace-a.jsonl", FIXTURE_A);
     let full = fs::File::options().write(true).open("/dev/full").unwrap();
