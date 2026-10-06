@@ -123,16 +123,16 @@ fn stop_session(record: &RunningRecord, grace: Duration) -> Result<SessionStop, 
 /// The block `mur stop <session>` prints, and `mur stop <formation id>` prints once per member
 /// started by hand.
 fn print_session_stop(stopped: &SessionStop) {
-    println!("stopped: {}", stopped.session_id);
-    println!("capsule: {}", stopped.capsule);
-    println!("signal:  {}", stopped.signal);
+    capsule_runtime::report_println!("stopped: {}", stopped.session_id);
+    capsule_runtime::report_println!("capsule: {}", stopped.capsule);
+    capsule_runtime::report_println!("signal:  {}", stopped.signal);
     match &stopped.door {
         Ok(result) => {
             for task_id in canceled_ids(result) {
-                println!("canceled: {task_id}");
+                capsule_runtime::report_println!("canceled: {task_id}");
             }
             for task_id in &stopped.unended {
-                println!("unended: {task_id}  {UNENDED_SENTENCE}");
+                capsule_runtime::report_println!("unended: {task_id}  {UNENDED_SENTENCE}");
             }
             let residue = result
                 .get("residue")
@@ -140,12 +140,12 @@ fn print_session_stop(stopped: &SessionStop) {
                 .cloned()
                 .unwrap_or_default();
             if residue.is_empty() {
-                println!("{RESIDUE_NONE}");
+                capsule_runtime::report_println!("{RESIDUE_NONE}");
             } else {
                 print_residue(&residue);
             }
         }
-        Err(reason) => println!("{RESIDUE_UNKNOWN_PREFIX} {reason}"),
+        Err(reason) => capsule_runtime::report_println!("{RESIDUE_UNKNOWN_PREFIX} {reason}"),
     }
 }
 
@@ -248,8 +248,8 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
 
     let still_running = wait_for_members(&members);
 
-    println!("stopped:  {formation_id}");
-    println!("launcher: {}", launcher.line(grace));
+    capsule_runtime::report_println!("stopped:  {formation_id}");
+    capsule_runtime::report_println!("launcher: {}", launcher.line(grace));
     for member in &members {
         let ending = if started_by_hand(member) {
             STARTED_BY_HAND_ENDING.to_string()
@@ -258,16 +258,18 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
         } else {
             recorded_ending(&member.workdir.join("trace.jsonl"))
         };
-        println!(
+        capsule_runtime::report_println!(
             "member:   {}  {}@{}  {ending}",
-            member.session_id, member.capsule_name, member.capsule_version
+            member.session_id,
+            member.capsule_name,
+            member.capsule_version
         );
     }
     for stopped in &by_hand {
-        println!();
+        capsule_runtime::report_println!();
         match stopped {
             Ok(stopped) => print_session_stop(stopped),
-            Err(error) => println!("error: {}", error.message),
+            Err(error) => capsule_runtime::report_println!("error: {}", error.message),
         }
     }
 

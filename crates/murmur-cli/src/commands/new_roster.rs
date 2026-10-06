@@ -168,7 +168,7 @@ pub(crate) fn run_new_roster(name: &str) -> Result<(), CliError> {
     let scaffold = render_scaffold(name, &choice);
     self_check(&scaffold, name, &choice)?;
     write_formation(&cwd, name, &scaffold)?;
-    print!("{}", render_summary(name, &choice));
+    capsule_runtime::report_print!("{}", render_summary(name, &choice));
     Ok(())
 }
 

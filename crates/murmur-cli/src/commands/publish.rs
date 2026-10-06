@@ -82,7 +82,10 @@ pub(crate) fn run_publish(
                             "pass an explicit platform with --platform <PLATFORM> (e.g. darwin-aarch64)",
                         ));
                     }
-                    println!("Platform: {} (auto-detected)", current_platform());
+                    capsule_runtime::report_println!(
+                        "Platform: {} (auto-detected)",
+                        current_platform()
+                    );
                     let platform_parts = parse_platform(current_platform())?;
                     (RuntimeType::Native, vec![platform_parts])
                 }
@@ -106,7 +109,7 @@ pub(crate) fn run_publish(
 
     let registry = resolve_registry(registry_override)?;
     registry.publish(meta, &bytes).map_err(CliError::from)?;
-    println!("Published {artifact_id}");
+    capsule_runtime::report_println!("Published {artifact_id}");
     Ok(())
 }
 

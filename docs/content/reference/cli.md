@@ -37,6 +37,21 @@ Every `mur` command, its flags, and what each one does.
 
 ---
 
+## Piped output { #piped-output }
+
+Every `mur` command stops writing when the program reading its output goes away, as
+`mur trace show <session> | head -1` does after one line, and exits with the status it would have
+had with its output open.
+
+| What happens to the output | Effect on the command |
+|---|---|
+| Its reader closes standard output or standard error | The rest of that stream's output is dropped. The command finishes its work — an install or removal completes — and exits with its own status |
+| Its reader closes the stream under [`mur watch`](#mur-watch) | The watch ends with exit 0. The capsule keeps running |
+| A write to standard output fails for another reason, such as a full disk | A command that otherwise succeeded reports `E-IO-003` `failed to write to standard output` and exits 1. A command that failed keeps its own error |
+| Its reader closes either stream under [`mur run`](#mur-run) | The session keeps running to its own end and keeps the lines it could not write. See [A closed stream](#mur-run-closed-stream) |
+
+---
+
 ## Session addresses { #session-addresses }
 
 Every command that names a session spells the address the same way.
@@ -1256,6 +1271,9 @@ diagnostics.
 The fallback writes to that file alone, so `--json` standard output holds the readiness line and
 nothing else.
 
+This applies to every member of a [`--roster`](#mur-run-roster) formation. Every other command
+ends its output instead, as [Piped output](#piped-output) describes.
+
 ### `SIGTERM` { #mur-run-sigterm }
 
 An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur stop`](#mur-stop),
@@ -1688,6 +1706,9 @@ before the connection is opened.
 this connection to it closes. On connect, `mur watch` prints one line to stderr naming the session
 it is watching and saying so, which keeps stdout to SSE events alone for piping. To end the capsule
 itself, use [`mur stop`](#mur-stop).
+
+When the program reading stdout goes away, the watch ends with exit 0 at the next event it would
+have printed, and the capsule keeps running. See [Piped output](#piped-output).
 
 Output format:
 

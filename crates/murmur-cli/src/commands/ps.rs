@@ -58,11 +58,14 @@ pub(crate) fn run_ps() -> Result<(), CliError> {
             Liveness::Gone(reason) => {
                 running::prune(&record);
                 match &record.formation_id {
-                    Some(formation) => eprintln!(
+                    Some(formation) => capsule_runtime::report_eprintln!(
                         "pruned: {} — {reason} (formation {formation})",
                         record.session_id
                     ),
-                    None => eprintln!("pruned: {} — {reason}", record.session_id),
+                    None => capsule_runtime::report_eprintln!(
+                        "pruned: {} — {reason}",
+                        record.session_id
+                    ),
                 }
                 pruned.push(record);
             }
@@ -81,9 +84,9 @@ pub(crate) fn run_ps() -> Result<(), CliError> {
 
     let rows = grouped(rows);
     print_table(&rows, true);
-    println!();
+    capsule_runtime::report_println!();
     for formation in formations_in_order(&rows, &pruned) {
-        println!("{}", summary_line(&formation, &rows, &pruned));
+        capsule_runtime::report_println!("{}", summary_line(&formation, &rows, &pruned));
     }
     Ok(())
 }
@@ -94,7 +97,7 @@ fn print_table(rows: &[(RunningRecord, &str)], with_formation: bool) {
     // A machine with no record directory and a machine with an empty one are the same fact, and
     // are reported in the same words.
     if rows.is_empty() {
-        println!("no running capsules");
+        capsule_runtime::report_println!("no running capsules");
         return;
     }
 
@@ -103,7 +106,7 @@ fn print_table(rows: &[(RunningRecord, &str)], with_formation: bool) {
     } else {
         String::new()
     };
-    println!(
+    capsule_runtime::report_println!(
         "{:<SESSION_WIDTH$}  {:<CAPSULE_WIDTH$}  {:<STATUS_WIDTH$}  {:<DETACHED_WIDTH$}  {:<UPTIME_WIDTH$}  {formation_header}URL",
         "SESSION", "CAPSULE", "STATUS", "DETACHED", "UPTIME"
     );
@@ -117,7 +120,7 @@ fn print_table(rows: &[(RunningRecord, &str)], with_formation: bool) {
         } else {
             String::new()
         };
-        println!(
+        capsule_runtime::report_println!(
             "{:<SESSION_WIDTH$}  {:<CAPSULE_WIDTH$}  {:<STATUS_WIDTH$}  {:<DETACHED_WIDTH$}  {:<UPTIME_WIDTH$}  {formation}{}",
             record.session_id,
             format!("{}@{}", record.capsule_name, record.capsule_version),

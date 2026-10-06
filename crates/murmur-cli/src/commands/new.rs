@@ -44,7 +44,10 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         if std::env::var("MUR_KEEP_SESSION").is_ok() {
-            eprintln!("mur new: session dir preserved at {}", self.path.display());
+            capsule_runtime::report_eprintln!(
+                "mur new: session dir preserved at {}",
+                self.path.display()
+            );
         } else {
             let _ = fs::remove_dir_all(&self.path);
         }
@@ -182,7 +185,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
     fs::write(session_workdir.join("task.md"), &task_prompt)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to write task prompt: {e}")))?;
 
-    eprintln!("mur new: generating manifest...");
+    capsule_runtime::report_eprintln!("mur new: generating manifest...");
 
     // Run the generator synchronously. The capsule reads skill.md via murmur-tool-editor,
     // discovers artifacts via murmur-tool-registry-search, generates the manifest, and writes
@@ -206,7 +209,9 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
 
     // Validate structure before touching CWD.
     if std::env::var("MUR_DEBUG_MANIFEST").is_ok() {
-        eprintln!("--- generated manifest ---\n{manifest_yaml}\n--- end ---");
+        capsule_runtime::report_eprintln!(
+            "--- generated manifest ---\n{manifest_yaml}\n--- end ---"
+        );
     }
     RuntimeManifest::from_yaml_str(&manifest_yaml).map_err(|e| {
         CliError::new(
@@ -239,7 +244,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
         )
     })?;
 
-    println!("{MANIFEST_FILENAME} written to {}", output_path.display());
+    capsule_runtime::report_println!("{MANIFEST_FILENAME} written to {}", output_path.display());
     Ok(())
 }
 
@@ -256,7 +261,7 @@ fn resolve_inference_config() -> Result<InferenceConfig, CliError> {
     for provider in [&ANTHROPIC, &OPENAI] {
         if let Ok(key) = std::env::var(provider.key_var) {
             if !key.is_empty() {
-                eprintln!(
+                capsule_runtime::report_eprintln!(
                     "hint: found {} in environment; add [inference] to ~/.murmur/config.yaml to persist your provider settings",
                     provider.key_var
                 );
@@ -283,7 +288,7 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
         )
     };
 
-    eprintln!("No inference provider configured.");
+    capsule_runtime::report_eprintln!("No inference provider configured.");
 
     let theme = ColorfulTheme::default();
 

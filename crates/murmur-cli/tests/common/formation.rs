@@ -2,9 +2,11 @@
 //! the host, the launcher read as it runs, and the check that no member outlives it.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -182,6 +184,9 @@ pub struct Launcher {
     lines: mpsc::Receiver<(Instant, String)>,
     stdout: Arc<Mutex<Vec<String>>>,
     stderr: Arc<Mutex<String>>,
+    /// Set by [`Launcher::close_output`]: each drain thread drops its read end and returns.
+    closing: Arc<AtomicBool>,
+    drains: Vec<thread::JoinHandle<()>>,
 }
 
 impl Launcher {
@@ -193,23 +198,26 @@ impl Launcher {
         let (line_tx, lines) = mpsc::channel::<(Instant, String)>();
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&stdout);
+        let closing = Arc::new(AtomicBool::new(false));
         let out = child.stdout.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
+        let close_out = Arc::clone(&closing);
+        let stdout_drain = thread::spawn(move || {
+            drain_lines(out, &close_out, |line| {
                 seen.lock().unwrap().push(line.clone());
                 let _ = line_tx.send((Instant::now(), line));
-            }
+            });
         });
         let stderr = Arc::new(Mutex::new(String::new()));
         let sink = Arc::clone(&stderr);
         let err = child.stderr.take().unwrap();
-        thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
+        let close_err = Arc::clone(&closing);
+        let stderr_drain = thread::spawn(move || {
+            drain_lines(err, &close_err, |line| {
                 eprintln!("[launcher] {line}");
                 let mut sink = sink.lock().unwrap();
                 sink.push_str(&line);
                 sink.push('\n');
-            }
+            });
         });
         Self {
             child,
@@ -217,6 +225,18 @@ impl Launcher {
             lines,
             stdout,
             stderr,
+            closing,
+            drains: vec![stdout_drain, stderr_drain],
+        }
+    }
+
+    /// Close this test's read ends of the launcher's stdout and stderr, as a reader that goes
+    /// away does: every later write the launcher makes to either stream fails with `EPIPE`.
+    /// Returns once both are closed.
+    pub fn close_output(&mut self) {
+        self.closing.store(true, Ordering::Release);
+        for drain in self.drains.drain(..) {
+            drain.join().unwrap();
         }
     }
 
@@ -260,6 +280,48 @@ impl Launcher {
 
     pub fn signal(&self, signal: i32) {
         self::signal(self.child.id(), signal);
+    }
+}
+
+/// Hand every line `stream` carries to `on_line`, without its line ending, until EOF or until
+/// `closing` is set, when `stream` is dropped with whatever it still holds unread.
+#[allow(unsafe_code)]
+fn drain_lines<R: Read + AsRawFd>(
+    mut stream: R,
+    closing: &AtomicBool,
+    mut on_line: impl FnMut(String),
+) {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while !closing.load(Ordering::Acquire) {
+        let mut ready = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `ready` is one initialised `pollfd` that lives across the call, and `nfds` is 1;
+        // its descriptor is `stream`'s, open until `stream` drops at the end of this function.
+        let polled = unsafe { libc::poll(&mut ready, 1, 50) };
+        if polled <= 0 {
+            // A timeout, to look at `closing` again, or `EINTR`.
+            continue;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                pending.extend_from_slice(&chunk[..read]);
+                while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=end).collect();
+                    let line = String::from_utf8_lossy(&line[..end]);
+                    on_line(line.trim_end_matches('\r').to_string());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if !pending.is_empty() && !closing.load(Ordering::Acquire) {
+        on_line(String::from_utf8_lossy(&pending).into_owned());
     }
 }
 

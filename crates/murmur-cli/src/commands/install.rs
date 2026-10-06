@@ -95,7 +95,7 @@ fn recorded_platforms(
 /// Report a native payload filed where every host will resolve it, because nothing in the
 /// install said which platform it is for.
 fn warn_untagged_native(name: &str, version: &str) {
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "warning[{W_REG_001}]: {name}@{version} is a native artifact with no recorded platform \u{2014} \
          it was filed at the generic path, where every host resolves it\n  {}",
         registry_warning_link(W_REG_001)
@@ -137,7 +137,7 @@ fn upsert_lock_entry(
 /// Print each adoption line [`upsert_lock_entry`] returned, once the progress bars are finished.
 fn print_adoptions(adoptions: &[String]) {
     for adoption in adoptions {
-        println!("{adoption}");
+        capsule_runtime::report_println!("{adoption}");
     }
 }
 
@@ -196,12 +196,14 @@ pub(crate) fn install_resolved(
         if let Some(adoption) =
             upsert_lock_entry(lock_path, &manifest.name, &installed_version, pin)?
         {
-            println!("{adoption}");
+            capsule_runtime::report_println!("{adoption}");
         }
     }
-    println!(
+    capsule_runtime::report_println!(
         "Installed {}@{} from {}",
-        manifest.name, installed_version, resolved.source
+        manifest.name,
+        installed_version,
+        resolved.source
     );
     precompile(
         precompiler,
@@ -432,7 +434,7 @@ fn install_single(
                 if let Some(adoption) =
                     upsert_lock_entry(&root.join("murmur.lock"), name, version, pin)?
                 {
-                    println!("{adoption}");
+                    capsule_runtime::report_println!("{adoption}");
                 }
             }
             resolved.bytes
@@ -459,7 +461,9 @@ fn install_single(
     };
 
     let display = store_display(store);
-    println!("Installed {name}@{version} → {display}/{name}/{version}/{file_stem}.mur.zip");
+    capsule_runtime::report_println!(
+        "Installed {name}@{version} → {display}/{name}/{version}/{file_stem}.mur.zip"
+    );
     precompile(
         build_precompiler(no_precompile, project_root).as_ref(),
         name,
@@ -493,7 +497,7 @@ fn install_manifest_deps(
         .collect();
 
     if artifacts.is_empty() {
-        println!("No artifacts in manifest.");
+        capsule_runtime::report_println!("No artifacts in manifest.");
         return Ok(());
     }
 
@@ -715,11 +719,11 @@ fn install_manifest_deps(
     );
     print_adoptions(&adoptions);
 
-    // Plain `println!` rather than indicatif bar text: MultiProgress writes nothing at all
+    // Plain report lines rather than indicatif bar text: MultiProgress writes nothing at all
     // when stdout/stderr is not a terminal, so bar messages are cosmetic-only and would make
     // the failure report invisible in CI logs and pipes.
-    println!();
-    println!(
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!(
         "{} of {} artifact{} failed to install:",
         failures.len(),
         n,
@@ -727,17 +731,17 @@ fn install_manifest_deps(
     );
     for (i, err) in &failures {
         let artifact = artifacts[*i];
-        println!();
-        println!("  {}@{}", artifact.name, artifact.version);
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("  {}@{}", artifact.name, artifact.version);
         // CliError's Display renders `error[CODE]: message` plus its hint line; keep every
         // failure's full text, indented under the artifact that produced it.
         for line in err.to_string().lines() {
-            println!("    {line}");
+            capsule_runtime::report_println!("    {line}");
         }
     }
     if !successes.is_empty() {
-        println!();
-        println!("installed {summary_tail}");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("installed {summary_tail}");
     }
 
     // A CliError carries a single code/message/hint and cannot represent "K of N artifacts
@@ -897,9 +901,11 @@ pub(crate) fn install_from_local_file(
         .store_installed_overwrite(meta, &bytes, &sha256)
         .map_err(CliError::from)?;
 
-    println!(
+    capsule_runtime::report_println!(
         "Installed {}@{} from {}",
-        manifest.name, manifest.version, path_str
+        manifest.name,
+        manifest.version,
+        path_str
     );
     precompile(precompiler, &manifest.name, &manifest.version, &bytes);
     Ok(())
@@ -935,7 +941,7 @@ fn local_file_platform(path_str: &str) -> Result<String, CliError> {
         ));
     }
 
-    println!("Platform: {} (auto-detected)", current_platform());
+    capsule_runtime::report_println!("Platform: {} (auto-detected)", current_platform());
     Ok(current_platform().to_string())
 }
 
@@ -994,7 +1000,7 @@ fn run_install_all_platforms(
                 global_registry
                     .store_installed_overwrite(meta, &resolved.bytes, &sha256)
                     .map_err(CliError::from)?;
-                println!(
+                capsule_runtime::report_println!(
                     "Installed {name}@{version} ({platform}) → ~/.murmur/artifacts/{name}/{version}/{name}-{version}-{platform}.mur.zip"
                 );
                 // Only this host's payload: a form is native code for the machine that compiled
@@ -1009,7 +1015,7 @@ fn run_install_all_platforms(
                 }
             }
             Err(e) => {
-                eprintln!(
+                capsule_runtime::report_eprintln!(
                     "warning: could not install {name}@{version} for {platform}: {}",
                     source_chain_err_display(&e)
                 );

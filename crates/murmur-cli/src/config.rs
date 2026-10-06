@@ -324,7 +324,7 @@ pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, Cl
     if let Some(project) = &project_opt {
         warn_if_project_api_key_literal(project)?;
         if let Some(warning) = project_credentials_warning(&project_mur_config_path()?, project) {
-            eprintln!("{warning}");
+            capsule_runtime::report_eprintln!("{warning}");
         }
     }
 
@@ -475,7 +475,7 @@ fn warn_if_project_api_key_literal(project: &MurConfig) -> Result<(), CliError> 
     }
 
     let path = project_mur_config_path()?;
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "warning: {} sets inference.api_key to a literal value, but inference.api_key is \
          always read from the global config (~/.murmur/config.yaml); this project-level value \
          will be ignored",

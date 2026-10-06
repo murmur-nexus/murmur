@@ -62,7 +62,7 @@ pub(crate) fn run_search(
         .collect();
 
     if matches.is_empty() {
-        println!("No results found.");
+        capsule_runtime::report_println!("No results found.");
         return Ok(());
     }
 
@@ -209,13 +209,13 @@ fn print_results(entries: &[&ArtifactIndexEntry]) {
         .unwrap_or(0)
         .max(H_RUNTIME.len());
 
-    println!("{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_DESC}");
+    capsule_runtime::report_println!("{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_DESC}");
 
     for entry in entries {
         let desc = entry.description.as_deref().unwrap_or("\u{2014}"); // em dash for missing
         let name = &entry.name;
         let version = &entry.version;
         let runtime = &entry.runtime;
-        println!("{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {desc}");
+        capsule_runtime::report_println!("{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {desc}");
     }
 }

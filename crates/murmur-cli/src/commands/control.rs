@@ -70,7 +70,7 @@ pub(crate) fn run_control(command: ControlCommand) -> Result<(), CliError> {
             let surface = Surface::resolve(session.as_deref())?;
             let listing = surface.request("GET", "/control", None, &[])?;
             if json {
-                println!("{listing}");
+                capsule_runtime::report_println!("{listing}");
             } else {
                 print_listing(&listing);
             }
@@ -92,10 +92,10 @@ pub(crate) fn run_control(command: ControlCommand) -> Result<(), CliError> {
                 Some("application/json"),
                 body.as_bytes(),
             )?;
-            println!("setting:  {}", field(&answer, "name", &setting));
-            println!("previous: {}", field(&answer, "previous", "?"));
-            println!("value:    {}", field(&answer, "value", "?"));
-            println!("applies:  next inference call");
+            capsule_runtime::report_println!("setting:  {}", field(&answer, "name", &setting));
+            capsule_runtime::report_println!("previous: {}", field(&answer, "previous", "?"));
+            capsule_runtime::report_println!("value:    {}", field(&answer, "value", "?"));
+            capsule_runtime::report_println!("applies:  next inference call");
             Ok(())
         }
         ControlCommand::Secret { name, session } => {
@@ -110,8 +110,8 @@ pub(crate) fn run_control(command: ControlCommand) -> Result<(), CliError> {
             overwrite(&mut value);
             let answer = answer?;
             let replaced = answer.get("replaced").and_then(Value::as_bool) == Some(true);
-            println!("secret: {name}");
-            println!(
+            capsule_runtime::report_println!("secret: {name}");
+            capsule_runtime::report_println!(
                 "set:    yes ({})",
                 if replaced { "replaced" } else { "new" }
             );
@@ -120,8 +120,8 @@ pub(crate) fn run_control(command: ControlCommand) -> Result<(), CliError> {
         ControlCommand::Forget { name, session } => {
             let surface = Surface::resolve(session.as_deref())?;
             surface.request("DELETE", &format!("/control/secrets/{name}"), None, &[])?;
-            println!("secret: {name}");
-            println!("set:    no");
+            capsule_runtime::report_println!("secret: {name}");
+            capsule_runtime::report_println!("set:    no");
             Ok(())
         }
     }
@@ -137,7 +137,7 @@ fn field(answer: &Value, key: &str, default: &str) -> String {
 }
 
 fn print_listing(listing: &Value) {
-    println!("session:  {}", field(listing, "session_id", "?"));
+    capsule_runtime::report_println!("session:  {}", field(listing, "session_id", "?"));
     let settings = listing
         .get("settings")
         .and_then(Value::as_array)
@@ -155,23 +155,23 @@ fn print_listing(listing: &Value) {
         .max()
         .unwrap_or(0);
     if !settings.is_empty() {
-        println!("settings:");
+        capsule_runtime::report_println!("settings:");
         for setting in &settings {
-            println!(
+            capsule_runtime::report_println!(
                 "  {:<width$}   {}",
                 field(setting, "name", "?"),
                 field(setting, "value", "?")
             );
             for line in choice_lines(setting) {
-                println!("      {line}");
+                capsule_runtime::report_println!("      {line}");
             }
         }
     }
     if !secrets.is_empty() {
-        println!("secrets:");
+        capsule_runtime::report_println!("secrets:");
         for secret in &secrets {
             let set = secret.get("set").and_then(Value::as_bool) == Some(true);
-            println!(
+            capsule_runtime::report_println!(
                 "  {:<width$}   {}",
                 field(secret, "name", "?"),
                 if set { "set" } else { "not set" }
@@ -340,12 +340,11 @@ fn read_secret(name: &str) -> Result<Vec<u8>, CliError> {
     let stdin = std::io::stdin();
     let mut value = Vec::new();
     let read = if stdin.is_terminal() {
-        eprint!("value for {name}: ");
-        let _ = std::io::stderr().flush();
+        capsule_runtime::report_eprint!("value for {name}: ");
         let echo = EchoOff::new();
         let read = stdin.lock().read_until(b'\n', &mut value);
         drop(echo);
-        eprintln!();
+        capsule_runtime::report_eprintln!();
         read
     } else {
         stdin.lock().read_to_end(&mut value)

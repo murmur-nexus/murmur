@@ -7,7 +7,6 @@
 
 // The formation line goes to stdout ahead of the entry member's own output, which the entry member
 // writes to the same inherited stream; a reader may close it at any point after that.
-#![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::path::{Path, PathBuf};
 

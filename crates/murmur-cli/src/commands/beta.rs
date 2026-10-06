@@ -35,20 +35,22 @@ fn run_beta_list() -> Result<(), CliError> {
     let features = compiled_beta_features();
 
     if features.is_empty() {
-        println!("This build has no beta features.");
+        capsule_runtime::report_println!("This build has no beta features.");
         return Ok(());
     }
 
-    println!("Beta features compiled into this build:\n");
+    capsule_runtime::report_println!("Beta features compiled into this build:\n");
     for f in &features {
         let status = if config.beta.is_enabled(f.name) {
             "enabled "
         } else {
             "disabled"
         };
-        println!("  {:<20} {}  {}", f.name, status, f.description);
+        capsule_runtime::report_println!("  {:<20} {}  {}", f.name, status, f.description);
     }
-    println!("\nUse `mur beta enable <name>` or `mur beta disable <name>` to opt in or out.");
+    capsule_runtime::report_println!(
+        "\nUse `mur beta enable <name>` or `mur beta disable <name>` to opt in or out."
+    );
     Ok(())
 }
 
@@ -58,7 +60,7 @@ fn run_beta_enable(feature: &str) -> Result<(), CliError> {
     let is_known = known.iter().any(|f| f.name == feature);
 
     if !is_known {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "Warning: '{}' is not compiled into this build. \
              The flag will be saved but has no effect until a build that includes it is installed.",
             feature
@@ -67,9 +69,9 @@ fn run_beta_enable(feature: &str) -> Result<(), CliError> {
 
     if config.beta.enable(feature) {
         save_mur_config(&config)?;
-        println!("Beta feature '{}' enabled.", feature);
+        capsule_runtime::report_println!("Beta feature '{}' enabled.", feature);
     } else {
-        println!("Beta feature '{}' is already enabled.", feature);
+        capsule_runtime::report_println!("Beta feature '{}' is already enabled.", feature);
     }
     Ok(())
 }
@@ -79,9 +81,9 @@ fn run_beta_disable(feature: &str) -> Result<(), CliError> {
 
     if config.beta.disable(feature) {
         save_mur_config(&config)?;
-        println!("Beta feature '{}' disabled.", feature);
+        capsule_runtime::report_println!("Beta feature '{}' disabled.", feature);
     } else {
-        println!("Beta feature '{}' is already disabled.", feature);
+        capsule_runtime::report_println!("Beta feature '{}' is already disabled.", feature);
     }
     Ok(())
 }

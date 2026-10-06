@@ -94,10 +94,10 @@ fn run_config_set(key: &str, value: &str, global: bool) -> Result<(), CliError> 
     let target = parse_key(key, global)?;
 
     if key == "inference.api_key" {
-        eprintln!("{INFERENCE_API_KEY_NOTE}");
+        capsule_runtime::report_eprintln!("{INFERENCE_API_KEY_NOTE}");
         if !global && is_literal_inference_api_key(value) {
             let path = project_mur_config_path()?;
-            eprintln!(
+            capsule_runtime::report_eprintln!(
                 "warning: writing a literal inference.api_key to {} has no effect; \
                  inference.api_key is always read from the global config \
                  (~/.murmur/config.yaml) — this project-level value will be ignored when \
@@ -120,7 +120,7 @@ fn run_config_set(key: &str, value: &str, global: bool) -> Result<(), CliError> 
     } else {
         save_project_mur_config(&config)?;
     }
-    println!("{}", set_message(key, global)?);
+    capsule_runtime::report_println!("{}", set_message(key, global)?);
 
     Ok(())
 }

@@ -8,6 +8,8 @@
 //! It shares `mur`'s allocator selection by including the same source file, because
 //! `murmur-cli` has no `[lib]` target for a second binary to `use`.
 
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 #[path = "../allocator.rs"]
 mod allocator;
 
@@ -99,11 +101,11 @@ fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(Some(args)) => args,
         Ok(None) => {
-            println!("{USAGE}");
+            capsule_runtime::report_println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("{message}");
+            capsule_runtime::report_eprintln!("{message}");
             return ExitCode::FAILURE;
         }
     };
@@ -112,13 +114,13 @@ fn main() -> ExitCode {
     let wasm = match std::fs::read(&args.component) {
         Ok(wasm) => wasm,
         Err(err) => {
-            eprintln!("cannot read {}: {err}", args.component.display());
+            capsule_runtime::report_eprintln!("cannot read {}: {err}", args.component.display());
             return ExitCode::FAILURE;
         }
     };
 
-    println!("{name}\tthreads_before\t{}", thread_count());
-    println!(
+    capsule_runtime::report_println!("{name}\tthreads_before\t{}", thread_count());
+    capsule_runtime::report_println!(
         "{name}\tconfig\trounds={}\tcompiles={}\tstores={}\tcomponent={}\tbytes={}",
         args.rounds,
         args.compiles,
@@ -130,9 +132,9 @@ fn main() -> ExitCode {
     for round in 1..=args.rounds {
         let compile_ns: u128 = compile_component_nanos(&wasm, args.compiles).iter().sum();
         let store_ns = store_churn_nanos(args.stores);
-        println!("{name}\t{round}\t{compile_ns}\t{store_ns}");
+        capsule_runtime::report_println!("{name}\t{round}\t{compile_ns}\t{store_ns}");
     }
 
-    println!("{name}\tthreads_after\t{}", thread_count());
+    capsule_runtime::report_println!("{name}\tthreads_after\t{}", thread_count());
     ExitCode::SUCCESS
 }

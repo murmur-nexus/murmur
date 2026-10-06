@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -2428,102 +2428,105 @@ fn fmt_session_short(id: &str) -> String {
 // ── Show ──────────────────────────────────────────────────────────────────────
 
 fn print_show(m: &TraceMetrics) {
-    println!("── Session ──────────────────────────────────────");
-    println!("session:    {}", m.session_id);
+    capsule_runtime::report_println!("── Session ──────────────────────────────────────");
+    capsule_runtime::report_println!("session:    {}", m.session_id);
     // Only for a capsule another capsule launched. One level up from here is where "why did this
     // run?" is answered, and this is the only line in the file that names it.
     if let Some(parent) = &m.spawned_by {
         match &m.spawned_by_delegation {
-            Some(id) => println!("Spawned by {parent} (delegation {id})"),
-            None => println!("Spawned by {parent}"),
+            Some(id) => capsule_runtime::report_println!("Spawned by {parent} (delegation {id})"),
+            None => capsule_runtime::report_println!("Spawned by {parent}"),
         }
     }
     if let Some(formation) = &m.formation_id {
-        println!("formation:  {formation}");
+        capsule_runtime::report_println!("formation:  {formation}");
     }
-    println!("capsule:    {} v{}", m.capsule_name, m.capsule_version);
-    println!("model:      {}", m.model);
-    println!("status:     {}", m.exit_status);
-    println!("duration:   {}", fmt_dur(m.duration_ms));
+    capsule_runtime::report_println!("capsule:    {} v{}", m.capsule_name, m.capsule_version);
+    capsule_runtime::report_println!("model:      {}", m.model);
+    capsule_runtime::report_println!("status:     {}", m.exit_status);
+    capsule_runtime::report_println!("duration:   {}", fmt_dur(m.duration_ms));
     if !m.capabilities.is_empty() {
-        println!("{:<11} {}", "capabilities:", m.capabilities.join(", "));
+        capsule_runtime::report_println!("{:<11} {}", "capabilities:", m.capabilities.join(", "));
     }
     if !m.tools_declared.is_empty() {
-        println!("{:<11} {}", "tools:", m.tools_declared.join(", "));
+        capsule_runtime::report_println!("{:<11} {}", "tools:", m.tools_declared.join(", "));
     }
     // Artifacts a running capsule pinned rather than the operator: each reached the model
     // marked untrusted.
     if let Some(line) = runtime_pins_line(&m.runtime_artifacts) {
-        println!("{line}");
+        capsule_runtime::report_println!("{line}");
     }
     // What was asked for against what this host could enforce. The two are read together:
     // a capsule that declared `sealed` and achieved `advisory` ran with neither.
     if let (Some(declared), Some(achieved)) = (&m.containment_declared, &m.containment_achieved) {
-        println!("{:<11} {} → {}", "containment:", declared, achieved);
+        capsule_runtime::report_println!("{:<11} {} → {}", "containment:", declared, achieved);
     }
     if let Some(exec) = m.workdir_exec {
-        println!(
+        capsule_runtime::report_println!(
             "{:<11} {}",
             "workdir exec:",
             if exec { "yes" } else { "no" }
         );
     }
     if let Some(grant) = &m.userns_grant {
-        println!("{:<11} {}", "userns:", grant);
+        capsule_runtime::report_println!("{:<11} {}", "userns:", grant);
     }
     if let Some(source) = &m.system_prompt_source {
         let sha = match &m.system_prompt_sha256 {
             Some(sha) => format!("  {}", fmt_sha_short(sha)),
             None => String::new(),
         };
-        println!("{:<11} {}{}", "prompt:", source, sha);
+        capsule_runtime::report_println!("{:<11} {}{}", "prompt:", source, sha);
     }
-    println!();
+    capsule_runtime::report_println!();
 
     // Beside the hook failures: on a `transport: process` session these are the only account of
     // an untested harness version, an unexpected auth mode, or a turn the harness refused.
     if !m.harness_lines.is_empty() {
-        println!("── Harness ──────────────────────────────────────");
+        capsule_runtime::report_println!("── Harness ──────────────────────────────────────");
         for line in &m.harness_lines {
-            println!("{}", line.0);
+            capsule_runtime::report_println!("{}", line.0);
         }
-        println!();
+        capsule_runtime::report_println!();
     }
 
     // Placed where it cannot be scrolled past: a hook that failed left the session running
     // as if it had returned nothing, and no other section says so.
     if !m.hook_failures.is_empty() {
-        println!("── Hook failures ────────────────────────────────");
+        capsule_runtime::report_println!("── Hook failures ────────────────────────────────");
         for f in &m.hook_failures {
-            println!("✗ {}  {}  {}", f.hook_name, f.event, f.arm);
+            capsule_runtime::report_println!("✗ {}  {}  {}", f.hook_name, f.event, f.arm);
         }
-        println!();
+        capsule_runtime::report_println!();
     }
 
     // Beside the hook failures, and for the same reason: this is the only record that something
     // an operator might go looking for is gone, and why.
     if !m.retentions.is_empty() {
-        println!("── Retention ────────────────────────────────────");
+        capsule_runtime::report_println!("── Retention ────────────────────────────────────");
         for r in &m.retentions {
             let dropped = r
                 .messages_dropped
                 .map(|n| format!(", {n} messages dropped"))
                 .unwrap_or_default();
-            println!(
+            capsule_runtime::report_println!(
                 "{}  {}  removed {}{}",
-                r.store, r.reason, r.removed, dropped
+                r.store,
+                r.reason,
+                r.removed,
+                dropped
             );
             if !r.targets.is_empty() {
-                println!("  {}", r.targets.join(", "));
+                capsule_runtime::report_println!("  {}", r.targets.join(", "));
             }
         }
-        println!();
+        capsule_runtime::report_println!();
     }
 
     if !m.context_seeds.is_empty() {
-        println!("── Context ──────────────────────────────────────");
+        capsule_runtime::report_println!("── Context ──────────────────────────────────────");
         for seed in &m.context_seeds {
-            println!(
+            capsule_runtime::report_println!(
                 "{}  {}  {} tokens (proposed {}, budget {})",
                 seed.hook_name,
                 seed.outcome,
@@ -2532,34 +2535,34 @@ fn print_show(m: &TraceMetrics) {
                 fmt_thousands(seed.budget_tokens)
             );
             if let Some(reason) = &seed.reason {
-                println!("  reason:   {}", reason);
+                capsule_runtime::report_println!("  reason:   {}", reason);
             }
             if !seed.message_ids.is_empty() {
-                println!("  messages: {}", seed.message_ids.join(", "));
+                capsule_runtime::report_println!("  messages: {}", seed.message_ids.join(", "));
             }
         }
-        println!();
+        capsule_runtime::report_println!();
     }
 
-    println!("── Turns ────────────────────────────────────────");
-    println!("count:      {}  (max: {})", m.total_turns, m.max_turns);
+    capsule_runtime::report_println!("── Turns ────────────────────────────────────────");
+    capsule_runtime::report_println!("count:      {}  (max: {})", m.total_turns, m.max_turns);
     for line in failed_call_lines(&m.inference_records) {
-        println!("{line}");
+        capsule_runtime::report_println!("{line}");
     }
-    println!();
+    capsule_runtime::report_println!();
 
-    println!("── Tokens ───────────────────────────────────────");
-    println!(
+    capsule_runtime::report_println!("── Tokens ───────────────────────────────────────");
+    capsule_runtime::report_println!(
         "input:      {}  (avg {}/turn)",
         fmt_thousands(m.total_input_tokens),
         fmt_opt_f(m.avg_input_per_turn())
     );
-    println!(
+    capsule_runtime::report_println!(
         "output:     {}  (avg {}/turn)",
         fmt_thousands(m.total_output_tokens),
         fmt_opt_f(m.avg_output_per_turn())
     );
-    println!(
+    capsule_runtime::report_println!(
         "total:      {}",
         fmt_thousands(m.total_input_tokens + m.total_output_tokens)
     );
@@ -2568,9 +2571,9 @@ fn print_show(m: &TraceMetrics) {
     // is estimator drift; under `process` only the cache and thinking members appear here,
     // because the harness's input and output counts are already the totals above.
     if let Some(p) = &m.provider_tokens {
-        println!("provider:   {}", p.parts().join(", "));
+        capsule_runtime::report_println!("provider:   {}", p.parts().join(", "));
     }
-    println!();
+    capsule_runtime::report_println!();
 
     let wire_turns: Vec<&InferenceRecord> = m
         .inference_records
@@ -2578,9 +2581,9 @@ fn print_show(m: &TraceMetrics) {
         .filter(|rec| rec.is_agent_loop() && rec.has_hashes())
         .collect();
     if !wire_turns.is_empty() || !m.tool_refreshes.is_empty() {
-        println!("── Wire ─────────────────────────────────────────");
+        capsule_runtime::report_println!("── Wire ─────────────────────────────────────────");
         for rec in &wire_turns {
-            println!(
+            capsule_runtime::report_println!(
                 "turn {}  system {}  tools {}  response {}  {} message{}",
                 rec.turn,
                 rec.system_sha
@@ -2600,29 +2603,36 @@ fn print_show(m: &TraceMetrics) {
             );
         }
         for refresh in &m.tool_refreshes {
-            println!("refreshed:  turn {}  {}", refresh.turn, refresh.changes());
+            capsule_runtime::report_println!(
+                "refreshed:  turn {}  {}",
+                refresh.turn,
+                refresh.changes()
+            );
         }
         if let Some(first) = wire_turns.first() {
-            println!(
+            capsule_runtime::report_println!(
                 "bodies:     mur trace show --body system --turn {}",
                 first.turn
             );
         }
-        println!();
+        capsule_runtime::report_println!();
     }
 
-    println!("── Tool calls ───────────────────────────────────");
+    capsule_runtime::report_println!("── Tool calls ───────────────────────────────────");
     if m.total_tool_calls == 0 {
-        println!("count:      0");
+        capsule_runtime::report_println!("count:      0");
     } else {
-        println!(
+        capsule_runtime::report_println!(
             "count:      {}  ({} ok, {} error)  success {:.1}%",
             m.total_tool_calls,
             m.tool_ok,
             m.tool_error,
             m.tool_success_rate().unwrap_or(0.0)
         );
-        println!("latency:    avg {}", fmt_opt_dur(m.avg_tool_latency_ms()));
+        capsule_runtime::report_println!(
+            "latency:    avg {}",
+            fmt_opt_dur(m.avg_tool_latency_ms())
+        );
         let mut by_turn: BTreeMap<u32, Vec<&ToolCallRecord>> = BTreeMap::new();
         for rec in &m.tool_call_records {
             by_turn.entry(rec.turn).or_default().push(rec);
@@ -2652,16 +2662,16 @@ fn print_show(m: &TraceMetrics) {
                         )
                     })
                     .collect();
-                println!("  turn {}  {}", turn, parts.join("  "));
+                capsule_runtime::report_println!("  turn {}  {}", turn, parts.join("  "));
             } else if let Some(decision) = inference_map.get(&turn) {
-                println!("  turn {}  {}", turn, decision);
+                capsule_runtime::report_println!("  turn {}  {}", turn, decision);
             }
         }
     }
-    println!();
+    capsule_runtime::report_println!();
 
-    println!("── Redundant calls ──────────────────────────────");
-    println!("count:      {}", m.redundant_calls.len());
+    capsule_runtime::report_println!("── Redundant calls ──────────────────────────────");
+    capsule_runtime::report_println!("count:      {}", m.redundant_calls.len());
     for rec in &m.redundant_calls {
         // A plan step names no tool of its own, so its row is the site, the resource and the
         // prior site — one column shorter than a turn's.
@@ -2669,7 +2679,7 @@ fn print_show(m: &TraceMetrics) {
             Some(name) => format!("{name}  "),
             None => String::new(),
         };
-        println!(
+        capsule_runtime::report_println!(
             "  {}  {}{}  (re-reads {})",
             rec.site.label(),
             caller,
@@ -2677,21 +2687,24 @@ fn print_show(m: &TraceMetrics) {
             rec.prior.label()
         );
     }
-    println!();
+    capsule_runtime::report_println!();
 
-    println!("── Skill calls ──────────────────────────────────");
+    capsule_runtime::report_println!("── Skill calls ──────────────────────────────────");
     let total_skill = m.total_skill_calls();
     if total_skill == 0 {
-        println!("count:      0");
+        capsule_runtime::report_println!("count:      0");
     } else {
-        println!(
+        capsule_runtime::report_println!(
             "count:      {}  ({} ok, {} error)  success {:.1}%",
             total_skill,
             m.skill_ok,
             m.skill_error,
             m.skill_success_rate().unwrap_or(0.0)
         );
-        println!("latency:    avg {}", fmt_opt_dur(m.avg_skill_latency_ms()));
+        capsule_runtime::report_println!(
+            "latency:    avg {}",
+            fmt_opt_dur(m.avg_skill_latency_ms())
+        );
         let mut by_turn: BTreeMap<u32, Vec<&SkillCallRecord>> = BTreeMap::new();
         for rec in &m.skill_call_records {
             by_turn.entry(rec.turn).or_default().push(rec);
@@ -2701,33 +2714,36 @@ fn print_show(m: &TraceMetrics) {
                 .iter()
                 .map(|rec| skill_call_show_entry(rec))
                 .collect();
-            println!("  turn {}  {}", turn, parts.join("  "));
+            capsule_runtime::report_println!("  turn {}  {}", turn, parts.join("  "));
         }
     }
-    println!();
+    capsule_runtime::report_println!();
 
     if !m.artifacts_pulled.is_empty() {
-        println!("── Pulled at runtime ────────────────────────────");
+        capsule_runtime::report_println!("── Pulled at runtime ────────────────────────────");
         for pulled in &m.artifacts_pulled {
-            println!("{}", artifact_pulled_show_row(pulled));
+            capsule_runtime::report_println!("{}", artifact_pulled_show_row(pulled));
         }
-        println!();
+        capsule_runtime::report_println!();
     }
 
-    println!("── Shell calls ──────────────────────────────────");
+    capsule_runtime::report_println!("── Shell calls ──────────────────────────────────");
     if m.total_shell_calls == 0 {
-        println!("count:      0");
+        capsule_runtime::report_println!("count:      0");
     } else {
-        println!("count:      {}", m.total_shell_calls);
-        println!("exit codes: {}", fmt_exit_codes(&m.shell_exit_codes));
-        println!("latency:    avg {}", fmt_opt_dur(m.avg_shell_latency_ms()));
+        capsule_runtime::report_println!("count:      {}", m.total_shell_calls);
+        capsule_runtime::report_println!("exit codes: {}", fmt_exit_codes(&m.shell_exit_codes));
+        capsule_runtime::report_println!(
+            "latency:    avg {}",
+            fmt_opt_dur(m.avg_shell_latency_ms())
+        );
     }
-    println!();
+    capsule_runtime::report_println!();
 
-    println!("── Compaction ───────────────────────────────────");
+    capsule_runtime::report_println!("── Compaction ───────────────────────────────────");
     match &m.compaction {
-        None => println!("fired:      no"),
-        Some(c) => println!(
+        None => capsule_runtime::report_println!("fired:      no"),
+        Some(c) => capsule_runtime::report_println!(
             "fired:      yes  at turn {}  ({} → {} tokens)",
             c.turn,
             fmt_thousands(c.tokens_before),
@@ -2735,7 +2751,7 @@ fn print_show(m: &TraceMetrics) {
         ),
     }
     for d in &m.compactions_declined {
-        println!(
+        capsule_runtime::report_println!(
             "declined:   at turn {}  ({} tokens)  {}",
             d.turn,
             fmt_thousands(d.tokens),
@@ -2744,22 +2760,22 @@ fn print_show(m: &TraceMetrics) {
     }
 
     if let Some(formation) = &m.formation_ended {
-        println!();
-        println!("── Formation ended ──────────────────────────────");
-        println!("{}", formation_ended_show_row(formation));
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Formation ended ──────────────────────────────");
+        capsule_runtime::report_println!("{}", formation_ended_show_row(formation));
     }
 
     if let Some(spawner) = &m.spawner_ended {
-        println!();
-        println!("── Spawner ended ────────────────────────────────");
-        println!("{}", spawner_ended_show_row(spawner));
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Spawner ended ────────────────────────────────");
+        capsule_runtime::report_println!("{}", spawner_ended_show_row(spawner));
     }
 
     if !m.cancels.is_empty() {
-        println!();
-        println!("── Cancelled ────────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Cancelled ────────────────────────────────────");
         for c in &m.cancels {
-            println!(
+            capsule_runtime::report_println!(
                 "task_canceled  at {}  {}",
                 c.phase,
                 cancel_residue(&c.detached_work_ids, &c.delegation_ids)
@@ -2768,16 +2784,16 @@ fn print_show(m: &TraceMetrics) {
     }
 
     if !m.rejections.is_empty() {
-        println!();
-        println!("── Rejected ─────────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Rejected ─────────────────────────────────────");
         for r in &m.rejections {
-            println!("{}", rejected_show_row(r));
+            capsule_runtime::report_println!("{}", rejected_show_row(r));
         }
     }
 
     if !m.failures.is_empty() {
-        println!();
-        println!("── Failed ───────────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Failed ───────────────────────────────────────");
         for f in &m.failures {
             let task = f
                 .task_id
@@ -2788,35 +2804,41 @@ fn print_show(m: &TraceMetrics) {
                 .turn
                 .map(|turn| format!("  at turn {turn}"))
                 .unwrap_or_default();
-            println!("task_failed  {}{task}{turn}", f.cause);
-            println!("  reason: {}", f.reason);
+            capsule_runtime::report_println!("task_failed  {}{task}{turn}", f.cause);
+            capsule_runtime::report_println!("  reason: {}", f.reason);
         }
     }
 
     if !m.reopens.is_empty() {
-        println!();
-        println!("── Reopens ──────────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Reopens ──────────────────────────────────────");
         for r in &m.reopens {
             let reason: String = r.reason.chars().take(80).collect();
             let next_attempt = r
                 .next_attempt()
                 .map(|next| format!("{next}  "))
                 .unwrap_or_default();
-            println!(
+            capsule_runtime::report_println!(
                 "reopen {}  by {}  {next_attempt}“{}”",
-                r.reopen_number, r.hook_name, reason
+                r.reopen_number,
+                r.hook_name,
+                reason
             );
         }
     }
 
     if !m.denials.is_empty() {
-        println!();
-        println!("── Denied calls ─────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Denied calls ─────────────────────────────────");
         for d in &m.denials {
             let reason: String = d.reason.chars().take(80).collect();
-            println!(
+            capsule_runtime::report_println!(
                 "turn {}  {}  {}  by {}  “{}”",
-                d.turn, d.event, d.target, d.hook_name, reason
+                d.turn,
+                d.event,
+                d.target,
+                d.hook_name,
+                reason
             );
         }
     }
@@ -2826,28 +2848,33 @@ fn print_show(m: &TraceMetrics) {
     // run that attempted a protected write and was refused is a different result from one that
     // never tried.
     if !m.protected_path_denials.is_empty() {
-        println!();
-        println!("── Protected paths ──────────────────────────────");
-        println!(
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Protected paths ──────────────────────────────");
+        capsule_runtime::report_println!(
             "protected-path refusals: {}",
             m.protected_path_denials.len()
         );
         for d in &m.protected_path_denials {
-            println!(
+            capsule_runtime::report_println!(
                 "turn {}  {}  {}  path {}  rule {}  ({})",
-                d.turn, d.call, d.target, d.path, d.rule, d.signal
+                d.turn,
+                d.call,
+                d.target,
+                d.path,
+                d.rule,
+                d.signal
             );
         }
     }
 
     if !m.resource_lists.is_empty() || !m.resource_reads.is_empty() {
-        println!();
-        println!("── Resource plane ───────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Resource plane ───────────────────────────────");
         if !m.resource_lists.is_empty() {
-            println!("list:       {}", fmt_outcomes(&m.resource_lists));
+            capsule_runtime::report_println!("list:       {}", fmt_outcomes(&m.resource_lists));
         }
         if !m.resource_reads.is_empty() {
-            println!("read:       {}", fmt_outcomes(&m.resource_reads));
+            capsule_runtime::report_println!("read:       {}", fmt_outcomes(&m.resource_reads));
         }
     }
 
@@ -2859,48 +2886,48 @@ fn print_show(m: &TraceMetrics) {
         .filter(|rec| rec.is_agent_loop() && rec.served_by.is_some())
         .collect();
     if !served.is_empty() {
-        println!();
-        println!("── Driver choices ───────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Driver choices ───────────────────────────────");
         for rec in served {
             if let Some((choice, model)) = &rec.served_by {
-                println!("turn {}  on {choice} ({model})", rec.turn);
+                capsule_runtime::report_println!("turn {}  on {choice} ({model})", rec.turn);
             }
         }
     }
 
     if !m.control_changes.is_empty() || !m.control_refusals.is_empty() {
-        println!();
-        println!("── Control ──────────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Control ──────────────────────────────────────");
         for record in &m.control_changes {
-            println!(
+            capsule_runtime::report_println!(
                 "{}",
                 control_change_line(&record.change, Some(record.applied_turn))
             );
         }
         if !m.control_refusals.is_empty() {
-            println!("refused:    {}", fmt_outcomes(&m.control_refusals));
+            capsule_runtime::report_println!("refused:    {}", fmt_outcomes(&m.control_refusals));
         }
     }
 
     if !m.peer_mints.is_empty() || !m.peer_redeems.is_empty() || !m.peer_fetches.is_empty() {
-        println!();
-        println!("── Peer files ───────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Peer files ───────────────────────────────────");
         if !m.peer_mints.is_empty() {
-            println!("minted:     {}", fmt_outcomes(&m.peer_mints));
+            capsule_runtime::report_println!("minted:     {}", fmt_outcomes(&m.peer_mints));
         }
         if !m.peer_redeems.is_empty() {
-            println!("redeemed:   {}", fmt_outcomes(&m.peer_redeems));
+            capsule_runtime::report_println!("redeemed:   {}", fmt_outcomes(&m.peer_redeems));
         }
         if !m.peer_fetches.is_empty() {
-            println!("fetched:    {}", fmt_outcomes(&m.peer_fetches));
+            capsule_runtime::report_println!("fetched:    {}", fmt_outcomes(&m.peer_fetches));
         }
     }
 
     if !m.delegations.is_empty() {
-        println!();
-        println!("── Delegations ──────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Delegations ──────────────────────────────────");
         for d in &m.delegations {
-            println!(
+            capsule_runtime::report_println!(
                 "{}  {}@{}  {}  {}",
                 d.delegation_id.as_deref().unwrap_or("(none)"),
                 d.capsule,
@@ -2911,29 +2938,31 @@ fn print_show(m: &TraceMetrics) {
             // Carried on every outcome that is not `completed`, which is exactly where the
             // runtime writes one: a delegation that did nothing shows why rather than nothing.
             if let Some(reason) = &d.reason {
-                println!("  {reason}");
+                capsule_runtime::report_println!("  {reason}");
             }
             // The one join a reader would otherwise have to compose by hand, and the only thing
             // in this file that points outside it. Relative to this capsule's accessible workdir.
             if let (Some(workdir), Some(child)) = (&d.child_workdir, &d.child_session_id) {
-                println!("  child trace: {workdir}/.murmur/{child}/trace.jsonl");
+                capsule_runtime::report_println!(
+                    "  child trace: {workdir}/.murmur/{child}/trace.jsonl"
+                );
             }
         }
     }
 
     if !m.member_calls.is_empty() {
-        println!();
-        println!("── Member calls ─────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Member calls ─────────────────────────────────");
         for call in &m.member_calls {
-            println!("{}", member_call_show_row(call));
+            capsule_runtime::report_println!("{}", member_call_show_row(call));
         }
     }
 
     if !m.plan_runs.is_empty() {
-        println!();
-        println!("── Plan ─────────────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Plan ─────────────────────────────────────────");
         for run in &m.plan_runs {
-            println!(
+            capsule_runtime::report_println!(
                 "{}  {}  {} step{}  {}",
                 run.plan_id,
                 run.outcome.as_deref().unwrap_or("in flight"),
@@ -2941,17 +2970,19 @@ fn print_show(m: &TraceMetrics) {
                 if run.step_count == 1 { "" } else { "s" },
                 fmt_dur(run.duration_ms)
             );
-            println!(
+            capsule_runtime::report_println!(
                 "steps:      {} succeeded, {} failed, {} skipped",
-                run.steps_succeeded, run.steps_failed, run.steps_skipped
+                run.steps_succeeded,
+                run.steps_failed,
+                run.steps_skipped
             );
             if let Some(step) = &run.failed_step {
-                println!("failed at:  {step}");
+                capsule_runtime::report_println!("failed at:  {step}");
             }
             // Written only when the run ended for a reason no step's own line carries — a plan
             // that would not parse, a host that refused the scope, a DAG with nothing to run.
             if let Some(reason) = &run.reason {
-                println!("  {reason}");
+                capsule_runtime::report_println!("  {reason}");
             }
             // In authored order, so the DAG reads the way it was written and a step that never
             // ran is still listed. A settled step the `plan_start` does not name — a partial
@@ -2990,23 +3021,25 @@ fn print_show(m: &TraceMetrics) {
                     Some(shape) if shape.has_condition => "  conditional",
                     _ => "",
                 };
-                println!("  {step_id}  {kind}  {status}{attempts}{depends_on}{conditional}");
+                capsule_runtime::report_println!(
+                    "  {step_id}  {kind}  {status}{attempts}{depends_on}{conditional}"
+                );
                 if let Some(error) = settled.and_then(|step| step.error.as_deref()) {
-                    println!("    {error}");
+                    capsule_runtime::report_println!("    {error}");
                 }
             }
         }
     }
 
     if m.a2a_tasks_received > 0 || !m.a2a_sends.is_empty() {
-        println!();
-        println!("── A2A ──────────────────────────────────────────");
-        println!(
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── A2A ──────────────────────────────────────────");
+        capsule_runtime::report_println!(
             "received:   {} task{}",
             m.a2a_tasks_received,
             if m.a2a_tasks_received == 1 { "" } else { "s" }
         );
-        println!(
+        capsule_runtime::report_println!(
             "sent:       {} message{}",
             m.a2a_sends.len(),
             if m.a2a_sends.len() == 1 { "" } else { "s" }
@@ -3018,7 +3051,7 @@ fn print_show(m: &TraceMetrics) {
             }
         }
         for url in peers {
-            println!("  → {}", url);
+            capsule_runtime::report_println!("  → {}", url);
         }
     }
 }
@@ -3294,10 +3327,9 @@ fn print_body(path: &Path, arg: &str, turn: Option<u32>) -> Result<(), CliError>
         _ => CliError::new(E_IO_003, format!("failed to read {}: {e}", blob.display())),
     })?;
 
-    let mut out = std::io::stdout();
-    out.write_all(&bytes)
-        .and_then(|()| out.flush())
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to write body to stdout: {e}")))
+    // A reader that stops early has the bytes it wanted; any other refusal is reported by `main`.
+    capsule_runtime::diagnostic::report_to_stdout(&bytes);
+    Ok(())
 }
 
 pub(crate) fn run_trace_show(
@@ -3337,7 +3369,7 @@ pub(crate) fn run_trace_show(
     let (metrics, tasks) = load_metrics(&path)?;
     print_show(&metrics);
     if tasks.len() > 1 {
-        println!("── Tasks ───────────────────────────────────────");
+        capsule_runtime::report_println!("── Tasks ───────────────────────────────────────");
         for (i, t) in tasks.iter().enumerate() {
             let short_id = if t.task_id.len() >= 12 {
                 &t.task_id[..12]
@@ -3349,7 +3381,7 @@ pub(crate) fn run_trace_show(
             } else {
                 String::new()
             };
-            println!(
+            capsule_runtime::report_println!(
                 "task {}  {}  turns: {}  in: {}  out: {}  {}  {}{}",
                 i + 1,
                 short_id,
@@ -3366,7 +3398,7 @@ pub(crate) fn run_trace_show(
         // Written by a runtime, so it parses; a value that does not names no formation to list.
         if let (Ok(formation), Some(root)) = (FormationId::parse(formation), session_root(&path)) {
             let search = search_formation(&root, formation_member_roots(&formation), &formation)?;
-            println!();
+            capsule_runtime::report_println!();
             print_formation(&formation, &search);
         }
     }
@@ -3421,26 +3453,26 @@ fn session_root(trace: &Path) -> Option<PathBuf> {
 /// Follows no delegation edge out of the searched roots, so a member's child recorded elsewhere
 /// is counted and pointed at rather than listed.
 fn print_formation(formation: &FormationId, search: &FormationSearch) {
-    println!("── Formation ────────────────────────────────────");
-    println!("formation:  {formation}");
+    capsule_runtime::report_println!("── Formation ────────────────────────────────────");
+    capsule_runtime::report_println!("formation:  {formation}");
     for line in searched_lines(search) {
-        println!("{line}");
+        capsule_runtime::report_println!("{line}");
     }
     let found = &search.found;
     for line in formation_member_lines(&found.members) {
-        println!("{line}");
+        capsule_runtime::report_println!("{line}");
     }
     if !found.children_elsewhere.is_empty() {
-        println!(
+        capsule_runtime::report_println!(
             "delegated children not under these roots: {} — `mur trace show <member>` names each child trace",
             found.children_elsewhere.len()
         );
     }
     let calls = formation_calls(&found.members);
     if !calls.is_empty() {
-        println!("calls:      {}", calls.len());
+        capsule_runtime::report_println!("calls:      {}", calls.len());
         for line in formation_call_lines(&calls) {
-            println!("{line}");
+            capsule_runtime::report_println!("{line}");
         }
     }
 }
@@ -4006,7 +4038,7 @@ fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
         1 => "1 task, ".to_string(),
         n => format!("{n} tasks, "),
     };
-    println!(
+    capsule_runtime::report_println!(
         "Session {}  ({}{} turn{})",
         session_id,
         task_note,
@@ -4017,7 +4049,7 @@ fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
     for root in roots {
         walk_steps_tree(records, &children, root, 0, verbose);
     }
-    println!();
+    capsule_runtime::report_println!();
 }
 
 fn walk_steps_tree(
@@ -4030,9 +4062,9 @@ fn walk_steps_tree(
     let child_depth = match steps_row(&records[index], verbose) {
         Some(row) => {
             if matches!(records[index].event, TraceEvent::TaskStart(_)) {
-                println!();
+                capsule_runtime::report_println!();
             }
-            println!("{}{}", "  ".repeat(depth), row);
+            capsule_runtime::report_println!("{}{}", "  ".repeat(depth), row);
             depth + 1
         }
         // A line the tree does not render — `session_start` itself, and the session-level
@@ -4078,13 +4110,13 @@ fn print_steps_flat(records: &[TraceRecord], verbose: bool) {
     }
 
     let n = inferences.len();
-    println!(
+    capsule_runtime::report_println!(
         "Session {}  ({} turn{})",
         session_id,
         n,
         if n == 1 { "" } else { "s" }
     );
-    println!();
+    capsule_runtime::report_println!();
 
     // Build rows first so we can compute max tool name width for alignment.
     let rows: Vec<(u32, String, String, String, String)> = inferences
@@ -4120,16 +4152,26 @@ fn print_steps_flat(records: &[TraceRecord], verbose: bool) {
     for (turn, decision, tool_display, dur_str, input_summary) in &rows {
         let tool_padded = format!("{:<width$}", tool_display, width = max_tool_width);
         if verbose && !input_summary.is_empty() {
-            println!(
+            capsule_runtime::report_println!(
                 "  {:<3}{:<13}{}{:<5}   {}",
-                turn, decision, tool_padded, dur_str, input_summary
+                turn,
+                decision,
+                tool_padded,
+                dur_str,
+                input_summary
             );
         } else {
-            println!("  {:<3}{:<13}{}{}", turn, decision, tool_padded, dur_str);
+            capsule_runtime::report_println!(
+                "  {:<3}{:<13}{}{}",
+                turn,
+                decision,
+                tool_padded,
+                dur_str
+            );
         }
     }
 
-    println!();
+    capsule_runtime::report_println!();
 }
 
 fn extract_input_summary(v: &serde_json::Value) -> String {
@@ -4154,26 +4196,29 @@ fn extract_input_summary(v: &serde_json::Value) -> String {
 }
 
 fn print_session_block(m: &TraceMetrics) {
-    println!(
+    capsule_runtime::report_println!(
         "Session {}  {}  {} turn{}",
         fmt_session_short(&m.session_id),
         fmt_dur(m.duration_ms),
         m.total_turns,
         if m.total_turns == 1 { "" } else { "s" }
     );
-    println!();
+    capsule_runtime::report_println!();
 
     if m.tool_error > 0 {
-        println!(
+        capsule_runtime::report_println!(
             "  {:<14} {}  ({} ok, {} error)",
-            "Tool calls:", m.total_tool_calls, m.tool_ok, m.tool_error
+            "Tool calls:",
+            m.total_tool_calls,
+            m.tool_ok,
+            m.tool_error
         );
     } else {
-        println!("  {:<14} {}", "Tool calls:", m.total_tool_calls);
+        capsule_runtime::report_println!("  {:<14} {}", "Tool calls:", m.total_tool_calls);
     }
 
     if m.total_shell_calls > 0 {
-        println!(
+        capsule_runtime::report_println!(
             "  {:<14} {}  exit codes: {}",
             "Shell calls:",
             m.total_shell_calls,
@@ -4182,7 +4227,7 @@ fn print_session_block(m: &TraceMetrics) {
     }
 
     if !m.redundant_calls.is_empty() {
-        println!("  Redundant calls: {}", m.redundant_calls.len());
+        capsule_runtime::report_println!("  Redundant calls: {}", m.redundant_calls.len());
     }
 
     if let Some(avg_tool) = m.avg_tool_latency_ms() {
@@ -4190,7 +4235,7 @@ fn print_session_block(m: &TraceMetrics) {
             .avg_shell_latency_ms()
             .map(|v| format!("  shell {}", fmt_dur(v as u64)))
             .unwrap_or_default();
-        println!(
+        capsule_runtime::report_println!(
             "  {:<14} tool {}{}",
             "Avg latency:",
             fmt_dur(avg_tool as u64),
@@ -4198,7 +4243,7 @@ fn print_session_block(m: &TraceMetrics) {
         );
     }
 
-    println!();
+    capsule_runtime::report_println!();
 }
 
 // ── Diff ──────────────────────────────────────────────────────────────────────
@@ -4260,11 +4305,13 @@ fn print_diff(a: &TraceMetrics, b: &TraceMetrics) {
     const COL: usize = 22;
     const VAL: usize = 16;
 
-    println!(
+    capsule_runtime::report_println!(
         "{:<COL$} {:<VAL$} {:<VAL$} Delta",
-        "Metric", "Run A", "Run B"
+        "Metric",
+        "Run A",
+        "Run B"
     );
-    println!(
+    capsule_runtime::report_println!(
         "{} {} {} {}",
         "─".repeat(COL),
         "─".repeat(VAL),
@@ -4274,7 +4321,7 @@ fn print_diff(a: &TraceMetrics, b: &TraceMetrics) {
 
     macro_rules! row {
         ($label:expr, $va:expr, $vb:expr, $delta:expr) => {
-            println!(
+            capsule_runtime::report_println!(
                 "{:<COL$} {:<VAL$} {:<VAL$} {}",
                 $label,
                 $va.to_string(),
@@ -4477,7 +4524,7 @@ fn print_prefix_line(label: &str, a: Option<&String>, b: Option<&String>) {
         (None, Some(y)) => format!("{:<10} A not recorded  B {}", "only in B", fmt_sha_short(y)),
         (None, None) => format!("{:<10}", "not recorded"),
     };
-    println!("{:<15}{}", label, body);
+    capsule_runtime::report_println!("{:<15}{}", label, body);
 }
 
 /// Where two runs' prompts stopped agreeing — the answer to "why did my cache miss".
@@ -4485,8 +4532,8 @@ fn print_prefix_line(label: &str, a: Option<&String>, b: Option<&String>) {
 /// Divergence has no polarity: neither run is better for having a longer or shorter agreeing
 /// prefix, so no `(A better)`/`(B better)` marker appears anywhere in this section.
 fn print_prefix_divergence(a: &TraceMetrics, b: &TraceMetrics) {
-    println!();
-    println!("── Prefix divergence ────────────────────────────");
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("── Prefix divergence ────────────────────────────");
 
     let turns_a = hashed_turns(a);
     let turns_b = hashed_turns(b);
@@ -4494,17 +4541,21 @@ fn print_prefix_divergence(a: &TraceMetrics, b: &TraceMetrics) {
     // record from a session that recorded hashes and stored no bodies.
     match (turns_a.is_empty(), turns_b.is_empty()) {
         (true, true) => {
-            println!(
+            capsule_runtime::report_println!(
                 "runs A and B recorded no content hashes — both ran under trace.capture: none"
             );
             return;
         }
         (true, false) => {
-            println!("run A recorded no content hashes — it ran under trace.capture: none");
+            capsule_runtime::report_println!(
+                "run A recorded no content hashes — it ran under trace.capture: none"
+            );
             return;
         }
         (false, true) => {
-            println!("run B recorded no content hashes — it ran under trace.capture: none");
+            capsule_runtime::report_println!(
+                "run B recorded no content hashes — it ran under trace.capture: none"
+            );
             return;
         }
         (false, false) => {}
@@ -4518,7 +4569,7 @@ fn print_prefix_divergence(a: &TraceMetrics, b: &TraceMetrics) {
     print_prefix_line("tool schemas:", tools_a, tools_b);
     for (run, changed) in [("A", sys_changed_a), ("B", sys_changed_b)] {
         if let Some((turn, sha)) = changed {
-            println!(
+            capsule_runtime::report_println!(
                 "note:          run {} changes its system prompt at turn {} ({})",
                 run,
                 turn,
@@ -4567,7 +4618,7 @@ fn print_prefix_divergence(a: &TraceMetrics, b: &TraceMetrics) {
             (None, Some(_)) => "only in run B".to_string(),
             (None, None) => continue,
         };
-        println!("turn {}:  {}", turn, line);
+        capsule_runtime::report_println!("turn {}:  {}", turn, line);
     }
 }
 
@@ -4655,7 +4706,7 @@ fn stat_max(values: &[f64]) -> f64 {
 fn print_stat_row(label: &str, values: &[f64], format_fn: &dyn Fn(f64) -> String) {
     const COL: usize = 22;
     const VAL: usize = 14;
-    println!(
+    capsule_runtime::report_println!(
         "{:<COL$} {:<VAL$} {:<VAL$} {:<VAL$} {}",
         label,
         format_fn(stat_mean(values)),
@@ -4666,16 +4717,19 @@ fn print_stat_row(label: &str, values: &[f64], format_fn: &dyn Fn(f64) -> String
 }
 
 fn print_report(workdir: &Path, stats: &[RunStats]) {
-    println!("Sessions: {}  ({})", stats.len(), workdir.display());
-    println!();
+    capsule_runtime::report_println!("Sessions: {}  ({})", stats.len(), workdir.display());
+    capsule_runtime::report_println!();
 
     const COL: usize = 22;
     const VAL: usize = 14;
-    println!(
+    capsule_runtime::report_println!(
         "{:<COL$} {:<VAL$} {:<VAL$} {:<VAL$} Max",
-        "Metric", "Mean", "StdDev", "Min"
+        "Metric",
+        "Mean",
+        "StdDev",
+        "Min"
     );
-    println!(
+    capsule_runtime::report_println!(
         "{} {} {} {} {}",
         "─".repeat(COL),
         "─".repeat(VAL),
@@ -4704,8 +4758,8 @@ fn print_report(workdir: &Path, stats: &[RunStats]) {
     print_stat_row("shell calls", &shells, &|v| format!("{:.1}", v));
     print_stat_row("redundant calls", &redundants, &|v| format!("{:.1}", v));
 
-    println!();
-    println!("Exit status:");
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("Exit status:");
     let mut exit_dist: HashMap<String, usize> = HashMap::new();
     for s in stats {
         *exit_dist.entry(s.exit_status.clone()).or_insert(0) += 1;
@@ -4714,7 +4768,7 @@ fn print_report(workdir: &Path, stats: &[RunStats]) {
     let mut sorted: Vec<(&String, &usize)> = exit_dist.iter().collect();
     sorted.sort_by_key(|(k, _)| k.as_str());
     for (status, count) in &sorted {
-        println!(
+        capsule_runtime::report_println!(
             "  {:<24} {}  ({:.1}%)",
             status,
             count,
@@ -4826,7 +4880,7 @@ pub(crate) fn run_trace_report(
         ));
     }
     if skipped > 0 {
-        eprintln!("note: skipped {} incomplete session(s)", skipped);
+        capsule_runtime::report_eprintln!("note: skipped {} incomplete session(s)", skipped);
     }
 
     for m in &session_metrics {
@@ -4851,15 +4905,20 @@ pub(crate) fn run_trace_report(
     print_report(&workdir, &run_stats);
 
     if !all_task_metrics.is_empty() {
-        println!();
-        println!("── Per-task averages (multi-task sessions only) ──────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!(
+            "── Per-task averages (multi-task sessions only) ──────────────"
+        );
         const COL: usize = 22;
         const VAL: usize = 14;
-        println!(
+        capsule_runtime::report_println!(
             "{:<COL$} {:<VAL$} {:<VAL$} {:<VAL$} Max",
-            "Metric", "Mean", "StdDev", "Min"
+            "Metric",
+            "Mean",
+            "StdDev",
+            "Min"
         );
-        println!(
+        capsule_runtime::report_println!(
             "{} {} {} {} {}",
             "─".repeat(COL),
             "─".repeat(VAL),
@@ -4890,7 +4949,7 @@ pub(crate) fn run_trace_report(
         print_stat_row("task duration (ms)", &task_durations, &|v| {
             fmt_thousands(v as u64)
         });
-        println!("Tasks: {}", all_task_metrics.len());
+        capsule_runtime::report_println!("Tasks: {}", all_task_metrics.len());
     }
 
     Ok(())

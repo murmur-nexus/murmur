@@ -44,7 +44,7 @@ section that explains it.
 | `E-EVAL-002` | No eval file found for the session named on the command line | [`mur eval`](cli.md#mur-eval) |
 | `E-IO-001` | File or directory not found | — |
 | `E-IO-002` | Permission denied on a host path (the host's own permissions, not a capsule capability) | — |
-| `E-IO-003` | General I/O error (read/write failure) | — |
+| `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
 | `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication) or one declared beside a non-empty `capabilities.spawn.allow`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |

@@ -555,7 +555,7 @@ fn serve_on_port(html: &str, port: u16) -> Result<(), CliError> {
         .map_err(|e| CliError::new(E_IO_003, format!("failed to bind port {port}: {e}")))?;
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
-    eprintln!("murmur: serving topology at {url}  (Ctrl+C to stop)");
+    capsule_runtime::report_eprintln!("murmur: serving topology at {url}  (Ctrl+C to stop)");
     open_browser(&url);
 
     while let Ok((mut stream, _)) = listener.accept() {
@@ -590,7 +590,7 @@ pub(crate) fn run_topology(args: &TopologyArgs) -> Result<(), CliError> {
 
     let tempo_version = tempo.detect_version();
     if let Some(ref v) = tempo_version {
-        eprintln!("murmur: Tempo {v}");
+        capsule_runtime::report_eprintln!("murmur: Tempo {v}");
     }
 
     let trace_ids = tempo.search_capsule_sessions(start, end, 500)?;
@@ -601,13 +601,13 @@ pub(crate) fn run_topology(args: &TopologyArgs) -> Result<(), CliError> {
             .map(|v| v.starts_with('3'))
             .unwrap_or(false);
         if is_v3 {
-            eprintln!(
+            capsule_runtime::report_eprintln!(
                 "murmur: hint: Tempo v3 requires 'block: version: vParquet4' under \
                  storage.trace in tempo.yaml — restart with \
                  'docker compose down -v && docker compose up -d' after editing"
             );
         } else {
-            eprintln!(
+            capsule_runtime::report_eprintln!(
                 "murmur: hint: WAL flush takes 60–90 s after spans are posted — \
                  retry if sessions were just recorded; also confirm tempo.yaml has \
                  'block: version: vParquet3' under storage.trace"
@@ -619,7 +619,7 @@ pub(crate) fn run_topology(args: &TopologyArgs) -> Result<(), CliError> {
     for trace_id in &trace_ids {
         match tempo.get_trace(trace_id) {
             Ok(t) => traces.push((trace_id.clone(), t)),
-            Err(e) => eprintln!("murmur: warning: {e}"),
+            Err(e) => capsule_runtime::report_eprintln!("murmur: warning: {e}"),
         }
     }
 
@@ -630,7 +630,7 @@ pub(crate) fn run_topology(args: &TopologyArgs) -> Result<(), CliError> {
         serve_on_port(&html, port)?;
     } else if let Some(output_path) = &args.output {
         write_html_file(output_path, &html)?;
-        println!("murmur: topology written to {}", output_path.display());
+        capsule_runtime::report_println!("murmur: topology written to {}", output_path.display());
     } else {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -638,7 +638,7 @@ pub(crate) fn run_topology(args: &TopologyArgs) -> Result<(), CliError> {
             .as_secs();
         let tmp_path = PathBuf::from(format!("/tmp/murmur-topology-{ts}.html"));
         write_html_file(&tmp_path, &html)?;
-        println!("murmur: opening topology at {}", tmp_path.display());
+        capsule_runtime::report_println!("murmur: opening topology at {}", tmp_path.display());
         open_browser(tmp_path.to_str().unwrap_or_default());
     }
 

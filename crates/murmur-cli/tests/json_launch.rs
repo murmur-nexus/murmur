@@ -814,6 +814,100 @@ fn json_launch_answers_its_door_after_the_supervisor_stops_reading() {
     );
 }
 
+/// The human-readable launch, with no `--json`: a supervisor reads up to the `murmur: url` line
+/// and closes the pipe. The session serves a task at its door, ends on its own terms, and the
+/// `status:` line its reader can no longer take lands in the session's `logs/bootstrap.log`.
+#[test]
+fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
+    let server = end_turn_server("human launch door");
+    let user_workdir = tempfile::tempdir().unwrap();
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--workdir",
+            user_workdir.path().to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mur should spawn");
+    let stderr = drain_on_thread(child.stderr.take().expect("stderr should be piped"));
+
+    let url = {
+        let mut reader = BufReader::new(child.stdout.take().expect("stdout should be piped"));
+        loop {
+            let mut line = String::new();
+            let read = reader
+                .read_line(&mut line)
+                .expect("stdout should be readable");
+            assert_ne!(read, 0, "stdout ended before the `murmur: url` line");
+            if let Some(url) = line.trim_end().strip_prefix("murmur: url ") {
+                break url.to_string();
+            }
+        }
+        // `reader` is dropped here: every later write to stdout fails with `EPIPE`.
+    };
+
+    let response = http_post_json(
+        &url,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {"message": {
+                "messageId": "msg-1",
+                "role": "user",
+                "parts": [{"text": "human launch door"}]
+            }}
+        })
+        .to_string(),
+    );
+    assert!(
+        response["result"]["id"].as_str().is_some(),
+        "the door should accept a task; got: {response}"
+    );
+
+    let status = child.wait().expect("mur should exit");
+    let stderr = stderr.join().expect("stderr drain should not panic");
+    assert_capsule_survived(status, &stderr);
+
+    let session_dir = fs::read_dir(user_workdir.path().join(".murmur"))
+        .expect("--workdir should hold a .murmur directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.join("trace.jsonl").is_file())
+        .expect("the session should have written a trace");
+    let trace = fs::read_to_string(session_dir.join("trace.jsonl")).expect("should read trace");
+    let event_types: Vec<String> = trace
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| event["event_type"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        event_types.iter().any(|t| t == "task_end"),
+        "the task submitted through the door should have run; trace was:\n{trace}"
+    );
+    assert_eq!(
+        event_types.last().map(String::as_str),
+        Some("session_end"),
+        "the session should end with session_end; trace was:\n{trace}"
+    );
+    let bootstrap_log = fs::read_to_string(session_dir.join("logs").join("bootstrap.log"))
+        .expect("the refused lines should land in logs/bootstrap.log");
+    assert!(
+        bootstrap_log
+            .lines()
+            .any(|line| line.starts_with("status:")),
+        "the status line should be kept in bootstrap.log; it was:\n{bootstrap_log}"
+    );
+}
+
 // ── Door tokens ───────────────────────────────────────────────────────────────
 
 /// A capsule declaring `network.authentication` puts every token it minted on its readiness line,

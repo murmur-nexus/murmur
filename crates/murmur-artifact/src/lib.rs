@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// Warnings go through `warn_line`: a bare print panics when its reader has closed the stream.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod artifact;
 pub mod artifact_ref;
@@ -23,6 +25,13 @@ pub mod trace_capture;
 pub mod unknown_manifest_keys;
 pub mod wit_contract;
 pub mod zip_guard;
+
+/// Write one warning line to standard error. A refused write is dropped: a reader that closed
+/// the stream does not want the warning, and must not abort the command that raised it.
+pub(crate) fn warn_line(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
 
 pub use artifact::{
     declared_runtime_from_artifact_bytes, load_manifest_from_artifact,

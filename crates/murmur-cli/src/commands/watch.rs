@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
 
 use serde_json::Value;
@@ -81,7 +81,7 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
     // Which tool the operator is looking at, said once, on stderr so piping stdout is unaffected.
     // The same keystroke means opposite things in the two places a capsule is watched from: here
     // it ends the watch, in the nexus CLI it ends the capsule.
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "[murmur] watching {} — Ctrl-C ends the watch, not the capsule; use `mur stop` to end \
          the capsule",
         target.label()
@@ -89,9 +89,11 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
 
     match read_stream(reader, &mut std::io::stdout().lock()) {
         Ok(StreamEnd::CapsuleClosed) => {
-            eprintln!("[murmur] capsule closed");
+            capsule_runtime::report_eprintln!("[murmur] capsule closed");
             Ok(())
         }
+        // The reader has what it wanted; the capsule is left running.
+        Ok(StreamEnd::ReaderClosed) => Ok(()),
         Ok(StreamEnd::ConnectionLost { last_event_id }) => {
             let position = match last_event_id {
                 Some(id) => format!("after event id {id}"),
@@ -123,6 +125,8 @@ pub(crate) enum StreamEnd {
     /// Ids are unique and ascending within a capsule session, so it is the `Last-Event-ID` a new
     /// `stream/watch` connection resumes after.
     ConnectionLost { last_event_id: Option<u64> },
+    /// Standard output was closed by its reader.
+    ReaderClosed,
 }
 
 /// The stderr warning for a `lagged` frame, naming how many live frames this connection lost.
@@ -133,8 +137,9 @@ fn lagged_warning(missed: u64) -> String {
 /// Read a `stream/watch` SSE body to its end, rendering `status`, `artifact` and `text` frames to
 /// `out` and warnings to stderr.
 ///
-/// `reader` is positioned after the HTTP response headers. Errors only when writing to `out`
-/// fails; a failed read ends the stream as [`StreamEnd::ConnectionLost`].
+/// `reader` is positioned after the HTTP response headers. A write to `out` that fails with
+/// `BrokenPipe` ends the stream as [`StreamEnd::ReaderClosed`]; any other failed write is the
+/// error. A failed read ends the stream as [`StreamEnd::ConnectionLost`].
 pub(crate) fn read_stream(
     mut reader: impl BufRead,
     out: &mut impl Write,
@@ -179,26 +184,33 @@ pub(crate) fn read_stream(
                             .ok()
                             .and_then(|v| v.get("first_available_id").and_then(Value::as_u64))
                             .unwrap_or(0);
-                        eprintln!("[murmur] warning: buffer overflow — some earlier events were lost (first available id: {first_id})");
+                        capsule_runtime::report_eprintln!("[murmur] warning: buffer overflow — some earlier events were lost (first available id: {first_id})");
                     }
                     "lagged" => {
                         let missed = serde_json::from_str::<Value>(&current_data)
                             .ok()
                             .and_then(|v| v.get("missed").and_then(Value::as_u64))
                             .unwrap_or(0);
-                        eprintln!("{}", lagged_warning(missed));
+                        capsule_runtime::report_eprintln!("{}", lagged_warning(missed));
                     }
                     "capsule-closed" => return Ok(StreamEnd::CapsuleClosed),
                     "status" | "artifact" | "text" => {
                         // A `final` status ends one task, not the capsule, so the watch goes on.
-                        dispatch_sse_event(
+                        let rendered = dispatch_sse_event(
                             out,
                             &current_event_type,
                             &current_data,
                             &conversation_mode,
                             &mut task_context_map,
                             &mut context_turns,
-                        )?;
+                        );
+                        match rendered {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                                return Ok(StreamEnd::ReaderClosed)
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     // Reasoning chunks are not shown.
                     "thinking" => {}
@@ -629,5 +641,43 @@ mod tests {
     fn frame_from_a_runtime_without_outcome_fields_renders_without_brackets() {
         let artifact = json!({ "tool_name": "bash", "content": "hello" });
         assert_eq!(artifact_header(&artifact), "[artifact] tool: bash");
+    }
+
+    /// A stdout whose every write fails with `kind`.
+    struct Refusing(std::io::ErrorKind);
+
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "refused"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "refused"))
+        }
+    }
+
+    const STATUS_THEN_MORE: &str = "id: 0\nevent: status\ndata: {\"id\":\"tsk_1\",\"status\":{\"state\":\"working\",\"message\":\"inference turn 1\"},\"final\":false}\n\n\
+         id: 1\nevent: capsule-closed\ndata: {}\n\n";
+
+    #[test]
+    fn a_closed_reader_ends_the_stream_as_reader_closed() {
+        let body = format!("{ACK}{STATUS_THEN_MORE}");
+        let end = read_stream(
+            body.as_bytes(),
+            &mut Refusing(std::io::ErrorKind::BrokenPipe),
+        )
+        .unwrap();
+        assert_eq!(end, StreamEnd::ReaderClosed);
+    }
+
+    #[test]
+    fn any_other_write_failure_is_an_error() {
+        let body = format!("{ACK}{STATUS_THEN_MORE}");
+        let error = read_stream(
+            body.as_bytes(),
+            &mut Refusing(std::io::ErrorKind::StorageFull),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
     }
 }

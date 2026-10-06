@@ -67,24 +67,30 @@ pub(crate) fn run_conversation_ls(
 
     if json {
         let rows: Vec<_> = summaries.iter().map(summary_json).collect();
-        println!("{}", serde_json::Value::Array(rows));
+        capsule_runtime::report_println!("{}", serde_json::Value::Array(rows));
         return Ok(());
     }
 
     if summaries.is_empty() {
         match record {
-            Some(record) => println!("No conversation records under record store '{record}'."),
-            None => println!("No conversation records."),
+            Some(record) => capsule_runtime::report_println!(
+                "No conversation records under record store '{record}'."
+            ),
+            None => capsule_runtime::report_println!("No conversation records."),
         }
         return Ok(());
     }
 
-    println!(
+    capsule_runtime::report_println!(
         "{:<24} {:<28} {:>8} {:>10}  {:<20} TRUNCATED",
-        "RECORD", "CONTEXT", "MESSAGES", "SIZE", "LAST TOUCHED"
+        "RECORD",
+        "CONTEXT",
+        "MESSAGES",
+        "SIZE",
+        "LAST TOUCHED"
     );
     for summary in &summaries {
-        println!(
+        capsule_runtime::report_println!(
             "{:<24} {:<28} {:>8} {:>10}  {:<20} {}",
             summary.record,
             summary.context_id,
@@ -140,7 +146,7 @@ fn report_message(message_id: &str, json: bool) -> Result<(), CliError> {
                 row
             })
             .collect();
-        println!(
+        capsule_runtime::report_println!(
             "{}",
             json!({"message_id": message_id, "locations": rows,
                    "status": if found.is_empty() { "unknown" } else { "found" }})
@@ -149,22 +155,24 @@ fn report_message(message_id: &str, json: bool) -> Result<(), CliError> {
     }
 
     if found.is_empty() {
-        println!("unknown: {message_id} is in no record on this host");
+        capsule_runtime::report_println!("unknown: {message_id} is in no record on this host");
         return Ok(());
     }
     for location in &found {
         match &location.status {
-            MessageStatus::Present { position, total } => println!(
+            MessageStatus::Present { position, total } => capsule_runtime::report_println!(
                 "present:   {message_id} is message {position} of {total} in {}/{}",
-                location.record, location.context_id
+                location.record,
+                location.context_id
             ),
             MessageStatus::Truncated {
                 dropped,
                 oldest_surviving_id,
-            } => println!(
+            } => capsule_runtime::report_println!(
                 "truncated: {message_id} was dropped from {}/{} ({dropped} messages dropped; \
                  oldest surviving is {oldest_surviving_id})",
-                location.record, location.context_id
+                location.record,
+                location.context_id
             ),
             MessageStatus::Unknown => {}
         }
@@ -181,7 +189,7 @@ pub(crate) fn run_conversation_rm(
     let target = resolve_context(context_id, record.as_deref())?;
     let removed = remove_record(&target.record, &target.context_id)
         .map_err(|reason| CliError::new(E_IO_003, reason))?;
-    println!(
+    capsule_runtime::report_println!(
         "removed {} ({} messages)",
         removed.path.display(),
         removed.messages
@@ -207,14 +215,14 @@ pub(crate) fn run_conversation_truncate(
     let outcome = truncate_record(&target.path, keep, &target.record)
         .map_err(|reason| CliError::new(E_IO_003, reason))?;
     if outcome.dropped == 0 {
-        println!(
+        capsule_runtime::report_println!(
             "{} already holds {} messages; nothing dropped",
             target.path.display(),
             outcome.kept
         );
         return Ok(());
     }
-    println!(
+    capsule_runtime::report_println!(
         "dropped {} messages from {} ({} kept; oldest surviving is {})",
         outcome.dropped,
         target.path.display(),

@@ -14,7 +14,7 @@ pub(crate) fn run_list(global: bool, all: bool, contract: Option<&str>) -> Resul
     let index = filter_by_contract(index, contract);
 
     if index.is_empty() {
-        println!("No artifacts found.");
+        capsule_runtime::report_println!("No artifacts found.");
         return Ok(());
     }
 
@@ -88,7 +88,7 @@ fn run_list_all(contract: Option<&str>) -> Result<(), CliError> {
     }
 
     if entries.is_empty() {
-        println!("No artifacts found.");
+        capsule_runtime::report_println!("No artifacts found.");
         return Ok(());
     }
 
@@ -126,10 +126,12 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
         .max(H_RUNTIME.len());
 
     let Some(prefix) = contract else {
-        println!("{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}");
+        capsule_runtime::report_println!(
+            "{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}"
+        );
         for meta in index {
             let platforms = format_platforms(&meta.platforms);
-            println!(
+            capsule_runtime::report_println!(
                 "{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms}",
                 name = meta.name,
                 version = meta.version,
@@ -146,12 +148,12 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta], contract: Option<&str
         .unwrap_or(0)
         .max(H_PLATFORMS.len());
 
-    println!(
+    capsule_runtime::report_println!(
         "{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS:<pw$}  {H_CONTRACTS}"
     );
     for meta in index {
         let platforms = format_platforms(&meta.platforms);
-        println!(
+        capsule_runtime::report_println!(
             "{name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms:<pw$}  {contracts}",
             name = meta.name,
             version = meta.version,
@@ -194,12 +196,12 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
         .max(H_RUNTIME.len());
 
     let Some(prefix) = contract else {
-        println!(
+        capsule_runtime::report_println!(
             "{H_SCOPE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS}"
         );
         for (scope, meta) in entries {
             let platforms = format_platforms(&meta.platforms);
-            println!(
+            capsule_runtime::report_println!(
                 "{scope:<sw$}  {name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms}",
                 name = meta.name,
                 version = meta.version,
@@ -216,12 +218,12 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)], contract: Opt
         .unwrap_or(0)
         .max(H_PLATFORMS.len());
 
-    println!(
+    capsule_runtime::report_println!(
         "{H_SCOPE:<sw$}  {H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_PLATFORMS:<pw$}  {H_CONTRACTS}"
     );
     for (scope, meta) in entries {
         let platforms = format_platforms(&meta.platforms);
-        println!(
+        capsule_runtime::report_println!(
             "{scope:<sw$}  {name:<nw$}  {version:<vw$}  {runtime:<rw$}  {platforms:<pw$}  {contracts}",
             name = meta.name,
             version = meta.version,

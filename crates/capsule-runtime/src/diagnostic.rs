@@ -16,9 +16,19 @@
 //! is what turns a write to a closed pipe into an `EPIPE` this module can handle rather than an
 //! immediate kill. Restoring the system default disposition would trade the abort for death by
 //! signal, which is the same loss.
+//!
+//! It is also the `mur` CLI's one way to write report output — what a short-lived command such
+//! as `mur trace show` or `mur ps` prints for its reader — through [`report_to_stdout`],
+//! [`report_to_stderr`] and the `report_println!` family. A report line has no session to fall
+//! back to, so a stream that refuses one is latched closed: every later report write to it is
+//! dropped without a syscall, and the command finishes its work and exits with its own status.
+//! A closed reader is the end of the output, not a failure. A stdout write that fails for any
+//! other reason, such as `ENOSPC` on a redirect to a full disk, is recorded once and read back
+//! with [`stdout_failure`], so the command can be reported as failed after it has finished.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::agent::append_bootstrap_log;
@@ -142,27 +152,161 @@ macro_rules! runtime_err {
     }};
 }
 
+/// Set once a report write to standard output has failed; every later report write to it is
+/// dropped unattempted.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// [`STDOUT_CLOSED`] for standard error.
+static STDERR_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// The first standard-output report error that was not `BrokenPipe`, as its display text.
+static STDOUT_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Write `bytes` verbatim to standard output as report output, and flush.
+///
+/// Never panics and never falls back to `logs/bootstrap.log`. A refused write latches standard
+/// output closed and returns [`Emitted::Dropped`]; so does every call after it, without touching
+/// the stream. A refusal other than `BrokenPipe` is also kept for [`stdout_failure`].
+pub fn report_to_stdout(bytes: &[u8]) -> Emitted {
+    if STDOUT_CLOSED.load(Ordering::Acquire) {
+        return Emitted::Dropped;
+    }
+    report_to(
+        &mut std::io::stdout().lock(),
+        bytes,
+        &STDOUT_CLOSED,
+        Some(&STDOUT_FAILURE),
+    )
+}
+
+/// [`report_to_stdout`] for standard error. A refusal of any kind only latches the stream:
+/// there is nowhere left to report it.
+pub fn report_to_stderr(bytes: &[u8]) -> Emitted {
+    if STDERR_CLOSED.load(Ordering::Acquire) {
+        return Emitted::Dropped;
+    }
+    report_to(&mut std::io::stderr().lock(), bytes, &STDERR_CLOSED, None)
+}
+
+/// Whether a report write to standard output has failed. A command rendering a long report
+/// may stop early once this is true; nothing it writes afterwards reaches the stream.
+pub fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(Ordering::Acquire)
+}
+
+/// The first report write error on standard output that was not `BrokenPipe`, or `None` when
+/// every report write succeeded or the reader merely went away.
+pub fn stdout_failure() -> Option<String> {
+    STDOUT_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// [`report_to_stdout`]'s core, over any writer and any latch, so a test can hand it a refusing
+/// stream without closing the process's own.
+///
+/// `failure`, when given, receives the text of the first error that is not `BrokenPipe`.
+pub(crate) fn report_to<W: Write>(
+    out: &mut W,
+    bytes: &[u8],
+    closed: &AtomicBool,
+    failure: Option<&Mutex<Option<String>>>,
+) -> Emitted {
+    if closed.load(Ordering::Acquire) {
+        return Emitted::Dropped;
+    }
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Ok(()) => Emitted::Written,
+        Err(error) => {
+            closed.store(true, Ordering::Release);
+            if error.kind() != ErrorKind::BrokenPipe {
+                if let Some(slot) = failure {
+                    slot.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get_or_insert_with(|| error.to_string());
+                }
+            }
+            Emitted::Dropped
+        }
+    }
+}
+
+/// The text `report_println!` and `report_eprintln!` write: the `format!` output and one
+/// newline, or a lone newline for the empty form.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __report_line {
+    () => {
+        ::std::string::String::from("\n")
+    };
+    ($($arg:tt)*) => {{
+        let mut line = ::std::format!($($arg)*);
+        line.push('\n');
+        line
+    }};
+}
+
+/// `println!` for report output, through [`report_to_stdout`]: same arguments, same bytes on an
+/// open stream, and a closed stream drops the line instead of panicking. Evaluates to `()`.
+#[macro_export]
+macro_rules! report_println {
+    ($($arg:tt)*) => {{
+        $crate::diagnostic::report_to_stdout($crate::__report_line!($($arg)*).as_bytes());
+    }};
+}
+
+/// `print!` for report output, through [`report_to_stdout`]. Flushes on every call.
+#[macro_export]
+macro_rules! report_print {
+    ($($arg:tt)*) => {{
+        $crate::diagnostic::report_to_stdout(::std::format!($($arg)*).as_bytes());
+    }};
+}
+
+/// `eprintln!` for report output, through [`report_to_stderr`].
+#[macro_export]
+macro_rules! report_eprintln {
+    ($($arg:tt)*) => {{
+        $crate::diagnostic::report_to_stderr($crate::__report_line!($($arg)*).as_bytes());
+    }};
+}
+
+/// `eprint!` for report output, through [`report_to_stderr`].
+#[macro_export]
+macro_rules! report_eprint {
+    ($($arg:tt)*) => {{
+        $crate::diagnostic::report_to_stderr(::std::format!($($arg)*).as_bytes());
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
 
-    /// A stream that has gone away: every write fails the way a closed pipe fails.
-    struct BrokenPipe;
+    /// A stream that refuses every write and flush with `kind`, counting each call.
+    /// `ErrorKind::BrokenPipe` is a stream whose reader has gone away.
+    struct Refusing {
+        kind: ErrorKind,
+        calls: usize,
+    }
 
-    impl Write for BrokenPipe {
+    impl Refusing {
+        fn new(kind: ErrorKind) -> Self {
+            Self { kind, calls: 0 }
+        }
+    }
+
+    impl Write for Refusing {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(Error::new(
-                ErrorKind::BrokenPipe,
-                "Broken pipe (os error 32)",
-            ))
+            self.calls += 1;
+            Err(Error::new(self.kind, "refused"))
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(Error::new(
-                ErrorKind::BrokenPipe,
-                "Broken pipe (os error 32)",
-            ))
+            self.calls += 1;
+            Err(Error::new(self.kind, "refused"))
         }
     }
 
@@ -170,7 +314,7 @@ mod tests {
     fn refused_line_lands_in_the_bootstrap_log() {
         let workdir = tempfile::tempdir().expect("temp workdir");
         let outcome = emit_to(
-            &mut BrokenPipe,
+            &mut Refusing::new(ErrorKind::BrokenPipe),
             "{\"url\":\"http://127.0.0.1:1/\"}",
             Some(workdir.path()),
         );
@@ -182,7 +326,11 @@ mod tests {
 
     #[test]
     fn refused_line_with_no_workdir_is_dropped() {
-        let outcome = emit_to(&mut BrokenPipe, "a warning raised during staging", None);
+        let outcome = emit_to(
+            &mut Refusing::new(ErrorKind::BrokenPipe),
+            "a warning raised during staging",
+            None,
+        );
         assert_eq!(outcome, Emitted::Dropped);
     }
 
@@ -205,10 +353,63 @@ mod tests {
     #[test]
     fn refused_raw_chunk_is_logged_without_a_doubled_newline() {
         let workdir = tempfile::tempdir().expect("temp workdir");
-        let outcome = emit_raw_to(&mut BrokenPipe, "child line\n", Some(workdir.path()));
+        let outcome = emit_raw_to(
+            &mut Refusing::new(ErrorKind::BrokenPipe),
+            "child line\n",
+            Some(workdir.path()),
+        );
         assert_eq!(outcome, Emitted::Logged);
         let log = workdir.path().join("logs").join("bootstrap.log");
         let contents = std::fs::read_to_string(&log).expect("bootstrap.log was written");
         assert_eq!(contents, "child line\n");
+    }
+
+    #[test]
+    fn report_over_a_broken_pipe_latches_and_stops_writing() {
+        let closed = AtomicBool::new(false);
+        let failure = Mutex::new(None);
+        let mut out = Refusing::new(ErrorKind::BrokenPipe);
+        let first = report_to(&mut out, b"row one\n", &closed, Some(&failure));
+        assert_eq!(first, Emitted::Dropped);
+        assert!(closed.load(Ordering::Acquire));
+        assert_eq!(*failure.lock().unwrap(), None);
+        let calls_after_first = out.calls;
+        assert!(calls_after_first > 0);
+
+        let second = report_to(&mut out, b"row two\n", &closed, Some(&failure));
+        assert_eq!(second, Emitted::Dropped);
+        assert_eq!(
+            out.calls, calls_after_first,
+            "a latched stream is not written"
+        );
+    }
+
+    #[test]
+    fn report_over_a_full_disk_latches_and_records_the_error() {
+        let closed = AtomicBool::new(false);
+        let failure = Mutex::new(None);
+        let mut out = Refusing::new(ErrorKind::StorageFull);
+        let outcome = report_to(&mut out, b"row\n", &closed, Some(&failure));
+        assert_eq!(outcome, Emitted::Dropped);
+        assert!(closed.load(Ordering::Acquire));
+        assert_eq!(failure.lock().unwrap().as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn report_over_an_open_stream_writes_the_formatted_bytes() {
+        let cases: [(String, &str); 4] = [
+            (crate::__report_line!("{} rows", 3), "3 rows\n"),
+            (crate::__report_line!(), "\n"),
+            (::std::format!("value for {}: ", "KEY"), "value for KEY: "),
+            (crate::__report_line!("{:>4}|", 7), "   7|\n"),
+        ];
+        for (text, expected) in cases {
+            let closed = AtomicBool::new(false);
+            let mut sink: Vec<u8> = Vec::new();
+            let outcome = report_to(&mut sink, text.as_bytes(), &closed, None);
+            assert_eq!(outcome, Emitted::Written);
+            assert_eq!(String::from_utf8(sink).unwrap(), expected);
+            assert!(!closed.load(Ordering::Acquire));
+        }
     }
 }

@@ -210,24 +210,24 @@ pub(crate) fn run_eval_show(
 }
 
 fn print_show_human(m: &EvalMetrics, path: &Path) {
-    println!(
+    capsule_runtime::report_println!(
         "── Eval: {} ─────────────────────────────────────",
         path.display()
     );
 
     if m.event_scores.is_empty() && m.dataset_run.is_none() {
-        println!("  (no scored events)");
+        capsule_runtime::report_println!("  (no scored events)");
         return;
     }
 
     let rates = m.pass_rate_by_scorer();
     if rates.is_empty() && m.dataset_run.is_none() {
-        println!("  (no scored events)");
+        capsule_runtime::report_println!("  (no scored events)");
         return;
     }
 
-    println!();
-    println!("── Scorers ──────────────────────────────────────");
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("── Scorers ──────────────────────────────────────");
     let mut scorer_names: Vec<&String> = rates.keys().collect();
     scorer_names.sort();
     for name in &scorer_names {
@@ -238,34 +238,34 @@ fn print_show_human(m: &EvalMetrics, path: &Path) {
         } else {
             0.0
         };
-        println!("  {:<24} {}/{} pass  ({:.1}%)", name, pass, total, pct);
+        capsule_runtime::report_println!("  {:<24} {}/{} pass  ({:.1}%)", name, pass, total, pct);
     }
 
-    println!();
-    println!("── Overall ──────────────────────────────────────");
-    println!("  result:  {}", m.overall());
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("── Overall ──────────────────────────────────────");
+    capsule_runtime::report_println!("  result:  {}", m.overall());
 
     if let Some(run) = &m.dataset_run {
         if let Some(case_id) = &run.case_id {
-            println!("  case:    {case_id}");
+            capsule_runtime::report_println!("  case:    {case_id}");
         }
         if let Some(dataset_id) = &run.dataset_id {
-            println!("  dataset: {dataset_id}");
+            capsule_runtime::report_println!("  dataset: {dataset_id}");
         }
         if !run.scores.is_empty() {
-            println!();
-            println!("── Score summary ────────────────────────────────");
+            capsule_runtime::report_println!();
+            capsule_runtime::report_println!("── Score summary ────────────────────────────────");
             let mut scorer_names: Vec<&String> = run.scores.keys().collect();
             scorer_names.sort();
             for name in scorer_names {
-                println!("  {:<24} {:.4}", name, run.scores[name]);
+                capsule_runtime::report_println!("  {:<24} {:.4}", name, run.scores[name]);
             }
         }
     }
 
     if !m.event_scores.is_empty() {
-        println!();
-        println!("── Worst events ─────────────────────────────────");
+        capsule_runtime::report_println!();
+        capsule_runtime::report_println!("── Worst events ─────────────────────────────────");
         let mut fails: Vec<&EventScoreRecord> = m
             .event_scores
             .iter()
@@ -273,7 +273,7 @@ fn print_show_human(m: &EvalMetrics, path: &Path) {
             .collect();
         fails.sort_by_key(|e| (e.scorer.as_str(), e.turn));
         for ev in fails.iter().take(5) {
-            println!(
+            capsule_runtime::report_println!(
                 "  turn {:>3}  {:12}  {:<24} {}  score={:.2}",
                 ev.turn,
                 ev.event_type,
@@ -283,7 +283,7 @@ fn print_show_human(m: &EvalMetrics, path: &Path) {
             );
         }
         if fails.is_empty() {
-            println!("  (no failing events)");
+            capsule_runtime::report_println!("  (no failing events)");
         }
     }
 }
@@ -309,7 +309,7 @@ fn print_show_json(m: &EvalMetrics, _path: &Path) {
         "scorers": scorer_pass_rates,
         "dataset_run": m.dataset_run,
     });
-    println!(
+    capsule_runtime::report_println!(
         "{}",
         serde_json::to_string_pretty(&output).unwrap_or_default()
     );
@@ -348,11 +348,13 @@ fn print_diff(a: &EvalMetrics, b: &EvalMetrics) {
     const COL: usize = 24;
     const VAL: usize = 14;
 
-    println!(
+    capsule_runtime::report_println!(
         "{:<COL$} {:<VAL$} {:<VAL$} Delta",
-        "Scorer", "Run A", "Run B"
+        "Scorer",
+        "Run A",
+        "Run B"
     );
-    println!(
+    capsule_runtime::report_println!(
         "{} {} {} {}",
         "─".repeat(COL),
         "─".repeat(VAL),
@@ -406,11 +408,11 @@ fn print_diff(a: &EvalMetrics, b: &EvalMetrics) {
             (None, None) => "—".to_string(),
         };
 
-        println!("{:<COL$} {:<VAL$} {:<VAL$} {}", scorer, sa, sb, delta);
+        capsule_runtime::report_println!("{:<COL$} {:<VAL$} {:<VAL$} {}", scorer, sa, sb, delta);
     }
 
-    println!();
-    println!(
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!(
         "{:<COL$} {:<VAL$} {:<VAL$}",
         "overall",
         a.overall(),
@@ -632,13 +634,13 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         secondary: global_registry,
     });
 
-    println!("Running {} case(s) …", cases.len());
+    capsule_runtime::report_println!("Running {} case(s) …", cases.len());
 
     let mut case_results: Vec<(String, String, PathBuf, Option<DatasetRunRecord>)> = Vec::new();
     let mut lock_written = false;
 
     for case in &cases {
-        println!("  case: {}", case.case_id);
+        capsule_runtime::report_println!("  case: {}", case.case_id);
 
         let stage_request = StageRequest {
             credentials_file: crate::config::mur_config_path().ok(),
@@ -691,7 +693,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {
             Ok(s) => s,
             Err(error) => {
-                eprintln!("    stage failed: {error}");
+                capsule_runtime::report_eprintln!("    stage failed: {error}");
                 case_results.push((
                     case.case_id.clone(),
                     "stage_failed".to_string(),
@@ -728,10 +730,13 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         if task_path.exists() {
             let dst = staged.workdir.join("task.md");
             if let Err(e) = fs::copy(task_path, &dst) {
-                eprintln!("    warning: failed to copy task file: {e}");
+                capsule_runtime::report_eprintln!("    warning: failed to copy task file: {e}");
             }
         } else if !case.task_path.is_empty() {
-            eprintln!("    warning: task_path '{}' not found", case.task_path);
+            capsule_runtime::report_eprintln!(
+                "    warning: task_path '{}' not found",
+                case.task_path
+            );
         }
 
         let case_workdir = staged.workdir.clone();
@@ -740,10 +745,10 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         match launch_session(staged, |_| {}) {
             Ok(_) => {}
             Err(RuntimeError::CapsuleTrap(msg)) => {
-                eprintln!("    session trapped: {msg}");
+                capsule_runtime::report_eprintln!("    session trapped: {msg}");
             }
             Err(error) => {
-                eprintln!("    session failed: {error}");
+                capsule_runtime::report_eprintln!("    session failed: {error}");
             }
         }
 
@@ -753,7 +758,9 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             match parse_eval_file(&eval_path) {
                 Ok(metrics) => metrics.dataset_run,
                 Err(e) => {
-                    eprintln!("    warning: failed to read eval.jsonl: {e}");
+                    capsule_runtime::report_eprintln!(
+                        "    warning: failed to read eval.jsonl: {e}"
+                    );
                     None
                 }
             }
@@ -766,19 +773,19 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             .map(|r| r.overall.clone())
             .unwrap_or_else(|| "no_scores".to_string());
 
-        println!("    result: {overall}  session: {case_session_id}");
+        capsule_runtime::report_println!("    result: {overall}  session: {case_session_id}");
         case_results.push((case.case_id.clone(), overall, case_workdir, run_record));
     }
 
-    println!();
-    println!("── Summary ──────────────────────────────────────");
+    capsule_runtime::report_println!();
+    capsule_runtime::report_println!("── Summary ──────────────────────────────────────");
     let pass_count = case_results
         .iter()
         .filter(|(_, r, _, _)| r == "pass")
         .count();
     let total = case_results.len();
-    println!("pass: {pass_count}/{total}");
-    println!();
+    capsule_runtime::report_println!("pass: {pass_count}/{total}");
+    capsule_runtime::report_println!();
 
     for (case_id, result, case_workdir, run) in &case_results {
         let scores_str = run
@@ -793,7 +800,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                 parts.join(" ")
             })
             .unwrap_or_default();
-        println!(
+        capsule_runtime::report_println!(
             "  {:<24} {}  {}  ({})",
             case_id,
             result,
