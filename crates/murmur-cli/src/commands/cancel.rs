@@ -66,8 +66,8 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let id = result.get("id").and_then(Value::as_str).unwrap_or(task_id);
-    println!("task:    {id}");
-    println!("state:   {state}");
+    capsule_runtime::report_println!("task:    {id}");
+    capsule_runtime::report_println!("state:   {state}");
 
     // One line per thing the capsule left running. Nothing was killed: a detached command keeps
     // its own lifecycle and a delegated child is still going, and both are named so whoever

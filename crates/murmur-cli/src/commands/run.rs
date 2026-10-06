@@ -1,7 +1,6 @@
 // `mur run` writes at and after the readiness line, when its reader may already have closed the
-// pipe. A bare print panics on that write error; everything here goes through
-// `capsule_runtime::diagnostic` instead.
-#![deny(clippy::print_stdout, clippy::print_stderr)]
+// pipe. Its lines go through `runtime_out!` and `runtime_err!`, which keep a refused line in the
+// session's `logs/bootstrap.log`, rather than the report macros the rest of `mur` writes with.
 
 use std::{
     collections::HashSet,

@@ -768,6 +768,43 @@ fn a_task_file_in_the_project_is_never_a_peers_task() {
     );
 }
 
+/// The launcher's reader — a `tee`, a supervisor — goes away mid-task. Every member runs on to its
+/// own end: the entry member finishes its task and writes `session_end`, its exit winds the peers
+/// down, and the launcher exits 0 with nothing left running.
+#[test]
+fn a_formation_runs_to_its_end_after_its_reader_goes_away() {
+    use std::os::unix::process::ExitStatusExt;
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, REVIEWER, PLANNER],
+        FULL_REACH,
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    launcher.close_output();
+    project.release.send(()).unwrap();
+    let status = launcher.wait();
+    assert_eq!(status.signal(), None, "stderr:\n{}", launcher.stderr());
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let planner_trace = project.trace_of("planner");
+    let kinds = event_kinds(&planner_trace);
+    assert!(kinds.contains(&"task_end"), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&"session_end"), "{kinds:?}");
+    assert_traces_intact(&project, planner["session_id"].as_str().unwrap());
+    let id = formation["formation_id"].as_str().unwrap();
+    for peer in ["coder", "reviewer"] {
+        assert_wound_down(&project.trace_of(peer), id);
+    }
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+}
+
 /// Scenario 2: only the members the entry member may call are handed to it; every member is
 /// launched regardless.
 #[test]

@@ -1,3 +1,7 @@
+// Every write to standard output or standard error goes through `capsule_runtime::diagnostic`,
+// whose report path ends the output when a reader goes away instead of panicking.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 mod allocator;
 mod beta;
 mod commands;
@@ -523,7 +527,9 @@ fn cancel_usage_error(message: &str) -> ! {
 
 fn main() {
     if let Err(e) = capsule_runtime::security::harden_process_dumpable() {
-        eprintln!("mur: warning: failed to harden process against /proc environ reads: {e}");
+        capsule_runtime::report_eprintln!(
+            "mur: warning: failed to harden process against /proc environ reads: {e}"
+        );
     }
 
     #[cfg(any(
@@ -585,7 +591,7 @@ fn main() {
             registry,
         } => {
             if !beta_config.is_enabled("mur-new") {
-                eprintln!(
+                capsule_runtime::report_eprintln!(
                     "error: `mur new <task>` is a beta feature, and it is not enabled\n  \
                      hint: run `mur beta enable mur-new` to enable it; \
                      `mur new --roster <NAME>` scaffolds a formation without it"
@@ -767,7 +773,7 @@ fn main() {
         #[cfg(feature = "beta-mur-topology")]
         Commands::Topology(args) => {
             if !beta_config.is_enabled("mur-topology") {
-                eprintln!(
+                capsule_runtime::report_eprintln!(
                     "error: unrecognized subcommand 'topology'\n\n\
                      For more information, try '--help'."
                 );
@@ -791,7 +797,7 @@ fn main() {
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Deploy { command } => {
             if !beta_config.is_enabled("mur-deploy") {
-                eprintln!(
+                capsule_runtime::report_eprintln!(
                     "error: unrecognized subcommand 'deploy'\n\n\
                      For more information, try '--help'."
                 );
@@ -827,7 +833,7 @@ fn main() {
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Destroy { deployment_id } => {
             if !beta_config.is_enabled("mur-deploy") {
-                eprintln!(
+                capsule_runtime::report_eprintln!(
                     "error: unrecognized subcommand 'destroy'\n\n\
                      For more information, try '--help'."
                 );
@@ -839,8 +845,16 @@ fn main() {
         Commands::Config { command } => run_config(&command),
     };
 
-    if let Err(err) = result {
-        exit_with_error(&err);
+    match result {
+        Err(err) => exit_with_error(&err),
+        Ok(()) => {
+            if let Some(failure) = capsule_runtime::diagnostic::stdout_failure() {
+                exit_with_error(&error::CliError::new(
+                    error::E_IO_003,
+                    format!("failed to write to standard output: {failure}"),
+                ));
+            }
+        }
     }
 }
 
@@ -848,7 +862,6 @@ fn main() {
 ///
 /// Reached after a session has announced itself, when standard error may be closed: a bare
 /// `eprintln!` would panic and replace exit status 1 with an abort.
-#[deny(clippy::print_stdout, clippy::print_stderr)]
 fn exit_with_error(err: &impl std::fmt::Display) -> ! {
     capsule_runtime::runtime_err!("{err}");
     std::process::exit(1);

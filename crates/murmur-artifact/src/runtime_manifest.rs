@@ -3230,11 +3230,11 @@ impl RuntimeManifest {
                 // If both are set, `version:` is ignored and a warning is printed to stderr.
                 let version = if source.is_some() {
                     if let Some(explicit) = artifact.version.filter(|s| !s.trim().is_empty()) {
-                        eprintln!(
+                        crate::warn_line(format_args!(
                             "warning: artifact '{name}' declares both 'source:' and \
                              'version: {explicit}'; version is ignored for local-source skills \
                              (using 'local')"
-                        );
+                        ));
                     }
                     "local".to_string()
                 } else {
@@ -5231,7 +5231,9 @@ fn parse_eval_config(raw: RawEvalConfig) -> EvalConfig {
                 }),
                 "llm_judge" => Some(ScorerConfig::LlmJudge { name }),
                 other => {
-                    eprintln!("[murmur-artifact] unknown scorer type '{other}' — skipping");
+                    crate::warn_line(format_args!(
+                        "[murmur-artifact] unknown scorer type '{other}' — skipping"
+                    ));
                     None
                 }
             }

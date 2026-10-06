@@ -6,21 +6,28 @@ pub(crate) fn run_deploy_ls() -> Result<(), CliError> {
     let records = load_deployments()?;
 
     if records.is_empty() {
-        println!("no deployments");
+        capsule_runtime::report_println!("no deployments");
         return Ok(());
     }
 
     // Header
-    println!(
+    capsule_runtime::report_println!(
         "{:<38}  {:<12}  {:<12}  {:<10}  URL",
-        "DEPLOYMENT_ID", "PROVIDER", "REGION", "STATUS"
+        "DEPLOYMENT_ID",
+        "PROVIDER",
+        "REGION",
+        "STATUS"
     );
-    println!("{}", "-".repeat(100));
+    capsule_runtime::report_println!("{}", "-".repeat(100));
 
     for r in &records {
-        println!(
+        capsule_runtime::report_println!(
             "{:<38}  {:<12}  {:<12}  {:<10}  {}",
-            r.deployment_id, r.provider, r.region, r.status, r.url
+            r.deployment_id,
+            r.provider,
+            r.region,
+            r.status,
+            r.url
         );
     }
 

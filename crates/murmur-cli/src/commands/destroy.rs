@@ -22,6 +22,6 @@ pub(crate) fn run_destroy(deployment_id: &str) -> Result<(), CliError> {
         let _ = std::fs::remove_dir_all(staging_dir);
     }
 
-    eprintln!("destroyed {id} ({})", record.ip);
+    capsule_runtime::report_eprintln!("destroyed {id} ({})", record.ip);
     Ok(())
 }

@@ -105,10 +105,14 @@ pub(crate) fn run_precompile(
     if json {
         let line = serde_json::to_string(&report)
             .map_err(|e| CliError::new(crate::error::E_IO_003, format!("report: {e}")))?;
-        println!("{line}");
+        capsule_runtime::report_println!("{line}");
     } else {
         for file in &report.artifacts {
-            println!("{:<14}  {}", outcome_text(file.outcome), file.label());
+            capsule_runtime::report_println!(
+                "{:<14}  {}",
+                outcome_text(file.outcome),
+                file.label()
+            );
         }
     }
     if report

@@ -203,11 +203,11 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
     match std::env::current_exe() {
         Ok(path) => {
             let resolved = std::fs::canonicalize(&path).unwrap_or(path);
-            println!("  this binary:  {}", resolved.display());
+            capsule_runtime::report_println!("  this binary:  {}", resolved.display());
         }
         Err(error) => {
-            println!("  this binary:  <unavailable> ({error})");
-            println!(
+            capsule_runtime::report_println!("  this binary:  <unavailable> ({error})");
+            capsule_runtime::report_println!(
                 "    Without the running binary's path there is nothing to say which profile \
                  could attach to it. The `profile attached` line below is still what the kernel \
                  reports."
@@ -217,25 +217,29 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
 
     match inspect_profile_attachment() {
         ProfileAttachment::Sealed { profile } => {
-            println!("  profile attached: {profile}");
-            println!(
+            capsule_runtime::report_println!("  profile attached: {profile}");
+            capsule_runtime::report_println!(
                 "    An AppArmor profile named for the one mur ships is confining this binary, so \
                  the userns grant below covers mur alone."
             );
         }
         ProfileAttachment::Other { profile } => {
-            println!("  profile attached: {profile}");
-            println!(
+            capsule_runtime::report_println!("  profile attached: {profile}");
+            capsule_runtime::report_println!(
                 "    Some other profile confines this binary. It is not the profile mur ships and \
                  grants nothing mur asked for; it may also be narrower than unconfined."
             );
         }
         ProfileAttachment::Unconfined => {
-            println!("  profile attached: none (the kernel reports this binary as unconfined)");
+            capsule_runtime::report_println!(
+                "  profile attached: none (the kernel reports this binary as unconfined)"
+            );
         }
         ProfileAttachment::NotReported => {
-            println!("  profile attached: not reported (/proc/self/attr/current is unreadable)");
-            println!(
+            capsule_runtime::report_println!(
+                "  profile attached: not reported (/proc/self/attr/current is unreadable)"
+            );
+            capsule_runtime::report_println!(
                 "    Expected where AppArmor is not enabled, and on every non-Linux host. Not the \
                  same as `none`: nothing attaches and I could not look are different findings."
             );
@@ -243,20 +247,20 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
     }
 
     if grant == Some(UsernsGrant::Withheld) {
-        println!(
+        capsule_runtime::report_println!(
             "    This path is why the grant below is withheld: AppArmor attaches profiles by \
              executable path, and no mur-sealed profile attaches to this one."
         );
-        println!("    The shipped profile attaches to:");
+        capsule_runtime::report_println!("    The shipped profile attaches to:");
         for attachment in SEALED_APPARMOR_ATTACHMENT_PATHS {
-            println!("      {attachment}");
+            capsule_runtime::report_println!("      {attachment}");
         }
-        println!(
+        capsule_runtime::report_println!(
             "    Running from a checkout build: `scripts/install-dev-apparmor.sh` generates and \
              loads the same grant for ./target/{{debug,release}}/mur. Running from anywhere else: \
              install mur to one of the paths above."
         );
-        println!(
+        capsule_runtime::report_println!(
             "    Adding this path to the profile is not the fix. Path attachment is the \
              mechanism's design — a profile that matched everything would grant userns to \
              everything — so the next unusual location would fail exactly the same way."
@@ -284,27 +288,33 @@ fn report_binary_attachment(grant: Option<UsernsGrant>) {
 /// [`SEALED_APPARMOR_ATTACHMENT_PATHS`], which is remediation text only.
 fn report_userns_grant() {
     let grant = detect_userns_grant();
-    println!("AppArmor / user namespaces");
+    capsule_runtime::report_println!("AppArmor / user namespaces");
     report_binary_attachment(grant);
     match grant {
         Some(grant) => {
-            println!("  userns grant: {}", grant.wire_name());
-            println!("    {}", grant.summary());
+            capsule_runtime::report_println!("  userns grant: {}", grant.wire_name());
+            capsule_runtime::report_println!("    {}", grant.summary());
         }
-        None => println!("  userns grant: n/a (AppArmor is a Linux mechanism)"),
+        None => {
+            capsule_runtime::report_println!("  userns grant: n/a (AppArmor is a Linux mechanism)")
+        }
     }
 
     match inspect_installed_profile() {
         InstalledProfileState::Matches => {
-            println!("  {SEALED_APPARMOR_PROFILE_PATH}: matches the profile this build ships");
+            capsule_runtime::report_println!(
+                "  {SEALED_APPARMOR_PROFILE_PATH}: matches the profile this build ships"
+            );
         }
         InstalledProfileState::Drifted { installed_sha256 } => {
-            println!(
+            capsule_runtime::report_println!(
                 "  {SEALED_APPARMOR_PROFILE_PATH}: does NOT match the profile this build ships"
             );
-            println!("    installed sha256: {installed_sha256}");
-            println!("    shipped sha256:   {SEALED_APPARMOR_PROFILE_SHA256}");
-            println!(
+            capsule_runtime::report_println!("    installed sha256: {installed_sha256}");
+            capsule_runtime::report_println!(
+                "    shipped sha256:   {SEALED_APPARMOR_PROFILE_SHA256}"
+            );
+            capsule_runtime::report_println!(
                 "    This compares file contents only. It does not establish what the kernel has \
                  loaded — a file can be edited without `apparmor_parser -r` ever running. The \
                  `userns grant` line above is what the kernel actually did. Local customisation \
@@ -313,23 +323,25 @@ fn report_userns_grant() {
             );
         }
         InstalledProfileState::Absent => {
-            println!("  {SEALED_APPARMOR_PROFILE_PATH}: not installed");
-            println!(
+            capsule_runtime::report_println!("  {SEALED_APPARMOR_PROFILE_PATH}: not installed");
+            capsule_runtime::report_println!(
                 "    Expected on a host without AppArmor, and on a checkout build using \
                  scripts/install-dev-apparmor.sh, which writes its own separate file. The `userns \
                  grant` line above is what decides whether sealed containment works here."
             );
         }
         InstalledProfileState::Unreadable { error } => {
-            println!("  {SEALED_APPARMOR_PROFILE_PATH}: present but unreadable ({error})");
-            println!(
+            capsule_runtime::report_println!(
+                "  {SEALED_APPARMOR_PROFILE_PATH}: present but unreadable ({error})"
+            );
+            capsule_runtime::report_println!(
                 "    Not the same as absent, and it changes nothing: the `userns grant` line above \
                  is what the kernel actually did."
             );
         }
     }
 
-    println!();
+    capsule_runtime::report_println!();
 
     // Stderr, in the same words `mur run` uses at staging, so the two cannot state it differently.
     warn_on_userns_restriction_disabled_host_wide(grant);
@@ -347,14 +359,14 @@ fn report_murmur_home() {
             .expect("the global config path always has ~/.murmur as its parent")
             .to_path_buf(),
         Err(err) => {
-            println!("Murmur home");
-            println!("  not reported: {}", err.message);
-            println!();
+            capsule_runtime::report_println!("Murmur home");
+            capsule_runtime::report_println!("  not reported: {}", err.message);
+            capsule_runtime::report_println!();
             return;
         }
     };
 
-    println!("Murmur home ({})", home.display());
+    capsule_runtime::report_println!("Murmur home ({})", home.display());
     let mut warnings = Vec::new();
     for report in audit_murmur_home(&home) {
         let name = match report.path.strip_prefix(&home) {
@@ -379,10 +391,14 @@ fn report_murmur_home() {
             .unwrap_or_default();
         match &report.state {
             HomeEntryState::Absent => {
-                println!("  {name}: absent  {holds}{kept}{deletable}{expected}")
+                capsule_runtime::report_println!(
+                    "  {name}: absent  {holds}{kept}{deletable}{expected}"
+                )
             }
             HomeEntryState::Unreadable { error } => {
-                println!("  {name}: unreadable ({error})  {holds}{kept}{deletable}{expected}")
+                capsule_runtime::report_println!(
+                    "  {name}: unreadable ({error})  {holds}{kept}{deletable}{expected}"
+                )
             }
             HomeEntryState::Present {
                 mode,
@@ -390,7 +406,9 @@ fn report_murmur_home() {
                 wide_descendants,
                 wide_descendants_omitted,
             } => {
-                println!("  {name}: {mode:04o}  {holds}{kept}{deletable}{expected}");
+                capsule_runtime::report_println!(
+                    "  {name}: {mode:04o}  {holds}{kept}{deletable}{expected}"
+                );
                 if *wide {
                     warnings.push(wide_entry_warning(
                         &report.path,
@@ -401,7 +419,7 @@ fn report_murmur_home() {
                 }
                 for entry in wide_descendants {
                     let relative = entry.path.strip_prefix(&home).unwrap_or(&entry.path);
-                    println!(
+                    capsule_runtime::report_println!(
                         "    wider than {:04o}: {} is {:04o}",
                         entry.allowed,
                         relative.display(),
@@ -415,15 +433,17 @@ fn report_murmur_home() {
                     ));
                 }
                 if *wide_descendants_omitted > 0 {
-                    println!("    and {wide_descendants_omitted} more wider than expected");
+                    capsule_runtime::report_println!(
+                        "    and {wide_descendants_omitted} more wider than expected"
+                    );
                 }
             }
         }
     }
-    println!();
+    capsule_runtime::report_println!();
 
     for warning in warnings {
-        eprintln!("{warning}");
+        capsule_runtime::report_eprintln!("{warning}");
     }
 }
 
@@ -441,7 +461,7 @@ fn report_murmur_home() {
 /// `E-CAP-004` precedent above: doctor launches nothing, so it has nothing to refuse, and aborting
 /// the checklist over one manifest line would hide every artifact problem behind it.
 fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
-    println!("Filesystem preopens");
+    capsule_runtime::report_println!("Filesystem preopens");
     match preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
         (
             artifact.name.as_str(),
@@ -450,16 +470,18 @@ fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
         )
     })) {
         Ok(preopens) if preopens.is_empty() => {
-            println!("  <none> (this capsule declares no tool, driver or hook artifact)");
+            capsule_runtime::report_println!(
+                "  <none> (this capsule declares no tool, driver or hook artifact)"
+            );
         }
         Ok(preopens) => {
             for preopen in &preopens {
-                println!("  - {}", preopen.render());
+                capsule_runtime::report_println!("  - {}", preopen.render());
             }
         }
         Err(error) => {
-            println!("  <unresolved>");
-            eprintln!(
+            capsule_runtime::report_println!("  <unresolved>");
+            capsule_runtime::report_eprintln!(
                 "[mur doctor] warning[{E_CAP_002}]: {error}\n  \
                  `mur run` will refuse this capsule until that entry's \
                  capabilities.filesystem.scope names a path inside the workdir."
@@ -467,7 +489,7 @@ fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
         }
     }
 
-    println!();
+    capsule_runtime::report_println!();
 }
 
 /// Prints the workdir subtrees `capabilities.filesystem.read_only` protects, and whether that
@@ -478,15 +500,15 @@ fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
 /// verdict: declaring nothing is the common case and reaches no `fixes` entry, and an advisory
 /// declaration is a legitimate pairing that `W-SEC-017` already states in words.
 fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
-    println!("Read-only paths");
-    print!(
+    capsule_runtime::report_println!("Read-only paths");
+    capsule_runtime::report_print!(
         "{}",
         render_read_only(
             &policy.read_only_paths,
             &read_only_advisory_for(&policy.read_only_paths, &policy.shell_allow),
         )
     );
-    println!();
+    capsule_runtime::report_println!();
 }
 
 /// Prints which skills and tools `capabilities.install` lets `manage.pull` install into a session.
@@ -495,12 +517,12 @@ fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
 /// and `mur run --explain-scope` state the grant in one voice. A report, never a verdict: an
 /// absent grant is the common case and reaches no `fixes` entry.
 fn report_install(policy: &capsule_runtime::CapabilityPolicy) {
-    println!("Install grant");
-    print!(
+    capsule_runtime::report_println!("Install grant");
+    capsule_runtime::report_print!(
         "{}",
         render_install(&policy.install_skill, &policy.install_tool)
     );
-    println!();
+    capsule_runtime::report_println!();
 }
 
 /// The daemon binary a delegating capsule needs, under the name the installer puts on `PATH` and
@@ -519,7 +541,7 @@ const ROOST_BINARY: &str = "mur-roost";
 /// `E-RUN-019`; this is that refusal predicted before the run.
 fn report_roost_daemon() {
     let Some(binary) = find_on_path(ROOST_BINARY) else {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "[mur doctor] warning[{E_RUN_019}]: this capsule declares capabilities.spawn.allow, \
              and {ROOST_BINARY} was not found on PATH.\n  \
              `mur run` refuses a capsule that cannot register with the daemon that referees its \
@@ -532,7 +554,7 @@ fn report_roost_daemon() {
     let roost_url = std::env::var("MURMUR_ROOST_URL").unwrap_or_default();
     let roost_url = roost_url.trim();
     if roost_url.is_empty() {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "[mur doctor] warning[{E_RUN_019}]: this capsule declares capabilities.spawn.allow, \
              and {ROOST_BINARY} is installed at {binary}, but MURMUR_ROOST_URL — the variable \
              naming the daemon to register with — is not set.\n  \
@@ -544,7 +566,7 @@ fn report_roost_daemon() {
     }
 
     if let Err(reason) = check_roost_health(roost_url) {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "[mur doctor] warning[{E_RUN_019}]: this capsule declares capabilities.spawn.allow, \
              and {ROOST_BINARY} is installed at {binary}, but no daemon answered at \
              {roost_url}: {reason}\n  \
@@ -602,8 +624,8 @@ fn report_env_requirements(
         return findings;
     };
 
-    println!("Environment requirements");
-    println!(
+    capsule_runtime::report_println!("Environment requirements");
+    capsule_runtime::report_println!(
         "  capsules: {}",
         report
             .inspected
@@ -614,7 +636,7 @@ fn report_env_requirements(
     );
 
     if let Some(error) = dotenv_error {
-        println!(
+        capsule_runtime::report_println!(
             "  {}/.env could not be read, so set/unset below is this shell's environment alone: {error}",
             project_root.display()
         );
@@ -628,13 +650,14 @@ fn report_env_requirements(
     print_uninspectable(&report, &mut findings);
 
     for cycle in &report.cycles {
-        println!(
+        capsule_runtime::report_println!(
             "  spawn.allow cycle: {} → {} — already on this walk, not descended again",
-            cycle.parent, cycle.child
+            cycle.parent,
+            cycle.child
         );
     }
 
-    println!();
+    capsule_runtime::report_println!();
     findings
 }
 
@@ -649,14 +672,14 @@ fn report_control_secrets(runtime_manifest: &RuntimeManifest) {
     else {
         return;
     };
-    println!("Control secrets");
+    capsule_runtime::report_println!("Control secrets");
     let width = control.secrets.iter().map(String::len).max().unwrap_or(0);
     for name in &control.secrets {
-        println!(
+        capsule_runtime::report_println!(
             "  {name:<width$}   supplied by a controller at run time \u{2014} `mur control secret {name}`"
         );
     }
-    println!();
+    capsule_runtime::report_println!();
 }
 
 /// Which installed artifact store an inventoried artifact sits in.
@@ -735,9 +758,9 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
         return InterfaceFindings { stale };
     }
 
-    println!("Interface versions");
+    capsule_runtime::report_println!("Interface versions");
     for (scope, error) in &unreadable {
-        println!("  not checked ({} store): {error}", scope.label());
+        capsule_runtime::report_println!("  not checked ({} store): {error}", scope.label());
     }
     let ref_width = stale
         .iter()
@@ -746,7 +769,7 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
         .unwrap_or(0);
     for artifact in &stale {
         for interface in &artifact.unserved {
-            println!(
+            capsule_runtime::report_println!(
                 "{}",
                 render_unserved_line(
                     &format!("{}@{}", artifact.name, artifact.version),
@@ -758,12 +781,12 @@ fn report_interface_versions(project: &LocalRegistry, global: &LocalRegistry) ->
         }
     }
     if !stale.is_empty() {
-        println!(
+        capsule_runtime::report_println!(
             "  mur run refuses these at launch (warning[{W_REG_003}], {})",
             registry_warning_link(W_REG_003)
         );
     }
-    println!();
+    capsule_runtime::report_println!();
 
     InterfaceFindings { stale }
 }
@@ -940,7 +963,7 @@ fn print_variables(report: &EnvRequirementsReport, findings: &mut EnvRequirement
         return;
     }
 
-    println!("  variables:");
+    capsule_runtime::report_println!("  variables:");
     // Align on the widest name, the way the artifact checklist aligns on `col_width`.
     let col_width = report
         .variables
@@ -954,7 +977,7 @@ fn print_variables(report: &EnvRequirementsReport, findings: &mut EnvRequirement
         } else {
             ("\u{2717}", "unset")
         };
-        println!(
+        capsule_runtime::report_println!(
             "    {mark}  {name:<col_width$}   {status:<5}   \u{2014} {declared_by}",
             name = variable.name,
             declared_by = render_sources(variable)
@@ -977,7 +1000,7 @@ fn print_variables(report: &EnvRequirementsReport, findings: &mut EnvRequirement
             render_sources(variable)
         ));
     }
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "[mur doctor] error[{E_CAP_014}]: this project needs {count} variable{s} nothing in \
          this environment sets: {names}\n  \
          Every name is copied from the launching shell at the moment of the spawn, so an unset \
@@ -998,9 +1021,9 @@ fn print_refusals(report: &EnvRequirementsReport, findings: &mut EnvRequirements
         return;
     }
 
-    println!("  declarations mur-roost will refuse:");
+    capsule_runtime::report_println!("  declarations mur-roost will refuse:");
     for refusal in &report.refusals {
-        println!(
+        capsule_runtime::report_println!(
             "    \u{2717}  {child} declares {axis} '{variable}', which its parent {parent} does not",
             child = refusal.child,
             axis = refusal.axis,
@@ -1016,7 +1039,7 @@ fn print_refusals(report: &EnvRequirementsReport, findings: &mut EnvRequirements
         ));
     }
 
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "[mur doctor] error[{E_CAP_015}]: {count} declaration{s} in the spawn closure exceed{verb} \
          the envelope the capsule spawning it holds, and mur-roost refuses a spawn that widens \
          one.\n  \
@@ -1033,7 +1056,7 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
         return;
     }
 
-    println!(
+    capsule_runtime::report_println!(
         "  could not inspect {} of {} capsules in the spawn closure:",
         report.uninspectable.len(),
         report.reached()
@@ -1052,7 +1075,7 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
                 format!("installed but unreadable: {detail}")
             }
         };
-        println!(
+        capsule_runtime::report_println!(
             "    - {name} (declared by {declared_by}): {reason}",
             name = capsule.name,
             declared_by = capsule.declared_by
@@ -1063,7 +1086,7 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
         ));
     }
 
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "[mur doctor] warning[{W_REG_002}]: {count} capsule{s} in the spawn closure could not be \
          inspected, so what {pronoun} declares is absent from the report above: {names}\n  \
          The walk not being able to read a capsule is not evidence that a run fails, so this \
@@ -1105,16 +1128,16 @@ fn report_roster(
         return Vec::new();
     }
 
-    println!("Roster");
-    println!("  file: {}", path.display());
+    capsule_runtime::report_println!("Roster");
+    capsule_runtime::report_println!("  file: {}", path.display());
     let admitted = match capsule_runtime::admit_roster_file(project_root, registry, lock) {
         Ok(admitted) => admitted,
         Err(refusal) => {
             let error = CliError::from(refusal);
-            println!("  \u{2717}  {}", error.message);
-            println!();
+            capsule_runtime::report_println!("  \u{2717}  {}", error.message);
+            capsule_runtime::report_println!();
             let hint = error.hint.unwrap_or_default();
-            eprintln!(
+            capsule_runtime::report_eprintln!(
                 "[mur doctor] error[{code}]: {message}\n  hint: {hint}",
                 code = error.code,
                 message = error.message
@@ -1147,7 +1170,7 @@ fn report_roster(
         } else {
             "public door"
         };
-        println!(
+        capsule_runtime::report_println!(
             "  {name:<name_width$}   {coordinate:<coordinate_width$}   {entry:<5}   {peers:<13}   {door}",
             name = member.name
         );
@@ -1160,11 +1183,13 @@ fn report_roster(
         .collect::<Vec<_>>()
         .join(", ");
     match admitted.reachability() {
-        _ if edges.is_empty() => println!("  reachability: none"),
-        RosterReachability::All => println!("  reachability (all): {edges}"),
-        _ => println!("  reachability: {edges}"),
+        _ if edges.is_empty() => capsule_runtime::report_println!("  reachability: none"),
+        RosterReachability::All => {
+            capsule_runtime::report_println!("  reachability (all): {edges}")
+        }
+        _ => capsule_runtime::report_println!("  reachability: {edges}"),
     }
-    println!();
+    capsule_runtime::report_println!();
     Vec::new()
 }
 
@@ -1172,9 +1197,9 @@ fn report_roster(
 /// exposes a door that declares no `network.authentication`. The warning is rendered from the
 /// manifest by the same function `mur run --bind` uses, so the two lines are byte-identical.
 fn report_door(runtime_manifest: &RuntimeManifest, bind_addr: &str) {
-    println!("{}", capsule_runtime::door_posture(runtime_manifest));
+    capsule_runtime::report_println!("{}", capsule_runtime::door_posture(runtime_manifest));
     if let Some(line) = capsule_runtime::public_door_bind_warning(runtime_manifest, bind_addr) {
-        println!("{line}");
+        capsule_runtime::report_println!("{line}");
     }
 }
 
@@ -1182,11 +1207,11 @@ fn report_door(runtime_manifest: &RuntimeManifest, bind_addr: &str) {
 /// from the stores, and against the lock, that `mur run --roster <dir>` uses, and close with
 /// doctor's tally. A formation directory has no artifacts of its own, so nothing else is checked.
 fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
-    println!(
+    capsule_runtime::report_println!(
         "No {MANIFEST_FILENAME} in {}: checking its {ROSTER_FILENAME}. Run mur doctor in a member's source directory to check that member's artifacts.",
         formation_dir.display()
     );
-    println!();
+    capsule_runtime::report_println!();
     let lock = read_optional_lockfile(formation_dir)?;
     let fixes = report_roster(
         formation_dir,
@@ -1205,7 +1230,7 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
 /// not empty; a warning alone returns.
 fn print_tally(total_pass: u32, fixes: &[String], warnings: &[String]) {
     if fixes.is_empty() && warnings.is_empty() {
-        println!("All checks passed.");
+        capsule_runtime::report_println!("All checks passed.");
         return;
     }
 
@@ -1219,11 +1244,13 @@ fn print_tally(total_pass: u32, fixes: &[String], warnings: &[String]) {
         let ws = if total_warn == 1 { "" } else { "s" };
         format!(", {total_warn} warning{ws}")
     };
-    println!("{total_pass} check{ps} passed, {total_fail} error{es} found{warn_tail}.");
-    println!();
+    capsule_runtime::report_println!(
+        "{total_pass} check{ps} passed, {total_fail} error{es} found{warn_tail}."
+    );
+    capsule_runtime::report_println!();
 
     for fix in fixes.iter().chain(warnings.iter()) {
-        println!("Fix: {fix}");
+        capsule_runtime::report_println!("Fix: {fix}");
     }
 
     // A warning is a report, not a failure: the artifact resolves and a session would run it.
@@ -1317,7 +1344,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     if let Err(error) = capsule_runtime::check_env_allow_reaches_guests(
         &capability_policy_from_runtime_manifest(&runtime_manifest),
     ) {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "[mur doctor] warning[{E_CAP_016}]: {error}\n  \
              `mur run` will refuse this capsule — remove the entries above; no manifest setting \
              exempts a name from the credential backstop."
@@ -1379,7 +1406,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         .unwrap_or_default();
     if !staged_runtime.is_empty() {
         if let Err(error) = check_staged_runtime_floor(staged_runtime, declared_floor) {
-            eprintln!(
+            capsule_runtime::report_eprintln!(
                 "[mur doctor] warning[{E_CAP_004}]: {error}\n  \
                  `mur run` will refuse this capsule unless the floor is raised — set \
                  `capabilities.containment: sealed` in murmur.yaml, set `containment: sealed` in \
@@ -1401,7 +1428,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
     if let Err(error) = check_interpreted_entrypoints_reachable(&capability_policy, declared_floor)
     {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "[mur doctor] warning[{E_CAP_006}]: {error}\n  \
              `mur run` will refuse this capsule at the declared floor — declare the grant above, \
              or lower `capabilities.containment` if this capsule does not need a composed root."
@@ -1437,7 +1464,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     if let Err(error) =
         check_egress_namespace(can_spawn_subprocess, detect_egress_namespace_blocker())
     {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "[mur doctor] warning[{E_CAP_005}]: {error}\n  \
              `mur run` will refuse this capsule on this host until that is resolved. Nothing in \
              murmur.yaml can change it — the refusal is about this machine, not the manifest."
@@ -1521,7 +1548,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // new host refuses.
     let interface_findings = report_interface_versions(&project_registry, &global_registry);
 
-    println!("Checking {} for {platform}...", manifest_path.display());
+    capsule_runtime::report_println!("Checking {} for {platform}...", manifest_path.display());
 
     // Align every check line on the widest "name@version" reference string.
     let col_width = runtime_manifest
@@ -1565,7 +1592,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             // Local-source artifacts are never registry-resolved and never locked, so
             // they are exempt from every lock check — the same exemption `mur run` makes.
             ArtifactPresence::LocalSource => {
-                println!("  \u{2713}  {ref_str:<col_width$}   local source");
+                capsule_runtime::report_println!(
+                    "  \u{2713}  {ref_str:<col_width$}   local source"
+                );
                 total_pass += 1;
             }
             ArtifactPresence::Installed(resolved) => {
@@ -1603,7 +1632,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                         // tag: reinstalling fixes both, but only one of them stops `mur run`.
                         match (platform_verdict, pulled_by) {
                             (PlatformVerdict::Mismatch { binary_platform }, _) => {
-                                println!(
+                                capsule_runtime::report_println!(
                                     "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} native binary is built for {binary_platform}, this host is {platform}"
                                 );
                                 fixes.push(format!(
@@ -1620,7 +1649,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                                 } else {
                                     String::new()
                                 };
-                                println!(
+                                capsule_runtime::report_println!(
                                     "  \u{2717}  {ref_str:<col_width$}   \u{2014} built against {}, {}{more}",
                                     interface_label(first),
                                     served_phrase(first)
@@ -1634,7 +1663,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             // `mur install` both adopts the pin and records a missing platform
                             // tag, so one warning covers an artifact that has both findings.
                             (_, Some(session)) => {
-                                println!(
+                                capsule_runtime::report_println!(
                                     "  \u{26A0}  {ref_str:<col_width$}   \u{2014} pulled at runtime by session {session}"
                                 );
                                 warnings.push(format!("mur install {ref_str}"));
@@ -1643,7 +1672,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             (_, None)
                                 if resolved.platform_match == PlatformMatch::UntaggedFallback =>
                             {
-                                println!(
+                                capsule_runtime::report_println!(
                                     "  \u{26A0}  {ref_str:<col_width$}   {platform}   \u{2014} native artifact with no recorded platform (warning[{W_REG_001}])"
                                 );
                                 warnings.push(format!("mur install {ref_str}"));
@@ -1653,17 +1682,21 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                             // on it solely for a native binary this check identified and
                             // matched, never for an artifact whose payload doctor never opened.
                             (PlatformVerdict::Independent, None) => {
-                                println!(
+                                capsule_runtime::report_println!(
                                     "  \u{2713}  {ref_str:<col_width$}   platform-independent"
                                 );
                                 total_pass += 1;
                             }
                             (PlatformVerdict::Matches, None) => {
-                                println!("  \u{2713}  {ref_str:<col_width$}   {platform}");
+                                capsule_runtime::report_println!(
+                                    "  \u{2713}  {ref_str:<col_width$}   {platform}"
+                                );
                                 total_pass += 1;
                             }
                             (PlatformVerdict::Unverified, None) => {
-                                println!("  \u{2713}  {ref_str:<col_width$}   platform unverified");
+                                capsule_runtime::report_println!(
+                                    "  \u{2713}  {ref_str:<col_width$}   platform unverified"
+                                );
                                 total_pass += 1;
                             }
                         }
@@ -1672,19 +1705,19 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                         session,
                         declared_as,
                     } => {
-                        println!(
+                        capsule_runtime::report_println!(
                             "  \u{2717}  {ref_str:<col_width$}   \u{2014} murmur.lock pins '{name}' from a runtime pull by session {session}; murmur.yaml declares it with {declared_as}"
                         );
                         fixes.push(format!("mur install {ref_str}"));
                     }
                     LockVerdict::MissingEntry => {
-                        println!(
+                        capsule_runtime::report_println!(
                             "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock missing artifact entry for '{name}'"
                         );
                         fixes.push(format!("mur install {ref_str}"));
                     }
                     LockVerdict::VersionMismatch { pinned } => {
-                        println!(
+                        capsule_runtime::report_println!(
                             "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock version mismatch for '{name}': manifest requested {version}, lock pinned {pinned}"
                         );
                         fixes.push(format!(
@@ -1692,17 +1725,21 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                         ));
                     }
                     LockVerdict::MissingPlatform { pinned } => {
-                        println!(
+                        capsule_runtime::report_println!(
                             "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock has no sha256 for '{name}' on {platform}: it pins {pinned}"
                         );
                         fixes.push(format!("mur install {ref_str}"));
                     }
                     LockVerdict::HashMismatch { expected, actual } => {
-                        println!(
+                        capsule_runtime::report_println!(
                             "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} artifact integrity check failed for {ref_str}"
                         );
-                        println!("        expected sha256 (murmur.lock): {expected}");
-                        println!("        actual sha256 (on disk):       {actual}");
+                        capsule_runtime::report_println!(
+                            "        expected sha256 (murmur.lock): {expected}"
+                        );
+                        capsule_runtime::report_println!(
+                            "        actual sha256 (on disk):       {actual}"
+                        );
                         fixes.push(format!(
                             "{name}: artifact on disk does not match murmur.lock \u{2014} re-publish or delete the lock"
                         ));
@@ -1712,7 +1749,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
             // A missing artifact is already one failure; there is nothing on disk to
             // hash, so it never also gets a lock line.
             ArtifactPresence::Missing => {
-                println!("  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} missing");
+                capsule_runtime::report_println!(
+                    "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} missing"
+                );
                 fixes.push(format!("mur install {ref_str}"));
             }
         }
@@ -1733,7 +1772,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
                 continue;
             }
             let ref_str = format!("{}@{}", entry.name, entry.resolved_version);
-            println!(
+            capsule_runtime::report_println!(
                 "  \u{00B7}  {ref_str:<col_width$}   pulled at runtime by session {session} \u{2014} not declared in murmur.yaml, so mur run does not stage it"
             );
         }
@@ -1745,7 +1784,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
         }
     }
 
-    println!();
+    capsule_runtime::report_println!();
 
     print_tally(total_pass, &fixes, &warnings);
     Ok(())

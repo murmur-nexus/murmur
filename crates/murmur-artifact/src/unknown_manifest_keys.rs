@@ -200,7 +200,7 @@ pub fn warn_on_unknown_manifest_keys(manifest: &RuntimeManifest, running_version
         manifest.mur_version.as_deref(),
         running_version,
     ) {
-        eprintln!("{line}");
+        crate::warn_line(format_args!("{line}"));
     }
 }
 

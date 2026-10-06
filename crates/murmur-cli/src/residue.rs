@@ -19,7 +19,7 @@ use serde_json::Value;
 /// describe the same item, so both are read here rather than at each caller.
 pub(crate) fn print_residue(parts: &[Value]) {
     for item in parts.iter().filter_map(unwrap_item) {
-        println!("{}", residue_line(&item));
+        capsule_runtime::report_println!("{}", residue_line(&item));
     }
 }
 

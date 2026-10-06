@@ -1730,7 +1730,7 @@ pub(crate) fn run_deploy(
         // Bar text is drawn only on a terminal; a warning must reach a pipe or a log too.
         multi.suspend(|| {
             for warning in &warnings {
-                eprintln!("{warning}");
+                capsule_runtime::report_eprintln!("{warning}");
             }
         });
     }
@@ -1817,8 +1817,8 @@ pub(crate) fn run_deploy(
     multi.suspend(|| {
         for line in door_lines(&runtime_manifest, &start_info, &public_url) {
             match line {
-                DoorLine::Warning(warning) => eprintln!("{warning}"),
-                DoorLine::Token(token) => println!("{token}"),
+                DoorLine::Warning(warning) => capsule_runtime::report_eprintln!("{warning}"),
+                DoorLine::Token(token) => capsule_runtime::report_println!("{token}"),
             }
         }
     });

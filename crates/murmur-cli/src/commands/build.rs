@@ -39,7 +39,7 @@ pub(crate) fn run_build(
                 &cwd,
                 summary,
             )?;
-            println!("Built artifact: {}", out.display());
+            capsule_runtime::report_println!("Built artifact: {}", out.display());
             Ok(())
         }
     }
@@ -54,7 +54,7 @@ fn run_build_standard(source: &Path, output_arg: Option<&Path>) -> Result<(), Cl
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| warning.file.clone());
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "warning[{}]: {}: field '{}' appears to contain a literal secret value\n  → use a ${{VAR_NAME}} reference instead and inject the value via environment\n  → this file may not be safe to commit to version control\n  → {}",
             W_SEC_004, filename, warning.field_path, security_warning_link(W_SEC_004)
         );
@@ -66,7 +66,7 @@ fn run_build_standard(source: &Path, output_arg: Option<&Path>) -> Result<(), Cl
     // Authoring lints run over the same entry set the build is about to pack, so they print
     // before the artifact line — and before a payload-shape failure, when there is one.
     for warning in lint_build_warnings(source, &output_path).map_err(CliError::from)? {
-        eprintln!(
+        capsule_runtime::report_eprintln!(
             "warning[{}]: {}\n  → {}\n  → {}",
             warning.code,
             warning.message,
@@ -77,7 +77,7 @@ fn run_build_standard(source: &Path, output_arg: Option<&Path>) -> Result<(), Cl
 
     let artifact_path = build_artifact(source, &output_path).map_err(CliError::from)?;
 
-    println!("Built artifact: {}", artifact_path.display());
+    capsule_runtime::report_println!("Built artifact: {}", artifact_path.display());
     Ok(())
 }
 
