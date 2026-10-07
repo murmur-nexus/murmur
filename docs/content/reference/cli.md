@@ -990,7 +990,13 @@ directory's own `.murmur/artifacts` store, then the global store, and against th
 
 1. One line, `No murmur.yaml in <dir>: checking its roster.yaml. Run mur doctor in a member's source directory to check that member's artifacts.`, then a blank line.
 2. The `Roster` block.
-3. `All checks passed.` and exit code `0`, or, for a refused roster, `0 checks passed, 1 error found.`, a blank line, `Fix: <hint>` and exit code `1`.
+3. The tally:
+
+    | Roster | Tally | Exit code |
+    |---|---|---:|
+    | Admitted, no warning | `All checks passed.` | `0` |
+    | Admitted, with warnings | `0 checks passed, 0 errors found, N warning(s).`, a blank line, and one `Fix: <remedy>` per warning | `0` |
+    | Refused | `0 checks passed, 1 error found.`, a blank line, and `Fix: <hint>` | `1` |
 
 No member's artifacts, environment requirements, door or host checks are reported, and `--bind`
 changes nothing.
@@ -1002,6 +1008,7 @@ changes nothing.
 | `reachability: none` | No member may call another |
 | `reachability: a → b, …` | The edges the rules declare, ordered by the members' order in the roster |
 | `reachability (all): a → b, …` | The edges `reachability: all` expands to |
+| `warning[W-ROS-001]: …` | More members may call this member than its `lifecycle` holds at once. One line per such member, in roster order, each counted as a warning with a `Fix:` entry. See [`W-ROS-001`](diagnostics.md#w-ros-001) |
 | `✗  <message>` | The roster is refused. The member lines are not printed |
 
 A refused roster is an error: its code goes to stderr with a hint, the hint is added as a `Fix:`
@@ -1018,6 +1025,7 @@ Roster
   coder      coder@1.2.0              serves peers    authenticated door
   reviewer   reviewer@0.9.0           serves peers    authenticated door
   reachability: planner → coder, planner → reviewer, reviewer → coder
+  warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (planner, reviewer), but it holds 1 task at once — lifecycle.task_acceptance: single — so a call that arrives while it is busy is rejected; lifecycle.task_acceptance: queue with lifecycle.queue_depth: 1 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
 ```
 
 **Output — a refused roster:**
@@ -1340,6 +1348,10 @@ Standard output under `--json` carries exactly two lines:
 | `entry` | The entry member's roster name |
 | `formation_id` | The id every member was launched with, `frm_` followed by 32 lowercase hex digits |
 | `peers` | One object per non-entry member, in roster order: `name`, `pid`, `session_id`, `url` as `http://host:port`, and `workdir`, the peer's own [directory](roster.md#member-directories) `~/.murmur/formations/<frm_id>/<member>` |
+
+Before anything starts, the launcher writes one [`W-ROS-001`](diagnostics.md#w-ros-001) line to
+stderr, behind `[mur run] `, for each member more members may call than its `lifecycle` holds at
+once, with or without `--json`. The formation launches all the same.
 
 Neither the formation line nor any member's output carries a door token. Without `--json`, the launcher writes the same
 information to stderr as a `formation:` block, and the entry member writes its usual startup lines

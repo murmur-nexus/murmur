@@ -21,6 +21,34 @@ const SERVES: &str = "exports:\n  peer_tasks:\n    accept: true\n";
 const REFUSES: &str = "exports:\n  peer_tasks:\n    accept: false\n";
 const AUTHENTICATED: &str = "network:\n  authentication:\n    scheme: bearer\n";
 
+const W_ROS_001_LINK: &str = "https://docs.murmur.nexus/reference/diagnostics/#w-ros-001";
+
+/// `lead` calls `a`, `b` and `target`; `a` and `b` each call `target`. Three members may call
+/// `target`.
+const THREE_CALLERS_ROSTER: &str = "roster_version: 1
+members:
+  - name: lead
+    capsule: lead
+    version: 1.0.0
+    entry: true
+  - name: a
+    capsule: a
+    version: 1.0.0
+  - name: b
+    capsule: b
+    version: 1.0.0
+  - name: target
+    capsule: target
+    version: 1.0.0
+reachability:
+  - from: lead
+    to: [a, b, target]
+  - from: a
+    to: [target]
+  - from: b
+    to: [target]
+";
+
 const S1_ROSTER: &str = "roster_version: 1
 members:
   - name: planner
@@ -52,6 +80,14 @@ fn manifest(name: &str, version: &str, serves: bool, authenticated: bool) -> Str
         yaml.push_str(AUTHENTICATED);
     }
     yaml
+}
+
+/// [`manifest`] for a serving, authenticated capsule under `task_acceptance: queue` at `depth`.
+fn queue_manifest(name: &str, version: &str, depth: usize) -> String {
+    manifest(name, version, true, true)
+        + &format!(
+            "lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n  queue_depth: {depth}\n"
+        )
 }
 
 /// Install a capsule into `store_root` whose packed `murmur.yaml` is exactly `manifest_yaml`.
@@ -270,7 +306,23 @@ fn s1_doctor_prints_the_admitted_roster_and_passes() {
             "  reviewer   reviewer@0.9.0           serves peers    authenticated door".to_string(),
             "  reachability: planner \u{2192} coder, planner \u{2192} reviewer, reviewer \u{2192} coder"
                 .to_string(),
+            format!(
+                "  warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (planner, reviewer), \
+                 but it holds 1 task at once \u{2014} lifecycle.task_acceptance: single \u{2014} so a \
+                 call that arrives while it is busy is rejected; lifecycle.task_acceptance: queue \
+                 with lifecycle.queue_depth: 1 would hold them all ({W_ROS_001_LINK})"
+            ),
         ]
+    );
+    assert!(
+        doctor.stdout.ends_with(
+            "0 checks passed, 0 errors found, 1 warning.\n\nFix: coder (coder@1.2.0): set \
+             lifecycle.task_acceptance: queue and lifecycle.queue_depth: 1 in its murmur.yaml so \
+             all 2 members that may call it are held at once, or narrow its callers in roster.yaml \
+             (warning[W-ROS-001])\n"
+        ),
+        "{}",
+        doctor.stdout
     );
 }
 
@@ -639,8 +691,14 @@ fn s12_without_a_roster_doctor_prints_no_roster_block() {
     assert!(!without.stdout.contains("Roster"), "{}", without.stdout);
     assert!(without.stdout.contains("All checks passed."));
 
-    // A roster that admits adds its block and nothing else.
+    // A roster that admits, and whose members hold every caller, adds its block and nothing else.
     s1_project(project.path());
+    install_capsule(
+        &project_store(project.path()),
+        "coder",
+        "1.2.0",
+        &queue_manifest("coder", "1.2.0", 1),
+    );
     let with = mur_doctor(&home, project.path());
     assert_admitted(&with);
     let block_free: String = {
@@ -878,8 +936,11 @@ fn s15_a_formation_directory_is_checked_as_one_and_its_parent_as_before() {
         "{}",
         doctor.stdout
     );
+    // S1's `coder` draws `W-ROS-001`; a warning leaves the exit code alone.
     assert!(
-        doctor.stdout.ends_with("\n\nAll checks passed.\n"),
+        doctor.stdout.contains(
+            "\n\n0 checks passed, 0 errors found, 1 warning.\n\nFix: coder (coder@1.2.0): "
+        ),
         "{}",
         doctor.stdout
     );
@@ -949,4 +1010,106 @@ fn capsule_runtime_registry(home: &TempDir, project_dir: &Path) -> ProjectThenGl
         project: murmur_artifact::LocalRegistry::new(project_store(project_dir)),
         global: murmur_artifact::LocalRegistry::new(global_store(home)),
     }
+}
+
+// ── W-ROS-001: more members may call a member than it holds ─────────────────
+
+/// [`THREE_CALLERS_ROSTER`] in `project_dir`, its `target` under `queue` at `depth` and every
+/// other member at the default lifecycle.
+fn three_callers_project(project_dir: &Path, depth: usize) {
+    write_roster(project_dir, THREE_CALLERS_ROSTER);
+    let store = project_store(project_dir);
+    for name in ["lead", "a", "b"] {
+        install_capsule(&store, name, "1.0.0", &manifest(name, "1.0.0", true, true));
+    }
+    install_capsule(
+        &store,
+        "target",
+        "1.0.0",
+        &queue_manifest("target", "1.0.0", depth),
+    );
+}
+
+fn three_callers_warning() -> String {
+    format!(
+        "  warning[W-ROS-001]: roster.yaml lets 3 members call 'target' (lead, a, b), but it holds \
+         2 tasks at once \u{2014} one running and lifecycle.queue_depth: 1 waiting \u{2014} so a call \
+         that arrives while it is full is rejected; lifecycle.queue_depth: 2 would hold them all \
+         ({W_ROS_001_LINK})"
+    )
+}
+
+/// The `W-ROS-001` line sits in the `Roster` block right after `reachability`, the tally counts
+/// one warning with a `Fix:` naming the member, and doctor still passes.
+fn assert_three_callers_warned(doctor: &Doctor) {
+    assert_admitted(doctor);
+    let block: Vec<&str> = doctor
+        .stdout
+        .lines()
+        .skip_while(|line| *line != "Roster")
+        .take_while(|line| !line.is_empty())
+        .collect();
+    let reachability = block
+        .iter()
+        .position(|line| line.starts_with("  reachability: "))
+        .unwrap_or_else(|| panic!("no reachability line in:\n{}", doctor.stdout));
+    assert_eq!(&block[reachability + 1..], [three_callers_warning()]);
+    assert_eq!(
+        doctor.stdout.matches("W-ROS-001").count(),
+        2,
+        "{}",
+        doctor.stdout
+    );
+    assert!(
+        doctor.stdout.contains(
+            "0 checks passed, 0 errors found, 1 warning.\n\nFix: target (target@1.0.0): set \
+             lifecycle.queue_depth: 2 in its murmur.yaml so all 3 members that may call it are \
+             held at once, or narrow its callers in roster.yaml (warning[W-ROS-001])\n"
+        ),
+        "{}",
+        doctor.stdout
+    );
+}
+
+#[test]
+fn three_callers_of_a_member_at_depth_one_warn_and_doctor_still_passes() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path());
+    three_callers_project(project.path(), 1);
+
+    assert_three_callers_warned(&mur_doctor(&home, project.path()));
+}
+
+#[test]
+fn three_callers_of_a_member_at_depth_two_draw_no_warning() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path());
+    three_callers_project(project.path(), 2);
+
+    let doctor = mur_doctor(&home, project.path());
+    assert_admitted(&doctor);
+    assert!(!doctor.stdout.contains("W-ROS-001"), "{}", doctor.stdout);
+    assert!(!doctor.stderr.contains("W-ROS-001"), "{}", doctor.stderr);
+    assert!(
+        doctor.stdout.ends_with("All checks passed.\n"),
+        "{}",
+        doctor.stdout
+    );
+}
+
+#[test]
+fn a_formation_directory_warns_about_three_callers_the_same_way() {
+    let home = tempfile::tempdir().unwrap();
+    let formation = tempfile::tempdir().unwrap();
+    three_callers_project(formation.path(), 1);
+
+    let doctor = mur_doctor(&home, formation.path());
+    assert!(
+        doctor.stdout.starts_with("No murmur.yaml in "),
+        "{}",
+        doctor.stdout
+    );
+    assert_three_callers_warned(&doctor);
 }

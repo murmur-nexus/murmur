@@ -18,13 +18,18 @@
 //!
 //! Checks 1–4 read no store, so a structurally broken roster is refused without a lookup. Within a
 //! check, members are taken in roster order.
+//!
+//! An admitted roster can be asked for [`AdmittedRoster::caller_overflows`]: the members more
+//! members may call than their `lifecycle` holds at once, which `mur` prints as `W-ROS-001`
+//! without refusing anything.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use murmur_artifact::{
-    current_platform, load_roster, resolve_roster_path, sha256_hex, LockedSha256, MurmurLock,
-    Registry, RegistryError, Roster, RosterReachability, RuntimeManifest, ROSTER_FILENAME,
+    current_platform, load_roster, resolve_roster_path, roster_warning_link, sha256_hex,
+    LockedSha256, MurmurLock, Registry, RegistryError, Roster, RosterReachability, RuntimeManifest,
+    TaskAcceptance, ROSTER_FILENAME, W_ROS_001,
 };
 use thiserror::Error;
 
@@ -75,6 +80,24 @@ impl AdmittedMember {
 pub struct RosterEdge {
     pub from: String,
     pub to: String,
+}
+
+/// A member the roster lets more members call than it holds at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerOverflow {
+    pub member: String,
+    pub capsule: String,
+    pub version: String,
+    /// Every member with an edge into `member`, in roster order. Never empty.
+    pub callers: Vec<String>,
+    pub task_acceptance: TaskAcceptance,
+    pub queue_depth: usize,
+    /// [`murmur_artifact::LifecycleConfig::tasks_held_at_once`] of the member's effective
+    /// lifecycle. Always less than `callers.len()`.
+    pub holds: usize,
+    /// The `queue_depth` that, under `task_acceptance: queue`, holds every caller at once:
+    /// `max(callers.len() - 1, 1)`.
+    pub sufficient_queue_depth: usize,
 }
 
 /// Why a roster was not admitted. One refusal covers the whole roster: no member of a refused
@@ -209,6 +232,100 @@ impl AdmittedRoster {
     pub fn declares_peer_traffic(&self) -> bool {
         !self.edges.is_empty()
     }
+
+    /// Every member whose callers outnumber the tasks it holds at once, in roster order.
+    ///
+    /// Callers are the `from` of each edge into the member, so `reachability: all` counts as
+    /// expanded, and each calling member counts once: a member holds at most one unanswered call
+    /// to a given member. A member nothing calls never overflows, the entry member included.
+    #[must_use]
+    pub fn caller_overflows(&self) -> Vec<CallerOverflow> {
+        self.members
+            .iter()
+            .filter_map(|member| {
+                let callers: Vec<String> = self
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.to == member.name)
+                    .map(|edge| edge.from.clone())
+                    .collect();
+                let lifecycle = member.manifest.effective_lifecycle();
+                let holds = lifecycle.tasks_held_at_once();
+                (callers.len() > holds).then(|| CallerOverflow {
+                    member: member.name.clone(),
+                    capsule: member.capsule.clone(),
+                    version: member.version.clone(),
+                    sufficient_queue_depth: callers.len().saturating_sub(1).max(1),
+                    callers,
+                    task_acceptance: lifecycle.task_acceptance,
+                    queue_depth: lifecycle.queue_depth,
+                    holds,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The whole `warning[W-ROS-001]: …` line for `overflow`, link included. `mur run --roster` and
+/// `mur doctor` both print this string, so the two read the same.
+#[must_use]
+pub fn caller_overflow_warning(overflow: &CallerOverflow) -> String {
+    let count = overflow.callers.len();
+    let noun = if count == 1 { "member" } else { "members" };
+    let depth = overflow.sufficient_queue_depth;
+    let (holding, rejection, remedy) = match overflow.task_acceptance {
+        TaskAcceptance::Queue if overflow.queue_depth > 0 => (
+            format!(
+                "{} tasks at once — one running and lifecycle.queue_depth: {} waiting —",
+                overflow.holds, overflow.queue_depth
+            ),
+            "a call that arrives while it is full is rejected",
+            format!("lifecycle.queue_depth: {depth}"),
+        ),
+        TaskAcceptance::Queue => (
+            "no task — lifecycle.queue_depth: 0 —".to_string(),
+            "every call is rejected",
+            format!("lifecycle.queue_depth: {depth}"),
+        ),
+        TaskAcceptance::Single => (
+            "1 task at once — lifecycle.task_acceptance: single —".to_string(),
+            "a call that arrives while it is busy is rejected",
+            format!("lifecycle.task_acceptance: queue with lifecycle.queue_depth: {depth}"),
+        ),
+        TaskAcceptance::None => (
+            "no task — lifecycle.task_acceptance: none —".to_string(),
+            "every call is rejected",
+            format!("lifecycle.task_acceptance: queue with lifecycle.queue_depth: {depth}"),
+        ),
+    };
+    format!(
+        "warning[{W_ROS_001}]: {ROSTER_FILENAME} lets {count} {noun} call '{}' ({}), but it holds \
+         {holding} so {rejection}; {remedy} would hold them all ({})",
+        overflow.member,
+        overflow.callers.join(", "),
+        roster_warning_link(W_ROS_001),
+    )
+}
+
+/// The one-line remedy `mur doctor` prints under `Fix:` for `overflow`.
+#[must_use]
+pub fn caller_overflow_fix(overflow: &CallerOverflow) -> String {
+    let depth = overflow.sufficient_queue_depth;
+    let setting = match overflow.task_acceptance {
+        TaskAcceptance::Queue => format!("lifecycle.queue_depth: {depth}"),
+        TaskAcceptance::Single | TaskAcceptance::None => {
+            format!("lifecycle.task_acceptance: queue and lifecycle.queue_depth: {depth}")
+        }
+    };
+    let held = match overflow.callers.len() {
+        1 => "the 1 member that may call it is held".to_string(),
+        count => format!("all {count} members that may call it are held"),
+    };
+    format!(
+        "{} ({}@{}): set {setting} in its murmur.yaml so {held} at once, or narrow its callers \
+         in {ROSTER_FILENAME} (warning[{W_ROS_001}])",
+        overflow.member, overflow.capsule, overflow.version,
+    )
 }
 
 /// Load `roster.yaml` from `project_dir` and admit it.
@@ -1063,5 +1180,244 @@ mod tests {
         ] {
             assert!(refusal.to_string().starts_with("roster.yaml"), "{refusal}");
         }
+    }
+
+    const S5A_WARNING: &str = "warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' \
+        (w01, w02, w03, w04, w05, w06, w07, w08, w09, w10), but it holds 2 tasks at once — one \
+        running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full is \
+        rejected; lifecycle.queue_depth: 9 would hold them all \
+        (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)";
+
+    /// A serving, authenticated member manifest with `lifecycle_yaml` as its `lifecycle:` block's
+    /// body, two-space indented; an empty body declares no `lifecycle:` at all.
+    fn manifest_with_lifecycle(name: &str, lifecycle_yaml: &str) -> String {
+        let mut yaml = manifest(name, "1.0.0", true, true);
+        if !lifecycle_yaml.is_empty() {
+            yaml.push_str(&format!("lifecycle:\n  {lifecycle_yaml}\n"));
+        }
+        yaml
+    }
+
+    const QUEUE_DEPTH_1: &str = "task_acceptance: queue\n  after_task: sleep";
+
+    fn queue_at(depth: usize) -> String {
+        format!("task_acceptance: queue\n  after_task: sleep\n  queue_depth: {depth}")
+    }
+
+    /// Install every `(name, lifecycle)` and admit them as one roster, the first member the entry.
+    fn admit_with(
+        members: &[(&str, &str)],
+        reachability: RosterReachability,
+    ) -> (tempfile::TempDir, AdmittedRoster) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalRegistry::new(dir.path());
+        for (name, lifecycle) in members {
+            install(
+                &store,
+                name,
+                "1.0.0",
+                &manifest_with_lifecycle(name, lifecycle),
+            );
+        }
+        let roster = Roster {
+            members: members
+                .iter()
+                .enumerate()
+                .map(|(index, (name, _))| member(name, "1.0.0", index == 0))
+                .collect(),
+            reachability,
+        };
+        let admitted = admit_roster(&roster, &store, None).unwrap();
+        (dir, admitted)
+    }
+
+    const WORKERS: [&str; 10] = [
+        "w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10",
+    ];
+
+    /// S5a's shape: `lead` calls ten workers, each worker calls `reviewer`.
+    fn s5a_shaped(reviewer_lifecycle: &str) -> (tempfile::TempDir, AdmittedRoster) {
+        let mut members = vec![("lead", "")];
+        members.extend(WORKERS.iter().map(|worker| (*worker, QUEUE_DEPTH_1)));
+        members.push(("reviewer", reviewer_lifecycle));
+        let mut rules = vec![rule("lead", &WORKERS)];
+        rules.extend(WORKERS.iter().map(|worker| rule(worker, &["reviewer"])));
+        admit_with(&members, RosterReachability::Rules(rules))
+    }
+
+    #[test]
+    fn s5a_ten_callers_overflow_a_reviewer_at_depth_one() {
+        let (_dir, admitted) = s5a_shaped(QUEUE_DEPTH_1);
+        assert_eq!(
+            admitted.caller_overflows(),
+            [CallerOverflow {
+                member: "reviewer".to_string(),
+                capsule: "reviewer".to_string(),
+                version: "1.0.0".to_string(),
+                callers: WORKERS.iter().map(ToString::to_string).collect(),
+                task_acceptance: TaskAcceptance::Queue,
+                queue_depth: 1,
+                holds: 2,
+                sufficient_queue_depth: 9,
+            }]
+        );
+    }
+
+    #[test]
+    fn s5a_the_warning_line_is_exact() {
+        let (_dir, admitted) = s5a_shaped(QUEUE_DEPTH_1);
+        let overflows = admitted.caller_overflows();
+        assert_eq!(caller_overflow_warning(&overflows[0]), S5A_WARNING);
+        assert_eq!(
+            caller_overflow_fix(&overflows[0]),
+            "reviewer (reviewer@1.0.0): set lifecycle.queue_depth: 9 in its murmur.yaml so all 10 \
+             members that may call it are held at once, or narrow its callers in roster.yaml \
+             (warning[W-ROS-001])"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_deep_enough_for_every_caller_does_not_overflow() {
+        for depth in [9, 10] {
+            let (_dir, admitted) = s5a_shaped(&queue_at(depth));
+            assert!(
+                admitted.caller_overflows().is_empty(),
+                "depth {depth} holds all ten callers"
+            );
+        }
+    }
+
+    #[test]
+    fn all_counts_every_expanded_caller_and_never_the_entry_member() {
+        for (lifecycle, overflows) in [
+            (String::new(), true),
+            (QUEUE_DEPTH_1.to_string(), true),
+            (queue_at(2), false),
+        ] {
+            let members: Vec<(&str, &str)> = ["a", "b", "c", "d"]
+                .iter()
+                .map(|name| (*name, lifecycle.as_str()))
+                .collect();
+            let (_dir, admitted) = admit_with(&members, RosterReachability::All);
+            let found = admitted.caller_overflows();
+            if !overflows {
+                assert!(found.is_empty(), "'{lifecycle}' holds three callers");
+                continue;
+            }
+            let named: Vec<_> = found.iter().map(|o| o.member.as_str()).collect();
+            assert_eq!(named, ["b", "c", "d"], "'{lifecycle}'");
+            for overflow in &found {
+                assert_eq!(overflow.callers.len(), 3, "{overflow:?}");
+                assert!(!overflow.callers.contains(&overflow.member));
+                assert_eq!(overflow.sufficient_queue_depth, 2);
+            }
+            assert_eq!(found[0].callers, ["a", "c", "d"]);
+        }
+    }
+
+    #[test]
+    fn a_single_member_with_two_callers_is_told_to_switch_to_queue() {
+        let (_dir, admitted) = admit_with(
+            &[("lead", ""), ("helper", ""), ("coder", "")],
+            RosterReachability::Rules(vec![
+                rule("lead", &["coder", "helper"]),
+                rule("helper", &["coder"]),
+            ]),
+        );
+        let overflows = admitted.caller_overflows();
+        assert_eq!(overflows.len(), 1);
+        let overflow = &overflows[0];
+        assert_eq!(overflow.member, "coder");
+        assert_eq!(overflow.callers, ["lead", "helper"]);
+        assert_eq!(overflow.task_acceptance, TaskAcceptance::Single);
+        assert_eq!(overflow.holds, 1);
+        assert_eq!(overflow.sufficient_queue_depth, 1);
+        assert_eq!(
+            caller_overflow_warning(overflow),
+            "warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (lead, helper), but it \
+             holds 1 task at once — lifecycle.task_acceptance: single — so a call that arrives \
+             while it is busy is rejected; lifecycle.task_acceptance: queue with \
+             lifecycle.queue_depth: 1 would hold them all \
+             (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
+        );
+        assert_eq!(
+            caller_overflow_fix(overflow),
+            "coder (coder@1.0.0): set lifecycle.task_acceptance: queue and \
+             lifecycle.queue_depth: 1 in its murmur.yaml so all 2 members that may call it are \
+             held at once, or narrow its callers in roster.yaml (warning[W-ROS-001])"
+        );
+    }
+
+    #[test]
+    fn a_member_that_accepts_no_task_overflows_with_one_caller() {
+        let (_dir, admitted) = admit_with(
+            &[("lead", ""), ("idle", "task_acceptance: none")],
+            RosterReachability::Rules(vec![rule("lead", &["idle"])]),
+        );
+        let overflows = admitted.caller_overflows();
+        assert_eq!(overflows.len(), 1);
+        assert_eq!(overflows[0].holds, 0);
+        assert_eq!(
+            caller_overflow_warning(&overflows[0]),
+            "warning[W-ROS-001]: roster.yaml lets 1 member call 'idle' (lead), but it holds no \
+             task — lifecycle.task_acceptance: none — so every call is rejected; \
+             lifecycle.task_acceptance: queue with lifecycle.queue_depth: 1 would hold them all \
+             (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
+        );
+        assert_eq!(
+            caller_overflow_fix(&overflows[0]),
+            "idle (idle@1.0.0): set lifecycle.task_acceptance: queue and lifecycle.queue_depth: 1 \
+             in its murmur.yaml so the 1 member that may call it is held at once, or narrow its \
+             callers in roster.yaml (warning[W-ROS-001])"
+        );
+    }
+
+    #[test]
+    fn a_queue_member_at_depth_zero_holds_no_task() {
+        let (_dir, admitted) = admit_with(
+            &[("lead", ""), ("shut", &queue_at(0))],
+            RosterReachability::Rules(vec![rule("lead", &["shut"])]),
+        );
+        let overflows = admitted.caller_overflows();
+        assert_eq!(overflows.len(), 1);
+        assert_eq!(
+            caller_overflow_warning(&overflows[0]),
+            "warning[W-ROS-001]: roster.yaml lets 1 member call 'shut' (lead), but it holds no \
+             task — lifecycle.queue_depth: 0 — so every call is rejected; \
+             lifecycle.queue_depth: 1 would hold them all \
+             (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
+        );
+    }
+
+    /// The entry member holds no task of its own here, yet nothing may call it, so it is never
+    /// the member named.
+    #[test]
+    fn the_entry_member_is_never_named() {
+        let (_dir, admitted) = admit_with(
+            &[
+                ("lead", "task_acceptance: none"),
+                ("a", ""),
+                ("b", &queue_at(5)),
+            ],
+            RosterReachability::All,
+        );
+        assert!(!admitted.edges().is_empty());
+        assert!(admitted
+            .caller_overflows()
+            .iter()
+            .all(|overflow| overflow.member != "lead"));
+    }
+
+    #[test]
+    fn a_roster_with_no_edges_has_no_overflow() {
+        let (_dir, admitted) = admit_with(
+            &[
+                ("lead", "task_acceptance: none"),
+                ("idle", "task_acceptance: none"),
+            ],
+            RosterReachability::Closed,
+        );
+        assert!(admitted.edges().is_empty());
+        assert!(admitted.caller_overflows().is_empty());
     }
 }

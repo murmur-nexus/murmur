@@ -17,6 +17,7 @@ pub mod platform;
 pub mod registry;
 pub mod registry_warnings;
 pub mod roster;
+pub mod roster_warnings;
 pub mod runtime_manifest;
 pub mod runtime_warnings;
 pub mod secrets;
@@ -78,6 +79,7 @@ pub use roster::{
     RosterError, RosterMember, RosterReachability, MAX_MEMBER_NAME_LEN, REACHABILITY_ALL,
     ROSTER_FILENAME, ROSTER_VERSION,
 };
+pub use roster_warnings::{roster_warning_link, W_ROS_001};
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,

@@ -4,17 +4,17 @@ use std::path::Path;
 
 use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEntryState};
 use capsule_runtime::{
-    capability_policy_from_runtime_manifest, check_egress_namespace,
-    check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
-    detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
-    inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_install,
-    render_read_only, undeclarable_runtime_pin_role, warn_on_gateway_endpoint_in_network_allow,
-    warn_on_interpreter_runtime_grants, warn_on_launch_only_gateway_credential,
-    warn_on_secret_shaped_env_grants, warn_on_unmetered_gateways,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
-    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
-    SERVED_WIT_PACKAGES,
+    caller_overflow_fix, caller_overflow_warning, capability_policy_from_runtime_manifest,
+    check_egress_namespace, check_interpreted_entrypoints_reachable, check_roost_health,
+    check_staged_runtime_floor, detect_egress_namespace_blocker, detect_userns_grant, find_on_path,
+    inspect_installed_profile, inspect_profile_attachment, preopen_reports, read_only_advisory_for,
+    render_install, render_read_only, undeclarable_runtime_pin_role,
+    warn_on_gateway_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_gateway_credential, warn_on_secret_shaped_env_grants,
+    warn_on_unmetered_gateways, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
+    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
+    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256, SERVED_WIT_PACKAGES,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
@@ -1113,19 +1113,30 @@ fn print_uninspectable(report: &EnvRequirementsReport, findings: &mut EnvRequire
     );
 }
 
+/// What [`report_roster`] found, split by whether it fails the exit code.
+#[derive(Default)]
+struct RosterFindings {
+    /// The refusal's hint, when admission refused the roster. Makes doctor exit non-zero.
+    fixes: Vec<String>,
+    /// One `W-ROS-001` remedy per member more members may call than it holds at once. Printed as
+    /// a `Fix:` line that leaves the exit code alone.
+    warnings: Vec<String>,
+}
+
 /// Print the `Roster` block when `roster.yaml` sits in `project_root`: the roster admitted through
-/// [`capsule_runtime::admit_roster_file`], with each member's peer posture and the expanded
-/// reachability. Returns the `Fix:` entries; a refusal is one, and it fails the exit code.
+/// [`capsule_runtime::admit_roster_file`], with each member's peer posture, the expanded
+/// reachability and a `W-ROS-001` line per member whose callers outnumber what it holds at once.
+/// A refusal is a fix, and it fails the exit code; an overflow is a warning, and it does not.
 ///
 /// Prints nothing, and finds nothing, when there is no `roster.yaml`.
 fn report_roster(
     project_root: &Path,
     registry: &dyn Registry,
     lock: Option<&MurmurLock>,
-) -> Vec<String> {
+) -> RosterFindings {
     let path = resolve_roster_path(project_root);
     if !path.exists() {
-        return Vec::new();
+        return RosterFindings::default();
     }
 
     capsule_runtime::report_println!("Roster");
@@ -1142,7 +1153,10 @@ fn report_roster(
                 code = error.code,
                 message = error.message
             );
-            return vec![hint];
+            return RosterFindings {
+                fixes: vec![hint],
+                warnings: Vec::new(),
+            };
         }
     };
 
@@ -1189,8 +1203,16 @@ fn report_roster(
         }
         _ => capsule_runtime::report_println!("  reachability: {edges}"),
     }
+    let mut warnings = Vec::new();
+    for overflow in admitted.caller_overflows() {
+        capsule_runtime::report_println!("  {}", caller_overflow_warning(&overflow));
+        warnings.push(caller_overflow_fix(&overflow));
+    }
     capsule_runtime::report_println!();
-    Vec::new()
+    RosterFindings {
+        fixes: Vec::new(),
+        warnings,
+    }
 }
 
 /// Who may call the capsule's door: the posture line, always, and `W-SEC-032` when `bind_addr`
@@ -1213,7 +1235,7 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
     );
     capsule_runtime::report_println!();
     let lock = read_optional_lockfile(formation_dir)?;
-    let fixes = report_roster(
+    let findings = report_roster(
         formation_dir,
         &FallbackRegistry {
             primary: LocalRegistry::new(formation_dir.join(".murmur").join("artifacts")),
@@ -1221,7 +1243,7 @@ fn run_formation_doctor(formation_dir: &Path) -> Result<(), CliError> {
         },
         lock.as_ref(),
     );
-    print_tally(0, &fixes, &[]);
+    print_tally(0, &findings.fixes, &findings.warnings);
     Ok(())
 }
 
@@ -1534,7 +1556,7 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let platform = current_platform();
 
     // Members resolve from the stores `mur run --capsule` resolves from, in the same order.
-    let roster_fixes = report_roster(
+    let roster_findings = report_roster(
         &project_root,
         &FallbackRegistry {
             primary: project_registry.clone(),
@@ -1570,8 +1592,9 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     let mut interface_failed: HashSet<String> = HashSet::new();
 
     fixes.extend(env_requirements_findings.fixes);
-    fixes.extend(roster_fixes);
+    fixes.extend(roster_findings.fixes);
     warnings.extend(env_requirements_findings.warnings);
+    warnings.extend(roster_findings.warnings);
 
     for artifact in &runtime_manifest.artifacts {
         let request = ArtifactRequest {

@@ -202,7 +202,8 @@ pub use retention::{
     RemovedRecord, TruncationMarker, TruncationOutcome,
 };
 pub use roster::{
-    admit_roster, admit_roster_file, AdmittedMember, AdmittedRoster, RosterEdge, RosterRefusal,
+    admit_roster, admit_roster_file, caller_overflow_fix, caller_overflow_warning, AdmittedMember,
+    AdmittedRoster, CallerOverflow, RosterEdge, RosterRefusal,
 };
 // The running-capsule vocabulary a reader of a record needs. The verbs stay module-qualified —
 // `running::list`, `running::verify`, `running::prune`, `running::running_dir` — on the same terms

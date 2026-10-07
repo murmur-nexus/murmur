@@ -127,6 +127,7 @@ section that explains it.
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in the spawn closure could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-REG-003` | An installed artifact speaks an interface version this `mur` does not serve | [W-REG-003](#w-reg-003) |
+| `W-ROS-001` | A roster lets more members call a member than its `lifecycle` holds at once | [W-ROS-001](#w-ros-001) |
 | `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-RUN-002` | A `transport: process` harness reports a version its process driver was not tested against | [W-RUN-002](#w-run-002) |
 | `W-RUN-003` | An `inference.alternates` driver choice's credential was found nowhere at launch, so the choice is unavailable | [W-RUN-003](#w-run-003) |
@@ -1856,6 +1857,48 @@ entry member's own task. The caller, as a callee, then needs
 [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) in its `murmur.yaml`.
 `reachability: all` never pairs a member with the entry member as its callee, so it never raises
 this code.
+
+## Roster warnings
+
+[`mur run --roster`](cli.md#mur-run-roster) prints these on stderr after admitting the roster and
+before the formation launches. [`mur doctor`](cli.md#doctor-roster) prints them in its `Roster` block
+on stdout and counts each as a warning. Each one carries a `W-ROS-NNN` code and a link back to its
+section on this page. None of them refuses the roster or changes an exit code.
+
+### W-ROS-001 — more members may call a member than it holds { #w-ros-001 }
+
+```text
+warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' (w01, w02, w03, w04, w05, w06, w07, w08, w09, w10), but it holds 2 tasks at once — one running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full is rejected; lifecycle.queue_depth: 9 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
+```
+
+A member holds a fixed number of tasks at once, set by its own
+[`lifecycle`](manifest.md#field-lifecycle). A call that arrives while it holds that many ends
+`rejected` at once, and the calling member's `call-member` returns `rejected`.
+
+| `lifecycle.task_acceptance` | Tasks held at once |
+|---|---|
+| `queue`, `queue_depth` 1 or more | `queue_depth` + 1: one running and `queue_depth` waiting |
+| `queue`, `queue_depth: 0` | 0 |
+| `single` | 1 |
+| `none` | 0 |
+
+Callers are counted from the roster's expanded [`reachability`](roster.md#reachability), `all`
+included, one per calling member: a member holds at most one unanswered call to a given member.
+The warning names the member, how many members may call it and which, what it holds, and the
+`queue_depth` that holds every caller.
+
+Fix it with one of:
+
+- raise `lifecycle.queue_depth` in the called member's `murmur.yaml` to the value the warning
+  names;
+- under `single` or `none`, set `task_acceptance: queue` with that `queue_depth`;
+- narrow the roster's rules so fewer members may call it.
+
+A member's own background work — a demoted shell command's completion, a delegation's outcome —
+takes a queue slot too, and is not counted here.
+
+Nothing is refused, because the calls may never overlap: a roster whose callers take turns runs
+without a rejection.
 
 ---
 
