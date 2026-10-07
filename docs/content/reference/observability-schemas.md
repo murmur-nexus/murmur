@@ -42,7 +42,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `control_applied`, `tools_refreshed` | The task node, or the session node between tasks. Written just before the turn's own `inference` line |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
-| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_start`, `member_call` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation`, `member_call_busy`, `member_call_start`, `member_call` | The session node |
 | `plan_start` | The session node. Its `event_id` is the plan node |
 | `plan_step_start`, `plan_step` | The plan node |
 | `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
@@ -672,9 +672,31 @@ because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
 {"event_type":"spawner_ended","event_id":"evt_01a1058d3a9070319d2783f65aa594f3","parent_id":"evt_01a1058d39ef70d18c55d007dae98732","session_id":"ses_01a1058d39de73f18822af4c5494398f","timestamp":1791094504080,"spawned_by":"ses_01a1058d39217722b5e52c896926dbf4","delegation_id":"dlg_01a1058d39a07992a594e3ff0888c45a"}
 ```
 
+**`member_call_busy`**{ #member-call-busy } — written once per offer of a
+[`call-member`](runtime-provided-tools.md#call-member) call's task that the member's door turned
+away busy: it answered `rejected` with the status message `task rejected: capsule is busy`. The
+first is written as the tool call returns, each later one as the runtime offers the task again —
+see [A busy member](runtime-provided-tools.md#call-member-busy)
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The calling task |
+| `call_id` | string | `mcl_` and 32 hex digits, as the tool result names it |
+| `member` | string | The called member's roster name |
+| `offer` | u32 | Which offer of the call this was, from 1 |
+| `waited_ms` | u64 | From the tool call to this refusal |
+| `message` | string | The door's status message: always `task rejected: capsule is busy` |
+
+A call's lines are written in order: its `member_call_busy` lines, then `member_call_start` if the
+member took the task, then its `member_call`.
+
+```json
+{"event_type":"member_call_busy","event_id":"evt_01a106502a33702a9a3b5d0c4e8f2a61","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107280431,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c5","member":"reviewer","offer":2,"waited_ms":1187,"message":"task rejected: capsule is busy"}
+```
+
 **`member_call_start`**{ #member-call-start } — written once per
-[`call-member`](runtime-provided-tools.md#call-member) call whose member holds the task, as the
-tool call returns
+[`call-member`](runtime-provided-tools.md#call-member) call whose member holds the task: as the
+tool call returns, or, for a member that was busy, when it takes the task on a later offer
 
 | Field | Type | Notes |
 |---|---|---|
@@ -700,18 +722,18 @@ delivered to the calling task, or left behind when that task ended
 | `duration_ms` | u64 | From the tool call to this outcome |
 | `output` | string | The member's answer for `completed`, its task's status message for `failed`, `canceled` and `rejected`, or why the call ended otherwise. At most 64 KiB and a cut marker |
 | `truncated` | bool | Whether `output` was cut |
-| `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that failed to start, as a continuation for one that started. `false` for every `abandoned` call, and for an answer that arrived when the task did not wait for it — see [How the answer arrives](runtime-provided-tools.md#call-member-answer) |
+| `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that ended within its tool call, as a continuation for any other. `false` for every `abandoned` call, and for an answer that arrived when the task did not wait for it — see [How the answer arrives](runtime-provided-tools.md#call-member-answer) |
 
 | `status` | Meaning |
 |---|---|
 | `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state |
-| `rejected`, with no `member_task_id` | The member's door refused the task without holding it: the member was busy, or its session was closing |
+| `rejected`, with no `member_task_id` | The member never held the task: it stayed busy for the whole [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), or its door refused the task because its session was closing |
 | `failed`, with no `member_task_id` | Every other call that never started: the caller's `capabilities.network.allow` does not reach the member's door, the door's address never arrived, the door answered an error, or it could not be reached |
 | `timed_out` | The member had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); its task was not cancelled |
 | `unreachable` | The member's door stopped answering |
-| `abandoned` | The calling task ended before the answer arrived, or was cancelled while the member's door was being reached, in which case there is no `member_task_id`. Always `delivered: false` |
+| `abandoned` | The calling task ended before the answer arrived. There is no `member_task_id` when the task ended while a busy member was still being offered the task, or was cancelled while the member's door was being reached. Always `delivered: false` |
 
-Neither line carries the member's door address or a token.
+No member call line carries the member's door address or a token.
 
 ```json
 {"event_type":"member_call","event_id":"evt_01a106502c377c72bcc0f222268e783d","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107279927,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c5","member":"worker","member_task_id":"tsk_01a106502a41745381369d93d349d695","status":"completed","duration_ms":504,"output":"WORKER-0123456789abcdef0123456789abcdef","truncated":false,"delivered":true}

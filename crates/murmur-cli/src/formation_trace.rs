@@ -69,8 +69,9 @@ pub(crate) struct RecordedMembers {
     pub(crate) children_elsewhere: Vec<String>,
 }
 
-/// One `call-member` call, as its `member_call_start` and `member_call` lines join up on the call
-/// id. A call with no start was never held by its callee; one with no ending is still outstanding.
+/// One `call-member` call, as its `member_call_busy`, `member_call_start` and `member_call` lines
+/// join up on the call id. A call with no start was never held by its callee; one with no ending is
+/// still outstanding, including one whose callee has so far only turned it away busy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemberCallRecord {
     pub(crate) call_id: String,
@@ -80,13 +81,15 @@ pub(crate) struct MemberCallRecord {
     pub(crate) calling_task_id: String,
     /// The callee's task, `None` for a call it never held.
     pub(crate) member_task_id: Option<String>,
-    /// The `member_call_start` timestamp, or for a call with none, the `member_call` timestamp
-    /// less its duration.
+    /// When the call was made: the first line's timestamp less the time it says had passed since,
+    /// or a `member_call_start`'s own timestamp when that is the first line.
     pub(crate) started_ms: u64,
     /// `None` while the call is outstanding.
     pub(crate) status: Option<String>,
     pub(crate) duration_ms: u64,
     pub(crate) delivered: bool,
+    /// How many offers of the task the callee turned away busy: one per `member_call_busy`.
+    pub(crate) busy_offers: u32,
 }
 
 /// One `member_call_start` line: a `call-member` call whose callee holds the task.
@@ -97,6 +100,22 @@ pub(crate) struct MemberCallStartLine {
     pub(crate) call_id: String,
     pub(crate) member: String,
     pub(crate) member_task_id: String,
+    #[serde(default)]
+    pub(crate) timestamp: u64,
+}
+
+/// One `member_call_busy` line: an offer of a `call-member` call's task that the callee's door
+/// turned away busy. Its `message` is always the busy refusal, so it is not read.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemberCallBusyLine {
+    #[serde(default)]
+    pub(crate) task_id: String,
+    pub(crate) call_id: String,
+    pub(crate) member: String,
+    #[serde(default)]
+    pub(crate) offer: u32,
+    #[serde(default)]
+    pub(crate) waited_ms: u64,
     #[serde(default)]
     pub(crate) timestamp: u64,
 }
@@ -120,21 +139,59 @@ pub(crate) struct MemberCallLine {
     pub(crate) timestamp: u64,
 }
 
-/// Fold one `member_call_start` line into `calls`.
+/// The first call with `call_id` its callee does not yet hold.
+fn open_call<'a>(
+    calls: &'a mut [MemberCallRecord],
+    call_id: &str,
+) -> Option<&'a mut MemberCallRecord> {
+    calls
+        .iter_mut()
+        .find(|call| call.call_id == call_id && call.member_task_id.is_none())
+}
+
+/// Fold one `member_call_busy` line into `calls`: it counts against the call with its call id
+/// that has no ending yet, or opens that call, outstanding and not yet held.
 ///
-/// With [`fold_member_call`], the one rule a call's lines join by, for `mur trace show`'s Member
-/// calls section and for the formation's call list alike.
+/// With [`fold_member_call_start`] and [`fold_member_call`], the one rule a call's lines join by,
+/// for `mur trace show`'s Member calls section and for the formation's call list alike.
+pub(crate) fn fold_member_call_busy(calls: &mut Vec<MemberCallRecord>, line: MemberCallBusyLine) {
+    match calls
+        .iter_mut()
+        .find(|call| call.call_id == line.call_id && call.status.is_none())
+    {
+        Some(call) => call.busy_offers += 1,
+        None => calls.push(MemberCallRecord {
+            call_id: line.call_id,
+            member: line.member,
+            calling_task_id: line.task_id,
+            member_task_id: None,
+            started_ms: line.timestamp.saturating_sub(line.waited_ms),
+            status: None,
+            duration_ms: 0,
+            delivered: false,
+            busy_offers: 1,
+        }),
+    }
+}
+
+/// Fold one `member_call_start` line into `calls`: the callee now holds the call with its call id
+/// that it did not hold before — one it had turned away busy — or the line opens a call of its
+/// own.
 pub(crate) fn fold_member_call_start(calls: &mut Vec<MemberCallRecord>, line: MemberCallStartLine) {
-    calls.push(MemberCallRecord {
-        call_id: line.call_id,
-        member: line.member,
-        calling_task_id: line.task_id,
-        member_task_id: Some(line.member_task_id),
-        started_ms: line.timestamp,
-        status: None,
-        duration_ms: 0,
-        delivered: false,
-    });
+    match open_call(calls, &line.call_id) {
+        Some(call) => call.member_task_id = Some(line.member_task_id),
+        None => calls.push(MemberCallRecord {
+            call_id: line.call_id,
+            member: line.member,
+            calling_task_id: line.task_id,
+            member_task_id: Some(line.member_task_id),
+            started_ms: line.timestamp,
+            status: None,
+            duration_ms: 0,
+            delivered: false,
+            busy_offers: 0,
+        }),
+    }
 }
 
 /// Fold one `member_call` line into `calls`: it ends the first call with its call id that has no
@@ -148,6 +205,9 @@ pub(crate) fn fold_member_call(calls: &mut Vec<MemberCallRecord>, line: MemberCa
             call.status = Some(line.status);
             call.duration_ms = line.duration_ms;
             call.delivered = line.delivered;
+            if call.member_task_id.is_none() {
+                call.member_task_id = line.member_task_id;
+            }
         }
         None => calls.push(MemberCallRecord {
             call_id: line.call_id,
@@ -158,6 +218,7 @@ pub(crate) fn fold_member_call(calls: &mut Vec<MemberCallRecord>, line: MemberCa
             status: Some(line.status),
             duration_ms: line.duration_ms,
             delivered: line.delivered,
+            busy_offers: 0,
         }),
     }
 }
@@ -226,6 +287,7 @@ enum Line {
         #[serde(default)]
         child_session_id: Option<String>,
     },
+    MemberCallBusy(MemberCallBusyLine),
     MemberCallStart(MemberCallStartLine),
     MemberCall(MemberCallLine),
     A2aTaskReceived(A2aTaskReceivedLine),
@@ -435,6 +497,8 @@ pub(crate) struct FormationCall {
     pub(crate) calling_task_id: Option<String>,
     /// The callee's task, `None` for a call it never held.
     pub(crate) member_task_id: Option<String>,
+    /// How many offers of the task the callee turned away busy.
+    pub(crate) busy_offers: u32,
 }
 
 /// Every `call-member` call `members` record, once each, in display order.
@@ -491,6 +555,7 @@ pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> 
                 gap,
                 calling_task_id: Some(call.calling_task_id.clone()),
                 member_task_id: call.member_task_id.clone(),
+                busy_offers: call.busy_offers,
             });
         }
     }
@@ -509,6 +574,7 @@ pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> 
                 gap: Some(CallGap::CallerTraceNotFound(task.ending.clone())),
                 calling_task_id: None,
                 member_task_id: Some(task.task_id.clone()),
+                busy_offers: 0,
             });
         }
     }
@@ -612,6 +678,7 @@ fn read_member(session_dir: &Path, session_id: String) -> RecordedMember {
             Line::DelegationStart { child_session_id } => {
                 member.delegated_children.extend(child_session_id)
             }
+            Line::MemberCallBusy(busy) => fold_member_call_busy(&mut member.calls_made, busy),
             Line::MemberCallStart(start) => fold_member_call_start(&mut member.calls_made, start),
             Line::MemberCall(end) => fold_member_call(&mut member.calls_made, end),
             Line::A2aTaskReceived(received) => {
@@ -1093,6 +1160,84 @@ mod tests {
         );
     }
 
+    fn call_busy(task: &str, call: &str, member: &str, offer: u32, waited: u64, at: u64) -> String {
+        json!({
+            "event_type": "member_call_busy", "timestamp": at, "task_id": task, "call_id": call,
+            "member": member, "offer": offer, "waited_ms": waited,
+            "message": "task rejected: capsule is busy",
+        })
+        .to_string()
+    }
+
+    /// `member_call_busy` lines fold into the call with their call id: a call turned away busy
+    /// and later held is one row, counting its busy offers, started when the call was made; one
+    /// turned away busy and nothing since is outstanding and not yet held; one busy until it
+    /// ended `rejected` is never held.
+    #[test]
+    fn member_call_busy_lines_fold_into_their_call() {
+        let formation = FormationId::mint();
+        let root = tempfile::tempdir().unwrap();
+        let lead = session_after(&formation, 10, "1");
+        write_trace(
+            root.path(),
+            &lead,
+            &[
+                member_start(&lead, &formation, Some("lead"), &["c", "d", "e"], "lead"),
+                call_busy("tsk_l", "mcl_1", "c", 1, 2, 102),
+                call_busy("tsk_l", "mcl_2", "d", 1, 1, 151),
+                call_busy("tsk_l", "mcl_3", "e", 1, 1, 161),
+                call_busy("tsk_l", "mcl_1", "c", 2, 1100, 1200),
+                call_start("tsk_l", "mcl_1", "c", "tsk_c", 2300),
+                call_busy("tsk_l", "mcl_3", "e", 2, 1000, 1160),
+                call_end(
+                    "tsk_l",
+                    "mcl_1",
+                    "c",
+                    Some("tsk_c"),
+                    "completed",
+                    5000,
+                    true,
+                    5100,
+                ),
+                call_end("tsk_l", "mcl_3", "e", None, "rejected", 4000, true, 4160),
+            ],
+        );
+        let members = recorded_members(root.path(), &formation).unwrap().members;
+        let made = &members[0].calls_made;
+        assert_eq!(made.len(), 3, "{made:?}");
+        assert_eq!(
+            made[0],
+            MemberCallRecord {
+                call_id: "mcl_1".into(),
+                member: "c".into(),
+                calling_task_id: "tsk_l".into(),
+                member_task_id: Some("tsk_c".into()),
+                started_ms: 100,
+                status: Some("completed".into()),
+                duration_ms: 5000,
+                delivered: true,
+                busy_offers: 2,
+            }
+        );
+        assert_eq!(made[1].member_task_id, None);
+        assert_eq!(made[1].status, None);
+        assert_eq!(made[1].busy_offers, 1);
+        assert_eq!(made[1].started_ms, 150);
+        assert_eq!(made[2].busy_offers, 2);
+        let calls = formation_calls(&members);
+        assert_eq!(
+            summary(&calls),
+            [
+                (0, "lead→c".into(), "c's trace not found".into()),
+                (0, "lead→d".into(), String::new()),
+                (0, "lead→e".into(), "never held by e".into()),
+            ]
+        );
+        assert_eq!(calls[1].ending, CallEnding::Outstanding);
+        let busy: Vec<u32> = calls.iter().map(|call| call.busy_offers).collect();
+        assert_eq!(busy, [2, 1, 2]);
+    }
+
     /// The lead's trace, in `lead_root`, calls `worker`, whose root is `worker_root`.
     fn lead_calling_worker(formation: &FormationId, lead_root: &Path) {
         let lead = session_after(formation, 10, "1");
@@ -1296,6 +1441,7 @@ mod tests {
                     status: Some("completed".to_string()),
                     duration_ms: 1,
                     delivered: true,
+                    busy_offers: 0,
                 })
                 .collect(),
             tasks_received: tasks

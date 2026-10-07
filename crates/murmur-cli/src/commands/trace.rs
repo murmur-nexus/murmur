@@ -14,9 +14,9 @@ use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
 use crate::formation_trace::{
-    fold_member_call, fold_member_call_start, formation_calls, search_formation, CallEnding,
-    FormationCall, FormationSearch, MemberCallLine, MemberCallRecord, MemberCallStartLine,
-    RecordedMember,
+    fold_member_call, fold_member_call_busy, fold_member_call_start, formation_calls,
+    search_formation, CallEnding, FormationCall, FormationSearch, MemberCallBusyLine,
+    MemberCallLine, MemberCallRecord, MemberCallStartLine, RecordedMember,
 };
 use crate::session_address::{self, ses_entries, SessionQuery};
 
@@ -875,6 +875,7 @@ enum TraceEvent {
     A2aSend(A2aSendEvent),
     DelegationStart(DelegationStartEvent),
     Delegation(DelegationEvent),
+    MemberCallBusy(MemberCallBusyLine),
     MemberCallStart(MemberCallStartLine),
     MemberCall(MemberCallLine),
     PlanStart(PlanStartEvent),
@@ -1297,12 +1298,21 @@ fn member_call_show_row(call: &MemberCallRecord) -> String {
         ),
         None => "outstanding".to_string(),
     };
-    format!(
+    let mut row = format!(
         "{}  {}  {}  {status}",
         call.call_id,
         call.member,
         call.member_task_id.as_deref().unwrap_or("(not started)")
-    )
+    );
+    if call.busy_offers > 0 {
+        row.push_str(&format!("  {}", busy_note(call.busy_offers)));
+    }
+    row
+}
+
+/// How a call row says its callee turned `offers` offers away busy.
+fn busy_note(offers: u32) -> String {
+    format!("busy ×{offers}")
 }
 
 /// One `retention` trace record, surfaced in `mur trace show`.
@@ -2036,6 +2046,7 @@ fn compute_metrics(
                     }),
                 }
             }
+            TraceEvent::MemberCallBusy(e) => fold_member_call_busy(&mut member_calls, e),
             TraceEvent::MemberCallStart(e) => fold_member_call_start(&mut member_calls, e),
             TraceEvent::MemberCall(e) => fold_member_call(&mut member_calls, e),
             TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
@@ -3596,7 +3607,10 @@ fn formation_call_lines(calls: &[FormationCall]) -> Vec<String> {
                 .gap
                 .as_ref()
                 .map(|gap| gap.note(&call.caller, &call.callee))
-                .unwrap_or_default();
+                .into_iter()
+                .chain((call.busy_offers > 0).then(|| busy_note(call.busy_offers)))
+                .collect::<Vec<_>>()
+                .join("; ");
             [id, pair, status, duration, delivery.to_string(), note]
         })
         .collect();
@@ -3917,6 +3931,13 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             "{}{}",
             kind("spawner_ended"),
             e.spawned_by.as_deref().unwrap_or("-")
+        ),
+        TraceEvent::MemberCallBusy(e) => format!(
+            "{}{}  {}  offer {} turned away busy",
+            kind("member_call_busy"),
+            e.member,
+            e.call_id,
+            e.offer
         ),
         TraceEvent::MemberCallStart(e) => format!(
             "{}{}  {}  task {}",
@@ -5344,6 +5365,49 @@ mod tests {
         );
     }
 
+    /// A `member_call_busy` renders a `steps` row naming the member, the call and the offer, and
+    /// folds into its call's `show` row as a busy count: a call later taken shows the callee's
+    /// task, and one turned away busy and nothing since is outstanding and not started.
+    #[test]
+    fn member_call_busy_renders_a_steps_row_and_counts_on_its_call_s_show_row() {
+        let busy = |offer: u32, call: &str, at: u64| {
+            format!(
+                r#"{{"event_type":"member_call_busy","event_id":"evt_{at}","parent_id":"evt_1","session_id":"s","timestamp":{at},"task_id":"tsk_lead","call_id":"{call}","member":"reviewer","offer":{offer},"waited_ms":{at},"message":"task rejected: capsule is busy"}}"#
+            )
+        };
+        let start = r#"{"event_type":"member_call_start","event_id":"evt_40","parent_id":"evt_1","session_id":"s","timestamp":4000,"task_id":"tsk_lead","call_id":"mcl_1","member":"reviewer","member_task_id":"tsk_reviewer"}"#;
+        let end = r#"{"event_type":"member_call","event_id":"evt_90","parent_id":"evt_1","session_id":"s","timestamp":9000,"task_id":"tsk_lead","call_id":"mcl_1","member":"reviewer","member_task_id":"tsk_reviewer","status":"completed","duration_ms":9000,"output":"ok","truncated":false,"delivered":true}"#;
+        assert_eq!(
+            row(&busy(2, "mcl_1", 1100)),
+            "member_call_busy reviewer  mcl_1  offer 2 turned away busy"
+        );
+
+        let mut calls = Vec::new();
+        for line in [
+            busy(1, "mcl_1", 1),
+            busy(1, "mcl_2", 2),
+            busy(2, "mcl_1", 1100),
+            busy(3, "mcl_1", 3200),
+            start.to_string(),
+            end.to_string(),
+        ] {
+            match serde_json::from_str::<TraceEvent>(&line).unwrap() {
+                TraceEvent::MemberCallBusy(e) => fold_member_call_busy(&mut calls, e),
+                TraceEvent::MemberCallStart(e) => fold_member_call_start(&mut calls, e),
+                TraceEvent::MemberCall(e) => fold_member_call(&mut calls, e),
+                _ => unreachable!("a member call line"),
+            }
+        }
+        let rows: Vec<String> = calls.iter().map(member_call_show_row).collect();
+        assert_eq!(
+            rows,
+            [
+                "mcl_1  reviewer  tsk_reviewer  completed in 9.0s  busy ×3",
+                "mcl_2  reviewer  (not started)  outstanding  busy ×1",
+            ]
+        );
+    }
+
     /// A `tools_refreshed` line parses into its own variant rather than falling through to
     /// `Unknown`, and its row names the trigger, what entered and left the array, and the turn.
     #[test]
@@ -5529,6 +5593,7 @@ mod tests {
             gap,
             calling_task_id: None,
             member_task_id: None,
+            busy_offers: 0,
         }
     }
 
@@ -5558,13 +5623,16 @@ mod tests {
                 ended("rejected", 4, true),
                 Some(CallGap::NeverHeld),
             ),
-            formation_call(
-                1,
-                Some("mcl_3"),
-                ("lead-b", "w"),
-                ended("abandoned", 900, false),
-                None,
-            ),
+            FormationCall {
+                busy_offers: 3,
+                ..formation_call(
+                    1,
+                    Some("mcl_3"),
+                    ("lead-b", "w"),
+                    ended("abandoned", 900, false),
+                    None,
+                )
+            },
             formation_call(
                 0,
                 Some("mcl_4"),
@@ -5585,7 +5653,7 @@ mod tests {
             [
                 "mcl_1         chief → lead-b      completed    12.3s  delivered",
                 "  mcl_2       lead-b → worker-b4  rejected     4ms    delivered      never held by worker-b4",
-                "  mcl_3       lead-b → w          abandoned    900ms  not delivered",
+                "  mcl_3       lead-b → w          abandoned    900ms  not delivered  busy ×3",
                 "mcl_4         chief → lead-a      outstanding  -                     lead-a's task has no task_end",
                 "(no call id)  ghost → lead-a      unknown      -                     ghost's trace not found; lead-a's task ended completed",
             ]

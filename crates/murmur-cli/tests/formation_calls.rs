@@ -263,6 +263,14 @@ impl Project {
     }
 }
 
+/// The whole text of the `call-member` result `tool_id` that a model received: the fenced result
+/// and the runtime's note after it.
+fn call_member_result(requests: &[Value], tool_id: &str) -> String {
+    common::extract_result_text(
+        &common::find_tool_result(requests, tool_id).expect("a tool result"),
+    )
+}
+
 fn records<'a>(trace: &'a [Value], kind: &str) -> Vec<&'a Value> {
     trace
         .iter()
@@ -445,7 +453,7 @@ fn a_caller_without_egress_is_warned_and_refused() {
             .starts_with("<untrusted-content source=tool:call-member>\n"),
         "{raw}"
     );
-    let result = common::tool_result_text(&requests, "toolu_call_0").expect("a tool result");
+    let result = call_member_result(&requests, "toolu_call_0");
     assert!(result.contains("\"status\":\"failed\""), "{result}");
     assert!(result.contains("capabilities.network.allow"), "{result}");
     let port = door.rsplit(':').next().unwrap();
@@ -545,6 +553,12 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
         );
         assert!(continued.contains("ended timed_out"), "{continued}");
         assert!(continued.contains("was not cancelled"), "{continued}");
+        assert!(
+            continued.contains("No answer came from: worker (call mcl_")
+                && continued.contains(", timed_out). What you asked of them has not been done"),
+            "{continued}"
+        );
+        assert!(!continued.contains("the answers are above"), "{continued}");
         let worker_trace = read_whole_trace(
             &session_dirs(&project.member_dir(&formation_id, "worker").join(".murmur"))[0]
                 .join("trace.jsonl"),
@@ -1267,6 +1281,161 @@ fn a_process_lead_gets_the_answer_in_its_resumed_session() {
     );
 }
 
+// ── A busy callee ─────────────────────────────────────────────────────────────
+
+/// How many `member_call_busy` lines `trace` holds for calls to `member`.
+fn busy_call_offers(trace: &[Value], member: &str) -> usize {
+    records(trace, "member_call_busy")
+        .into_iter()
+        .filter(|record| record["member"] == member)
+        .count()
+}
+
+/// Three members call `c` at once while `c`'s model holds its first task. `c` holds that one and
+/// queues one more, so at least one caller is turned away busy: its tool call returns `busy` at
+/// once, with no `failed` anywhere, and the runtime offers it the task again until `c` takes it.
+/// Every call ends `completed`, the busy caller's trace has its `member_call_busy` lines before
+/// its `member_call_start`, and every answer reaches lead.
+#[test]
+fn busy_callee_is_offered_the_task_again_and_both_callers_get_answers() {
+    const CALLERS: [&str; 3] = ["a", "b", "d"];
+    let lead = Model::new(|n| match n {
+        1 => call_members(&CALLERS.map(|caller| (caller, "ask c"))),
+        _ => end_turn(n, "every caller answered"),
+    });
+    let caller = |name: &'static str| {
+        let task = match name {
+            "a" => "A-TASK",
+            "b" => "B-TASK",
+            _ => "D-TASK",
+        };
+        Model::new(move |n| match n {
+            1 => call_members(&[("c", task)]),
+            _ => end_turn(n, "c answered"),
+        })
+    };
+    let (c, release_c) = Model::held("C-ANSWER");
+    let mut members = vec![Member {
+        name: "lead",
+        entry: true,
+        allow: Some("localhost"),
+        max_turns: None,
+        model: lead,
+    }];
+    for name in CALLERS {
+        members.push(Member {
+            name,
+            entry: false,
+            allow: Some("localhost"),
+            max_turns: None,
+            model: caller(name),
+        });
+    }
+    members.push(Member {
+        name: "c",
+        entry: false,
+        allow: None,
+        max_turns: None,
+        model: c,
+    });
+    let project = Project::new(
+        members,
+        "reachability:\n  - from: lead\n    to: [a, b, d]\n  - from: a\n    to: [c]\n  \
+         - from: b\n    to: [c]\n  - from: d\n    to: [c]\n",
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("LEAD-TASK", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+
+    // c's model holds its first task until some caller has been turned away busy.
+    let deadline = Instant::now() + LAUNCH_LIMIT;
+    while !CALLERS.iter().any(|caller| {
+        session_dirs(&project.member_dir(&formation_id, caller).join(".murmur"))
+            .iter()
+            .any(|session| {
+                std::fs::read_to_string(session.join("trace.jsonl"))
+                    .is_ok_and(|trace| trace.contains("\"event_type\":\"member_call_busy\""))
+            })
+    }) {
+        assert!(Instant::now() < deadline, "no caller was turned away busy");
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(release_c);
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let mut busy_callers = 0;
+    for name in CALLERS {
+        let trace = project.trace_of(&formation_id, name);
+        let ends = records(&trace, "member_call");
+        assert_eq!(ends.len(), 1, "{name}: {trace:?}");
+        assert_eq!(ends[0]["status"], "completed", "{name}: {}", ends[0]);
+        assert!(ends[0]["member_task_id"].is_string(), "{}", ends[0]);
+        let starts = records(&trace, "member_call_start");
+        assert_eq!(starts.len(), 1, "{name}: {trace:?}");
+        let call_id = &ends[0]["call_id"];
+        assert_eq!(&starts[0]["call_id"], call_id);
+
+        let kinds: Vec<&str> = trace
+            .iter()
+            .filter(|record| &record["call_id"] == call_id)
+            .map(|record| record["event_type"].as_str().unwrap())
+            .collect();
+        let busy = busy_call_offers(&trace, "c");
+        if busy > 0 {
+            busy_callers += 1;
+            let mut expected = vec!["member_call_busy"; busy];
+            expected.extend(["member_call_start", "member_call"]);
+            assert_eq!(kinds, expected, "{name}");
+            let offers: Vec<u64> = records(&trace, "member_call_busy")
+                .iter()
+                .map(|record| record["offer"].as_u64().unwrap())
+                .collect();
+            assert_eq!(offers, (1..=busy as u64).collect::<Vec<_>>(), "{name}");
+        } else {
+            assert_eq!(kinds, ["member_call_start", "member_call"], "{name}");
+        }
+
+        let requests = project.model(name).requests();
+        let result = call_member_result(&requests, "toolu_call_0");
+        assert!(
+            !result.contains("\"status\":\"failed\""),
+            "{name}: {result}"
+        );
+        let expected = if busy > 0 { "busy" } else { "started" };
+        assert!(
+            result.contains(&format!("\"status\":\"{expected}\"")),
+            "{name}: {result}"
+        );
+        let last = requests.last().unwrap().to_string();
+        assert!(
+            last.contains("<untrusted-content source=member:c>\\nC-ANSWER"),
+            "{name}: {last}"
+        );
+        assert!(!last.contains("No answer came from"), "{name}: {last}");
+    }
+    assert!(busy_callers >= 1, "no caller was turned away busy");
+
+    let lead_requests = project.model("lead").requests();
+    for index in 0..CALLERS.len() {
+        let result = call_member_result(&lead_requests, &format!("toolu_call_{index}"));
+        assert!(!result.contains("\"status\":\"failed\""), "{result}");
+    }
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 3, "{lead_trace:?}");
+    assert!(ends.iter().all(|end| end["status"] == "completed"));
+
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
 // ── Who called whom ───────────────────────────────────────────────────────────
 
 /// Block until some session under `root` has a trace line containing every one of `needles`.
@@ -1293,9 +1462,10 @@ fn await_trace_line(root: &Path, needles: &[&str]) {
 
 /// A two-tier formation: `chief` calls two leads in one response, and each lead calls its four
 /// workers in one response. `worker-b4`'s door is full of operator tasks when `lead-b` calls it,
-/// so that call is refused. `mur trace show <frm>`, run from the roster's directory, lists every
-/// member by roster name and every call nested under the call that handed over its task, the
-/// refused one `rejected` and never held, and no row for the operator's tasks.
+/// so that call is turned away busy and offered again until `worker-b4` takes it. `mur trace show
+/// <frm>`, run from the roster's directory, lists every member by roster name and every call
+/// nested under the call that handed over its task, the busy one completed with its busy offers
+/// counted, and no row for the operator's tasks.
 #[test]
 fn two_tier_formation_trace_names_every_call() {
     const A_WORKERS: [&str; 4] = ["worker-a1", "worker-a2", "worker-a3", "worker-a4"];
@@ -1403,21 +1573,28 @@ fn two_tier_formation_trace_names_every_call() {
     let lead_b_root = project.member_dir(&formation_id, "lead-b").join(".murmur");
     await_trace_line(
         &lead_b_root,
-        &["\"event_type\":\"member_call\"", "\"member\":\"worker-b4\""],
+        &[
+            "\"event_type\":\"member_call_busy\"",
+            "\"member\":\"worker-b4\"",
+        ],
     );
     drop(release_busy);
     let status = launcher.wait();
     assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
 
     let lead_b = project.trace_of(&formation_id, "lead-b");
-    let refused: Vec<&Value> = records(&lead_b, "member_call")
+    let busy_call: Vec<&Value> = records(&lead_b, "member_call")
         .into_iter()
         .filter(|record| record["member"] == "worker-b4")
         .collect();
-    assert_eq!(refused.len(), 1, "{lead_b:?}");
-    assert_eq!(refused[0]["status"], "rejected", "{}", refused[0]);
-    assert!(refused[0].get("member_task_id").is_none(), "{}", refused[0]);
-    println!("lead-b's member_call for worker-b4:\n{}", refused[0]);
+    assert_eq!(busy_call.len(), 1, "{lead_b:?}");
+    assert_eq!(busy_call[0]["status"], "completed", "{}", busy_call[0]);
+    assert!(
+        busy_call[0]["member_task_id"].is_string(),
+        "{}",
+        busy_call[0]
+    );
+    println!("lead-b's member_call for worker-b4:\n{}", busy_call[0]);
 
     let mut trace_bytes = 0;
     let mut roots = vec![project.path().join(".murmur")];
@@ -1473,16 +1650,20 @@ fn two_tier_formation_trace_names_every_call() {
         .unwrap();
     assert!(chief_row.ends_with("  may call lead-a, lead-b"), "{stdout}");
 
-    // Each call's start, as its caller recorded it: the `member_call_start`, or for a call its
-    // callee never held, the `member_call` less its duration.
+    // Each call's start, as its caller recorded it on the call's first line: a busy refusal less
+    // the time waited, the `member_call_start`, or the `member_call` less its duration.
     let mut started: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for caller in ["chief", "lead-a", "lead-b"] {
         for record in project.trace_of(&formation_id, caller) {
             let call_id = record["call_id"].as_str().unwrap_or_default().to_string();
             let at = record["timestamp"].as_u64().unwrap_or_default();
             match record["event_type"].as_str() {
+                Some("member_call_busy") => {
+                    let waited = record["waited_ms"].as_u64().unwrap_or_default();
+                    started.entry(call_id).or_insert(at - waited);
+                }
                 Some("member_call_start") => {
-                    started.insert(call_id, at);
+                    started.entry(call_id).or_insert(at);
                 }
                 Some("member_call") => {
                     let took = record["duration_ms"].as_u64().unwrap_or_default();
@@ -1539,20 +1720,17 @@ fn two_tier_formation_trace_names_every_call() {
         .iter()
         .filter(|line| {
             let words: Vec<&str> = line.split_whitespace().collect();
-            words[4] == "completed" && words[6] == "delivered" && words.len() == 7
+            words[4] == "completed" && words[6] == "delivered"
         })
         .count();
-    assert_eq!(completed, 9, "{stdout}");
-    let refused_rows: Vec<&&str> = rows
-        .iter()
-        .filter(|line| line.contains("→ worker-b4"))
-        .collect();
-    assert_eq!(refused_rows.len(), 1, "{stdout}");
-    let words: Vec<&str> = refused_rows[0].split_whitespace().collect();
-    assert_eq!(words[4], "rejected", "{stdout}");
+    assert_eq!(completed, 10, "{stdout}");
+    let busy_rows: Vec<&&str> = rows.iter().filter(|line| line.contains("busy ×")).collect();
+    assert_eq!(busy_rows.len(), 1, "{stdout}");
+    assert!(busy_rows[0].contains("→ worker-b4"), "{stdout}");
+    let offers = busy_call_offers(&lead_b, "worker-b4");
     assert!(
-        refused_rows[0].ends_with("never held by worker-b4"),
-        "{stdout}"
+        busy_rows[0].ends_with(&format!("busy ×{offers}")),
+        "{offers}: {stdout}"
     );
 
     assert_no_member_remains(

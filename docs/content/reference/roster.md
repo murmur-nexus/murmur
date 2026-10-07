@@ -447,7 +447,9 @@ lets it call someone. A call is made from a running task, and names the member a
 in full:
 
 1. The member's door gets the task as a `message/send`, carrying the caller's formation token. The
-   tool call returns as soon as the door holds the task.
+   tool call returns as soon as the door holds the task, or at once when the member is busy, in
+   which case the runtime keeps offering it the task until it takes it or the call's deadline
+   passes — see [A busy member](runtime-provided-tools.md#call-member-busy).
 2. The member runs it in its own directory, as any task at its door.
 3. When the caller's turn ends with an [`inference.max_turns`](manifest.md#field-inference) turn
    still left, the caller's same task waits for the answer and continues with it, fenced under
