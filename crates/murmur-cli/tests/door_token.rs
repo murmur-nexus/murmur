@@ -285,7 +285,7 @@ fn mur_token_with_nothing_running_is_e_run_022() {
 }
 
 /// `mur watch`, `mur cancel` and `mur stop` by session address read the operator token from the
-/// record, as they did when `mur run` printed it.
+/// record.
 #[test]
 fn watch_cancel_and_stop_by_address_still_reach_an_authenticated_door() {
     let home = driver_home();

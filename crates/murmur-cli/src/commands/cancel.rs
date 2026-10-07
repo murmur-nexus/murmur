@@ -175,7 +175,7 @@ pub(crate) fn door_refusal(status_line: &str) -> Option<CliError> {
         format!(
             "the capsule's door refused the call: {} — it declares network.authentication; a \
              session address presents the token in its running record, and --url presents \
-             {} when it is set to a token `mur run` printed",
+             {} when it is set to a token `mur token` printed",
             status_line.trim(),
             capsule_runtime::DOOR_TOKEN_ENV
         ),

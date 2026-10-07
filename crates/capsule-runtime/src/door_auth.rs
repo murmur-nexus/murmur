@@ -72,7 +72,7 @@ impl DoorToken {
         Self(token)
     }
 
-    /// The token text, for an `Authorization` header or the line `mur run` prints.
+    /// The token text, for an `Authorization` header, the running record, or `mur token`'s output.
     pub fn expose(&self) -> &str {
         &self.0
     }

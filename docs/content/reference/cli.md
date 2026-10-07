@@ -1186,9 +1186,8 @@ murmur: auth bearer (mur token ses_019f01a940ce7761854e768ecbe3d399)
 session: ses_019f01a940ce7761854e768ecbe3d399
 ```
 
-A run's output is often redirected to a log, and every token is in the session's
-[running-capsule record](#running-capsule-records), so [`mur token`](#mur-token) is how a token is
-read. A token is valid until the session ends. What each token reaches is in
+Every token is in the session's [running-capsule record](#running-capsule-records); read one with
+[`mur token`](#mur-token). A token is valid until the session ends. What each token reaches is in
 [Agent Card: Security](agent-card.md#tokens).
 
 <span id="mur-run-formation"></span>**Formation membership.** A session launched with
