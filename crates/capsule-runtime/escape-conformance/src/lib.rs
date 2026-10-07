@@ -35,13 +35,12 @@
 //!
 //! # Never in CI
 //!
-//! No runner this project has resolves to the full enforcement tier, so a CI-run gate would skip
-//! its way to green and certify nothing — which is exactly how a non-functional Linux tier came to
-//! be documented as merely "unverified". Nothing in CI executes the `escape-conformance` binary.
-//! The package is a workspace member all the same, so the tests in this library — which are pure,
-//! and touch neither the host nor `mur` — run with `cargo test --workspace`. They are what keeps
-//! the generated manifest, the committed driver and the probe's output in step with the runtime
-//! between hand runs.
+//! Nothing in CI may execute the `escape-conformance` binary: no CI runner resolves to the full
+//! enforcement tier, so a CI-run gate would skip its way to green and certify nothing. The package
+//! is a workspace member all the same, so the tests in this library — which are pure, and touch
+//! neither the host nor `mur` — run with `cargo test --workspace`. They keep the generated
+//! manifest, the committed driver and the probe's output in step with the runtime between hand
+//! runs.
 
 pub mod cases;
 pub mod driver_artifact;

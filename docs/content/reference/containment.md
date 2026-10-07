@@ -689,13 +689,18 @@ cargo build --release -p murmur-cli -p escape-conformance
 `--list-cases` prints the registry with each case's expectation per class, and `--help` lists the
 remaining options.
 
-The run needs a built `mur` binary, `python3`, and a delegated cgroup v2 subtree — the harness wraps
-each capsule in `systemd-run --user --scope --property=Delegate=yes` by default to get one. The
-harness carries its own process driver, `escape-conformance-driver`, and installs it into each
-case's project with `mur install`, so nothing is installed from a registry and the run needs no
-model and no API key. It runs
-on bare metal: a host that cannot back the class under test, and a host that looks like a container,
-are both refused before the first case runs, and a refused run writes no record.
+The run needs:
+
+- a built `mur` binary;
+- `python3`;
+- a delegated cgroup v2 subtree — the harness wraps each capsule in
+  `systemd-run --user --scope --property=Delegate=yes` by default to get one.
+
+It needs no registry access, model or API key: the harness carries its own process driver,
+`escape-conformance-driver`, and installs it into each case's project with `mur install`.
+
+It runs on bare metal: a host that cannot back the class under test, and a host that looks like a
+container, are both refused before the first case runs, and a refused run writes no record.
 
 The exit code separates a refusal from a failure, and an escape from a ceiling that gave way:
 
