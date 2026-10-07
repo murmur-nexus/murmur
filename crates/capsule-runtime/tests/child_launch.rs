@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use capsule_runtime::{
     child_workdir_for, delegation::SPAWNER_ENV, formation::FORMATION_ID_ENV, launch_child_capsule,
-    ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner, SPAWNER_LIFELINE_ENV,
+    ChildLaunchRequest, FormationId, LaunchedChild, SpawnApproval, Spawner,
+    HOST_WARNINGS_REPORTED_ENV, SPAWNER_LIFELINE_ENV,
 };
 use common::{component, files_under, find_in_files, mur_binary, Roost, ScriptedServer};
 use serde_json::{json, Value};
@@ -463,7 +464,13 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     let plain = parent.launch("child-a", &[]);
     assert_eq!(
         keys(&plain),
-        ["PATH", "HOME", "MURMUR_ROOST_URL", SPAWNER_LIFELINE_ENV]
+        [
+            "PATH",
+            "HOME",
+            "MURMUR_ROOST_URL",
+            HOST_WARNINGS_REPORTED_ENV,
+            SPAWNER_LIFELINE_ENV
+        ]
     );
 
     // The same launch with lineage. It reports to nobody, so the handle is the whole of what the
@@ -491,6 +498,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
             "PATH",
             "HOME",
             "MURMUR_ROOST_URL",
+            HOST_WARNINGS_REPORTED_ENV,
             SPAWNER_LIFELINE_ENV,
             SPAWNER_ENV
         ]

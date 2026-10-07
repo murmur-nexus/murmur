@@ -1133,12 +1133,15 @@ impl Channel {
         self.reader.as_raw_fd()
     }
 
-    /// The environment every member is started with: its formation id and its channel.
+    /// The environment every member is started with: its formation id, its channel, and
+    /// [`crate::host_warnings::HOST_WARNINGS_REPORTED_ENV`], because the launcher prints the
+    /// host-level warnings once before any member starts.
     fn member_env(&self, formation_id: &FormationId) -> Vec<(String, String)> {
         let (id_name, id_value) = formation_id.env_pair();
         vec![
             (id_name.to_string(), id_value),
             (FORMATION_CHANNEL_ENV.to_string(), self.fd().to_string()),
+            crate::host_warnings::reported_env_pair(),
         ]
     }
 }
@@ -1832,6 +1835,20 @@ mod tests {
             version: "0.1.0".to_string(),
             sha256: "ab".repeat(32),
         }
+    }
+
+    /// Every member, peer or entry, is started told its launcher already printed the host-level
+    /// warnings.
+    #[test]
+    fn every_member_is_told_host_warnings_were_reported() {
+        let channel = Channel::open("first").expect("a channel opens");
+        let env = channel.member_env(&FormationId::mint());
+        let values: Vec<&str> = env
+            .iter()
+            .filter(|(key, _)| key == crate::host_warnings::HOST_WARNINGS_REPORTED_ENV)
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values, vec!["1"], "{env:?}");
     }
 
     fn options(deadline: Duration) -> FormationLaunchOptions {

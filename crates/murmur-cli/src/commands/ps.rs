@@ -35,47 +35,66 @@ const STATUS_UNREACHABLE: &str = "unreachable";
 /// Host-scoped, exactly like `docker ps`. A capsule deployed onto another machine writes its
 /// record on *that* machine, so it is that machine's `mur ps` that lists it.
 ///
-/// The listing is also the reaper: a record whose process is gone is unlinked on the way past, and
-/// each unlink is named on stderr as `pruned: <session_id> — <reason>`, with ` (formation <id>)`
-/// appended for a member. A record whose process is alive and whose door is quiet, or whose start
-/// time could not be read, is kept and reported as `unreachable` — neither is evidence of a dead
-/// capsule, and unlinking it would throw away the only handle to something still running.
+/// The listing is also the reaper: a record whose process is gone is unlinked on the way past, as
+/// is a record file that cannot be read. A record whose process is alive and whose door is quiet,
+/// or whose start time could not be read, is kept and reported as `unreachable` — neither is
+/// evidence of a dead capsule, and unlinking it would throw away the only handle to something
+/// still running.
 ///
-/// When any listed or pruned record names a formation, the table gains a `FORMATION` column, a
-/// formation's rows are kept together, and one summary line per formation follows the table. With
-/// no member, there is neither the column nor a summary line.
+/// What was unlinked is stated on stderr, before the table. By default that is one line counting
+/// every removal, [`pruned_summary`], and nothing when there was none. With `verbose` it is one
+/// line per removal: `pruned: <session_id> — <reason>`, with ` (formation <id>)` appended for a
+/// member, and `pruned: <path> — not a readable record` for an unreadable file.
+///
+/// When a record that keys formations names one, the table gains a `FORMATION` column, a
+/// formation's rows are kept together, and one summary line per keyed formation follows the
+/// table. By default only listed records key formations; with `verbose`, pruned records do too,
+/// so a formation known only from pruned records is summarised last. With no keyed member there
+/// is neither the column nor a summary line.
 ///
 /// A record directory that cannot be read fails with `E-RUN-028` and prints nothing on stdout.
 /// Nothing a formation summary reads can fail the command.
-pub(crate) fn run_ps() -> Result<(), CliError> {
-    let records = running::list().map_err(|reason| records_unreadable(&reason))?;
+pub(crate) fn run_ps(verbose: bool) -> Result<(), CliError> {
+    let listing = running::list_reporting().map_err(|reason| records_unreadable(&reason))?;
     let mut rows = Vec::new();
     let mut pruned = Vec::new();
-    for record in records {
+    for record in listing.records {
         match running::verify(&record) {
             Liveness::Live => rows.push((record, STATUS_RUNNING)),
             Liveness::Unreachable(_) => rows.push((record, STATUS_UNREACHABLE)),
             Liveness::Gone(reason) => {
                 running::prune(&record);
-                match &record.formation_id {
-                    Some(formation) => capsule_runtime::report_eprintln!(
-                        "pruned: {} — {reason} (formation {formation})",
-                        record.session_id
-                    ),
-                    None => capsule_runtime::report_eprintln!(
-                        "pruned: {} — {reason}",
-                        record.session_id
-                    ),
+                if verbose {
+                    match &record.formation_id {
+                        Some(formation) => capsule_runtime::report_eprintln!(
+                            "pruned: {} — {reason} (formation {formation})",
+                            record.session_id
+                        ),
+                        None => capsule_runtime::report_eprintln!(
+                            "pruned: {} — {reason}",
+                            record.session_id
+                        ),
+                    }
                 }
                 pruned.push(record);
             }
         }
     }
+    if verbose {
+        for path in &listing.removed_unreadable {
+            capsule_runtime::report_eprintln!("pruned: {} — not a readable record", path.display());
+        }
+    } else if let Some(line) = pruned_summary(pruned.len() + listing.removed_unreadable.len()) {
+        capsule_runtime::report_eprintln!("{line}");
+    }
 
+    // By default pruned records are only counted, so a formation known only from them is not
+    // summarised; a listed formation's summary still counts its pruned members.
+    let keyed: &[RunningRecord] = if verbose { &pruned } else { &[] };
     let any_member = rows
         .iter()
         .map(|(record, _)| record)
-        .chain(&pruned)
+        .chain(keyed)
         .any(|record| record.formation_id.is_some());
     if !any_member {
         print_table(&rows, false);
@@ -85,10 +104,21 @@ pub(crate) fn run_ps() -> Result<(), CliError> {
     let rows = grouped(rows);
     print_table(&rows, true);
     capsule_runtime::report_println!();
-    for formation in formations_in_order(&rows, &pruned) {
+    for formation in formations_in_order(&rows, keyed) {
         capsule_runtime::report_println!("{}", summary_line(&formation, &rows, &pruned));
     }
     Ok(())
+}
+
+/// The one stderr line a default `mur ps` prints for `removed` records, or `None` for none.
+fn pruned_summary(removed: usize) -> Option<String> {
+    match removed {
+        0 => None,
+        1 => Some("pruned 1 stale record; mur ps --verbose names each".to_string()),
+        n => Some(format!(
+            "pruned {n} stale records; mur ps --verbose names each"
+        )),
+    }
 }
 
 /// The table, or `no running capsules` when no row survived. `with_formation` adds the
@@ -312,6 +342,19 @@ fn format_uptime(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pruned_summary_counts_every_removal_in_one_line() {
+        assert_eq!(pruned_summary(0), None);
+        assert_eq!(
+            pruned_summary(1).as_deref(),
+            Some("pruned 1 stale record; mur ps --verbose names each")
+        );
+        assert_eq!(
+            pruned_summary(302).as_deref(),
+            Some("pruned 302 stale records; mur ps --verbose names each")
+        );
+    }
 
     fn row(session_id: &str, formation: Option<&FormationId>) -> (RunningRecord, &'static str) {
         let record = RunningRecord {

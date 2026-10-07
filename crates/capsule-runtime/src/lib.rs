@@ -43,6 +43,7 @@ pub mod formation_launch;
 pub(crate) mod gateway_credential;
 pub(crate) mod harness_session;
 pub(crate) mod hooks;
+pub mod host_warnings;
 pub(crate) mod http_client;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
@@ -167,6 +168,9 @@ pub use formation::{FormationId, FormationPeer, FormationPeers};
 pub use formation_credentials::{
     FormationAuthority, FormationBundle, FormationMember, FormationToken, FormationVerifier,
     FormationVerifyKey, FORMATION_CALL_SCOPES, FORMATION_CHANNEL_ENV,
+};
+pub use host_warnings::{
+    host_warnings_reported, host_warnings_reported_in, HOST_WARNINGS_REPORTED_ENV,
 };
 pub use lanes::TaskLane;
 #[cfg(unix)]

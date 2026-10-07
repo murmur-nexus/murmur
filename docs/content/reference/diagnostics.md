@@ -2449,8 +2449,17 @@ evidence would block capsules that would have worked.
 ### W-SEC-013 — Unprivileged user namespaces are unrestricted host-wide { #w-sec-013 }
 
 **Fires when:** AppArmor is enabled on this host and
-`kernel.apparmor_restrict_unprivileged_userns` is `0`. Once, at staging, on stderr — from both
-`mur run` and `mur doctor`.
+`kernel.apparmor_restrict_unprivileged_userns` is `0`. Once per launch, on stderr:
+
+| Command | Prints it |
+|---|---|
+| `mur run` | Once, at staging |
+| `mur run --roster` | Once, from the launcher, after the roster is admitted and before any member starts |
+| A formation member, or a sub-capsule a capsule delegates to or a plan step starts | Never: the runtime that starts it sets `MURMUR_HOST_WARNINGS_REPORTED=1` in its environment |
+| `mur doctor` | Always |
+
+A `mur run` started with `MURMUR_HOST_WARNINGS_REPORTED=1` does not print it. Only the value `1`
+silences it, and only on stderr: `session_start` still records the grant.
 
 **Why it matters:** `capabilities.containment: sealed` and the capsule network namespace both need
 an unprivileged user namespace, and on an AppArmor host something has to permit it. This warning is

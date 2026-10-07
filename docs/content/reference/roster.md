@@ -165,6 +165,7 @@ call a member than it holds tasks at once, [`W-ROS-001`](diagnostics.md#w-ros-00
 | `MURMUR_FORMATION_ID` | The formation id minted in step 2 |
 | `MURMUR_FORMATION_CHANNEL` | The number of the inherited file descriptor its [formation channel](#formation-channel) is read from |
 | `MURMUR_FORMATION_LIFELINE` | The descriptor of the member's own [lifeline](#launch-stop). Set by the launcher; not for operators |
+| `MURMUR_HOST_WARNINGS_REPORTED` | `1`: the launcher already printed [`W-SEC-013`](diagnostics.md#w-sec-013), so the member does not |
 | Directory | The entry member runs in the roster's project directory, where its `--task` is written. Each peer runs in its own directory under `~/.murmur/formations/` — see [Member directories](#member-directories) |
 | Stores | The roster's project, for every member: the project store, then the global store, and the project's `murmur.lock` — the stores admission read |
 | Current directory | The launcher's, so a relative `--task` path names the same file |

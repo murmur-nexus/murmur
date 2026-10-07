@@ -771,7 +771,12 @@ pub(crate) async fn run_agent_loop(
         &store_state.installed_artifacts,
         store_state.installed_generation,
     );
-    log_tool_inventory(workdir, "Installed tools", inventory.tools())?;
+    log_tool_inventory(
+        workdir,
+        "Installed tools",
+        inventory.tools(),
+        &mut store_state.logged_tool_inventory,
+    )?;
 
     let augmented_system = build_augmented_system_prompt(
         name,
@@ -1069,7 +1074,12 @@ pub(crate) async fn run_agent_loop(
                 )
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
-            log_tool_inventory(workdir, "Refreshed tools", inventory.tools())?;
+            log_tool_inventory(
+                workdir,
+                "Refreshed tools",
+                inventory.tools(),
+                &mut store_state.logged_tool_inventory,
+            )?;
         }
         let tools = inventory.tools();
         let occupancy = ContextOccupancy {
@@ -4096,12 +4106,24 @@ fn build_augmented_system_prompt(
     format!("{context}{base}")
 }
 
-/// Write the tool array a call is about to send to `bootstrap.log` under `heading`.
-fn log_tool_inventory(workdir: &Path, heading: &str, tools: &[Value]) -> Result<(), RuntimeError> {
+/// Write the tool array a call is about to send to `bootstrap.log` under `heading`, unless it is
+/// byte-identical to `last_logged`, the array this session last wrote there; a written array
+/// becomes the new `last_logged`. The log is the only thing this decides: every request carries
+/// its full array regardless.
+pub(crate) fn log_tool_inventory(
+    workdir: &Path,
+    heading: &str,
+    tools: &[Value],
+    last_logged: &mut Option<String>,
+) -> Result<(), RuntimeError> {
     let tools_json = serde_json::to_string_pretty(tools).map_err(|e| {
         RuntimeError::AgentLoopFailed(format!("failed to serialize tool inventory: {e}"))
     })?;
+    if last_logged.as_deref() == Some(tools_json.as_str()) {
+        return Ok(());
+    }
     append_bootstrap_log(workdir, &format!("{heading} (JSON):\n{tools_json}"));
+    *last_logged = Some(tools_json);
     Ok(())
 }
 

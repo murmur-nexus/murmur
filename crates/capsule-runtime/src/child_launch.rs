@@ -47,6 +47,7 @@ use crate::delegation::{
 };
 use crate::errors::RuntimeError;
 use crate::formation::{FormationId, FORMATION_ID_ENV};
+use crate::host_warnings::HOST_WARNINGS_REPORTED_ENV;
 use crate::lifeline::SPAWNER_LIFELINE_ENV;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
@@ -729,10 +730,13 @@ fn watch_for_completion(
 ///
 /// `capabilities.env.allow` is the child's own, not the parent's: a sibling's declaration reaches
 /// nothing here, and a variable the parent holds but the child did not declare is simply absent.
-/// The runtime-owned names — `PATH`, `HOME`, `MURMUR_ROOST_URL`, [`SPAWNER_ENV`] on a delegated
-/// launch and [`FORMATION_ID_ENV`] for a parent in a formation, in that order — are applied last,
-/// so a child cannot displace the daemon URL it is required to register with, the handle it
-/// reports its outcome to, or the formation it joins, by allowlisting the name.
+/// The runtime-owned names — `PATH`, `HOME`, `MURMUR_ROOST_URL`,
+/// [`HOST_WARNINGS_REPORTED_ENV`], [`SPAWNER_ENV`] on a delegated launch and [`FORMATION_ID_ENV`]
+/// for a parent in a formation, in that order — are applied last, so a child cannot displace the
+/// daemon URL it is required to register with, the handle it reports its outcome to, or the
+/// formation it joins, by allowlisting the name. [`HOST_WARNINGS_REPORTED_ENV`] is always `1`:
+/// the host-level warnings were printed by the process the operator started, so a child does not
+/// repeat them, and its manifest cannot choose otherwise.
 ///
 /// Two kinds of name are never copied from this process's environment, whatever the child
 /// allowlists:
@@ -758,6 +762,7 @@ pub(crate) fn child_environment(
             && key != SPAWNER_ENV
             && key != FORMATION_ID_ENV
             && key != SPAWNER_LIFELINE_ENV
+            && key != HOST_WARNINGS_REPORTED_ENV
             && !crate::formation::is_member_grant_env(key)
     });
 
@@ -768,6 +773,7 @@ pub(crate) fn child_environment(
         env.push(("HOME".to_string(), home));
     }
     env.push(("MURMUR_ROOST_URL".to_string(), request.roost_url.clone()));
+    env.push(crate::host_warnings::reported_env_pair());
     // Last, with the other runtime-owned names, and only for a launch that has a spawner: a child
     // nobody wants told holds no handle at all, whatever this process's own environment carries
     // and whatever the child declared.
@@ -1316,6 +1322,26 @@ mod tests {
             );
         }
         std::env::remove_var(FORMATION_ID_ENV);
+    }
+
+    /// Every child is told its launcher already printed the host-level warnings, once, whatever
+    /// this process's own environment holds and whatever the child declared.
+    #[test]
+    fn every_child_is_told_host_warnings_were_reported() {
+        std::env::set_var(HOST_WARNINGS_REPORTED_ENV, "0");
+        let handle = SpawnerHandle::for_delegation(&spawner(), "dlg_0001".to_string());
+        for (spawner, handle) in [(Some(spawner()), Some(&handle)), (None, None)] {
+            for allow in [&[][..], &[HOST_WARNINGS_REPORTED_ENV][..]] {
+                let env = child_environment(&request(allow, spawner.clone()), handle);
+                let values: Vec<&str> = env
+                    .iter()
+                    .filter(|(key, _)| key == HOST_WARNINGS_REPORTED_ENV)
+                    .map(|(_, value)| value.as_str())
+                    .collect();
+                assert_eq!(values, vec!["1"], "{env:?}");
+            }
+        }
+        std::env::remove_var(HOST_WARNINGS_REPORTED_ENV);
     }
 
     /// A child's exit closes its stdout and its stderr together, so the reader that reports the

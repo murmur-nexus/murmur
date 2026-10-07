@@ -1688,7 +1688,11 @@ pub fn stage_session(
     // shipped profile can both produce, and the operator should be told which one they are on
     // before reading the result. Never a refusal — see `warn_on_userns_restriction_disabled_host_wide`.
     // Read off the report rather than re-probed, so the warning and the record cannot disagree.
-    warn_on_userns_restriction_disabled_host_wide(scope_report.userns_grant);
+    // Host-level, so stated once per launch: a process the runtime started was told by
+    // `HOST_WARNINGS_REPORTED_ENV` that its launcher already printed it (see `host_warnings`).
+    if !crate::host_warnings::host_warnings_reported() {
+        warn_on_userns_restriction_disabled_host_wide(scope_report.userns_grant);
+    }
     // The non-fatal half of the reachability check above. A compiler driver's helper binaries
     // (`cc1`, `as`, `ld`, `collect2`) are exec'd by the driver itself and sit outside its own
     // DT_NEEDED closure, inside the fixed sealed tree that is deliberately bound without the
@@ -3276,6 +3280,7 @@ fn launch(
                         declared_artifacts,
                         removed_artifacts: HashSet::new(),
                         required_schema_warned: Mutex::new(BTreeSet::new()),
+                        logged_tool_inventory: None,
                         session_id: session_id.clone(),
                         pending_a2a_events: Vec::new(),
                         pending_artifact_pulls: Vec::new(),
@@ -4297,6 +4302,7 @@ fn launch(
         installed_generation: 0,
         removed_artifacts: HashSet::new(),
         required_schema_warned: Mutex::new(BTreeSet::new()),
+        logged_tool_inventory: None,
         session_id: staged.session_id.clone(),
         pending_a2a_events: Vec::new(),
         pending_artifact_pulls: Vec::new(),
@@ -5418,7 +5424,7 @@ fn warn_on_unannotated_tool_schemas(installed_manifests: &[(String, String)]) {
     }
 }
 
-/// Warns (non-fatal, once per session) when this host's unprivileged user namespaces are
+/// Warns (non-fatal) when this host's unprivileged user namespaces are
 /// unrestricted because `kernel.apparmor_restrict_unprivileged_userns` is off, rather than because
 /// the shipped `mur-sealed` AppArmor profile is confining this binary.
 ///
@@ -5434,6 +5440,9 @@ fn warn_on_unannotated_tool_schemas(installed_manifests: &[(String, String)]) {
 /// one warning in one wording, and so the decision is testable without a host that has AppArmor.
 /// Every other grant, including [`UsernsGrant::Withheld`], is silent here — `Withheld` is already
 /// carried by `E-CAP-003`/`E-CAP-005` where it actually blocks something.
+///
+/// A host-level warning: ungated here, so `mur doctor` always states it, while `mur run` calls it
+/// only when [`crate::host_warnings::host_warnings_reported`] is false.
 pub fn warn_on_userns_restriction_disabled_host_wide(grant: Option<UsernsGrant>) {
     if grant != Some(UsernsGrant::RestrictionDisabledHostWide) {
         return;
@@ -6297,6 +6306,11 @@ pub(crate) struct CapsuleStoreState {
     /// The tool names whose malformed `input_schema` has already been named in `W-RUN-004` this
     /// session, so [`Self::check_required_fields`] names each one once rather than on every call.
     pub(crate) required_schema_warned: Mutex<BTreeSet<String>>,
+    /// The serialized tool array last written to this session's `logs/bootstrap.log`, `None`
+    /// until the first attempt writes one. An attempt — a continuation, or the next task a door
+    /// serves — whose array is byte-identical writes nothing, so the log holds the inventory once
+    /// and again each time it changes.
+    pub(crate) logged_tool_inventory: Option<String>,
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
     pub(crate) pending_a2a_events: Vec<PendingA2aSend>,
@@ -13899,6 +13913,7 @@ inference:
             declared_artifacts: HashSet::new(),
             removed_artifacts: HashSet::new(),
             required_schema_warned: Mutex::new(BTreeSet::new()),
+            logged_tool_inventory: None,
             session_id: "ses_test".to_string(),
             pending_a2a_events: Vec::new(),
             pending_artifact_pulls: Vec::new(),
@@ -14604,15 +14619,131 @@ inference:
         }
     }
 
-    /// Runs one `tsk_1` over `task.md` through the real http agent loop, with `launch-skill`
-    /// installed at launch and a driver double that calls it on every turn, and returns the
-    /// parsed `trace.jsonl`.
-    async fn run_tool_refresh_loop(
-        trigger: murmur_artifact::ToolRefresh,
-    ) -> Vec<serde_json::Value> {
+    /// The real http agent loop over one session's state, its driver a double that answers every
+    /// call with `response`: the trace, the hooks and the inference config every attempt shares.
+    struct AgentLoopHarness {
+        workdir: PathBuf,
+        inference: InferenceConfig,
+        trace: TraceWriter,
+        otel: OtelEmitter,
+        hooks: HookRuntime,
+    }
+
+    impl AgentLoopHarness {
+        /// Writes `task.md` into `workdir`, installs the driver double into `state`, and opens the
+        /// session's trace under `trigger`.
+        async fn new(
+            state: &mut CapsuleStoreState,
+            workdir: &Path,
+            trigger: murmur_artifact::ToolRefresh,
+            response: &str,
+        ) -> Self {
+            fs::create_dir_all(workdir).unwrap();
+            fs::write(workdir.join("task.md"), "use the skill").unwrap();
+            fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
+            state.tool_components.insert(
+                "mock-driver".to_string(),
+                crate::inference_import::test_support::driver_double(&state.engine, 0, response),
+            );
+            let inference = InferenceConfig {
+                transport: "http".into(),
+                driver: Some(murmur_artifact::InferenceDriver {
+                    artifact: "mock-driver".to_string(),
+                    config: None,
+                }),
+                max_turns: 3,
+                tool_refresh: trigger,
+                ..task_io_inference_config()
+            };
+            let mut trace = tool_refresh_trace(workdir).await;
+            trace.set_tool_refresh(Some(trigger.wire_name()));
+            trace.write_session_start(3, Vec::new()).await.unwrap();
+            let otel = OtelEmitter::new(None, workdir, "cap".to_string(), "0.1.0".to_string());
+            let hooks = crate::hooks::test_support::no_hooks(&state.engine, workdir).await;
+            Self {
+                workdir: workdir.to_path_buf(),
+                inference,
+                trace,
+                otel,
+                hooks,
+            }
+        }
+
+        /// Runs `task_id` over `task.md` as one attempt, reopening never.
+        async fn run_task(&mut self, state: &mut CapsuleStoreState, task_id: &str) {
+            let run_config = agent::AgentRunConfig {
+                context_window: 0,
+                compaction_threshold: 0.98,
+                compaction_model: None,
+                compaction_system_prompt: None,
+                compaction_dump_summaries: false,
+                max_output_tokens: 1024,
+                control: None,
+                seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
+                seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+                conversation_root: None,
+                record_owner: None,
+                harness_sessions: None,
+                resume: None,
+            };
+            self.trace
+                .write_task_start(
+                    task_id,
+                    "ctx_1",
+                    "task_md",
+                    TaskProvenance::derive(TaskOrigin::User, None),
+                    3,
+                )
+                .await
+                .unwrap();
+
+            // An attempt that runs out of turns is not what any caller asserts on.
+            let _ = run_task_with_reopens(
+                state,
+                &self.workdir,
+                &self.inference,
+                0,
+                None,
+                run_config,
+                &mut self.hooks,
+                &mut self.trace,
+                &mut self.otel,
+                None,
+                None,
+                &self.workdir,
+                "cap",
+                "0.1.0",
+                ConversationMode::Stateless,
+                Some("ctx_1".to_string()),
+                task_id,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        /// The parsed `trace.jsonl`.
+        async fn events(&mut self) -> Vec<serde_json::Value> {
+            self.trace.flush().await.unwrap();
+            read_trace_events(&self.workdir)
+        }
+
+        fn bootstrap_log(&self) -> String {
+            bootstrap_log_of(&self.workdir)
+        }
+    }
+
+    /// A driver double's answer that calls `launch-skill`.
+    const CALLS_LAUNCH_SKILL: &str = r#"{"stop_reason":"tool_call","content":[{"type":"tool_call","id":"c1","name":"launch-skill","input":{}}]}"#;
+
+    /// A driver double's answer that ends the turn.
+    const ENDS_THE_TURN: &str =
+        r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}"#;
+
+    /// A session whose workdir holds `launch-skill`, installed at launch.
+    fn launch_skill_session() -> (tempfile::TempDir, PathBuf, CapsuleStoreState) {
         let dir = tempfile::tempdir().unwrap();
         let workdir = dir.path().to_path_buf();
-        fs::write(workdir.join("task.md"), "use the skill").unwrap();
         let skill = workdir.join("tools").join("launch-skill");
         fs::create_dir_all(&skill).unwrap();
         fs::write(
@@ -14621,89 +14752,189 @@ inference:
         )
         .unwrap();
         fs::write(skill.join("skill.md"), "# launch guidance").unwrap();
-
-        let mut state = build_test_state(
+        let state = build_test_state(
             Arc::new(FakeSkillRegistry::new(Vec::new())),
             workdir.clone(),
             workdir.join("murmur.lock"),
         );
-        fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
-        state.tool_components.insert(
-            "mock-driver".to_string(),
-            crate::inference_import::test_support::driver_double(
-                &state.engine,
-                0,
-                r#"{"stop_reason":"tool_call","content":[{"type":"tool_call","id":"c1","name":"launch-skill","input":{}}]}"#,
-            ),
-        );
-        let inference = InferenceConfig {
-            transport: "http".into(),
-            driver: Some(murmur_artifact::InferenceDriver {
-                artifact: "mock-driver".to_string(),
-                config: None,
-            }),
-            max_turns: 3,
-            tool_refresh: trigger,
-            ..task_io_inference_config()
-        };
+        (dir, workdir, state)
+    }
 
-        let mut trace = tool_refresh_trace(&workdir).await;
-        trace.set_tool_refresh(Some(trigger.wire_name()));
-        trace.write_session_start(3, Vec::new()).await.unwrap();
-        let mut otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
-        let mut hooks = crate::hooks::test_support::no_hooks(&state.engine, &workdir).await;
-        let run_config = agent::AgentRunConfig {
-            context_window: 0,
-            compaction_threshold: 0.98,
-            compaction_model: None,
-            compaction_system_prompt: None,
-            compaction_dump_summaries: false,
-            max_output_tokens: 1024,
-            control: None,
-            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
-            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
-            conversation_root: None,
-            record_owner: None,
-            harness_sessions: None,
-            resume: None,
-        };
-        trace
-            .write_task_start(
-                "tsk_1",
-                "ctx_1",
-                "task_md",
-                TaskProvenance::derive(TaskOrigin::User, None),
-                3,
-            )
-            .await
-            .unwrap();
+    /// Runs one `tsk_1` over `task.md` through the real http agent loop, with `launch-skill`
+    /// installed at launch and a driver double that calls it on every turn, and returns the
+    /// parsed `trace.jsonl`.
+    async fn run_tool_refresh_loop(
+        trigger: murmur_artifact::ToolRefresh,
+    ) -> Vec<serde_json::Value> {
+        let (_dir, workdir, mut state) = launch_skill_session();
+        let mut harness =
+            AgentLoopHarness::new(&mut state, &workdir, trigger, CALLS_LAUNCH_SKILL).await;
+        harness.run_task(&mut state, "tsk_1").await;
+        harness.events().await
+    }
 
-        // The attempt runs out of turns, which is not what this asserts on.
-        let _ = run_task_with_reopens(
+    /// `workdir`'s `logs/bootstrap.log`, empty when nothing has been written.
+    fn bootstrap_log_of(workdir: &Path) -> String {
+        fs::read_to_string(workdir.join("logs").join("bootstrap.log")).unwrap_or_default()
+    }
+
+    /// The number of `heading (JSON):` blocks in `log`.
+    fn inventory_blocks(log: &str, heading: &str) -> usize {
+        log.matches(&format!("{heading} (JSON):")).count()
+    }
+
+    /// Every attempt of a session sends the same tool array, and `bootstrap.log` holds it once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inventory_is_logged_once_across_attempts() {
+        let (_dir, workdir, mut state) = launch_skill_session();
+        let mut harness = AgentLoopHarness::new(
             &mut state,
             &workdir,
-            &inference,
-            0,
-            None,
-            run_config,
-            &mut hooks,
-            &mut trace,
-            &mut otel,
-            None,
-            None,
+            murmur_artifact::ToolRefresh::Immediate,
+            ENDS_THE_TURN,
+        )
+        .await;
+        for task in ["tsk_1", "tsk_2", "tsk_3"] {
+            harness.run_task(&mut state, task).await;
+        }
+
+        let events = harness.events().await;
+        let tools_shas: Vec<&str> = events
+            .iter()
+            .filter(|e| e["event_type"] == "inference")
+            .map(|e| {
+                e["tools_sha"]
+                    .as_str()
+                    .expect("meta capture hashes the tools")
+            })
+            .collect();
+        assert_eq!(tools_shas.len(), 3, "{events:?}");
+        assert!(
+            tools_shas.iter().all(|sha| *sha == tools_shas[0]),
+            "{tools_shas:?}"
+        );
+        let log = harness.bootstrap_log();
+        assert_eq!(inventory_blocks(&log, "Installed tools"), 1, "{log}");
+        assert_eq!(inventory_blocks(&log, "Refreshed tools"), 0, "{log}");
+        assert!(log.contains("launch-skill"), "{log}");
+    }
+
+    /// A pull between attempts changes the next attempt's array, which is logged once; an
+    /// attempt after it, unchanged, writes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_inventory_is_logged_again_between_attempts() {
+        let (_project, workdir, mut state) = late_skill_fixture();
+        let mut harness = AgentLoopHarness::new(
+            &mut state,
             &workdir,
-            "cap",
-            "0.1.0",
-            ConversationMode::Stateless,
-            Some("ctx_1".to_string()),
-            "tsk_1",
-            None,
-            None,
+            murmur_artifact::ToolRefresh::Immediate,
+            ENDS_THE_TURN,
         )
         .await;
 
-        trace.flush().await.unwrap();
-        read_trace_events(&workdir)
+        harness.run_task(&mut state, "tsk_1").await;
+        let first = harness.bootstrap_log();
+        assert_eq!(inventory_blocks(&first, "Installed tools"), 1, "{first}");
+        assert!(!first.contains("aaa-late-skill"), "{first}");
+
+        pull_late_skill(&mut state);
+        harness.run_task(&mut state, "tsk_2").await;
+        let second = harness.bootstrap_log();
+        assert_eq!(inventory_blocks(&second, "Installed tools"), 2, "{second}");
+        assert!(
+            second[first.len()..].contains("aaa-late-skill"),
+            "the second block names the pulled skill: {second}"
+        );
+
+        harness.run_task(&mut state, "tsk_3").await;
+        assert_eq!(
+            harness.bootstrap_log(),
+            second,
+            "an unchanged attempt writes nothing"
+        );
+        assert_eq!(inventory_blocks(&second, "Refreshed tools"), 0, "{second}");
+        let inference = harness
+            .events()
+            .await
+            .into_iter()
+            .filter(|e| e["event_type"] == "inference")
+            .count();
+        assert_eq!(inference, 3);
+    }
+
+    /// A mid-attempt refresh under `tool_refresh: immediate` is logged once under its own
+    /// heading, and the next attempt, which starts from the refreshed array, writes nothing.
+    ///
+    /// No guest reachable from the http agent loop calls `manage.pull()`, so the attempt's two
+    /// logging points are driven here through the same `HeldInventory` and the session's memo;
+    /// the later attempt is the real loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_inventory_is_logged_again_after_a_mid_attempt_refresh() {
+        use crate::agent::inventory::HeldInventory;
+        let (_project, workdir, mut state) = late_skill_fixture();
+
+        let mut held = HeldInventory::build(
+            &workdir,
+            None,
+            &state.installed_artifacts,
+            state.installed_generation,
+        );
+        crate::agent::log_tool_inventory(
+            &workdir,
+            "Installed tools",
+            held.tools(),
+            &mut state.logged_tool_inventory,
+        )
+        .unwrap();
+        pull_late_skill(&mut state);
+        held.refresh_before_call(
+            &workdir,
+            None,
+            &state.installed_artifacts,
+            murmur_artifact::ToolRefresh::Immediate,
+            state.installed_generation,
+            false,
+        )
+        .expect("an immediate trigger rebuilds on the next call");
+        crate::agent::log_tool_inventory(
+            &workdir,
+            "Refreshed tools",
+            held.tools(),
+            &mut state.logged_tool_inventory,
+        )
+        .unwrap();
+        let refreshed = bootstrap_log_of(&workdir);
+        assert_eq!(
+            inventory_blocks(&refreshed, "Installed tools"),
+            1,
+            "{refreshed}"
+        );
+        assert_eq!(
+            inventory_blocks(&refreshed, "Refreshed tools"),
+            1,
+            "{refreshed}"
+        );
+
+        let mut harness = AgentLoopHarness::new(
+            &mut state,
+            &workdir,
+            murmur_artifact::ToolRefresh::Immediate,
+            ENDS_THE_TURN,
+        )
+        .await;
+        harness.run_task(&mut state, "tsk_2").await;
+        assert_eq!(
+            harness.bootstrap_log(),
+            refreshed,
+            "an attempt starting from the refreshed array writes nothing"
+        );
+        let inference = harness
+            .events()
+            .await
+            .into_iter()
+            .filter(|e| e["event_type"] == "inference")
+            .count();
+        assert_eq!(inference, 1);
     }
 
     /// With no install during the session, every call sends one tool array under either
