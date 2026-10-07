@@ -855,6 +855,55 @@ fn a_formation_runs_to_its_end_after_its_reader_goes_away() {
     );
 }
 
+/// Three members may call `tester`, which holds two tasks at once under [`PEER_LIFECYCLE`]: the
+/// launcher warns with `W-ROS-001` on stderr before its `formation:` block, and the formation
+/// launches and runs to its end all the same.
+#[test]
+fn a_member_with_more_callers_than_it_holds_is_warned_about_and_still_launched() {
+    let _lock = launch_lock();
+    let project = Project::new(
+        &[CODER, REVIEWER, peer("tester", "0.4.0"), PLANNER],
+        "reachability:\n  - from: planner\n    to: [coder, reviewer, tester]\n  \
+         - from: coder\n    to: [tester]\n  - from: reviewer\n    to: [tester]\n",
+    );
+    let mut launcher = Launcher::spawn(project.command(&["run", "--roster", "--task", "probe"]));
+    project.release.send(()).unwrap();
+    let status = launcher.wait();
+    let stderr = launcher.stderr();
+    assert_eq!(status.code(), Some(0), "stderr:\n{stderr}");
+
+    let lines: Vec<&str> = stderr.lines().collect();
+    let warning = "[mur run] warning[W-ROS-001]: roster.yaml lets 3 members call 'tester' \
+                   (coder, reviewer, planner), but it holds 2 tasks at once \u{2014} one running \
+                   and lifecycle.queue_depth: 1 waiting \u{2014} so a call that arrives while it is \
+                   full is rejected; lifecycle.queue_depth: 2 would hold them all \
+                   (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)";
+    let warned = lines
+        .iter()
+        .position(|line| *line == warning)
+        .unwrap_or_else(|| panic!("no W-ROS-001 line on stderr:\n{stderr}"));
+    let announced = lines
+        .iter()
+        .position(|line| line.starts_with("formation: frm_"))
+        .unwrap_or_else(|| panic!("no formation block on stderr:\n{stderr}"));
+    assert!(warned < announced, "{stderr}");
+    assert_eq!(stderr.matches("W-ROS-001").count(), 1, "one line: {stderr}");
+    for peer in ["coder", "reviewer", "tester"] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim_start().starts_with(&format!("peer   {peer} "))),
+            "{peer} was not launched:\n{stderr}"
+        );
+    }
+
+    let planner_trace = project.trace_of("planner");
+    let kinds = event_kinds(&planner_trace);
+    assert!(kinds.contains(&"task_end"), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&"session_end"), "{kinds:?}");
+    project.assert_no_member_remains(&[], Duration::from_secs(30));
+}
+
 /// Scenario 2: only the members the entry member may call are handed to it; every member is
 /// launched regardless.
 #[test]

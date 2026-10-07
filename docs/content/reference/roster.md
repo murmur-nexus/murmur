@@ -134,6 +134,10 @@ at the first failure. Within a check, members are taken in roster order.
 Checks 1–5 read no store, so a roster with a structural fault is refused even when no member is
 installed. Check 6 takes each member in turn through both rows before the next.
 
+An admitted roster is then compared against each called member's `lifecycle`. When more members may
+call a member than it holds tasks at once, [`W-ROS-001`](diagnostics.md#w-ros-001) names it and the
+`lifecycle.queue_depth` that holds every caller. The roster is still admitted.
+
 ## Launching a formation { #launch }
 
 [`mur run --roster`](cli.md#mur-run-roster) launches the admitted roster for one task:

@@ -1030,6 +1030,44 @@ mod tests {
         }
     }
 
+    /// `LifecycleConfig::tasks_held_at_once` is what `W-ROS-001` compares a member's callers
+    /// against; this registry is what actually rejects a call. Filling a registry the way the
+    /// door and the task loop do must accept exactly that many tasks, so a change to either rule
+    /// fails here instead of leaving the warning wrong.
+    #[test]
+    fn tasks_held_at_once_matches_what_the_registry_accepts() {
+        const SAFETY_CAP: usize = 64;
+        for (mode, depth, expected) in [
+            (TaskAcceptance::None, 1, 0),
+            (TaskAcceptance::Single, 1, 1),
+            (TaskAcceptance::Queue, 0, 0),
+            (TaskAcceptance::Queue, 1, 2),
+            (TaskAcceptance::Queue, 3, 4),
+        ] {
+            let mut r = TaskRegistry::new(depth, mode.clone());
+            let mut accepted = 0;
+            while r.can_accept() && accepted < SAFETY_CAP {
+                let task_id = format!("tsk_{accepted}");
+                r.enqueue(&task_id, "ctx_001");
+                if accepted == 0 {
+                    r.start_task(task_id, "ctx_001".to_string(), TaskLane::Peer);
+                }
+                accepted += 1;
+            }
+            let lifecycle = murmur_artifact::LifecycleConfig {
+                task_acceptance: mode.clone(),
+                queue_depth: depth,
+                ..Default::default()
+            };
+            assert_eq!(accepted, expected, "{mode:?} at depth {depth}");
+            assert_eq!(
+                accepted,
+                lifecycle.tasks_held_at_once(),
+                "{mode:?} at depth {depth}: tasks_held_at_once drifted from the registry"
+            );
+        }
+    }
+
     #[test]
     fn as_str_is_the_serialized_spelling() {
         for state in [

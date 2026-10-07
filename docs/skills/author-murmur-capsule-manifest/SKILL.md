@@ -509,6 +509,7 @@ lifecycle:
 Rules:
 
 - `queue_depth` only matters in queue mode;
+- a queue capsule holds one running task plus `queue_depth` waiting ones; for a roster member that several members may call, `mur doctor` reports [`W-ROS-001`](https://docs.murmur.nexus/reference/diagnostics/#w-ros-001) with the `queue_depth` that holds every caller;
 - `after_task: sleep` is for a capsule intended to remain available;
 - use `conversation: threaded` only when tasks sharing a context should accumulate conversational history;
 - add `input_timeout_secs` only when tools can request human/input replies and indefinite waiting is unacceptable.

@@ -47,6 +47,13 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
     let lock = read_optional_lockfile(&project_dir)?;
     let roster =
         admit_roster_file(&project_dir, &registry, lock.as_ref()).map_err(CliError::from)?;
+    // A warning only: calls may never overlap, so the formation launches regardless.
+    for overflow in roster.caller_overflows() {
+        capsule_runtime::runtime_err!(
+            "[mur run] {}",
+            capsule_runtime::caller_overflow_warning(&overflow)
+        );
+    }
 
     // The entry member's `trace.retain` bounds this project's formation directories as it bounds
     // the entry member's own sessions. Without one, nothing is removed.

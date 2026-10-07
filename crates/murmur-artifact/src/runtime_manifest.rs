@@ -88,6 +88,22 @@ impl LifecycleConfig {
     pub fn can_receive_background_tasks(&self) -> bool {
         self.task_acceptance == TaskAcceptance::Queue && self.after_task == AfterTask::Sleep
     }
+
+    /// How many tasks a capsule under this lifecycle holds at once: one running task plus
+    /// `queue_depth` waiting ones under `queue`, a single task under `single`, none under `none`.
+    ///
+    /// A `queue` lifecycle with `queue_depth: 0` holds nothing, because the A2A door admits a
+    /// task under `queue` only while fewer than `queue_depth` tasks are waiting. That door is the
+    /// authority this mirrors: the task registry in `capsule-runtime` (`TaskRegistry::can_accept`)
+    /// decides what is rejected, and a test there fails if the two drift apart.
+    pub fn tasks_held_at_once(&self) -> usize {
+        match self.task_acceptance {
+            TaskAcceptance::None => 0,
+            TaskAcceptance::Single => 1,
+            TaskAcceptance::Queue if self.queue_depth == 0 => 0,
+            TaskAcceptance::Queue => self.queue_depth + 1,
+        }
+    }
 }
 
 impl Default for LifecycleConfig {
@@ -5771,6 +5787,51 @@ mod tests {
 
     fn manifest_with_trace(block: &str) -> String {
         format!("name: cap\nversion: 0.0.1\ntrace:\n{block}")
+    }
+
+    fn lifecycle(task_acceptance: TaskAcceptance, queue_depth: usize) -> LifecycleConfig {
+        LifecycleConfig {
+            task_acceptance,
+            queue_depth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tasks_held_at_once_under_queue_is_one_running_plus_queue_depth_waiting() {
+        assert_eq!(lifecycle(TaskAcceptance::Queue, 1).tasks_held_at_once(), 2);
+        assert_eq!(lifecycle(TaskAcceptance::Queue, 9).tasks_held_at_once(), 10);
+    }
+
+    #[test]
+    fn tasks_held_at_once_under_queue_with_depth_zero_is_zero() {
+        assert_eq!(lifecycle(TaskAcceptance::Queue, 0).tasks_held_at_once(), 0);
+    }
+
+    #[test]
+    fn tasks_held_at_once_under_single_is_one_whatever_the_depth() {
+        assert_eq!(lifecycle(TaskAcceptance::Single, 1).tasks_held_at_once(), 1);
+        assert_eq!(lifecycle(TaskAcceptance::Single, 5).tasks_held_at_once(), 1);
+    }
+
+    #[test]
+    fn tasks_held_at_once_under_none_is_zero_whatever_the_depth() {
+        assert_eq!(lifecycle(TaskAcceptance::None, 1).tasks_held_at_once(), 0);
+        assert_eq!(lifecycle(TaskAcceptance::None, 5).tasks_held_at_once(), 0);
+    }
+
+    /// The default is `single` at `queue_depth: 1`, which holds one task; switching only
+    /// `task_acceptance` to `queue` keeps the default depth and holds two.
+    #[test]
+    fn tasks_held_at_once_of_the_default_lifecycle_and_default_depth() {
+        assert_eq!(LifecycleConfig::default().tasks_held_at_once(), 1);
+        let queue = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nlifecycle:\n  task_acceptance: queue\n",
+        )
+        .unwrap()
+        .effective_lifecycle();
+        assert_eq!(queue.queue_depth, 1);
+        assert_eq!(queue.tasks_held_at_once(), 2);
     }
 
     /// No `trace:` block at all leaves the config absent; the runtime substitutes
