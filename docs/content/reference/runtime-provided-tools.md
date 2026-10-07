@@ -20,7 +20,7 @@ Each one appears only when the declaration in the second column is present.
 | `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; once the turn ends, the task waits and continues with the outcome — see [The delegation tool](roost-api.md#the-delegation-tool) |
 | `submit-plan` | [`capabilities.plan.submit`](manifest.md#field-capabilities) | Runs one plan of steps against this session's own tools and returns every step's result — see [Plans](plans.md) |
 | `switch-driver` | [`control.agent_settings: [inference.driver]`](manifest.md#field-control) | Selects the [driver choice](manifest.md#inference-alternates) the agent's next inference call is served by — see [`switch-driver`](#switch-driver) |
-| `call-member` | A [`reachability`](roster.md#reachability) rule in the formation's `roster.yaml` that lets this member call another | Hands one task to another formation member and returns as soon as that member holds it; the answer arrives later in the same task — see [`call-member`](#call-member) |
+| `call-member` | A [`reachability`](roster.md#reachability) rule in the formation's `roster.yaml` that lets this member call another | Hands one task to another formation member and returns at once, started or busy; the answer arrives later in the same task — see [`call-member`](#call-member) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -94,22 +94,24 @@ member. A member the roster lets call nobody, and a session in no formation, has
 | Aspect | Behaviour |
 |---|---|
 | Input | `{"member": "<name>", "task": "<text>"}`, both required. The schema's `member` is an `enum` of the members this one may call, in roster order |
-| Description | Tells the model that `task` is the whole of what the member is told, so any file content it needs goes in the task text; that the call returns once the member holds the task; that the answer arrives in the conversation after the turn ends, so it should not wait or poll; and that a second call to a member before its answer has arrived is refused |
+| Description | Tells the model that `task` is the whole of what the member is told, so any file content it needs goes in the task text; that the call returns at once with a call id, started when the member holds the task or busy when it has no room, in which case the runtime keeps offering the task until the member takes it or the call's deadline passes; that the answer arrives in the conversation after the turn ends, so it should not wait or poll; and that a second call to a member before its answer has arrived is refused |
 | Sent | One `message/send` to the member's door, carrying `task` as one text part, the formation token, and the calling task's trust class with origin `peer`. The model never sees the door's address or the token |
 | Egress | The member's door is checked against this capsule's own [`capabilities.network.allow`](manifest.md#network-allow-entries), which must list `localhost` — see [Giving a member work](roster.md#member-calls). Without it, every call fails and staging prints [`W-RUN-008`](diagnostics.md#w-run-008) |
-| Trace | [`member_call_start`](observability-schemas.md#member-call-start) when the member holds the task, and one [`member_call`](observability-schemas.md#member-call) per call once it is accounted for |
+| Trace | One [`member_call_busy`](observability-schemas.md#member-call-busy) per offer the member turns away busy, [`member_call_start`](observability-schemas.md#member-call-start) when the member holds the task, and one [`member_call`](observability-schemas.md#member-call) per call once it is accounted for |
 
 ### What a call returns { #call-member-result }
 
-A call ends its tool call in one of two ways:
+A call ends its tool call in one of four ways:
 
 | Result | When | `data` |
 |---|---|---|
 | `passed`, summary `Called <member>: started` | The member's door answered with a task id and a state that is not terminal | `{"call_id": "mcl_…", "member": "<name>", "status": "started", "task_id": "<the member's task id>"}` |
-| `failed`, summary `Called <member>: failed` | The call was refused, the door could not be reached, the door answered an error status or a JSON-RPC error, or the member answered with a terminal state such as `rejected` | `{"call_id": "mcl_…", "member": "<name>", "status": "failed", "output": "<why>"}` |
+| `passed`, summary `Called <member>: busy` | The member's door answered `rejected` with the status message `task rejected: capsule is busy`. The runtime keeps offering the task — see [A busy member](#call-member-busy) | `{"call_id": "mcl_…", "member": "<name>", "status": "busy", "output": "<member> is busy with other work and did not take the task"}` |
+| `failed`, summary `Called <member>: rejected` | The member's door answered `rejected` for any other reason, such as its session closing | `{"call_id": "mcl_…", "member": "<name>", "status": "rejected", "output": "<member> did not take the task: <reason>"}` |
+| `failed`, summary `Called <member>: failed` | The call was refused, the door could not be reached, the door answered an error status or a JSON-RPC error, or the member answered with another terminal state | `{"call_id": "mcl_…", "member": "<name>", "status": "failed", "output": "<why>"}` |
 
-`data` reaches the model [fenced](untrusted-fence.md) under `tool:call-member`. A started call adds the runtime's own note on the line after the closing
-marker, outside the fence:
+`data` reaches the model [fenced](untrusted-fence.md) under `tool:call-member`. Each result
+adds the runtime's own note on the line after the closing marker, outside the fence:
 
 ```text
 <untrusted-content source=tool:call-member>
@@ -117,6 +119,44 @@ marker, outside the fence:
 </untrusted-content>
 [call-member] worker is now working on call mcl_01a1…. Its answer is not in this result and no tool fetches it: the runtime adds it to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling worker again before its answer arrives is refused.
 ```
+
+| Result | Note |
+|---|---|
+| `started` | `[call-member] <member> is now working on call <call_id>. Its answer is not in this result and no tool fetches it: the runtime adds it to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling <member> again before its answer arrives is refused.` |
+| `busy` | `[call-member] <member> is busy with other work and has not taken call <call_id> yet. The runtime keeps offering it the task for up to <N>s and adds <member>'s answer, or word that it stayed busy, to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling <member> again before then is refused.` `<N>` is the call's deadline in seconds |
+| `rejected`, `failed` | `[call-member] Call <call_id> to <member> ended <status>, with no answer from <member>. Do not present an answer of your own as <member>'s.` |
+
+A door's `rejected` answer reads as one sentence:
+
+| The door's status message | `output` |
+|---|---|
+| `task rejected: capsule is busy` | `<member> is busy with other work and did not take the task` |
+| Any other | `<member> did not take the task: <message>`, with a leading `task rejected: ` dropped |
+| None | `<member> did not take the task` |
+
+### A busy member { #call-member-busy }
+
+A busy member's call is outstanding from the moment the tool call returns, and the runtime, not
+the model, offers the member the task again:
+
+1. Each offer is a new `message/send` carrying the same task text.
+2. The second offer comes 1 second after the first refusal. Each later wait doubles, up to 8
+   seconds, plus up to 250 ms of jitter.
+3. Each offer the member turns away busy writes its own
+   [`member_call_busy`](observability-schemas.md#member-call-busy).
+
+The call then ends in one of these ways:
+
+| What happens | The call |
+|---|---|
+| The member takes the task | Writes [`member_call_start`](observability-schemas.md#member-call-start) and runs as a started call does, against the same deadline |
+| The member answers `rejected` for another reason, or another terminal state | Ends with that status and sentence |
+| Two offers in a row get no answer | Ends `unreachable` |
+| The call's deadline passes while the member is still busy | Ends `rejected`, never held: `<member> stayed busy with other work for the whole <N>s this call may wait and never took the task; it was offered the task <k> times. Nothing was done on it.` |
+| The calling task ends | Ends `abandoned`, never held: `the calling task ended before <member> took the task; <member> was busy and was never handed it`. No further offer is sent |
+
+Only a refusal with exactly the message `task rejected: capsule is busy` is offered again; any
+other refusal ends the call in the same turn.
 
 Three calls are refused as a tool error, with nothing sent and nothing recorded as a member call:
 
@@ -143,9 +183,9 @@ different members in one turn never refuse each other.
    every answer that has arrived. The stream shows `continuing with <n> member answer(s)`.
 4. The model reads the answers and answers in turn, or calls again.
 
-Each answer in that message is one line naming the call id, the member and how the call ended,
-then the member's output fenced under `member:<name>`, whatever the calling task's trust. The
-message ends with one line of the runtime's own, outside every fence:
+Each answer in that message is one header line naming the call id, the member and how the call
+ended, then the member's output fenced under `member:<name>`, whatever the calling task's trust.
+The message ends with the runtime's own lines, outside every fence:
 
 ```text
 [call-member] call mcl_01a1… to worker ended completed:
@@ -153,18 +193,41 @@ message ends with one line of the runtime's own, outside every fence:
 WORKER-0123
 </untrusted-content>
 
-[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.
+[call-member] call mcl_01a2… to critic ended timed_out, with no answer from critic:
+<untrusted-content source=member:critic>
+critic did not answer within 600s. …
+</untrusted-content>
+
+[call-member] No answer came from: critic (call mcl_01a2…, timed_out). What you asked of them has not been done by them: do not present an answer of your own as theirs.
+
+[call-member] Every call this task made has ended. Answer the task with the answers you have and say plainly which part has no answer, or call a member again if another attempt could succeed.
 ```
 
-| Calls still outstanding | Last line |
+| Ending | Header |
 |---|---|
-| None | `[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.` |
-| One or more | `[call-member] Still working: <member> (call <call_id>), <member> (call <call_id>). Their answers arrive after you end your turn; do not call them again before then.` |
+| `completed` | `[call-member] call <call_id> to <member> ended completed:` |
+| Any other | `[call-member] call <call_id> to <member> ended <status>, with no answer from <member>:` |
+
+A member has no answer when its latest call in this task did not end `completed`, whether that
+call ended in its own tool call or in a continuation. Each such member is named, with that call's
+id and status, in one line after every fence:
+
+```text
+[call-member] No answer came from: <member> (call <call_id>, <status>), <member> (call <call_id>, <status>). What you asked of them has not been done by them: do not present an answer of your own as theirs.
+```
+
+A later call to the same member that completes removes it from that line. The message's last line:
+
+| Calls still outstanding | Members with no answer | Last line |
+|---|---|---|
+| One or more | Any | `[call-member] Still working: <member> (call <call_id>), <member> (call <call_id>). Their answers arrive after you end your turn; do not call them again before then.` |
+| None | None | `[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.` |
+| None | One or more | `[call-member] Every call this task made has ended. Answer the task with the answers you have and say plainly which part has no answer, or call a member again if another attempt could succeed.` |
 
 | Ending | Output |
 |---|---|
 | `completed` | The member's answer: its task's `response` artifact |
-| `failed`, `canceled`, `rejected` | The member's task's status message |
+| `failed`, `canceled`, `rejected` | The member's task's status message, or for a member that stayed busy, the runtime's sentence from [A busy member](#call-member-busy) |
 | `timed_out` | The member did not answer within the bound; it was not cancelled and may still be working |
 | `unreachable` | The member's door stopped answering |
 
@@ -192,9 +255,10 @@ either, answers first — see [How the outcome arrives](roost-api.md#how-the-out
 
 | Bound | Value |
 |---|---|
-| How long a call is watched | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600 seconds, or `MURMUR_DELEGATION_TIMEOUT_SECS` — the bound delegations use |
+| How long a call may take, offering a busy member the task and waiting for its answer together | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600 seconds, or `MURMUR_DELEGATION_TIMEOUT_SECS` — the bound delegations use |
+| How often a busy member is offered the task again | 1 second after the refusal, then doubling to at most 8 seconds, each plus up to 250 ms |
 | How often the member's task is read | Every 500 ms, through the member's `tasks/get` |
-| Unreachable | Two reads in a row that get no answer |
+| Unreachable | Two reads, or two offers, in a row that get no answer |
 
 No call is ever cancelled at the member: a formation token cannot call `tasks/cancel`. A call
 that times out or is abandoned leaves the member's task running until it finishes or the formation

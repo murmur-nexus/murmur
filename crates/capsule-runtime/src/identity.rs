@@ -1348,7 +1348,7 @@ async fn handle_message_stream(
         } else if reg.is_closed() {
             Some(crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE)
         } else {
-            Some(REJECTED_BUSY_MESSAGE)
+            Some(crate::a2a::REJECTED_BUSY_MESSAGE)
         }
     };
     if let Some(refusal) = refusal {
@@ -1471,9 +1471,6 @@ async fn write_replay(
     }
     Ok(last_written)
 }
-
-/// The `status.message` of a `message/stream` refusal from a capsule with no room for the task.
-const REJECTED_BUSY_MESSAGE: &str = "task rejected: capsule is busy";
 
 /// The `rejected` status written to a `message/stream` connection the door refuses, busy or
 /// closing. It goes to that one connection and is never buffered, so it carries no `id:` line:
@@ -1716,7 +1713,7 @@ fn handle_message_send(
             let refusal = if reg.is_closed() {
                 crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE
             } else {
-                REJECTED_BUSY_MESSAGE
+                crate::a2a::REJECTED_BUSY_MESSAGE
             };
             let task = A2aTask {
                 status: TaskStatus {
@@ -3120,7 +3117,7 @@ mod tests {
     async fn message_stream_refused_by_a_closed_registry_says_the_session_is_closing() {
         for (close, expected) in [
             (true, crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE),
-            (false, REJECTED_BUSY_MESSAGE),
+            (false, crate::a2a::REJECTED_BUSY_MESSAGE),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (client, lines) = spawn_sse_line_reader(

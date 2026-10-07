@@ -292,6 +292,10 @@ pub(crate) const REJECTED_SESSION_STOPPED_MESSAGE: &str =
 /// The `status.message` the door's `message/stream` refusal carries once the registry is closed.
 pub(crate) const REJECTED_SESSION_CLOSING_MESSAGE: &str = "task rejected: the session is closing";
 
+/// The `status.message` of a task refused because the capsule has no room for it. A `call-member`
+/// call reads exactly this text as "busy" and offers the task again; every other refusal ends it.
+pub(crate) const REJECTED_BUSY_MESSAGE: &str = "task rejected: capsule is busy";
+
 impl TaskRegistry {
     pub(crate) fn new(queue_depth: usize, task_acceptance: TaskAcceptance) -> Self {
         Self {

@@ -384,13 +384,14 @@ async fn run_task_with_reopens(
                         let mut said = Vec::new();
                         if !woken.answers.is_empty() {
                             // Answers only come from `call-member` calls, so `calls` is set here.
-                            let still_outstanding = calls
+                            let (still_outstanding, unanswered) = calls
                                 .as_ref()
-                                .map(|calls| calls.outstanding())
+                                .map(|calls| (calls.outstanding(), calls.unanswered()))
                                 .unwrap_or_default();
                             let message = crate::member_call::answers_message(
                                 &woken.answers,
                                 &still_outstanding,
+                                &unanswered,
                             );
                             member_answers.push(message.clone());
                             messages.push(message);
@@ -8331,7 +8332,7 @@ impl CapsuleStoreState {
     }
 
     /// `call-member`: hand one task to one formation member and return as soon as its door holds
-    /// it.
+    /// it or has turned it away busy.
     ///
     /// The agent names a member and a task. The member's door, the token and the egress check are
     /// the runtime's, through [`crate::member_call::resolve_member_call`] under this capsule's own
@@ -8341,23 +8342,31 @@ impl CapsuleStoreState {
     /// **The call returns when the member holds the task, not when it answers.** A started call is
     /// registered in the session's [`crate::member_call::MemberCalls`] and watched on a thread of
     /// its own; its answer is delivered into this same task once the model ends its turn, by
-    /// [`run_task_with_reopens`]. A call that did not start fails in this turn: the result is its
-    /// delivery, so its `member_call` line is written here.
+    /// [`run_task_with_reopens`]. A member that answered busy is registered the same way, and its
+    /// watcher offers it the task again until it takes it or the call's deadline passes. A call
+    /// that did not start for any other reason ends in this turn: the result is its delivery, so
+    /// its `member_call` line is written here.
     ///
     /// **One pending call per member.** While a call from this task to `member` is being sent,
     /// is outstanding, or has an answer not yet delivered, another call to `member` is a tool
     /// error and sends nothing, records nothing.
     ///
-    /// The second value is the runtime's note for a started call,
-    /// [`crate::member_call::started_note`], and `None` for every other result.
+    /// The second value is the runtime's note after the fenced result: [`started_note`] for a
+    /// started call, [`busy_note`] for a busy one, [`no_answer_note`] for one that ended here, and
+    /// `None` for a tool error.
+    ///
+    /// [`started_note`]: crate::member_call::started_note
+    /// [`busy_note`]: crate::member_call::busy_note
+    /// [`no_answer_note`]: crate::member_call::no_answer_note
     async fn dispatch_call_member(
         &self,
         input: murmur::tool::run::ToolInput,
     ) -> Result<(murmur::tool::run::ToolResult, Option<String>), String> {
         use crate::delegation_plane::bounded;
         use crate::member_call::{
-            elapsed_ms, mint_call_id, send_task, started_note, CallHeaders, CallRoute,
-            MemberCallOutcome, MemberCallRefusal, MemberCallStatus,
+            busy_note, elapsed_ms, mint_call_id, no_answer_note, send_task, started_note,
+            CallHeaders, CallRoute, CallStart, CallTrace, MemberCallOutcome, MemberCallRefusal,
+            MemberCallStatus,
         };
 
         let args = parse_tool_json_input(MEMBER_CALL_TOOL, &input)?;
@@ -8416,7 +8425,7 @@ impl CapsuleStoreState {
         // id, which `SIGTERM` and a closed lifeline raise.
         let cancel = self.task_cancel_signal().or_else(|| calls.task_cancel());
         let sending = {
-            let (route, call_id) = (route.clone(), call_id.clone());
+            let (route, call_id, task) = (route.clone(), call_id.clone(), task.clone());
             tokio::task::spawn_blocking(move || send_task(&route, &call_id, &task))
         };
         let joined = tokio::select! {
@@ -8443,6 +8452,12 @@ impl CapsuleStoreState {
             joined = sending => joined,
         };
         let sent = joined.map_err(|error| format!("'{MEMBER_CALL_TOOL}' panicked: {error}"))?;
+        let call_trace = || {
+            self.peer_trace.as_ref().map(|appender| CallTrace {
+                appender: Arc::clone(appender),
+                task_id: task_id.clone(),
+            })
+        };
 
         match sent {
             Ok(member_task_id) => {
@@ -8451,7 +8466,13 @@ impl CapsuleStoreState {
                         .write_member_call_start(&task_id, &call_id, &member, &member_task_id)
                         .await;
                 }
-                calls.watch(route, claim, &member_task_id, started);
+                calls.watch(
+                    route,
+                    claim,
+                    CallStart::Held(member_task_id.clone()),
+                    started,
+                    call_trace(),
+                );
                 let note = started_note(&member, &call_id);
                 let result = murmur::tool::run::ToolResult {
                     status: murmur::tool::run::Status::Passed,
@@ -8471,23 +8492,62 @@ impl CapsuleStoreState {
                 };
                 Ok((result, Some(note)))
             }
-            Err(failure) => {
-                drop(claim);
-                let (output, truncated) = bounded(failure.reason);
-                // The trace tells a busy door's refusal from every other failure to start; the
-                // model reads both as `failed`.
+            Err(failure) if failure.busy => {
                 if let Some(trace) = &self.peer_trace {
-                    let outcome = unstarted(failure.status, output.clone(), truncated);
-                    trace.write_member_call(&task_id, &outcome, true).await;
+                    trace
+                        .write_member_call_busy(
+                            &task_id,
+                            &call_id,
+                            &member,
+                            1,
+                            elapsed_ms(started),
+                            crate::a2a::REJECTED_BUSY_MESSAGE,
+                        )
+                        .await;
                 }
+                calls.watch(
+                    route,
+                    claim,
+                    CallStart::WaitingForRoom { task, offers: 1 },
+                    started,
+                    call_trace(),
+                );
+                let note = busy_note(&member, &call_id, calls.deadline());
                 let result = murmur::tool::run::ToolResult {
-                    status: murmur::tool::run::Status::Failed,
-                    summary: Some(format!("Called {member}: failed")),
+                    status: murmur::tool::run::Status::Passed,
+                    summary: Some(format!("Called {member}: busy")),
                     data: Some(
                         serde_json::json!({
                             "call_id": call_id,
                             "member": member,
-                            "status": "failed",
+                            "status": "busy",
+                            "output": failure.reason,
+                        })
+                        .to_string(),
+                    ),
+                    data_path: None,
+                    truncated: false,
+                    metadata: Vec::new(),
+                };
+                Ok((result, Some(note)))
+            }
+            Err(failure) => {
+                drop(claim);
+                let (output, truncated) = bounded(failure.reason);
+                if let Some(trace) = &self.peer_trace {
+                    let outcome = unstarted(failure.status, output.clone(), truncated);
+                    trace.write_member_call(&task_id, &outcome, true).await;
+                }
+                calls.record_unstarted(&member, &call_id, failure.status);
+                let status = failure.status.as_str();
+                let result = murmur::tool::run::ToolResult {
+                    status: murmur::tool::run::Status::Failed,
+                    summary: Some(format!("Called {member}: {status}")),
+                    data: Some(
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "member": member,
+                            "status": status,
                             "output": output,
                         })
                         .to_string(),
@@ -8496,7 +8556,10 @@ impl CapsuleStoreState {
                     truncated,
                     metadata: Vec::new(),
                 };
-                Ok((result, None))
+                Ok((
+                    result,
+                    Some(no_answer_note(&member, &call_id, failure.status)),
+                ))
             }
         }
     }
@@ -9804,7 +9867,9 @@ fn member_call_tool_manifest(callees: &[&str]) -> String {
          description: \"Hand one task to another member of this formation. `member` must be one \
          of the members this capsule may call. `task` is the whole of what that member is told, \
          so state it in full and include the content of any file the member needs: members do \
-         not share files. The call returns as soon as the member holds the task, with a call id. \
+         not share files. The call returns at once with a call id: started when the member holds \
+         the task, or busy when the member has no room for it, in which case the runtime keeps \
+         offering it the task until it takes it or the call's deadline passes. \
          The member's answer arrives in this conversation, naming that call id, after you end \
          your turn, so do not wait or poll for it. A second call to a member before its answer \
          has arrived is refused.\"\n\
@@ -20030,6 +20095,22 @@ mod member_call_tests {
         formation: Arc<FormationMember>,
         network_allow: &[&str],
     ) -> CapsuleStoreState {
+        calling_state_bounded(
+            workdir,
+            formation,
+            network_allow,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+
+    /// [`calling_state`], with each call watched for `deadline`.
+    async fn calling_state_bounded(
+        workdir: &Path,
+        formation: Arc<FormationMember>,
+        network_allow: &[&str],
+        deadline: std::time::Duration,
+    ) -> CapsuleStoreState {
         let mut state = build_test_state(
             Arc::new(super::tests::FakeSkillRegistry::new(Vec::new())),
             workdir.to_path_buf(),
@@ -20041,9 +20122,7 @@ mod member_call_tests {
             .collect();
         state.http_hooks.formation = Some(formation);
         state.current_task_provenance = Some(TaskProvenance::derive(TaskOrigin::User, None));
-        let calls = Arc::new(crate::member_call::MemberCalls::new(
-            std::time::Duration::from_secs(60),
-        ));
+        let calls = Arc::new(crate::member_call::MemberCalls::new(deadline));
         calls.begin_task("tsk_caller", None);
         state.member_calls = Some(calls);
         state.peer_trace = Some(Arc::new(
@@ -20115,8 +20194,10 @@ mod member_call_tests {
             "members this capsule may call",
             "include the content of any file",
             "do not share files",
-            "returns as soon as the member holds the task",
-            "call id",
+            "returns at once with a call id",
+            "started when the member holds the task",
+            "busy when the member has no room for it",
+            "keeps offering it the task until it takes it or the call's deadline passes",
             "after you end your turn",
             "do not wait or poll",
             "A second call to a member before its answer has arrived is refused.",
@@ -20193,10 +20274,12 @@ mod member_call_tests {
         assert_eq!(calls.counts(), (0, 0));
     }
 
-    /// A call the callee's door does not take fails in the same turn: the door's status and
-    /// message come back as a failed tool result, no watcher starts, and the one trace line is a
-    /// `member_call` with no `member_task_id`, `rejected` for a `rejected` answer and `failed`
-    /// otherwise. The door saw one bearer token and the stamped provenance.
+    /// A call the callee's door does not take, for any reason but busy, ends in the same turn:
+    /// the door's reason comes back as a failed tool result whose status is the call's, with the
+    /// runtime's no-answer note after the fence. No watcher starts, the member is named in the
+    /// task's no-answer ledger, and the one trace line is a `member_call` with no
+    /// `member_task_id`, `rejected` for a `rejected` answer and `failed` otherwise. The door saw
+    /// one bearer token and the stamped provenance.
     #[tokio::test(flavor = "multi_thread")]
     async fn call_member_refusals_fail_in_the_same_turn() {
         let answers: Vec<(&'static str, String, &'static str, &'static str)> = vec![
@@ -20209,12 +20292,8 @@ mod member_call_tests {
             ),
             (
                 "200 OK",
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                    "id": "tsk_busy", "contextId": "ctx", "status": {"state": "rejected",
-                    "message": {"messageId": "m", "role": "agent",
-                                "parts": [{"text": "task rejected: capsule is busy"}]}}}})
-                .to_string(),
-                "rejected: task rejected: capsule is busy",
+                rejected(crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE).1,
+                "worker did not take the task: the session is closing",
                 "rejected",
             ),
             (
@@ -20229,7 +20308,7 @@ mod member_call_tests {
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
                     "id": "tsk_r", "contextId": "ctx", "status": {"state": "rejected"}}})
                 .to_string(),
-                "answered the task rejected",
+                "\"output\":\"worker did not take the task\"",
                 "rejected",
             ),
         ];
@@ -20251,14 +20330,32 @@ mod member_call_tests {
             let data = result.data.as_deref().unwrap();
             assert!(data.contains(expected), "{expected}: {data}");
             assert!(
+                data.contains(&format!("\"status\":\"{recorded}\"")),
+                "{recorded}: {data}"
+            );
+            assert!(!data.contains("answered the task rejected"), "{data}");
+            assert!(
                 data.starts_with("<untrusted-content source=tool:call-member>"),
                 "{data}"
             );
             assert!(!data.contains(&port.to_string()), "{data}");
             assert!(!data.contains("mft1."), "{data}");
-            assert_eq!(state.member_calls.as_ref().unwrap().counts(), (0, 0));
+            let calls = state.member_calls.as_ref().unwrap();
+            assert_eq!(calls.counts(), (0, 0));
 
             let lines = trace_lines(dir.path());
+            let call_id = lines[0]["call_id"].as_str().unwrap();
+            let status = calls.unanswered()[0].2;
+            assert_eq!(status.as_str(), recorded);
+            assert_eq!(
+                calls.unanswered(),
+                vec![(call_id.to_string(), "worker".to_string(), status)]
+            );
+            let (_, note) = data.split_once("</untrusted-content>\n").unwrap();
+            assert_eq!(
+                note,
+                crate::member_call::no_answer_note("worker", call_id, status)
+            );
             assert_eq!(lines.len(), 1, "{lines:?}");
             assert_eq!(lines[0]["event_type"], "member_call");
             assert_eq!(lines[0]["status"], recorded, "{expected}");
@@ -20301,22 +20398,19 @@ mod member_call_tests {
         }
     }
 
-    /// A busy door's `rejected` answer is recorded `rejected` and a JSON-RPC error `failed`, each
-    /// never held and delivered; the model reads the same failed result for both.
+    /// A closing door's `rejected` answer is recorded `rejected` and a JSON-RPC error `failed`,
+    /// each never held and delivered; the model reads each status as recorded, with the no-answer
+    /// note.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_member_call_a_busy_door_rejected_is_recorded_rejected_not_failed() {
-        let busy = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-            "id": "tsk_busy", "contextId": "ctx", "status": {"state": "rejected",
-            "message": {"messageId": "m", "role": "agent",
-                        "parts": [{"text": "task rejected: capsule is busy"}]}}}})
-        .to_string();
+    async fn a_member_call_a_closing_door_rejected_is_recorded_rejected_not_failed() {
+        let closing = rejected(crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE).1;
         let error =
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"#;
         for (body, recorded, output) in [
             (
-                busy,
+                closing,
                 "rejected",
-                "worker answered the task rejected: task rejected: capsule is busy",
+                "worker did not take the task: the session is closing",
             ),
             (
                 error.to_string(),
@@ -20336,10 +20430,17 @@ mod member_call_tests {
                 .dispatch_call_member(call("worker", "add 2 and 2"))
                 .await
                 .unwrap();
-            assert!(note.is_none());
             let lines = trace_lines(dir.path());
             assert_eq!(lines.len(), 1, "{lines:?}");
             let line = &lines[0];
+            assert_eq!(
+                note.unwrap(),
+                format!(
+                    "[call-member] Call {} to worker ended {recorded}, with no answer from \
+                     worker. Do not present an answer of your own as worker's.",
+                    line["call_id"].as_str().unwrap()
+                )
+            );
             assert_eq!(line["event_type"], "member_call");
             assert_eq!(line["status"], recorded);
             assert!(line.get("member_task_id").is_none(), "{line}");
@@ -20347,12 +20448,15 @@ mod member_call_tests {
             assert_eq!(line["output"], output);
 
             assert_eq!(result.status, murmur::tool::run::Status::Failed);
-            assert_eq!(result.summary.as_deref(), Some("Called worker: failed"));
+            assert_eq!(
+                result.summary.unwrap(),
+                format!("Called worker: {recorded}")
+            );
             let data: serde_json::Value = serde_json::from_str(&result.data.unwrap()).unwrap();
             assert_eq!(
                 data,
                 serde_json::json!({"call_id": line["call_id"], "member": "worker",
-                                   "status": "failed", "output": output})
+                                   "status": recorded, "output": output})
             );
         }
     }
@@ -20501,6 +20605,7 @@ mod member_call_tests {
                 duration_ms: 1,
             }],
             &[],
+            &[],
         );
         let rewritten = build_continued_task_md("do it", &[], &[message], &[]);
         assert!(
@@ -20526,6 +20631,274 @@ mod member_call_tests {
                 "id": task_id, "contextId": "ctx", "status": {"state": "submitted"}}})
             .to_string(),
         )
+    }
+
+    /// The door's answer to `message/send`: it does not take the task, with `message`.
+    fn rejected(message: &str) -> (&'static str, String) {
+        (
+            "200 OK",
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "id": "tsk_refused", "contextId": "ctx", "status": {"state": "rejected",
+                "message": {"messageId": "m", "role": "agent", "parts": [{"text": message}]}}}})
+            .to_string(),
+        )
+    }
+
+    /// The door's answer to `message/send` when it has no room for the task.
+    fn busy() -> (&'static str, String) {
+        rejected(crate::a2a::REJECTED_BUSY_MESSAGE)
+    }
+
+    /// The JSON-RPC bodies a door received, parsed.
+    fn sent_bodies(seen: &Mutex<Vec<Seen>>) -> Vec<serde_json::Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|request| serde_json::from_str(&request.body).unwrap())
+            .collect()
+    }
+
+    /// A busy member's first refusal returns at once as `busy`, with the busy note; the runtime,
+    /// not the model, offers the same task again with a fresh request id until the member takes
+    /// it, and the call then runs as a started one does. Each refusal has its own
+    /// `member_call_busy` line, before the `member_call_start` written when the member took it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_offers_a_busy_member_the_task_again_until_it_takes_it() {
+        let (port, seen) = stand_in_door(vec![
+            busy(),
+            busy(),
+            held("tsk_w"),
+            completed("tsk_w", "four"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let began = std::time::Instant::now();
+        let outcome = state
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "add 2 and 2"), None)
+            .await
+            .unwrap();
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(900),
+            "a busy call waited before returning"
+        );
+        let result = &outcome.result;
+        assert_eq!(result.status, murmur::tool::run::Status::Passed);
+        let busy_lines = events(dir.path(), "member_call_busy");
+        assert_eq!(busy_lines.len(), 1, "{busy_lines:?}");
+        let call_id = busy_lines[0]["call_id"].as_str().unwrap().to_string();
+        let data = serde_json::json!({
+            "call_id": call_id,
+            "member": "worker",
+            "status": "busy",
+            "output": "worker is busy with other work and did not take the task",
+        })
+        .to_string();
+        assert_eq!(
+            result.data.as_deref().unwrap(),
+            format!(
+                "{}\n{}",
+                crate::fence::wrap_untrusted("tool:call-member", &data),
+                crate::member_call::busy_note(
+                    "worker",
+                    &call_id,
+                    std::time::Duration::from_secs(60)
+                )
+            )
+        );
+        let calls = state.member_calls.clone().unwrap();
+        assert_eq!(calls.counts(), (1, 0));
+        assert_eq!(
+            calls.outstanding(),
+            vec![(call_id.clone(), "worker".to_string())]
+        );
+        let Err(refused) = state
+            .dispatch_agent_tool_async(MEMBER_CALL_TOOL, call("worker", "again"), None)
+            .await
+        else {
+            panic!("a second call to a member waiting for room was dispatched");
+        };
+        assert_eq!(
+            refused,
+            crate::member_call::PendingCall {
+                member: "worker".to_string(),
+                call_id: call_id.clone(),
+                arrived: false,
+            }
+            .refusal()
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), calls.wait_for_outcome())
+            .await
+            .unwrap();
+        let arrived = calls.take_arrived();
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(
+            arrived[0].status,
+            crate::member_call::MemberCallStatus::Completed
+        );
+        assert_eq!(arrived[0].member_task_id.as_deref(), Some("tsk_w"));
+        assert_eq!(arrived[0].output, "four");
+        assert!(calls.unanswered().is_empty());
+
+        let lines = trace_lines(dir.path());
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| line["event_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["member_call_busy", "member_call_busy", "member_call_start"]
+        );
+        for (offer, line) in lines[..2].iter().enumerate() {
+            assert_eq!(line["call_id"], call_id.as_str());
+            assert_eq!(line["member"], "worker");
+            assert_eq!(line["task_id"], "tsk_caller");
+            assert_eq!(line["offer"], offer + 1);
+            assert_eq!(line["message"], "task rejected: capsule is busy");
+            assert!(line["waited_ms"].is_u64());
+        }
+        assert!(
+            lines[1]["waited_ms"].as_u64().unwrap() >= 1000,
+            "{:?}",
+            lines[1]
+        );
+        assert_eq!(lines[2]["call_id"], call_id.as_str());
+        assert_eq!(lines[2]["member_task_id"], "tsk_w");
+
+        assert_eq!(sent_tasks(&seen), ["add 2 and 2"; 3]);
+        let bodies = sent_bodies(&seen);
+        let offers: Vec<&serde_json::Value> = bodies
+            .iter()
+            .filter(|body| body["method"] == "message/send")
+            .collect();
+        let ids: std::collections::HashSet<String> =
+            offers.iter().map(|body| body["id"].to_string()).collect();
+        assert_eq!(ids.len(), 3, "{offers:?}");
+        for body in &offers {
+            assert_eq!(
+                body["params"]["message"]["messageId"],
+                format!("msg_{call_id}")
+            );
+        }
+        let seen = seen.lock().unwrap();
+        for request in seen.iter() {
+            let bearer: Vec<&str> = request
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "authorization")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(bearer.len(), 1);
+            assert!(bearer[0].starts_with("Bearer mft1."));
+        }
+    }
+
+    /// A member busy for the call's whole deadline is offered the task until then and never
+    /// after, each refusal its own `member_call_busy`, and the call ends `rejected`, never held,
+    /// saying it stayed busy and how many times it was offered the task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_member_ends_rejected_when_the_member_stays_busy_past_the_deadline() {
+        let (port, seen) = stand_in_door(std::iter::repeat_with(busy).take(10).collect());
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state_bounded(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+            std::time::Duration::from_secs(4),
+        )
+        .await;
+        let (result, note) = state
+            .dispatch_call_member(call("worker", "add 2 and 2"))
+            .await
+            .unwrap();
+        assert_eq!(result.summary.as_deref(), Some("Called worker: busy"));
+        assert!(note.unwrap().contains("for up to 4s"));
+        let calls = state.member_calls.clone().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), calls.wait_for_outcome())
+            .await
+            .unwrap();
+        let arrived = calls.take_arrived();
+        assert_eq!(arrived.len(), 1);
+        let ended = &arrived[0];
+        assert_eq!(ended.status, crate::member_call::MemberCallStatus::Rejected);
+        assert_eq!(ended.member_task_id, None);
+        assert!(ended.duration_ms >= 4000, "{ended:?}");
+        // Offers at 0s, about 1s and about 3s; the next would come after the 4s deadline.
+        assert_eq!(
+            ended.output,
+            "worker stayed busy with other work for the whole 4s this call may wait and never took the task; it was offered the task 3 times. Nothing was done on it."
+        );
+        assert_eq!(
+            calls.unanswered(),
+            vec![(
+                ended.call_id.clone(),
+                "worker".to_string(),
+                crate::member_call::MemberCallStatus::Rejected
+            )]
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(
+            sent_tasks(&seen).len(),
+            3,
+            "an offer was sent after the deadline"
+        );
+        let busy_lines = events(dir.path(), "member_call_busy");
+        let offers: Vec<u64> = busy_lines
+            .iter()
+            .map(|line| line["offer"].as_u64().unwrap())
+            .collect();
+        assert_eq!(offers, [1, 2, 3]);
+        assert!(busy_lines
+            .iter()
+            .all(|line| line["waited_ms"].as_u64().unwrap() < 4000));
+        assert!(events(dir.path(), "member_call_start").is_empty());
+    }
+
+    /// A call still waiting for room when its task ends is abandoned as never handed over, and
+    /// its watcher sends no further offer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_waiting_for_room_is_abandoned_without_another_offer() {
+        let (port, seen) = stand_in_door(vec![busy(), busy(), held("tsk_w")]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let (result, _) = state
+            .dispatch_call_member(call("worker", "add 2 and 2"))
+            .await
+            .unwrap();
+        assert_eq!(result.summary.as_deref(), Some("Called worker: busy"));
+        let calls = state.member_calls.clone().unwrap();
+        let left = calls.account_for_all();
+        assert!(left.undelivered.is_empty());
+        assert_eq!(left.abandoned.len(), 1);
+        let abandoned = &left.abandoned[0];
+        assert_eq!(
+            abandoned.status,
+            crate::member_call::MemberCallStatus::Abandoned
+        );
+        assert_eq!(abandoned.member_task_id, None);
+        assert_eq!(
+            abandoned.output,
+            "the calling task ended before worker took the task; worker was busy and was never handed it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        assert_eq!(
+            sent_tasks(&seen).len(),
+            1,
+            "an abandoned call was offered again"
+        );
+        assert_eq!(events(dir.path(), "member_call_busy").len(), 1);
+        assert!(events(dir.path(), "member_call_start").is_empty());
+        assert_eq!(calls.counts(), (0, 0));
     }
 
     /// The door's answer to `tasks/get`: the task completed with `text`.
@@ -20610,7 +20983,8 @@ mod member_call_tests {
         assert_eq!(outcome.runtime_note, None);
     }
 
-    /// A call that did not start, and a call refused before anything was sent, carry no note.
+    /// A call that did not start carries the no-answer note and no started call note; a call
+    /// refused before anything was sent carries neither.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_or_refused_call_carries_no_started_call_note() {
         let (port, _seen) = stand_in_door(vec![(
@@ -20630,7 +21004,15 @@ mod member_call_tests {
             .unwrap();
         assert_eq!(failed.result.status, murmur::tool::run::Status::Failed);
         let data = failed.result.data.unwrap();
-        assert!(data.ends_with("</untrusted-content>"), "{data}");
+        let (_, note) = data.split_once("</untrusted-content>\n").unwrap();
+        assert!(note.starts_with("[call-member] Call mcl_"), "{data}");
+        assert!(
+            note.ends_with(
+                " to worker ended failed, with no answer from worker. Do not present an answer \
+                 of your own as worker's."
+            ),
+            "{data}"
+        );
         assert!(!data.contains("is now working on call"), "{data}");
 
         let Err(refused) = state
@@ -20704,7 +21086,7 @@ mod member_call_tests {
             .await
             .unwrap();
         assert_eq!(failed.status, murmur::tool::run::Status::Failed);
-        assert!(note.is_none());
+        assert!(note.unwrap().contains("with no answer from worker"));
         let (started, note) = state
             .dispatch_call_member(call("worker", "second"))
             .await

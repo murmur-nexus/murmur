@@ -1659,7 +1659,8 @@ impl DelegationStartEvent {
     }
 }
 
-/// A `call-member` call whose callee holds the task, written as the tool call returns.
+/// A `call-member` call whose callee holds the task, written as the tool call returns — or later,
+/// by the call's watcher, when a callee that was busy takes the task.
 ///
 /// Carries the callee's roster name and the id of the task its door holds, never its door's URL
 /// or the token the call presented.
@@ -1678,6 +1679,32 @@ struct MemberCallStartEvent {
     member: String,
     /// The task the callee's door holds, as its `tasks/get` names it.
     member_task_id: String,
+}
+
+/// One offer of a `call-member` call that the callee's door turned away busy: it answered
+/// `message/send` with `rejected` and [`crate::a2a::REJECTED_BUSY_MESSAGE`]. The first is written
+/// as the tool call returns, each later one by the call's watcher as it offers the task again.
+///
+/// Carries the callee's roster name, never its door's URL or the token the call presented.
+#[derive(Serialize)]
+struct MemberCallBusyEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The calling task.
+    task_id: String,
+    /// The `mcl_` id the call returned to the model.
+    call_id: String,
+    /// The callee's roster name.
+    member: String,
+    /// Which offer of the call this was, from 1.
+    offer: u32,
+    /// From the tool call that made the call to this refusal.
+    waited_ms: u64,
+    /// The door's status message.
+    message: String,
 }
 
 /// One `call-member` call, written once it is accounted for: delivered to the calling task, or
@@ -3847,7 +3874,43 @@ impl ResourceTraceAppender {
         member: &str,
         member_task_id: &str,
     ) {
-        let event = MemberCallStartEvent {
+        let event = self.member_call_start(task_id, call_id, member, member_task_id);
+        self.append(&event).await;
+    }
+
+    /// [`Self::write_member_call_start`] when `admit`, run with the trace held, returns `true`;
+    /// returns what `admit` did. No other line lands between `admit` and this one.
+    pub(crate) async fn write_member_call_start_if(
+        &self,
+        task_id: &str,
+        call_id: &str,
+        member: &str,
+        member_task_id: &str,
+        admit: impl FnOnce() -> bool,
+    ) -> bool {
+        let event = self.member_call_start(task_id, call_id, member, member_task_id);
+        let Ok(mut line) = serde_json::to_string(&event) else {
+            return admit();
+        };
+        line.push('\n');
+        let mut file = self.file.lock().await;
+        if !admit() {
+            return false;
+        }
+        if file.write_all(line.as_bytes()).await.is_ok() {
+            let _ = file.flush().await;
+        }
+        true
+    }
+
+    fn member_call_start(
+        &self,
+        task_id: &str,
+        call_id: &str,
+        member: &str,
+        member_task_id: &str,
+    ) -> MemberCallStartEvent {
+        MemberCallStartEvent {
             event_type: "member_call_start",
             event_id: new_event_id(),
             parent_id: Some(self.session_event_id.clone()),
@@ -3857,6 +3920,32 @@ impl ResourceTraceAppender {
             call_id: call_id.to_string(),
             member: member.to_string(),
             member_task_id: member_task_id.to_string(),
+        }
+    }
+
+    /// Records the `offer`th offer of a `call-member` call turned away busy, `waited_ms` after the
+    /// call was made, with the door's status `message`.
+    pub(crate) async fn write_member_call_busy(
+        &self,
+        task_id: &str,
+        call_id: &str,
+        member: &str,
+        offer: u32,
+        waited_ms: u64,
+        message: &str,
+    ) {
+        let event = MemberCallBusyEvent {
+            event_type: "member_call_busy",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            call_id: call_id.to_string(),
+            member: member.to_string(),
+            offer,
+            waited_ms,
+            message: message.to_string(),
         };
         self.append(&event).await;
     }
