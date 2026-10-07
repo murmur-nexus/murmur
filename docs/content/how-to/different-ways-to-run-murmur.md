@@ -318,7 +318,7 @@ A manifest that declares nothing is never gated by this check — the effective 
 | `mur run --task task.md` | Human-readable: URL and session ID at port bind, `status:` when the session ends |
 | `--task <text>` | An argument that is not an existing file path is written to `task.md` verbatim |
 | `mur run -v` | Adds `workdir:`, `manifest:`, `driver:`, and `skills:` to the startup lines |
-| `mur run --json` | One JSON line at port bind carrying `url`, `pid`, `session_id`, `name`, `version`, `workdir`, and `tokens` when the capsule declares `network.authentication` |
+| `mur run --json` | One JSON line at port bind carrying `url`, `pid`, `session_id`, `name`, `version`, `workdir`, and `"auth": "bearer"` when the capsule declares `network.authentication`. No token: read one with [`mur token`](../reference/cli.md#mur-token) |
 | `--json` with `-v` | `--json` wins; no human-readable output is produced |
 | Launch failure with `--json` | Empty stdout, error on stderr, non-zero exit |
 | `--bind 0.0.0.0` | Accepts connections from other machines; the printed `url` still reads `localhost:PORT`. Pair it with [`network.authentication`](../reference/agent-card.md#security) |

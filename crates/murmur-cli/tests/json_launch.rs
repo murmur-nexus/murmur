@@ -913,7 +913,7 @@ fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
 /// A capsule declaring `network.authentication` puts every token it minted on its readiness line,
 /// under `tokens`, and the operator token drives the door.
 #[test]
-fn door_tokens_are_on_the_readiness_line_of_an_authenticated_capsule() {
+fn an_authenticated_capsule_readiness_line_says_auth_and_carries_no_token() {
     use common::door_capsule::{
         agent_project, driver_home, end_turn, message, rpc, wait_completed, MurRun,
         AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
@@ -945,27 +945,23 @@ fn door_tokens_are_on_the_readiness_line_of_an_authenticated_capsule() {
     assert_eq!(
         keys,
         [
+            "auth",
             "name",
             "pid",
             "session_id",
-            "tokens",
             "url",
             "version",
             "workdir"
         ]
     );
-    let mut names: Vec<&str> = run.startup["tokens"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    names.sort_unstable();
-    assert_eq!(names, ["operator", "reader", "watcher"]);
-    for name in names {
-        assert!(run.token(name).starts_with("mdt1."), "{name}");
+    assert_eq!(run.startup["auth"], "bearer");
+    for line in &run.stdout_lines {
+        assert!(!line.contains("mdt1."), "a token reached stdout: {line}");
     }
 
+    for name in ["operator", "reader", "watcher"] {
+        assert!(run.token(name).starts_with("mdt1."), "{name}");
+    }
     let addr = run.url();
     let operator = run.token("operator");
     let sent = rpc(
@@ -983,6 +979,41 @@ fn door_tokens_are_on_the_readiness_line_of_an_authenticated_capsule() {
         !stderr.contains("mdt1."),
         "a token reached stderr:\n{stderr}"
     );
+}
+
+/// `--readiness-tokens` — what a parent runtime and `mur run --roster` pass on a pipe of their own
+/// — puts every token back on the readiness line, and they are the tokens the record holds.
+#[test]
+fn readiness_tokens_puts_every_token_on_the_readiness_line() {
+    use common::door_capsule::{
+        agent_project, driver_home, MurRun, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    };
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(
+        &server.endpoint,
+        CAPSULE_NAME,
+        "",
+        &format!("{QUEUE_SLEEP_YAML}{AUTHENTICATION_YAML}"),
+    );
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        true,
+        &["--readiness-tokens"],
+        &[],
+    );
+
+    assert_eq!(run.startup["auth"], "bearer");
+    let tokens = run.startup["tokens"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no tokens in {}", run.startup));
+    let mut names: Vec<&str> = tokens.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["operator", "reader", "watcher"]);
+    for name in names {
+        assert_eq!(tokens[name], run.token(name).as_str(), "{name}");
+    }
 }
 
 /// A capsule declaring nothing keeps the six keys it always had.

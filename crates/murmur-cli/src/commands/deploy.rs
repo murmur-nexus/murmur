@@ -1815,10 +1815,10 @@ pub(crate) fn run_deploy(
     );
     // The port is on the network now, whatever the capsule bound: say who may call it.
     multi.suspend(|| {
-        for line in door_lines(&runtime_manifest, &start_info, &public_url) {
+        for line in door_lines(&runtime_manifest, &start_info, &public_url, ssh_user, host) {
             match line {
                 DoorLine::Warning(warning) => capsule_runtime::report_eprintln!("{warning}"),
-                DoorLine::Token(token) => capsule_runtime::report_println!("{token}"),
+                DoorLine::TokenHint(hint) => capsule_runtime::report_println!("{hint}"),
             }
         }
     });
@@ -1881,20 +1881,23 @@ pub(crate) fn run_deploy(
 enum DoorLine {
     /// `W-SEC-032`, for stderr.
     Warning(String),
-    /// `token <name> <value>`, for stdout.
-    Token(String),
+    /// The `door: bearer — …` line naming the command that reads a token on the target, for stdout.
+    TokenHint(String),
 }
 
 /// What `mur deploy` says about who may call the capsule it published at `public_url`.
 ///
 /// A manifest without `network.authentication` is `W-SEC-032`, since deploy publishes the
 /// loopback-bound port through DNAT and no bind check ever sees it exposed. An authenticated one
-/// is one line per token on the remote `mur run --json` readiness line, operator first and the
-/// rest by name.
+/// is one line naming the `ssh … mur token` command that reads a token from the session's running
+/// record on the target: no token leaves the target. The session id comes off the remote readiness
+/// line; without one the command names none, which `mur token` reads as `@1`.
 fn door_lines(
     manifest: &RuntimeManifest,
     start_info: &serde_json::Value,
     public_url: &str,
+    ssh_user: &str,
+    host: &str,
 ) -> Vec<DoorLine> {
     if let Some(warning) = capsule_runtime::public_door_warning(
         manifest,
@@ -1902,21 +1905,18 @@ fn door_lines(
     ) {
         return vec![DoorLine::Warning(warning)];
     }
-    let Some(tokens) = start_info
-        .get("tokens")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Vec::new();
-    };
-    let mut names: Vec<&String> = tokens.keys().collect();
-    names.sort_by_key(|name| (name.as_str() != murmur_artifact::OPERATOR_CREDENTIAL, *name));
-    names
-        .into_iter()
-        .filter_map(|name| {
-            let token = tokens[name].as_str()?;
-            Some(DoorLine::Token(format!("token {name} {token}")))
-        })
-        .collect()
+    let mut command = format!("ssh {ssh_user}@{host} /usr/local/bin/mur token");
+    if let Some(session_id) = start_info
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        command.push(' ');
+        command.push_str(session_id);
+    }
+    vec![DoorLine::TokenHint(format!(
+        "door: bearer — read a token on the target: {command}"
+    ))]
 }
 
 #[cfg(test)]
@@ -3118,6 +3118,8 @@ mod tests {
             &door_manifest(""),
             &serde_json::json!({"url": "localhost:41873"}),
             "http://203.0.113.9:41873",
+            "root",
+            "203.0.113.9",
         );
         assert_eq!(lines.len(), 1);
         let DoorLine::Warning(warning) = &lines[0] else {
@@ -3135,22 +3137,62 @@ mod tests {
     }
 
     #[test]
-    fn door_lines_print_the_tokens_of_an_authenticated_door_operator_first() {
+    fn door_lines_name_the_command_that_reads_a_token_on_the_target() {
         let manifest = door_manifest(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
              watcher: {scopes: [tasks/get]}\n      auditor: {scopes: [tasks/get]}\n",
         );
+        // A remote `mur` that still printed tokens is never echoed.
         let start_info = serde_json::json!({
             "url": "localhost:41873",
-            "tokens": {"watcher": "mdt1.w.w", "auditor": "mdt1.a.a", "operator": "mdt1.o.o"},
+            "session_id": "ses_0199c4e2f1b7712a9d3e4f5061728394",
+            "auth": "bearer",
+            "tokens": {"watcher": "mdt1.w.w", "operator": "mdt1.o.o"},
         });
+        let lines = door_lines(
+            &manifest,
+            &start_info,
+            "http://203.0.113.9:41873",
+            "root",
+            "203.0.113.9",
+        );
         assert_eq!(
-            door_lines(&manifest, &start_info, "http://203.0.113.9:41873"),
-            vec![
-                DoorLine::Token("token operator mdt1.o.o".to_string()),
-                DoorLine::Token("token auditor mdt1.a.a".to_string()),
-                DoorLine::Token("token watcher mdt1.w.w".to_string()),
-            ]
+            lines,
+            vec![DoorLine::TokenHint(
+                "door: bearer — read a token on the target: ssh root@203.0.113.9 \
+                 /usr/local/bin/mur token ses_0199c4e2f1b7712a9d3e4f5061728394"
+                    .to_string()
+            )]
+        );
+        assert!(!format!("{lines:?}").contains("mdt1."), "{lines:?}");
+    }
+
+    #[test]
+    fn door_lines_name_no_session_when_the_readiness_line_carries_none() {
+        let manifest = door_manifest("network:\n  authentication:\n    scheme: bearer\n");
+        assert_eq!(
+            door_lines(
+                &manifest,
+                &serde_json::json!({"url": "localhost:41873"}),
+                "http://203.0.113.9:41873",
+                "ubuntu",
+                "203.0.113.9",
+            ),
+            vec![DoorLine::TokenHint(
+                "door: bearer — read a token on the target: ssh ubuntu@203.0.113.9 \
+                 /usr/local/bin/mur token"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_start_script_never_asks_for_the_tokens() {
+        let script = build_start_script("/opt/murmur/dep_x", "/opt/murmur/dep_x/murmur.yaml");
+        assert!(script.contains(" --json "), "{script}");
+        assert!(
+            !script.contains(capsule_runtime::READINESS_TOKENS_FLAG),
+            "{script}"
         );
     }
 }

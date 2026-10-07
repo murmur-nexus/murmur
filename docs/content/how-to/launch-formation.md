@@ -254,7 +254,7 @@ formation: frm_01a1100295f47ea3b227ddf4612759f3
   entry  lead    starting
 …
 murmur: url localhost:42759
-…
+murmur: auth bearer (mur token ses_01a11002984c7bd0ad3a7b1927d94d5d)
 session: ses_01a11002984c7bd0ad3a7b1927d94d5d
 status:  ok
 [worker] [capsule-runtime] formation lifeline closed — the formation has ended; cancelling live tasks and ending the session
@@ -274,11 +274,12 @@ The launcher starts `worker` first, waits for its door, and only then starts `le
 | `peer   worker …` | `worker` is ready: its process id, its session id, and the door that answered as that session |
 | `workdir …` | `worker`'s own directory, under `~/.murmur/formations/<frm_id>/worker`. Its sessions are under it |
 | `entry  lead    starting` | Every peer is ready, and `lead` is starting with the task |
-| `murmur: url`, `session:` | `lead`'s own startup lines: its door and its session id. `lead` works in `crew`, and its sessions are under `crew/.murmur` |
+| `murmur: url`, `murmur: auth`, `session:` | `lead`'s own startup lines: its door, that the door requires a token, and its session id. `lead` works in `crew`, and its sessions are under `crew/.murmur` |
 | `status:  ok` | `lead`'s task ended `ok` |
 | `[worker] … formation lifeline closed …` | `worker` saw the formation end and wound down |
 
-`lead` also prints the operator token for its own door, because its door requires authentication.
+No member prints a door token. While `lead` runs, `mur token <lead's session id>` prints the
+operator token for its door — see [`mur token`](../reference/cli.md#mur-token).
 A peer that does not come up within 180 seconds refuses the whole launch, and `lead` never starts.
 See [Readiness](../reference/roster.md#launch-readiness) and
 [Member directories](../reference/roster.md#member-directories).

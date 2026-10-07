@@ -51,6 +51,7 @@ use commands::{
     run_roster::{run_roster, RosterLaunch},
     search::run_search,
     stop::run_stop,
+    token::run_token,
     trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
     watch::run_watch,
 };
@@ -291,6 +292,7 @@ enum Commands {
                 "workdir",
                 "bind",
                 "explain_scope",
+                "readiness_tokens",
             ]
         )]
         roster: Option<PathBuf>,
@@ -371,10 +373,18 @@ enum Commands {
         workdir: Option<std::path::PathBuf>,
 
         /// Emit launch info as a single JSON line instead of human-readable output.
-        /// Output shape: {"url":"localhost:PORT","pid":N,"session_id":"uuid","name":"...","version":"...","workdir":"/path"}
+        /// Output shape: {"url":"localhost:PORT","pid":N,"session_id":"uuid","name":"...","version":"...","workdir":"/path"},
+        /// plus "auth":"bearer" for a door declaring network.authentication.
         /// When both --json and --verbose are set, --json takes precedence and no human output is produced.
         #[arg(long)]
         json: bool,
+
+        /// Put every door token the session minted on the --json readiness line, under "tokens".
+        /// Set by a parent capsule's runtime when it launches a delegated child, and by
+        /// `mur run --roster` on every peer: both read the readiness line on a pipe nothing else
+        /// holds. Anything a person reads gets `mur token` instead.
+        #[arg(long, hide = true, requires = "json")]
+        readiness_tokens: bool,
 
         /// Print extended startup info: workdir, manifest identity, driver, and installed skills.
         /// Session ID is always shown at startup regardless of this flag.
@@ -454,6 +464,16 @@ enum Commands {
     },
     /// List the capsules running on this machine
     Ps,
+    /// Print a door token of a running capsule
+    Token {
+        /// Running session: @1, a ses_ id, or a 4-character suffix of one (default: @1)
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// The credential whose token to print: operator, or a name the capsule's
+        /// network.authentication.credentials declares
+        #[arg(long, value_name = "NAME", default_value = murmur_artifact::OPERATOR_CREDENTIAL)]
+        credential: String,
+    },
     /// Stop one running capsule, or a whole formation, ending everything it still holds
     Stop {
         /// Running session to stop: @1, a ses_ id, or a 4-character suffix of one; or a formation id (frm_…) to stop every member
@@ -692,6 +712,7 @@ fn main() {
             lifecycle_after_task,
             workdir,
             json,
+            readiness_tokens,
             verbose,
             bind,
             no_env_file,
@@ -714,6 +735,7 @@ fn main() {
             lifecycle_after_task.as_deref(),
             workdir,
             json,
+            readiness_tokens,
             verbose,
             &bind,
             no_env_file,
@@ -793,6 +815,10 @@ fn main() {
             .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
         Commands::Control { command } => run_control(command),
         Commands::Ps => run_ps(),
+        Commands::Token {
+            session,
+            credential,
+        } => run_token(session.as_deref(), &credential),
         Commands::Stop { session, timeout } => run_stop(&session, timeout),
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Deploy { command } => {

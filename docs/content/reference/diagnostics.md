@@ -112,6 +112,8 @@ section that explains it.
 | `E-RUN-045` | A formation member did not come up, so `mur run --roster` launched nothing and stopped every member it had started | [E-RUN-045](#e-run-045) |
 | `E-RUN-046` | `mur run --roster` was run inside a formation member, a member's formation channel cannot be read, `MURMUR_FORMATION_PEERS` is set in `mur run`'s environment, or `MURMUR_FORMATION_LIFELINE` does not name this member's lifeline | [E-RUN-046](#e-run-046) |
 | `E-RUN-047` | An installed capsule's bytes no longer hash to the sha256 roster admission bound its member to | [E-RUN-047](#e-run-047) |
+| `E-RUN-048` | `mur token` named a session whose door is public, which minted no token | [E-RUN-048](#e-run-048) |
+| `E-RUN-049` | `mur token --credential` named a credential the session did not mint | [E-RUN-049](#e-run-049) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -1022,6 +1024,31 @@ error[E-RUN-047]: capsule 'coder@1.2.0' resolved to bytes with sha256 7bec909458
 
 Under `mur run --roster` it reaches the operator inside [`E-RUN-045`](#e-run-045), quoted from the
 member's stderr. Launching again admits what is installed now.
+
+### E-RUN-048 — the session's door is public { #e-run-048 }
+
+[`mur token`](cli.md#mur-token) named a running session whose capsule declares no
+[`network.authentication`](manifest.md#field-network-authentication). Its door takes no token, so
+none was minted:
+
+```text
+error[E-RUN-048]: ses_019f01a940ce7761854e768ecbe3d399 has a public door: its capsule declares no network.authentication, so it minted no token
+```
+
+Call the door without one, or check that the address names the session you meant: `@1` is the most
+recent running session on the machine, whichever capsule it is.
+
+### E-RUN-049 — the session minted no such credential { #e-run-049 }
+
+`mur token --credential` named a credential the session's manifest does not declare. The message
+lists every name it did mint, `operator` first:
+
+```text
+error[E-RUN-049]: ses_019f01a940ce7761854e768ecbe3d399 minted no credential 'admin'; it has: operator, reader, watcher
+```
+
+Pass one of the listed names. A credential added to `network.authentication.credentials` after
+launch is minted by the next launch, not this one.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -2744,13 +2771,15 @@ declaring `capabilities.shell.allow` on a capsule that runs no commands.
 stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL it announces: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/reference/diagnostics/#w-sec-023)
+[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL it announces — and `mur token` cannot read the tokens of an authenticated door: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/reference/diagnostics/#w-sec-023)
 ```
 
 **Why it matters:** the record is what lets [`mur watch`](cli.md#mur-watch) and
 [`mur cancel`](cli.md#mur-cancel) name this session from a terminal that never saw its URL. Without
 one, the address `mur run` printed is the only way back to the capsule, and it is gone as soon as
-that terminal is.
+that terminal is. It is also where [`mur token`](cli.md#mur-token) reads a token: a capsule declaring
+`network.authentication` whose record was not written has no token anyone can read, so its door
+refuses every caller.
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The capsule binds
 its port, serves its door and runs its tasks exactly as it would have.

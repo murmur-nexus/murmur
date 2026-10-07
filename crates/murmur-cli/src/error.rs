@@ -85,6 +85,8 @@ pub const E_RUN_044: &str = "E-RUN-044"; // MURMUR_FORMATION_ID is set to someth
 pub const E_RUN_045: &str = "E-RUN-045"; // a formation member did not come up, so the formation was not launched
 pub const E_RUN_046: &str = "E-RUN-046"; // a formation member tried to launch a formation, its formation channel or MURMUR_FORMATION_LIFELINE is unreadable, or MURMUR_FORMATION_PEERS is in the process environment
 pub const E_RUN_047: &str = "E-RUN-047"; // the capsule's bytes hash differently from the sha256 admission bound it to
+pub const E_RUN_048: &str = "E-RUN-048"; // `mur token` named a session whose door is public, which minted no token
+pub const E_RUN_049: &str = "E-RUN-049"; // `mur token --credential` named a credential the session did not mint
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
