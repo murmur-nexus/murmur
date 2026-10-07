@@ -1182,7 +1182,8 @@ mod tests {
         }
     }
 
-    const S5A_WARNING: &str = "warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' \
+    const TEN_CALLERS_WARNING: &str =
+        "warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' \
         (w01, w02, w03, w04, w05, w06, w07, w08, w09, w10), but it holds 2 tasks at once — one \
         running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full is \
         rejected; lifecycle.queue_depth: 9 would hold them all \
@@ -1235,8 +1236,8 @@ mod tests {
         "w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10",
     ];
 
-    /// S5a's shape: `lead` calls ten workers, each worker calls `reviewer`.
-    fn s5a_shaped(reviewer_lifecycle: &str) -> (tempfile::TempDir, AdmittedRoster) {
+    /// `lead` calls ten workers, and every worker calls `reviewer`.
+    fn ten_workers_one_reviewer(reviewer_lifecycle: &str) -> (tempfile::TempDir, AdmittedRoster) {
         let mut members = vec![("lead", "")];
         members.extend(WORKERS.iter().map(|worker| (*worker, QUEUE_DEPTH_1)));
         members.push(("reviewer", reviewer_lifecycle));
@@ -1246,8 +1247,8 @@ mod tests {
     }
 
     #[test]
-    fn s5a_ten_callers_overflow_a_reviewer_at_depth_one() {
-        let (_dir, admitted) = s5a_shaped(QUEUE_DEPTH_1);
+    fn ten_callers_overflow_a_reviewer_at_depth_one() {
+        let (_dir, admitted) = ten_workers_one_reviewer(QUEUE_DEPTH_1);
         assert_eq!(
             admitted.caller_overflows(),
             [CallerOverflow {
@@ -1264,10 +1265,10 @@ mod tests {
     }
 
     #[test]
-    fn s5a_the_warning_line_is_exact() {
-        let (_dir, admitted) = s5a_shaped(QUEUE_DEPTH_1);
+    fn the_ten_callers_warning_line_is_exact() {
+        let (_dir, admitted) = ten_workers_one_reviewer(QUEUE_DEPTH_1);
         let overflows = admitted.caller_overflows();
-        assert_eq!(caller_overflow_warning(&overflows[0]), S5A_WARNING);
+        assert_eq!(caller_overflow_warning(&overflows[0]), TEN_CALLERS_WARNING);
         assert_eq!(
             caller_overflow_fix(&overflows[0]),
             "reviewer (reviewer@1.0.0): set lifecycle.queue_depth: 9 in its murmur.yaml so all 10 \
@@ -1279,7 +1280,7 @@ mod tests {
     #[test]
     fn a_reviewer_deep_enough_for_every_caller_does_not_overflow() {
         for depth in [9, 10] {
-            let (_dir, admitted) = s5a_shaped(&queue_at(depth));
+            let (_dir, admitted) = ten_workers_one_reviewer(&queue_at(depth));
             assert!(
                 admitted.caller_overflows().is_empty(),
                 "depth {depth} holds all ten callers"

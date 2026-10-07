@@ -1858,6 +1858,8 @@ entry member's own task. The caller, as a callee, then needs
 `reachability: all` never pairs a member with the entry member as its callee, so it never raises
 this code.
 
+---
+
 ## Roster warnings
 
 [`mur run --roster`](cli.md#mur-run-roster) prints these on stderr after admitting the roster and
@@ -1872,8 +1874,9 @@ warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' (w01, w02, w03, 
 ```
 
 A member holds a fixed number of tasks at once, set by its own
-[`lifecycle`](manifest.md#field-lifecycle). A call that arrives while it holds that many ends
-`rejected` at once, and the calling member's `call-member` returns `rejected`.
+[`lifecycle`](manifest.md#field-lifecycle). A call that arrives while it holds that many is
+rejected at once: the calling member's [`call-member`](runtime-provided-tools.md#call-member)
+returns `failed`, and the caller's trace records the call as `rejected`.
 
 | `lifecycle.task_acceptance` | Tasks held at once |
 |---|---|
