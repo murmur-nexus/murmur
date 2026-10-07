@@ -457,6 +457,50 @@ fn show_exits_zero_and_covers_all_metric_categories() {
         .stdout(predicate::str::contains("no"));
 }
 
+/// The Turns section counts the continuations that delivered handed-off work, directly under
+/// its `count:` line, and says nothing of them in a trace that has none.
+#[test]
+fn show_counts_the_continuations_that_delivered_outcomes() {
+    let tmp = TempDir::new().unwrap();
+    let call_ids: Vec<String> = (1..=10).map(|n| format!("\"mcl_{n}\"")).collect();
+    let continued = format!(
+        "{{\"event_type\":\"task_continued\",\"session_id\":\"ses_aaaaaaaaaaaa4aaa8aaa000000000001\",\
+         \"timestamp\":1350,\"task_id\":\"tsk_1\",\"continuation_number\":1,\"member_calls\":[{}],\
+         \"delegations\":[],\"waited_ms\":19200,\"turns_remaining\":8}}\n",
+        call_ids.join(",")
+    );
+    let (head, tail) = FIXTURE_A.split_at(FIXTURE_A.find("{\"event_type\":\"inference\",\"session_id\":\"ses_aaaaaaaaaaaa4aaa8aaa000000000001\",\"timestamp\":1400").unwrap());
+    let path = write_fixture(
+        tmp.path(),
+        "trace-continued.jsonl",
+        &format!("{head}{continued}{tail}"),
+    );
+    let output = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let count = lines
+        .iter()
+        .position(|line| line.starts_with("count:      2  (max: 10)"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert_eq!(
+        lines[count + 1],
+        "continued:  1  (10 member answer(s), 0 delegation outcome(s))",
+        "{stdout}"
+    );
+
+    let plain = write_fixture(tmp.path(), "trace-a.jsonl", FIXTURE_A);
+    mur()
+        .args(["trace", "show", plain.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("count:      2  (max: 10)"))
+        .stdout(predicate::str::contains("continued:").not());
+}
+
 #[test]
 fn show_includes_tokens_per_turn_average() {
     let tmp = TempDir::new().unwrap();

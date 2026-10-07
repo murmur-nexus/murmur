@@ -1180,6 +1180,32 @@ struct TaskReopenedEvent {
     turns_remaining: u32,
 }
 
+/// A task continued once with everything it had handed off: its attempt ended with a turn left,
+/// it waited until no `call-member` call and no `delegate-task` delegation was outstanding, and
+/// the next attempt is handed every answer and outcome in one message. Written after that round's
+/// `member_call` and `delegation` lines and before the continued attempt's first `inference`.
+#[derive(Serialize)]
+struct TaskContinuedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: String,
+    /// 1-based ordinal of this continuation within the task, counted across reopens.
+    continuation_number: u32,
+    /// The `mcl_` id of every call whose outcome this continuation delivers, in arrival order.
+    member_calls: &'a [String],
+    /// The `dlg_` id of every delegation whose outcome this continuation delivers, arrived or
+    /// ended by the backstop, in id order.
+    delegations: &'a [String],
+    /// How long the task waited, from its attempt's end until nothing was outstanding.
+    waited_ms: u64,
+    /// The turns the continued attempt is handed: `inference.max_turns` less every turn the
+    /// task's attempts have spent so far.
+    turns_remaining: u32,
+}
+
 /// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
 /// because no call was made.
 #[derive(Serialize)]
@@ -2873,6 +2899,34 @@ impl TraceWriter {
             reason: reason.to_string(),
             reopen_number,
             attempt_context,
+            turns_remaining,
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that the task continues with one round of handed-off work's outcomes. Written by
+    /// the runtime's per-task loop once per continuation, before the continued attempt's first
+    /// `inference`. `continuation_number` is 1-based.
+    pub(crate) async fn write_task_continued(
+        &mut self,
+        task_id: &str,
+        continuation_number: u32,
+        member_calls: &[String],
+        delegations: &[String],
+        waited_ms: u64,
+        turns_remaining: u32,
+    ) -> std::io::Result<()> {
+        let event = TaskContinuedEvent {
+            event_type: "task_continued",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            continuation_number,
+            member_calls,
+            delegations,
+            waited_ms,
             turns_remaining,
         };
         self.write_event(&event).await
@@ -6119,6 +6173,46 @@ mod tests {
         assert_eq!(re["attempt_context"], "continued");
         assert_eq!(re["turns_remaining"], 7);
         assert!(re["timestamp"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn task_continued_names_the_round_under_the_task_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+            .await
+            .unwrap();
+        w.write_task_continued(
+            "tsk_1",
+            1,
+            &["mcl_b".to_string(), "mcl_a".to_string()],
+            &["dlg_1".to_string()],
+            1234,
+            8,
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let start = events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .unwrap();
+        let continued = events
+            .iter()
+            .find(|e| e["event_type"] == "task_continued")
+            .unwrap();
+        assert_eq!(continued["parent_id"], start["event_id"]);
+        assert_eq!(continued["task_id"], "tsk_1");
+        assert_eq!(continued["continuation_number"], 1);
+        assert_eq!(
+            continued["member_calls"],
+            serde_json::json!(["mcl_b", "mcl_a"])
+        );
+        assert_eq!(continued["delegations"], serde_json::json!(["dlg_1"]));
+        assert_eq!(continued["waited_ms"], 1234);
+        assert_eq!(continued["turns_remaining"], 8);
     }
 
     /// `task_turns()` reports the cumulative per-task turn count the reopen loop reads to

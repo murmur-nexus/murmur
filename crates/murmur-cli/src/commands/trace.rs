@@ -530,6 +530,25 @@ struct TaskReopenedEvent {
     turns_remaining: Option<u32>,
 }
 
+/// A task continued once with one round of handed-off work's outcomes: every `call-member`
+/// answer and `delegate-task` outcome, delivered once nothing the task handed off was outstanding.
+/// Every field defaults, so a line missing one still parses.
+#[derive(Debug, Deserialize)]
+struct TaskContinuedEvent {
+    /// 1-based ordinal of this continuation within its task.
+    #[serde(default)]
+    continuation_number: u32,
+    /// The `mcl_` id of every call whose outcome this continuation delivered.
+    #[serde(default)]
+    member_calls: Vec<String>,
+    /// The `dlg_` id of every delegation whose outcome this continuation delivered.
+    #[serde(default)]
+    delegations: Vec<String>,
+    /// How long the task waited for the round to end.
+    #[serde(default)]
+    waited_ms: u64,
+}
+
 /// What an `on-task-start` hook proposed as context and what the runtime did with it. One
 /// per task that had a seeding hook return something, including a rejection.
 #[derive(Debug, Deserialize)]
@@ -854,6 +873,7 @@ enum TraceEvent {
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
+    TaskContinued(TaskContinuedEvent),
     TaskCanceled(TaskCanceledEvent),
     TaskRejected(TaskRejectedEvent),
     TaskFailed(TaskFailedEvent),
@@ -1174,6 +1194,8 @@ struct TraceMetrics {
     failures: Vec<TaskFailedEvent>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
     reopens: Vec<ReopenRecord>,
+    /// Every `task_continued` record, in file order — one per round of handed-off work.
+    continuations: Vec<TaskContinuedEvent>,
     /// Every `context_seed` record, in file order — one per seeded task.
     context_seeds: Vec<ContextSeedRecord>,
     /// Every `call_denied` record, in file order — one per call a policy hook refused.
@@ -1781,6 +1803,7 @@ fn compute_metrics(
     let mut spawner_ended: Option<SpawnerEndedEvent> = None;
     let mut failures: Vec<TaskFailedEvent> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
+    let mut continuations: Vec<TaskContinuedEvent> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut denials: Vec<DenialRecord> = Vec::new();
     let mut protected_path_denials: Vec<ProtectedPathDenialRecord> = Vec::new();
@@ -1942,6 +1965,7 @@ fn compute_metrics(
                     turns_remaining: e.turns_remaining,
                 });
             }
+            TraceEvent::TaskContinued(e) => continuations.push(e),
             TraceEvent::ContextSeed(e) => {
                 context_seeds.push(ContextSeedRecord {
                     hook_name: e.hook_name,
@@ -2211,6 +2235,7 @@ fn compute_metrics(
             spawner_ended,
             failures,
             reopens,
+            continuations,
             context_seeds,
             denials,
             protected_path_denials,
@@ -2345,6 +2370,20 @@ fn fmt_thousands(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+/// The Turns section's `continued:` line: how many continuations delivered handed-off work's
+/// outcomes, and how many of each kind they delivered. `None` when none did.
+fn continued_line(continuations: &[TaskContinuedEvent]) -> Option<String> {
+    if continuations.is_empty() {
+        return None;
+    }
+    let answers: usize = continuations.iter().map(|c| c.member_calls.len()).sum();
+    let outcomes: usize = continuations.iter().map(|c| c.delegations.len()).sum();
+    Some(format!(
+        "continued:  {}  ({answers} member answer(s), {outcomes} delegation outcome(s))",
+        continuations.len()
+    ))
 }
 
 fn fmt_dur(ms: u64) -> String {
@@ -2557,6 +2596,9 @@ fn print_show(m: &TraceMetrics) {
 
     capsule_runtime::report_println!("── Turns ────────────────────────────────────────");
     capsule_runtime::report_println!("count:      {}  (max: {})", m.total_turns, m.max_turns);
+    if let Some(line) = continued_line(&m.continuations) {
+        capsule_runtime::report_println!("{line}");
+    }
     for line in failed_call_lines(&m.inference_records) {
         capsule_runtime::report_println!("{line}");
     }
@@ -3913,6 +3955,14 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                 .as_deref()
                 .map(|context| format!("  {context}"))
                 .unwrap_or_default()
+        ),
+        TraceEvent::TaskContinued(e) => format!(
+            "{}continuation {}  {} member answer(s)  {} delegation outcome(s)  waited {}",
+            kind("task_continued"),
+            e.continuation_number,
+            e.member_calls.len(),
+            e.delegations.len(),
+            fmt_dur(e.waited_ms)
         ),
         TraceEvent::TaskCanceled(e) => format!(
             "{}{}  {}",
@@ -5423,6 +5473,26 @@ mod tests {
             row(line),
             "tools_refreshed compaction  +aaa-late-skill  -old-tool  turn 3"
         );
+    }
+
+    /// A `task_continued` line parses into its own variant, and its row gives the continuation's
+    /// number, how many answers and outcomes it delivered, and how long the task waited. A line
+    /// missing every optional field still parses.
+    #[test]
+    fn task_continued_renders_a_steps_row() {
+        let line = r#"{"event_type":"task_continued","event_id":"evt_7","parent_id":"evt_2","session_id":"s","timestamp":7,"task_id":"tsk_1","continuation_number":1,"member_calls":["mcl_1","mcl_2","mcl_3"],"delegations":["dlg_1"],"waited_ms":12345,"turns_remaining":7}"#;
+        assert_eq!(
+            row(line),
+            "task_continued continuation 1  3 member answer(s)  1 delegation outcome(s)  waited \
+             12.3s"
+        );
+        let bare =
+            r#"{"event_type":"task_continued","event_id":"evt_8","session_id":"s","timestamp":8}"#;
+        let TraceEvent::TaskContinued(e) = serde_json::from_str::<TraceEvent>(bare).unwrap() else {
+            panic!("a task_continued line parses as TaskContinued");
+        };
+        assert!(e.member_calls.is_empty() && e.delegations.is_empty());
+        assert_eq!(e.waited_ms, 0);
     }
 
     /// A `tool_input_refused` line parses into its own variant, and its row names the tool and
