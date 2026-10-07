@@ -1890,10 +1890,13 @@ version = "0.5.0"
 dependencies = [
  "bytes",
  "http",
+ "proc-macro2",
+ "quote",
  "ring",
  "serde",
  "serde_json",
  "serde_yaml",
+ "syn 2.0.117",
  "tempfile",
  "thiserror",
  "url",

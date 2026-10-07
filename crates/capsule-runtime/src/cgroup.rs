@@ -1448,8 +1448,8 @@ pub fn skip_without_host_support(test_name: &str) -> bool {
         crate::runtime_err!(
             "[SKIP-HOST] {test_name}: this host cannot delegate a cgroup v2 scope, so a capsule \
              that can spawn native subprocesses refuses to launch with E-RUN-012 before anything \
-             this test observes happens -- see \
-             docs/content/reference/resource-limits-manual-verification.md"
+             this test observes happens -- see {}",
+            murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
         );
         return true;
     }
