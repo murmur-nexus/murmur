@@ -678,11 +678,10 @@ which containment class a tier achieves, that a zero limit value is rejected.
 
 [`crates/capsule-runtime/escape-conformance`](https://github.com/murmur-nexus/murmur/tree/main/crates/capsule-runtime/escape-conformance)
 drives a real capsule through a registry of escape probes and grades each verdict against what the
-declared class promises. It is its own workspace root, so build and run it from its own directory:
+declared class promises. Build it with `mur` and run it from the repository root:
 
 ```bash
-cd crates/capsule-runtime/escape-conformance
-cargo build --release
+cargo build --release -p murmur-cli -p escape-conformance
 ./target/release/escape-conformance --class sealed
 ```
 
@@ -691,7 +690,10 @@ cargo build --release
 remaining options.
 
 The run needs a built `mur` binary, `python3`, and a delegated cgroup v2 subtree — the harness wraps
-each capsule in `systemd-run --user --scope --property=Delegate=yes` by default to get one. It runs
+each capsule in `systemd-run --user --scope --property=Delegate=yes` by default to get one. The
+harness carries its own process driver, `escape-conformance-driver`, and installs it into each
+case's project with `mur install`, so nothing is installed from a registry and the run needs no
+model and no API key. It runs
 on bare metal: a host that cannot back the class under test, and a host that looks like a container,
 are both refused before the first case runs, and a refused run writes no record.
 
@@ -701,7 +703,7 @@ The exit code separates a refusal from a failure, and an escape from a ceiling t
 |---|---|---|
 | `0` | every asserted case matched its expected verdict | written |
 | `1` | usage error, or the harness itself could not proceed | none |
-| `2` | refused — this host cannot back the class, or a prerequisite is missing | none |
+| `2` | refused — this host cannot back the class, a prerequisite is missing, or no probe could run | none |
 | `3` | a boundary case failed — a containment escape | written |
 | `4` | boundary clean, a resource ceiling did not hold — denial of service | written |
 

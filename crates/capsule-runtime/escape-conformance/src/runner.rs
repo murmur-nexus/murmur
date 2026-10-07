@@ -12,14 +12,15 @@
 //!
 //! So each case launches a real capsule through the built `mur` binary, exactly as every existing
 //! manual-verification document in this repository does — but with `inference.transport: process`
-//! pointed at this package's own `probe-driver` binary instead of a subscription CLI. `mur run`
-//! stands up the Claude Bridge, advertises the capsule's `shell.allow` binaries over it, and
-//! spawns whatever `inference.command` names; `probe-driver` makes exactly one predetermined tool
-//! call and exits. Tool execution, capability enforcement and the trace are all murmur's, byte
-//! for byte the same path a live model would drive — only the *choice* of which tool to call is
-//! scripted rather than sampled.
+//! driven by this package's own process driver (`crate::driver_artifact`) and its `probe-driver`
+//! harness instead of a subscription CLI. `mur run` stands up the tool bridge, advertises the
+//! capsule's `shell.allow` binaries over it, and spawns `probe-driver` with the bridge and the
+//! case in its environment; `probe-driver` makes one or two predetermined tool calls and exits.
+//! Tool execution, capability enforcement and the trace are all murmur's, byte for byte the same
+//! path a live model would drive — only the *choice* of which tool to call is scripted rather than
+//! sampled.
 //!
-//! That is deliberate and it is what makes this a gate rather than a demonstration. A release
+//! That is what makes this a gate rather than a demonstration. A release
 //! gate whose verdicts depend on a model deciding to run the exact command it was asked to would
 //! be flaky in the one direction that matters: a case the model skipped would produce no
 //! evidence, and "no evidence" must never read as "contained". It also costs no API calls and
@@ -39,6 +40,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::cases::{Case, Evidence, Prepare, Profile};
+use crate::driver_artifact;
+use crate::harness_protocol::ProbeConfig;
 use crate::probe;
 use crate::verdict::{Expectation, Verdict};
 
@@ -48,6 +51,9 @@ pub struct RunnerConfig {
     pub mur: PathBuf,
     /// This package's `probe-driver`, named as `inference.command` in every generated manifest.
     pub probe_driver: PathBuf,
+    /// The `escape-conformance-driver` artifact `driver_artifact::build_artifact` packed for this
+    /// run, installed into every case's project store before its `mur run`.
+    pub driver_artifact: PathBuf,
     /// Root under which each case gets its own directory. Kept after the run: it holds the
     /// generated manifest, the probe source, `mur`'s stdout/stderr and the session trace, and the
     /// record points at it per case.
@@ -119,7 +125,9 @@ pub fn derive_interpreter_dirs(python: &str) -> Result<Vec<(String, bool)>, Stri
     // import; it is a subdirectory, but naming it explicitly keeps the grant legible.
     for base in [&stdlib, &platstdlib] {
         let dynload = format!("{base}/lib-dynload");
-        if !base.is_empty() && Path::new(&dynload).is_dir() && !dirs.iter().any(|(p, _)| p == &dynload)
+        if !base.is_empty()
+            && Path::new(&dynload).is_dir()
+            && !dirs.iter().any(|(p, _)| p == &dynload)
         {
             dirs.push((dynload, false));
         }
@@ -171,7 +179,27 @@ fn tight_resources_yaml() -> &'static str {
     \x20   workdir_max_bytes: 52428800        # 50 MiB\n"
 }
 
-/// The manifest one case runs under.
+/// A YAML scalar for `value`, JSON-quoted. JSON strings are YAML flow scalars, so a path with a
+/// space, a colon or a `#` reads back as itself.
+fn yaml_str(value: &str) -> String {
+    serde_json::to_string(value).expect("a string serializes")
+}
+
+/// What `probe-driver` is told about one case, through `inference.driver.config`.
+pub fn probe_config(case: &Case, driver_log: &Path) -> ProbeConfig {
+    ProbeConfig {
+        tool: "python3".to_string(),
+        script: probe::PROBE_SCRIPT.to_string(),
+        script2: match case.evidence {
+            Evidence::SecondSpawnRefused(_) => Some(probe::SECOND_SCRIPT.to_string()),
+            _ => None,
+        },
+        case: case.id.to_string(),
+        log: driver_log.display().to_string(),
+    }
+}
+
+/// The manifest one case runs under. `driver_log` is where `probe-driver` writes its summary.
 ///
 /// Declares `capabilities.containment: <class>` explicitly. Without this, every case would run at
 /// the manifest default (`advisory`), and on a `sealed`-capable host `applied_tier` would still
@@ -179,10 +207,27 @@ fn tight_resources_yaml() -> &'static str {
 /// matter what `--class` was passed to this binary. The banner and grading table would say
 /// `sealed` while every probe actually ran under `scoped`, which is exactly the "false assurance"
 /// this harness exists to prevent (see `lib.rs`'s module docs).
-fn manifest_yaml(case: &Case, config: &RunnerConfig, class: murmur_artifact::ContainmentClass) -> String {
+///
+/// `every_generated_manifest_parses_as_mur_run_parses_it` holds the result to the parser `mur run`
+/// calls.
+pub fn manifest_yaml(
+    case: &Case,
+    config: &RunnerConfig,
+    class: murmur_artifact::ContainmentClass,
+    driver_log: &Path,
+) -> String {
     let mut yaml = String::new();
     yaml.push_str(&format!("name: escape-conformance-{}\n", case.id));
     yaml.push_str("version: 0.0.1\n\n");
+    // A process driver has to come out of a store: `stage` installs this one into the case's
+    // project store before `mur run` resolves it.
+    yaml.push_str("artifacts:\n");
+    yaml.push_str(&format!("  - name: {}\n", driver_artifact::DRIVER_NAME));
+    yaml.push_str(&format!(
+        "    version: {}\n",
+        driver_artifact::DRIVER_VERSION
+    ));
+    yaml.push_str("    runtime: driver\n\n");
     yaml.push_str("capabilities:\n");
     yaml.push_str(&format!("  containment: {class}\n"));
     yaml.push_str("  shell:\n");
@@ -192,7 +237,7 @@ fn manifest_yaml(case: &Case, config: &RunnerConfig, class: murmur_artifact::Con
     if !config.interpreter_dirs.is_empty() {
         yaml.push_str("    interpreter_runtime:\n      - binary: python3\n        dirs:\n");
         for (path, list_dir) in &config.interpreter_dirs {
-            yaml.push_str(&format!("          - path: {path}\n"));
+            yaml.push_str(&format!("          - path: {}\n", yaml_str(path)));
             yaml.push_str(&format!("            list_dir: {list_dir}\n"));
         }
     }
@@ -201,15 +246,44 @@ fn manifest_yaml(case: &Case, config: &RunnerConfig, class: murmur_artifact::Con
     }
     // `network.allow` is left entirely undeclared, so every destination is unlisted and
     // `network.unix_sockets` keeps its default of false — which is what the four network cases
-    // and the two AF_UNIX cases assert against.
+    // and the two AF_UNIX cases assert against. `env.allow` is left undeclared too: the harness
+    // environment then holds only what the driver's launch plan sets, and so does every probe
+    // subprocess's.
+    // A shell command that outruns `lifecycle.shell_grace_secs` is demoted to the background and
+    // its tool result carries a `wrk_` handle instead of an exit code, which a `ShellExit` case
+    // cannot grade. A memory hog the cgroup pushes into swap runs far longer than the default
+    // grace, so the grace matches how long the harness waits for the case.
+    yaml.push_str("\nlifecycle:\n");
+    yaml.push_str(&format!(
+        "  shell_grace_secs: {}\n",
+        config.timeout.as_secs()
+    ));
+    let probe = probe_config(case, driver_log);
     yaml.push_str("\ninference:\n");
     yaml.push_str("  transport: process\n");
+    yaml.push_str("  driver:\n");
+    yaml.push_str(&format!("    artifact: {}\n", driver_artifact::DRIVER_NAME));
+    yaml.push_str("    config:\n");
+    yaml.push_str(&format!("      tool: {}\n", yaml_str(&probe.tool)));
+    yaml.push_str(&format!("      script: {}\n", yaml_str(&probe.script)));
+    if let Some(script2) = &probe.script2 {
+        yaml.push_str(&format!("      script2: {}\n", yaml_str(script2)));
+    }
+    yaml.push_str(&format!("      case: {}\n", yaml_str(&probe.case)));
+    yaml.push_str(&format!("      log: {}\n", yaml_str(&probe.log)));
+    // The binary override: the driver's `describe().binary` names `probe-driver` bare, and this
+    // package's build is not on any PATH `mur` would search.
     yaml.push_str(&format!(
         "  command: {}\n",
-        config.probe_driver.display()
+        yaml_str(&config.probe_driver.display().to_string())
     ));
     yaml.push_str("  max_turns: 2\n");
     yaml
+}
+
+/// Where `probe-driver` writes its summary line for the case staged in `case_dir`.
+fn driver_log_path(case_dir: &Path) -> PathBuf {
+    case_dir.join("probe-driver.txt")
 }
 
 /// Stages one case's directory and returns `(case_dir, capsule_workdir, manifest_path)`.
@@ -230,7 +304,14 @@ fn stage(
         )?;
     }
     let manifest = case_dir.join("murmur.yaml");
-    fs::write(&manifest, manifest_yaml(case, config, class))?;
+    fs::write(
+        &manifest,
+        manifest_yaml(case, config, class, &driver_log_path(&case_dir)),
+    )?;
+    // `mur install` upserts the artifact into the project the manifest's directory names, and
+    // `mur run --manifest` resolves its artifacts from that same project's store.
+    driver_artifact::install_into(&config.mur, &config.driver_artifact, &case_dir)
+        .map_err(io::Error::other)?;
 
     match case.prepare {
         Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
@@ -320,7 +401,6 @@ fn run_with_timeout(
     argv: &[String],
     case_dir: &Path,
     workdir: &Path,
-    driver_env: &[(&str, String)],
     timeout: Duration,
 ) -> io::Result<(Option<i32>, bool)> {
     let stdout = fs::File::create(case_dir.join("mur-stdout.txt"))?;
@@ -333,9 +413,6 @@ fn run_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    for (key, value) in driver_env {
-        command.env(key, value);
-    }
 
     let mut child = command.spawn()?;
     let started = Instant::now();
@@ -386,12 +463,13 @@ fn trace_files(workdir: &Path) -> Vec<PathBuf> {
 ///
 /// **Supplementary evidence, never the grading source.** `resource-limits-manual-verification.md`
 /// grades its scenarios on this string, but that document assumes the HTTP-driver agent loop,
-/// which writes a `shell` event per tool call. This harness drives cases through the
-/// process-transport Claude Bridge, and `claude_bridge::dispatch_tool_call` returns the tool
-/// result without writing any trace event at all — so on this path `trace.jsonl` carries no
-/// `shell` record and therefore no `resource_limit`, no matter what the kernel did. Grading on it
-/// would report every contained ceiling as uncontained. It is still read and folded into DETAIL,
-/// because when it *is* present it is the runtime's own attribution and worth having.
+/// which writes a `shell` event, carrying `resource_limit`, per tool call. This harness drives
+/// cases through process transport, where `ProcessEventSink` writes a `tool_call` record for each
+/// call the harness reports — tool name, input, output size, duration and `ok`/`error` status —
+/// and the bridge writes no `shell` event. So on this path `trace.jsonl` carries no
+/// `resource_limit`, no matter what the kernel did, and grading on it would report every contained
+/// ceiling as uncontained. It is still read and folded into DETAIL, because when it *is* present
+/// it is the runtime's own attribution and worth having.
 ///
 /// Parsed as JSON rather than grepped: a substring match would credit an attribution that
 /// appeared anywhere in the line, including inside a captured stderr string.
@@ -472,7 +550,10 @@ fn excerpt(text: &str, needle: &str) -> String {
 ///
 /// The hint on failure names the one cause seen so far in practice, because it is invisible from
 /// the outside and costs an afternoon to rediscover.
-pub fn preflight(config: &RunnerConfig, class: murmur_artifact::ContainmentClass) -> Result<String, String> {
+pub fn preflight(
+    config: &RunnerConfig,
+    class: murmur_artifact::ContainmentClass,
+) -> Result<String, String> {
     let outcome = run_case(&crate::cases::PREFLIGHT, config, class);
     if outcome.verdict == Verdict::Succeeded {
         return Ok(outcome.detail);
@@ -495,6 +576,9 @@ pub fn preflight(config: &RunnerConfig, class: murmur_artifact::ContainmentClass
          Note also that nothing the capsule writes into its own workdir can be executed at all \
          unless the manifest declares `capabilities.filesystem.workdir_exec: true`; a preflight \
          that stages its interpreter into the workdir needs that key.\n\
+         A manifest refusal (`E-MAN-*`) means the generated manifest no longer meets the manifest \
+         contract `mur run` enforces; `cargo test -p escape-conformance` reproduces it without a \
+         host.\n\
          (Before the exec supervisor was retired this hint named `prctl(PR_SET_DUMPABLE, 0)` and \
          a `/proc/<pid>/mem` read instead. That mechanism is gone: nothing reads the child's \
          memory any more, and the dumpable restore went with it.)\n\n\
@@ -503,6 +587,21 @@ pub fn preflight(config: &RunnerConfig, class: murmur_artifact::ContainmentClass
         outcome.case_dir.display()
     ))
 }
+
+/// What `mur` prints when it refused or abandoned a case's run, matched as substrings of its
+/// output. `E-MAN-` matches every manifest code. Harness codes: `E-RUN-006` the harness binary
+/// was not found, `E-RUN-033` the harness reported a failed turn, `E-RUN-034` a driver call
+/// failed, `E-RUN-035` the harness went quiet past the inactivity limit.
+const REFUSAL_CODES: [&str; 8] = [
+    "E-RUN-012",
+    "E-RUN-007",
+    "E-RUN-008",
+    "E-MAN-",
+    "E-RUN-006",
+    "E-RUN-033",
+    "E-RUN-034",
+    "E-RUN-035",
+];
 
 /// Runs one case end to end and grades it.
 pub fn run_case(
@@ -527,34 +626,25 @@ pub fn run_case(
     };
 
     let argv = build_argv(case, config, &manifest, &workdir);
-    let driver_log = case_dir.join("probe-driver.txt");
-    let mut driver_env = vec![
-        ("MURMUR_EC_TOOL", "python3".to_string()),
-        ("MURMUR_EC_SCRIPT", probe::PROBE_SCRIPT.to_string()),
-        ("MURMUR_EC_CASE", case.id.to_string()),
-        ("MURMUR_EC_DRIVER_LOG", driver_log.display().to_string()),
-    ];
-    if let Evidence::SecondSpawnRefused(_) = case.evidence {
-        driver_env.push(("MURMUR_EC_SCRIPT2", probe::SECOND_SCRIPT.to_string()));
-    }
+    let driver_log = driver_log_path(&case_dir);
 
-    let (exit_code, timed_out) =
-        match run_with_timeout(&argv, &case_dir, &workdir, &driver_env, config.timeout) {
-            Ok(result) => result,
-            Err(err) => {
-                return CaseOutcome {
-                    case,
-                    expectation,
-                    verdict: Verdict::Inconclusive,
-                    detail: format!("could not launch `{}`: {err}", argv.join(" ")),
-                    passed: !expectation.gates(),
-                    case_dir,
-                };
-            }
-        };
+    let (exit_code, timed_out) = match run_with_timeout(&argv, &case_dir, &workdir, config.timeout)
+    {
+        Ok(result) => result,
+        Err(err) => {
+            return CaseOutcome {
+                case,
+                expectation,
+                verdict: Verdict::Inconclusive,
+                detail: format!("could not launch `{}`: {err}", argv.join(" ")),
+                passed: !expectation.gates(),
+                case_dir,
+            };
+        }
+    };
 
     let output = session_output(&case_dir, &workdir);
-    let mut launch_refusal = ["E-RUN-012", "E-RUN-007", "E-RUN-008"]
+    let mut launch_refusal = REFUSAL_CODES
         .into_iter()
         .find(|code| output.contains(code))
         .map(|code| excerpt(&output, code));
@@ -685,11 +775,17 @@ pub fn run_case(
 mod tests {
     use super::*;
     use crate::cases;
+    use murmur_artifact::{ArtifactRuntime, ContainmentClass, RuntimeManifest};
+
+    fn log() -> PathBuf {
+        PathBuf::from("/tmp/escape-conformance-test/case/probe-driver.txt")
+    }
 
     fn config() -> RunnerConfig {
         RunnerConfig {
             mur: PathBuf::from("/nonexistent/mur"),
             probe_driver: PathBuf::from("/nonexistent/probe-driver"),
+            driver_artifact: PathBuf::from("/nonexistent/escape-conformance-driver-0.1.0.mur.zip"),
             work_root: PathBuf::from("/tmp/escape-conformance-test"),
             timeout: Duration::from_secs(1),
             systemd_scope: false,
@@ -700,7 +796,7 @@ mod tests {
     #[test]
     fn boundary_manifest_has_no_resource_block_and_declares_no_network() {
         let case = cases::find("read-etc-shadow").unwrap();
-        let yaml = manifest_yaml(case, &config(), murmur_artifact::ContainmentClass::Scoped);
+        let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
         assert!(yaml.contains("allow:\n      - bash\n      - python3"));
         assert!(!yaml.contains("resources:"));
         // Nothing may be declared network-reachable, or the four network cases assert nothing.
@@ -711,8 +807,8 @@ mod tests {
     #[test]
     fn manifest_declares_the_containment_class_under_test() {
         let case = cases::find("read-etc-shadow").unwrap();
-        for class in murmur_artifact::ContainmentClass::ALL {
-            let yaml = manifest_yaml(case, &config(), class);
+        for class in ContainmentClass::ALL {
+            let yaml = manifest_yaml(case, &config(), class, &log());
             assert!(
                 yaml.contains(&format!("containment: {class}\n")),
                 "manifest for class {class} must declare it, or applied_tier never installs \
@@ -725,7 +821,7 @@ mod tests {
     #[test]
     fn resource_manifest_carries_the_tight_ceilings() {
         let case = cases::find("resource-fork-bomb").unwrap();
-        let yaml = manifest_yaml(case, &config(), murmur_artifact::ContainmentClass::Scoped);
+        let yaml = manifest_yaml(case, &config(), ContainmentClass::Scoped, &log());
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
         // 128, not the manual-verification document's 16: the child's pre_exec window has to
@@ -787,5 +883,97 @@ mod tests {
         assert_eq!(argv[0], "systemd-run");
         assert!(argv.contains(&"--property=Delegate=yes".to_string()));
         assert!(argv.iter().any(|a| a.ends_with("mur")));
+    }
+
+    #[test]
+    fn every_generated_manifest_parses_as_mur_run_parses_it() {
+        let mut config = config();
+        // A work root with a space and a colon in it, and an interpreter dir with a `#`: every
+        // path is a quoted scalar, or one of these would end the value early.
+        config.work_root = PathBuf::from("/tmp/escape conformance: work");
+        config.probe_driver = PathBuf::from("/opt/a build: tree/probe-driver");
+        config.interpreter_dirs = vec![("/usr/lib/python3 #1".to_string(), true)];
+
+        let mut profiles_seen = (false, false);
+        let cases = std::iter::once(&cases::PREFLIGHT).chain(cases::all_cases());
+        for case in cases {
+            match case.profile {
+                Profile::Boundary => profiles_seen.0 = true,
+                Profile::TightResources => profiles_seen.1 = true,
+            }
+            let driver_log = driver_log_path(&config.work_root.join(case.id));
+            for class in ContainmentClass::ALL {
+                let yaml = manifest_yaml(case, &config, class, &driver_log);
+                let id = case.id;
+                let manifest = match RuntimeManifest::from_yaml_str(&yaml) {
+                    Ok(manifest) => manifest,
+                    Err(err) => panic!(
+                        "case {id} at class {class}: `mur run` would refuse the generated \
+                         manifest: {err}\n---\n{yaml}"
+                    ),
+                };
+                assert!(
+                    manifest.unknown_keys.is_empty(),
+                    "case {id} at class {class}: unknown keys {:?}\n---\n{yaml}",
+                    manifest.unknown_keys
+                );
+                assert_eq!(
+                    manifest.effective_lifecycle().shell_grace_secs,
+                    config.timeout.as_secs(),
+                    "case {id} at class {class}: a probe must stay in the foreground for the \
+                     whole case"
+                );
+                assert_eq!(
+                    manifest.capabilities.as_ref().and_then(|c| c.containment),
+                    Some(class),
+                    "case {id} at class {class}"
+                );
+
+                let inference = manifest.inference.as_ref().expect("an inference block");
+                assert_eq!(inference.transport, "process", "case {id} at class {class}");
+                assert_eq!(
+                    inference.command.as_deref(),
+                    Some("/opt/a build: tree/probe-driver"),
+                    "case {id} at class {class}"
+                );
+                let driver = inference.driver.as_ref().expect("an inference.driver");
+                assert_eq!(driver.artifact, driver_artifact::DRIVER_NAME);
+                assert!(
+                    manifest
+                        .artifacts
+                        .iter()
+                        .any(|a| a.name == driver_artifact::DRIVER_NAME
+                            && a.version == driver_artifact::DRIVER_VERSION
+                            && matches!(a.runtime, ArtifactRuntime::Driver)),
+                    "case {id} at class {class}: the driver is not declared under artifacts:"
+                );
+
+                let probe = ProbeConfig::from_json(
+                    driver
+                        .config
+                        .as_deref()
+                        .expect("an inference.driver.config"),
+                )
+                .unwrap_or_else(|err| panic!("case {id} at class {class}: {err}"));
+                assert_eq!(probe.case, id);
+                assert_eq!(probe.tool, "python3");
+                assert_eq!(probe.script, probe::PROBE_SCRIPT);
+                assert_eq!(probe.log, driver_log.display().to_string());
+                assert_eq!(
+                    probe.script2.is_some(),
+                    matches!(case.evidence, Evidence::SecondSpawnRefused(_)),
+                    "case {id} at class {class}: script2 is {:?}",
+                    probe.script2
+                );
+                if let Some(script2) = &probe.script2 {
+                    assert_eq!(script2, probe::SECOND_SCRIPT);
+                }
+            }
+        }
+        assert_eq!(
+            profiles_seen,
+            (true, true),
+            "both profiles must be generated, or one manifest shape goes unchecked"
+        );
     }
 }

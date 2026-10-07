@@ -1542,7 +1542,9 @@ pub fn find(id: &str) -> Option<&'static Case> {
 
 /// Cases in `category`, in registry order.
 pub fn in_category(category: Category) -> impl Iterator<Item = &'static Case> {
-    REGISTRY.iter().filter(move |case| case.category == category)
+    REGISTRY
+        .iter()
+        .filter(move |case| case.category == category)
 }
 
 #[cfg(test)]

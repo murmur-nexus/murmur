@@ -1,0 +1,4 @@
+/target/
+# The root `.gitignore` ignores every `murmur.yaml`; this one is the driver artifact's manifest,
+# which the gate embeds and packs at startup.
+!/murmur.yaml

@@ -223,11 +223,7 @@ impl Record<'_> {
         let _ = writeln!(out, "| date (UTC) | {} |", self.stamp.readable());
         let _ = writeln!(out, "| `uname -r` | `{}` |", self.host.kernel_release);
         let _ = writeln!(out, "| `uname -sm` | `{}` |", self.host.kernel_system);
-        let _ = writeln!(
-            out,
-            "| platform | {}/{} |",
-            self.host.os, self.host.arch
-        );
+        let _ = writeln!(out, "| platform | {}/{} |", self.host.os, self.host.arch);
         let _ = writeln!(
             out,
             "| effective uid | {} {} |",
@@ -249,8 +245,16 @@ impl Record<'_> {
             }
         );
         let _ = writeln!(out, "| container detection | {} |", self.host.container);
-        let _ = writeln!(out, "| declared containment class | **{}** |", self.declared);
-        let _ = writeln!(out, "| achieved containment class | **{}** |", self.achieved);
+        let _ = writeln!(
+            out,
+            "| declared containment class | **{}** |",
+            self.declared
+        );
+        let _ = writeln!(
+            out,
+            "| achieved containment class | **{}** |",
+            self.achieved
+        );
         let _ = writeln!(out, "| `mur` binary | `{}` |", self.mur_binary);
         let _ = writeln!(out, "| `mur` version | `{}` |", self.mur_version);
         let _ = writeln!(out, "| invocation | `{}` |\n", self.invocation);

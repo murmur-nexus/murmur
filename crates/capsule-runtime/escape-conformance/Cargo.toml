@@ -1,20 +1,12 @@
-# Standalone, hand-run escape-conformance harness for the containment boundary that
-# `crates/capsule-runtime/src/sandbox.rs` enforces. See
-# `ESCAPE_CONFORMANCE_HARNESS.md` at the repository root.
+# Hand-run escape-conformance release gate for the containment boundary that
+# `crates/capsule-runtime/src/sandbox.rs` enforces. The procedure is in
+# `docs/content/reference/containment.md`, under "The escape-conformance harness".
 #
-# Deliberately NOT a member of the root workspace (`/Cargo.toml`'s `members` list names exactly
-# four crates and this is not one of them). That is the whole mechanism keeping this package out
-# of `cargo check --workspace`, `cargo build --workspace` and `cargo test --workspace` — and out
-# of CI's `cargo check --workspace --all-targets` — without any `exclude` entry. The roadmap card
-# is explicit that a CI-wired suite would skip its way to green and certify nothing, so this
-# exclusion is load-bearing, not incidental.
-#
-# The empty `[workspace]` table below is what makes that legal: it declares this directory its own
-# workspace root, so cargo does not object to a package living under a workspace directory without
-# being a member of it. Removing it makes `cargo build` here fail outright, which is the intended
-# tripwire if someone tries to fold this into the workspace.
-[workspace]
-
+# A member of the root workspace, so its contract tests — the generated manifest against the
+# parser `mur run` uses, and the committed driver against this runtime's process interface — run
+# with `cargo test --workspace` and in CI. The gate itself stays hand-run: nothing in CI executes
+# the `escape-conformance` binary, and `cargo test` never runs a `[[bin]]` target. No CI runner
+# can back `scoped`, so a CI-run gate would refuse or skip its way to green and certify nothing.
 [package]
 name = "escape-conformance"
 version = "0.0.0"
@@ -24,19 +16,21 @@ publish = false
 description = "Hand-run escape-conformance release gate for the capsule-runtime containment boundary"
 
 # The gate itself: parses `--class`, refuses when the host cannot back it, runs the case
-# registry, writes the dated record.
+# registry, writes the dated record. No tests of its own; `test = false` keeps it from adding a
+# wasmtime-linking test binary.
 [[bin]]
 name = "escape-conformance"
 path = "src/main.rs"
+test = false
 
-# The scripted inference CLI each boundary case runs behind. `mur run`'s `transport: process`
-# spawns whatever `inference.command` names and talks to it over the Claude Bridge; this binary
-# stands in for a subscription CLI and makes exactly one, predetermined tool call. That is what
-# turns a case into a deterministic probe instead of a live model's guess — see
+# The scripted harness each case runs behind. `mur run`'s `transport: process` spawns it through
+# this package's own process driver (`driver/`), which hands it the tool bridge and the case; it
+# makes predetermined tool calls instead of asking a model which to make. See
 # `src/probe_driver.rs` for the full rationale.
 [[bin]]
 name = "probe-driver"
 path = "src/probe_driver.rs"
+test = false
 
 [lib]
 name = "escape_conformance"
@@ -45,13 +39,14 @@ path = "src/lib.rs"
 [dependencies]
 # The containment-class gate is a library call, not a subprocess: `detect_achieved_containment`
 # probes this host directly, so nothing between the harness and the kernel can soften the answer.
-# `containment` is a `pub mod` (unlike `sandbox`/`shell`, which are `pub(crate)`), which is why
-# this works from outside the crate at all.
-capsule-runtime = { path = ".." }
-# `ContainmentClass` itself lives here; `capsule-runtime` does not re-export it.
-murmur-artifact = { path = "../../murmur-artifact" }
-# The one non-path dependency. The probe driver speaks JSON-RPC to the Claude Bridge and the
-# runner reads `trace.jsonl`; hand-rolling either would be a source of harness bugs that look
-# like enforcement findings. Everything else (argument parsing, the record format, the date
-# stamp) is hand-rolled so a reviewer can read the whole harness in one sitting.
+# `containment` and `process_driver` are `pub mod`s, which is why this works from outside the
+# crate at all.
+capsule-runtime.workspace = true
+# `ContainmentClass`, `RuntimeManifest` and `extract_wit_contracts` live here.
+murmur-artifact.workspace = true
+# The one non-path dependency. The probe driver speaks JSON-RPC to the tool bridge, the runner
+# reads `trace.jsonl`, and the driver config travels as JSON; hand-rolling any of them would be a
+# source of harness bugs that look like enforcement findings. Everything else (argument parsing,
+# the record format, the date stamp) is hand-rolled so a reviewer can read the whole harness in
+# one sitting.
 serde_json = "1"

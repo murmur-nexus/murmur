@@ -1,0 +1,21 @@
+# The process driver the escape-conformance gate installs into every case's project store. It
+# drives the package's own `probe-driver` binary and nothing else. Built to wasm32-wasip2 and
+# committed as `escape_conformance_driver.wasm`; README.md carries the contract and the rebuild
+# command.
+#
+# The empty `[workspace]` keeps it out of the root workspace: a cdylib for another target has no
+# place in `cargo test --workspace`, and its unit tests run on the host with `cargo test` here.
+[package]
+name = "escape-conformance-driver"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[workspace]

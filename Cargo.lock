@@ -960,6 +960,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "escape-conformance"
+version = "0.0.0"
+dependencies = [
+ "capsule-runtime",
+ "murmur-artifact",
+ "serde_json",
+]
+
+[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
