@@ -1,6 +1,6 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake; 2026-08-09, the first full-registry escape-conformance run at `--class sealed` against a *gated* suite (exit 0, 26 of 28 cases asserted and passing)."
+!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake; 2026-08-09, the first full-registry escape-conformance run at `--class sealed` against a *gated* suite (exit 0, 26 of 28 cases asserted and passing); 2026-10-06, the escape-conformance gate running again through its own process driver at `scoped` and `sealed` (exit 4: every boundary case passes, `resource-memory-hog` fails)."
 
     Steps 0–4 and 6 were executed on a bare Ubuntu host on 2026-08-05, driven through a real,
     live capsule session (`claude` as the inference driver, a real `bash` tool call), and every
@@ -18,9 +18,9 @@
     runtime directories — and is recorded in the same section. A second targeted run on 2026-08-08
     did the same for the composed root's `/etc` allowlist, where the same mounted-but-denied defect
     was breaking TLS certificate verification, and carries a completed `pip install` over a verified
-    HTTPS connection. The **first entry** under Recording the result is now the 2026-08-09 run: the
-    first time the escape-conformance suite's `sealed` column *graded* anything rather than recording
-    an intention, and therefore the first `sealed`-class result whose exit code is citable.
+    HTTPS connection. The 2026-08-09 run under Recording the result is the first time the
+    escape-conformance suite's `sealed` column *graded* anything rather than recording an intention,
+    and therefore the first `sealed`-class result whose exit code is citable.
 
     **The steps dated 2026-08-05 to 2026-08-09 above were run with
     `kernel.apparmor_restrict_unprivileged_userns=0`** — that is, with the host's unprivileged-userns
@@ -726,6 +726,119 @@ If step 3a's output is identical under both classes, the probes are not measurin
 claims and the result must not be recorded as a pass.
 
 ## Recording the result
+
+### Run of 2026-10-06 — the escape-conformance gate through its own process driver (card `6bd3a744`)
+
+Since the process-driver contract, every escape-conformance run had been refused at preflight with
+`E-MAN-003`: the generated manifests named `inference.command` and no `inference.driver`. The gate
+now carries its own process driver, `escape-conformance-driver@0.1.0`, packs it with `mur build`
+at startup and installs it into each case's project with `mur install`. These are its first runs.
+
+**Host.** Same machine as every run below: `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP
+PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04, bare metal (`container: no container
+signal`), non-root `uid=1000`, cgroup v2 delegated through `systemd-run --user --scope
+--property=Delegate=yes`, `kernel.apparmor_restrict_unprivileged_userns=0`. CPython 3.12.3.
+
+**Invocation.** From the repository root:
+
+```bash
+cargo build --release -p murmur-cli -p escape-conformance
+./target/release/escape-conformance --class scoped --mur ./target/release/mur --record-dir <dir>/scoped
+./target/release/escape-conformance --class sealed --mur ./target/release/mur --record-dir <dir>/sealed
+```
+
+Both runs printed `preflight … ok` and graded all 28 cases. Every case's `trace.jsonl` carries a
+`harness_start` naming `"driver":"escape-conformance-driver"`, the `probe-driver` binary and
+`"version_tested":true`, and none carries a `harness_warning`.
+
+| class | `achieved:` | exit |
+|---|---|---|
+| `scoped` | `sealed` | `4` |
+| `sealed` | `sealed` | `4` |
+
+The `scoped` record's `## Summary`, verbatim:
+
+| category | asserted | passed | failed | recorded but not asserted |
+|---|---|---|---|---|
+| **boundary** (a failure here is an escape) | 23 | 23 | 0 | 0 |
+| **resource_exhaustion** (a failure here is denial of service, never an escape) | 5 | 4 | 1 | 0 |
+
+The `sealed` record's `## Summary`, verbatim:
+
+| category | asserted | passed | failed | recorded but not asserted |
+|---|---|---|---|---|
+| **boundary** (a failure here is an escape) | 21 | 21 | 0 | 2 |
+| **resource_exhaustion** (a failure here is denial of service, never an escape) | 5 | 4 | 1 | 0 |
+
+The two `sealed` cases recorded but not asserted are `hardlink-escape` and
+`rename-across-boundary`, both INCONCLUSIVE, as in the 2026-08-09 run.
+
+**`resource-fork-bomb`**, identical at both classes:
+
+| case | expected | actual | result |
+|---|---|---|---|
+| `resource-fork-bomb` | CONTAINED | CONTAINED | PASS |
+
+with evidence `fork refused with EAGAIN(11) after 31 live children; the host stayed up. attributable
+to the cgroup's pids.max: RLIMIT_NPROC was 55249, so the per-uid ceiling cannot be what refused it`.
+
+#### `resource-memory-hog` fails: the capsule's cgroup does not bound swap
+
+| case | expected | actual | result |
+|---|---|---|---|
+| `resource-memory-hog` | CONTAINED | UNCONTAINED | **FAIL** |
+
+The probe was never killed. It ran until `RLIMIT_AS` refused an allocation and exited 0, which the
+case grades as UNCONTAINED:
+
+```text
+the shell tool exited 0, which is not one of the codes that mean the ceiling bit ([137]). Tool call:
+case=resource-memory-hog tool=python3 :: isError=false :: $ python3 ec-probe.py Exit code: 0 Stdout:
+EC_VERDICT=INCONCLUSIVE EC_DETAIL=probe raised: Traceback (most recent call last): ; … ; block =
+bytearray(25 * 1024 * 1024) ; MemoryError
+```
+
+The capsule's own cgroup, read every two seconds while the probe ran:
+
+| elapsed | `memory.max` | `memory.swap.max` | `memory.current` | `memory.swap.current` | `memory.events` `max` / `oom_kill` |
+|---|---|---|---|---|---|
+| 0 s | 268435456 | `max` | 93474816 | 0 | 0 / 0 |
+| 4 s | 268435456 | `max` | 268247040 | 691437568 | 3135 / 0 |
+| 10 s | 268435456 | `max` | 268247040 | 1780211712 | 7962 / 0 |
+
+`cgroup_memory_bytes` holds resident memory at 256 MiB, but `memory.swap.max` is left at `max`, so
+the kernel swaps the capsule out instead of OOM-killing it, and the 4 GiB `memory_bytes`
+(`RLIMIT_AS`) ceiling is what finally refuses an allocation. The 2026-08-09 run measured exit `137`
+for the same probe. A finding for the runtime's cgroup setup, not for this harness: the boundary
+verdict is unaffected, and the case's probe and expectation are unchanged.
+
+**The manifest declares `lifecycle.shell_grace_secs`.** A shell command that outruns
+`lifecycle.shell_grace_secs` (default 10 seconds) is moved to the background, and its tool result
+carries a `wrk_` handle instead of an exit code. The first `scoped` attempt, before the generated
+manifest set the grace, recorded `resource-memory-hog` as INCONCLUSIVE for that reason. Each case
+now declares `shell_grace_secs` equal to the harness's per-case timeout (`--timeout-secs`, default
+300).
+
+#### Refusals, quoted from the same build
+
+A harness that never reports (`--probe-driver /bin/true`), exit `2`, no record:
+
+```text
+preflight … REFUSED
+…
+  the probe wrote no verdict file — a missing result is NOT a clean result. `mur run` exited 1; the
+  tool call reported: the probe driver left no record of its tool call [mur reported:
+  error[E-RUN-033]: the harness turn failed (harness-error): probe-driver exited without an end line]
+```
+
+A generated manifest with its `inference.driver` block removed, exit `2`, no record:
+
+```text
+preflight … REFUSED
+…
+  [mur reported: error[E-MAN-003]: murmur.yaml: invalid inference config for
+  'inference.driver.artifact': missing required field; …]
+```
 
 ### Run of 2026-08-09 — synthetic `/etc/passwd` and `/etc/group` (card `60e1c285`)
 

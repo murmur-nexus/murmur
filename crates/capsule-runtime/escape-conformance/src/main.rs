@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | 0 | every asserted case matched its expected verdict | yes |
 //! | 1 | usage error, or the harness itself could not proceed | no |
-//! | 2 | **refused before running any case** — class gate, container, or a missing prerequisite | **no** |
+//! | 2 | **refused before running any case** — class gate, container, a missing prerequisite, a stale driver, or a failed preflight | **no** |
 //! | 3 | at least one **boundary** case failed — a containment escape | yes |
 //! | 4 | boundary clean, but a **resource-exhaustion** case failed — denial of service | yes |
 //!
@@ -21,6 +21,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use escape_conformance::cases::{self, Case};
+use escape_conformance::driver_artifact;
 use escape_conformance::host;
 use escape_conformance::record::{Record, Stamp};
 use escape_conformance::runner::{self, RunnerConfig};
@@ -52,7 +53,7 @@ OPTIONS:
                            Default: <record-dir>/escape-conformance-work-<stamp>.
     --mur <PATH>           The built `mur` binary. Default: $MUR_BIN, then this repository's
                            target/release/mur and target/debug/mur, then PATH.
-    --probe-driver <PATH>  This package's probe-driver binary. Default: next to this binary.
+    --probe-driver <PATH>  This package's probe-driver harness. Default: next to this binary.
     --python <NAME>        Interpreter the probes run as. Default: python3.
     --timeout-secs <N>     Wall-clock ceiling per case. Default: 300.
     --systemd-scope        Wrap each `mur run` in
@@ -69,7 +70,10 @@ OPTIONS:
                            nothing and writes no record.
     -h, --help             This text.
 
-See ESCAPE_CONFORMANCE_HARNESS.md at the repository root for the full procedure.
+The gate carries its own process driver (escape-conformance-driver), packs it with
+`mur build` and installs it into each case's project with `mur install`; nothing is fetched
+from a registry. See \"The escape-conformance harness\" in
+docs/content/reference/containment.md for the full procedure.
 ";
 
 struct Options {
@@ -125,7 +129,9 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
             "--record-dir" => options.record_dir = PathBuf::from(value("--record-dir")?),
             "--work-root" => options.work_root = Some(PathBuf::from(value("--work-root")?)),
             "--mur" => options.mur = Some(PathBuf::from(value("--mur")?)),
-            "--probe-driver" => options.probe_driver = Some(PathBuf::from(value("--probe-driver")?)),
+            "--probe-driver" => {
+                options.probe_driver = Some(PathBuf::from(value("--probe-driver")?))
+            }
             "--python" => options.python = value("--python")?,
             "--timeout-secs" => {
                 let raw = value("--timeout-secs")?;
@@ -220,7 +226,8 @@ fn resolve_probe_driver(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
         Some(path) if path.is_file() => Ok(path),
         _ => Err(
             "could not find `probe-driver` next to this binary. Build both with `cargo build \
-             --release` inside this package, or pass --probe-driver <path>."
+             --release -p escape-conformance` from the repository root, or pass --probe-driver \
+             <path>."
                 .to_string(),
         ),
     }
@@ -238,7 +245,10 @@ fn mur_version(mur: &Path) -> String {
 }
 
 fn list_cases() {
-    println!("Escape-conformance case registry — {} cases", cases::all_cases().len());
+    println!(
+        "Escape-conformance case registry — {} cases",
+        cases::all_cases().len()
+    );
     println!(
         "  {} boundary, {} resource_exhaustion\n",
         cases::in_category(Category::Boundary).count(),
@@ -337,7 +347,10 @@ fn run() -> Result<u8, String> {
     let achieved = capsule_runtime::detect_achieved_containment();
 
     println!("escape-conformance — hand-run containment gate");
-    println!("  host:      {} ({})", facts.kernel_system, facts.kernel_release);
+    println!(
+        "  host:      {} ({})",
+        facts.kernel_system, facts.kernel_release
+    );
     println!("  container: {}", facts.container);
     println!("  declared:  {class}");
     println!("  achieved:  {achieved}");
@@ -350,8 +363,14 @@ fn run() -> Result<u8, String> {
     // Prerequisites are resolved *after* the class gate so the most fundamental refusal is the
     // one a reader sees first, but still before any case runs — a missing prerequisite is a
     // refusal too, never a run with holes in it.
-    let mur = resolve_mur(options.mur.clone())?;
-    let probe_driver = resolve_probe_driver(options.probe_driver.clone())?;
+    // Absolute, because `mur build`, `mur install` and `mur run` each run from a different
+    // directory, and `inference.command` is resolved from the capsule's.
+    let absolute = |path: PathBuf| {
+        std::path::absolute(&path)
+            .map_err(|err| format!("could not resolve {}: {err}", path.display()))
+    };
+    let mur = absolute(resolve_mur(options.mur.clone())?)?;
+    let probe_driver = absolute(resolve_probe_driver(options.probe_driver.clone())?)?;
     let interpreter_dirs = runner::derive_interpreter_dirs(&options.python).map_err(|err| {
         format!(
             "REFUSED — {err}\n\n\
@@ -382,8 +401,40 @@ fn run() -> Result<u8, String> {
         .canonicalize()
         .map_err(|err| format!("could not resolve {}: {err}", work_root.display()))?;
 
+    // The embedded driver has to export the process interface this build's runtime accepts, or
+    // every case would be refused at load; checked before anything is packed or run.
+    if let Err(err) = driver_artifact::check_interface() {
+        eprintln!(
+            "\nREFUSED — the embedded {}@{} does not export the process driver interface this \
+             runtime accepts.\n  {err}\n\n\
+             Rebuild it as crates/capsule-runtime/escape-conformance/driver/README.md describes, \
+             then rebuild this binary. No record file was written.",
+            driver_artifact::DRIVER_NAME,
+            driver_artifact::DRIVER_VERSION
+        );
+        return Ok(EXIT_REFUSED);
+    }
+    let driver_zip = match driver_artifact::build_artifact(&mur, &work_root) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "\nREFUSED — could not pack the embedded {}@{} driver artifact.\n  {err}\n\n\
+                 No case can run without it. No record file was written.",
+                driver_artifact::DRIVER_NAME,
+                driver_artifact::DRIVER_VERSION
+            );
+            return Ok(EXIT_REFUSED);
+        }
+    };
+
     println!("  mur:       {} ({})", mur.display(), mur_version(&mur));
-    println!("  driver:    {}", probe_driver.display());
+    println!(
+        "  driver:    {}@{} ({})",
+        driver_artifact::DRIVER_NAME,
+        driver_artifact::DRIVER_VERSION,
+        driver_zip.display()
+    );
+    println!("  harness:   {}", probe_driver.display());
     println!("  scratch:   {}", work_root.display());
     println!(
         "  python:    {} (interpreter_runtime grants: {})",
@@ -406,6 +457,7 @@ fn run() -> Result<u8, String> {
     let config = RunnerConfig {
         mur: mur.clone(),
         probe_driver,
+        driver_artifact: driver_zip,
         work_root,
         timeout: options.timeout,
         systemd_scope,

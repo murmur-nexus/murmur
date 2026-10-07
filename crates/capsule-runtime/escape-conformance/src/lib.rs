@@ -1,9 +1,10 @@
 //! Escape-conformance harness — a hand-run release gate for the containment boundary
 //! `crates/capsule-runtime/src/sandbox.rs` enforces.
 //!
-//! Read `ESCAPE_CONFORMANCE_HARNESS.md` at the repository root first; it carries the exact build
-//! and run commands and the full case list. This module documentation covers only what a reader
-//! of the code needs.
+//! Read "The escape-conformance harness" in `docs/content/reference/containment.md` first; it
+//! carries the build and run commands, the prerequisites and the exit codes, and `--list-cases`
+//! prints the case registry. This module documentation covers only what a reader of the code
+//! needs.
 //!
 //! # What this is for
 //!
@@ -34,12 +35,16 @@
 //!
 //! # Never in CI
 //!
-//! This package is not a member of the root workspace. That exclusion is the mechanism, not a
-//! convention: no runner this project has resolves to the full enforcement tier, so a CI-wired
-//! suite would skip its way to green and certify nothing — which is exactly how a non-functional
-//! Linux tier came to be documented as merely "unverified".
+//! Nothing in CI may execute the `escape-conformance` binary: no CI runner resolves to the full
+//! enforcement tier, so a CI-run gate would skip its way to green and certify nothing. The package
+//! is a workspace member all the same, so the tests in this library — which are pure, and touch
+//! neither the host nor `mur` — run with `cargo test --workspace`. They keep the generated
+//! manifest, the committed driver and the probe's output in step with the runtime between hand
+//! runs.
 
 pub mod cases;
+pub mod driver_artifact;
+pub mod harness_protocol;
 pub mod host;
 pub mod probe;
 pub mod record;

@@ -1,0 +1,9 @@
+name: escape-conformance-driver
+version: 0.1.0
+runtime: driver
+description: >-
+  Process driver for the escape-conformance gate. It drives only the gate's own probe-driver
+  harness, which makes predetermined tool calls over the capsule's tool bridge, and it is granted
+  nothing.
+requires_files:
+  - escape_conformance_driver.wasm

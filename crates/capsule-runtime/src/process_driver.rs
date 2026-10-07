@@ -335,6 +335,55 @@ fn unusable_env_name(description: &Description) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The name and version the `*_process_driver_wasm` helpers give a driver in errors, since bare
+/// bytes carry no artifact name.
+const STANDALONE_NAME: &str = "<wasm>";
+const STANDALONE_VERSION: &str = "";
+
+/// `wasm` compiled on a fresh engine with its own epoch ticker, and a current-thread runtime to
+/// drive one instance of it on: everything the `*_process_driver_wasm` helpers share.
+struct StandaloneDriver {
+    engine: Engine,
+    component: Component,
+    rt: tokio::runtime::Runtime,
+    _ticker: EpochTicker,
+}
+
+impl StandaloneDriver {
+    fn compile(wasm: &[u8]) -> Result<Self, RuntimeError> {
+        let engine = crate::runtime::build_engine()?;
+        let ticker = EpochTicker::spawn(&engine);
+        let component =
+            Component::new(&engine, wasm).map_err(|e| RuntimeError::ToolComponentCompile {
+                name: STANDALONE_NAME.to_string(),
+                version: STANDALONE_VERSION.to_string(),
+                message: e.to_string(),
+            })?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
+            })?;
+        Ok(StandaloneDriver {
+            engine,
+            component,
+            rt,
+            _ticker: ticker,
+        })
+    }
+
+    async fn instantiate(&self) -> Result<ProcessDriver, RuntimeError> {
+        ProcessDriver::instantiate(
+            &self.engine,
+            &self.component,
+            STANDALONE_NAME,
+            STANDALONE_VERSION,
+        )
+        .await
+    }
+}
+
 /// Compiles `wasm` as a process driver on a fresh engine, instantiates it with no grants, and
 /// returns what its `describe` reports.
 ///
@@ -342,25 +391,30 @@ fn unusable_env_name(description: &Description) -> Option<&str> {
 /// current-thread runtime, so it must not be called from inside one. Errors name the driver as
 /// `<wasm>` with an empty version, since the bytes carry no artifact name.
 pub fn describe_process_driver_wasm(wasm: &[u8]) -> Result<Description, RuntimeError> {
-    const NAME: &str = "<wasm>";
-    const VERSION: &str = "";
-    let engine = crate::runtime::build_engine()?;
-    let _ticker = EpochTicker::spawn(&engine);
-    let component =
-        Component::new(&engine, wasm).map_err(|e| RuntimeError::ToolComponentCompile {
-            name: NAME.to_string(),
-            version: VERSION.to_string(),
-            message: e.to_string(),
-        })?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            RuntimeError::Runtime(format!("failed to build process driver runtime: {e}"))
-        })?;
-    rt.block_on(async {
-        let mut driver = ProcessDriver::instantiate(&engine, &component, NAME, VERSION).await?;
-        driver.describe().await
+    let driver = StandaloneDriver::compile(wasm)?;
+    driver.rt.block_on(async {
+        let mut instance = driver.instantiate().await?;
+        instance.describe().await
+    })
+}
+
+/// Compiles `wasm` as a process driver the way [`describe_process_driver_wasm`] does, then calls
+/// `launch` with `request` and `parse` with `lines` on that one instance, as a run would.
+///
+/// Returns the driver's launch answer — its own refusal is the inner `Err` — and the events
+/// `parse` read. `parse` is called whether or not `launch` refused, so a driver's line reading
+/// can be checked on its own. The same blocking and error-naming rules apply.
+pub fn launch_and_parse_process_driver_wasm(
+    wasm: &[u8],
+    request: LaunchRequest,
+    lines: Vec<String>,
+) -> Result<(Result<LaunchPlan, String>, Vec<Event>), RuntimeError> {
+    let driver = StandaloneDriver::compile(wasm)?;
+    driver.rt.block_on(async {
+        let mut instance = driver.instantiate().await?;
+        let plan = instance.launch(request).await?;
+        let events = instance.parse(lines).await?;
+        Ok((plan, events))
     })
 }
 
@@ -645,6 +699,52 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other:?}"),
             Ok(_) => panic!("a driver importing a Murmur interface instantiated"),
+        }
+    }
+
+    #[test]
+    fn launch_and_parse_run_on_one_instance() {
+        const WASM: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../murmur-cli/tests/fixtures/process-driver/tool/process-driver.wasm"
+        ));
+        let request = LaunchRequest {
+            model: None,
+            system_prompt: String::new(),
+            config: None,
+            bridge: Some(Bridge {
+                server_name: "murmur".to_string(),
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                bearer_token: "token".to_string(),
+                tool_names: vec!["python3".to_string()],
+            }),
+            session: Session {
+                id: "s1".to_string(),
+                mode: SessionMode::New,
+            },
+            harness_version: None,
+            task: "probe".to_string(),
+        };
+        let lines = vec![
+            r#"tool c1 murmur__python3 {"command":"x"}"#.to_string(),
+            "end done".to_string(),
+        ];
+        let (plan, events) =
+            launch_and_parse_process_driver_wasm(WASM, request, lines).expect("driver runs");
+        let plan = plan.expect("the fixture accepts a non-empty task");
+        assert!(plan
+            .env_set
+            .iter()
+            .any(|(name, value)| name == "FIXTURE_BRIDGE_TOKEN" && value == "token"));
+        // The fixture strips the `<server-name>__` prefix it remembered in `launch`, so a bare
+        // name here shows `parse` ran on the instance `launch` configured.
+        match &events[..] {
+            [Event::ToolCall(call), Event::TurnEnd(summary)] => {
+                assert_eq!(call.name, "python3");
+                assert_eq!(call.input, r#"{"command":"x"}"#);
+                assert_eq!(summary, "done");
+            }
+            other => panic!("unexpected events: {other:?}"),
         }
     }
 }

@@ -4,6 +4,7 @@ members = [
   "crates/murmur-cli",
   "crates/capsule-runtime",
   "crates/mur-roost",
+  "crates/capsule-runtime/escape-conformance",
 ]
 resolver = "2"
 
