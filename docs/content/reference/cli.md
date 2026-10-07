@@ -2256,7 +2256,7 @@ Output sections, in the order they are printed:
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
-| Turns | always | Turn count and configured max |
+| Turns | always | Turn count and configured max. When the task continued with the outcomes of work it handed off, a `continued:  <N>  (<A> member answer(s), <D> delegation outcome(s))` line follows, counting its [`task_continued`](observability-schemas.md#task-continued) records |
 | Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing each reported count — `in`, `out`, `cached`, `cache write`, `thinking` — over the turns that reported it. A count no turn reported is left off the line. Under [`transport: process`](manifest.md#transport-process) the harness's input and output counts are the totals above, so only the cache and thinking counts appear here |
 | Wire | one or more turns carrying content hashes, or one or more [`tools_refreshed`](observability-schemas.md#tools-refreshed) records | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried. Then one `refreshed:  turn <n>  <trigger>  +<added>  -<removed>` row per turn whose tool list changed, and the `--body` command that prints one of the hashes |
 | Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
@@ -2603,6 +2603,15 @@ Session ses_019f01a940ce7761854e768ecbe3d399  (1 task, 1 turn)
 task tsk_11112222…  ctx_11112222…  (task_md, user/trusted, lane user)
   turn 0  end_turn
 task_rejected session_ended  tsk_33334444…
+```
+
+A task that continued with the outcomes of its [`call-member`](runtime-provided-tools.md#call-member-answer)
+calls and [`delegate-task`](roost-api.md#how-the-outcome-arrives) delegations renders a
+`task_continued` row under its task, naming the continuation, how many answers and outcomes it
+delivered, and how long the task waited for them:
+
+```text
+  task_continued continuation 1  3 member answer(s)  1 delegation outcome(s)  waited 12.3s
 ```
 
 A [plan run](observability-schemas.md#plan-events) renders as its own subtree: a `plan_start` row

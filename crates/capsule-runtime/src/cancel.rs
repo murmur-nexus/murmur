@@ -341,17 +341,6 @@ impl LiveDelegations {
         self.arrival.notified().await;
     }
 
-    /// Wait until at least one outcome has arrived. Resolves at once when one already has.
-    #[cfg(test)]
-    pub(crate) async fn wait_for_outcome(&self) {
-        loop {
-            if self.lock().entries.values().any(|entry| entry.arrived) {
-                return;
-            }
-            self.arrival.notified().await;
-        }
-    }
-
     /// Every delegation whose outcome has arrived, in id order — which is start order — taken
     /// for delivery.
     pub(crate) fn take_arrived(&self) -> Vec<(String, LiveDelegation)> {
@@ -774,26 +763,6 @@ mod tests {
         let ids: Vec<&str> = overdue.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["dlg_old"]);
         assert_eq!(live.counts(), (1, 1));
-    }
-
-    /// An arrival wakes a waiter, and a wait armed after it resolves at once.
-    #[tokio::test]
-    async fn an_arrival_wakes_the_wait() {
-        let (live, _scope) = scoped();
-        live.register("dlg_a".to_string(), live_delegation("worker"));
-        let door = Arc::clone(&live);
-        let waiting = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(5), live.wait_for_outcome())
-                .await
-                .expect("the arrival wakes the wait");
-            live
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(door.arrive("dlg_a"), Arrival::Delivered);
-        let live = waiting.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), live.wait_for_outcome())
-            .await
-            .expect("an outcome already there does not wait");
     }
 
     /// `wait_for_arrival` resolves once per arrival — one that landed before the wait included —
