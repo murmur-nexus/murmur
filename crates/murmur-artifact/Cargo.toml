@@ -20,5 +20,8 @@ wasmparser = { version = "0.251", default-features = false, features = ["std", "
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit-mut"] }
 tempfile = "3"
 wat = "=1.251.0"

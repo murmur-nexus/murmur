@@ -272,7 +272,7 @@ ways, so passing both is refused rather than resolved by precedence:
 
 ```text
 error[E-RUN-015]: --resume and --context name the same thing two ways
-  hint: --resume <session> resolves that session's context id for you; --context <id> names one directly. Pass whichever you have, not both — see docs/content/reference/cli.md
+  hint: --resume <session> resolves that session's context id for you; --context <id> names one directly. Pass whichever you have, not both — see https://docs.murmur.nexus/reference/cli/
 ```
 
 Refused before the session address is resolved and before anything is staged, so no session
@@ -286,7 +286,7 @@ reached a task carries none, and there is no conversation to continue:
 
 ```text
 error[E-RUN-016]: cannot resume session ses_0193f2…: its trace.jsonl records no task_start carrying a context id
-  hint: only a session that actually ran a task has a conversation to continue. Run `mur trace show <session>` to see what it did, and resume one that reached a task — see docs/content/reference/cli.md
+  hint: only a session that actually ran a task has a conversation to continue. Run `mur trace show <session>` to see what it did, and resume one that reached a task — see https://docs.murmur.nexus/reference/cli/
 ```
 
 Run [`mur trace show <session>`](cli.md#mur-trace-show) to see what that session did.
@@ -299,7 +299,7 @@ context and which of the reasons applies:
 
 ```text
 error[E-RUN-017]: cannot resume session ses_0193f2…: context 'ctx_0193f2…' has no conversation record (no conversation record at /home/you/.murmur/conversations/shey/ctx_0193f2…/conversation.jsonl)
-  hint: a session is resumable only if its capsule kept something to continue it with: a conversation record under transport: http, or a harness-session.json under transport: process. Either way context.record: off keeps neither. Run `mur trace show <session>` to see what that session did, and omit --resume to start a fresh conversation — see docs/content/reference/cli.md
+  hint: a session is resumable only if its capsule kept something to continue it with: a conversation record under transport: http, or a harness-session.json under transport: process. Either way context.record: off keeps neither. Run `mur trace show <session>` to see what that session did, and omit --resume to start a fresh conversation — see https://docs.murmur.nexus/reference/cli/
 ```
 
 What "nothing to continue" means is the one thing the transport decides:
@@ -321,7 +321,7 @@ summary, and quietly serving `full` instead would give the operator a mode they 
 
 ```text
 error[E-RUN-018]: --resume-mode compact needs a hook bound to on-compaction; this capsule declares none
-  hint: declare a hook artifact whose binding is on-compaction (or all) with commit_policy: replace-context, or use --resume-mode full, which loads the record verbatim and needs no hook — see docs/content/reference/cli.md
+  hint: declare a hook artifact whose binding is on-compaction (or all) with commit_policy: replace-context, or use --resume-mode full, which loads the record verbatim and needs no hook — see https://docs.murmur.nexus/reference/cli/
 ```
 
 `--resume-mode full` is often the cheaper mode anyway: a verbatim reload can hit the provider's
@@ -751,7 +751,7 @@ store:
 
 ```text
 error[E-RUN-036]: the harness 'claude-code' could not continue session 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55, which context 'ctx_0193f2…' names: no conversation found with session id 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55 (that id is recorded in /home/you/.murmur/conversations/shey/ctx_0193f2…/harness-session.json)
-  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or the header `x-murmur-forget-session: true` on the next message/send or message/stream — see docs/content/reference/cli.md
+  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or the header `x-murmur-forget-session: true` on the next message/send or message/stream — see https://docs.murmur.nexus/reference/cli/
 ```
 
 The map entry is left exactly as it was. Starting a new conversation instead would be silent memory
@@ -776,7 +776,7 @@ conversation, so there is no history to hand that hook:
 
 ```text
 error[E-RUN-037]: --resume-mode compact is not available under inference.transport: process; the harness holds this conversation and murmur has no history to compact
-  hint: use --resume-mode full, which hands the harness the session id this context already has and lets it answer from everything it was told — see docs/content/reference/cli.md
+  hint: use --resume-mode full, which hands the harness the session id this context already has and lets it answer from everything it was told — see https://docs.murmur.nexus/reference/cli/
 ```
 
 `--resume-mode full` is what this transport resumes with: the harness is launched on the session id
@@ -810,7 +810,7 @@ launch creates anything:
 
 ```text
 error[E-RUN-039]: --forget-session forgets the harness session a context names, and only inference.transport: process has one; this capsule's transport is 'http'
-  hint: a harness owns the conversation only under inference.transport: process, so that is the only transport with a session to forget; every other one keeps its conversation record here, which `mur conversation rm` removes — see docs/content/reference/cli.md
+  hint: a harness owns the conversation only under inference.transport: process, so that is the only transport with a session to forget; every other one keeps its conversation record here, which `mur conversation rm` removes — see https://docs.murmur.nexus/reference/cli/
 ```
 
 The door refuses the header on `message/send` and `message/stream` with JSON-RPC `-32602`, and
@@ -1154,7 +1154,7 @@ the workdir is created and before any session runs:
 
 ```text
 error[E-CAP-007]: exports.files.root 'out/' resolves to '/srv/elsewhere', which is outside the capsule workdir '/home/dev/project'
-  hint: point the export root at a directory inside the capsule workdir. A root that already exists as a symlink out of the workdir is refused whole rather than followed — see docs/content/reference/resource-plane.md
+  hint: point the export root at a directory inside the capsule workdir. A root that already exists as a symlink out of the workdir is refused whole rather than followed — see https://docs.murmur.nexus/reference/resource-plane/
 ```
 
 The root is refused whole rather than followed one file at a time: a per-request check would let
@@ -1180,7 +1180,7 @@ be at most `15m`:
 
 ```text
 error[E-CAP-008]: exports.peer_files with lifecycle.after_task: sleep requires exports.peer_files.max_ttl to be declared and at most 900s (declared 1800s); a handle's lifetime is not a durability mechanism
-  hint: declare `exports.peer_files.max_ttl: 15m` or shorter, or drop `lifecycle.after_task: sleep` so teardown bounds every handle instead. A consumer that needs these bytes after the capsule is gone should have the operator relaunch the runtime against the still-present workdir and request again — see docs/content/reference/resource-plane.md
+  hint: declare `exports.peer_files.max_ttl: 15m` or shorter, or drop `lifecycle.after_task: sleep` so teardown bounds every handle instead. A consumer that needs these bytes after the capsule is gone should have the operator relaunch the runtime against the still-present workdir and request again — see https://docs.murmur.nexus/reference/resource-plane/
 ```
 
 `mur run` refuses at staging, before the workdir is created and before any session runs, so no
@@ -1200,7 +1200,7 @@ neither is a store:
 
 ```text
 error[E-CAP-009]: invalid state store name '../escape': a store name is a single path segment and must not contain '/'
-  hint: capabilities.state.store names one directory under ~/.murmur/state/, so it must be a single path segment: no '/', no '.' or '..', not absolute, and not starting with a dot. Omit `store:` to use the capsule name — see docs/content/reference/workdir.md
+  hint: capabilities.state.store names one directory under ~/.murmur/state/, so it must be a single path segment: no '/', no '.' or '..', not absolute, and not starting with a dot. Omit `store:` to use the capsule name — see https://docs.murmur.nexus/reference/workdir/#state-store
 ```
 
 The same code covers a well-formed name whose directory this host cannot supply — an unresolvable
@@ -1208,7 +1208,7 @@ home directory, or a `~/.murmur/state/` that cannot be created as a `0700` direc
 
 ```text
 error[E-CAP-009]: state store 'shey' is unavailable at /home/dev/.murmur/state: failed to create the directory: File exists (os error 17)
-  hint: a capsule declaring capabilities.state needs a resolvable home directory: run with HOME set to an absolute path, and make sure ~/.murmur/state/ can be created as a 0700 directory — see docs/content/reference/workdir.md
+  hint: a capsule declaring capabilities.state needs a resolvable home directory: run with HOME set to an absolute path, and make sure ~/.murmur/state/ can be created as a 0700 directory — see https://docs.murmur.nexus/reference/workdir/#state-store
 ```
 
 Both are decided at staging, before any registry pull, workdir creation or component
@@ -1227,7 +1227,7 @@ JSON within 65536 bytes. Each rule refuses by name, quoting what the entry decla
 
 ```text
 error[E-CAP-010]: invalid config for artifact 'murmur-tool-corpus': 'config:' must be a mapping of keys to values, but this entry declares a sequence
-  hint: config: on an artifact entry must be a mapping with string keys that serializes to at most 65536 bytes of JSON; it is delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key entirely to deliver no variable, and keep secrets out of it — see docs/content/reference/manifest.md
+  hint: config: on an artifact entry must be a mapping with string keys that serializes to at most 65536 bytes of JSON; it is delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key entirely to deliver no variable, and keep secrets out of it — see https://docs.murmur.nexus/reference/manifest/#artifact-config
 ```
 
 An oversized block is refused rather than truncated, and the message names the size it serialized
@@ -1257,7 +1257,7 @@ refuses the launch, quoting what was written:
 
 ```text
 error[E-CAP-011]: invalid context.record_store 'a/b': must be a single path segment: no '/', no '.' or '..', not absolute, and not starting with a dot
-  hint: context.record_store names one directory under ~/.murmur/conversations/, and --context names one directory beneath that, so each must be a single path segment. Omit context.record_store to use the capsule name, and omit --context to get a fresh id per task — see docs/content/reference/manifest.md
+  hint: context.record_store names one directory under ~/.murmur/conversations/, and --context names one directory beneath that, so each must be a single path segment. Omit context.record_store to use the capsule name, and omit --context to get a fresh id per task — see https://docs.murmur.nexus/reference/manifest/#field-context
 ```
 
 The refusal is decided at staging, before any registry pull, workdir creation or component
@@ -1292,7 +1292,7 @@ are answered by the runtime itself, so an artifact cannot be declared under any 
 
 ```text
 error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member
-  hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see docs/content/reference/runtime-provided-tools.md
+  hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see https://docs.murmur.nexus/reference/runtime-provided-tools/
 ```
 
 The check runs at staging, ahead of every artifact in the manifest, so no artifact is resolved,
@@ -1359,7 +1359,7 @@ component's environment:
 
 ```text
 error[E-CAP-016]: capabilities.env.allow names 'GITHUB_TOKEN' (credential backstop pattern 'GITHUB_TOKEN'), 'MY_SERVICE_SECRET' (capabilities.shell.strip_env pattern '*_SERVICE_SECRET'); these entries are removed from every guest environment before any guest is built, so the grant would deliver nothing
-  hint: remove these entries from capabilities.env.allow. No manifest setting exempts a name from the credential backstop, and a provider key never belongs in env.allow: the runtime presents it itself through the artifact's gateway.api_key — see docs/content/reference/diagnostics.md#e-cap-016
+  hint: remove these entries from capabilities.env.allow. No manifest setting exempts a name from the credential backstop, and a provider key never belongs in env.allow: the runtime presents it itself through the artifact's gateway.api_key — see https://docs.murmur.nexus/reference/diagnostics/#e-cap-016
 ```
 
 **Fires when:** a name matches one of these patterns. The error names every matching entry once, in
@@ -1664,7 +1664,7 @@ gets one line with what it returned:
 ```text
 error[E-REG-006]: could not look up 'murmur-driver-anthropic': GitHub rate-limited the lookup, so whether a source publishes the artifact is not known
   github:murmur-nexus/default-artifacts — rate limited by GitHub (HTTP 403, x-ratelimit-remaining: 0): API rate limit exceeded for 203.0.113.7. — resets in about 41 minutes
-  hint: set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; see docs/content/reference/installing-artifacts.md
+  hint: set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and each artifact lookup can spend four; see https://docs.murmur.nexus/reference/installing-artifacts/
 ```
 
 The parenthesis on a `rate limited` line names what identified the rate limit:

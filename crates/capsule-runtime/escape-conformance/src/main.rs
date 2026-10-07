@@ -34,7 +34,8 @@ const EXIT_REFUSED: u8 = 2;
 const EXIT_BOUNDARY_FAILURE: u8 = 3;
 const EXIT_RESOURCE_FAILURE: u8 = 4;
 
-const USAGE: &str = "\
+const USAGE: &str = concat!(
+    "\
 escape-conformance — hand-run containment release gate (never wired into CI)
 
 USAGE:
@@ -72,9 +73,11 @@ OPTIONS:
 
 The gate carries its own process driver (escape-conformance-driver), packs it with
 `mur build` and installs it into each case's project with `mur install`; nothing is fetched
-from a registry. See \"The escape-conformance harness\" in
-docs/content/reference/containment.md for the full procedure.
-";
+from a registry. See \"The escape-conformance harness\" at ",
+    murmur_artifact::docs_reference_url!("containment/#the-escape-conformance-harness"),
+    " for the full procedure.
+"
+);
 
 struct Options {
     class: Option<ContainmentClass>,
@@ -281,8 +284,8 @@ fn list_cases() {
          link(2)/rename(2) hit EXDEV at a mount boundary before Landlock is consulted, for every \
          destination reachable from the workdir. Every other `sealed` expectation is graded, \
          against the verdict a real composed root produced on 2026-08-09. See each case's \
-         attribution note in a record, and \
-         docs/content/reference/sealed-containment-manual-verification.md."
+         attribution note in a record, and {}.",
+        murmur_artifact::docs_reference_url!("containment/#verification")
     );
 }
 

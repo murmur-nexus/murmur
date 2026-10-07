@@ -223,8 +223,11 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::CgroupDelegationUnavailable { .. } => CliError::with_hint(
                 E_RUN_012,
                 error.to_string(),
-                "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, \
-                 cpu and io — see docs/content/reference/resource-limits-manual-verification.md",
+                concat!(
+                    "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, \
+                     cpu and io — see ",
+                    murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior")
+                ),
             ),
             // Distinct from E-CAP-003 on purpose: that one is a pre-launch refusal by a host that
             // never claimed to offer `sealed`, so the remedy is to lower the floor or move hosts.
@@ -233,11 +236,13 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::SealedRootConstructionFailed { .. } => CliError::with_hint(
                 E_RUN_014,
                 error.to_string(),
-                "the host cleared the sealed probe at launch and then failed to construct the \
-                 composed root — check that the mount namespace was not restricted mid-session \
-                 (AppArmor profile reloaded, container policy changed), re-run `mur run \
-                 --explain-scope` to re-probe, and see \
-                 docs/content/reference/sealed-containment-manual-verification.md",
+                concat!(
+                    "the host cleared the sealed probe at launch and then failed to construct the \
+                     composed root — check that the mount namespace was not restricted mid-session \
+                     (AppArmor profile reloaded, container policy changed), re-run `mur run \
+                     --explain-scope` to re-probe, and see ",
+                    murmur_artifact::docs_reference_url!("containment/#field-containment")
+                ),
             ),
             error @ RuntimeError::WorkdirSizeExceeded { .. } => CliError::with_hint(
                 E_RUN_013,
@@ -366,25 +371,33 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ReservedToolName { .. } => CliError::with_hint(
                 E_CAP_013,
                 error.to_string(),
-                "the runtime answers these names itself, so an artifact under one of them would \
-                 be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, \
-                 or drop the dependency if the runtime-provided tool is what you wanted — see \
-                 docs/content/reference/runtime-provided-tools.md",
+                concat!(
+                    "the runtime answers these names itself, so an artifact under one of them \
+                     would be shadowed at dispatch whatever the tool allowlist said. Rename the \
+                     artifact, or drop the dependency if the runtime-provided tool is what you \
+                     wanted — see ",
+                    murmur_artifact::docs_reference_url!("runtime-provided-tools/")
+                ),
             ),
             error @ RuntimeError::EnvAllowStrippedByBackstop { .. } => CliError::with_hint(
                 E_CAP_016,
                 error.to_string(),
-                "remove these entries from capabilities.env.allow. No manifest setting exempts a \
-                 name from the credential backstop, and a provider key never belongs in env.allow: \
-                 the runtime presents it itself through the artifact's gateway.api_key — see \
-                 docs/content/reference/diagnostics.md#e-cap-016",
+                format!(
+                    "remove these entries from capabilities.env.allow. No manifest setting exempts \
+                     a name from the credential backstop, and a provider key never belongs in \
+                     env.allow: the runtime presents it itself through the artifact's \
+                     gateway.api_key — see {}",
+                    murmur_artifact::diagnostic_link("E-CAP-016")
+                ),
             ),
             error @ RuntimeError::RuntimeProvidedToolNotReserved { .. } => CliError::with_hint(
                 E_CAP_013,
                 error.to_string(),
-                "this is a runtime defect rather than a manifest one: a runtime-provided tool was \
-                 written under a name no artifact is stopped from claiming — see \
-                 docs/content/reference/runtime-provided-tools.md",
+                concat!(
+                    "this is a runtime defect rather than a manifest one: a runtime-provided tool \
+                     was written under a name no artifact is stopped from claiming — see ",
+                    murmur_artifact::docs_reference_url!("runtime-provided-tools/")
+                ),
             ),
             // One code for every shape rule the config channel enforces, because they are one
             // operator problem — a declared block that cannot be delivered — and the message
@@ -398,8 +411,8 @@ impl From<RuntimeError> for CliError {
                     "config: on an artifact entry must be a mapping with string keys that \
                      serializes to at most {MAX_ARTIFACT_CONFIG_BYTES} bytes of JSON; it is \
                      delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key \
-                     entirely to deliver no variable, and keep secrets out of it — see \
-                     docs/content/reference/manifest.md"
+                     entirely to deliver no variable, and keep secrets out of it — see {}",
+                    murmur_artifact::docs_reference_url!("manifest/#artifact-config")
                 ),
             ),
             // Both resume refusals arrive from staging, before this launch's session directory
@@ -408,25 +421,33 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ResumeRecordMissing { .. } => CliError::with_hint(
                 E_RUN_017,
                 error.to_string(),
-                "a session is resumable only if its capsule kept something to continue it with: a \
-                 conversation record under transport: http, or a harness-session.json under \
-                 transport: process. Either way context.record: off keeps neither. Run `mur trace \
-                 show <session>` to see what that session did, and omit --resume to start a fresh \
-                 conversation — see docs/content/reference/cli.md",
+                concat!(
+                    "a session is resumable only if its capsule kept something to continue it \
+                     with: a conversation record under transport: http, or a harness-session.json \
+                     under transport: process. Either way context.record: off keeps neither. Run \
+                     `mur trace show <session>` to see what that session did, and omit --resume to \
+                     start a fresh conversation — see ",
+                    murmur_artifact::docs_reference_url!("cli/")
+                ),
             ),
             error @ RuntimeError::ResumeCompactUnsupportedTransport => CliError::with_hint(
                 E_RUN_037,
                 error.to_string(),
-                "use --resume-mode full, which hands the harness the session id this context \
-                 already has and lets it answer from everything it was told — see \
-                 docs/content/reference/cli.md",
+                concat!(
+                    "use --resume-mode full, which hands the harness the session id this context \
+                     already has and lets it answer from everything it was told — see ",
+                    murmur_artifact::docs_reference_url!("cli/")
+                ),
             ),
             error @ RuntimeError::ResumeCompactionHookMissing => CliError::with_hint(
                 E_RUN_018,
                 error.to_string(),
-                "declare a hook artifact whose binding is on-compaction (or all) with \
-                 commit_policy: replace-context, or use --resume-mode full, which loads the \
-                 record verbatim and needs no hook — see docs/content/reference/cli.md",
+                concat!(
+                    "declare a hook artifact whose binding is on-compaction (or all) with \
+                     commit_policy: replace-context, or use --resume-mode full, which loads the \
+                     record verbatim and needs no hook — see ",
+                    murmur_artifact::docs_reference_url!("cli/")
+                ),
             ),
             // A record path is built from two operator-supplied segments, and both refuse here.
             // Kept off `E-CAP-009` on purpose: that one points at `capabilities.state.store` and
@@ -435,10 +456,13 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::InvalidConversationRecord { .. } => CliError::with_hint(
                 E_CAP_011,
                 error.to_string(),
-                "context.record_store names one directory under ~/.murmur/conversations/, and \
-                 --context names one directory beneath that, so each must be a single path \
-                 segment. Omit context.record_store to use the capsule name, and omit --context \
-                 to get a fresh id per task — see docs/content/reference/manifest.md",
+                concat!(
+                    "context.record_store names one directory under ~/.murmur/conversations/, and \
+                     --context names one directory beneath that, so each must be a single path \
+                     segment. Omit context.record_store to use the capsule name, and omit \
+                     --context to get a fresh id per task — see ",
+                    murmur_artifact::docs_reference_url!("manifest/#field-context")
+                ),
             ),
             // Both arms below are the same operator problem — a declared store that does not
             // resolve to a usable directory — so they share one code, and both hints point at the
@@ -447,17 +471,22 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::InvalidStateStore { .. } => CliError::with_hint(
                 E_CAP_009,
                 error.to_string(),
-                "capabilities.state.store names one directory under ~/.murmur/state/, so it must be a \
-                 single path segment: no '/', no '.' or '..', not absolute, and not starting \
-                 with a dot. Omit `store:` to use the capsule name — see \
-                 docs/content/reference/workdir.md",
+                concat!(
+                    "capabilities.state.store names one directory under ~/.murmur/state/, so it \
+                     must be a single path segment: no '/', no '.' or '..', not absolute, and not \
+                     starting with a dot. Omit `store:` to use the capsule name — see ",
+                    murmur_artifact::docs_reference_url!("workdir/#state-store")
+                ),
             ),
             error @ RuntimeError::StateStoreUnavailable { .. } => CliError::with_hint(
                 E_CAP_009,
                 error.to_string(),
-                "a capsule declaring capabilities.state needs a resolvable home directory: run with \
-                 HOME set to an absolute path, and make sure ~/.murmur/state/ can be created as \
-                 a 0700 directory — see docs/content/reference/workdir.md",
+                concat!(
+                    "a capsule declaring capabilities.state needs a resolvable home directory: run \
+                     with HOME set to an absolute path, and make sure ~/.murmur/state/ can be \
+                     created as a 0700 directory — see ",
+                    murmur_artifact::docs_reference_url!("workdir/#state-store")
+                ),
             ),
             // Delegate the message to the RuntimeError Display text so the declared/achieved
             // pair and the missing-mechanism reason cannot drift from capsule-runtime's
@@ -478,9 +507,12 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ExportRootOutsideWorkdir { .. } => CliError::with_hint(
                 E_CAP_007,
                 error.to_string(),
-                "point the export root at a directory inside the capsule workdir. A root \
-                 that already exists as a symlink out of the workdir is refused whole rather than \
-                 followed — see docs/content/reference/resource-plane.md",
+                concat!(
+                    "point the export root at a directory inside the capsule workdir. A root that \
+                     already exists as a symlink out of the workdir is refused whole rather than \
+                     followed — see ",
+                    murmur_artifact::docs_reference_url!("resource-plane/")
+                ),
             ),
             // The remedy is never "declare a longer handle lifetime", so the hint does not offer
             // one: a consumer that needs bytes after teardown wants the workdir read again, not a
@@ -488,11 +520,14 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::PersistentCapsuleNeedsHandleTtl { .. } => CliError::with_hint(
                 E_CAP_008,
                 error.to_string(),
-                "declare `exports.peer_files.max_ttl: 15m` or shorter, or drop \
-                 `lifecycle.after_task: sleep` so teardown bounds every handle instead. A \
-                 consumer that needs these bytes after the capsule is gone should have the \
-                 operator relaunch the runtime against the still-present workdir and request \
-                 again — see docs/content/reference/resource-plane.md",
+                concat!(
+                    "declare `exports.peer_files.max_ttl: 15m` or shorter, or drop \
+                     `lifecycle.after_task: sleep` so teardown bounds every handle instead. A \
+                     consumer that needs these bytes after the capsule is gone should have the \
+                     operator relaunch the runtime against the still-present workdir and request \
+                     again — see ",
+                    murmur_artifact::docs_reference_url!("resource-plane/")
+                ),
             ),
             // Distinct from E-CAP-003 above, and the remedies point in opposite directions: that
             // one means the host is too weak for the declared floor (lower it, or move hosts),
@@ -502,11 +537,14 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::StagedRuntimeRequiresSealed { .. } => CliError::with_hint(
                 E_CAP_004,
                 error.to_string(),
-                "set `capabilities.containment: sealed` in murmur.yaml (or pass \
-                 `--containment sealed`) so the capsule gets a composed root to stage the runtime \
-                 into, or remove the capabilities.shell.staged_runtime grant. Run `mur run \
-                 --explain-scope` to see the declared grants and whether this host can back \
-                 `sealed` — see docs/content/reference/containment.md",
+                concat!(
+                    "set `capabilities.containment: sealed` in murmur.yaml (or pass `--containment \
+                     sealed`) so the capsule gets a composed root to stage the runtime into, or \
+                     remove the capabilities.shell.staged_runtime grant. Run `mur run \
+                     --explain-scope` to see the declared grants and whether this host can back \
+                     `sealed` — see ",
+                    murmur_artifact::docs_reference_url!("containment/#field-staged-runtime")
+                ),
             ),
             // Sits next to E-CAP-004 and is deliberately not it: that one means a grant was
             // declared at too low a floor (raise the floor, or drop the grant), this one means the
@@ -516,22 +554,25 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ShellBinaryPackageUnreachable { .. } => CliError::with_hint(
                 E_CAP_006,
                 error.to_string(),
-                "if this command also has a module form, prefer it: allowlist the interpreter \
-                 and invoke the module through it — `python3 -m pytest` in place of `pytest` — \
-                 which runs the same code and needs no grant at all when the interpreter is the \
-                 distro's, because a `/usr/bin` interpreter already resolves under a fixed sealed \
-                 runtime path. `node`, `ruby` and `perl` all have the same form; murmur does not \
-                 check whether one exists here, so read the command's own docs. If it has none — \
-                 a wrapper script with no module entry point, or a case where that exact script \
-                 must run — declare `capabilities.shell.interpreter_runtime` (or \
-                 `staged_runtime`) for the interpreter named above, listing the directories its \
-                 import machinery actually reads: measure them on this host with \
-                 `strace -f -e trace=openat,getdents64 <the command>` rather than guessing, since \
-                 murmur deliberately does not try to derive an interpreted program's import \
-                 closure. Those directories are host-specific — \
-                 `/opt/venv/lib/python3.11/site-packages` on one image, a distro `dist-packages` \
-                 on the next — so declaring them ties the capsule to one image's layout. See \
-                 docs/content/reference/diagnostics.md",
+                format!(
+                    "if this command also has a module form, prefer it: allowlist the interpreter \
+                     and invoke the module through it — `python3 -m pytest` in place of `pytest` — \
+                     which runs the same code and needs no grant at all when the interpreter is \
+                     the distro's, because a `/usr/bin` interpreter already resolves under a fixed \
+                     sealed runtime path. `node`, `ruby` and `perl` all have the same form; murmur \
+                     does not check whether one exists here, so read the command's own docs. If it \
+                     has none — a wrapper script with no module entry point, or a case where that \
+                     exact script must run — declare `capabilities.shell.interpreter_runtime` (or \
+                     `staged_runtime`) for the interpreter named above, listing the directories \
+                     its import machinery actually reads: measure them on this host with `strace \
+                     -f -e trace=openat,getdents64 <the command>` rather than guessing, since \
+                     murmur deliberately does not try to derive an interpreted program's import \
+                     closure. Those directories are host-specific — \
+                     `/opt/venv/lib/python3.11/site-packages` on one image, a distro \
+                     `dist-packages` on the next — so declaring them ties the capsule to one \
+                     image's layout. See {}",
+                    murmur_artifact::diagnostic_link("E-CAP-006")
+                ),
             ),
             // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
             // with another: this one is not about the containment ladder at all. A network
@@ -543,9 +584,11 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::EgressNamespaceUnavailable { .. } => CliError::with_hint(
                 E_CAP_005,
                 error.to_string(),
-                "the refusal above names the exact remediation for this host. Run `mur doctor` \
-                 to see what this machine can back — see \
-                 docs/content/reference/network-namespace-egress-proxy-manual-verification.md",
+                format!(
+                    "the refusal above names the exact remediation for this host. Run `mur doctor` \
+                     to see what this machine can back — see {}",
+                    murmur_artifact::diagnostic_link("E-CAP-005")
+                ),
             ),
             // Delegate to the RuntimeError Display text so the versioned interface
             // name and rebuild hint can't drift from capsule-runtime's errors.rs.
@@ -646,20 +689,25 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::HarnessSessionGone { .. } => CliError::with_hint(
                 E_RUN_036,
                 error.to_string(),
-                "the harness no longer holds that conversation. murmur left the id where it is, \
-                 so the next task in this context fails the same way rather than answering from \
-                 nothing. Ask for it to be dropped and this context starts a new conversation: \
-                 `mur run --context <id> --forget-session`, or the header \
-                 `x-murmur-forget-session: true` on the next message/send or message/stream — see \
-                 docs/content/reference/cli.md",
+                concat!(
+                    "the harness no longer holds that conversation. murmur left the id where it \
+                     is, so the next task in this context fails the same way rather than answering \
+                     from nothing. Ask for it to be dropped and this context starts a new \
+                     conversation: `mur run --context <id> --forget-session`, or the header \
+                     `x-murmur-forget-session: true` on the next message/send or message/stream — \
+                     see ",
+                    murmur_artifact::docs_reference_url!("cli/")
+                ),
             ),
             error @ RuntimeError::ForgetSessionUnsupportedTransport { .. } => CliError::with_hint(
                 E_RUN_039,
                 error.to_string(),
-                "a harness owns the conversation only under inference.transport: process, so that \
-                 is the only transport with a session to forget; every other one keeps its \
-                 conversation record here, which `mur conversation rm` removes — see \
-                 docs/content/reference/cli.md",
+                concat!(
+                    "a harness owns the conversation only under inference.transport: process, so \
+                     that is the only transport with a session to forget; every other one keeps \
+                     its conversation record here, which `mur conversation rm` removes — see ",
+                    murmur_artifact::docs_reference_url!("cli/")
+                ),
             ),
             error @ RuntimeError::ProcessDriverCallFailed { .. } => CliError::with_hint(
                 E_RUN_034,
@@ -948,9 +996,11 @@ impl From<RosterRefusal> for CliError {
         let (code, hint) = match &refusal {
             RosterRefusal::Malformed { .. } => (
                 E_ROS_001,
-                "correct the key named above in roster.yaml — see docs/content/reference/roster.md \
-                 for every key, its type and whether it is required"
-                    .to_string(),
+                format!(
+                    "correct the key named above in roster.yaml — see {} for every key, its type \
+                     and whether it is required",
+                    murmur_artifact::docs_reference_url!("roster/#fields")
+                ),
             ),
             RosterRefusal::DuplicateMember { member } => (
                 E_ROS_003,

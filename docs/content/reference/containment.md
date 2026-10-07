@@ -674,7 +674,7 @@ ground.
 The rest of the test suite asserts the *decision* logic: which enforcement tier a probe resolves to,
 which containment class a tier achieves, that a zero limit value is rejected.
 
-### The escape-conformance harness
+### The escape-conformance harness { #the-escape-conformance-harness }
 
 [`crates/capsule-runtime/escape-conformance`](https://github.com/murmur-nexus/murmur/tree/main/crates/capsule-runtime/escape-conformance)
 drives a real capsule through a registry of escape probes and grades each verdict against what the

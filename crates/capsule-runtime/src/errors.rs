@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Where the reference docs state the cgroup delegation a subprocess-capable capsule needs on
+/// Linux, cited by [`RuntimeError::CgroupDelegationUnavailable`].
+const RESOURCE_LIMITS_PLATFORM_URL: &str =
+    murmur_artifact::docs_reference_url!("resource-limits/#platform-behavior");
+
 /// One `capabilities.shell.allow` entry that resolved to a script whose interpreter's package
 /// tree nothing declared could reach inside a `sealed` composed root.
 ///
@@ -478,7 +483,8 @@ pub enum RuntimeError {
         "this capsule can spawn native subprocesses but no cgroup v2 scope could be created to \
          bound them ({reason}); on Linux the runtime refuses to launch rather than run a \
          subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user \
-         delegation requirement in docs/content/reference/resource-limits-manual-verification.md"
+         delegation requirement at {}",
+        RESOURCE_LIMITS_PLATFORM_URL
     )]
     CgroupDelegationUnavailable { reason: String },
 
@@ -890,5 +896,22 @@ impl RuntimeError {
             path: path.display().to_string(),
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_delegation_refusal_links_the_published_platform_section() {
+        let message = RuntimeError::CgroupDelegationUnavailable { reason: "x".into() }.to_string();
+        assert!(message.contains("(x)"), "{message}");
+        assert!(
+            message
+                .contains("https://docs.murmur.nexus/reference/resource-limits/#platform-behavior"),
+            "{message}"
+        );
+        assert!(!message.contains("docs/content"), "{message}");
     }
 }

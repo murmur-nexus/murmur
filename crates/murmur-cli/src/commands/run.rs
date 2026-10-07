@@ -125,9 +125,12 @@ fn resolve_resume(
                 "cannot resume session {session}: its trace.jsonl records no task_start carrying \
                  a context id"
             ),
-            "only a session that actually ran a task has a conversation to continue. Run \
-             `mur trace show <session>` to see what it did, and resume one that reached a task \
-             — see docs/content/reference/cli.md",
+            concat!(
+                "only a session that actually ran a task has a conversation to continue. Run `mur \
+                 trace show <session>` to see what it did, and resume one that reached a task — \
+                 see ",
+                murmur_artifact::docs_reference_url!("cli/")
+            ),
         )
     })?;
     Ok((
@@ -312,9 +315,11 @@ pub(crate) fn run_run(
             CliError::with_hint(
                 E_RUN_015,
                 "--resume and --context name the same thing two ways",
-                "--resume <session> resolves that session's context id for you; --context <id> \
-                 names one directly. Pass whichever you have, not both — see \
-                 docs/content/reference/cli.md",
+                concat!(
+                    "--resume <session> resolves that session's context id for you; --context <id> \
+                     names one directly. Pass whichever you have, not both — see ",
+                    murmur_artifact::docs_reference_url!("cli/")
+                ),
             ),
             json,
         ));

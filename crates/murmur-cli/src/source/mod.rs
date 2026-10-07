@@ -105,11 +105,13 @@ const NOT_FOUND_HINT: &str = "check the name and version; the sources searched a
      registry.sources entries of the effective config, or name one directly with \
      mur install github:<owner>/<repo>@<tag>";
 
-const ANONYMOUS_RATE_LIMIT_HINT: &str = "set GITHUB_TOKEN to any GitHub token, for example \
-     `export GITHUB_TOKEN=$(gh auth token)`, or point the source's `token:` in config.yaml at a \
-     variable you already export, such as `token: ${GH_TOKEN}` — GitHub allows 60 unauthenticated \
-     API requests an hour and each artifact lookup can spend four; see \
-     docs/content/reference/installing-artifacts.md";
+const ANONYMOUS_RATE_LIMIT_HINT: &str = concat!(
+    "set GITHUB_TOKEN to any GitHub token, for example `export GITHUB_TOKEN=$(gh auth token)`, or \
+     point the source's `token:` in config.yaml at a variable you already export, such as `token: \
+     ${GH_TOKEN}` — GitHub allows 60 unauthenticated API requests an hour and each artifact lookup \
+     can spend four; see ",
+    murmur_artifact::docs_reference_url!("installing-artifacts/")
+);
 
 const TOKEN_RATE_LIMIT_HINT: &str = "the token sent with these requests has exhausted its own \
      GitHub rate limit; retry after the reset shown above";
@@ -625,7 +627,7 @@ mod tests {
             "gh auth token",
             "token: ${GH_TOKEN}",
             "60",
-            "installing-artifacts.md",
+            "https://docs.murmur.nexus/reference/installing-artifacts/",
         ] {
             assert!(hint.contains(needle), "{needle} missing from {hint}");
         }
