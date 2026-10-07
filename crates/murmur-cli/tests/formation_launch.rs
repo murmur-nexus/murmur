@@ -275,6 +275,7 @@ impl Project {
             .env_remove(capsule_runtime::formation::FORMATION_ID_ENV)
             .env_remove(capsule_runtime::formation::FORMATION_PEERS_ENV)
             .env_remove(capsule_runtime::FORMATION_CHANNEL_ENV)
+            .env_remove(capsule_runtime::HOST_WARNINGS_REPORTED_ENV)
             .env_remove("MURMUR_SPAWNER");
         command
     }
@@ -902,6 +903,46 @@ fn a_member_with_more_callers_than_it_holds_is_warned_about_and_still_launched()
     assert!(kinds.contains(&"task_end"), "{kinds:?}");
     assert_eq!(kinds.last(), Some(&"session_end"), "{kinds:?}");
     project.assert_no_member_remains(&[], Duration::from_secs(30));
+}
+
+/// A host-level warning is printed once per launch, by the launcher and unprefixed, however many
+/// members start; every member still records the host's grant in its `session_start`.
+#[test]
+fn a_formation_states_a_host_warning_once() {
+    let _lock = launch_lock();
+    let project = Project::new(&[CODER, REVIEWER, PLANNER], FULL_REACH);
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.release.send(()).unwrap();
+    assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
+
+    let stderr = launcher.stderr();
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("warning[W-SEC-013]"))
+        .collect();
+    let host_wide = capsule_runtime::detect_userns_grant()
+        == Some(capsule_runtime::UsernsGrant::RestrictionDisabledHostWide);
+    assert_eq!(warnings.len(), usize::from(host_wide), "{stderr}");
+    for line in warnings {
+        assert!(
+            line.starts_with("[capsule-runtime] warning[W-SEC-013]"),
+            "printed by the launcher, not relayed from a member: {line}"
+        );
+    }
+    for capsule in ["coder", "reviewer", "planner"] {
+        let start = &project.trace_of(capsule)[0];
+        assert_eq!(start["event_type"], "session_start", "{capsule}: {start}");
+        assert!(
+            start.get("userns_grant").is_some(),
+            "{capsule} records the host's grant: {start}"
+        );
+    }
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
 }
 
 /// Scenario 2: only the members the entry member may call are handed to it; every member is

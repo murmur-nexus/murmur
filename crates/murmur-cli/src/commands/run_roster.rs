@@ -84,6 +84,15 @@ pub(crate) fn run_roster(launch: RosterLaunch<'_>) -> Result<i32, CliError> {
         )
     })?;
 
+    // The host-level warnings, once for the whole formation and before any member starts: every
+    // member is started with `HOST_WARNINGS_REPORTED_ENV` set and does not repeat them. The
+    // launcher answers to the same variable as any other `mur run`.
+    if !capsule_runtime::host_warnings_reported() {
+        capsule_runtime::warn_on_userns_restriction_disabled_host_wide(
+            capsule_runtime::detect_userns_grant(),
+        );
+    }
+
     // Every return below runs the pass once, after every member of this launch is reaped: a
     // refused launch has stopped what it started, and `wait` stops every member before it returns.
     let mut formation = match formation_launch::launch_formation(&roster, options) {

@@ -276,12 +276,34 @@ pub fn scan(dir: &Path) -> Result<RecordScan, String> {
 /// `0700`, or listed — and names the path and the OS error. An empty machine is `Ok` with no
 /// records, so a caller can tell the two apart.
 pub fn list() -> Result<Vec<RunningRecord>, String> {
+    list_reporting().map(|listing| listing.records)
+}
+
+/// What [`list_reporting`] read, and what it removed on the way past.
+#[derive(Debug, Default)]
+pub struct RecordListing {
+    /// Every record that parses, most recent session first.
+    pub records: Vec<RunningRecord>,
+    /// Every `.json` file that could not be read or did not parse and that this read unlinked. A
+    /// file the unlink failed on is not here.
+    pub removed_unreadable: Vec<PathBuf>,
+}
+
+/// [`list`], also naming the unreadable files it removed, for a reader that reports its pruning.
+///
+/// The `Err` is [`list`]'s.
+pub fn list_reporting() -> Result<RecordListing, String> {
     let dir = running_dir()?;
     let scan = scan(&dir)?;
-    for path in &scan.unreadable {
-        let _ = std::fs::remove_file(path);
-    }
-    Ok(scan.records)
+    let removed_unreadable = scan
+        .unreadable
+        .into_iter()
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect();
+    Ok(RecordListing {
+        records: scan.records,
+        removed_unreadable,
+    })
 }
 
 /// What layers 1 and 2 say about the process a record names.

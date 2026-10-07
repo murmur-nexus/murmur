@@ -274,6 +274,9 @@ fn write_launched_member_record(
     fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 }
 
+/// A pid the kernel never hands out, so a record naming it is always pruned.
+const DEAD_PID: u32 = 0x7FFF_FFFE;
+
 /// A 36-character session id ending in `suffix`, so a fabricated record sorts predictably against
 /// its siblings.
 fn fabricated_id(suffix: &str) -> String {
@@ -439,9 +442,26 @@ fn ps_stdout(home: &Path) -> String {
     ps_output(home).0
 }
 
-/// A successful `mur ps`'s stdout and stderr. Stderr carries one `pruned:` line per record unlinked.
+/// A successful `mur ps`'s stdout and stderr. Stderr carries one line counting the records
+/// unlinked, when there were any.
 fn ps_output(home: &Path) -> (String, String) {
-    let output = mur(home).arg("ps").assert().success().get_output().clone();
+    ps_output_with(home, &[])
+}
+
+/// A successful `mur ps --verbose`'s stdout and stderr. Stderr carries one `pruned:` line per
+/// record unlinked.
+fn ps_output_verbose(home: &Path) -> (String, String) {
+    ps_output_with(home, &["--verbose"])
+}
+
+fn ps_output_with(home: &Path, args: &[&str]) -> (String, String) {
+    let output = mur(home)
+        .arg("ps")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -453,6 +473,20 @@ fn pruned_lines(stderr: &str) -> Vec<&str> {
     stderr
         .lines()
         .filter(|line| line.starts_with("pruned:"))
+        .collect()
+}
+
+/// The count line a default `mur ps` prints for `n` records unlinked.
+fn pruned_summary(n: usize) -> String {
+    let records = if n == 1 { "record" } else { "records" };
+    format!("pruned {n} stale {records}; mur ps --verbose names each")
+}
+
+/// Every `pruned <N> …` count line a `mur ps` stderr carries.
+fn pruned_summaries(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("pruned "))
         .collect()
 }
 
@@ -608,7 +642,7 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     let dead = fabricated_id("dead");
     let quiet = fabricated_id("beef");
     // A pid nothing holds: the kernel never hands this one out.
-    write_record(home.path(), &dead, "127.0.0.1:1", 0x7FFF_FFFE, "1");
+    write_record(home.path(), &dead, "127.0.0.1:1", DEAD_PID, "1");
     write_record(
         home.path(),
         &quiet,
@@ -622,7 +656,14 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     assert_eq!(rows.len(), 1, "expected one row in:\n{stdout}");
     assert!(rows[0].contains(&quiet), "{stdout}");
     assert!(rows[0].contains("unreachable"), "{stdout}");
+    assert_eq!(pruned_summaries(&stderr), [pruned_summary(1)], "{stderr}");
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    assert!(!record_for(home.path(), &dead).exists(), "the dead record");
 
+    write_record(home.path(), &dead, "127.0.0.1:1", DEAD_PID, "1");
+    let (verbose, stderr) = ps_output_verbose(home.path());
+    assert_eq!(ps_rows(&verbose), rows, "{verbose}");
+    assert!(pruned_summaries(&stderr).is_empty(), "{stderr}");
     let pruned = pruned_lines(&stderr);
     assert_eq!(pruned.len(), 1, "one unlink, one line: {stderr}");
     assert!(pruned[0].contains(&dead), "{stderr}");
@@ -643,7 +684,7 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     assert_eq!(ps_rows(&again).len(), 1, "{again}");
     assert!(again.contains(&quiet), "{again}");
     assert!(
-        pruned_lines(&again_stderr).is_empty(),
+        again_stderr.is_empty(),
         "nothing was left to prune: {again_stderr}"
     );
     assert!(stray.is_alive(), "`mur ps` must signal nothing");
@@ -665,6 +706,19 @@ fn ps_prunes_a_reused_pid_and_signals_nothing() {
     );
 
     let (stdout, stderr) = ps_output(home.path());
+    assert_eq!(stdout, "no running capsules\n");
+    assert_eq!(pruned_summaries(&stderr), [pruned_summary(1)], "{stderr}");
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    assert!(!record_for(home.path(), &session_id).exists());
+
+    write_record(
+        home.path(),
+        &session_id,
+        "127.0.0.1:1",
+        stray.pid(),
+        "deliberately-not-this-process",
+    );
+    let (stdout, stderr) = ps_output_verbose(home.path());
     assert_eq!(stdout, "no running capsules\n");
     assert!(
         stderr.contains(&format!("pruned: {session_id}")),
@@ -2137,7 +2191,7 @@ fn ps_counts_a_formations_pruned_and_unreachable_members() {
     write_member_record(
         home.path(),
         &dead,
-        0x7FFF_FFFE,
+        DEAD_PID,
         "1",
         Some(formation.as_str()),
         &root,
@@ -2160,6 +2214,22 @@ fn ps_counts_a_formations_pruned_and_unreachable_members() {
     );
 
     let (stdout, stderr) = ps_output(home.path());
+    assert_eq!(pruned_summaries(&stderr), [pruned_summary(1)], "{stderr}");
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    let summary = format!(
+        "formation {formation}: 2 listed (1 running, 1 unreachable), 1 pruned now; no other member found in 1 session root"
+    );
+    assert_eq!(summary_lines(&stdout), [summary.as_str()], "{stdout}");
+
+    write_member_record(
+        home.path(),
+        &dead,
+        DEAD_PID,
+        "1",
+        Some(formation.as_str()),
+        &root,
+    );
+    let (stdout, stderr) = ps_output_verbose(home.path());
     let pruned = pruned_lines(&stderr);
     assert_eq!(pruned.len(), 1, "{stderr}");
     assert!(
@@ -2180,16 +2250,11 @@ fn ps_counts_a_formations_pruned_and_unreachable_members() {
     assert!(rows[2].contains(&unrelated), "{stdout}");
     assert_eq!(formation_cell(rows[2]), "-");
 
-    assert_eq!(
-        summary_lines(&stdout),
-        [format!(
-            "formation {formation}: 2 listed (1 running, 1 unreachable), 1 pruned now; no other member found in 1 session root"
-        )]
-    );
+    assert_eq!(summary_lines(&stdout), [summary]);
 
     // The dead record went with the first read: a second neither lists nor prunes it.
     let (stdout, stderr) = ps_output(home.path());
-    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
     assert!(!stdout.contains(&dead), "{stdout}");
     assert_eq!(
         summary_lines(&stdout),
@@ -2217,7 +2282,15 @@ fn a_formation_is_accounted_for_after_its_members_end() {
 
     kill(killed.pid(), 9);
     killed.child.wait().unwrap();
+    let killed_record = record_for(home.path(), &killed.session_id());
+    let killed_bytes = fs::read(&killed_record).unwrap();
     let (_, stderr) = ps_output(home.path());
+    assert_eq!(pruned_summaries(&stderr), [pruned_summary(1)], "{stderr}");
+    assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
+    assert!(!killed_record.exists());
+
+    fs::write(&killed_record, &killed_bytes).unwrap();
+    let (_, stderr) = ps_output_verbose(home.path());
     let pruned = pruned_lines(&stderr);
     assert_eq!(pruned.len(), 1, "{stderr}");
     assert!(pruned[0].contains(&killed.session_id()), "{stderr}");
@@ -2498,4 +2571,236 @@ fn a_launcher_that_cannot_be_signalled_is_refused_and_no_member_is_signalled() {
     thread::sleep(Duration::from_millis(300));
     assert!(member.is_alive(), "the member was signalled");
     assert!(record_for(home.path(), &session_id).exists());
+}
+
+// ── Pruning summarised ────────────────────────────────────────────────────────
+
+/// Formations of dead members, in the order a verbose `mur ps` summarises them, each with its
+/// member count.
+struct StaleRecords {
+    formations: Vec<(capsule_runtime::FormationId, usize)>,
+    unreadable: Vec<PathBuf>,
+}
+
+/// 300 records naming a pid no process holds — 200 of them members of 60 formations, 100
+/// standalone — and 2 `.json` files that do not parse, beside whatever `home` already holds.
+fn write_stale_records(home: &Path, root: &Path) -> StaleRecords {
+    let mut formations = Vec::new();
+    let mut next = 1u32;
+    for index in 0..60 {
+        let formation = capsule_runtime::FormationId::mint();
+        let members = if index < 20 { 4 } else { 3 };
+        for _ in 0..members {
+            let session = fabricated_id(&format!("{next:x}"));
+            write_member_record(
+                home,
+                &session,
+                DEAD_PID,
+                "1",
+                Some(formation.as_str()),
+                root,
+            );
+            next += 1;
+        }
+        formations.push((formation, members));
+    }
+    for _ in 0..100 {
+        let session = fabricated_id(&format!("{next:x}"));
+        write_member_record(home, &session, DEAD_PID, "1", None, root);
+        next += 1;
+    }
+    // Session ids grow with `next`, and a formation is summarised by its newest member.
+    formations.reverse();
+    let unreadable: Vec<PathBuf> = ["garbage-a", "garbage-b"]
+        .iter()
+        .map(|name| running_dir(home).join(format!("{name}.json")))
+        .collect();
+    for path in &unreadable {
+        fs::write(path, "not a record").unwrap();
+    }
+    StaleRecords {
+        formations,
+        unreadable,
+    }
+}
+
+/// The `.json` files left in `home`'s record directory.
+fn record_files(home: &Path) -> Vec<PathBuf> {
+    fs::read_dir(running_dir(home))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect()
+}
+
+/// Hundreds of stale records are one line on stderr, and none of their formations reaches the
+/// listing; every one of them is gone afterwards.
+#[test]
+fn pruning_summary_counts_hundreds_of_stale_records_in_one_line() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let live = start_agent(&home, &server, "standalone");
+    let roots = tempfile::tempdir().unwrap();
+    write_stale_records(home.path(), roots.path());
+    assert_eq!(record_files(home.path()).len(), 303);
+
+    let (stdout, stderr) = ps_output(home.path());
+    assert_eq!(stderr, format!("{}\n", pruned_summary(302)));
+    assert!(!stdout.contains("FORMATION"), "{stdout}");
+    assert!(summary_lines(&stdout).is_empty(), "{stdout}");
+    let rows = ps_rows(&stdout);
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert!(rows[0].contains(&live.session_id()), "{stdout}");
+    assert_eq!(
+        record_files(home.path()),
+        [record_for(home.path(), &live.session_id())]
+    );
+
+    let (again, stderr) = ps_output(home.path());
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(ps_rows(&again), rows);
+}
+
+/// `--verbose` names every removal and summarises every formation a removed record names, in the
+/// words a default `mur ps` counts instead.
+#[test]
+fn pruning_summary_verbose_names_every_stale_record() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let live = start_agent(&home, &server, "standalone");
+    let roots = tempfile::tempdir().unwrap();
+    let stale = write_stale_records(home.path(), roots.path());
+
+    let (stdout, stderr) = ps_output_verbose(home.path());
+    assert!(pruned_summaries(&stderr).is_empty(), "{stderr}");
+    let pruned = pruned_lines(&stderr);
+    assert_eq!(pruned.len(), 302, "{stderr}");
+    let dead: Vec<&&str> = pruned
+        .iter()
+        .filter(|line| line.contains(&format!("no process holds pid {DEAD_PID}")))
+        .collect();
+    assert_eq!(dead.len(), 300, "{stderr}");
+    assert_eq!(
+        dead.iter()
+            .filter(|line| line.contains(" (formation frm_"))
+            .count(),
+        200,
+        "{stderr}"
+    );
+    for path in &stale.unreadable {
+        let line = format!("pruned: {} — not a readable record", path.display());
+        assert!(pruned.contains(&line.as_str()), "{line}\n{stderr}");
+    }
+
+    let header = stdout.lines().next().unwrap();
+    assert!(header.contains("FORMATION"), "{header}");
+    let rows = table_rows(&stdout);
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert!(rows[0].contains(&live.session_id()), "{stdout}");
+    assert_eq!(formation_cell(rows[0]), "-");
+    let summaries = summary_lines(&stdout);
+    assert_eq!(summaries.len(), 60, "{stdout}");
+    for (line, (formation, members)) in summaries.iter().zip(&stale.formations) {
+        assert!(
+            line.starts_with(&format!(
+                "formation {formation}: 0 listed, {members} pruned now; "
+            )),
+            "{line}"
+        );
+    }
+    assert_eq!(record_files(home.path()).len(), 1);
+}
+
+/// A formation with a listed member keeps its summary line and its pruned count by default; one
+/// known only from pruned records gets none.
+#[test]
+fn pruning_summary_keeps_a_listed_formations_line() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let listed = capsule_runtime::FormationId::mint();
+    let gone = capsule_runtime::FormationId::mint();
+    let project = Arc::new(agent_project(&server.endpoint, "member", ""));
+    let live = start_member(&home, &project, listed.as_str());
+    let root = session_root(&live);
+    let dead_member = fabricated_id("dead");
+    let dead_elsewhere = fabricated_id("beef");
+    write_member_record(
+        home.path(),
+        &dead_member,
+        DEAD_PID,
+        "1",
+        Some(listed.as_str()),
+        &root,
+    );
+    write_member_record(
+        home.path(),
+        &dead_elsewhere,
+        DEAD_PID,
+        "1",
+        Some(gone.as_str()),
+        &root,
+    );
+
+    let (stdout, stderr) = ps_output(home.path());
+    assert_eq!(stderr, format!("{}\n", pruned_summary(2)));
+    let header = stdout.lines().next().unwrap();
+    assert!(header.contains("FORMATION"), "{header}");
+    let rows = table_rows(&stdout);
+    assert_eq!(rows.len(), 1, "{stdout}");
+    assert_eq!(formation_cell(rows[0]), listed.as_str());
+    let summaries = summary_lines(&stdout);
+    assert_eq!(summaries.len(), 1, "{stdout}");
+    assert!(
+        summaries[0].starts_with(&format!(
+            "formation {listed}: 1 listed (1 running), 1 pruned now; "
+        )),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(gone.as_str()), "{stdout}");
+}
+
+/// With nothing stale, neither mode says anything about pruning; `--help` says listing prunes;
+/// an unreadable record directory is `E-RUN-028` in both modes.
+#[test]
+fn pruning_summary_is_silent_with_nothing_stale() {
+    let server = common::ScriptedServer::start(Vec::new());
+    let home = driver_home();
+    let _live = start_agent(&home, &server, "standalone");
+    let (_, stderr) = ps_output(home.path());
+    assert!(stderr.is_empty(), "{stderr}");
+    let (_, stderr) = ps_output_verbose(home.path());
+    assert!(stderr.is_empty(), "{stderr}");
+
+    let help = mur(home.path())
+        .args(["ps", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8_lossy(&help).to_string();
+    assert!(
+        help.contains("Listing also removes the record of every capsule whose process is gone"),
+        "{help}"
+    );
+    assert!(help.contains("--verbose"), "{help}");
+
+    for args in [&["ps"][..], &["ps", "--verbose"][..]] {
+        let unreadable = tempfile::tempdir().unwrap();
+        let murmur = unreadable.path().join(".murmur");
+        fs::create_dir(&murmur).unwrap();
+        fs::write(running_dir(unreadable.path()), "not a directory\n").unwrap();
+        let output = mur(unreadable.path())
+            .args(args)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(stderr.contains("E-RUN-028"), "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
 }

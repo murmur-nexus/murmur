@@ -463,7 +463,16 @@ enum Commands {
         command: ControlCommand,
     },
     /// List the capsules running on this machine
-    Ps,
+    ///
+    /// Listing also removes the record of every capsule whose process is gone, and of every
+    /// record file that cannot be read: the record directory is a hint, and the listing is what
+    /// keeps it true. One stderr line counts what was removed; --verbose names each.
+    Ps {
+        /// Name every record removed because its capsule is gone, and summarise formations known
+        /// only from removed records
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Print a door token of a running capsule
     Token {
         /// Running session: @1, a ses_ id, or a 4-character suffix of one (default: @1)
@@ -814,7 +823,7 @@ fn main() {
         } => cancel_arguments(session, task_id, url)
             .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
         Commands::Control { command } => run_control(command),
-        Commands::Ps => run_ps(),
+        Commands::Ps { verbose } => run_ps(verbose),
         Commands::Token {
             session,
             credential,

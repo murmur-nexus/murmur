@@ -1367,6 +1367,10 @@ launcher's stderr behind a `[<member>] ` prefix:
 The entry member writes to the launcher's own stdout and stderr, unprefixed, and stays in the
 launcher's process group, so `^C` at a terminal reaches it as it reaches a hand-run `mur run`.
 
+A warning about the host rather than a member, [`W-SEC-013`](diagnostics.md#w-sec-013), is printed
+once by the launcher, unprefixed, after the roster is admitted and before any member starts. No
+member repeats it.
+
 | The launcher | Exits with |
 |---|---|
 | The entry member's process ended | The entry member's exit code, or 128 plus the signal that ended it |
@@ -1393,12 +1397,16 @@ unchanged. See [Removing formation directories](roster.md#formation-retention).
 List the capsules running on this machine, with the address each one answers on.
 
 ```bash
-mur ps
+mur ps [--verbose]
 ```
 
-`mur ps` takes no arguments. It is host-scoped, exactly like `docker ps`: a capsule deployed onto
-another machine writes its [record](#running-capsule-records) on *that* machine, so it is that
-machine's `mur ps` that lists it.
+| Flag | Default | Description |
+|---|---|---|
+| `--verbose` | off | Name every record the listing removes, one line each, and add a summary line for every formation known only from removed records |
+
+`mur ps` is host-scoped, exactly like `docker ps`: a capsule deployed onto another machine writes
+its [record](#running-capsule-records) on *that* machine, so it is that machine's `mur ps` that
+lists it.
 
 | Column | Width | Carries |
 |---|---|---|
@@ -1407,7 +1415,7 @@ machine's `mur ps` that lists it.
 | `STATUS` | 12 | `running` or `unreachable` |
 | `DETACHED` | 8 | `yes` when the capsule outlives the window that launched it, `no` when it dies with it |
 | `UPTIME` | 9 | `HH:MM:SS` since the session started, prefixed `Nd ` past a day |
-| `FORMATION` | 36 | The full formation id of a [member](#mur-run-formation), `-` for a session in no formation. Present only when [a formation is listed](#mur-ps-formations) |
+| `FORMATION` | 36 | The full formation id of a [member](#mur-run-formation), `-` for a session in no formation. Present only when [a record that keys the listing names a formation](#mur-ps-formations) |
 | `URL` | — | The `host:port` the capsule's A2A door is bound to |
 
 ```text
@@ -1427,17 +1435,26 @@ same way. A `~/.murmur/running/` that cannot be read — a file where the direct
 directory this user may not list — is neither: `mur ps` prints nothing on stdout and fails with
 [`E-RUN-028`](diagnostics.md#e-run-028).
 
-Every record `mur ps` removes because its process is gone is named on stderr, one line each. A
-file in the directory that is not a readable record is removed without a line.
+Listing also prunes the directory: `mur ps` removes the record of every capsule whose process is
+gone, and every file in the directory that is not a readable record. What it removed is printed on
+stderr, before the table. A read that removes nothing prints nothing on stderr.
+
+| Mode | Stderr |
+|---|---|
+| Default | One line counting every removal |
+| `--verbose` | One `pruned:` line per removal |
+
+```text
+pruned 302 stale records; mur ps --verbose names each
+```
+
+With `--verbose`, a removed record names its session and the [reason](#mur-ps-verification), a
+formation member's line ends with its formation, and an unreadable file is named by its path:
 
 ```text
 pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce2 — no process holds pid 48213
-```
-
-A pruned record of a formation member names its formation at the end of the line:
-
-```text
-pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce2 — no process holds pid 48213 (formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61)
+pruned: ses_019f0193c7d871a5b2e30ff41a7c0ce3 — no process holds pid 48214 (formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61)
+pruned: /home/me/.murmur/running/ses_019f0193c7d871a5b2e30ff41a7c0ce4.json — not a readable record
 ```
 
 Exit codes:
@@ -1474,16 +1491,21 @@ past the first row count `@N` by session id, not by row.
 
 ### Formations { #mur-ps-formations }
 
-When any record `mur ps` lists or prunes carries a formation id, the listing changes in three ways.
+When a record that keys the listing carries a formation id, the listing changes in three ways.
 When none does, the output is the plain listing above.
+
+| Mode | Records that key the listing |
+|---|---|
+| Default | Every listed record |
+| `--verbose` | Every listed record, and every record this read pruned |
 
 1. The `FORMATION` column appears between `UPTIME` and `URL`.
 2. Rows are grouped. A formation's listed members form one group, and a session in no formation
    is a group of one. Groups are ordered by their newest session, newest first, and rows within a
    group by session id descending. The first row is still the newest session.
 3. After the table — or after `no running capsules` — come a blank line and one summary line per
-   formation: listed formations in row order, then formations known only from records pruned in
-   this read.
+   formation: listed formations in row order, then, with `--verbose`, formations known only from
+   records pruned in this read.
 
 ```text
 SESSION                               CAPSULE                   STATUS        DETACHED  UPTIME     FORMATION                             URL
