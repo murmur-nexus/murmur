@@ -590,10 +590,11 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
     // (b)
     {
         let lead = Model::new(|n| match n {
-            1 => call_members(&[("worker", "take your time")]),
-            _ => end_turn(n, "waiting on worker"),
+            1 => call_members(&[("a", "answer at once"), ("b", "take your time")]),
+            _ => end_turn(n, "waiting on b"),
         });
-        let (worker, _never) = Model::held("too late");
+        let (a, release_a) = Model::held("A-ANSWER");
+        let (b, _never) = Model::held("too late");
         let project = Project::new(
             vec![
                 Member {
@@ -604,25 +605,35 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
                     model: lead,
                 },
                 Member {
-                    name: "worker",
+                    name: "a",
                     entry: false,
                     allow: None,
                     max_turns: None,
-                    model: worker,
+                    model: a,
+                },
+                Member {
+                    name: "b",
+                    entry: false,
+                    allow: None,
+                    max_turns: None,
+                    model: b,
                 },
             ],
-            "reachability:\n  - from: lead\n    to: [worker]\n",
+            "reachability:\n  - from: lead\n    to: [a, b]\n",
         );
 
         let _lock = launch_lock();
-        let mut launcher = project.launch("call worker", &[]);
+        let mut launcher = project.launch("call a and b", &[]);
         let formation = launcher.next_json().1;
         let formation_id = formation["formation_id"].as_str().unwrap().to_string();
         let readiness = launcher.next_json().1;
         project.await_requests("lead", 2);
-        project.await_requests("worker", 1);
-        // Lead's attempt has ended; it is waiting on worker.
-        thread::sleep(Duration::from_millis(500));
+        project.await_requests("a", 1);
+        project.await_requests("b", 1);
+        // Lead's attempt has ended; it is waiting on both. a's answer arrives and is held for the
+        // round, which b never lets end.
+        release_a.send(()).unwrap();
+        thread::sleep(Duration::from_millis(1500));
         launcher.signal(libc::SIGTERM);
         let status = launcher.wait();
         assert_eq!(status.code(), Some(143), "stderr:\n{}", launcher.stderr());
@@ -632,13 +643,24 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
             Duration::from_secs(30),
         );
 
+        assert_eq!(project.model("lead").arrived(), 2);
         let lead_trace = project.trace_of(&formation_id, "lead");
         let ends = records(&lead_trace, "member_call");
-        assert_eq!(ends.len(), 1, "{lead_trace:?}");
-        assert_eq!(ends[0]["status"], "abandoned");
-        assert_eq!(ends[0]["delivered"], false);
+        assert_eq!(ends.len(), 2, "{lead_trace:?}");
+        let end_of = |member: &str| {
+            *ends
+                .iter()
+                .find(|end| end["member"] == member)
+                .unwrap_or_else(|| panic!("no member_call for {member}: {lead_trace:?}"))
+        };
+        assert_eq!(end_of("a")["status"], "completed");
+        assert_eq!(end_of("a")["delivered"], false);
+        assert_eq!(end_of("b")["status"], "abandoned");
+        assert_eq!(end_of("b")["delivered"], false);
+        assert!(records(&lead_trace, "task_continued").is_empty());
         // Every trace the formation wrote parses line by line.
-        let _ = project.trace_of(&formation_id, "worker");
+        let _ = project.trace_of(&formation_id, "a");
+        let _ = project.trace_of(&formation_id, "b");
     }
 }
 
@@ -698,6 +720,245 @@ fn a_call_left_out_on_the_last_turn_is_abandoned_without_waiting() {
     assert_eq!(ends.len(), 1, "{lead_trace:?}");
     assert_eq!(ends[0]["status"], "abandoned");
     assert_eq!(ends[0]["delivered"], false);
+    assert!(records(&lead_trace, "task_continued").is_empty());
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
+// ── One continuation per round ───────────────────────────────────────────────
+
+/// A member that answers its first request with `reply` without waiting.
+fn answering(reply: &'static str) -> Model {
+    Model::new(move |n| end_turn(n, reply))
+}
+
+/// A scripted lead that calls `calls` in its first reply and ends every later turn, with the
+/// instant each of its requests arrived.
+fn timed_lead(calls: &'static [(&'static str, &'static str)]) -> (Model, Arc<Mutex<Vec<Instant>>>) {
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&arrivals);
+    let model = Model::new(move |n| {
+        seen.lock().unwrap().push(Instant::now());
+        match n {
+            1 => call_members(calls),
+            _ => end_turn(n, "answered"),
+        }
+    });
+    (model, arrivals)
+}
+
+/// The one `task_continued` record of `trace`, after every `member_call` line, each of which says
+/// its answer was delivered.
+fn the_one_continuation(trace: &[Value]) -> &Value {
+    let continued = records(trace, "task_continued");
+    assert_eq!(continued.len(), 1, "{trace:?}");
+    let at = |record: &Value| trace.iter().position(|line| line == record).unwrap();
+    for end in records(trace, "member_call") {
+        assert_eq!(end["delivered"], true, "{end}");
+        assert!(at(end) < at(continued[0]), "{trace:?}");
+    }
+    continued[0]
+}
+
+/// Lead calls three members in one reply and ends its turn; the answers land at least a second
+/// apart. Lead is continued once, with all three, and finishes within three turns.
+#[test]
+fn a_staggered_fan_out_reaches_the_lead_in_one_continuation() {
+    let (lead, _) = timed_lead(&[("w1", "one"), ("w2", "two"), ("w3", "three")]);
+    let mut releases = Vec::new();
+    let mut members = vec![Member {
+        name: "lead",
+        entry: true,
+        allow: Some("localhost"),
+        max_turns: Some(3),
+        model: lead,
+    }];
+    for (name, answer) in [
+        ("w1", "W1-ANSWER"),
+        ("w2", "W2-ANSWER"),
+        ("w3", "W3-ANSWER"),
+    ] {
+        let (model, release) = Model::held(answer);
+        releases.push(release);
+        members.push(Member {
+            name,
+            entry: false,
+            allow: None,
+            max_turns: None,
+            model,
+        });
+    }
+    let project = Project::new(
+        members,
+        "reachability:\n  - from: lead\n    to: [w1, w2, w3]\n",
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch("ask w1, w2 and w3", &[]);
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    project.await_requests("lead", 2);
+    for worker in ["w1", "w2", "w3"] {
+        project.await_requests(worker, 1);
+    }
+    for (index, release) in releases.iter().enumerate() {
+        if index > 0 {
+            thread::sleep(Duration::from_millis(1100));
+        }
+        release.send(()).unwrap();
+    }
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let requests = project.model("lead").requests();
+    assert_eq!(requests.len(), 3);
+    let continued = requests[2].to_string();
+    for (member, answer) in [
+        ("w1", "W1-ANSWER"),
+        ("w2", "W2-ANSWER"),
+        ("w3", "W3-ANSWER"),
+    ] {
+        let fenced = format!("<untrusted-content source=member:{member}>\\n{answer}");
+        assert!(continued.contains(&fenced), "{member}: {continued}");
+    }
+    assert!(
+        continued.contains("Every call this task made has ended"),
+        "{continued}"
+    );
+    assert!(!continued.contains("Still working"), "{continued}");
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let continuation = the_one_continuation(&lead_trace);
+    assert_eq!(continuation["continuation_number"], 1);
+    assert_eq!(continuation["delegations"], json!([]));
+    assert_eq!(continuation["turns_remaining"], 1);
+    let mut delivered: Vec<&str> = continuation["member_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    delivered.sort_unstable();
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 3, "{lead_trace:?}");
+    let mut called: Vec<&str> = ends
+        .iter()
+        .map(|end| end["call_id"].as_str().unwrap())
+        .collect();
+    called.sort_unstable();
+    assert_eq!(delivered, called);
+    assert!(ends.iter().all(|end| end["status"] == "completed"));
+    assert!(
+        !serde_json::to_string(&lead_trace)
+            .unwrap()
+            .contains("max_turns_reached"),
+        "{lead_trace:?}"
+    );
+
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+}
+
+/// One member answers at once and the other never does: lead is continued once, when the silent
+/// member's call reaches its deadline, with both outcomes.
+#[test]
+fn a_member_that_never_answers_holds_the_round_until_its_deadline() {
+    let (lead, arrivals) = timed_lead(&[("fast", "answer at once"), ("stuck", "never mind")]);
+    let (stuck, _never) = Model::held("too late");
+    let project = Project::new(
+        vec![
+            Member {
+                name: "lead",
+                entry: true,
+                allow: Some("localhost"),
+                max_turns: None,
+                model: lead,
+            },
+            Member {
+                name: "fast",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: answering("FAST-ANSWER"),
+            },
+            Member {
+                name: "stuck",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: stuck,
+            },
+        ],
+        "reachability:\n  - from: lead\n    to: [fast, stuck]\n",
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch(
+        "ask fast and stuck",
+        &[(
+            capsule_runtime::delegation_plane::DELEGATION_TIMEOUT_ENV,
+            "2",
+        )],
+    );
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+    project.await_requests("lead", 3);
+    let status = launcher.wait();
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", launcher.stderr());
+
+    let requests = project.model("lead").requests();
+    assert_eq!(requests.len(), 3);
+    let continued = requests[2].to_string();
+    assert!(
+        continued.contains("<untrusted-content source=member:fast>\\nFAST-ANSWER"),
+        "{continued}"
+    );
+    assert!(
+        continued.contains(" to fast ended completed:"),
+        "{continued}"
+    );
+    assert!(
+        continued.contains(" to stuck ended timed_out, with no answer from stuck:"),
+        "{continued}"
+    );
+    // The call's deadline runs from its start, a few milliseconds before the second request.
+    let arrivals = arrivals.lock().unwrap().clone();
+    let held = arrivals[2] - arrivals[1];
+    assert!(
+        held >= Duration::from_millis(1500),
+        "lead was continued {held:?} after ending its turn, before stuck's deadline"
+    );
+
+    let lead_trace = project.trace_of(&formation_id, "lead");
+    let continuation = the_one_continuation(&lead_trace);
+    let ends = records(&lead_trace, "member_call");
+    assert_eq!(ends.len(), 2, "{lead_trace:?}");
+    for end in &ends {
+        let expected = if end["member"] == "fast" {
+            "completed"
+        } else {
+            "timed_out"
+        };
+        assert_eq!(end["status"], expected, "{end}");
+        assert!(
+            continuation["member_calls"]
+                .as_array()
+                .unwrap()
+                .contains(&end["call_id"]),
+            "{continuation}"
+        );
+    }
+    assert_eq!(continuation["member_calls"][0], ends[0]["call_id"]);
+    assert!(continuation["waited_ms"].as_u64().unwrap() >= 1500);
+
     assert_no_member_remains(
         project.path(),
         &reported_pids(&formation, Some(&readiness)),

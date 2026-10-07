@@ -31,7 +31,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 |---|---|
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
-| `task_end`, `task_reopened`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
+| `task_end`, `task_reopened`, `task_continued`, `task_canceled`, `task_failed`, `context_seed` | The task node, or the session node for a `task_failed` written outside any task |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied`, `tool_input_refused`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
@@ -780,6 +780,30 @@ the reopen is granted
 Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full
 mechanism.
+
+**`task_continued`**{ #task-continued } — written once per continuation with handed-off work's
+outcomes: the task's attempt ended with a turn left, the task waited until no
+[`call-member`](runtime-provided-tools.md#call-member-answer) call and no
+[`delegate-task`](roost-api.md#how-the-outcome-arrives) delegation was outstanding, and the next
+attempt receives every answer and outcome in one message
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task that continues |
+| `continuation_number` | u32 | 1-based ordinal of this continuation within the task, counted across reopens |
+| `member_calls` | string[] | The `mcl_` id of every call whose outcome this continuation delivers, in arrival order. `[]` when it delivers none |
+| `delegations` | string[] | The `dlg_` id of every delegation whose outcome this continuation delivers — arrived, or ended by the backstop — in id order. `[]` when it delivers none |
+| `waited_ms` | u64 | How long the task waited, from its attempt's end until nothing was outstanding |
+| `turns_remaining` | u32 | Turns the continued attempt is handed: `inference.max_turns` less every turn the task's attempts have spent |
+
+```json
+{"event_type":"task_continued","event_id":"evt_0193…","parent_id":"evt_0192…","session_id":"ses_0192…","timestamp":1791273600000,"task_id":"tsk_0192…","continuation_number":1,"member_calls":["mcl_01a1…","mcl_01a2…","mcl_01a3…"],"delegations":[],"waited_ms":12210,"turns_remaining":8}
+```
+
+Written after the round's `member_call` and `delegation` lines and before the continued attempt's
+first `inference`. Not written when the task is cancelled while it waits, when the attempt ended any
+other way, or when no turn is left. `mur trace show` counts these lines under **Turns** as
+`continued:  <N>  (<A> member answer(s), <D> delegation outcome(s))`.
 
 **`call_denied`**{ #call-denied } — written when a [policy hook](../concepts/hooks.md#policy-hooks)
 refuses a shell command or tool call before it runs

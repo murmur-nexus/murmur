@@ -2083,19 +2083,41 @@ fn three_delegations_leave_one_turn_and_every_outcome_arrives_before_the_task_en
         }
     }
 
-    // Every outcome reached the model exactly once, across however many continuations it took.
+    // The task waited for all three and continued once, after every terminal line, naming them.
+    let continued: Vec<(usize, &Value)> = trace
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event_type"] == "task_continued")
+        .collect();
+    assert_eq!(continued.len(), 1, "{trace:?}");
+    let (continued_at, continued) = continued[0];
+    assert_eq!(continued["continuation_number"], 1, "{continued}");
+    assert_eq!(continued["member_calls"], json!([]), "{continued}");
+    assert_eq!(continued["delegations"], json!(distinct), "{continued}");
+    for (index, event) in trace.iter().enumerate() {
+        if event["event_type"] == "delegation" {
+            assert!(index < continued_at, "{event} after the continuation");
+        }
+    }
+    assert_eq!(trace[task_end]["exit_status"], "ok", "{trace:?}");
+
+    // Every outcome reached the model exactly once, all in one continuation.
     let continuations = parent.outcome_messages();
-    assert!(
-        !continuations.is_empty() && continuations.len() <= 3,
+    assert_eq!(continuations.len(), 1, "{continuations:?}");
+    for id in &distinct {
+        assert_eq!(
+            continuations[0]
+                .matches(&format!("{OUTCOME_OPENING}{id} "))
+                .count(),
+            1,
+            "{id} in {continuations:?}"
+        );
+    }
+    assert_eq!(
+        continuations[0].matches(" ended ok:\n").count(),
+        3,
         "{continuations:?}"
     );
-    for id in &distinct {
-        let named = continuations
-            .iter()
-            .map(|text| text.matches(&format!("{OUTCOME_OPENING}{id} ")).count())
-            .sum::<usize>();
-        assert_eq!(named, 1, "{id} in {continuations:?}");
-    }
     assert_no_completion_task(&parent);
 }
 
