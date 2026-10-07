@@ -833,7 +833,15 @@ error[E-RUN-040]: the task ended failed: {"error":"driver: failed to parse Anthr
 | `failed` | The `reason` of the run's [`task_failed`](observability-schemas.md#task-failed) line, whose `cause` names the kind of failure |
 | `max_turns_reached` | That the task used every turn `inference.max_turns` allows |
 | `spend_ceiling_reached` | That a spend ceiling refused the next inference call. The [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line names which ceiling and the numbers |
-| `canceled` | That the task was canceled, by `tasks/cancel`, `session/stop`, `mur stop` or `SIGTERM` |
+| `canceled` | That the task was canceled, by `tasks/cancel`, `session/stop`, `mur stop`, `SIGTERM` or the end of the session that delegated it. A task canceled by its formation's end is no error: the member ends [`formation_ended`](cli.md#mur-run-status) |
+
+For `canceled` the hint says there is no result to read:
+
+```text
+status:  canceled
+error[E-RUN-040]: the task ended canceled: the task was canceled
+  hint: the task was canceled before it completed, so out/result.txt holds no result; `mur trace show <session>` shows the turn it was canceled on and why
+```
 
 A launch reports the first task that did not complete; a later run that completed does not replace
 it. See [Status and exit code](cli.md#mur-run-status). Under `--json` no `status:` line is printed,

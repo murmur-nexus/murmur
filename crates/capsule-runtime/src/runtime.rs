@@ -99,9 +99,9 @@ use crate::{
     tool_call_progress::ToolCallProgress,
     trace::TraceWriter,
     types::{
-        ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
-        ResolvedLockArtifact, ResumeMode, ResumeRequest, StageRequest, StagedHookArtifact,
-        StagedProcessDriver, StagedSession,
+        ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchEnding,
+        LaunchResult, ResolvedLockArtifact, ResumeMode, ResumeRequest, StageRequest,
+        StagedHookArtifact, StagedProcessDriver, StagedSession,
     },
 };
 
@@ -610,6 +610,8 @@ async fn run_task_with_reopens(
                     state,
                     hooks,
                     trace,
+                    workdir,
+                    &mode,
                     trace_task_id,
                     "reopen_budget_exhausted",
                     reopens_used,
@@ -631,6 +633,8 @@ async fn run_task_with_reopens(
                     state,
                     hooks,
                     trace,
+                    workdir,
+                    &mode,
                     trace_task_id,
                     exit_str,
                     reopens_used,
@@ -654,11 +658,17 @@ async fn run_task_with_reopens(
 /// An accepted `tasks/cancel` the loop did not observe has already recorded `canceled`, which
 /// [`TaskRegistry::finish_task`] keeps; the frame then says `canceled` too, so it never disagrees
 /// with `tasks/get`.
+///
+/// A task that ends `canceled`, after that override, gets [`write_canceled_result`] in `workdir`
+/// before its final frame, so a client that reads `out/result.txt` on seeing the frame finds the
+/// marker rather than an earlier attempt's text.
 #[allow(clippy::too_many_arguments)]
 async fn end_task(
     state: &CapsuleStoreState,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
+    workdir: &Path,
+    mode: &ConversationMode,
     trace_task_id: &str,
     exit_status: &str,
     reopens_used: u32,
@@ -673,6 +683,9 @@ async fn end_task(
     hooks.end_task();
     let _ = trace.flush().await;
     let Some(task_id) = agent_task_id else {
+        if ending.state == TaskState::Canceled {
+            write_canceled_result(workdir, mode, None);
+        }
         return;
     };
     // The ending `tasks/get` reports is recorded under the lock the terminal state is, after the
@@ -701,6 +714,9 @@ async fn end_task(
             ending
         }
     };
+    if ending.state == TaskState::Canceled {
+        write_canceled_result(workdir, mode, Some(task_id));
+    }
     emit_sse(
         sse,
         StreamFrame::Status,
@@ -717,6 +733,30 @@ async fn end_task(
         },
     )
     .await;
+}
+
+/// Write [`crate::cancel::CANCELED_RESULT_TEXT`] to the session's `out/result.txt`, and, under
+/// `lifecycle.conversation: threaded` with an A2A task id, to `out/result_<task_id>.txt`.
+///
+/// Through [`agent::write_result`] rather than the task-output funnel: the cancelled attempt's
+/// task-io output was cleared when the attempt began, and stays unset. A failed write is reported
+/// on stderr and in the bootstrap log, and changes nothing about the task's ending.
+fn write_canceled_result(workdir: &Path, mode: &ConversationMode, task_id: Option<&str>) {
+    let text = crate::cancel::CANCELED_RESULT_TEXT;
+    let mut failures = Vec::new();
+    if let Err(error) = agent::write_result(workdir, text) {
+        failures.push(error);
+    }
+    if let (ConversationMode::Threaded, Some(task_id)) = (mode, task_id) {
+        if let Err(error) = agent::write_result_for_task(workdir, task_id, text) {
+            failures.push(error);
+        }
+    }
+    for error in failures {
+        let message = format!("[capsule-runtime] cancelled task's result marker: {error}");
+        crate::runtime_err!("{message}");
+        agent::append_bootstrap_log(workdir, &message);
+    }
 }
 
 /// Why a reopen a hook asked for was refused, naming the limit that refused it. The two limits
@@ -1235,6 +1275,10 @@ struct LaunchOutcome {
     result: Result<AgentLoopExit, RuntimeError>,
     /// The `task_failed` reason the run behind `result` wrote, or `None` when it wrote none.
     failure_reason: Option<String>,
+    /// Whether the session's formation ended while it was running a task, and the wind-down
+    /// cancelled that task. Such a run is not folded into `result`: the launch ends
+    /// `formation_ended` rather than `canceled` unless an earlier run already decided otherwise.
+    formation_ended: bool,
 }
 
 impl LaunchOutcome {
@@ -1243,6 +1287,36 @@ impl LaunchOutcome {
         Self {
             result: Ok(AgentLoopExit::Ok),
             failure_reason: None,
+            formation_ended: false,
+        }
+    }
+
+    /// Fold in a run the session's termination may have cancelled: the launch's own task, which
+    /// only the termination cancels, or the task a terminating session was running.
+    /// `ended_by_formation` says the formation's end began the termination: a run that ended
+    /// `canceled` is then that end's doing, and is recorded as the formation ending rather than
+    /// folded in as a cancel. Every other run, and every run under any other cause, is folded in
+    /// by [`Self::record`].
+    fn record_terminated(
+        &mut self,
+        result: Result<AgentLoopExit, RuntimeError>,
+        ended_by_formation: bool,
+        trace: &TraceWriter,
+        failures_before: u64,
+    ) {
+        if ended_by_formation && matches!(result, Ok(AgentLoopExit::Canceled)) {
+            self.formation_ended = true;
+        } else {
+            self.record(result, trace, failures_before);
+        }
+    }
+
+    /// How a launch whose every folded run completed ended.
+    fn ending(&self) -> LaunchEnding {
+        if self.formation_ended {
+            LaunchEnding::FormationEnded
+        } else {
+            LaunchEnding::Completed
         }
     }
 
@@ -1267,16 +1341,18 @@ impl LaunchOutcome {
     /// The `exit_status` vocabulary `session_end` and `on-session-end` carry.
     fn exit_status(&self) -> &'static str {
         match &self.result {
+            Ok(AgentLoopExit::Ok) => self.ending().as_str(),
             Ok(exit) => exit.as_str(),
             Err(_) => AgentLoopExit::Failed.as_str(),
         }
     }
 
-    /// `Ok(())` only for a launch whose every run completed.
-    fn into_launch_result(self) -> Result<(), RuntimeError> {
+    /// `Ok` only for a launch whose every folded run completed, carrying how it ended.
+    fn into_launch_result(self) -> Result<LaunchEnding, RuntimeError> {
+        let ending = self.ending();
         let exit = self.result?;
         let reason = match exit {
-            AgentLoopExit::Ok => return Ok(()),
+            AgentLoopExit::Ok => return Ok(ending),
             AgentLoopExit::Failed => self
                 .failure_reason
                 .filter(|reason| !reason.trim().is_empty())
@@ -3076,7 +3152,7 @@ fn launch(
         // `CapsuleStoreState::close_started_delegation` holds `&CapsuleStoreState` across an
         // `.await` while the store state is `!Sync` (its `WasiCtx` is). The loop and the async
         // hook workers therefore run on this thread; the A2A door does not.
-        let loop_result: Result<(), RuntimeError> = rt.block_on(async move {
+        let loop_result: Result<LaunchEnding, RuntimeError> = rt.block_on(async move {
             let mut trace = TraceWriter::open(
                 &workdir,
                 session_id.clone(),
@@ -3517,6 +3593,11 @@ fn launch(
                     // cancel races it, and the loop takes no new work once it is up, so the
                     // session falls through to the same teardown a clean exit runs.
                     let terminating = crate::cancel::CancelSignal::new();
+                    // Raised by the termination routine before `terminating`, when the formation
+                    // lifeline's EOF began it, so a task the wind-down cancelled is read as the
+                    // formation's end rather than as a cancel. Nothing raises it on a platform
+                    // without lifelines.
+                    let ended_by_formation = Arc::new(AtomicBool::new(false));
                     #[cfg(unix)]
                     {
                         let sources = TerminationSources {
@@ -3533,6 +3614,7 @@ fn launch(
                                 },
                                 Arc::clone(&task_registry),
                                 terminating.clone(),
+                                Arc::clone(&ended_by_formation),
                             ));
                         }
                     }
@@ -3634,7 +3716,12 @@ fn launch(
                                         )
                                         .await;
                                         let failed = result.is_err();
-                                        outcome.record(result, &trace, failures_before);
+                                        outcome.record_terminated(
+                                            result,
+                                            ended_by_formation.load(Ordering::Acquire),
+                                            &trace,
+                                            failures_before,
+                                        );
                                         if failed {
                                             break 'task_loop;
                                         }
@@ -3715,7 +3802,12 @@ fn launch(
                                         let failed = result.is_err();
                                         // The launch's own task decides its outcome under every
                                         // lifecycle, queue+sleep included, whatever runs next.
-                                        outcome.record(result, &trace, failures_before);
+                                        outcome.record_terminated(
+                                            result,
+                                            ended_by_formation.load(Ordering::Acquire),
+                                            &trace,
+                                            failures_before,
+                                        );
                                         // Only queue+sleep outlives its task. Every other
                                         // lifecycle, `queue` + `exit` included, ends here: it
                                         // closes out what is already in a lane, such as a
@@ -3911,7 +4003,12 @@ fn launch(
                                                                 .await;
                                                         }
                                                     }
-                                                    outcome.record(result, &trace, failures_before);
+                                                    outcome.record_terminated(
+                                                        result,
+                                                        ended_by_formation.load(Ordering::Acquire),
+                                                        &trace,
+                                                        failures_before,
+                                                    );
                                                     break 'task_loop;
                                                 }
                                             }
@@ -4042,7 +4139,12 @@ fn launch(
                         // A terminating session starts nothing after the task it was running:
                         // what is still in a lane gets its cancel recorded, and the loop ends.
                         if terminating.is_canceled() {
-                            outcome.record(loop_result, &trace, failures_before);
+                            outcome.record_terminated(
+                                loop_result,
+                                ended_by_formation.load(Ordering::Acquire),
+                                &trace,
+                                failures_before,
+                            );
                             close_lanes_on_termination(
                                 &mut lanes,
                                 &task_registry,
@@ -4225,13 +4327,14 @@ fn launch(
                 .await
         });
 
-        loop_result?;
+        let ending = loop_result?;
 
         delegation.complete();
         roost_session.complete();
         return Ok(LaunchResult {
             session_id: session_id_ret,
             workdir: workdir_ret,
+            ending,
         });
     }
 
@@ -4446,6 +4549,7 @@ fn launch(
     Ok(LaunchResult {
         session_id: staged.session_id,
         workdir: staged.workdir,
+        ending: LaunchEnding::Completed,
     })
 }
 
@@ -10942,6 +11046,7 @@ async fn run_termination(
     ends: EndTraces,
     task_registry: Arc<Mutex<TaskRegistry>>,
     terminating: crate::cancel::CancelSignal,
+    ended_by_formation: Arc<AtomicBool>,
 ) {
     let mut sigterms = 0u32;
     let mut begun = false;
@@ -10998,22 +11103,27 @@ async fn run_termination(
                 }
             }
         }
-        begin_termination(&task_registry, &terminating, cause);
+        begin_termination(&task_registry, &terminating, &ended_by_formation, cause);
     }
 }
 
-/// Cancel every live task, raise `terminating`, say why, and arm
-/// [`TERMINATE_TEARDOWN_DEADLINE`], after which the process exits with status 143 whatever it is
-/// doing.
+/// Cancel every live task, raise `ended_by_formation` when the formation's end is the cause, raise
+/// `terminating`, say why, and arm [`TERMINATE_TEARDOWN_DEADLINE`], after which the process exits
+/// with status 143 whatever it is doing.
 #[cfg(unix)]
 fn begin_termination(
     task_registry: &Mutex<TaskRegistry>,
     terminating: &crate::cancel::CancelSignal,
+    ended_by_formation: &AtomicBool,
     cause: TerminationCause,
 ) {
     // Cancelled before the signal is raised, so an agent loop that wakes on either finds its task
     // already `Canceled`.
     let _ = task_registry.lock().unwrap().cancel_every_live();
+    // Before `terminating`, so the task loop that wakes on it reads the cause already set.
+    if cause == TerminationCause::FormationEnded {
+        ended_by_formation.store(true, Ordering::Release);
+    }
     terminating.cancel();
     match cause {
         TerminationCause::Sigterm => crate::runtime_err!(
@@ -18836,6 +18946,7 @@ inference:
         let outcome = |result, failure_reason: Option<&str>| LaunchOutcome {
             result,
             failure_reason: failure_reason.map(str::to_string),
+            formation_ended: false,
         };
         assert!(outcome(Ok(AgentLoopExit::Ok), None)
             .into_launch_result()
@@ -18882,6 +18993,104 @@ inference:
         ));
         assert!(MAX_TURNS_REACHED_REASON.contains("inference.max_turns"));
         assert!(SPEND_CEILING_REACHED_REASON.contains("spend ceiling"));
+    }
+
+    /// A running task the formation's end cancelled ends the launch `formation_ended`, and is no
+    /// error; the same cancel under any other cause stays `canceled`, a run that ended otherwise is
+    /// folded in as it ended, and an earlier run that did not complete still decides.
+    #[tokio::test]
+    async fn launch_outcome_reports_formation_ended_only_for_a_task_the_formation_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = tool_refresh_trace(dir.path()).await;
+        let terminated = |earlier: Option<AgentLoopExit>, result, by_formation| {
+            let mut outcome = LaunchOutcome::new();
+            if let Some(earlier) = earlier {
+                outcome.record(Ok(earlier), &trace, 0);
+            }
+            outcome.record_terminated(Ok(result), by_formation, &trace, 0);
+            outcome
+        };
+
+        let ended = terminated(None, AgentLoopExit::Canceled, true);
+        assert_eq!(ended.exit_status(), "formation_ended");
+        assert_eq!(
+            ended.into_launch_result().unwrap(),
+            LaunchEnding::FormationEnded
+        );
+
+        // `SIGTERM`, `session/stop` or the spawner's end: still a cancel.
+        let canceled = terminated(None, AgentLoopExit::Canceled, false);
+        assert_eq!(canceled.exit_status(), "canceled");
+        assert!(matches!(
+            canceled.into_launch_result(),
+            Err(RuntimeError::TaskDidNotComplete {
+                exit_status: "canceled",
+                ..
+            })
+        ));
+
+        // A run that ended on its own terms while the formation ended is recorded as it ended.
+        for exit in [
+            AgentLoopExit::Failed,
+            AgentLoopExit::MaxTurnsReached,
+            AgentLoopExit::SpendCeilingReached,
+        ] {
+            assert_eq!(terminated(None, exit, true).exit_status(), exit.as_str());
+        }
+        let completed = terminated(None, AgentLoopExit::Ok, true);
+        assert_eq!(completed.exit_status(), "ok");
+        assert_eq!(
+            completed.into_launch_result().unwrap(),
+            LaunchEnding::Completed
+        );
+
+        // An earlier run that did not complete still decides the launch.
+        let failed = terminated(Some(AgentLoopExit::Failed), AgentLoopExit::Canceled, true);
+        assert_eq!(failed.exit_status(), "failed");
+        assert!(matches!(
+            failed.into_launch_result(),
+            Err(RuntimeError::TaskDidNotComplete {
+                exit_status: "failed",
+                ..
+            })
+        ));
+
+        // An idle session: nothing was running, so nothing was cancelled.
+        assert_eq!(LaunchOutcome::new().exit_status(), "ok");
+    }
+
+    /// The cancelled-task marker replaces whatever `out/result.txt` held, and under a threaded
+    /// conversation the per-task file of an A2A task as well.
+    #[test]
+    fn a_cancelled_task_writes_the_marker_to_its_result_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("result.txt"), "an earlier answer").unwrap();
+        std::fs::write(out.join("result_tsk_a.txt"), "interim 42").unwrap();
+
+        write_canceled_result(dir.path(), &ConversationMode::Threaded, Some("tsk_a"));
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
+        assert_eq!(read("result.txt"), crate::cancel::CANCELED_RESULT_TEXT);
+        assert_eq!(
+            read("result_tsk_a.txt"),
+            crate::cancel::CANCELED_RESULT_TEXT
+        );
+        assert_eq!(
+            crate::cancel::CANCELED_RESULT_TEXT,
+            "canceled: the task was canceled before it completed, so it has no result"
+        );
+
+        // A stateless conversation keeps no per-task file, and a task.md task has no task id.
+        let dir = tempfile::tempdir().unwrap();
+        write_canceled_result(dir.path(), &ConversationMode::Stateless, Some("tsk_b"));
+        write_canceled_result(dir.path(), &ConversationMode::Threaded, None);
+        let out = dir.path().join("out");
+        assert_eq!(
+            std::fs::read_to_string(out.join("result.txt")).unwrap(),
+            crate::cancel::CANCELED_RESULT_TEXT
+        );
+        assert!(!out.join("result_tsk_b.txt").exists());
     }
 
     /// Turn ceiling respected: `inference.max_turns: 3`, `lifecycle.max_task_reopens: 5`, a

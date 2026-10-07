@@ -240,8 +240,8 @@ pub use state_store::{
 pub use trace::{PlanTraceAppender, ResourceTraceAppender};
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
-    InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, ResumeMode,
-    ResumeRequest, StageRequest, StagedSession,
+    InstalledArtifactSummary, LaunchEnding, LaunchResult, LockExpectation, ResolvedLockArtifact,
+    ResumeMode, ResumeRequest, StageRequest, StagedSession,
 };
 // The declaration `--explain-scope` prints and `trace.jsonl` carries as
 // `session_start.effective_grants.runtime_writes`. Flat, on the same terms as the other report

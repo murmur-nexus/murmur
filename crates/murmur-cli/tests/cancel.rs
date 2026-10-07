@@ -13,7 +13,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -342,6 +345,15 @@ fn poll_until_state(addr: &str, task_id: &str, expected: &str, timeout: Duration
     }
 }
 
+/// What `out/result.txt` holds once a task that ran ends `canceled`.
+const CANCELED_RESULT: &str =
+    "canceled: the task was canceled before it completed, so it has no result";
+
+/// `out/<name>` under the session's workdir, or `None` when nothing wrote it.
+fn out_file(capsule: &Capsule, name: &str) -> Option<String> {
+    fs::read_to_string(capsule.session_dir.join("out").join(name)).ok()
+}
+
 // ── Reading the trace ─────────────────────────────────────────────────────────
 
 fn read_trace(trace_path: &Path) -> Vec<Value> {
@@ -616,6 +628,16 @@ fn cancel_leaves_the_session_and_its_queue_running() {
         tasks_get(&capsule.url, &task_a)["result"]["status"]["state"],
         "canceled"
     );
+    // Under a threaded conversation the cancelled task's own result file says it has no result,
+    // and the one beside it is the next task's answer.
+    assert_eq!(
+        out_file(&capsule, &format!("result_{task_a}.txt")).as_deref(),
+        Some(CANCELED_RESULT)
+    );
+    assert_eq!(
+        out_file(&capsule, &format!("result_{task_b}.txt")).as_deref(),
+        Some("task B is done")
+    );
 
     let c = send_message(&capsule.url, "msg-c", "task C words", Some(context_id));
     let task_c = c["result"]["id"].as_str().unwrap().to_string();
@@ -632,6 +654,85 @@ fn cancel_leaves_the_session_and_its_queue_running() {
     // And the capsule is still answering for itself.
     let card = http_get(&capsule.url, "/.well-known/agent-card.json");
     assert!(card.contains("cancel-queue"), "{card}");
+}
+
+/// A task cancelled after an earlier one completed leaves `out/result.txt` saying it has no
+/// result, never the earlier task's answer, and both the threaded per-task file and the shared one
+/// say so; the session keeps serving, and the next task's answer replaces the marker.
+#[test]
+fn a_cancelled_task_leaves_no_earlier_answer_in_the_result_file() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    let server = common::ScriptedServer::start_answering(3, move |_| {
+        match counted.fetch_add(1, Ordering::SeqCst) {
+            0 => end_turn_response("msg_1", "task A answer"),
+            1 => {
+                std::thread::sleep(Duration::from_secs(10));
+                end_turn_response("msg_2", "task B, never delivered")
+            }
+            _ => end_turn_response("msg_3", "task C answer"),
+        }
+    });
+    let (home, manifest_path) = setup_project(&server.endpoint, "cancel-result", &network(&server));
+    let capsule = launch(stage_agent(
+        &home,
+        &manifest_path,
+        LifecycleConfig {
+            conversation_mode: ConversationMode::Threaded,
+            ..queue_lifecycle()
+        },
+    ));
+    let context_id = "ctx_cancel_result";
+
+    let a = send_message(&capsule.url, "msg-a", "task A words", Some(context_id));
+    let task_a = a["result"]["id"].as_str().unwrap().to_string();
+    poll_until_state(&capsule.url, &task_a, "completed", Duration::from_secs(60));
+    assert_eq!(
+        out_file(&capsule, "result.txt").as_deref(),
+        Some("task A answer")
+    );
+
+    let b = send_message(&capsule.url, "msg-b", "task B words", Some(context_id));
+    let task_b = b["result"]["id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while asked.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < deadline, "task B never asked its model");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        tasks_cancel(&capsule.url, &task_b)["result"]["status"]["state"],
+        "canceled"
+    );
+    wait_for_trace(
+        &capsule.trace_path,
+        Duration::from_secs(30),
+        "task B's task_end",
+        |events| {
+            events_named(events, "task_end")
+                .iter()
+                .any(|event| event["task_id"] == json!(task_b))
+        },
+    );
+    assert_eq!(
+        out_file(&capsule, "result.txt").as_deref(),
+        Some(CANCELED_RESULT)
+    );
+    assert_eq!(
+        out_file(&capsule, &format!("result_{task_b}.txt")).as_deref(),
+        Some(CANCELED_RESULT)
+    );
+    assert_eq!(
+        out_file(&capsule, &format!("result_{task_a}.txt")).as_deref(),
+        Some("task A answer")
+    );
+
+    let c = send_message(&capsule.url, "msg-c", "task C words", Some(context_id));
+    let task_c = c["result"]["id"].as_str().unwrap().to_string();
+    poll_until_state(&capsule.url, &task_c, "completed", Duration::from_secs(60));
+    assert_eq!(
+        out_file(&capsule, "result.txt").as_deref(),
+        Some("task C answer")
+    );
 }
 
 fn http_get(addr: &str, path: &str) -> String {
@@ -1010,6 +1111,11 @@ fn a_task_cancelled_while_queued_never_starts() {
     assert_eq!(canceled.len(), 1, "{canceled:?}");
     assert_eq!(canceled[0]["task_id"], json!(task_b), "{}", canceled[0]);
     assert_eq!(canceled[0]["phase"], "queued", "{}", canceled[0]);
+    // A task that never ran writes no result of its own.
+    assert_eq!(
+        out_file(&capsule, "result.txt").as_deref(),
+        Some("task A is done")
+    );
 
     assert!(
         server

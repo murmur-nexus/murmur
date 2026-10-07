@@ -4266,7 +4266,11 @@ pub(crate) fn write_result(workdir: &Path, value: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write result output: {e}"))
 }
 
-fn write_result_for_task(workdir: &Path, task_id: &str, value: &str) -> Result<(), String> {
+pub(crate) fn write_result_for_task(
+    workdir: &Path,
+    task_id: &str,
+    value: &str,
+) -> Result<(), String> {
     let out_dir = workdir.join("out");
     fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
     fs::write(out_dir.join(format!("result_{task_id}.txt")), value)

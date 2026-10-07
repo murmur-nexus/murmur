@@ -678,6 +678,11 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
     assert_eq!(canceled["task_id"], task_id.as_str(), "{canceled}");
     let ended = capsule.one("task_end");
     assert_eq!(ended["exit_status"], "canceled", "{ended}");
+    // A stopped harness produced no result, and the file says so.
+    assert_eq!(
+        fs::read_to_string(capsule.workdir.join("out").join("result.txt")).unwrap(),
+        "canceled: the task was canceled before it completed, so it has no result"
+    );
 
     // The conversation the stopped harness opened is still this context's, so the next task
     // resumes it rather than starting from nothing.

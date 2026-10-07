@@ -766,6 +766,15 @@ impl From<RuntimeError> for CliError {
                 E_RUN_007,
                 format!("agent loop failed: {message}"),
             ),
+            error @ RuntimeError::TaskDidNotComplete {
+                exit_status: "canceled",
+                ..
+            } => CliError::with_hint(
+                E_RUN_040,
+                error.to_string(),
+                "the task was canceled before it completed, so out/result.txt holds no result; \
+                 `mur trace show <session>` shows the turn it was canceled on and why",
+            ),
             error @ RuntimeError::TaskDidNotComplete { .. } => CliError::with_hint(
                 E_RUN_040,
                 error.to_string(),
