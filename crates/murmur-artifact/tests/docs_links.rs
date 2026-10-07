@@ -14,7 +14,9 @@
 //!   page under `docs/content/reference/` that `exclude_docs` in `docs/mkdocs.yml` does not drop,
 //!   and that carries `{ #<anchor> }`;
 //! - every `diagnostic_link("<code>")` names a code whose `{ #<code lowercased> }` entry exists in
-//!   `diagnostics.md`.
+//!   `diagnostics.md`;
+//! - every `W-*` code literal has that entry too. A warning prints its link from the code through
+//!   `diagnostic_link(code)`, so the code literal is the only place the link can be checked.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -41,6 +43,8 @@ struct Scan {
     reference_paths: Vec<String>,
     /// The literal argument of each `diagnostic_link("…")`.
     diagnostic_codes: Vec<String>,
+    /// Every string literal that is a whole `W-*` code, such as `"W-SEC-024"`.
+    warning_codes: Vec<String>,
 }
 
 struct ScannedFile {
@@ -195,6 +199,9 @@ fn scan_tokens(tokens: TokenStream, scan: &mut Scan) {
                 if value.contains("docs/content") {
                     scan.source_paths.push(text);
                 }
+                if is_warning_code(&value) {
+                    scan.warning_codes.push(value);
+                }
             }
             TokenTree::Ident(ident) if ident == "docs_reference_url" => {
                 if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
@@ -230,6 +237,19 @@ fn sole_string_argument(group: &proc_macro2::Group) -> Option<String> {
         (Some(only), None) => string_value(&only),
         _ => None,
     }
+}
+
+/// `W-<LETTERS>-<DIGITS>`, the shape of every warning code.
+fn is_warning_code(value: &str) -> bool {
+    let mut parts = value.split('-');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("W"), Some(family), Some(number), None)
+            if !family.is_empty()
+                && family.bytes().all(|b| b.is_ascii_uppercase())
+                && !number.is_empty()
+                && number.bytes().all(|b| b.is_ascii_digit())
+    )
 }
 
 fn string_value(tree: &TokenTree) -> Option<String> {
@@ -350,6 +370,18 @@ fn reference_path_problem(path: &str, excluded: &[String]) -> Option<String> {
     }
 }
 
+/// Why `diagnostic_link(code)` does not open an entry in `diagnostics.md`, if it does not.
+fn diagnostic_entry_problem(code: &str, diagnostics: &str) -> Option<String> {
+    let anchor = code.to_lowercase();
+    (!diagnostics.contains(&format!("{{ #{anchor} }}"))).then(|| {
+        format!(
+            "{}/diagnostics/#{anchor} — docs/content/reference/diagnostics.md has no \
+             `{{ #{anchor} }}` entry for {code}",
+            murmur_artifact::DOCS_REFERENCE_URL
+        )
+    })
+}
+
 #[test]
 fn no_shipping_code_names_a_docs_source_path() {
     let offenders: Vec<String> = scanned_crates()
@@ -389,15 +421,16 @@ fn every_literal_docs_link_opens_a_published_section() {
             crates.insert(file.krate.as_str());
         }
         for code in &file.scan.diagnostic_codes {
-            let anchor = code.to_lowercase();
-            if !diagnostics.contains(&format!("{{ #{anchor} }}")) {
-                problems.push(format!(
-                    "{location}: {base}/diagnostics/#{anchor} — docs/content/reference/\
-                     diagnostics.md has no `{{ #{anchor} }}` entry for {code}"
-                ));
+            if let Some(problem) = diagnostic_entry_problem(code, &diagnostics) {
+                problems.push(format!("{location}: {problem}"));
             }
             checked += 1;
             crates.insert(file.krate.as_str());
+        }
+        for code in &file.scan.warning_codes {
+            if let Some(problem) = diagnostic_entry_problem(code, &diagnostics) {
+                problems.push(format!("{location}: {problem}"));
+            }
         }
     }
 
@@ -481,4 +514,13 @@ fn scanner_strips_comments_docs_and_test_only_code() {
     .unwrap();
     assert_eq!(links.reference_paths, ["cli/", "containment/#verification"]);
     assert_eq!(links.diagnostic_codes, ["E-CAP-016"]);
+
+    let codes = scan_source(
+        r#"
+        pub const W_SEC_024: &str = "W-SEC-024";
+        const NOT_A_CODE: [&str; 4] = ["W-SEC-", "W-sec-024", "E-CAP-016", "see W-SEC-024"];
+        "#,
+    )
+    .unwrap();
+    assert_eq!(codes.warning_codes, ["W-SEC-024"]);
 }
