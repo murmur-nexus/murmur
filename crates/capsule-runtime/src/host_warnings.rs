@@ -1,10 +1,10 @@
 //! Host-level warnings: stated once per launch, not once per process.
 //!
 //! A host-level warning is one whose condition and text depend on the host alone — the same for
-//! every process on the machine, whatever manifest it runs. `W-SEC-013`
-//! ([`crate::runtime::warn_on_userns_restriction_disabled_host_wide`]) is the one there is. A
-//! warning gated on, or naming, something in a session's own manifest is a fact about that
-//! session and is stated per session, outside this gate.
+//! every process on the machine, whatever manifest it runs, such as `W-SEC-013`
+//! ([`crate::runtime::warn_on_userns_restriction_disabled_host_wide`]). A warning gated on, or
+//! naming, something in a session's own manifest is a fact about that session and is stated per
+//! session, outside this gate.
 //!
 //! The process the operator started prints each host-level warning once: a plain `mur run` while
 //! staging its session, and `mur run --roster` from the launcher before any member starts. Every

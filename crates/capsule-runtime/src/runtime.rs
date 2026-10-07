@@ -14729,7 +14729,7 @@ inference:
         }
 
         fn bootstrap_log(&self) -> String {
-            bootstrap_log_of(&self.workdir)
+            bootstrap_log_contents(&self.workdir)
         }
     }
 
@@ -14771,11 +14771,6 @@ inference:
             AgentLoopHarness::new(&mut state, &workdir, trigger, CALLS_LAUNCH_SKILL).await;
         harness.run_task(&mut state, "tsk_1").await;
         harness.events().await
-    }
-
-    /// `workdir`'s `logs/bootstrap.log`, empty when nothing has been written.
-    fn bootstrap_log_of(workdir: &Path) -> String {
-        fs::read_to_string(workdir.join("logs").join("bootstrap.log")).unwrap_or_default()
     }
 
     /// The number of `heading (JSON):` blocks in `log`.
@@ -14903,7 +14898,7 @@ inference:
             &mut state.logged_tool_inventory,
         )
         .unwrap();
-        let refreshed = bootstrap_log_of(&workdir);
+        let refreshed = bootstrap_log_contents(&workdir);
         assert_eq!(
             inventory_blocks(&refreshed, "Installed tools"),
             1,

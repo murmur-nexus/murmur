@@ -274,6 +274,9 @@ fn write_launched_member_record(
     fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 }
 
+/// A pid the kernel never hands out, so a record naming it is always pruned.
+const DEAD_PID: u32 = 0x7FFF_FFFE;
+
 /// A 36-character session id ending in `suffix`, so a fabricated record sorts predictably against
 /// its siblings.
 fn fabricated_id(suffix: &str) -> String {
@@ -639,7 +642,7 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     let dead = fabricated_id("dead");
     let quiet = fabricated_id("beef");
     // A pid nothing holds: the kernel never hands this one out.
-    write_record(home.path(), &dead, "127.0.0.1:1", 0x7FFF_FFFE, "1");
+    write_record(home.path(), &dead, "127.0.0.1:1", DEAD_PID, "1");
     write_record(
         home.path(),
         &quiet,
@@ -657,7 +660,7 @@ fn ps_prunes_the_dead_and_keeps_the_unreachable() {
     assert!(pruned_lines(&stderr).is_empty(), "{stderr}");
     assert!(!record_for(home.path(), &dead).exists(), "the dead record");
 
-    write_record(home.path(), &dead, "127.0.0.1:1", 0x7FFF_FFFE, "1");
+    write_record(home.path(), &dead, "127.0.0.1:1", DEAD_PID, "1");
     let (verbose, stderr) = ps_output_verbose(home.path());
     assert_eq!(ps_rows(&verbose), rows, "{verbose}");
     assert!(pruned_summaries(&stderr).is_empty(), "{stderr}");
@@ -2188,7 +2191,7 @@ fn ps_counts_a_formations_pruned_and_unreachable_members() {
     write_member_record(
         home.path(),
         &dead,
-        0x7FFF_FFFE,
+        DEAD_PID,
         "1",
         Some(formation.as_str()),
         &root,
@@ -2221,7 +2224,7 @@ fn ps_counts_a_formations_pruned_and_unreachable_members() {
     write_member_record(
         home.path(),
         &dead,
-        0x7FFF_FFFE,
+        DEAD_PID,
         "1",
         Some(formation.as_str()),
         &root,
@@ -2571,9 +2574,6 @@ fn a_launcher_that_cannot_be_signalled_is_refused_and_no_member_is_signalled() {
 }
 
 // ── Pruning summarised ────────────────────────────────────────────────────────
-
-/// A pid the kernel never hands out, so a record naming it is always pruned.
-const DEAD_PID: u32 = 0x7FFF_FFFE;
 
 /// Formations of dead members, in the order a verbose `mur ps` summarises them, each with its
 /// member count.

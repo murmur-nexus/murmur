@@ -1415,7 +1415,7 @@ lists it.
 | `STATUS` | 12 | `running` or `unreachable` |
 | `DETACHED` | 8 | `yes` when the capsule outlives the window that launched it, `no` when it dies with it |
 | `UPTIME` | 9 | `HH:MM:SS` since the session started, prefixed `Nd ` past a day |
-| `FORMATION` | 36 | The full formation id of a [member](#mur-run-formation), `-` for a session in no formation. Present only when [a formation is listed](#mur-ps-formations) |
+| `FORMATION` | 36 | The full formation id of a [member](#mur-run-formation), `-` for a session in no formation. Present only when [a record that keys the listing names a formation](#mur-ps-formations) |
 | `URL` | — | The `host:port` the capsule's A2A door is bound to |
 
 ```text
