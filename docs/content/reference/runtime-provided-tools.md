@@ -152,7 +152,7 @@ The call then ends in one of these ways:
 | The member takes the task | Writes [`member_call_start`](observability-schemas.md#member-call-start) and runs as a started call does, against the same deadline |
 | The member answers `rejected` for another reason, or another terminal state | Ends with that status and sentence |
 | Two offers in a row get no answer | Ends `unreachable` |
-| The call's deadline passes while the member is still busy | Ends `rejected`, never held: `<member> stayed busy with other work for the whole <N>s this call may wait and never took the task; it was offered the task <k> times. Nothing was done on it.` |
+| [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) passes while the member is still busy | Ends `rejected`, never held: `<member> stayed busy with other work for the whole <N>s this call may wait and never took the task; it was offered the task <k> times. Nothing was done on it.` |
 | The calling task ends | Ends `abandoned`, never held: `the calling task ended before <member> took the task; <member> was busy and was never handed it`. No further offer is sent |
 
 Only a refusal with exactly the message `task rejected: capsule is busy` is offered again; any
@@ -228,7 +228,7 @@ A later call to the same member that completes removes it from that line. The me
 |---|---|
 | `completed` | The member's answer: its task's `response` artifact |
 | `failed`, `canceled`, `rejected` | The member's task's status message, or for a member that stayed busy, the runtime's sentence from [A busy member](#call-member-busy) |
-| `timed_out` | The member did not answer within the bound; it was not cancelled and may still be working |
+| `timed_out` | The member did not answer within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); it was not cancelled and may still be working |
 | `unreachable` | The member's door stopped answering |
 
 Under [`transport: process`](manifest.md#transport-process), the harness calls `call-member`
@@ -255,12 +255,11 @@ either, answers first — see [How the outcome arrives](roost-api.md#how-the-out
 
 | Bound | Value |
 |---|---|
-| How long a call may take, offering a busy member the task and waiting for its answer together | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600 seconds, or `MURMUR_DELEGATION_TIMEOUT_SECS` — the bound delegations use |
-| How often a busy member is offered the task again | 1 second after the refusal, then doubling to at most 8 seconds, each plus up to 250 ms |
+| How long a call may take, [offering a busy member the task](#call-member-busy) and waiting for its answer together | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600 seconds, or `MURMUR_DELEGATION_TIMEOUT_SECS` — the bound delegations use |
 | How often the member's task is read | Every 500 ms, through the member's `tasks/get` |
 | Unreachable | Two reads, or two offers, in a row that get no answer |
 
 No call is ever cancelled at the member: a formation token cannot call `tasks/cancel`. A call
-that times out or is abandoned leaves the member's task running until it finishes or the formation
-ends.
+that times out, or is abandoned after the member took the task, leaves the member's task running
+until it finishes or the formation ends.
 

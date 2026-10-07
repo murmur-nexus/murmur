@@ -3889,18 +3889,7 @@ impl ResourceTraceAppender {
         admit: impl FnOnce() -> bool,
     ) -> bool {
         let event = self.member_call_start(task_id, call_id, member, member_task_id);
-        let Ok(mut line) = serde_json::to_string(&event) else {
-            return admit();
-        };
-        line.push('\n');
-        let mut file = self.file.lock().await;
-        if !admit() {
-            return false;
-        }
-        if file.write_all(line.as_bytes()).await.is_ok() {
-            let _ = file.flush().await;
-        }
-        true
+        self.append_if(&event, admit).await
     }
 
     fn member_call_start(
@@ -4079,14 +4068,24 @@ impl ResourceTraceAppender {
     }
 
     async fn append(&self, event: &impl Serialize) {
+        self.append_if(event, || true).await;
+    }
+
+    /// [`Self::append`] when `admit`, run with the trace held, returns `true`; returns what
+    /// `admit` did. No other line lands between `admit` and this one.
+    async fn append_if(&self, event: &impl Serialize, admit: impl FnOnce() -> bool) -> bool {
         let Ok(mut line) = serde_json::to_string(event) else {
-            return;
+            return admit();
         };
         line.push('\n');
         let mut file = self.file.lock().await;
+        if !admit() {
+            return false;
+        }
         if file.write_all(line.as_bytes()).await.is_ok() {
             let _ = file.flush().await;
         }
+        true
     }
 }
 

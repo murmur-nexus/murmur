@@ -293,9 +293,14 @@ fn offer_task(
     let member = &route.member;
     let answer =
         door_request(route, &body, crate::http_client::DEFAULT_TIMEOUT).map_err(|error| {
-            let transport = matches!(error, DoorRequestError::Transport(_));
+            let kind = match error {
+                DoorRequestError::Transport(_) => StartFailureKind::Transport,
+                DoorRequestError::Refused(_) | DoorRequestError::Answered(_) => {
+                    StartFailureKind::Refused
+                }
+            };
             StartFailure {
-                transport,
+                kind,
                 ..StartFailure::failed(error.into_text())
             }
         })?;
@@ -325,8 +330,11 @@ fn offer_task(
             Err(StartFailure {
                 status: MemberCallStatus::Rejected,
                 reason: rejection_sentence(member, message.as_deref()),
-                busy: message.as_deref() == Some(crate::a2a::REJECTED_BUSY_MESSAGE),
-                transport: false,
+                kind: if message.as_deref() == Some(crate::a2a::REJECTED_BUSY_MESSAGE) {
+                    StartFailureKind::Busy
+                } else {
+                    StartFailureKind::Refused
+                },
             })
         }
         (_, Some(state)) => Err(StartFailure::failed(match status_message(&answer) {
@@ -347,11 +355,19 @@ pub(crate) struct StartFailure {
     /// a call fails to start.
     pub(crate) status: MemberCallStatus,
     pub(crate) reason: String,
+    pub(crate) kind: StartFailureKind,
+}
+
+/// Which way a call failed to start, as far as offering the task again goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartFailureKind {
     /// The door answered `rejected` with exactly [`crate::a2a::REJECTED_BUSY_MESSAGE`]: it has no
     /// room for the task now, and is the one refusal the task is offered again after.
-    pub(crate) busy: bool,
+    Busy,
     /// Nothing usable came back from the door: no connection, or no complete response.
-    pub(crate) transport: bool,
+    Transport,
+    /// Every other failure: a refusal, an error answer, or an answer that is not a held task.
+    Refused,
 }
 
 impl StartFailure {
@@ -359,8 +375,7 @@ impl StartFailure {
         Self {
             status: MemberCallStatus::Failed,
             reason,
-            busy: false,
-            transport: false,
+            kind: StartFailureKind::Refused,
         }
     }
 }
@@ -978,12 +993,12 @@ impl Watcher {
                         Offered::Abandoned
                     };
                 }
-                Err(failure) if failure.busy => {
+                Err(failure) if failure.kind == StartFailureKind::Busy => {
                     failed_offers = 0;
                     offers += 1;
                     self.write_busy(offers);
                 }
-                Err(failure) if failure.transport => {
+                Err(failure) if failure.kind == StartFailureKind::Transport => {
                     failed_offers += 1;
                     if failed_offers >= UNREACHABLE_AFTER_FAILED_POLLS {
                         return Offered::Ended(self.ended(
@@ -1656,10 +1671,10 @@ pub(crate) mod tests {
                                  no answer, or call a member again if another attempt could \
                                  succeed.";
 
-    /// Every call completed: the closing line is the one it has always been, and no member is
-    /// named as giving no answer.
+    /// Every call completed: the closing line says the answers are above, and no member is named
+    /// as giving no answer.
     #[test]
-    fn answers_that_all_completed_close_as_before() {
+    fn answers_that_all_completed_close_with_the_answers_are_above() {
         let calls = Arc::new(MemberCalls::new(Duration::from_secs(60)));
         calls.begin_task("tsk_a", None);
         calls

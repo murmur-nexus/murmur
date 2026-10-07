@@ -41,8 +41,8 @@ when the roster lets it call another:
 3. The other member runs the task in its own directory.
 4. Its answer comes back into the caller's same task, fenced as coming from that member, and the
    caller's model continues with it. A call that ends with no answer — the member stayed busy,
-   timed out or failed — is named by the runtime as giving no answer, so the caller does not
-   present an answer of its own as that member's.
+   timed out or failed — is named by the runtime as giving no answer, and the caller's model is
+   told not to present an answer of its own as that member's.
 
 A second call to a member is refused, with nothing sent, until the first call's answer has been
 delivered. A call carries text only, so whatever the other member needs goes in the task text. See

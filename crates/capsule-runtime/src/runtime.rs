@@ -8366,7 +8366,7 @@ impl CapsuleStoreState {
         use crate::member_call::{
             busy_note, elapsed_ms, mint_call_id, no_answer_note, send_task, started_note,
             CallHeaders, CallRoute, CallStart, CallTrace, MemberCallOutcome, MemberCallRefusal,
-            MemberCallStatus,
+            MemberCallStatus, StartFailureKind,
         };
 
         let args = parse_tool_json_input(MEMBER_CALL_TOOL, &input)?;
@@ -8492,7 +8492,7 @@ impl CapsuleStoreState {
                 };
                 Ok((result, Some(note)))
             }
-            Err(failure) if failure.busy => {
+            Err(failure) if failure.kind == StartFailureKind::Busy => {
                 if let Some(trace) = &self.peer_trace {
                     trace
                         .write_member_call_busy(
