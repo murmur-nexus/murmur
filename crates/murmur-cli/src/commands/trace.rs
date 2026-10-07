@@ -3326,7 +3326,9 @@ fn resolve_body_hash(
 /// The refusal for a `--turn` that names several agent-loop turns, listing each one's hashes so
 /// the reader can name exactly one with a `<sha256>` selector instead.
 fn ambiguous_turn(n: u32, matches: &[&WireTurn]) -> CliError {
-    let hash = |sha: &Option<String>| sha.clone().unwrap_or_else(|| "-".to_string());
+    fn hash(sha: &Option<String>) -> &str {
+        sha.as_deref().unwrap_or("-")
+    }
     let rows = matches
         .iter()
         .map(|t| {

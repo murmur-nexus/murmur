@@ -401,7 +401,7 @@ runtime has no other way back under the token budget:
 | `on-stage` | Once at capsule staging, before any session starts |
 | `on-session-start` | Once per capsule launch, before the first task's work begins |
 | `on-task-start` | Once per task, before that task's first inference turn |
-| `on-inference` | After each inference driver response is parsed |
+| `on-inference` | After each inference driver response is parsed. Its `turn` is the number the turn's [`inference`](observability-schemas.md#inference) trace line carries: zero-based, counted across every attempt of the task |
 | `on-tool-call` | Twice per model-requested tool invocation: once before it is dispatched, once after it returns or errors |
 | `on-shell` | Twice per allowed shell command: once before it is dispatched, once after it returns |
 | `on-compaction` | When the session token threshold is reached, before any history is replaced |

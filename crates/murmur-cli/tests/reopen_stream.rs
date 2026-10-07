@@ -413,9 +413,18 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
     });
     let boundary = stream.index(0, Frame::is_boundary);
     // The second attempt's first turn numbers on from the first attempt's one turn.
-    let second_turn = stream.index(boundary, |f| {
-        f.is_status() && f.message() == "inference turn 2"
-    });
+    let is_turn_status = |f: &Frame| f.is_status() && f.message().starts_with("inference turn ");
+    let first_turn = stream.index(0, is_turn_status);
+    let second_turn = stream.index(boundary, is_turn_status);
+    assert_eq!(
+        (
+            stream.frames[first_turn].message(),
+            stream.frames[second_turn].message()
+        ),
+        ("inference turn 1", "inference turn 2"),
+        "{:#?}",
+        stream.frames
+    );
     assert!(
         first_text < boundary && boundary < second_turn,
         "{:#?}",
