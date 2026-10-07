@@ -54,14 +54,15 @@ fn child_project(server: &ScriptedServer) -> TempDir {
     )
 }
 
-/// `mur run --manifest <project>/murmur.yaml --json <args>` under `home`, with no lifeline,
+/// `mur run --manifest <project>/murmur.yaml --json --readiness-tokens <args>` under `home`, as
+/// the runtime launches a session it reads the operator token of, with no lifeline,
 /// formation variable, spawner handle, door token or provider key inherited from this process.
 fn command(home: &Path, project: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin("mur"));
     command
         .args(["run", "--manifest"])
         .arg(project.join("murmur.yaml"))
-        .arg("--json")
+        .args(["--json", capsule_runtime::READINESS_TOKENS_FLAG])
         .args(args)
         .current_dir(project)
         .env("HOME", home)

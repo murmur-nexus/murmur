@@ -26,6 +26,7 @@ pub(crate) mod run;
 pub(crate) mod run_roster;
 pub(crate) mod search;
 pub(crate) mod stop;
+pub(crate) mod token;
 #[cfg(feature = "beta-mur-topology")]
 pub(crate) mod topology;
 pub(crate) mod trace;

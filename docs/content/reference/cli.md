@@ -15,6 +15,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur doctor` | Check every artifact declared in `murmur.yaml` against the project and global stores |
 | `mur run` | Run a capsule with lockfile-aware artifact resolution |
 | `mur ps` | List the capsules running on this machine |
+| `mur token` | Print a door token of a running capsule |
 | `mur watch` | Stream live events from a running capsule's output to stdout |
 | `mur cancel` | Stop one running task on a capsule, leaving the session running |
 | `mur stop` | End one running capsule, or every member of a formation, and report what was left behind |
@@ -68,13 +69,13 @@ What an address is resolved against depends on what the command needs.
 | Command | Candidate set | `@1` means |
 |---|---|---|
 | [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` session directories in one workdir, whether or not the session is still running | The most recent recorded session |
-| [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel), [`mur stop`](#mur-stop) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
+| [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel), [`mur stop`](#mur-stop), [`mur token`](#mur-token) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
 
 The recorded set is the `ses_*` directories in `./workdir` for the `mur trace` and `mur eval`
 commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside the directory
 `--workdir` names. See [Session workdir](workdir.md).
 
-`mur watch`, `mur cancel` and `mur stop` have to reach a process, so they take the three forms that
+`mur watch`, `mur cancel`, `mur stop` and `mur token` have to reach a process, so they take the three forms that
 name a session and refuse the path form: a path names a directory on disk, which says nothing
 about whether a process is running. An address naming a session that has stopped reports
 [`E-RUN-022`](diagnostics.md#e-run-022) rather than resolving to a different capsule.
@@ -91,6 +92,7 @@ Omitting the address selects a default:
 | `mur eval show` | `@1` |
 | `mur eval diff` | `@2 @1` |
 | `mur watch` | `@1` |
+| `mur token` | `@1` |
 
 `mur trace diff` and `mur eval diff` take their arguments in *before, after* order, so the bare
 `@2 @1` puts the older run in the Run A column and the delta column reads forwards in time. Both
@@ -99,7 +101,7 @@ take two addresses or none; one address is refused.
 An address matching no session, or several, is refused with
 [`E-TRC-002`](diagnostics.md) under `mur run` and `mur trace`,
 [`E-EVAL-002`](diagnostics.md) under `mur eval`, and
-[`E-RUN-022`](diagnostics.md#e-run-022) under `mur watch`, `mur cancel` and `mur stop`.
+[`E-RUN-022`](diagnostics.md#e-run-022) under `mur watch`, `mur cancel`, `mur stop` and `mur token`.
 
 ---
 
@@ -143,9 +145,14 @@ decide which members it stops itself. A `formation_launcher` that is not an obje
 `pid` and a string `process_start` makes the record unreadable.
 
 A session whose manifest declares [`network.authentication`](manifest.md#field-network-authentication)
-also records its operator token, as `door_token`. [`mur ps`](#mur-ps), [`mur stop`](#mur-stop),
-[`mur watch`](#mur-watch) and [`mur cancel`](#mur-cancel) present it to the door when they name the
-session by address. `mur ps` never prints it.
+also records every door token it minted. A public door's record carries neither key.
+
+| Key | Written when | Value |
+|---|---|---|
+| `door_token` | The manifest declares `network.authentication` | The operator token. [`mur ps`](#mur-ps), [`mur stop`](#mur-stop), [`mur watch`](#mur-watch) and [`mur cancel`](#mur-cancel) present it to the door when they name the session by address |
+| `credentials` | `network.authentication.credentials` declares at least one credential | `{"<name>": "<token>", …}`, one entry per declared credential. The operator token is never an entry |
+
+[`mur token`](#mur-token) prints either. `mur ps` prints neither.
 
 Taken together the records are a map of every reachable capsule on the machine, readable by
 anything running as the same user. The `0700` directory and `0600` files are what keep that map
@@ -1164,23 +1171,23 @@ For the output modes, the read-only pre-flight checks and driving a capsule over
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
 - Creates/uses `murmur.lock` in manifest directory, except under `--capsule`, which has no project directory to hold one
 
-**Door tokens.** A capsule declaring [`network.authentication`](manifest.md#field-network-authentication)
-prints the tokens its runtime minted, on stdout only, once the door is up:
+**Door tokens.** `mur run` prints no door token. A capsule declaring
+[`network.authentication`](manifest.md#field-network-authentication) says its door is authenticated
+instead, once the door is up:
 
 | Mode | Output |
 |---|---|
-| Human | One `murmur: token <name> <token>` line per token, right after `murmur: url`: `operator` first, then the declared credentials by name |
-| `--json` | The readiness line gains `"tokens": {"operator": "<token>", "<name>": "<token>", …}`. A capsule declaring no `network.authentication` prints the line without the key |
+| Human | `murmur: auth bearer (mur token <session_id>)`, right after `murmur: url` |
+| `--json` | The readiness line gains `"auth": "bearer"`. A capsule declaring no `network.authentication` prints the line without the key |
 
 ```text
 murmur: url localhost:41873
-murmur: token operator mdt1.eyJjcmVkZW50aWFsIjoib3BlcmF0b3IiLC4uLn0.Zk9x…
-murmur: token watcher mdt1.eyJjcmVkZW50aWFsIjoid2F0Y2hlciIsLi4ufQ.q2Lr…
+murmur: auth bearer (mur token ses_019f01a940ce7761854e768ecbe3d399)
 session: ses_019f01a940ce7761854e768ecbe3d399
 ```
 
-A token is valid until the session ends. A line carrying a token that standard output refuses is
-dropped, never written to `logs/bootstrap.log`. What each token reaches is in
+Every token is in the session's [running-capsule record](#running-capsule-records); read one with
+[`mur token`](#mur-token). A token is valid until the session ends. What each token reaches is in
 [Agent Card: Security](agent-card.md#tokens).
 
 <span id="mur-run-formation"></span>**Formation membership.** A session launched with
@@ -1334,7 +1341,7 @@ Standard output under `--json` carries exactly two lines:
 | `formation_id` | The id every member was launched with, `frm_` followed by 32 lowercase hex digits |
 | `peers` | One object per non-entry member, in roster order: `name`, `pid`, `session_id`, `url` as `http://host:port`, and `workdir`, the peer's own [directory](roster.md#member-directories) `~/.murmur/formations/<frm_id>/<member>` |
 
-The formation line carries no door token. Without `--json`, the launcher writes the same
+Neither the formation line nor any member's output carries a door token. Without `--json`, the launcher writes the same
 information to stderr as a `formation:` block, and the entry member writes its usual startup lines
 to stdout.
 
@@ -1678,6 +1685,36 @@ A formation id is matched in full; a part of one names nothing.
 
 ---
 
+## `mur token` { #mur-token }
+
+Print one door token of a running capsule that declares
+[`network.authentication`](manifest.md#field-network-authentication).
+
+```bash
+mur token [<SESSION>] [--credential <NAME>]
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `SESSION` | `@1` | A [session address](#session-addresses) naming a running capsule |
+| `--credential` | `operator` | The credential whose token to print: `operator`, or a name `network.authentication.credentials` declares |
+
+The token is read from the session's [running-capsule record](#running-capsule-records); the door is
+not asked anything, so a capsule slow to answer still has its token printed. Standard output is the
+token and a newline, nothing else, so a shell substitution holds exactly the token:
+
+```bash
+MURMUR_DOOR_TOKEN=$(mur token) mur watch --url localhost:41873
+```
+
+| Code | Cause |
+|---|---|
+| [`E-RUN-022`](diagnostics.md#e-run-022) | The address names no running session |
+| [`E-RUN-048`](diagnostics.md#e-run-048) | The session's door is public: its capsule declares no `network.authentication` |
+| [`E-RUN-049`](diagnostics.md#e-run-049) | The session minted no credential by that name. The message lists the names it did mint, `operator` first |
+
+---
+
 ## `mur watch`
 
 Stream live SSE events from a running capsule's output to stdout. The command opens a
@@ -1784,7 +1821,7 @@ mur cancel --url <host:port> <TASK_ID>
 
 | Environment variable | Read by | Holds |
 |---|---|---|
-| `MURMUR_DOOR_TOKEN` | `mur cancel --url`, `mur watch --url` | A door token `mur run` printed, presented as `Authorization: Bearer` to a capsule declaring [`network.authentication`](manifest.md#field-network-authentication). A session address reads the operator token from the [running-capsule record](#running-capsule-records) instead |
+| `MURMUR_DOOR_TOKEN` | `mur cancel --url`, `mur watch --url` | A door token [`mur token`](#mur-token) printed, presented as `Authorization: Bearer` to a capsule declaring [`network.authentication`](manifest.md#field-network-authentication). A session address reads the operator token from the [running-capsule record](#running-capsule-records) instead |
 
 A door that answers `401` or `403` fails the command with `E-IO-003`, naming the status and
 `MURMUR_DOOR_TOKEN`.
@@ -1913,7 +1950,8 @@ mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--no-precompile` | off | Skip compiling the uploaded WASM artifacts on the target; they compile on the capsule's first launch instead |
 
 **Output — a summary box on stderr.** `mur deploy run` emits no JSON; progress and the final box
-both go to stderr. Standard output carries the capsule's door tokens alone, when it has any.
+both go to stderr. Standard output carries one `door:` line alone, when the capsule declares
+`network.authentication`.
 
 ```
   ┌────────────────────────────────┐
@@ -1951,7 +1989,7 @@ for humans and its layout is not a stable interface.
     | Manifest | Output |
     |---|---|
     | No [`network.authentication`](manifest.md#field-network-authentication) | [`W-SEC-032`](diagnostics.md#w-sec-032) on stderr, naming the public URL |
-    | `network.authentication` | One `token <name> <token>` line per token on stdout, `operator` first, then the declared credentials by name |
+    | `network.authentication` | `door: bearer — read a token on the target: ssh <user>@<host> /usr/local/bin/mur token <session_id>` on stdout. No token leaves the VM |
 
 12. Persist to `~/.murmur/deployments.json`; print the summary box
 

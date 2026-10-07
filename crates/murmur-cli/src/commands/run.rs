@@ -157,6 +157,7 @@ pub(crate) fn run_run(
     lifecycle_after_task: Option<&str>,
     workdir_arg: Option<PathBuf>,
     json: bool,
+    readiness_tokens: bool,
     verbose: bool,
     bind_addr: &str,
     no_env_file: bool,
@@ -860,9 +861,17 @@ pub(crate) fn run_run(
             .map_err(|error| fail(&session_id, &workdir, lockfile_error_to_cli(error), json))?;
     }
 
-    // Read before `staged` moves into the launch. Printed only to stdout, and only once the door
-    // is bound: a token is the credential for a door that exists.
+    // Read before `staged` moves into the launch. A run's output is often redirected to a file, so
+    // no token is printed to it: every token is in the running record, where `mur token` reads
+    // one. The values are kept only for `--readiness-tokens`, whose line a launcher reads on a
+    // pipe of its own.
     let door_tokens = staged.door_tokens();
+    let authenticated = !door_tokens.is_empty();
+    let readiness_door_tokens = if json && readiness_tokens {
+        door_tokens
+    } else {
+        Vec::new()
+    };
     let formation_id = staged.formation_id().cloned();
 
     if json {
@@ -888,11 +897,17 @@ pub(crate) fn run_run(
             if let Some(id) = &formation_id {
                 ready["formation_id"] = serde_json::Value::from(id.as_str());
             }
-            if door_tokens.is_empty() || url.is_empty() {
+            // A door exists to authenticate against only once it is bound.
+            if !authenticated || url.is_empty() {
+                capsule_runtime::runtime_out!("{ready}");
+                return;
+            }
+            ready["auth"] = serde_json::Value::from("bearer");
+            if readiness_door_tokens.is_empty() {
                 capsule_runtime::runtime_out!("{ready}");
             } else {
                 // A JSON object keeps no order, so a reader finds the operator token by name.
-                ready["tokens"] = door_tokens
+                ready["tokens"] = readiness_door_tokens
                     .iter()
                     .map(|(name, token)| (name.clone(), serde_json::Value::from(token.expose())))
                     .collect::<serde_json::Map<_, _>>()
@@ -929,11 +944,10 @@ pub(crate) fn run_run(
         match launch_session_handling_sigterm(staged, move |url| {
             if !url.is_empty() {
                 capsule_runtime::runtime_out!("murmur: url {url}");
-                for (name, token) in &door_tokens {
-                    capsule_runtime::diagnostic::credential_to_stdout(&format!(
-                        "murmur: token {name} {}",
-                        token.expose()
-                    ));
+                if authenticated {
+                    capsule_runtime::runtime_out!(
+                        "murmur: auth bearer (mur token {session_id_for_startup})"
+                    );
                 }
             }
             capsule_runtime::runtime_out!("session: {session_id_for_startup}");

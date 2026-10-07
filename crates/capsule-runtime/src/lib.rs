@@ -140,6 +140,7 @@ pub use cgroup::{
 };
 pub use child_launch::{
     child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
+    READINESS_TOKENS_FLAG,
 };
 // The delegation types and constants stay module-qualified beyond these: `Spawner` and
 // `SpawnerHandle` are what a caller of `launch_child_capsule` composes, and the rest of the

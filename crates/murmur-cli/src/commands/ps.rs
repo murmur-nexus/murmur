@@ -325,6 +325,7 @@ mod tests {
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            credentials: Default::default(),
             formation_id: formation.cloned(),
             formation_lifeline: false,
             formation_launcher: None,

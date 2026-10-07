@@ -369,21 +369,13 @@ struct Finished {
     stderr: String,
 }
 
-/// `stdout` and `stderr` with the entry member's own readiness-line tokens taken out: the one
-/// token the launcher's output may carry is the entry member's, on its own readiness line.
-fn assert_no_token_but_the_entrys(stdout: &[String], stderr: &str) {
+/// No line of `stdout` — the entry member's readiness line included — and nothing on `stderr`
+/// carries a door token: the launcher's output is the operator's, and `mur token` is how a token
+/// is read.
+fn assert_no_door_token(stdout: &[String], stderr: &str) {
     for (index, line) in stdout.iter().enumerate() {
-        let mut value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
-        if index == 1 {
-            value.as_object_mut().map(|object| object.remove("tokens"));
-        }
-        let text = if value.is_null() {
-            line.clone()
-        } else {
-            value.to_string()
-        };
         assert!(
-            !text.contains("mdt1."),
+            !line.contains("mdt1."),
             "stdout line {index} carries a token: {line}"
         );
     }
@@ -652,12 +644,15 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     assert!(!stderr.contains("W-RUN-005"), "{stderr}");
     assert!(!stderr.contains("W-RUN-006"), "{stderr}");
 
-    // No formation token anywhere the run wrote, and no door token but the entry member's own
-    // readiness-line tokens.
+    // No formation token anywhere the run wrote, and no door token on its output: the entry
+    // member's readiness line says its door is authenticated and carries none.
     let stdout = launcher.stdout();
     assert_eq!(stdout.len(), 2, "{stdout:?}");
     assert_no_formation_token(&project, &stdout, &stderr);
-    assert_no_token_but_the_entrys(&stdout, &stderr);
+    assert_no_door_token(&stdout, &stderr);
+    let entry_line: Value = serde_json::from_str(&stdout[1]).unwrap();
+    assert_eq!(entry_line["auth"], "bearer", "{entry_line}");
+    assert!(entry_line.get("tokens").is_none(), "{entry_line}");
 
     project.assert_no_member_remains(
         &reported_pids(&formation, Some(&planner)),
@@ -729,6 +724,61 @@ fn assert_no_formation_token(project: &Project, stdout: &[String], stderr: &str)
             !requests.contains("mft1."),
             "{member}'s model was sent a formation token"
         );
+    }
+}
+
+/// A formation launched with its output redirected to a file, as `mur run --roster … >
+/// formation.log 2>&1` does, writes no door token there in either output mode, and its entry
+/// task ends `ok`. The entry member's door is authenticated and says so instead.
+#[test]
+fn a_redirected_formation_log_holds_no_door_token() {
+    let _lock = launch_lock();
+    for json in [false, true] {
+        let project = Project::with_probes(
+            &[CODER, REVIEWER, PLANNER],
+            FULL_REACH,
+            &[("planner", json!({"names": []}))],
+        );
+        // The entry model holds its last reply until released; released up front, it answers at
+        // once.
+        project.release.send(()).unwrap();
+        let log_path = project.path().join("formation.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut args = vec!["run", "--roster", "--task", "probe"];
+        if json {
+            args.push("--json");
+        }
+        let status = project
+            .command(&args)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .status()
+            .unwrap();
+        let written = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(status.code(), Some(0), "json={json}:\n{written}");
+        assert!(
+            !written.contains("mdt1."),
+            "json={json}: the log holds a token:\n{written}"
+        );
+        if json {
+            let entry_line = written
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value.get("session_id").is_some() && value.get("pid").is_some())
+                .unwrap_or_else(|| panic!("no entry readiness line:\n{written}"));
+            assert_eq!(entry_line["auth"], "bearer", "{entry_line}");
+        } else {
+            assert!(
+                written
+                    .lines()
+                    .any(|line| line.starts_with("murmur: auth bearer (mur token ses_")),
+                "{written}"
+            );
+            assert!(
+                written.lines().any(|line| line.trim() == "status:  ok"),
+                "{written}"
+            );
+        }
     }
 }
 

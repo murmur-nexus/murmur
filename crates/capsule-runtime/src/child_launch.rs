@@ -58,6 +58,12 @@ use crate::spawn_credential::SpawnApproval;
 /// built `mur` instead.
 pub const MUR_BINARY_ENV: &str = "MURMUR_MUR_BINARY";
 
+/// The hidden `mur run` flag that puts every door token the session minted on its `--json`
+/// readiness line, under `tokens`. Passed only by a launcher reading that line on a pipe nothing
+/// else holds — a parent runtime launching a delegated child, and `mur run --roster` launching a
+/// peer — because it is the one `mur run` output that carries a token.
+pub const READINESS_TOKENS_FLAG: &str = "--readiness-tokens";
+
 /// How long the parent waits for a child to print its `--json` launch line.
 ///
 /// Generous, because it bounds more than a handshake: a script capsule prints the line when its
@@ -414,6 +420,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         "--workdir".to_string(),
         workdir.display().to_string(),
         "--json".to_string(),
+        READINESS_TOKENS_FLAG.to_string(),
         "--no-env-file".to_string(),
         "--spawn-grant-stdin".to_string(),
     ];
@@ -543,7 +550,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
 }
 
 /// The operator token a child's `--json` readiness line carries under `tokens.operator`, present
-/// only when the child declares `network.authentication`.
+/// only when the child declares `network.authentication` and was launched with
+/// [`READINESS_TOKENS_FLAG`].
 pub(crate) fn readiness_door_token(
     report: &serde_json::Value,
 ) -> Option<crate::door_auth::DoorToken> {

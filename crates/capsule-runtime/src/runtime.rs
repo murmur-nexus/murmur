@@ -4466,9 +4466,10 @@ async fn drain_script_trace_buffers(
 /// A capsule started in a terminal dies with that window; one started without a terminal —
 /// `nohup … </dev/null &`, a `setsid`, a service manager — survives whoever started it.
 ///
-/// `door_token` is the operator token of a session declaring `network.authentication`, and the
-/// only one written anywhere: it is how `mur ps`, `mur stop`, `mur cancel` and `mur watch` call
-/// an authenticated door.
+/// `door_token` is the operator token of a session declaring `network.authentication`: it is how
+/// `mur ps`, `mur stop`, `mur cancel` and `mur watch` call an authenticated door. `credentials`
+/// holds the token of every credential the manifest declares beside it, which is where `mur token
+/// --credential` reads one. The record is the only place outside the process a token is written.
 ///
 /// `holds_formation_lifeline` is whether this session holds a formation lifeline, which its
 /// launcher ends it by closing. Only such a member records the launcher its channel named, which
@@ -4497,6 +4498,12 @@ fn running_record_for(
             .door_auth
             .as_ref()
             .map(|auth| auth.operator_token().clone()),
+        // `tokens()` is the operator first, which `door_token` already holds.
+        credentials: staged
+            .door_auth
+            .as_ref()
+            .map(|auth| auth.tokens().iter().skip(1).cloned().collect())
+            .unwrap_or_default(),
         formation_id: staged.formation_id.clone(),
         formation_lifeline: holds_formation_lifeline,
         formation_launcher: staged
@@ -4528,7 +4535,8 @@ fn write_running_record(
             let message = format!(
                 "this session's record under ~/.murmur/running/ could not be written, so \
                  `mur watch` and `mur cancel` cannot reach it by session address — only by the \
-                 URL it announces: {reason}"
+                 URL it announces — and `mur token` cannot read the tokens of an authenticated \
+                 door: {reason}"
             );
             crate::runtime_err!("[capsule-runtime] warning[{W_SEC_023}]: {message} ({link})");
             agent::append_bootstrap_log(

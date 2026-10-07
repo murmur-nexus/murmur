@@ -1286,7 +1286,15 @@ fn door_auth_session_address_resolves_an_authenticated_capsule() {
         serde_json::from_str(&fs::read_to_string(record_for(home.path(), &session_id)).unwrap())
             .unwrap();
     assert_eq!(record["door_token"], run.token("operator").as_str());
-    assert_eq!(record.as_object().unwrap().len(), 10, "{record}");
+    assert_eq!(
+        record["credentials"]["watcher"],
+        run.token("watcher").as_str()
+    );
+    assert_eq!(
+        record["credentials"]["reader"],
+        run.token("reader").as_str()
+    );
+    assert_eq!(record.as_object().unwrap().len(), 11, "{record}");
 
     let canceled = mur(home.path(), &[])
         .args(["cancel", suffix, &task_id])

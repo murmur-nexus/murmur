@@ -770,10 +770,10 @@ fn write_registry_source_config(home: &Path, repo: &str) {
 
 // ── Door authentication ───────────────────────────────────────────────────────
 
-/// `mur run` prints one `murmur: token` line per token right after the url line, operator first,
-/// then the declared credentials by name, and the printed operator token drives the door.
+/// `mur run` prints no token: the line after the url says the door is authenticated and names the
+/// `mur token` command, and the token that command prints drives the door.
 #[test]
-fn door_tokens_are_printed_after_the_url_line() {
+fn an_authenticated_door_names_mur_token_after_the_url_line() {
     use common::door_capsule::{
         agent_project, driver_home, end_turn, message, rpc, wait_completed, MurRun,
         AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
@@ -799,24 +799,22 @@ fn door_tokens_are_printed_after_the_url_line() {
         .iter()
         .position(|line| line.starts_with("murmur: url "))
         .expect("a url line");
-    let printed: Vec<(&str, &str)> = run.stdout_lines[url_at + 1..url_at + 4]
-        .iter()
-        .map(|line| {
-            let rest = line
-                .strip_prefix("murmur: token ")
-                .unwrap_or_else(|| panic!("not a token line: {line:?}"));
-            rest.split_once(' ').unwrap()
-        })
-        .collect();
-    let names: Vec<&str> = printed.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ["operator", "reader", "watcher"]);
-    for (_, token) in &printed {
-        assert!(token.starts_with("mdt1."), "{token}");
+    let session_id = run.session_id();
+    assert_eq!(
+        run.stdout_lines[url_at + 1],
+        format!("murmur: auth bearer (mur token {session_id})")
+    );
+    assert_eq!(
+        run.stdout_lines[url_at + 2],
+        format!("session: {session_id}")
+    );
+    for line in &run.stdout_lines {
+        assert!(!line.contains("mdt1."), "a token reached stdout: {line}");
     }
-    assert!(run.stdout_lines[url_at + 4].starts_with("session: "));
 
     let addr = run.url();
     let operator = run.token("operator");
+    assert!(operator.starts_with("mdt1."), "{operator}");
     let sent = rpc(
         &addr,
         Some(&operator),
@@ -832,6 +830,51 @@ fn door_tokens_are_printed_after_the_url_line() {
         !stderr.contains("mdt1."),
         "a token reached stderr:\n{stderr}"
     );
+}
+
+/// A public door prints no `murmur: auth` line.
+#[test]
+fn a_public_door_prints_no_auth_line() {
+    use common::door_capsule::{agent_project, driver_home, MurRun, QUEUE_SLEEP_YAML};
+    let server = common::ScriptedServer::start(vec![]);
+    let home = driver_home();
+    let project = agent_project(&server.endpoint, "door-public", "", QUEUE_SLEEP_YAML);
+    let run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        false,
+        &[],
+        &[],
+    );
+    assert!(
+        run.stdout_lines
+            .iter()
+            .any(|line| line.starts_with("murmur: url ")),
+        "{:?}",
+        run.stdout_lines
+    );
+    assert!(
+        !run.stdout_lines
+            .iter()
+            .any(|line| line.starts_with("murmur: auth")),
+        "{:?}",
+        run.stdout_lines
+    );
+}
+
+/// `--readiness-tokens` belongs to the `--json` readiness line, and is refused without it.
+#[test]
+fn readiness_tokens_without_json_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .args(["run", "--readiness-tokens"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--json"), "{stderr}");
 }
 
 /// A delegating parent cannot declare `network.authentication`: nothing issues its children a

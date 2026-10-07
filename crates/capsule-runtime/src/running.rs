@@ -21,10 +21,12 @@
 //! only handle to a running capsule because it was slow to answer.
 //!
 //! The record names the process and stores nothing from the environment. A session declaring
-//! `network.authentication` also records its operator door token, which is how the host tools
-//! call its door; layer 3 then reads the session id off the extended card with that token. The
-//! directory is `0700` and each record `0600`, because the set of records is a map of reachable
-//! capsules, and of the tokens that drive them, to anything on the machine that can read it.
+//! `network.authentication` also records every door token it minted: the operator token, which is
+//! how the host tools call its door, and one per declared credential, which `mur token` hands out.
+//! Layer 3 reads the session id off the extended card with the operator token. The record is the
+//! only place a token is written: `mur run` prints none. The directory is `0700` and each record
+//! `0600`, because the set of records is a map of reachable capsules, and of the tokens that drive
+//! them, to anything on the machine that can read it.
 //!
 //! A session whose manifest declares `control:` also holds `<session_id>.control` beside its
 //! record: the control token, at the same mode, written before the record and removed with it.
@@ -32,6 +34,7 @@
 //! is gone, because the key that verifies it was never written anywhere.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -60,9 +63,9 @@ const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
 ///
-/// Every field but `door_token`, `formation_id`, `formation_lifeline`, `formation_launcher` and
-/// `spawned_by` is required, and each of those five is omitted when it does not apply, so a
-/// standalone session's record carries the nine required keys alone. There is no version field: a
+/// Every field but `door_token`, `credentials`, `formation_id`, `formation_lifeline`,
+/// `formation_launcher` and `spawned_by` is required, and each of those six is omitted when it does
+/// not apply, so a standalone session's record carries the nine required keys alone. There is no version field: a
 /// record that does not deserialize names no process that could be checked, and is pruned, which
 /// is what "the record is a hint" already means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +96,17 @@ pub struct RunningRecord {
         with = "door_token_field"
     )]
     pub door_token: Option<crate::door_auth::DoorToken>,
+    /// The tokens of the credentials `network.authentication.credentials` declares, by name. The
+    /// operator token is `door_token`, never an entry here. Empty, and omitted, for a public door,
+    /// for one declaring no credentials, and in a record an older runtime wrote. Every scope of
+    /// every entry is also a scope of `door_token`, so holding them beside it exposes nothing the
+    /// file did not already.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "door_credentials_field"
+    )]
+    pub credentials: BTreeMap<String, crate::door_auth::DoorToken>,
     /// The formation this session is a member of, so a reader can tell a formation's records from
     /// unrelated sessions on the machine. Absent for a session in no formation, and in a record an
     /// older runtime wrote. It groups records and grants nothing. A value that is not a formation
@@ -135,7 +149,8 @@ impl ProcessIdentity {
     }
 }
 
-/// The one place a [`crate::door_auth::DoorToken`] is serialized: the running record.
+/// How the running record serializes its operator token. With [`door_credentials_field`], the one
+/// place a [`crate::door_auth::DoorToken`] is serialized.
 mod door_token_field {
     use crate::door_auth::DoorToken;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -154,6 +169,36 @@ mod door_token_field {
         deserializer: D,
     ) -> Result<Option<DoorToken>, D::Error> {
         Ok(Option::<String>::deserialize(deserializer)?.map(DoorToken::new))
+    }
+}
+
+/// How the running record serializes its declared credentials' tokens: a JSON object of credential
+/// name to token. With [`door_token_field`], the one place a [`crate::door_auth::DoorToken`] is
+/// serialized.
+mod door_credentials_field {
+    use std::collections::BTreeMap;
+
+    use crate::door_auth::DoorToken;
+    use serde::{ser::SerializeMap, Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        credentials: &BTreeMap<String, DoorToken>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(credentials.len()))?;
+        for (name, token) in credentials {
+            map.serialize_entry(name, token.expose())?;
+        }
+        map.end()
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, DoorToken>, D::Error> {
+        Ok(BTreeMap::<String, String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(name, token)| (name, DoorToken::new(token)))
+            .collect())
     }
 }
 
@@ -765,6 +810,7 @@ mod tests {
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            credentials: BTreeMap::new(),
             formation_id: None,
             formation_lifeline: false,
             formation_launcher: None,
@@ -808,6 +854,7 @@ mod tests {
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            credentials: BTreeMap::new(),
             formation_id: None,
             formation_lifeline: false,
             formation_launcher: None,
@@ -866,6 +913,69 @@ mod tests {
         let debug = format!("{with_token:?}");
         assert!(!debug.contains("secretpayload"), "{debug}");
         assert!(debug.contains("DoorToken(<redacted>)"), "{debug}");
+    }
+
+    fn with_credentials() -> RunningRecord {
+        let mut authenticated = record(1, "42");
+        authenticated.door_token = Some(crate::door_auth::DoorToken::new(
+            "mdt1.operatorpayload.mac".to_string(),
+        ));
+        for name in ["watcher", "reader"] {
+            authenticated.credentials.insert(
+                name.to_string(),
+                crate::door_auth::DoorToken::new(format!("mdt1.{name}secret.mac")),
+            );
+        }
+        authenticated
+    }
+
+    #[test]
+    fn a_record_with_credentials_serializes_them_as_an_object_by_name() {
+        let authenticated = with_credentials();
+        let value = serde_json::to_value(&authenticated).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 11);
+        assert_eq!(
+            object["credentials"],
+            serde_json::json!({
+                "reader": "mdt1.readersecret.mac",
+                "watcher": "mdt1.watchersecret.mac",
+            })
+        );
+        let back: RunningRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back, authenticated);
+    }
+
+    #[test]
+    fn a_record_debug_prints_no_credential_token() {
+        let debug = format!("{:?}", with_credentials());
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(!debug.contains("operatorpayload"), "{debug}");
+        assert!(
+            debug.contains("\"watcher\": DoorToken(<redacted>)"),
+            "{debug}"
+        );
+    }
+
+    /// An operator token alone — a door declaring no credentials — writes no `credentials` key.
+    #[test]
+    fn a_record_with_no_declared_credentials_omits_the_key() {
+        let mut operator_only = record(1, "42");
+        operator_only.door_token = Some(crate::door_auth::DoorToken::new(
+            "mdt1.payload.mac".to_string(),
+        ));
+        let value = serde_json::to_value(&operator_only).unwrap();
+        assert!(value.get("credentials").is_none(), "{value}");
+    }
+
+    /// A record an older runtime wrote has no `credentials` key, and reads as declaring none.
+    #[test]
+    fn a_record_without_a_credentials_key_parses_as_empty() {
+        let mut value = serde_json::to_value(with_credentials()).unwrap();
+        value.as_object_mut().unwrap().remove("credentials");
+        let parsed: RunningRecord = serde_json::from_value(value).unwrap();
+        assert!(parsed.credentials.is_empty());
+        assert!(parsed.door_token.is_some());
     }
 
     /// A record an older runtime wrote has no `door_token` key, and still names a process.
@@ -1355,6 +1465,7 @@ mod home_tests {
             outlives_launcher: true,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            credentials: BTreeMap::new(),
             formation_id: None,
             formation_lifeline: false,
             formation_launcher: None,

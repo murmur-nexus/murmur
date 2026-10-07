@@ -178,11 +178,13 @@ pub const QUEUE_SLEEP_YAML: &str =
 /// A `mur run` child: its readiness output, and everything it writes to stderr.
 pub struct MurRun {
     pub child: Child,
-    /// The `--json` readiness line, or `{"url": …, "tokens": {…}}` read off the human lines.
+    /// The `--json` readiness line, or `{"url": …, "session_id": …}` read off the human lines.
     pub startup: Value,
     /// Every stdout line up to and including the readiness output.
     pub stdout_lines: Vec<String>,
     stderr: Arc<Mutex<String>>,
+    /// The `HOME` it runs under, whose running record `mur token` reads.
+    home: PathBuf,
 }
 
 impl MurRun {
@@ -264,6 +266,7 @@ impl MurRun {
             startup,
             stdout_lines,
             stderr,
+            home: home.to_path_buf(),
         }
     }
 
@@ -271,11 +274,26 @@ impl MurRun {
         self.startup["url"].as_str().unwrap().to_string()
     }
 
-    pub fn token(&self, name: &str) -> String {
-        self.startup["tokens"][name]
+    pub fn session_id(&self) -> String {
+        self.startup["session_id"]
             .as_str()
-            .unwrap_or_else(|| panic!("no {name} token in {}", self.startup))
+            .unwrap_or_else(|| panic!("no session_id in {}", self.startup))
             .to_string()
+    }
+
+    /// The token of credential `name`, as `mur token <session_id> --credential <name>` prints it
+    /// under the same `HOME`.
+    pub fn token(&self, name: &str) -> String {
+        let output = mur(&self.home, &[])
+            .args(["token", &self.session_id(), "--credential", name])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mur token --credential {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     pub fn stderr(&self) -> String {
@@ -290,19 +308,18 @@ impl Drop for MurRun {
     }
 }
 
-/// The url and tokens a human-mode `mur run` printed.
+/// The url and session id a human-mode `mur run` printed.
 fn human_startup(lines: &[String]) -> Value {
     let mut url = Value::Null;
-    let mut tokens = serde_json::Map::new();
+    let mut session_id = Value::Null;
     for line in lines {
         if let Some(rest) = line.strip_prefix("murmur: url ") {
             url = Value::from(rest.trim());
-        } else if let Some(rest) = line.strip_prefix("murmur: token ") {
-            let (name, token) = rest.split_once(' ').expect("murmur: token <name> <token>");
-            tokens.insert(name.to_string(), Value::from(token));
+        } else if let Some(rest) = line.strip_prefix("session: ") {
+            session_id = Value::from(rest.trim());
         }
     }
-    json!({"url": url, "tokens": tokens})
+    json!({"url": url, "session_id": session_id})
 }
 
 // ── Raw HTTP ──────────────────────────────────────────────────────────────────

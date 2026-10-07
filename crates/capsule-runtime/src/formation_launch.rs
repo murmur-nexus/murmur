@@ -841,7 +841,8 @@ fn pass_through(args: &mut Vec<String>, options: &FormationLaunchOptions) {
 }
 
 /// A peer's arguments after the binary: it runs in `workdir`, a directory of its own, and resolves
-/// from the project's stores.
+/// from the project's stores. Its readiness line carries its tokens, which this launcher reads on
+/// the peer's stdout pipe for the door probe.
 pub(crate) fn peer_args(
     member: &PlannedMember,
     options: &FormationLaunchOptions,
@@ -852,6 +853,7 @@ pub(crate) fn peer_args(
         STORE_ROOT_FLAG.to_string(),
         options.project_dir.display().to_string(),
         "--json".to_string(),
+        child_launch::READINESS_TOKENS_FLAG.to_string(),
         "--bind".to_string(),
         PEER_BIND_ADDR.to_string(),
     ]);
@@ -860,7 +862,8 @@ pub(crate) fn peer_args(
 }
 
 /// The entry member's arguments after the binary. It runs in the project directory, where its
-/// `--task` is written.
+/// `--task` is written. Never [`child_launch::READINESS_TOKENS_FLAG`]: the entry's output is the
+/// operator's.
 pub(crate) fn entry_args(member: &PlannedMember, options: &FormationLaunchOptions) -> Vec<String> {
     let mut args = member_args(member, &options.project_dir);
     args.extend([
@@ -1861,6 +1864,7 @@ mod tests {
                 "--store-root",
                 "/tmp/project",
                 "--json",
+                "--readiness-tokens",
                 "--bind",
                 "127.0.0.1",
             ]
@@ -1889,9 +1893,9 @@ mod tests {
             ]
         );
         assert!(
-            !entry
-                .iter()
-                .any(|arg| arg == "--bind" || arg == STORE_ROOT_FLAG),
+            !entry.iter().any(|arg| arg == "--bind"
+                || arg == STORE_ROOT_FLAG
+                || arg == child_launch::READINESS_TOKENS_FLAG),
             "{entry:?}"
         );
         let peer = peer_args(&coder, &options, &workdir);
@@ -2697,6 +2701,7 @@ mod tests {
             outlives_launcher: false,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             door_token: None,
+            credentials: Default::default(),
             formation_id: formation.cloned(),
             formation_lifeline: false,
             formation_launcher: None,

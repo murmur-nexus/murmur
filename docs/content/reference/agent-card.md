@@ -155,7 +155,7 @@ A public door's card is exactly the card at the top of this page.
 
 ### Tokens { #tokens }
 
-An authenticated capsule's runtime mints its tokens at launch, and [`mur run`](cli.md#mur-run)
+An authenticated capsule's runtime mints its tokens at launch, and [`mur token`](cli.md#mur-token)
 prints them. A token is valid until the session ends; a restart or a `--resume` mints new ones.
 
 | Credential | Scopes | Minted |

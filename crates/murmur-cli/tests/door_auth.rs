@@ -1,5 +1,5 @@
 //! The A2A door of a capsule that declares `network.authentication`, end to end: the gate's order
-//! and refusals, the public and extended cards, the tokens `mur run` prints, and what never sees a
+//! and refusals, the public and extended cards, the tokens `mur token` prints, and what never sees a
 //! token. And the door of a capsule that declares nothing, which is unchanged.
 
 #[path = "common/mod.rs"]
