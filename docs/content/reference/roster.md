@@ -457,8 +457,9 @@ in full:
    passes — see [A busy member](runtime-provided-tools.md#call-member-busy).
 2. The member runs it in its own directory, as any task at its door.
 3. When the caller's turn ends with an [`inference.max_turns`](manifest.md#field-inference) turn
-   still left, the caller's same task waits for the answer and continues with it, fenced under
-   `member:<name>`. A task with no turn left does not wait — see
+   still left, the caller's same task waits for every answer to every call it made, and continues
+   once with all of them, each fenced under `member:<name>`. A task with no turn left does not
+   wait — see
    [How the answer arrives](runtime-provided-tools.md#call-member-answer).
 
 The call reaches the member's real door only if the caller's own

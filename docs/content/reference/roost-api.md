@@ -457,15 +457,17 @@ so in a non-final `working` frame.
 
 | Frame message | When |
 |---|---|
-| `waiting on delegate-task: M delegation(s) outstanding` | The task starts waiting and nothing has arrived |
-| `continuing with M delegation outcome(s)` | Outcomes arrived, and the task continues with them |
+| `waiting on delegate-task: M delegation(s) outstanding` | The task starts waiting with a delegation outstanding, and again with the new count each time one ends while another is still outstanding |
+| `continuing with M delegation outcome(s)` | Nothing is outstanding, and the task continues with every outcome |
 
 When the task also has [`call-member`](runtime-provided-tools.md) calls outstanding, it waits for
 both together, and the two texts are joined by `; `.
 
 The task waits only when its attempt finished with at least one turn of `inference.max_turns` left.
-Each wake that delivers outcomes spends one turn. The wait spends no tokens and counts against no
-spend ceiling.
+It continues once nothing it handed off is outstanding, so a round of delegations costs one
+continuation however far apart the outcomes arrive: the delivery spends one turn and writes one
+[`task_continued`](observability-schemas.md#task-continued) trace line. The wait spends no tokens
+and counts against no spend ceiling.
 
 Each outcome reaches the model as one block:
 
@@ -486,8 +488,8 @@ The child's own output is in that file and is not reproduced here.
 ```
 
 The block names the result file, which the model reads for the answer, or says
-`result: none (the child wrote no result file)`. It never carries the child's output. Outcomes for
-several delegations that arrive together are delivered in one continuation.
+`result: none (the child wrote no result file)`. It never carries the child's output. Every
+outcome of the round is delivered in one continuation, one block per delegation in id order.
 
 A task that ends before an outcome arrives ends the sub-capsule. The `delegation` trace line
 records `terminated`, with a `reason` naming why:
@@ -509,7 +511,7 @@ flight, taken before the task ends them.
 | Launch | 180s | From starting the child process to its first `--json` line |
 | Delivery | 30s | Retrying the task delivery while the child's listener comes up |
 | Child watch | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | How long the started child runs. Counted from the moment it reported itself ready, so the launch bound above is not spent out of it. On expiry the child is ended and a `terminated` outcome naming the bound in seconds is delivered into the delegating task |
-| Backstop | The child watch plus 30s | How long the delegating task waits for one delegation's outcome, counted from the launch. On expiry the task ends the child itself and continues with a `terminated` outcome saying no outcome arrived |
+| Backstop | The child watch plus 30s | How long the delegating task waits for one delegation's outcome, counted from the launch. On expiry the task ends the child at once, and a `terminated` outcome saying no outcome arrived joins the round's continuation |
 
 Both bounds are the delegating capsule's own runtime's clock. No request is made to the daemon to
 decide or enforce them, so no daemon has to be reachable for them to fire. A task's whole wait is at

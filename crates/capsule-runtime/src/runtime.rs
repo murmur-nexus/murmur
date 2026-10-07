@@ -242,6 +242,8 @@ async fn run_task_with_reopens(
     // Every reopen's (hook_name, reason) so far — all re-injected on each reopen.
     let mut feedback: Vec<(String, String)> = Vec::new();
     let mut reopens_used: u32 = 0;
+    // How many times the task has continued with handed-off work's outcomes, across reopens.
+    let mut continuations: u32 = 0;
     // The task plus every reopen's feedback so far, tracked alongside the `task.md` writes below
     // so `murmur:task-io/read`'s `as-given` form is the text the attempt was handed rather than a
     // re-read of a file whose path is a convention. A continued attempt received the same content
@@ -334,9 +336,10 @@ async fn run_task_with_reopens(
 
         // Everything this task handed off — `call-member` calls and `delegate-task` delegations
         // alike — is accounted for before its `on-task-end`: a finished attempt with a turn left
-        // waits for an outcome and continues with whatever has arrived, and any other ending
-        // leaves its calls behind and ends its delegations. With no turn left nothing could read
-        // an outcome, so the attempt does not wait for one.
+        // waits until nothing it handed off is outstanding and continues once with every outcome,
+        // so one round of handed-off work costs one turn whatever the arrival timing; any other
+        // ending leaves its calls behind and ends its delegations. With no turn left nothing could
+        // read an outcome, so the attempt does not wait for one.
         let mut result = result;
         let calls = state.member_calls.clone();
         let delegations = Arc::clone(&state.live_delegations);
@@ -352,8 +355,7 @@ async fn run_task_with_reopens(
                     .as_ref()
                     .map(|plane| plane.result_timeout() + DELEGATION_ARRIVAL_GRACE);
                 match wait_for_handed_off_work(
-                    calls.as_deref(),
-                    &delegations,
+                    state,
                     backstop,
                     cancel.as_ref(),
                     &sse,
@@ -362,42 +364,31 @@ async fn run_task_with_reopens(
                 )
                 .await
                 {
-                    Some(woken) => {
-                        record_member_calls(state, trace_task_id, &woken.answers, true).await;
-                        let mut notices = Vec::new();
-                        for (delegation_id, delegation) in woken.arrived {
+                    // Nothing left to deliver: whatever was handed off was taken back by its
+                    // starter while the task waited.
+                    Some(round) if round.is_empty() => {}
+                    Some(round) => {
+                        record_member_calls(state, trace_task_id, &round.answers, true).await;
+                        let mut notices = round.ended;
+                        for (delegation_id, delegation) in round.arrived {
                             notices
                                 .push(deliver_delegation(state, delegation_id, delegation).await);
                         }
-                        for (delegation_id, delegation) in woken.overdue {
-                            notices.push(
-                                end_overdue_delegation(
-                                    state,
-                                    delegation_id,
-                                    delegation,
-                                    backstop.unwrap_or_default(),
-                                )
-                                .await,
-                            );
-                        }
+                        notices.sort_by(|a, b| a.delegation_id.cmp(&b.delegation_id));
                         let mut messages = Vec::new();
                         let mut said = Vec::new();
-                        if !woken.answers.is_empty() {
-                            // Answers only come from `call-member` calls, so `calls` is set here.
-                            let (still_outstanding, unanswered) = calls
+                        if !round.answers.is_empty() {
+                            let unanswered = calls
                                 .as_ref()
-                                .map(|calls| (calls.outstanding(), calls.unanswered()))
+                                .map(|calls| calls.unanswered())
                                 .unwrap_or_default();
-                            let message = crate::member_call::answers_message(
-                                &woken.answers,
-                                &still_outstanding,
-                                &unanswered,
-                            );
+                            let message =
+                                crate::member_call::answers_message(&round.answers, &unanswered);
                             member_answers.push(message.clone());
                             messages.push(message);
                             said.push(format!(
                                 "continuing with {} member answer(s)",
-                                woken.answers.len()
+                                round.answers.len()
                             ));
                         }
                         if !notices.is_empty() {
@@ -409,6 +400,26 @@ async fn run_task_with_reopens(
                                 notices.len()
                             ));
                         }
+                        continuations += 1;
+                        let call_ids: Vec<String> = round
+                            .answers
+                            .iter()
+                            .map(|answer| answer.call_id.clone())
+                            .collect();
+                        let delegation_ids: Vec<String> = notices
+                            .iter()
+                            .map(|notice| notice.delegation_id.clone())
+                            .collect();
+                        let _ = trace
+                            .write_task_continued(
+                                trace_task_id,
+                                continuations,
+                                &call_ids,
+                                &delegation_ids,
+                                u64::try_from(round.waited.as_millis()).unwrap_or(u64::MAX),
+                                inference.max_turns.saturating_sub(trace.task_turns()),
+                            )
+                            .await;
                         emit_task_working(
                             &sse,
                             agent_task_id.as_deref(),
@@ -850,46 +861,88 @@ const DELEGATING_TASK_CANCELED_REASON: &str = "the delegating task was cancelled
 const DELEGATING_TASK_NO_TURN_REASON: &str =
     "the delegating task had no inference turn left to read this outcome";
 
-/// What a wait for handed-off work woke to: everything that has arrived, and every delegation
-/// the backstop is to end.
-struct Woken {
+/// One round of handed-off work, gathered once nothing the task handed off is still outstanding.
+struct Round {
+    /// Every `call-member` outcome, in arrival order.
     answers: Vec<crate::member_call::MemberCallOutcome>,
+    /// Every delegation whose outcome arrived, in id order, still to be delivered.
     arrived: Vec<(String, crate::cancel::LiveDelegation)>,
-    overdue: Vec<(String, crate::cancel::LiveDelegation)>,
+    /// What the task is told of each delegation the backstop ended while it waited. Each is
+    /// already ended and its terminal `delegation` line written.
+    ended: Vec<crate::delegation::OutcomeNotice>,
+    /// From the start of the wait until nothing was outstanding.
+    waited: std::time::Duration,
 }
 
-/// Wait until a `call-member` answer or a delegation's outcome has arrived, or until an
-/// outstanding delegation passes `backstop`, and take everything that has. `None` when `cancel`
-/// fires first.
+impl Round {
+    fn is_empty(&self) -> bool {
+        self.answers.is_empty() && self.arrived.is_empty() && self.ended.is_empty()
+    }
+}
+
+/// The task's `working` frame while it waits: what is still outstanding of each kind, or `None`
+/// when nothing is.
+fn waiting_message(calls_outstanding: usize, delegations_outstanding: usize) -> Option<String> {
+    let mut waiting = Vec::new();
+    if calls_outstanding > 0 {
+        waiting.push(format!(
+            "waiting on call-member: {calls_outstanding} call(s) outstanding"
+        ));
+    }
+    if delegations_outstanding > 0 {
+        waiting.push(format!(
+            "waiting on delegate-task: {delegations_outstanding} delegation(s) outstanding"
+        ));
+    }
+    (!waiting.is_empty()).then(|| waiting.join("; "))
+}
+
+/// Wait until no `call-member` call and no `delegate-task` delegation the task handed off is
+/// still outstanding, then take everything as one [`Round`]. `None` when `cancel` fires first.
 ///
-/// Says so on the task's stream when nothing has arrived yet, so a client does not read the quiet
+/// Arrived answers and outcomes stay in their sets until then, so a cancelled wait leaves them to
+/// the task's own accounting. A delegation still outstanding when it passes `backstop` is ended
+/// at that moment, not at delivery; its notice joins the round. Every call ends by its watcher's
+/// deadline and every delegation by `backstop`, so the wait never outlasts the latest-started
+/// item's own bound.
+///
+/// Says what is outstanding on the task's stream when the wait starts with anything outstanding,
+/// and again each time that drops while something still is, so a client does not read the quiet
 /// as the task's end. Spends no tokens and counts against no spend ceiling.
 async fn wait_for_handed_off_work(
-    calls: Option<&crate::member_call::MemberCalls>,
-    delegations: &crate::cancel::LiveDelegations,
+    state: &CapsuleStoreState,
     backstop: Option<std::time::Duration>,
     cancel: Option<&crate::cancel::CancelSignal>,
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     agent_task_id: Option<&str>,
     context_id: Option<&String>,
-) -> Option<Woken> {
-    let (calls_outstanding, calls_arrived) = calls.map_or((0, 0), |calls| calls.counts());
-    let (delegations_outstanding, delegations_arrived) = delegations.counts();
-    if calls_arrived + delegations_arrived == 0 {
-        let mut waiting = Vec::new();
-        if calls_outstanding > 0 {
-            waiting.push(format!(
-                "waiting on call-member: {calls_outstanding} call(s) outstanding"
-            ));
-        }
-        if delegations_outstanding > 0 {
-            waiting.push(format!(
-                "waiting on delegate-task: {delegations_outstanding} delegation(s) outstanding"
-            ));
-        }
-        emit_task_working(sse, agent_task_id, context_id, waiting.join("; ")).await;
-    }
+) -> Option<Round> {
+    let began = std::time::Instant::now();
+    let calls = state.member_calls.as_deref();
+    let delegations = &state.live_delegations;
+    let mut ended = Vec::new();
+    let mut announced = None;
     loop {
+        if let Some(bound) = backstop {
+            for (delegation_id, delegation) in delegations.take_overdue(bound) {
+                ended.push(end_overdue_delegation(state, delegation_id, delegation, bound).await);
+            }
+        }
+        let calls_outstanding = calls.map_or(0, |calls| calls.counts().0);
+        let delegations_outstanding = delegations.counts().0;
+        let Some(waiting) = waiting_message(calls_outstanding, delegations_outstanding) else {
+            return Some(Round {
+                answers: calls.map(|calls| calls.take_arrived()).unwrap_or_default(),
+                arrived: delegations.take_arrived(),
+                ended,
+                waited: began.elapsed(),
+            });
+        };
+        let outstanding = calls_outstanding + delegations_outstanding;
+        if announced != Some(outstanding) {
+            announced = Some(outstanding);
+            emit_task_working(sse, agent_task_id, context_id, waiting).await;
+        }
         let overdue_at = backstop.and_then(|bound| delegations.next_overdue(bound));
         tokio::select! {
             biased;
@@ -901,27 +954,17 @@ async fn wait_for_handed_off_work(
             } => return None,
             () = async {
                 match calls {
-                    Some(calls) => calls.wait_for_outcome().await,
+                    Some(calls) => calls.wait_for_arrival().await,
                     None => std::future::pending().await,
                 }
             } => {}
-            () = delegations.wait_for_outcome() => {}
+            () = delegations.wait_for_arrival() => {}
             () = async {
                 match overdue_at {
                     Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
                     None => std::future::pending().await,
                 }
             } => {}
-        }
-        let woken = Woken {
-            answers: calls.map(|calls| calls.take_arrived()).unwrap_or_default(),
-            arrived: delegations.take_arrived(),
-            overdue: backstop
-                .map(|bound| delegations.take_overdue(bound))
-                .unwrap_or_default(),
-        };
-        if !(woken.answers.is_empty() && woken.arrived.is_empty() && woken.overdue.is_empty()) {
-            return Some(woken);
         }
     }
 }
@@ -17949,7 +17992,7 @@ inference:
     }
 
     /// Every frame in `buffer`, in order, as `{"event": <type>, "data": <data>}`.
-    fn buffered_frames(buffer: &Mutex<SseEventBuffer>) -> Vec<serde_json::Value> {
+    pub(super) fn buffered_frames(buffer: &Mutex<SseEventBuffer>) -> Vec<serde_json::Value> {
         let frames = match buffer.lock().unwrap().replay_from(0) {
             crate::streaming::ReplayResult::Complete(frames)
             | crate::streaming::ReplayResult::WithGap { events: frames, .. } => frames,
@@ -20831,7 +20874,6 @@ mod member_call_tests {
                 duration_ms: 1,
             }],
             &[],
-            &[],
         );
         let rewritten = build_continued_task_md("do it", &[], &[message], &[]);
         assert!(
@@ -20846,6 +20888,203 @@ mod member_call_tests {
                  Answer the task with them now; call a member again only to give it new work."
             ),
             "{rewritten}"
+        );
+    }
+
+    /// A session with `call-member` calls and delegations scoped to `tsk_caller` and a trace, for
+    /// driving [`wait_for_handed_off_work`] directly, and the stream it reports on.
+    async fn waiting_state(
+        workdir: &Path,
+    ) -> (
+        CapsuleStoreState,
+        crate::cancel::DelegationScope,
+        Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    ) {
+        let mut state = build_test_state(
+            Arc::new(super::tests::FakeSkillRegistry::new(Vec::new())),
+            workdir.to_path_buf(),
+            workdir.join("murmur.lock"),
+        );
+        let calls = Arc::new(crate::member_call::MemberCalls::new(
+            std::time::Duration::from_secs(60),
+        ));
+        calls.begin_task("tsk_caller", None);
+        state.member_calls = Some(calls);
+        let scope = state.live_delegations.scope_task("tsk_caller");
+        state.peer_trace = Some(Arc::new(
+            crate::trace::ResourceTraceAppender::open(
+                workdir,
+                "ses_test".to_string(),
+                "evt_session".to_string(),
+            )
+            .await
+            .unwrap(),
+        ));
+        let (sse_tx, _) = tokio::sync::broadcast::channel(64);
+        let sse = Some((sse_tx, Arc::new(Mutex::new(SseEventBuffer::new(64)))));
+        (state, scope, sse)
+    }
+
+    /// The message of every `working` frame on `sse`, in order.
+    fn working_messages(sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>) -> Vec<String> {
+        let (_, buffer) = sse.as_ref().unwrap();
+        super::tests::buffered_frames(buffer)
+            .iter()
+            .filter(|frame| frame["event"] == "status")
+            .map(|frame| {
+                frame["data"]["status"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A delegation of `tsk_caller` started `ago`, whose child left no record.
+    fn delegation_started(
+        workdir: &Path,
+        ago: std::time::Duration,
+    ) -> crate::cancel::LiveDelegation {
+        crate::cancel::LiveDelegation {
+            task_id: "tsk_caller".to_string(),
+            workdir: workdir.join("no-child"),
+            capsule: "worker".to_string(),
+            version: "0.1.0".to_string(),
+            child_session_id: "ses_child".to_string(),
+            child_workdir: ".murmur/children/child-1".to_string(),
+            started: std::time::Instant::now() - ago,
+            child: None,
+            arrived: false,
+        }
+    }
+
+    /// Three calls answering one by one: the stream counts down 3, 2, 1, and the wait returns
+    /// once, with all three. With every answer in before the wait begins, it says nothing and
+    /// returns at once.
+    #[tokio::test]
+    async fn handed_off_work_wait_announces_each_arrival_and_continues_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _scope, sse) = waiting_state(dir.path()).await;
+        let calls = state.member_calls.clone().unwrap();
+        let members = [("mcl_1", "w1"), ("mcl_2", "w2"), ("mcl_3", "w3")];
+        for (call_id, member) in members {
+            crate::member_call::tests::hold(&calls, call_id, member);
+        }
+        let answering = {
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                for (call_id, member) in members {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    crate::member_call::tests::answer(&calls, call_id, member);
+                }
+            })
+        };
+        let round = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_handed_off_work(&state, None, None, &sse, Some("tsk_1"), None),
+        )
+        .await
+        .expect("the wait ends once every call has")
+        .expect("nothing cancelled the wait");
+        answering.await.unwrap();
+        let answered: Vec<&str> = round
+            .answers
+            .iter()
+            .map(|answer| answer.call_id.as_str())
+            .collect();
+        assert_eq!(answered, ["mcl_1", "mcl_2", "mcl_3"]);
+        assert!(round.arrived.is_empty() && round.ended.is_empty());
+        assert!(round.waited >= std::time::Duration::from_millis(400));
+        assert_eq!(calls.counts(), (0, 0));
+        assert_eq!(
+            working_messages(&sse),
+            [
+                "waiting on call-member: 3 call(s) outstanding",
+                "waiting on call-member: 2 call(s) outstanding",
+                "waiting on call-member: 1 call(s) outstanding",
+            ]
+        );
+
+        for (call_id, member) in members {
+            crate::member_call::tests::hold(&calls, call_id, member);
+            crate::member_call::tests::answer(&calls, call_id, member);
+        }
+        let round = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            wait_for_handed_off_work(&state, None, None, &sse, Some("tsk_1"), None),
+        )
+        .await
+        .expect("nothing outstanding: the wait returns at once")
+        .unwrap();
+        assert_eq!(round.answers.len(), 3);
+        assert_eq!(
+            working_messages(&sse).len(),
+            3,
+            "no frame for a wait with nothing out"
+        );
+    }
+
+    /// A call and two delegations: the wait holds until neither kind has anything outstanding,
+    /// ends the delegation that passes the backstop when it passes, before the other arrives, and
+    /// returns once with all three.
+    #[tokio::test]
+    async fn handed_off_work_waits_for_both_kinds_and_ends_an_overdue_delegation_on_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _scope, sse) = waiting_state(dir.path()).await;
+        let calls = state.member_calls.clone().unwrap();
+        crate::member_call::tests::hold(&calls, "mcl_1", "worker");
+        let backstop = std::time::Duration::from_secs(10);
+        // Passes the backstop 400 ms into the wait; the other passes it long after it arrives.
+        let delegations = Arc::clone(&state.live_delegations);
+        assert!(delegations.register(
+            "dlg_a".to_string(),
+            delegation_started(dir.path(), backstop - std::time::Duration::from_millis(400)),
+        ));
+        assert!(delegations.register(
+            "dlg_b".to_string(),
+            delegation_started(dir.path(), std::time::Duration::ZERO),
+        ));
+        let workdir = dir.path().to_path_buf();
+        let arriving = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            crate::member_call::tests::answer(&calls, "mcl_1", "worker");
+            tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+            let ended: Vec<serde_json::Value> = trace_lines(&workdir)
+                .into_iter()
+                .filter(|line| line["event_type"] == "delegation")
+                .collect();
+            assert_eq!(ended.len(), 1, "{ended:?}");
+            assert_eq!(ended[0]["delegation_id"], "dlg_a");
+            assert_eq!(ended[0]["outcome"], "terminated");
+            assert_eq!(delegations.counts(), (1, 0), "dlg_a is ended, not held");
+            assert_eq!(
+                delegations.arrive("dlg_b"),
+                crate::cancel::Arrival::Delivered
+            );
+        });
+        let round = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_handed_off_work(&state, Some(backstop), None, &sse, Some("tsk_1"), None),
+        )
+        .await
+        .expect("the wait ends once neither kind has anything outstanding")
+        .expect("nothing cancelled the wait");
+        arriving.await.unwrap();
+        assert_eq!(round.answers.len(), 1);
+        assert_eq!(round.answers[0].call_id, "mcl_1");
+        let arrived: Vec<&str> = round.arrived.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(arrived, ["dlg_b"]);
+        assert_eq!(round.ended.len(), 1);
+        assert_eq!(round.ended[0].delegation_id, "dlg_a");
+        assert_eq!(round.ended[0].status, "terminated");
+        assert_eq!(
+            working_messages(&sse),
+            [
+                "waiting on call-member: 1 call(s) outstanding; waiting on delegate-task: 2 \
+                 delegation(s) outstanding",
+                "waiting on delegate-task: 2 delegation(s) outstanding",
+                "waiting on delegate-task: 1 delegation(s) outstanding",
+            ]
         );
     }
 

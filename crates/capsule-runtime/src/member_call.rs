@@ -665,6 +665,7 @@ impl MemberCalls {
     }
 
     /// `(call_id, member)` for every call still waited on, in the order they started.
+    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> Vec<(String, String)> {
         self.lock()
             .outstanding
@@ -794,8 +795,17 @@ impl MemberCalls {
         self.arrival.notify_one();
     }
 
+    /// Wait for the next outcome to arrive, whatever has arrived already. An arrival since the
+    /// last wait that nothing was waiting for resolves it at once, so an outcome that lands
+    /// between reading [`Self::counts`] and this wait is never missed; it may also resolve with
+    /// nothing new, so a caller re-reads the counts after every wake. Cancellation-safe: arrived
+    /// outcomes stay in the set until taken.
+    pub(crate) async fn wait_for_arrival(&self) {
+        self.arrival.notified().await;
+    }
+
     /// Wait until at least one outcome has arrived. Resolves at once when one already has.
-    /// Cancellation-safe: dropping the future loses no outcome.
+    #[cfg(test)]
     pub(crate) async fn wait_for_outcome(&self) {
         loop {
             if !self.lock().arrived.is_empty() {
@@ -1219,13 +1229,12 @@ pub(crate) fn no_answer_note(member: &str, call_id: &str, status: MemberCallStat
 /// naming the call, the member and how it ended, then the member's output fenced under
 /// `member:<name>`.
 ///
-/// After every fence come the runtime's own lines. `unanswered` is
-/// [`MemberCalls::unanswered`]: each member it names gets a line saying no answer came from it. The
-/// last line says which calls are still out — `still_outstanding` is `(call_id, member)` per call
-/// still waited on — or, once none is, how to answer with what came back.
+/// Delivered once every call the task made has ended, so after every fence come the runtime's own
+/// lines: `unanswered` is [`MemberCalls::unanswered`], and each member it names gets a line saying
+/// no answer came from it; the last line says every call has ended and how to answer with what
+/// came back.
 pub(crate) fn answers_message(
     outcomes: &[MemberCallOutcome],
-    still_outstanding: &[(String, String)],
     unanswered: &[(String, String, MemberCallStatus)],
 ) -> String {
     let mut lines = vec![outcomes
@@ -1263,17 +1272,7 @@ pub(crate) fn answers_message(
              by them: do not present an answer of your own as theirs."
         ));
     }
-    lines.push(if !still_outstanding.is_empty() {
-        let working = still_outstanding
-            .iter()
-            .map(|(call_id, member)| format!("{member} (call {call_id})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "[call-member] Still working: {working}. Their answers arrive after you end your \
-             turn; do not call them again before then."
-        )
-    } else if unanswered.is_empty() {
+    lines.push(if unanswered.is_empty() {
         "[call-member] Every call this task made has ended, and the answers are above. Answer the \
          task with them now; call a member again only to give it new work."
             .to_string()
@@ -1439,7 +1438,6 @@ pub(crate) mod tests {
                 duration_ms: 1,
             }],
             &[],
-            &[],
         );
         assert!(message.starts_with("[call-member] call mcl_1 to worker ended completed:\n"));
         assert!(message.contains("<untrusted-content source=member:worker>\n"));
@@ -1470,6 +1468,16 @@ pub(crate) mod tests {
         assert_eq!(calls.counts(), (0, 0));
     }
 
+    /// Register `call_id` to `member` as outstanding in `calls`, as a call its member holds is.
+    pub(crate) fn hold(calls: &MemberCalls, call_id: &str, member: &str) {
+        calls.lock().outstanding.push(outstanding(call_id, member));
+    }
+
+    /// Deliver `call_id`'s completed answer from `member` to `calls`, as its watcher does.
+    pub(crate) fn answer(calls: &MemberCalls, call_id: &str, member: &str) {
+        calls.arrive(outcome(call_id, member));
+    }
+
     fn outcome(call_id: &str, member: &str) -> MemberCallOutcome {
         MemberCallOutcome {
             call_id: call_id.to_string(),
@@ -1492,11 +1500,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// The last line of a delivery is the runtime's, after every fence: every call ended, or
-    /// which are still out, by member and call id in start order.
+    /// The last line of a delivery is the runtime's, after every fence: every call has ended. The
+    /// only other runtime lines are the two calls' headers.
     #[test]
-    fn answers_end_with_the_runtime_s_line_on_what_is_still_out() {
-        let done = answers_message(&[outcome("mcl_1", "worker")], &[], &[]);
+    fn answers_end_with_the_runtime_s_line_that_every_call_has_ended() {
+        let done = answers_message(
+            &[outcome("mcl_1", "worker"), outcome("mcl_2", "critic")],
+            &[],
+        );
         assert!(
             done.ends_with(
                 "</untrusted-content>\n\n[call-member] Every call this task made has ended, and \
@@ -1505,30 +1516,7 @@ pub(crate) mod tests {
             ),
             "{done}"
         );
-        let waiting = answers_message(
-            &[outcome("mcl_1", "worker")],
-            &[("mcl_x".to_string(), "critic".to_string())],
-            &[],
-        );
-        assert!(
-            waiting.ends_with(
-                "</untrusted-content>\n\n[call-member] Still working: critic (call mcl_x). Their \
-                 answers arrive after you end your turn; do not call them again before then."
-            ),
-            "{waiting}"
-        );
-        let two = answers_message(
-            &[outcome("mcl_1", "worker")],
-            &[
-                ("mcl_x".to_string(), "critic".to_string()),
-                ("mcl_y".to_string(), "editor".to_string()),
-            ],
-            &[],
-        );
-        assert!(
-            two.contains("Still working: critic (call mcl_x), editor (call mcl_y). Their"),
-            "{two}"
-        );
+        assert_eq!(done.matches("[call-member] ").count(), 3, "{done}");
     }
 
     #[test]
@@ -1684,7 +1672,7 @@ pub(crate) mod tests {
         calls.arrive(outcome("mcl_1", "worker"));
         let taken = calls.take_arrived();
         assert!(calls.unanswered().is_empty());
-        let message = answers_message(&taken, &calls.outstanding(), &calls.unanswered());
+        let message = answers_message(&taken, &calls.unanswered());
         assert!(!message.contains("No answer came from"), "{message}");
         assert!(message.ends_with(&format!("</untrusted-content>\n\n{ANSWERED_ALL}")));
     }
@@ -1712,7 +1700,7 @@ pub(crate) mod tests {
                 MemberCallStatus::TimedOut
             )]
         );
-        let message = answers_message(&taken, &calls.outstanding(), &calls.unanswered());
+        let message = answers_message(&taken, &calls.unanswered());
         assert_eq!(
             message,
             format!(
@@ -1727,31 +1715,33 @@ pub(crate) mod tests {
         assert!(!message.contains("the answers are above"), "{message}");
     }
 
-    /// With a call still out, the no-answer line comes first and the last line is still the one
-    /// on what is still working.
+    /// The no-answer line comes before the last line, which says every call has ended.
     #[test]
-    fn a_no_answer_line_comes_before_what_is_still_working() {
+    fn a_no_answer_line_comes_before_the_last_line() {
         let message = answers_message(
-            &[ended(
-                "mcl_1",
-                "worker",
-                MemberCallStatus::Failed,
-                "worker's task ended failed",
-            )],
-            &[("mcl_2".to_string(), "critic".to_string())],
+            &[
+                ended(
+                    "mcl_1",
+                    "worker",
+                    MemberCallStatus::Failed,
+                    "worker's task ended failed",
+                ),
+                outcome("mcl_2", "critic"),
+            ],
             &[(
                 "mcl_1".to_string(),
                 "worker".to_string(),
                 MemberCallStatus::Failed,
             )],
         );
-        let tail = message.split_once("</untrusted-content>\n\n").unwrap().1;
+        let tail = message.rsplit_once("</untrusted-content>\n\n").unwrap().1;
         assert_eq!(
             tail,
-            "[call-member] No answer came from: worker (call mcl_1, failed). What you asked of \
-             them has not been done by them: do not present an answer of your own as theirs.\n\n\
-             [call-member] Still working: critic (call mcl_2). Their answers arrive after you end \
-             your turn; do not call them again before then."
+            format!(
+                "[call-member] No answer came from: worker (call mcl_1, failed). What you asked \
+                 of them has not been done by them: do not present an answer of your own as \
+                 theirs.\n\n{ANSWERED_SOME}"
+            )
         );
     }
 
@@ -1778,7 +1768,7 @@ pub(crate) mod tests {
                 MemberCallStatus::Rejected
             )]
         );
-        let message = answers_message(&taken, &[], &calls.unanswered());
+        let message = answers_message(&taken, &calls.unanswered());
         assert!(
             message.contains("No answer came from: critic (call mcl_2, rejected). What"),
             "{message}"
@@ -1864,7 +1854,6 @@ pub(crate) mod tests {
                 ),
                 outcome("mcl_2", "critic"),
             ],
-            &[],
             &[(
                 "mcl_1".to_string(),
                 "worker".to_string(),

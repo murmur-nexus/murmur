@@ -177,11 +177,19 @@ different members in one turn never refuse each other.
 ### How the answer arrives { #call-member-answer }
 
 1. The model ends its turn with a turn still left.
-2. If no answer has arrived yet, the task's stream shows a `working` status
-   `waiting on call-member: <n> call(s) outstanding`, and the task waits.
-3. Once at least one answer has arrived, the task continues with one new user message holding
-   every answer that has arrived. The stream shows `continuing with <n> member answer(s)`.
+2. The task waits until every call it made has ended. While any call is outstanding, the task's
+   stream shows a `working` status `waiting on call-member: <n> call(s) outstanding`: once when
+   the wait starts, and again with the new count each time an answer arrives while others are
+   still out. When every answer arrived during the turn, the task does not wait and shows no
+   such status.
+3. Once every call has ended, the task continues with one new user message holding every answer.
+   The stream shows `continuing with <n> member answer(s)`, and the trace records one
+   [`task_continued`](observability-schemas.md#task-continued).
 4. The model reads the answers and answers in turn, or calls again.
+
+One round of calls costs one continuation, however far apart the answers arrive. The wait is
+bounded by each call's own deadline, [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs):
+a member that never answers holds the round until its call ends `timed_out`.
 
 Each answer in that message is one header line naming the call id, the member and how the call
 ended, then the member's output fenced under `member:<name>`, whatever the calling task's trust.
@@ -218,11 +226,10 @@ id and status, in one line after every fence:
 
 A later call to the same member that completes removes it from that line. The message's last line:
 
-| Calls still outstanding | Members with no answer | Last line |
-|---|---|---|
-| One or more | Any | `[call-member] Still working: <member> (call <call_id>), <member> (call <call_id>). Their answers arrive after you end your turn; do not call them again before then.` |
-| None | None | `[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.` |
-| None | One or more | `[call-member] Every call this task made has ended. Answer the task with the answers you have and say plainly which part has no answer, or call a member again if another attempt could succeed.` |
+| Members with no answer | Last line |
+|---|---|
+| None | `[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.` |
+| One or more | `[call-member] Every call this task made has ended. Answer the task with the answers you have and say plainly which part has no answer, or call a member again if another attempt could succeed.` |
 
 | Ending | Output |
 |---|---|
@@ -250,8 +257,9 @@ the task ends as its attempt ended:
 | Fails, runs out of turns, is cancelled, or is stopped by `SIGTERM` or its formation ending | Each is recorded `abandoned` | Recorded `delivered: false` |
 
 A task cancelled while it waits ends `canceled`. A task with `delegate-task` delegations
-outstanding as well waits for both kinds together and continues with whatever has arrived of
-either, answers first — see [How the outcome arrives](roost-api.md#how-the-outcome-arrives).
+outstanding as well waits for both kinds together and continues once neither has anything
+outstanding, with every answer and every delegation outcome in one message, answers first — see
+[How the outcome arrives](roost-api.md#how-the-outcome-arrives).
 
 | Bound | Value |
 |---|---|

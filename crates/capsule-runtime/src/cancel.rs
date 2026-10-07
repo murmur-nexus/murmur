@@ -332,15 +332,13 @@ impl LiveDelegations {
         (delegations.entries.len() - arrived, arrived)
     }
 
-    /// Wait until at least one outcome has arrived. Resolves at once when one already has.
-    /// Cancellation-safe: dropping the future loses no outcome.
-    pub(crate) async fn wait_for_outcome(&self) {
-        loop {
-            if self.lock().entries.values().any(|entry| entry.arrived) {
-                return;
-            }
-            self.arrival.notified().await;
-        }
+    /// Wait for the next outcome to arrive, whatever has arrived already. An arrival since the
+    /// last wait that nothing was waiting for resolves it at once, so an outcome that lands
+    /// between reading [`Self::counts`] and this wait is never missed; it may also resolve with
+    /// nothing new, so a caller re-reads the counts after every wake. Cancellation-safe: arrived
+    /// delegations stay in the set until taken.
+    pub(crate) async fn wait_for_arrival(&self) {
+        self.arrival.notified().await;
     }
 
     /// Every delegation whose outcome has arrived, in id order — which is start order — taken
@@ -767,24 +765,41 @@ mod tests {
         assert_eq!(live.counts(), (1, 1));
     }
 
-    /// An arrival wakes a waiter, and a wait armed after it resolves at once.
+    /// `wait_for_arrival` resolves once per arrival — one that landed before the wait included —
+    /// and an outcome already taken note of does not resolve it again, so a task can wait for
+    /// every outstanding delegation without draining the ones that have arrived.
     #[tokio::test]
-    async fn an_arrival_wakes_the_wait() {
+    async fn each_arrival_wakes_the_wait_for_the_next_one() {
         let (live, _scope) = scoped();
         live.register("dlg_a".to_string(), live_delegation("worker"));
+        live.register("dlg_b".to_string(), live_delegation("worker"));
+        assert_eq!(live.arrive("dlg_a"), Arrival::Delivered);
+        tokio::time::timeout(Duration::from_secs(5), live.wait_for_arrival())
+            .await
+            .expect("an arrival nobody was waiting for resolves the next wait");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), live.wait_for_arrival())
+                .await
+                .is_err(),
+            "an arrival already woken for does not resolve the wait again"
+        );
+        assert_eq!(
+            live.counts(),
+            (1, 1),
+            "the arrived delegation stays in the set"
+        );
+
         let door = Arc::clone(&live);
         let waiting = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(5), live.wait_for_outcome())
+            tokio::time::timeout(Duration::from_secs(5), live.wait_for_arrival())
                 .await
                 .expect("the arrival wakes the wait");
             live
         });
         tokio::task::yield_now().await;
-        assert_eq!(door.arrive("dlg_a"), Arrival::Delivered);
+        assert_eq!(door.arrive("dlg_b"), Arrival::Delivered);
         let live = waiting.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), live.wait_for_outcome())
-            .await
-            .expect("an outcome already there does not wait");
+        assert_eq!(live.counts(), (0, 2));
     }
 
     #[test]
