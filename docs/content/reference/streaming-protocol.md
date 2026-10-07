@@ -275,7 +275,7 @@ resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 
 | `status.state` | `final` | `status.message` |
 |---|---|---|
-| `working` | `false` | `inference turn <n>`, counted from 1, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task. `waiting on call-member: <n> call(s) outstanding` when the model ends a turn, with a turn left, while [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered and none has answered yet. `continuing with <n> member answer(s)` when the task continues with the answers that arrived |
+| `working` | `false` | `inference turn <n>`, counted from 1 across every attempt of the task, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task. `waiting on call-member: <n> call(s) outstanding` when the model ends a turn, with a turn left, while [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered and none has answered yet. `continuing with <n> member answer(s)` when the task continues with the answers that arrived |
 | `input-required` | `false` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
 | `completed` | `true` | `session ended` |
 | `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
@@ -320,7 +320,7 @@ boundary frame:
 | What a client sees | Reading |
 |---|---|
 | `text`, `thinking` and `artifact` frames of a rejected attempt | Written live and never withdrawn |
-| The boundary frame | The rejected attempt is over; the next attempt starts with `working` `inference turn 1` |
+| The boundary frame | The rejected attempt is over; the next attempt starts with `working` `inference turn <n>`, numbered on from the rejected attempt's last turn |
 | The final status's `status.response` | The task's answer |
 
 Never join `text` frames across a boundary frame: the joined text mixes a rejected answer with the

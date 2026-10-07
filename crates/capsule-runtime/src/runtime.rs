@@ -18555,6 +18555,11 @@ inference:
             3,
             "cumulative turns must never exceed max_turns"
         );
+        let turns: Vec<&serde_json::Value> = of_type(&events, "inference")
+            .into_iter()
+            .map(|inference| &inference["turn"])
+            .collect();
+        assert_eq!(turns, [0, 1, 2], "each attempt numbers on from the last");
         assert_eq!(
             count_type(&events, "task_reopened"),
             2,
@@ -18624,6 +18629,11 @@ inference:
 
         let inferences = of_type(&run.events, "inference");
         assert_eq!(inferences.len(), 2);
+        assert_eq!(
+            (&inferences[0]["turn"], &inferences[1]["turn"]),
+            (&serde_json::json!(0), &serde_json::json!(1)),
+            "the reopened attempt's turn numbers on from the first attempt's"
+        );
         let expected: Vec<String> = run.record[..3].iter().map(line_id).collect();
         assert_eq!(message_ids(inferences[1]), expected);
 
@@ -19082,7 +19092,8 @@ inference:
         assert_eq!(boundaries.len(), 1, "{:#?}", run.frames);
         assert_boundary_frame(boundaries[0], 1);
 
-        // The boundary sits after the first attempt's answer and before the second's first turn.
+        // The boundary sits after the first attempt's answer and before the second's first turn,
+        // which numbers on from the first attempt's one turn.
         let first_answer = frame_index(&run, 0, |frame| {
             frame["event"] == "text" && frame["data"]["text"] == "RESULT-1"
         });
@@ -19090,9 +19101,14 @@ inference:
             frame["data"]["status"].get("reopen").is_some()
         });
         let second_turn = frame_index(&run, boundary, |frame| {
-            frame["data"]["status"]["message"] == "inference turn 1"
+            frame["data"]["status"]["message"] == "inference turn 2"
         });
         assert!(first_answer < boundary && boundary < second_turn);
+        let turns: Vec<&serde_json::Value> = of_type(&run.events, "inference")
+            .into_iter()
+            .map(|inference| &inference["turn"])
+            .collect();
+        assert_eq!(turns, [0, 1]);
     }
 
     /// A process task whose hook still wants a reopen when `lifecycle.max_task_reopens` is spent

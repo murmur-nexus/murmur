@@ -370,7 +370,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
     # `call-member`, keeps the bridge's answer in its store as `call-member-answer`, and ends the
     # turn. On a resume the prompt is the runtime's delivery of the answers, several lines ending
     # at the runtime's last `[call-member]` line; stdin stays open, so it reads up to that line
-    # and no further, and answers with the whole prompt on one line.
+    # and no further, and answers with the whole prompt on one line, as a turn of its own.
     if [ "$MODE" = "resume" ]; then
       echo "started $SESSION"
       PROMPT="$TASK"
@@ -382,6 +382,7 @@ case "${FIXTURE_HARNESS_PROFILE:-happy}" in
         IFS= read -r line || break
         PROMPT="$PROMPT $line"
       done
+      echo "text $PROMPT"
       echo "end $PROMPT"
     else
       unfence_task

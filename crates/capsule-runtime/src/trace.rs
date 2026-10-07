@@ -114,6 +114,11 @@ pub(crate) struct TraceWriter {
     task_output_tokens: u64,
     task_tool_calls: u32,
     task_shell_calls: u32,
+    /// Agent-loop `inference` lines (`origin` absent) written since `task_start`, counted or
+    /// not; a hook's `run-inference` record is not one. Where an attempt's turn numbering starts,
+    /// so a task's turns number straight through its reopens and continuations. Reset at both
+    /// task boundaries, so a run outside any task frame starts at 0.
+    task_agent_turns: u32,
     task_start_instant: Option<Instant>,
     pub(crate) active_task_id: Option<String>,
     /// How many `task_failed` lines this writer has written, so a caller can tell whether one run
@@ -1864,6 +1869,7 @@ impl TraceWriter {
             task_output_tokens: 0,
             task_tool_calls: 0,
             task_shell_calls: 0,
+            task_agent_turns: 0,
             task_start_instant: None,
             active_task_id: None,
             task_failures_written: 0,
@@ -2267,6 +2273,9 @@ impl TraceWriter {
             provider_status,
         };
         self.write_event(&event).await?;
+        if origin.is_none() {
+            self.task_agent_turns = self.task_agent_turns.saturating_add(1);
+        }
         if !counted {
             return Ok(());
         }
@@ -2654,6 +2663,7 @@ impl TraceWriter {
         self.task_output_tokens = 0;
         self.task_tool_calls = 0;
         self.task_shell_calls = 0;
+        self.task_agent_turns = 0;
         self.task_start_instant = Some(Instant::now());
         self.active_task_id = Some(task_id.to_string());
 
@@ -2713,6 +2723,7 @@ impl TraceWriter {
         self.active_task_id = None;
         self.task_event_id = None;
         self.turn_event_id = None;
+        self.task_agent_turns = 0;
         self.write_event(&event).await
     }
 
@@ -2846,6 +2857,13 @@ impl TraceWriter {
     /// so reopening never grants turns past the capsule's ceiling.
     pub(crate) fn task_turns(&self) -> u32 {
         self.task_turns
+    }
+
+    /// The number the active task's next agent-loop turn takes: how many agent-loop `inference`
+    /// lines it has written since [`Self::write_task_start`], across every attempt. 0 outside a
+    /// task frame. Not the `max_turns` budget, which is [`Self::task_turns`].
+    pub(crate) fn task_agent_turns(&self) -> u32 {
+        self.task_agent_turns
     }
 
     pub(crate) async fn write_compaction(
@@ -6060,6 +6078,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
+    }
+
+    /// `task_agent_turns()` counts the agent loop's own `inference` lines and not a hook's
+    /// `run-inference` record, which `task_turns()` does count; both task boundaries reset it.
+    #[tokio::test]
+    async fn task_agent_turns_counts_agent_loop_inference_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+            .await
+            .unwrap();
+        assert_eq!(w.task_agent_turns(), 0);
+        let hook = InferenceOrigin {
+            source: "hook:x".into(),
+            model: "m".into(),
+        };
+        for (turn, origin) in [(0, None), (0, Some(&hook)), (1, None)] {
+            w.write_inference(
+                turn,
+                Some(10),
+                Some(5),
+                "end_turn".to_string(),
+                Some("end_turn"),
+                None,
+                origin,
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(w.task_agent_turns(), 2);
+        assert_eq!(w.task_turns(), 3);
+        w.write_task_end("tsk_1", "completed", 0).await.unwrap();
+        assert_eq!(
+            w.task_agent_turns(),
+            0,
+            "a run outside a task frame starts at 0"
+        );
+        w.write_inference(
+            0,
+            Some(10),
+            Some(5),
+            "end_turn".to_string(),
+            Some("end_turn"),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        w.write_task_start("tsk_2", "ctx_2", "a2a", event_provenance(), 3)
+            .await
+            .unwrap();
+        assert_eq!(w.task_agent_turns(), 0);
     }
 
     // ── Event identity and parenting ──────────────────────────────────────────

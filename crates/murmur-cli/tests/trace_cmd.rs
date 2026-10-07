@@ -3253,6 +3253,176 @@ fn body_under_capture_none_names_the_missing_hashes() {
         ));
 }
 
+/// A session of `(task id, turn, response body)` turns, one task frame per run of a task id,
+/// with every body stored. Each turn shares the system and tools bodies and has its own response.
+fn write_numbered_turns_session(workdir: &Path, session_id: &str, turns: &[(&str, u32, &str)]) {
+    let mut lines = vec![format!(
+        "{{\"event_type\":\"session_start\",\"session_id\":\"{session_id}\",\"timestamp\":1000,\
+         \"capsule_name\":\"wire\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":5,\
+         \"capabilities\":[],\"tools_declared\":[]}}"
+    )];
+    let task_end = |task: &str| {
+        format!(
+            "{{\"event_type\":\"task_end\",\"session_id\":\"{session_id}\",\"timestamp\":1900,\
+             \"task_id\":\"{task}\",\"exit_status\":\"ok\",\"duration_ms\":10,\"turns\":1,\
+             \"input_tokens\":100,\"output_tokens\":20,\"tool_calls\":0,\"shell_calls\":0}}"
+        )
+    };
+    let mut open_task: Option<&str> = None;
+    for (i, (task, turn, response)) in turns.iter().enumerate() {
+        if open_task != Some(*task) {
+            if let Some(previous) = open_task {
+                lines.push(task_end(previous));
+            }
+            lines.push(format!(
+                "{{\"event_type\":\"task_start\",\"session_id\":\"{session_id}\",\"timestamp\":1050,\
+                 \"task_id\":\"{task}\",\"context_id\":\"ctx_1\",\"source\":\"a2a\",\
+                 \"message_parts_bytes\":4}}"
+            ));
+            open_task = Some(task);
+        }
+        lines.push(format!(
+            "{{\"event_type\":\"inference\",\"session_id\":\"{session_id}\",\"timestamp\":{},\
+             \"task_id\":\"{task}\",\"turn\":{turn},\"input_tokens\":100,\"output_tokens\":20,\
+             \"decision\":\"end_turn\",\"tool_name\":null,\"system_sha\":\"{}\",\
+             \"tools_sha\":\"{}\",\"response_sha\":\"{}\",\"message_shas\":[]}}",
+            1100 + i,
+            sha(PROMPT_BODY),
+            sha(TOOLS_BODY),
+            sha(response)
+        ));
+    }
+    if let Some(task) = open_task {
+        lines.push(task_end(task));
+    }
+    lines.push(format!(
+        "{{\"event_type\":\"session_end\",\"session_id\":\"{session_id}\",\"timestamp\":2000,\
+         \"total_turns\":{},\"total_input_tokens\":100,\"total_output_tokens\":20,\
+         \"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":1000,\"exit_status\":\"ok\"}}",
+        turns.len()
+    ));
+    write_session(workdir, session_id, &(lines.join("\n") + "\n"));
+
+    let blobs = workdir.join(session_id).join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    for body in [PROMPT_BODY, TOOLS_BODY]
+        .into_iter()
+        .chain(turns.iter().map(|(_, _, response)| *response))
+    {
+        fs::write(blobs.join(sha(body)), body).unwrap();
+    }
+}
+
+const SESSION_ID_RENUMBERED: &str = "ses_11111111111141118111000000000012";
+
+/// A trace whose runtime numbered a continued task's attempts each from 0 renders as recorded,
+/// and `--turn` refuses a number two of its turns share, listing both so one can be named by
+/// hash instead.
+#[test]
+fn a_turn_number_two_turns_share_is_refused_with_each_ones_hashes() {
+    let tmp = TempDir::new().unwrap();
+    let responses = [
+        "{\"answer\":\"first\"}",
+        "{\"answer\":\"second\"}",
+        "{\"answer\":\"third\"}",
+    ];
+    write_numbered_turns_session(
+        tmp.path(),
+        SESSION_ID_RENUMBERED,
+        &[
+            ("tsk_1", 0, responses[0]),
+            ("tsk_1", 1, responses[1]),
+            ("tsk_1", 0, responses[2]),
+        ],
+    );
+    let workdir = tmp.path().to_str().unwrap();
+    let show = |extra: &[&str]| {
+        let mut cmd = mur();
+        cmd.args(["trace", "show", SESSION_ID_RENUMBERED, "--workdir", workdir])
+            .args(extra);
+        cmd.assert()
+    };
+
+    let out = show(&[]).success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let wire_turns: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("  system "))
+        .map(|line| line.split("  ").next().unwrap().trim())
+        .collect();
+    assert_eq!(wire_turns, ["turn 0", "turn 1", "turn 0"], "{stdout}");
+
+    let refused = show(&["--body", "response", "--turn", "0"])
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("E-TRC-001"))
+        .stderr(predicate::str::contains("--turn 0 names 2 turns"))
+        .stderr(predicate::str::contains(sha(responses[0])))
+        .stderr(predicate::str::contains(sha(responses[2])))
+        .stderr(predicate::str::contains("task tsk_1"))
+        .stderr(predicate::str::contains(
+            "pass one of these hashes to --body instead of --turn",
+        ));
+    assert!(
+        !String::from_utf8_lossy(&refused.get_output().stderr).contains(&sha(responses[1])),
+        "turn 1 is not one of the matches"
+    );
+
+    let prefix = &sha(responses[2])[..12];
+    let out = show(&["--body", prefix]).success();
+    assert_eq!(
+        out.get_output().stdout,
+        fs::read(
+            tmp.path()
+                .join(SESSION_ID_RENUMBERED)
+                .join("blobs")
+                .join(sha(responses[2]))
+        )
+        .unwrap()
+    );
+
+    show(&["--body", "response", "--turn", "1"])
+        .success()
+        .stdout(predicate::eq(responses[1]));
+}
+
+const SESSION_ID_TWO_TASKS: &str = "ses_11111111111141118111000000000013";
+
+/// Each task of a session numbers its turns from 0, so `--turn 0` in a session that ran two
+/// tasks names two turns and is refused, naming each one's task.
+#[test]
+fn a_turn_number_in_a_session_of_several_tasks_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    write_numbered_turns_session(
+        tmp.path(),
+        SESSION_ID_TWO_TASKS,
+        &[
+            ("tsk_1", 0, "{\"answer\":\"one\"}"),
+            ("tsk_2", 0, "{\"answer\":\"two\"}"),
+        ],
+    );
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_TWO_TASKS,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--body",
+            "system",
+            "--turn",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("E-TRC-001"))
+        .stderr(predicate::str::contains("--turn 0 names 2 turns"))
+        .stderr(predicate::str::contains("task tsk_1"))
+        .stderr(predicate::str::contains("task tsk_2"))
+        .stderr(predicate::str::contains(sha(PROMPT_BODY)));
+}
+
 /// An ambiguous sha prefix lists every hash it matched.
 #[test]
 fn an_ambiguous_sha_prefix_lists_every_match() {
