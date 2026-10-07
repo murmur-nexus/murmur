@@ -853,7 +853,8 @@ fn system_prompt(name: &str, member: &MemberTemplate) -> String {
              yourself: {callees} does it. Your first reply is a call-member tool call that hands \
              {callees} the task you are given, stated in full. Then end your turn while \
              {callees} works. When {callees}'s answer arrives in this conversation, answer with \
-             it.",
+             it. If the runtime says {callees} gave no answer, say so in your reply and do not \
+             answer the task yourself.",
             member.name,
         )
     } else if member.entry {
@@ -1023,7 +1024,9 @@ mod tests {
             "You are 'lead', the entry member of the formation 'crew'. You do not do the task \
              yourself: worker does it. Your first reply is a call-member tool call that hands \
              worker the task you are given, stated in full. Then end your turn while worker \
-             works. When worker's answer arrives in this conversation, answer with it."
+             works. When worker's answer arrives in this conversation, answer with it. If the \
+             runtime says worker gave no answer, say so in your reply and do not answer the task \
+             yourself."
         );
         let worker_prompt = worker.inference.unwrap().system_prompt.unwrap();
         assert!(!worker_prompt.contains("call-member"), "{worker_prompt}");

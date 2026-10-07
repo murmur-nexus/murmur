@@ -2275,7 +2275,7 @@ Output sections, in the order they are printed:
 | Plan | one or more [`plan_start`](observability-schemas.md#plan-events)/`plan_step`/`plan_end` records | Per plan run: its id, outcome, duration and step totals by status, the step that ended it, and one row per step in the order the plan declared them — kind, status, duration, attempt count when it retried more than once, what it waited on, and its error. A step the run never reached reads `not run` |
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown |
-| Member calls | one or more [`member_call_start`](observability-schemas.md#member-call-start)/[`member_call`](observability-schemas.md#member-call) records | One row per [`call-member`](runtime-provided-tools.md#call-member) call: its `mcl_` id, the member, the member's task id — `(not started)` for a call the member never held — and how it ended with its duration, `outstanding` for a call this trace never saw end, `not delivered` for an answer the task never received |
+| Member calls | one or more [`member_call_busy`](observability-schemas.md#member-call-busy)/[`member_call_start`](observability-schemas.md#member-call-start)/[`member_call`](observability-schemas.md#member-call) records | One row per [`call-member`](runtime-provided-tools.md#call-member) call: its `mcl_` id, the member, the member's task id — `(not started)` for a call the member never held — and how it ended with its duration, `outstanding` for a call this trace never saw end, `not delivered` for an answer the task never received. `busy ×<n>` follows when the member turned `<n>` offers of the task away busy |
 | Formation | the session is a [formation member](#mur-run-formation) | The [Formation section](#mur-trace-show-formation) for the session root this session is in and the formation's peer directories: every member by roster name, and every `call-member` call between them |
 
 #### Listing a formation { #mur-trace-show-formation }
@@ -2322,7 +2322,7 @@ mcl_019f01a9512a7b3c8d9e0f1a2b3c4d5e    chief → lead-a      completed  48.2s  
   mcl_019f01a9564c7d5e0f1a2b3c4d5e6f70  lead-a → worker-a2  completed  19.4s  delivered
 mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b      completed  51.0s  delivered
   mcl_019f01a9575e7f702b3c4d5e6f708192  lead-b → worker-b1  completed  24.9s  delivered
-  mcl_019f01a9576f80813c4d5e6f708192a3  lead-b → worker-b2  rejected   3ms    delivered  never held by worker-b2
+  mcl_019f01a9576f80813c4d5e6f708192a3  lead-b → worker-b2  completed  38.6s  delivered  busy ×3
 ```
 
 | Row | Carries |
@@ -2332,7 +2332,7 @@ mcl_019f01a9513d7e6f1a2b3c4d5e6f7081    chief → lead-b      completed  51.0s  
 | One per member | Session id, the roster name from [`session_start.formation_member`](observability-schemas.md#session-trace-tracejsonl) — `-` for a member's delegated child, which has none — `name@version`, and the `session_end` exit status — `no session_end` for a member that was killed or is still running. `spawned by <session>` follows for a member another member delegated to, and `may call <member>, …` for a member the roster lets call others, its callees in roster order |
 | `delegated children not under these roots` | Members' delegated children whose traces are in another session root. Only when there are any. The member's own `mur trace show` prints each `child trace:` path in its Delegations section |
 | `calls:` | How many calls follow. Only when the members' traces record at least one call |
-| One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then the note for a missing side when there is one. Columns are aligned |
+| One per call | `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>`, then the note for a missing side when there is one and `busy ×<n>` when the callee turned `<n>` offers away busy, joined by `; `. Columns are aligned |
 
 Each call row carries:
 
@@ -2340,7 +2340,7 @@ Each call row carries:
 |---|---|
 | Call id | The `mcl_` id the caller's model was given. `(no call id)` for a task received with a message id that names none |
 | `<caller> → <callee>` | Roster names: the caller is the calling session's `formation_member`, or its session id when it has none; the callee is the call's [`member_call.member`](observability-schemas.md#member-call). A call only the callee recorded takes its caller from [`a2a_task_received.caller_member`](observability-schemas.md#session-trace-tracejsonl) |
-| Status | The [`member_call.status`](observability-schemas.md#member-call) — `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned`. `outstanding` for a call with a `member_call_start` and no `member_call`; `unknown` for a call only the callee recorded |
+| Status | The [`member_call.status`](observability-schemas.md#member-call) — `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned`. `outstanding` for a call with a `member_call_start` or `member_call_busy` and no `member_call`; `unknown` for a call only the callee recorded |
 | Duration | From the tool call to the outcome. `-` for `outstanding` and `unknown` |
 | Delivery | `delivered`, or `not delivered` for an answer the calling task never received. Empty for `outstanding` and `unknown` |
 
@@ -2348,7 +2348,7 @@ A call whose other side was not found still has its row, with one of these notes
 
 | Note | The row is |
 |---|---|
-| `never held by <callee>` | A call that ended without the callee's door holding it: refused `rejected` because the callee was busy or closing, or failed to start |
+| `never held by <callee>` | A call that ended without the callee's door holding it: `rejected` because the callee stayed busy for the whole deadline or its session was closing, `abandoned` while the callee was still busy, or failed to start |
 | `<callee>'s trace not found` | A call whose callee task no searched root records |
 | `<callee>'s task ended <exit status>` | An `outstanding` call: how the callee's task ended, from its `task_end` |
 | `<callee>'s task has no task_end` | An `outstanding` call whose callee task has not ended, or was killed |

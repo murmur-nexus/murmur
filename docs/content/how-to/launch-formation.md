@@ -127,7 +127,7 @@ network:
 doors:
 
 ```yaml
-  system_prompt: "You are 'lead', the entry member of the formation 'crew'. You do not do the task yourself: worker does it. Your first reply is a call-member tool call that hands worker the task you are given, stated in full. Then end your turn while worker works. When worker's answer arrives in this conversation, answer with it."
+  system_prompt: "You are 'lead', the entry member of the formation 'crew'. You do not do the task yourself: worker does it. Your first reply is a call-member tool call that hands worker the task you are given, stated in full. Then end your turn while worker works. When worker's answer arrives in this conversation, answer with it. If the runtime says worker gave no answer, say so in your reply and do not answer the task yourself."
 …
 lifecycle:
   task_acceptance: single           # one task: the formation's
@@ -289,7 +289,8 @@ See [Readiness](../reference/roster.md#launch-readiness) and
 ## Step 6 — follow the hand-off from `lead` to `worker`
 
 `lead`'s model calls `call-member` once, with `worker` and the task text. The call returns as soon
-as `worker`'s door holds the task, and `lead`'s model ends its turn. `worker` runs the task in its
+as `worker`'s door holds the task, or at once when `worker` is busy, in which case the runtime
+keeps offering it the task. `lead`'s model then ends its turn. `worker` runs the task in its
 own directory and answers. `lead`'s same task then continues with one new message holding
 `worker`'s answer, fenced as coming from `member:worker`, and `lead` answers with it.
 
@@ -495,6 +496,6 @@ session resumed by hand belongs to no formation. See
 | Egress | The caller's `capabilities.network.allow` lists `localhost` |
 | Key | `mur config set -g credentials.<KEY_VAR> <your key>`, first of the `Next:` steps |
 | Launch | `mur run --roster crew --task "…"` starts the peers, waits for each door, then starts the entry member |
-| Hand-off | `call-member` returns once the callee holds the task; the answer comes back into the caller's same task |
-| Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name and every call: who called whom, how it ended, and whether the answer was delivered. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller_member` in the callee's |
+| Hand-off | `call-member` returns at once: started when the callee holds the task, or busy when it has no room, and the runtime keeps offering a busy callee the task. The answer, or word that none came, comes back into the caller's same task |
+| Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name and every call: who called whom, how it ended, whether the answer was delivered, and how many offers a busy callee turned away. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller_member` in the callee's |
 | End | The entry member exits after its task; every other member records `formation_ended` and exits; the launcher exits with the entry member's status |
