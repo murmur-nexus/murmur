@@ -1,15 +1,13 @@
 # Graduation fixture source crates
 
-Recompile the prebuilt fixture components from this directory:
+| Crate | Committed component | Name to rebuild it by |
+| --- | --- | --- |
+| `jsonl-line-count` | `../tool/jsonl-line-count.wasm` | `jsonl-line-count` |
+| `graduation-capsule` | `../capsule/capsule.wasm` | `graduation-capsule` |
+
+Rebuild both from the repository root:
 
 ```bash
-cargo build --target wasm32-wasip2 --release --manifest-path jsonl-line-count/Cargo.toml
-cargo build --target wasm32-wasip2 --release --manifest-path graduation-capsule/Cargo.toml
-```
-
-Copy the outputs into the committed fixture paths:
-
-```bash
-cp jsonl-line-count/target/wasm32-wasip2/release/jsonl_line_count_fixture.wasm ../tool/jsonl-line-count.wasm
-cp graduation-capsule/target/wasm32-wasip2/release/graduation_capsule_fixture.wasm ../capsule/capsule.wasm
+scripts/rebuild-components.sh jsonl-line-count
+scripts/rebuild-components.sh graduation-capsule
 ```

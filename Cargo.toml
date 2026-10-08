@@ -5,6 +5,7 @@ members = [
   "crates/capsule-runtime",
   "crates/mur-roost",
   "crates/capsule-runtime/escape-conformance",
+  "crates/committed-components",
 ]
 resolver = "2"
 

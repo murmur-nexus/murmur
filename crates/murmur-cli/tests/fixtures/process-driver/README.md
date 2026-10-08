@@ -190,16 +190,15 @@ said rather than what it asked for; on a resume it reports the id it was handed,
 
 ## Rebuild
 
-One build per component, each copied over the one it produces:
+From the repository root, rebuild all four with:
 
 ```bash
-cd src/process-driver
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver.wasm
-cargo build --target wasm32-wasip2 --release --features signal-int
-cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-signal.wasm
-cargo build --target wasm32-wasip2 --release --features unsupported
-cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-unsupported.wasm
-cargo build --target wasm32-wasip2 --release --features no-usage
-cp target/wasm32-wasip2/release/process_driver_fixture.wasm ../../tool/process-driver-no-usage.wasm
+scripts/rebuild-components.sh process-driver
+scripts/rebuild-components.sh process-driver-signal
+scripts/rebuild-components.sh process-driver-unsupported
+scripts/rebuild-components.sh process-driver-no-usage
 ```
+
+`scripts/rebuild-components.sh` with no argument rebuilds them along with every other committed
+component. Each name's source, Cargo feature and output are its line in
+`crates/capsule-runtime/wit/components.list`.

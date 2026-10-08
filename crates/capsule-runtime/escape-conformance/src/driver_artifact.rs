@@ -118,8 +118,9 @@ mod tests {
     fn committed_driver_exports_the_process_interface_this_runtime_accepts() {
         if let Err(err) = check_interface() {
             panic!(
-                "the committed driver does not export {}; rebuild it as driver/README.md \
-                 describes: {err}",
+                "the committed driver does not export {}; rebuild it with \
+                 `scripts/rebuild-components.sh escape-conformance-driver` from the repository \
+                 root: {err}",
                 capsule_runtime::process_driver::PROCESS_DRIVER_IFACE
             );
         }

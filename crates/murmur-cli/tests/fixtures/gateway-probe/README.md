@@ -25,12 +25,9 @@ their summaries to `out/result.txt` and `out/result-b.txt`.
 
 ## Rebuild
 
-```bash
-cd src/gateway-probe
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/gateway_probe_fixture.wasm ../../tool/gateway-probe.wasm
+From the repository root:
 
-cd ../capsule-gateway-probe
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/capsule_gateway_probe_fixture.wasm ../../capsule/capsule-gateway-probe.wasm
+```bash
+scripts/rebuild-components.sh gateway-probe
+scripts/rebuild-components.sh capsule-gateway-probe
 ```

@@ -32,38 +32,9 @@ pub const SERVED_WIT_PACKAGES: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::fs;
     use std::path::Path;
 
     use super::SERVED_WIT_PACKAGES;
-
-    fn collect_package_declarations(dir: &Path, into: &mut BTreeSet<(String, String)>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                collect_package_declarations(&path, into);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("wit") {
-                continue;
-            }
-            for line in fs::read_to_string(&path).unwrap().lines() {
-                let Some(declaration) = line
-                    .trim()
-                    .strip_prefix("package murmur:")
-                    .and_then(|rest| rest.strip_suffix(';'))
-                else {
-                    continue;
-                };
-                let (name, version) = declaration
-                    .split_once('@')
-                    .unwrap_or_else(|| panic!("unversioned package in {}", path.display()));
-                // A name that is a WIT keyword is written `%stream`; the `%` is not part of it.
-                let name = name.strip_prefix('%').unwrap_or(name);
-                into.insert((format!("murmur:{name}"), version.to_string()));
-            }
-        }
-    }
 
     fn served_set() -> BTreeSet<(String, String)> {
         SERVED_WIT_PACKAGES
@@ -77,11 +48,11 @@ mod tests {
     /// that the table does not follow fails here.
     #[test]
     fn wit_versions_table_matches_the_wit_tree() {
-        let mut declared = BTreeSet::new();
-        collect_package_declarations(
-            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/wit")),
-            &mut declared,
-        );
+        let declared = murmur_artifact::wit_package_declarations(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/wit"
+        )))
+        .unwrap();
         assert!(!declared.is_empty(), "no murmur package declarations found");
 
         let mut packages: Vec<&str> = SERVED_WIT_PACKAGES.iter().map(|(p, _)| *p).collect();

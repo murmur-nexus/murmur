@@ -77,17 +77,16 @@ A probe that exits without an `end` line never reads as a finished run.
 
 ## Rebuilding
 
-From this directory:
+From the repository root:
 
 ```bash
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/escape_conformance_driver.wasm escape_conformance_driver.wasm
-cargo test
+scripts/rebuild-components.sh escape-conformance-driver
 ```
 
-`cargo test` runs the line reader's unit tests on the host. Rebuild after any change to
-`src/lib.rs`, and after any version bump of `crates/capsule-runtime/wit/process-driver/`: until
-then `committed_driver_exports_the_process_interface_this_runtime_accepts` in the gate package
-fails, and the gate refuses to start. A change to the line protocol in
-`../src/harness_protocol.rs` that this driver does not read fails
-`committed_driver_reads_every_line_the_probe_writes`.
+Rebuild after any change to `src/lib.rs`, and after any version bump of
+`crates/capsule-runtime/wit/process-driver/`: until then
+`committed_driver_exports_the_process_interface_this_runtime_accepts` in the gate package fails,
+and the gate refuses to start. A change to the line protocol in `../src/harness_protocol.rs` that
+this driver does not read fails `committed_driver_reads_every_line_the_probe_writes`.
+
+`cargo test` from this directory runs the line reader's unit tests on the host.

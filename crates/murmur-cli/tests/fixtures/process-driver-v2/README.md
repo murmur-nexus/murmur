@@ -18,11 +18,6 @@ edit it.** A later bump adds another frozen copy beside this one; it does not ch
 
 ## Rebuild
 
-Only needed if the component has to be rebuilt for a new toolchain — never to follow an interface
-change, which is the one thing this fixture must not do:
-
-```bash
-cd src/process-driver-v2
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/process_driver_v2_fixture.wasm ../../tool/process-driver-v2.wasm
-```
+`process-driver-v2` is listed frozen in `crates/capsule-runtime/wit/components.list`, so
+`scripts/rebuild-components.sh` never rebuilds it. It must never be rebuilt to follow an interface
+change: exporting `@0.2.0` is the one thing it exists to do.

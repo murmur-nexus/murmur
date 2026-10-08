@@ -1,0 +1,27 @@
+# The list of committed WASM components, the rebuild that refreshes them from source, and the
+# check that names the ones a WIT change left behind. `scripts/rebuild-components.sh` runs the
+# binary; `cargo test --workspace` runs the same check as a test.
+#
+# Depends on `murmur-artifact` for the component interface reader and nothing heavier, so the
+# `wit-components` CI job builds it without compiling wasmtime or installing libseccomp.
+[package]
+name = "committed-components"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Rebuilds and checks the WASM components committed to this repository against the WIT they build against"
+
+[lib]
+name = "committed_components"
+path = "src/lib.rs"
+
+[[bin]]
+name = "committed-components"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+murmur-artifact.workspace = true
+# Reads cargo's `--message-format=json` stream for the path of each built component.
+serde_json = "1"

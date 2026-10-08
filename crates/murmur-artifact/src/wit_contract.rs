@@ -10,7 +10,10 @@
 //! that does not parse simply has nothing to record; that is not an error, and
 //! [`wit_contracts_from_artifact_bytes`] is total for exactly that reason.
 
-use std::io::{Cursor, Read, Seek};
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::{self, Cursor, Read, Seek};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -215,6 +218,57 @@ fn read_root_wasm_from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> O
         zip_guard::max_artifact_decompressed_bytes(),
     )
     .ok()
+}
+
+/// Every `murmur:*` package declared by a `.wit` file under `dir`, recursively, as
+/// `("murmur:<name>", "<version>")` pairs.
+///
+/// A declaration is a line that, trimmed, reads `package murmur:<name>@<version>;`. A name that
+/// is a WIT keyword is written with a leading `%` (`murmur:%stream`); the `%` is escaping and is
+/// dropped. Files without the `.wit` extension are not read.
+///
+/// Errors with [`io::ErrorKind::InvalidData`], naming the file, on a `package murmur:` line with
+/// no `@version`: every `murmur:*` package is versioned (see
+/// `crates/capsule-runtime/wit/VERSIONING.md`). Any error reading `dir` or a file under it is
+/// returned as is.
+pub fn wit_package_declarations(dir: &Path) -> io::Result<BTreeSet<(String, String)>> {
+    let mut declared = BTreeSet::new();
+    collect_package_declarations(dir, &mut declared)?;
+    Ok(declared)
+}
+
+fn collect_package_declarations(
+    dir: &Path,
+    into: &mut BTreeSet<(String, String)>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_package_declarations(&path, into)?;
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("wit") {
+            continue;
+        }
+        for line in fs::read_to_string(&path)?.lines() {
+            let Some(declaration) = line
+                .trim()
+                .strip_prefix("package murmur:")
+                .and_then(|rest| rest.strip_suffix(';'))
+            else {
+                continue;
+            };
+            let (name, version) = declaration.split_once('@').ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unversioned package in {}: {}", path.display(), line.trim()),
+                )
+            })?;
+            let name = name.strip_prefix('%').unwrap_or(name);
+            into.insert((format!("murmur:{name}"), version.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Record `name` when it names an interface. Component extern names that carry no `/` are
@@ -483,5 +537,66 @@ mod tests {
             vec!["murmur:tool-registry/invoke@0.1.0", "murmur:tool/run@0.1.0",]
         );
         assert!(contracts.matching_prefix("murmur:hook").is_empty());
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn package_declarations_are_read_recursively_with_the_keyword_escape_dropped() {
+        let tree = tempfile::tempdir().unwrap();
+        write(
+            &tree.path().join("worlds.wit"),
+            "package murmur:host@0.1.0;\n\nworld w {}\n",
+        );
+        write(
+            &tree.path().join("deps/murmur-stream/stream.wit"),
+            "  package murmur:%stream@0.1.0;\ninterface events {}\n",
+        );
+        write(
+            &tree.path().join("deps/nested/deeper/task.wit"),
+            "package murmur:task@0.2.0;\n",
+        );
+        write(
+            &tree.path().join("deps/wasi/cli.wit"),
+            "package wasi:cli@0.2.0;\n",
+        );
+        write(
+            &tree.path().join("README.md"),
+            "package murmur:ignored@9.9.9;\n",
+        );
+
+        let declared = wit_package_declarations(tree.path()).unwrap();
+        let expected: BTreeSet<(String, String)> = [
+            ("murmur:host", "0.1.0"),
+            ("murmur:stream", "0.1.0"),
+            ("murmur:task", "0.2.0"),
+        ]
+        .into_iter()
+        .map(|(package, version)| (package.to_string(), version.to_string()))
+        .collect();
+        assert_eq!(declared, expected);
+    }
+
+    #[test]
+    fn an_unversioned_package_declaration_is_refused_naming_the_file() {
+        let tree = tempfile::tempdir().unwrap();
+        let file = tree.path().join("deps/bare.wit");
+        write(&file, "package murmur:bare;\n");
+
+        let err = wit_package_declarations(tree.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(&file.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_is_an_error() {
+        let tree = tempfile::tempdir().unwrap();
+        assert!(wit_package_declarations(&tree.path().join("absent")).is_err());
     }
 }
