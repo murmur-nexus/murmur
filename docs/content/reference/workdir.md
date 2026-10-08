@@ -61,7 +61,7 @@ Under `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep` the 
 
 | Path | Notes |
 |---|---|
-| `MURMUR.md` | The capsule's generated inventory: identity, directory layout, installed tools and skills, shell access. Agent sessions only. Written at staging and rewritten once the capsule's port is bound |
+| `MURMUR.md` | The capsule's generated inventory: identity (for a formation member, also its roster name and formation id), directory layout, installed tools and skills, shell access. Agent sessions only. Written at staging and rewritten once the capsule's port is bound |
 | `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md) |
 | `eval.jsonl` | Scorer output for the session. `mur eval` reads it after each case. See [Observability schemas](observability-schemas.md) |
 | `out/result.txt` | The agent's final output. Written on every terminal outcome of a task that ran; a failure writes `error: <message>`, a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap, and a task that ends `canceled` writes `canceled: the task was canceled before it completed, so it has no result`. A task canceled before it started writes nothing |

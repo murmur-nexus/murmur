@@ -29,7 +29,7 @@ use crate::{
         CallDecision, DispatchFault, HookArtifact, HookEvent, HookRuntime, HookSeed, ResolvedCall,
         FAULT_ARM_SEED_REJECTED,
     },
-    murmur_md::MURMUR_MD_TRUST_NOTICE,
+    murmur_md::{self, MURMUR_MD_TRUST_NOTICE},
     origin::{TaskProvenance, TrustClass},
     otel::OtelEmitter,
     protected_paths::ProtectedPathRefusal,
@@ -107,6 +107,10 @@ pub(crate) struct AgentRunConfig {
     /// `Some` with no root behind it — `context.record: off`, or a host with no usable `HOME` —
     /// still threads the tasks of one launch; it just forgets when the capsule stops.
     pub harness_sessions: Option<Arc<crate::harness_session::HarnessSessionMap>>,
+    /// This session's roster name, or `None` for a session `mur run --roster` did not launch as a
+    /// member — a standalone capsule, or a member's delegated child. Named in the `[Capsule]`
+    /// block; see [`build_augmented_system_prompt`].
+    pub formation_member: Option<String>,
 }
 
 impl AgentRunConfig {
@@ -799,6 +803,7 @@ pub(crate) async fn run_agent_loop(
     let augmented_system = build_augmented_system_prompt(
         name,
         version,
+        run_config.formation_member.as_deref(),
         system_prompt.as_deref(),
         store_state.capability_policy.plan_submit,
     );
@@ -4141,17 +4146,28 @@ follow from what you found.";
 /// element of the block a manifest can switch off, and still launch-invariant because the
 /// manifest fixes it before the session starts.
 ///
+/// `member` is a formation member's roster name, rendered through
+/// [`murmur_md::formation_member_line`] after `Version:`; `None` for every session that is not a
+/// member. The roster fixes it, so it is the same on every launch of that roster. The formation
+/// id is minted per launch and is never placed here: MURMUR.md carries it.
+///
 /// Every element of the block is launch-invariant, because this is the first text of every
 /// prompt and providers match their cache on an exact prefix from the first token: a single
-/// per-launch value here — a workdir path, a session id, a timestamp — means no request can
-/// ever match a cached prefix. Anything varying per launch belongs elsewhere.
+/// per-launch value here — a workdir path, a session id, a formation id, a timestamp — means no
+/// request can ever match a cached prefix. Anything varying per launch belongs elsewhere.
 fn build_augmented_system_prompt(
     name: &str,
     version: &str,
+    member: Option<&str>,
     system_prompt: Option<&str>,
     plan_tool_present: bool,
 ) -> String {
     let base = system_prompt.unwrap_or("");
+    // Like the plan notice's, this newline belongs to the member line, so a non-member's block
+    // carries no stray byte.
+    let member = member
+        .map(|member| format!("{}\n", murmur_md::formation_member_line(member)))
+        .unwrap_or_default();
     // The separating newline belongs to the notice, not to the template below, so an ungranted
     // capsule's block carries no blank line where the guidance would go. A single stray byte here
     // is enough to miss the provider's cached prefix on every request.
@@ -4161,7 +4177,7 @@ fn build_augmented_system_prompt(
         String::new()
     };
     let context = format!(
-        "[Capsule]\nName: {name}\nVersion: {version}\nManifest: murmur.yaml (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
+        "[Capsule]\nName: {name}\nVersion: {version}\n{member}Manifest: murmur.yaml (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}\n\n"
     );
     format!("{context}{base}")
 }
@@ -4420,7 +4436,7 @@ mod tests {
 
     #[test]
     fn augmented_system_prompt_carries_trust_notice_with_no_custom_prompt() {
-        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", None, false);
+        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", None, None, false);
         assert!(
             prompt.contains(MURMUR_MD_TRUST_NOTICE),
             "notice missing from: {prompt}"
@@ -4438,6 +4454,7 @@ mod tests {
         let prompt = build_augmented_system_prompt(
             "my-capsule",
             "1.0.0",
+            None,
             Some("You are a helpful assistant."),
             false,
         );
@@ -4457,14 +4474,42 @@ mod tests {
     fn augmented_system_prompt_names_no_host_path() {
         // The block is the first text of every prompt, so every element of it has to be
         // launch-invariant for a provider to match the prefix against its cache.
-        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", Some("custom"), false);
+        let prompt =
+            build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false);
         assert!(!prompt.contains("Workdir:"), "got:\n{prompt}");
         assert_eq!(
             prompt,
-            build_augmented_system_prompt("my-capsule", "1.0.0", Some("custom"), false),
+            build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false),
             "the block must be a pure function of capsule identity and manifest prompt"
         );
         assert!(prompt.starts_with("[Capsule]\nName: my-capsule\nVersion: 1.0.0\nManifest: murmur.yaml (in your workdir)\n"));
+    }
+
+    /// A formation member's block names its roster name right after its version. The roster fixes
+    /// the name, so the block stays launch-invariant; the per-launch formation id stays out of it.
+    #[test]
+    fn augmented_system_prompt_names_a_formation_member() {
+        let prompt =
+            build_augmented_system_prompt("s4-worker", "0.1.0", Some("a1"), Some("custom"), false);
+        assert_eq!(
+            prompt,
+            format!(
+                "[Capsule]\nName: s4-worker\nVersion: 0.1.0\nFormation member: a1 (your name in \
+                 this formation; other members may run the same capsule)\nManifest: murmur.yaml \
+                 (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
+            )
+        );
+        assert_eq!(
+            prompt,
+            build_augmented_system_prompt("s4-worker", "0.1.0", Some("a1"), Some("custom"), false),
+        );
+        assert!(!prompt.contains("frm_"), "got:\n{prompt}");
+        assert!(!prompt.contains("ses_"), "got:\n{prompt}");
+        assert_ne!(
+            prompt,
+            build_augmented_system_prompt("s4-worker", "0.1.0", Some("a2"), Some("custom"), false),
+            "two members of one capsule must be told apart"
+        );
     }
 
     /// The model is told the rule the runtime enforces on its side: what the markers are, that
@@ -4473,7 +4518,7 @@ mod tests {
     #[test]
     fn untrusted_content_notice_states_the_fence_rule() {
         for prompt in [
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, false),
+            build_augmented_system_prompt("my-capsule", "1.0.0", None, None, false),
             process::build_process_system_prompt(None, false),
         ] {
             assert!(
@@ -4506,7 +4551,7 @@ forgery: {prompt}"
     #[test]
     fn plan_guidance_is_present_exactly_when_the_grant_is() {
         for granted in [
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, true),
+            build_augmented_system_prompt("my-capsule", "1.0.0", None, None, true),
             process::build_process_system_prompt(None, true),
         ] {
             assert!(
@@ -4515,7 +4560,7 @@ forgery: {prompt}"
             );
         }
         for ungranted in [
-            build_augmented_system_prompt("my-capsule", "1.0.0", None, false),
+            build_augmented_system_prompt("my-capsule", "1.0.0", None, None, false),
             process::build_process_system_prompt(None, false),
         ] {
             assert!(
@@ -4532,7 +4577,7 @@ forgery: {prompt}"
     #[test]
     fn the_ungranted_prompt_is_unchanged_on_both_transports() {
         assert_eq!(
-            build_augmented_system_prompt("my-capsule", "1.0.0", Some("custom"), false),
+            build_augmented_system_prompt("my-capsule", "1.0.0", None, Some("custom"), false),
             format!(
                 "[Capsule]\nName: my-capsule\nVersion: 1.0.0\nManifest: murmur.yaml (in your \
                  workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\ncustom"
@@ -6667,8 +6712,13 @@ forgery: {prompt}"
             .and_then(|n| n.parse().ok())
             .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         let tools = inventory::build_tool_inventory(std::path::Path::new(&workdir), None, &[]);
-        let system =
-            build_augmented_system_prompt(&name, &version, var("SYSTEM_PROMPT").as_deref(), false);
+        let system = build_augmented_system_prompt(
+            &name,
+            &version,
+            None,
+            var("SYSTEM_PROMPT").as_deref(),
+            false,
+        );
         let cache_key = build_prompt_cache_key(&name, &version, var("CONTEXT_ID").as_deref());
         let occupancy = ContextOccupancy {
             model: &model,

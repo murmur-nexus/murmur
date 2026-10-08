@@ -1245,7 +1245,8 @@ fn a_repeated_call_is_refused_and_the_answer_still_arrives() {
 }
 
 /// Once worker's answer has been delivered, a second call to worker is new work: it starts as a
-/// call of its own and is answered like the first.
+/// call of its own and is answered like the first. Each member's model is told its own roster
+/// name in the same system prompt on every request, across both of worker's tasks.
 #[test]
 fn a_follow_up_after_the_answer_is_a_new_call() {
     let lead = Model::new(|n| match n {
@@ -1289,6 +1290,25 @@ fn a_follow_up_after_the_answer_is_a_new_call() {
     assert_eq!(project.model("lead").arrived(), 5);
     let worker_trace = project.trace_of(&formation_id, "worker");
     assert_eq!(records(&worker_trace, "a2a_task_received").len(), 2);
+    for (member, requests) in [("lead", 5), ("worker", 2)] {
+        let systems: Vec<String> = project
+            .model(member)
+            .requests()
+            .iter()
+            .map(|request| common::system_text(&request["system"]).expect("a system field"))
+            .collect();
+        assert_eq!(systems.len(), requests, "{member}");
+        assert!(
+            systems[0].contains(&format!("\nFormation member: {member} (")),
+            "{member}: {}",
+            systems[0]
+        );
+        assert!(!systems[0].contains("frm_"), "{member}: {}", systems[0]);
+        assert!(
+            systems.iter().all(|system| *system == systems[0]),
+            "{member}'s system prompt changed between requests"
+        );
+    }
     assert_no_member_remains(
         project.path(),
         &reported_pids(&formation, Some(&readiness)),
