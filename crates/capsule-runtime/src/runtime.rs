@@ -2513,6 +2513,7 @@ pub fn stage_session(
             has_compaction_hook(&hook_components),
             &request.capability_policy,
             &partial_identity,
+            request.formation_member.as_deref(),
         );
     }
 
@@ -2851,6 +2852,10 @@ fn launch(
                     &workdir,
                 ))
             }),
+            formation_member: staged
+                .formation_member
+                .as_ref()
+                .map(|member| member.name().to_string()),
         };
 
         // --- Identity and HTTP server setup ---
@@ -2987,6 +2992,7 @@ fn launch(
             has_compaction_hook(&staged.hook_components),
             &staged.capability_policy,
             &capsule_identity,
+            staged.formation_member.as_deref(),
         );
 
         sandbox::warn_for_enforcement_tier(
@@ -15002,6 +15008,7 @@ inference:
                 record_owner: None,
                 harness_sessions: None,
                 resume: None,
+                formation_member: None,
             };
             self.trace
                 .write_task_start(
@@ -18388,6 +18395,7 @@ inference:
             record_owner: None,
             harness_sessions,
             resume: None,
+            formation_member: None,
         }
     }
 
@@ -18813,6 +18821,7 @@ inference:
             record_owner: None,
             harness_sessions: None,
             resume: None,
+            formation_member: None,
         };
 
         trace

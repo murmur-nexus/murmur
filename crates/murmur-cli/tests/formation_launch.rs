@@ -105,6 +105,9 @@ fn peer_model(input: Option<Value>) -> MemberModel {
 /// One member of a fixture roster.
 struct Member {
     name: &'static str,
+    /// The capsule it runs: its own name unless [`Member::running`] set another. Members running
+    /// one capsule share its manifest, and with it the first such member's scripted model.
+    capsule: &'static str,
     version: &'static str,
     entry: bool,
     /// A driver version nothing installed, so the member cannot start.
@@ -114,6 +117,7 @@ struct Member {
 const fn peer(name: &'static str, version: &'static str) -> Member {
     Member {
         name,
+        capsule: name,
         version,
         entry: false,
         broken: false,
@@ -123,6 +127,7 @@ const fn peer(name: &'static str, version: &'static str) -> Member {
 const fn entry(name: &'static str, version: &'static str) -> Member {
     Member {
         name,
+        capsule: name,
         version,
         entry: true,
         broken: false,
@@ -132,9 +137,17 @@ const fn entry(name: &'static str, version: &'static str) -> Member {
 const fn broken(name: &'static str, version: &'static str) -> Member {
     Member {
         name,
+        capsule: name,
         version,
         entry: false,
         broken: true,
+    }
+}
+
+impl Member {
+    /// This member, running `capsule` instead of a capsule of its own name.
+    const fn running(self, capsule: &'static str) -> Member {
+        Member { capsule, ..self }
     }
 }
 
@@ -142,6 +155,21 @@ const fn broken(name: &'static str, version: &'static str) -> Member {
 const CODER: Member = peer("coder", "1.2.0");
 const REVIEWER: Member = peer("reviewer", "0.9.0");
 const PLANNER: Member = entry("planner", "0.3.0");
+
+/// `member`'s entry under the roster's `members:`.
+fn roster_line(member: &Member) -> String {
+    format!(
+        "  - name: {name}\n    capsule: {capsule}\n    version: {version}\n{entry}",
+        name = member.name,
+        capsule = member.capsule,
+        version = member.version,
+        entry = if member.entry {
+            "    entry: true\n"
+        } else {
+            ""
+        },
+    )
+}
 
 /// A project directory with every member published into its store, a `roster.yaml`, and a scratch
 /// `HOME` holding the driver. Every member has a scripted model of its own.
@@ -185,9 +213,15 @@ impl Project {
                 .map(|(_, input)| input.clone())
         };
         let mut models = Vec::new();
+        let mut published = Vec::new();
         let mut release = None;
         let mut roster = String::from("roster_version: 1\nmembers:\n");
         for member in members {
+            if published.contains(&member.capsule) {
+                roster.push_str(&roster_line(member));
+                continue;
+            }
+            published.push(member.capsule);
             let driver_version = if member.broken {
                 "9.9.9"
             } else {
@@ -201,18 +235,16 @@ impl Project {
                 (peer_model(probe_of(member.name)), PEER_LIFECYCLE)
             };
             let body = member_manifest(&model.server.endpoint, lifecycle, driver_version);
-            publish_to_store(&store, member.name, member.version, "capsule", &body, None);
+            publish_to_store(
+                &store,
+                member.capsule,
+                member.version,
+                "capsule",
+                &body,
+                None,
+            );
             models.push((member.name, model));
-            roster.push_str(&format!(
-                "  - name: {name}\n    capsule: {name}\n    version: {version}\n{entry}",
-                name = member.name,
-                version = member.version,
-                entry = if member.entry {
-                    "    entry: true\n"
-                } else {
-                    ""
-                },
-            ));
+            roster.push_str(&roster_line(member));
         }
         roster.push_str(reachability);
         std::fs::write(dir.path().join("roster.yaml"), roster).unwrap();
@@ -338,6 +370,21 @@ impl Project {
     fn session_of(&self, capsule: &str) -> PathBuf {
         let sessions = self.sessions_of(capsule);
         assert_eq!(sessions.len(), 1, "{capsule}: {sessions:?}");
+        sessions.into_iter().next().unwrap()
+    }
+
+    /// The one session the roster member `member` ran, found by its `session_start`.
+    fn session_of_member(&self, member: &str) -> PathBuf {
+        let sessions: Vec<PathBuf> = self
+            .sessions()
+            .into_iter()
+            .filter(|session| {
+                read_trace(&session.join("trace.jsonl"))
+                    .first()
+                    .is_some_and(|start| start["formation_member"] == member)
+            })
+            .collect();
+        assert_eq!(sessions.len(), 1, "{member}: {sessions:?}");
         sessions.into_iter().next().unwrap()
     }
 
@@ -979,6 +1026,62 @@ fn only_the_entry_members_callees_are_handed_to_it() {
             Duration::from_secs(30),
         );
     }
+}
+
+/// Two members running one capsule are each told their own roster name: MURMUR.md names the
+/// member and its formation, and the entry member's system prompt names the member and never the
+/// per-launch formation id.
+#[test]
+fn members_running_one_capsule_are_each_told_their_own_name() {
+    const W1: Member = peer("w1", "0.2.0").running("worker");
+    const W2: Member = peer("w2", "0.2.0").running("worker");
+    let _lock = launch_lock();
+    let project = Project::new(
+        &[W1, W2, PLANNER],
+        "reachability:\n  - from: planner\n    to: [w1, w2]\n",
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    assert_formation_line(&formation, "planner", &["w1", "w2"]);
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    project.release.send(()).unwrap();
+    assert_eq!(launcher.wait().code(), Some(0), "{}", launcher.stderr());
+
+    assert_eq!(project.sessions_of("worker").len(), 2);
+    let id = formation["formation_id"].as_str().unwrap();
+    let members = ["planner", "w1", "w2"];
+    for member in members {
+        let session = project.session_of_member(member);
+        let start = &read_trace(&session.join("trace.jsonl"))[0];
+        assert_eq!(start["formation_id"], id, "{start}");
+        let murmur_md = std::fs::read_to_string(session.join("MURMUR.md")).unwrap();
+        assert!(
+            murmur_md.contains(&format!(
+                "\n- Formation member: {member} (your name in this formation; other members may \
+                 run the same capsule)\n- Formation ID: {id}\n- Session ID: "
+            )),
+            "{member}: {murmur_md}"
+        );
+        for other in members.iter().filter(|other| **other != member) {
+            assert!(
+                !murmur_md.contains(&format!("Formation member: {other} (")),
+                "{member} is told {other}'s name: {murmur_md}"
+            );
+        }
+    }
+
+    let requests = project.entry_model().requests();
+    assert!(!requests.is_empty());
+    for request in &requests {
+        let system = common::system_text(&request["system"]).expect("a system field");
+        assert!(system.contains("\nFormation member: planner ("), "{system}");
+        assert!(!system.contains("frm_"), "{system}");
+    }
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
 }
 
 /// Scenario 3: a peer that cannot start refuses the whole launch, leaves nothing running, and the

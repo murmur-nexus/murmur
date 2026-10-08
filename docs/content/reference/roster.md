@@ -495,6 +495,7 @@ On a formation token, `tasks/get` answers only the tasks the calling member subm
 
 | A member | Learns |
 |---|---|
+| About itself | Its roster name and formation id, in the Identity section of its `MURMUR.md`. On `transport: http`, its roster name also opens its system prompt, in the `[Capsule]` block. A member running the same capsule as another is told its own name, not the capsule's |
 | About a member it may call | The member's name, in its components' environment. Only its runtime holds the door URL and the token |
 | About a member it may not call | Nothing: no name, no address, no token |
 | Its delegated children | Inherit `MURMUR_FORMATION_ID` and nothing else of the formation: no channel, no token, no `MURMUR_FORMATION_PEERS`, no formation lifeline. A child's door belongs to no formation, so it refuses every formation token with `401`. Each child holds a [spawner lifeline](roost-api.md#spawner-lifeline) of its own, which ends it when the member does |
