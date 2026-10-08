@@ -5,7 +5,9 @@
 //! uid owns on the host, so it cannot bound one tree, and no rlimit bounds *aggregate* memory or
 //! CPU across a tree at all. A cgroup v2 scope does exactly what rlimits structurally cannot:
 //! `pids.max`, `memory.max` and `cpu.max` apply to every task in the scope together, and the
-//! kernel enforces them at fork/allocate time rather than after the fact. A spawn that joins a
+//! kernel enforces them at fork/allocate time rather than after the fact. `memory.swap.max` is
+//! written as [`SCOPE_SWAP_MAX`] beside `memory.max`, so the memory ceiling bounds the tree's
+//! whole footprint rather than only its resident pages. A spawn that joins a
 //! scope therefore gets no `RLIMIT_NPROC` at all, and `pids.max` is its only process bound — see
 //! `resources::NprocBound`.
 //!
@@ -76,6 +78,124 @@ const DEFAULT_CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
 /// writes is expressed against it (`cgroup_cpu_percent * 1000` µs of every 100 000 µs).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const CPU_MAX_PERIOD_US: u64 = 100_000;
+
+/// `memory.swap.max` for every scope: no swap at all.
+///
+/// `memory.max` alone bounds only resident pages; with `memory.swap.max` at the kernel default
+/// `max`, a tree over `cgroup_memory_bytes` is pushed out to swap instead of being OOM-killed and
+/// keeps growing there. Zero makes `cgroup_memory_bytes` the tree's whole memory footprint, which
+/// is what the manifest field promises.
+pub const SCOPE_SWAP_MAX: &str = "0";
+
+/// One cgroup interface file a scope's limits are written to, and the value written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeLimit {
+    pub(crate) file: &'static str,
+    pub(crate) value: String,
+    /// Whether a kernel that exposes no such file still yields a bounded scope. Only
+    /// `memory.swap.max` is: it is absent when swap support is compiled out or swap accounting
+    /// is off at boot, and on such a kernel there is no per-cgroup swap control to write. A file
+    /// that exists and refuses the write is fatal either way.
+    pub(crate) absent_ok: bool,
+}
+
+/// The limit writes a scope is created with, in write order. `io.max` is not among them: it is
+/// best-effort and reported separately (see [`CgroupScope::apply_io_max`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn scope_limits(limits: &HostResourceLimits) -> Vec<ScopeLimit> {
+    let required = |file, value| ScopeLimit {
+        file,
+        value,
+        absent_ok: false,
+    };
+    vec![
+        required("memory.max", limits.cgroup_memory_bytes.to_string()),
+        ScopeLimit {
+            file: "memory.swap.max",
+            value: SCOPE_SWAP_MAX.to_string(),
+            absent_ok: true,
+        },
+        required("pids.max", limits.cgroup_pids_max.to_string()),
+        required(
+            "cpu.max",
+            format!(
+                "{} {CPU_MAX_PERIOD_US}",
+                u64::from(limits.cgroup_cpu_percent) * (CPU_MAX_PERIOD_US / 100)
+            ),
+        ),
+    ]
+}
+
+/// Whether this kernel gives a cgroup a `memory.swap.max` to write, as `mur doctor` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapControl {
+    /// A cgroup on this host carries `memory.swap.max`, so a scope's swap is bounded at
+    /// [`SCOPE_SWAP_MAX`].
+    Exposed,
+    /// A cgroup on this host carries `memory.max` and no `memory.swap.max`: the kernel has no
+    /// per-cgroup swap control, and a scope's swap is unbounded.
+    Absent,
+    /// No cgroup this process can see has the memory controller enabled, so the question cannot
+    /// be answered from here. Also the answer off Linux.
+    Unknown,
+}
+
+/// Probe whether this kernel exposes `memory.swap.max`, without creating or moving anything.
+///
+/// Walks from this process's own cgroup up to the hierarchy root and answers from the first
+/// cgroup that has the memory controller (a `memory.max` file): the file set a cgroup gets is the
+/// kernel's, so one cgroup with `memory.max` and no `memory.swap.max` speaks for every scope this
+/// host would create.
+#[must_use]
+pub fn probe_swap_control() -> SwapControl {
+    #[cfg(not(target_os = "linux"))]
+    {
+        SwapControl::Unknown
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount = std::fs::read_to_string("/proc/mounts")
+            .map(|contents| parse_cgroup2_mount(&contents))
+            .unwrap_or_else(|_| DEFAULT_CGROUP2_MOUNT.to_string());
+        let Some(own) = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|contents| parse_unified_cgroup_path(&contents))
+        else {
+            return SwapControl::Unknown;
+        };
+        let root = PathBuf::from(mount);
+        let mut dir = root.join(own.trim_start_matches('/'));
+        loop {
+            if dir.join("memory.max").exists() {
+                return if dir.join("memory.swap.max").exists() {
+                    SwapControl::Exposed
+                } else {
+                    SwapControl::Absent
+                };
+            }
+            if dir == root || !dir.pop() || !dir.starts_with(&root) {
+                return SwapControl::Unknown;
+            }
+        }
+    }
+}
+
+/// How many swap areas `/proc/swaps` lists as active, or `None` where it cannot be read.
+#[must_use]
+pub fn active_swap_areas() -> Option<usize> {
+    let contents = std::fs::read_to_string("/proc/swaps").ok()?;
+    Some(count_swap_areas(&contents))
+}
+
+/// Count the device lines in `/proc/swaps` contents, below its one header line.
+fn count_swap_areas(contents: &str) -> usize {
+    contents
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
 
 /// Controllers that must be delegated and settable. `io` is deliberately absent: it is
 /// best-effort (see [`CgroupScope::apply_io_max`]).
@@ -710,9 +830,11 @@ fn device_major_minor(dev: u64) -> (u64, u64) {
 #[cfg(target_os = "linux")]
 impl CgroupScope {
     /// Probe delegation, enable the controllers, create the scope directory, and write its
-    /// limits. Any failure to establish `memory.max`, `pids.max` or `cpu.max` is fatal — those
-    /// three are settable on any cgroup v2 host once the controllers are delegated, so a failure
-    /// there means the bound genuinely does not exist and the launch must not proceed.
+    /// limits from [`scope_limits`]. Any failure to establish `memory.max`, `memory.swap.max`,
+    /// `pids.max` or `cpu.max` is fatal — they are settable on any cgroup v2 host once the
+    /// controllers are delegated, so a failure there means the bound genuinely does not exist and
+    /// the launch must not proceed. The one exception is a kernel that exposes no
+    /// `memory.swap.max` at all (see [`ScopeLimit::absent_ok`]).
     fn create(
         limits: &HostResourceLimits,
         session_id: &str,
@@ -736,15 +858,9 @@ impl CgroupScope {
             occupancy: Arc::default(),
         };
 
-        scope.write_limit("memory.max", &limits.cgroup_memory_bytes.to_string())?;
-        scope.write_limit("pids.max", &limits.cgroup_pids_max.to_string())?;
-        scope.write_limit(
-            "cpu.max",
-            &format!(
-                "{} {CPU_MAX_PERIOD_US}",
-                u64::from(limits.cgroup_cpu_percent) * (CPU_MAX_PERIOD_US / 100)
-            ),
-        )?;
+        for limit in scope_limits(limits) {
+            scope.write_limit(&limit)?;
+        }
         let io_max = scope.apply_io_max(limits.cgroup_io_bytes_per_sec, workdir);
 
         // Opened last, so a scope that failed any of the fatal writes above is never handed out
@@ -774,10 +890,27 @@ impl CgroupScope {
         path
     }
 
-    fn write_limit(&self, file: &str, value: &str) -> Result<(), String> {
-        let path = self.path.join(file);
-        std::fs::write(&path, format!("{value}\n"))
-            .map_err(|error| format!("could not write {} to {}: {error}", value, path.display()))
+    /// Opened without `O_CREAT`, so a file this kernel does not expose reads as `NotFound`
+    /// rather than as a refused create.
+    fn write_limit(&self, limit: &ScopeLimit) -> Result<(), String> {
+        use std::io::Write as _;
+        let path = self.path.join(limit.file);
+        let value = &limit.value;
+        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if limit.absent_ok && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not write {value} to {}: {error}",
+                    path.display()
+                ))
+            }
+        };
+        (&file)
+            .write_all(format!("{value}\n").as_bytes())
+            .map_err(|error| format!("could not write {value} to {}: {error}", path.display()))
     }
 
     /// Best-effort `io.max` on the workdir's backing block device, reported rather than printed.
@@ -1762,6 +1895,7 @@ mod tests {
     /// itself resident in while running this very binary.
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::print_stdout)]
     fn a_required_scope_is_created_whatever_cgroup_this_process_inherited() {
         if skip_without_host_support(
             "a_required_scope_is_created_whatever_cgroup_this_process_inherited",
@@ -1787,6 +1921,25 @@ mod tests {
             assert!(!contents.trim().is_empty(), "{file} was left unset");
             assert_ne!(contents.trim(), "max", "{file} carries no ceiling");
         }
+        match std::fs::read_to_string(scope.path().join("memory.swap.max")) {
+            Ok(contents) => {
+                assert_eq!(
+                    contents.trim(),
+                    SCOPE_SWAP_MAX,
+                    "memory.swap.max was not bounded"
+                );
+                assert_eq!(contents.trim(), "0");
+                println!(
+                    "memory.swap.max in the created scope reads {}",
+                    contents.trim()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert_eq!(probe_swap_control(), SwapControl::Absent);
+                println!("this kernel exposes no memory.swap.max; swap is not bounded here");
+            }
+            Err(error) => panic!("memory.swap.max unreadable in the scope: {error}"),
+        }
 
         // Whatever the host did with `io.max`, the scope says which of the two it was, and never
         // `NotProbed`: a scope that exists has had the write attempted against it.
@@ -1808,6 +1961,50 @@ mod tests {
             assert_eq!(io_max.reason, None);
             assert_eq!(io_max_warning(&io_max), None);
         }
+    }
+
+    /// Swap is bounded at zero whatever the manifest declares, beside a `memory.max` that is the
+    /// declared ceiling itself.
+    #[test]
+    fn the_scope_limits_bound_swap_at_zero() {
+        let declared = HostResourceLimits {
+            cgroup_memory_bytes: 268_435_456,
+            ..HostResourceLimits::default()
+        };
+        for limits in [HostResourceLimits::default(), declared] {
+            let writes: Vec<(&str, String)> = scope_limits(&limits)
+                .into_iter()
+                .map(|limit| (limit.file, limit.value))
+                .collect();
+            assert!(
+                writes.contains(&("memory.swap.max", "0".to_string())),
+                "writes were {writes:?}"
+            );
+            assert!(writes.contains(&("memory.max", limits.cgroup_memory_bytes.to_string())));
+            assert_eq!(
+                writes.iter().map(|(file, _)| *file).collect::<Vec<_>>(),
+                ["memory.max", "memory.swap.max", "pids.max", "cpu.max"]
+            );
+        }
+        let absent_ok: Vec<&str> = scope_limits(&HostResourceLimits::default())
+            .into_iter()
+            .filter(|limit| limit.absent_ok)
+            .map(|limit| limit.file)
+            .collect();
+        assert_eq!(absent_ok, ["memory.swap.max"]);
+    }
+
+    #[test]
+    fn active_swap_areas_are_the_lines_below_the_header() {
+        let header = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        assert_eq!(count_swap_areas(header), 0);
+        assert_eq!(count_swap_areas(""), 0);
+        assert_eq!(
+            count_swap_areas(&format!(
+                "{header}/swapfile                               file\t\t33554428\t\t0\t\t-2\n"
+            )),
+            1
+        );
     }
 
     /// The unit name systemd is asked for stays inside the `murmur-*` convention operators

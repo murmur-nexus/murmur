@@ -586,6 +586,110 @@ pub(crate) mod test_support {
         Component::new(engine, &bytes).expect("bare driver double compiles")
     }
 
+    /// A driver double answering `before` until a request carries `marker` anywhere in its
+    /// input, and `after` on every request that does — so one capsule's turns can answer
+    /// differently once, say, a reopen's feedback is in the conversation.
+    ///
+    /// The marker sits at 2048 and the two responses from 4096, each laid out as
+    /// [`driver_double`] lays out its one; the bump allocator starts past both.
+    pub(crate) fn driver_double_switching(
+        engine: &wasmtime::Engine,
+        marker: &str,
+        before: &str,
+        after: &str,
+    ) -> Component {
+        let escape =
+            |text: &str| -> String { text.bytes().map(|b| format!("\\{b:02x}")).collect() };
+        let marker_len = marker.len();
+        assert!(
+            2048 + marker_len <= 4096,
+            "the marker must fit below the responses"
+        );
+        let (before_at, before_len) = (4096, before.len());
+        let after_at = before_at + before_len + 8;
+        let after_len = after.len();
+        let bump_start = after_at + after_len + 8;
+        let (marker_data, before_data, after_data) =
+            (escape(marker), escape(before), escape(after));
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 4)
+    (global $bump (mut i32) (i32.const {bump_start}))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (i32.add (local.get 3) (i32.const 8))))
+      (local.get $p))
+    (func $contains (param $p i32) (param $n i32) (result i32)
+      (local $i i32) (local $j i32)
+      (loop $outer
+        (if (i32.gt_u (i32.add (local.get $i) (i32.const {marker_len})) (local.get $n))
+          (then (return (i32.const 0))))
+        (local.set $j (i32.const 0))
+        (block $mismatch
+          (loop $inner
+            (if (i32.eq (local.get $j) (i32.const {marker_len}))
+              (then (return (i32.const 1))))
+            (br_if $mismatch
+              (i32.ne
+                (i32.load8_u (i32.add (local.get $p) (i32.add (local.get $i) (local.get $j))))
+                (i32.load8_u (i32.add (i32.const 2048) (local.get $j)))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $inner)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $outer))
+      (i32.const 0))
+    (func (export "run") (param i32 i32 i32 i32 i32 i32) (result i32)
+      (i32.store8 (i32.const 128) (i32.const 0))
+      (i32.store  (i32.const 132) (i32.const 0))
+      (i32.store  (i32.const 144) (i32.const 1))
+      (if (i32.and (local.get 0) (call $contains (local.get 1) (local.get 2)))
+        (then
+          (i32.store (i32.const 148) (i32.const {after_at}))
+          (i32.store (i32.const 152) (i32.const {after_len})))
+        (else
+          (i32.store (i32.const 148) (i32.const {before_at}))
+          (i32.store (i32.const 152) (i32.const {before_len}))))
+      (i32.store  (i32.const 156) (i32.const 0))
+      (i32.store8 (i32.const 168) (i32.const 0))
+      (i32.store  (i32.const 172) (i32.const 0))
+      (i32.store  (i32.const 176) (i32.const 0))
+      (i32.const 128))
+    (data (i32.const 2048) "{marker_data}")
+    (data (i32.const {before_at}) "{before_data}")
+    (data (i32.const {after_at}) "{after_data}")
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $status (enum "passed" "failed" "error"))
+  (type $tool-input (record
+    (field "data" (option string))
+    (field "log-path" (option string))))
+  (type $tool-result (record
+    (field "status" $status)
+    (field "summary" (option string))
+    (field "data" (option string))
+    (field "data-path" (option string))
+    (field "truncated" bool)
+    (field "metadata" (list (tuple string string)))))
+  (type $ft (func (param "input" $tool-input) (result $tool-result)))
+  (func $run (type $ft)
+    (canon lift (core func $i "run") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (instance $ti
+    (export "status" (type $status))
+    (export "tool-input" (type $tool-input))
+    (export "tool-result" (type $tool-result))
+    (export "run" (func $run)))
+  (export "murmur:tool/run@0.1.0" (instance $ti))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("switching driver double WAT parses");
+        Component::new(engine, &bytes).expect("switching driver double compiles")
+    }
+
     /// [`driver_double`], answering with `metadata` on every call — a `continuation_id` entry
     /// makes it a stateful driver holding a continuation.
     ///

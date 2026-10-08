@@ -104,7 +104,7 @@ ending the session. The capsule itself keeps running.
 
 | Step, when the cancel lands | What happens |
 |---|---|
-| A `capsule` step whose sub-capsule is running | The sub-capsule is ended within about a second. The step settles `failed` with the error `the task running this plan was cancelled; this step's sub-capsule was ended with it`, and is not retried |
+| A `capsule` step whose sub-capsule is running | The sub-capsule is sent `SIGTERM` within about a second and `SIGKILL` 5 seconds later if it has not exited. The step settles `failed` with the error `the task running this plan was cancelled; this step's sub-capsule was ended with it`, and is not retried |
 | A `capsule` step whose launch is still being approved or started | The same, as soon as the sub-capsule is up |
 | A `tool` or `shell` step already running | Runs to its own bound and settles with its own result |
 | A step that has not been dispatched | Never runs. It settles `skipped` with the error `the task running this plan was cancelled before this step ran` |
@@ -116,10 +116,12 @@ No `on_error` policy is applied once the task is cancelled, and no step is retri
 An ended sub-capsule is closed the way a cancelled task closes a
 [`delegate-task`](roost-api.md#the-delegation-tool) child:
 
-1. Its directory gets a `completion.json` with `status: terminated`, `reported_by: launcher` and
-   the detail `the parent ended this delegation`.
-2. The parent's trace writes `task_canceled`, whose `delegation_ids` names the step's delegation.
-3. The parent's trace then writes the delegation's terminal `delegation` line, with `outcome:
+1. It winds down from `SIGTERM` and, if it exits within the 5 seconds, writes `session_end` with
+   `exit_status: canceled` to its own trace, which [`mur trace show`](cli.md#mur-trace-show) reads.
+2. Its directory gets a `completion.json` with `status: terminated`, `reported_by: launcher` and
+   the detail `the parent ended this delegation`, once it has exited.
+3. The parent's trace writes `task_canceled`, whose `delegation_ids` names the step's delegation.
+4. The parent's trace then writes the delegation's terminal `delegation` line, with `outcome:
    terminated` and `reason: the delegating task was cancelled`, followed by `task_end`.
 
 A parent killed outright, with `SIGKILL` or by a crash, ends nothing itself. Its plan step's

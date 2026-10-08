@@ -266,6 +266,11 @@ impl AdmittedRoster {
     }
 }
 
+/// What W-ROS-001 says of a member that holds no task: the door answers every offer busy, so each
+/// call is offered again with backoff until its deadline passes and ends `rejected`.
+const NEVER_TAKEN: &str =
+    "no call is ever taken: each is offered again until its deadline and then rejected";
+
 /// The whole `warning[W-ROS-001]: …` line for `overflow`, link included. `mur run --roster` and
 /// `mur doctor` both print this string, so the two read the same.
 #[must_use]
@@ -279,22 +284,24 @@ pub fn caller_overflow_warning(overflow: &CallerOverflow) -> String {
                 "{} tasks at once — one running and lifecycle.queue_depth: {} waiting —",
                 overflow.holds, overflow.queue_depth
             ),
-            "a call that arrives while it is full is rejected",
+            "a call that arrives while it is full waits and is offered again, and is rejected only \
+             if it stays full until the call's deadline",
             format!("lifecycle.queue_depth: {depth}"),
         ),
         TaskAcceptance::Queue => (
             "no task — lifecycle.queue_depth: 0 —".to_string(),
-            "every call is rejected",
+            NEVER_TAKEN,
             format!("lifecycle.queue_depth: {depth}"),
         ),
         TaskAcceptance::Single => (
             "1 task at once — lifecycle.task_acceptance: single —".to_string(),
-            "a call that arrives while it is busy is rejected",
+            "a call that arrives while it is busy waits and is offered again, and is rejected only \
+             if it stays busy until the call's deadline",
             format!("lifecycle.task_acceptance: queue with lifecycle.queue_depth: {depth}"),
         ),
         TaskAcceptance::None => (
             "no task — lifecycle.task_acceptance: none —".to_string(),
-            "every call is rejected",
+            NEVER_TAKEN,
             format!("lifecycle.task_acceptance: queue with lifecycle.queue_depth: {depth}"),
         ),
     };
@@ -1185,8 +1192,9 @@ mod tests {
     const TEN_CALLERS_WARNING: &str =
         "warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' \
         (w01, w02, w03, w04, w05, w06, w07, w08, w09, w10), but it holds 2 tasks at once — one \
-        running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full is \
-        rejected; lifecycle.queue_depth: 9 would hold them all \
+        running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full \
+        waits and is offered again, and is rejected only if it stays full until the call's \
+        deadline; lifecycle.queue_depth: 9 would hold them all \
         (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)";
 
     /// A serving, authenticated member manifest with `lifecycle_yaml` as its `lifecycle:` block's
@@ -1337,7 +1345,8 @@ mod tests {
             caller_overflow_warning(overflow),
             "warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (lead, helper), but it \
              holds 1 task at once — lifecycle.task_acceptance: single — so a call that arrives \
-             while it is busy is rejected; lifecycle.task_acceptance: queue with \
+             while it is busy waits and is offered again, and is rejected only if it stays busy \
+             until the call's deadline; lifecycle.task_acceptance: queue with \
              lifecycle.queue_depth: 1 would hold them all \
              (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
         );
@@ -1361,7 +1370,8 @@ mod tests {
         assert_eq!(
             caller_overflow_warning(&overflows[0]),
             "warning[W-ROS-001]: roster.yaml lets 1 member call 'idle' (lead), but it holds no \
-             task — lifecycle.task_acceptance: none — so every call is rejected; \
+             task — lifecycle.task_acceptance: none — so no call is ever taken: each is offered \
+             again until its deadline and then rejected; \
              lifecycle.task_acceptance: queue with lifecycle.queue_depth: 1 would hold them all \
              (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
         );
@@ -1384,7 +1394,8 @@ mod tests {
         assert_eq!(
             caller_overflow_warning(&overflows[0]),
             "warning[W-ROS-001]: roster.yaml lets 1 member call 'shut' (lead), but it holds no \
-             task — lifecycle.queue_depth: 0 — so every call is rejected; \
+             task — lifecycle.queue_depth: 0 — so no call is ever taken: each is offered again \
+             until its deadline and then rejected; \
              lifecycle.queue_depth: 1 would hold them all \
              (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
         );

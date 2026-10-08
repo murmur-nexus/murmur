@@ -50,7 +50,10 @@ REQUIRED:
 OPTIONS:
     --record-dir <DIR>     Where the dated record is written. Default: the current directory.
     --work-root <DIR>      Per-case scratch (manifests, probes, mur output, traces). Kept after
-                           the run; the record points at it per case.
+                           the run; the record points at it per case. Must not exist yet, be
+                           empty, or be a work root an earlier run left: those carry
+                           .escape-conformance-work-root and are emptied before the run.
+                           Any other non-empty directory is refused (exit 1).
                            Default: <record-dir>/escape-conformance-work-<stamp>.
     --mur <PATH>           The built `mur` binary. Default: $MUR_BIN, then this repository's
                            target/release/mur and target/debug/mur, then PATH.
@@ -395,14 +398,10 @@ fn run() -> Result<u8, String> {
             .record_dir
             .join(format!("escape-conformance-work-{}", stamp.compact()))
     });
-    std::fs::create_dir_all(&work_root)
-        .map_err(|err| format!("could not create {}: {err}", work_root.display()))?;
-    // Absolute from here on. Each case's `mur run` is spawned with its own capsule workdir as
-    // cwd, so a relative scratch path would resolve against the wrong directory and every case
-    // would fail to find its manifest — an infrastructure fault that would read as 28 escapes.
-    let work_root = work_root
-        .canonicalize()
-        .map_err(|err| format!("could not resolve {}: {err}", work_root.display()))?;
+    // Absolute from here on, and empty but for its marker: a relative scratch path would resolve
+    // against each case's capsule workdir, and a file an earlier run left would be graded as this
+    // run's evidence. A directory the harness cannot safely clear is a usage error.
+    let work_root = escape_conformance::work_root::prepare_work_root(&work_root)?;
 
     // The embedded driver has to export the process interface this build's runtime accepts, or
     // every case would be refused at load; checked before anything is packed or run.

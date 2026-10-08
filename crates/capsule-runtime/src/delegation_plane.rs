@@ -215,7 +215,7 @@ impl DelegationResult {
 /// What [`DelegationPlane::start`] produced: the result the agent reads, and on
 /// [`DelegationStatus::Started`] the handle that ends the child.
 ///
-/// Dropping [`Self::child`] kills and reaps a child still running, so a caller that does not keep
+/// Dropping [`Self::child`] ends and reaps a child still running, so a caller that does not keep
 /// it — a `delegate-task` call cancelled while the launch was finishing — leaves nothing behind.
 #[derive(Debug)]
 pub struct StartedDelegation {
@@ -558,7 +558,7 @@ impl DelegationPlane {
     /// [`DelegationStatus`] words can come out of it: `started`, `failed` and `refused`.
     ///
     /// "Started" means the child holds its task, not merely that a process exists. Everything
-    /// before that point kills and reaps the child on the way out, because a child that will never
+    /// before that point ends and reaps the child on the way out, because a child that will never
     /// be given work will never report and would strand a process nothing waits on. A started
     /// child's handle is returned in [`StartedDelegation::child`]: the child lives as long as that
     /// handle, or its own run, whichever ends first.
@@ -624,7 +624,7 @@ impl DelegationPlane {
         self.announce(request, origin, &child, &delegation_id);
 
         let child_workdir = self.workdir_relative(&child.workdir);
-        // `child` is dropped on every early return below, which kills and reaps it.
+        // `child` is dropped on every early return below, which ends and reaps it.
         let failed = |session_id: &str, output: String| {
             let (output, truncated) = bounded(output);
             StartedDelegation::without_child(DelegationResult {
@@ -844,7 +844,7 @@ impl DelegationPlane {
                 // The wait and the child end together. This caller has nowhere for a later outcome
                 // to arrive — that is why it is waiting on this connection at all — so a child left
                 // running past it would be a process nothing would ever collect from or reap.
-                // `child` is dropped on the way out, which kills and reaps it.
+                // `child` is dropped on the way out, which ends and reaps it.
                 return outcome(
                     DelegationStatus::TimedOut,
                     &child.session_id,

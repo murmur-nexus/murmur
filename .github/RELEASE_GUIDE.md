@@ -31,7 +31,8 @@ four on every PR; the rest are release-time only.
 | WIT self-consistency | `./scripts/check-wit-versions.sh` |
 | WIT contracts moved since the last release | `./scripts/wit-versions-changed-since.sh vX.Y.Z` — pass the *previous* release tag; exits 1 naming every `murmur:*` package whose version moved |
 | Docs | `cd docs && mkdocs build --strict` |
-| Host-only isolation tests | `docs/content/reference/resource-limits-manual-verification.md` — CI reports these as `[SKIP-HOST]`; run them by hand on a real Linux host for any release touching containment |
+| Host-only isolation tests | `docs/content/reference/resource-limits-manual-verification.md` — CI reports these as `[SKIP-HOST]`; run them by hand on a real Linux host for every release |
+| Escape conformance | On a Linux host that backs `sealed` (delegated cgroup v2, Landlock, seccomp, swap on): `cargo build --release -p murmur-cli -p escape-conformance`, then `./target/release/escape-conformance --class scoped --mur ./target/release/mur --record-dir <dir>` and the same with `--class sealed`. Both must exit 0. Exit 4 is a failed case and exit 2 a refused host; neither is a pass. Keep the dated `escape-conformance-<class>-<stamp>.md` records from the commit being released. See `docs/content/reference/sealed-containment-manual-verification.md` |
 | Smoke | `/space/_murmur/smoke/smoke` — the maintainer-local smoke suite: real capsules against the built `mur`. Run it before every release cut and after merging any card that touches staging, install or launch. Exit 3 is SKIPPED, a host that could not measure, and is not a pass: re-run on a quiet baseline host, or rebaseline deliberately |
 
 **If `wit-versions-changed-since.sh` fails, the release has work in another

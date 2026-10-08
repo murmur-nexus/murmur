@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn door_auth_formation_tokens_reach_their_audience_with_two_scopes() {
+    fn door_auth_formation_tokens_reach_their_audience_with_three_scopes() {
         let authority = crate::formation_credentials::FormationAuthority::for_test();
         let coder = formation_door(&authority, "coder");
         let token = authority.mint("planner", "coder");
@@ -749,7 +749,10 @@ mod tests {
             .unwrap();
         assert_eq!(grant.credential(), "member:planner");
         assert_eq!(grant.formation_caller(), Some("planner"));
-        assert_eq!(FORMATION_CALL_SCOPES, ["message/send", "tasks/get"]);
+        assert_eq!(
+            FORMATION_CALL_SCOPES,
+            ["message/send", "tasks/get", "tasks/cancel"]
+        );
         for scope in DOOR_SCOPES {
             assert_eq!(
                 grant.allows(scope),

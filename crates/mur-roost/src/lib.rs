@@ -16,6 +16,8 @@
 //! registrant that could state its grants would be a registrant that could declare its own
 //! ceiling.
 
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 pub mod authority;
 pub mod bounds;
 pub mod census;

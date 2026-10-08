@@ -132,12 +132,14 @@ pub use sealed::{
     SEALED_APPARMOR_PROFILE_SHA256,
 };
 // `cgroup` is a private module, but the entry points below are consumed from `murmur-cli` — the
-// three test-support probes from its integration tests, and the `io.max` reporting from
-// `mur run --explain-scope`, which has to answer the same question a launch does without staging
-// a session. Re-exported here rather than duplicating either probe once per crate that needs it.
+// three test-support probes from its integration tests, the `io.max` reporting from
+// `mur run --explain-scope` and the swap-bound reporting from `mur doctor`, each of which has to
+// answer the question a launch does without staging a session. Re-exported here rather than
+// duplicating a probe once per crate that needs it.
 pub use cgroup::{
-    cgroup_delegation_available, io_max_device_available, probe_io_max, requires_process_bounding,
-    skip_without_host_support, IoMaxReport, IoMaxStatus,
+    active_swap_areas, cgroup_delegation_available, io_max_device_available, probe_io_max,
+    probe_swap_control, requires_process_bounding, skip_without_host_support, IoMaxReport,
+    IoMaxStatus, SwapControl, SCOPE_SWAP_MAX,
 };
 pub use child_launch::{
     child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,

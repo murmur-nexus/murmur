@@ -646,7 +646,11 @@ fn user_message((text, fence_source): (String, Option<String>)) -> Value {
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
     workdir: &Path,
+    // `max_turns` here is what this attempt has left of the task's budget, and bounds its loop.
     inference: &InferenceConfig,
+    // The task-wide ceiling, `inference.max_turns` as declared: what a message about running out
+    // of turns names.
+    task_max_turns: u32,
     system_prompt: Option<String>,
     run_config: AgentRunConfig,
     hooks: &mut HookRuntime,
@@ -736,6 +740,7 @@ pub(crate) async fn run_agent_loop(
             store_state,
             workdir,
             inference,
+            task_max_turns,
             system_prompt,
             hooks,
             trace,
@@ -2064,20 +2069,39 @@ pub(crate) async fn run_agent_loop(
         return finish_no_answer_turn(hooks, trace, otel, workdir, ending, &reason).await;
     }
 
-    record_result(
-        hooks,
-        workdir,
-        &format!("error: inference loop exceeded {max_turns} turns"),
-    )
-    .map_err(RuntimeError::AgentLoopFailed)?;
+    let exceeded = max_turns_exceeded_message(
+        task_max_turns,
+        trace.task_agent_turns(),
+        trace.task_hook_inferences(),
+    );
+    record_result(hooks, workdir, &format!("error: {exceeded}"))
+        .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     otel.emit_session_end("max_turns_reached").await;
     // Names the budget rather than reusing the generic "session ended": the session is still up
     // and still accepting tasks, and the caller's next move is to raise inference.max_turns.
-    *ending = Some(AttemptEnding::failed(format!(
-        "max_turns exceeded: the task used all {max_turns} inference turns"
-    )));
+    *ending = Some(AttemptEnding::failed(exceeded));
     Ok(AgentLoopExit::MaxTurnsReached)
+}
+
+/// What a task that ran out of turns says: the ceiling, and the turns the whole task used — its
+/// agent-loop turns by the numbers `mur trace show` prints (0-based, continuing across attempts),
+/// and the hook `run-inference` calls that counted toward the same ceiling.
+fn max_turns_exceeded_message(ceiling: u32, agent_turns: u32, hook_calls: u32) -> String {
+    let turns = match agent_turns {
+        0 => "no agent-loop turn".to_string(),
+        1 => "turn 0".to_string(),
+        n => format!("turn 0 to turn {}", n - 1),
+    };
+    let hooks = match hook_calls {
+        0 => String::new(),
+        1 => ", and 1 hook run-inference call".to_string(),
+        n => format!(", and {n} hook run-inference calls"),
+    };
+    format!(
+        "max_turns exceeded: the task used all {ceiling} inference turns inference.max_turns \
+         allows ({turns}{hooks})"
+    )
 }
 
 /// End one attempt because it failed: the driver call, the response, the compaction hook or the

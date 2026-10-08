@@ -599,7 +599,10 @@ pub(crate) async fn run_process_inference_loop(
     // same dispatch the HTTP path uses, and carries the process driver this session staged.
     store_state: &CapsuleStoreState,
     workdir: &Path,
+    // `max_turns` here is this attempt's remaining budget; `task_max_turns` is the task-wide
+    // ceiling a run that exceeds it names.
     inference: &InferenceConfig,
+    task_max_turns: u32,
     system_prompt: Option<String>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -639,6 +642,7 @@ pub(crate) async fn run_process_inference_loop(
         store_state,
         workdir,
         inference,
+        task_max_turns,
         system_prompt,
         hooks,
         trace,
@@ -667,6 +671,7 @@ async fn run_attempt(
     store_state: &CapsuleStoreState,
     workdir: &Path,
     inference: &InferenceConfig,
+    task_max_turns: u32,
     system_prompt: Option<String>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -692,6 +697,7 @@ async fn run_attempt(
         &staged,
         workdir,
         inference,
+        task_max_turns,
         system_prompt.as_deref(),
         hooks,
         trace,
@@ -722,6 +728,7 @@ async fn run_harness(
     staged: &StagedProcessDriver,
     workdir: &Path,
     inference: &InferenceConfig,
+    task_max_turns: u32,
     system_prompt: Option<&str>,
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
@@ -867,6 +874,7 @@ async fn run_harness(
     let mut sink = ProcessEventSink::new(
         workdir,
         inference.max_turns,
+        task_max_turns,
         first_turn,
         session,
         Arc::clone(&store_state.spend),

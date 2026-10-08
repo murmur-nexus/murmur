@@ -299,6 +299,7 @@ async fn run_task_with_reopens(
             state,
             workdir,
             &attempt_inference,
+            inference.max_turns,
             system_prompt.clone(),
             run_config.clone(),
             hooks,
@@ -512,7 +513,9 @@ async fn run_task_with_reopens(
                 record_member_calls(state, trace_task_id, &left.undelivered, false).await;
             }
             let reason = delegation_ending_reason(&result);
-            for (delegation_id, delegation) in delegations.take_all() {
+            let left = delegations.take_all();
+            crate::cancel::begin_ending(left.iter().map(|(_, delegation)| delegation));
+            for (delegation_id, delegation) in left {
                 account_for_left_delegation(state, delegation_id, delegation, &reason).await;
             }
         }
@@ -922,7 +925,7 @@ async fn emit_task_working(
 }
 
 /// How long a delegated child whose outcome has arrived is given to finish exiting before its
-/// handle is dropped, which kills a child still running. The child posts its outcome at the very
+/// handle is dropped, which ends a child still running. The child posts its outcome at the very
 /// end of its own session, so this is the length of a process exit, not of any work.
 const DELEGATION_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1000,7 +1003,9 @@ async fn wait_for_handed_off_work(
     let mut announced = None;
     loop {
         if let Some(bound) = backstop {
-            for (delegation_id, delegation) in delegations.take_overdue(bound) {
+            let overdue = delegations.take_overdue(bound);
+            crate::cancel::begin_ending(overdue.iter().map(|(_, delegation)| delegation));
+            for (delegation_id, delegation) in overdue {
                 ended.push(end_overdue_delegation(state, delegation_id, delegation, bound).await);
             }
         }
@@ -1065,7 +1070,7 @@ fn delegation_ending_reason(result: &Result<AgentLoopExit, RuntimeError>) -> Str
 }
 
 /// Let a delegated child's handle go: once it has exited, or after [`DELEGATION_EXIT_GRACE`], when
-/// dropping the handle kills it. On a blocking thread, because both the wait and the kill are.
+/// dropping the handle ends it. On a blocking thread, because both the wait and the ending are.
 async fn release_finished_child(child: Option<crate::child_launch::LaunchedChild>) {
     let Some(child) = child else {
         return;
@@ -1085,9 +1090,11 @@ async fn release_finished_child(child: Option<crate::child_launch::LaunchedChild
 /// ordinary case.
 const DELEGATION_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// End a delegated child: kill and reap it, on a blocking thread. Its watcher then records the
-/// delegation `terminated` in the child's `completion.json` and posts nothing; the handle is held
-/// until it has, so the record is on disk before this process can exit.
+/// End a delegated child — `SIGTERM`, then `SIGKILL` once
+/// [`crate::child_launch::CHILD_END_GRACE`] has passed — and reap it, on a blocking thread. Its
+/// watcher then records the delegation `terminated` in the child's `completion.json` and posts
+/// nothing; the handle is held until it has, so the record is on disk before this process can
+/// exit.
 async fn end_child(child: Option<crate::child_launch::LaunchedChild>) {
     let Some(mut child) = child else {
         // Not yet adopted: the launch is still finishing, and the handle it returns is dropped,
@@ -4033,6 +4040,7 @@ fn launch(
                                                         &mut state,
                                                         &workdir,
                                                         inference,
+                                                        inference.max_turns,
                                                         system_prompt,
                                                         run_config,
                                                         &mut hooks,
@@ -18248,6 +18256,8 @@ inference:
         /// Every frame the task's stream carried, in order, as `{"event": <type>, "data": <data>}`;
         /// empty for a scenario that is not streamed.
         frames: Vec<serde_json::Value>,
+        /// `out/result.txt` as the last attempt left it, empty when none was written.
+        result_txt: String,
     }
 
     impl ReopenRun {
@@ -18482,6 +18492,8 @@ inference:
             record,
             task_md: fs::read_to_string(workdir.join("task.md")).unwrap(),
             frames: buffered_frames(&sse_buffer),
+            result_txt: fs::read_to_string(workdir.join("out").join("result.txt"))
+                .unwrap_or_default(),
         }
     }
 
@@ -19333,6 +19345,122 @@ inference:
             crate::cancel::CANCELED_RESULT_TEXT
         );
         assert!(!out.join("result_tsk_b.txt").exists());
+    }
+
+    /// A driver answer calling a tool no capsule declares: each one spends a turn.
+    const HTTP_TOOL_CALL_RESPONSE: &str = r#"{"stop_reason":"tool_call","content":[{"type":"tool_call","id":"c1","name":"no-such-tool","input":{}}]}"#;
+
+    /// The http reopen scenarios' driver, answering `end_turn` until the reopen's feedback is in
+    /// the conversation and a tool call from then on.
+    fn tool_calling_once_reopened(engine: &wasmtime::Engine) -> wasmtime::component::Component {
+        crate::inference_import::test_support::driver_double_switching(
+            engine,
+            REOPEN_REASON,
+            HTTP_REOPEN_RESPONSE,
+            HTTP_TOOL_CALL_RESPONSE,
+        )
+    }
+
+    /// `inference.max_turns: 3`, a first attempt that answers in one turn and is reopened, and a
+    /// continued attempt that runs out of the two turns left: the message names the ceiling and
+    /// the turns the whole task used, not the continued attempt's budget of two.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_continued_http_attempt_that_runs_out_names_the_task_s_ceiling() {
+        let run = run_http_reopen(HttpReopen {
+            max_turns: 3,
+            bare_driver: Some(tool_calling_once_reopened),
+            streamed: true,
+            ..HttpReopen::answering(ConversationMode::Stateless)
+        })
+        .await;
+        let turns: Vec<&serde_json::Value> = of_type(&run.events, "inference")
+            .into_iter()
+            .map(|inference| &inference["turn"])
+            .collect();
+        assert_eq!(turns, [0, 1, 2], "{:?}", run.events);
+        assert_eq!(count_type(&run.events, "task_reopened"), 1);
+        let expected = "max_turns exceeded: the task used all 3 inference turns \
+                        inference.max_turns allows (turn 0 to turn 2)";
+        assert_eq!(run.result_txt, format!("error: {expected}"));
+        let last = run.final_statuses();
+        let last = last
+            .last()
+            .expect("the task's stream ends with a final status");
+        assert!(last.to_string().contains(expected), "{last}");
+    }
+
+    /// A hook calling `run-inference` on every turn: its calls count toward `inference.max_turns`
+    /// beside the agent loop's own turns, and the message says how many of them there were.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_that_runs_out_counts_its_hook_s_run_inference_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
+        fs::write(workdir.join("task.md"), REOPEN_TASK).unwrap();
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+        let driver = crate::inference_import::test_support::driver_double(
+            &state.engine,
+            0,
+            HTTP_TOOL_CALL_RESPONSE,
+        );
+        state
+            .tool_components
+            .insert("mock-driver".to_string(), driver.clone());
+        let ctx = Arc::new(HookInferenceCtx {
+            driver_name: "mock-driver".to_string(),
+            driver_component: driver,
+            model: "test-model".to_string(),
+            engine: state.engine.clone(),
+            accessible_workdir: workdir.clone(),
+            workdir: workdir.clone(),
+            inference_env: Vec::new(),
+            capability_policy: CapabilityPolicy::default(),
+            network_allow_rules: Vec::new(),
+            driver_grant: None,
+            gateway: None,
+            formation: None,
+            spend: Arc::clone(&state.spend),
+            records: std::sync::Mutex::new(Vec::new()),
+            spend_refusals: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut hooks =
+            crate::hooks::test_support::inference_calling_hooks(&state.engine, &workdir, ctx).await;
+        let inference = InferenceConfig {
+            transport: "http".into(),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "mock-driver".to_string(),
+                config: None,
+            }),
+            max_turns: 2,
+            ..task_io_inference_config()
+        };
+        let run = drive_reopen_scenario(
+            &mut state,
+            &workdir,
+            &inference,
+            0,
+            reopen_scenario_run_config(0, None, None),
+            &mut hooks,
+            ConversationMode::Stateless,
+            None,
+            false,
+        )
+        .await;
+        let hook_records = run
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "inference" && event["origin"] == "hook:caller")
+            .count();
+        assert_eq!(hook_records, 2, "{:?}", run.events);
+        assert_eq!(
+            run.result_txt,
+            "error: max_turns exceeded: the task used all 2 inference turns inference.max_turns \
+             allows (turn 0 to turn 1, and 2 hook run-inference calls)"
+        );
     }
 
     /// Turn ceiling respected: `inference.max_turns: 3`, `lifecycle.max_task_reopens: 5`, a
@@ -20762,12 +20890,19 @@ mod member_call_tests {
         hold: std::time::Duration,
         answers: Vec<(&'static str, String)>,
     ) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        stand_in_door_paced(answers.into_iter().map(|answer| (hold, answer)).collect())
+    }
+
+    /// [`stand_in_door`], holding each answer for its own time after its request has been read.
+    fn stand_in_door_paced(
+        answers: Vec<(std::time::Duration, (&'static str, String))>,
+    ) -> (u16, Arc<Mutex<Vec<Seen>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
         std::thread::spawn(move || {
-            for (status, body) in answers {
+            for (hold, (status, body)) in answers {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
@@ -21819,6 +21954,221 @@ mod member_call_tests {
         assert_eq!(events(dir.path(), "member_call_busy").len(), 1);
         assert!(events(dir.path(), "member_call_start").is_empty());
         assert_eq!(calls.counts(), (0, 0));
+    }
+
+    /// The door's answer to `tasks/cancel`: the task is cancelled.
+    fn cancel_accepted(task_id: &str) -> (&'static str, String) {
+        (
+            "200 OK",
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "id": task_id, "contextId": "ctx", "status": {"state": "canceled"}}})
+            .to_string(),
+        )
+    }
+
+    /// Wait until the stand-in door has read `count` requests.
+    fn await_requests(seen: &Mutex<Vec<Seen>>, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while seen.lock().unwrap().len() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the door never read request {count}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Positions of `kind` lines in the trace, in file order.
+    fn positions(lines: &[serde_json::Value], kind: &str) -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line["event_type"] == kind)
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    /// A re-offer in flight when the calling task ends, which the member then takes: the task's
+    /// accounting waits for it, records the call `abandoned` with the member's task id and says a
+    /// cancel was sent, and the watcher sends that task one `tasks/cancel`. The call's
+    /// `member_call_start` precedes its `member_call`, and no `member_call_busy` follows it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offer_taken_after_the_calling_task_ended_is_recorded_and_cancelled() {
+        let zero = std::time::Duration::ZERO;
+        let (port, seen) = stand_in_door_paced(vec![
+            (zero, busy()),
+            (std::time::Duration::from_secs(2), held("tsk_late")),
+            (zero, cancel_accepted("tsk_late")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        let (result, _) = state
+            .dispatch_call_member(call("worker", "add 2 and 2"))
+            .await
+            .unwrap();
+        assert_eq!(result.summary.as_deref(), Some("Called worker: busy"));
+        let calls = state.member_calls.clone().unwrap();
+        // The re-offer has reached the door, which holds its answer.
+        let door = Arc::clone(&seen);
+        tokio::task::spawn_blocking(move || await_requests(&door, 2))
+            .await
+            .unwrap();
+        let accounting = Arc::clone(&calls);
+        let left = tokio::task::spawn_blocking(move || accounting.account_for_all())
+            .await
+            .unwrap();
+        assert_eq!(left.abandoned.len(), 1);
+        let abandoned = &left.abandoned[0];
+        assert_eq!(
+            abandoned.status,
+            crate::member_call::MemberCallStatus::Abandoned
+        );
+        assert_eq!(abandoned.member_task_id.as_deref(), Some("tsk_late"));
+        assert_eq!(
+            abandoned.output,
+            "the calling task ended just after worker took the task; a cancel was sent to worker"
+        );
+        record_member_calls(&state, "tsk_caller", &left.abandoned, false).await;
+
+        let door = Arc::clone(&seen);
+        tokio::task::spawn_blocking(move || await_requests(&door, 3))
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let bodies = sent_bodies(&seen);
+        let cancels: Vec<&serde_json::Value> = bodies
+            .iter()
+            .filter(|body| body["method"] == "tasks/cancel")
+            .collect();
+        assert_eq!(cancels.len(), 1, "{bodies:?}");
+        assert_eq!(cancels[0]["params"]["id"], "tsk_late");
+        assert_eq!(
+            sent_tasks(&seen).len(),
+            2,
+            "an abandoned call was offered again"
+        );
+
+        let lines = trace_lines(dir.path());
+        let call_line = positions(&lines, "member_call");
+        assert_eq!(call_line.len(), 1, "{lines:?}");
+        assert_eq!(lines[call_line[0]]["member_task_id"], "tsk_late");
+        assert!(
+            positions(&lines, "member_call_start")[0] < call_line[0],
+            "{lines:?}"
+        );
+        assert!(
+            positions(&lines, "member_call_busy")
+                .iter()
+                .all(|busy| *busy < call_line[0]),
+            "{lines:?}"
+        );
+    }
+
+    /// A re-offer in flight when the calling task ends, which the member answers busy: its
+    /// `member_call_busy` is written before the call's `member_call`, the call is recorded as never
+    /// handed over, and no further offer is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_answer_to_an_offer_in_flight_lands_before_the_abandoned_call() {
+        let (port, seen) = stand_in_door_paced(vec![
+            (std::time::Duration::ZERO, busy()),
+            (std::time::Duration::from_secs(2), busy()),
+            (std::time::Duration::ZERO, held("tsk_never")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        state
+            .dispatch_call_member(call("worker", "add 2 and 2"))
+            .await
+            .unwrap();
+        let calls = state.member_calls.clone().unwrap();
+        let door = Arc::clone(&seen);
+        tokio::task::spawn_blocking(move || await_requests(&door, 2))
+            .await
+            .unwrap();
+        let accounting = Arc::clone(&calls);
+        let left = tokio::task::spawn_blocking(move || accounting.account_for_all())
+            .await
+            .unwrap();
+        assert_eq!(left.abandoned.len(), 1);
+        assert_eq!(left.abandoned[0].member_task_id, None);
+        assert_eq!(
+            left.abandoned[0].output,
+            "the calling task ended before worker took the task; worker was busy and was never handed it"
+        );
+        record_member_calls(&state, "tsk_caller", &left.abandoned, false).await;
+
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+        assert_eq!(
+            sent_tasks(&seen).len(),
+            2,
+            "an abandoned call was offered again"
+        );
+        let lines = trace_lines(dir.path());
+        let call_line = positions(&lines, "member_call");
+        assert_eq!(call_line.len(), 1, "{lines:?}");
+        let busy_lines = positions(&lines, "member_call_busy");
+        assert_eq!(busy_lines.len(), 2, "{lines:?}");
+        assert!(
+            busy_lines.iter().all(|busy| *busy < call_line[0]),
+            "{lines:?}"
+        );
+        assert!(
+            positions(&lines, "member_call_start").is_empty(),
+            "{lines:?}"
+        );
+    }
+
+    /// A call abandoned after its watcher has woken to offer the task again, and before it marks
+    /// the offer in flight, sends nothing: no `message/send` reaches the door after the first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_abandoned_between_the_wait_and_the_offer_sends_nothing() {
+        let (port, seen) = stand_in_door(vec![busy(), held("tsk_never")]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        state
+            .dispatch_call_member(call("worker", "add 2 and 2"))
+            .await
+            .unwrap();
+        let call_id = events(dir.path(), "member_call_busy")[0]["call_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let calls = state.member_calls.clone().unwrap();
+        let (left_tx, left_rx) = std::sync::mpsc::channel();
+        let accounting = Arc::clone(&calls);
+        crate::member_call::test_seam::run_before_offer(&call_id, move || {
+            let _ = left_tx.send(accounting.account_for_all());
+        });
+        let left = tokio::task::spawn_blocking(move || {
+            left_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the watcher woke to offer the task again")
+        })
+        .await
+        .unwrap();
+        assert_eq!(left.abandoned.len(), 1);
+        assert_eq!(left.abandoned[0].member_task_id, None);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert_eq!(
+            sent_tasks(&seen).len(),
+            1,
+            "an offer was sent after the call was abandoned"
+        );
     }
 
     /// The door's answer to `tasks/get`: the task completed with `text`.

@@ -117,7 +117,7 @@ section that explains it.
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
-| `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`/`session_end`, empty file); unknown event types are silently skipped. A formation member's missing `session_end` also names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
+| `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`, empty file); unknown event types are silently skipped. `mur trace show` reads a trace with no `session_end`, and skips a torn final line; `mur trace diff` and `mur trace report` refuse both, and a formation member's missing `session_end` names its formation and `mur trace show <formation-id>`. Also a `mur trace show --body` selector that names no recorded hash, or a hash whose body was never stored, a `--turn` that names several turns, `--body` or `--turn` with a formation id, and `mur trace steps` with a formation id, which names the `mur trace show <formation-id>` that lists its members and calls | [`trace.jsonl` schema](observability-schemas.md#session-trace-tracejsonl), [`mur trace show --body`](cli.md#mur-trace-show-body), [Listing a formation](cli.md#mur-trace-show-formation), [`mur trace steps`](cli.md#mur-trace-steps) |
 | `E-TRC-002` | No session found in the workdir, or a session selector matched none or several. Also a `frm_` argument to `mur trace show` that is not a formation id, or a formation no session under any searched root belongs to | [`mur trace`](cli.md#mur-trace), [Listing a formation](cli.md#mur-trace-show-formation) |
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
@@ -1096,7 +1096,7 @@ Two host conditions produce it, and the refusal text names which one:
 
 | Reason reported | What to do |
 |---|---|
-| The kernel provides unprivileged user namespaces but this host withholds them — AppArmor's `restrict_unprivileged_userns` is on and the shipped profile is not confining `mur`, `unshare` was refused outright (the container case), or the namespace could not be owned or configured | Install and load the AppArmor profile shipped with `mur`, or run outside the container restriction. The refusal text names the exact command for the host it printed on |
+| The kernel provides unprivileged user namespaces but this host withholds them — AppArmor's `restrict_unprivileged_userns` is on and the shipped profile is not confining `mur`, `unshare` was refused outright (the container case), or the namespace could not be owned or configured | Install and load the AppArmor profile shipped with `mur`. Inside a container, add `--cap-add SYS_ADMIN` to the container invocation — the one capability the namespace needs — or create the network namespace outside the container and run `mur` inside it. The refusal text names the exact command for the host it printed on |
 | The kernel does not provide the mechanism at all — `CONFIG_USER_NS=n`, or `user.max_user_namespaces=0` | Enable user namespaces on the host |
 
 This applies to **every** Linux capsule that can spawn a subprocess, including one whose
@@ -1879,13 +1879,15 @@ section on this page. None of them refuses the roster or changes an exit code.
 ### W-ROS-001 — more members may call a member than it holds { #w-ros-001 }
 
 ```text
-warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' (w01, w02, w03, w04, w05, w06, w07, w08, w09, w10), but it holds 2 tasks at once — one running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full is rejected; lifecycle.queue_depth: 9 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
+warning[W-ROS-001]: roster.yaml lets 10 members call 'reviewer' (w01, w02, w03, w04, w05, w06, w07, w08, w09, w10), but it holds 2 tasks at once — one running and lifecycle.queue_depth: 1 waiting — so a call that arrives while it is full waits and is offered again, and is rejected only if it stays full until the call's deadline; lifecycle.queue_depth: 9 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
 ```
 
 A member holds a fixed number of tasks at once, set by its own
-[`lifecycle`](manifest.md#field-lifecycle). A call that arrives while it holds that many is
-rejected at once: the calling member's [`call-member`](runtime-provided-tools.md#call-member)
-returns `failed`, and the caller's trace records the call as `rejected`.
+[`lifecycle`](manifest.md#field-lifecycle). A call that arrives while it holds that many waits:
+the calling member's [`call-member`](runtime-provided-tools.md#call-member) offers the task again
+with backoff until the member takes it, and ends the call `rejected` only if the member stays full
+until the call's deadline. A member the table below gives 0 tasks never takes one, so every call
+to it ends `rejected` at its deadline. See [A busy member](runtime-provided-tools.md#call-member-busy).
 
 | `lifecycle.task_acceptance` | Tasks held at once |
 |---|---|

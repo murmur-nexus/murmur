@@ -625,9 +625,12 @@ fn s6_a_silent_harness_is_killed_and_a_busy_one_is_not() {
     let capsule = Built::new().build();
     let started = Instant::now();
     let run = capsule.run("silent", &debug).failed();
+    // A hang guard only, far inside the profile's `sleep 600`: a whole debug-build `mur run`
+    // stretches with host load, so wall-clock time cannot prove the window. The runtime's own
+    // record below does — E-RUN-035 and a `harness_exit` killed for `inactivity`.
     assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "the run should have been killed at the window, took {:?}",
+        started.elapsed() < Duration::from_secs(120),
+        "the silent harness was never killed for inactivity, took {:?}",
         started.elapsed()
     );
     assert!(run.text.contains("E-RUN-035"), "{}", run.text);

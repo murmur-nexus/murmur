@@ -388,13 +388,26 @@ and usually well under a second per level. With the default [`--max-depth`](#the
 | Ending | Effect on a `delegate-task` child |
 |---|---|
 | The parent's process is killed | The child winds down |
-| The delegating task is cancelled — `tasks/cancel`, `session/stop`, or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task kills the child before it ends, and records it `terminated` |
-| The delegating task ends any other way while the child is still running | The task kills the child, and records it `terminated` |
-| The [delegation deadline](#bounds) passes | The child is killed, and the task continues with a `terminated` outcome |
+| The delegating task is cancelled — `tasks/cancel`, `session/stop`, or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task ends the child before it ends, and records it `terminated` |
+| The delegating task ends any other way while the child is still running | The task ends the child, and records it `terminated` |
+| The [delegation deadline](#bounds) passes | The child is ended, and the task continues with a `terminated` outcome |
 
-A plan `capsule` step's child is killed when the step returns, which it does within about a second
-of the delegating task being cancelled, and otherwise ends with the parent's process. See
-[When the task is cancelled](plans.md#when-the-task-is-cancelled).
+Ending a child sends it `SIGTERM` and gives it 5 seconds to wind down before `SIGKILL`. A task
+that ends several children signals them all at once, so the whole ending waits one 5-second grace.
+What the child's own trace records depends on how it went down:
+
+| The child | Its trace |
+|---|---|
+| Exits within the 5 seconds, mid-task | Its task cancelled, then `session_end` with `exit_status: canceled`, and no `spawner_ended` |
+| Exits within the 5 seconds, idle | `session_end` with `exit_status: ok`, and no `spawner_ended` |
+| Is still running after the 5 seconds, or is killed together with a parent that was itself killed | No `session_end`. [`mur trace show`](cli.md#mur-trace-show) reads it as `ended without a session_end` and names its last event |
+
+Whatever the child records about itself, its `completion.json` is the launcher's `terminated`
+record, written once the child has exited.
+
+A plan `capsule` step's child is ended the same way when the step returns, which it does within
+about a second of the delegating task being cancelled, and otherwise ends with the parent's
+process. See [When the task is cancelled](plans.md#when-the-task-is-cancelled).
 
 On macOS a child can occasionally outlive its parent: if the parent starts another process at the
 instant it creates the child's lifeline, that process can hold the lifeline open, and the child

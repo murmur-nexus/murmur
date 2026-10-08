@@ -173,7 +173,8 @@ pub(crate) struct LiveDelegation {
     /// When the launch was recorded: the start of the backstop's bound, and the duration of a
     /// row closed without the child's own record.
     pub(crate) started: Instant,
-    /// The handle that ends the child; dropping it kills and reaps a child still running.
+    /// The handle that ends the child; dropping it ends a child still running — `SIGTERM`, then
+    /// `SIGKILL` past [`crate::child_launch::CHILD_END_GRACE`] — and reaps it.
     ///
     /// For a `delegate-task` child, `None` from the launch notice until [`LiveDelegations::adopt`]
     /// attaches it, which is the length of the task's delivery to the child. Always `None` for a
@@ -213,6 +214,10 @@ pub(crate) enum Arrival {
     AlreadyDelivered,
     /// No task in this session started it, or the task that did has ended it.
     NotOutstanding,
+    /// Its child is winding down from a `SIGTERM` this session sent: what it posts is its own
+    /// account of being ended, and the launcher's `terminated` record, written once the child is
+    /// reaped, is the delegation's outcome.
+    BeingEnded,
 }
 
 #[derive(Debug, Default)]
@@ -260,7 +265,7 @@ impl LiveDelegations {
             delegations.task_id = Some(task_id.to_string());
             std::mem::take(&mut delegations.entries)
         };
-        drop(left);
+        end_together(left.into_values());
         DelegationScope(Arc::clone(self))
     }
 
@@ -320,6 +325,13 @@ impl LiveDelegations {
         };
         if entry.arrived {
             return Arrival::AlreadyDelivered;
+        }
+        if entry
+            .child
+            .as_ref()
+            .is_some_and(LaunchedChild::is_being_ended)
+        {
+            return Arrival::BeingEnded;
         }
         entry.arrived = true;
         drop(delegations);
@@ -435,8 +447,31 @@ impl Drop for DelegationScope {
             delegations.task_id = None;
             std::mem::take(&mut delegations.entries)
         };
-        drop(left);
+        end_together(left.into_values());
     }
+}
+
+/// Send `SIGTERM` to every child among `delegations` that has not reported, before any is waited
+/// for, so ending them all together waits one [`crate::child_launch::CHILD_END_GRACE`] rather
+/// than one per child. Each is then ended and reaped by whoever ends it — its handle's
+/// `shutdown` or `Drop`. An arrived child is left alone: it is already exiting on its own.
+pub(crate) fn begin_ending<'a>(delegations: impl IntoIterator<Item = &'a LiveDelegation>) {
+    for delegation in delegations {
+        if delegation.arrived {
+            continue;
+        }
+        if let Some(child) = &delegation.child {
+            child.begin_ending();
+        }
+    }
+}
+
+/// End every child among `delegations` together: all are signalled by [`begin_ending`], then
+/// each handle is dropped, which reaps it.
+fn end_together(delegations: impl Iterator<Item = LiveDelegation>) {
+    let delegations: Vec<LiveDelegation> = delegations.collect();
+    begin_ending(&delegations);
+    drop(delegations);
 }
 
 // ── Residue ───────────────────────────────────────────────────────────────────

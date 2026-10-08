@@ -506,6 +506,26 @@ systemd-resolved's *stub listener* is unaffected: on a host whose `/etc/resolv.c
 `127.0.0.53`, the runtime speaks ordinary DNS to it like any other nameserver. It is the NSS module
 that is bypassed, not the daemon.
 
+## Network reach limits { #network-reach-limits }
+
+- **Only proxy-reachable ports work.** The namespace binds a listener for each port the allowlist
+  implies, and connections are relayed by address. A destination on a port no allow entry names
+  has no listener and is refused by the kernel, so an allowlist of `https://api.example.com` does
+  not make `api.example.com:22` reachable. At most 16 distinct ports get a listener: an allowlist
+  naming more is accepted, and the ports past that get none. The failure looks like a network
+  fault rather than a policy decision.
+- **IPv4 only, and a dual-stack name's real IPv6 address is still handed out.** The namespace
+  installs no IPv6 route, so an IPv6 destination fails with `ENETUNREACH` whatever DNS said. The
+  resolver answers `AAAA` with no records only when the name has no IPv6 address upstream; a
+  dual-stack name's real `AAAA` records are returned unchanged. A client that tries IPv6 first pays
+  a fallback-to-IPv4 delay but is granted nothing. A capsule whose allowlisted host is IPv6-only
+  cannot reach it.
+- **The address→name binding has a lifetime.** A connection is matched to a name through the
+  answer the runtime's own resolver gave. The binding lasts five minutes, longer than the
+  60-second TTL the resolver puts on its answers. A client that caches an address far past its TTL
+  and connects much later is checked against the addresses the allowlist resolved to at launch
+  instead, as a literal address is.
+
 ---
 
 ## Executable workdirs { #field-workdir-exec }
@@ -689,6 +709,13 @@ cargo build --release -p murmur-cli -p escape-conformance
 `--list-cases` prints the registry with each case's expectation per class, and `--help` lists the
 remaining options.
 
+Each run stages its cases under a work root: the directory `--work-root` names, or a new
+`escape-conformance-work-<stamp>` directory next to the record. A work root carries a
+`.escape-conformance-work-root` marker file, and a marked work root is emptied before a run reuses
+it, so every case is graded only on files its own run wrote. A non-empty directory without the
+marker is refused with exit `1`; clear it with the `rm -rf` command the refusal prints, or pass an
+empty directory.
+
 The run needs:
 
 - a built `mur` binary;
@@ -711,6 +738,9 @@ The exit code separates a refusal from a failure, and an escape from a ceiling t
 | `2` | refused — this host cannot back the class, a prerequisite is missing, or no probe could run | none |
 | `3` | a boundary case failed — a containment escape | written |
 | `4` | boundary clean, a resource ceiling did not hold — denial of service | written |
+
+When no probe can run, the refusal names the check the preflight case failed — `stage`, `launch`,
+`harness`, `interpreter exec` or `probe file` — and what to check first for it.
 
 ### The manual procedures
 

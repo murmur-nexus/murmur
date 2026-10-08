@@ -3,6 +3,10 @@
 //! Every request the daemon answers is handled in [`mur_roost`], so the endpoints can be driven by
 //! tests without a socket.
 
+// Every write to standard output or standard error goes through `capsule_runtime::diagnostic`,
+// whose report path drops a line the stream refuses instead of panicking.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -11,6 +15,10 @@ use std::thread;
 
 use mur_roost::bounds::{default_max_live_capsules, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
 use mur_roost::{authority::SpawnAuthority, handle_connection, State};
+
+/// The `mur` CLI's code for a standard-output write that failed for a reason other than a gone
+/// reader. Defined in `murmur-cli`, which this crate does not depend on.
+const E_IO_003: &str = "E-IO-003";
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -84,7 +92,15 @@ fn parse_args() -> Result<Args, String> {
             // exits 0 without binding a port or taking a registry path: every other argument this
             // daemon accepts leads to a listening socket.
             "--version" => {
-                println!("mur-roost {}", env!("CARGO_PKG_VERSION"));
+                capsule_runtime::report_println!("mur-roost {}", env!("CARGO_PKG_VERSION"));
+                // A reader that went away is not a failure; any other refusal, such as `ENOSPC`
+                // on a redirect to a full disk, means the version line was never written.
+                if let Some(failure) = capsule_runtime::diagnostic::stdout_failure() {
+                    capsule_runtime::report_eprintln!(
+                        "error[{E_IO_003}]: failed to write to standard output: {failure}"
+                    );
+                    std::process::exit(1);
+                }
                 std::process::exit(0);
             }
             other if other.starts_with("--spawn-allow=") => {
@@ -115,13 +131,15 @@ fn parse_args() -> Result<Args, String> {
 
 fn main() {
     if let Err(e) = capsule_runtime::security::harden_process_dumpable() {
-        eprintln!("mur-roost: warning: failed to harden process against /proc environ reads: {e}");
+        capsule_runtime::report_eprintln!(
+            "mur-roost: warning: failed to harden process against /proc environ reads: {e}"
+        );
     }
 
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("mur-roost: {e}");
+            capsule_runtime::report_eprintln!("mur-roost: {e}");
             std::process::exit(1);
         }
     };
@@ -133,11 +151,11 @@ fn main() {
         .and_then(|dir| mur_roost::census::inherit(&dir))
     {
         Ok((inherited, report)) => {
-            eprintln!("{}", report.startup_line());
+            capsule_runtime::report_eprintln!("{}", report.startup_line());
             inherited
         }
         Err(reason) => {
-            eprintln!(
+            capsule_runtime::report_eprintln!(
                 "mur-roost: cannot count the capsules already running on this host: {reason}"
             );
             std::process::exit(1);
@@ -149,7 +167,7 @@ fn main() {
     let authority = match SpawnAuthority::generate() {
         Ok(authority) => Arc::new(authority),
         Err(e) => {
-            eprintln!("mur-roost: {e}");
+            capsule_runtime::report_eprintln!("mur-roost: {e}");
             std::process::exit(1);
         }
     };
@@ -168,15 +186,15 @@ fn main() {
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", args.port)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("mur-roost: failed to bind port {}: {e}", args.port);
+            capsule_runtime::report_eprintln!("mur-roost: failed to bind port {}: {e}", args.port);
             std::process::exit(1);
         }
     };
 
-    eprintln!("mur-roost: listening on 127.0.0.1:{}", args.port);
+    capsule_runtime::report_eprintln!("mur-roost: listening on 127.0.0.1:{}", args.port);
     // Printed whether the ceiling was set or derived, so an operator who never passed the flag can
     // still read the number they are running under.
-    eprintln!(
+    capsule_runtime::report_eprintln!(
         "mur-roost: machine ceiling {} live capsules (--max-live-capsules)",
         args.max_live_capsules,
     );
@@ -187,7 +205,7 @@ fn main() {
                 let state = Arc::clone(&state);
                 thread::spawn(move || handle_connection(stream, state));
             }
-            Err(e) => eprintln!("mur-roost: accept error: {e}"),
+            Err(e) => capsule_runtime::report_eprintln!("mur-roost: accept error: {e}"),
         }
     }
 }

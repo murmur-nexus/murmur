@@ -924,7 +924,8 @@ fn a_member_with_more_callers_than_it_holds_is_warned_about_and_still_launched()
     let warning = "[mur run] warning[W-ROS-001]: roster.yaml lets 3 members call 'tester' \
                    (coder, reviewer, planner), but it holds 2 tasks at once \u{2014} one running \
                    and lifecycle.queue_depth: 1 waiting \u{2014} so a call that arrives while it is \
-                   full is rejected; lifecycle.queue_depth: 2 would hold them all \
+                   full waits and is offered again, and is rejected only if it stays full until \
+                   the call's deadline; lifecycle.queue_depth: 2 would hold them all \
                    (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)";
     let warned = lines
         .iter()

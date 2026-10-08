@@ -789,6 +789,7 @@ Ahead of the checklist it prints these blocks. None of them affects the exit cod
 | `Filesystem preopens` | One line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default). An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>`, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it |
 | `Read-only paths` | The subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects, and whether that protection is enforced for every call the runtime can read as a write or advisory against a named interpreter |
 | `Install grant` | The `install skill` and `install tool` entries of [`capabilities.install`](manifest.md#field-install) |
+| `Memory bound` | [`capabilities.resources.cgroup_memory_bytes`](manifest.md#field-capabilities) and the two cgroup files a launch writes from it — see [Memory bound](#doctor-memory-bound) |
 | `Interface versions` | Installed artifacts built against an interface version this `mur` does not serve, printed only when there is something to report. See [Interface versions](#doctor-interface-versions) |
 
 `Read-only paths` and `Install grant` print the same lines, in the same words, as [`mur run --explain-scope`](#mur-run).
@@ -887,6 +888,30 @@ Checking /path/to/murmur.yaml for linux-x86_64...
 
 Fix: murmur-tool-git: native binary is built for darwin-aarch64 — reinstall murmur-tool-git@{{ v.murmur_tool_git }} on this host
 ```
+
+### Memory bound { #doctor-memory-bound }
+
+The `Memory bound` block shows `capabilities.resources.cgroup_memory_bytes`, the aggregate memory
+bound on the capsule's native subprocess tree, as the cgroup scope files a launch on this host
+writes:
+
+```text
+Memory bound
+  cgroup_memory_bytes: 268435456
+  memory.max 268435456
+  memory.swap.max 0
+```
+
+| Line | Meaning |
+|---|---|
+| `cgroup_memory_bytes: <bytes>` | The declared value, or the default `4294967296` |
+| `memory.max <bytes>` | The scope's memory ceiling: the same value |
+| `memory.swap.max 0` | The scope's swap ceiling. Swap is bounded at zero, so a tree over `memory.max` is OOM-killed rather than pushed out to swap |
+| `memory.swap.max: swap is not bounded on this host — …` | This kernel exposes no `memory.swap.max` — swap support compiled out, or swap accounting off at boot — so `memory.max` bounds resident memory only. The line ends saying whether `/proc/swaps` lists an active swap area |
+| `memory.swap.max 0 where this kernel exposes it — …` | No cgroup this process can see has the memory controller, so whether the kernel exposes the file is unknown. The line ends saying whether swap is active |
+| `not applied on this host: cgroup bounds are Linux-only, …` | Off Linux, in place of the `memory.max` and `memory.swap.max` lines |
+
+A scope is created only for a capsule that can start a native subprocess.
 
 ### Lock integrity
 
@@ -1025,7 +1050,7 @@ Roster
   coder      coder@1.2.0              serves peers    authenticated door
   reviewer   reviewer@0.9.0           serves peers    authenticated door
   reachability: planner → coder, planner → reviewer, reviewer → coder
-  warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (planner, reviewer), but it holds 1 task at once — lifecycle.task_acceptance: single — so a call that arrives while it is busy is rejected; lifecycle.task_acceptance: queue with lifecycle.queue_depth: 1 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
+  warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (planner, reviewer), but it holds 1 task at once — lifecycle.task_acceptance: single — so a call that arrives while it is busy waits and is offered again, and is rejected only if it stays busy until the call's deadline; lifecycle.task_acceptance: queue with lifecycle.queue_depth: 1 would hold them all (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)
 ```
 
 **Output — a refused roster:**
@@ -1159,7 +1184,7 @@ mur run --roster [<path>] [--task <path-or-text>] [--json]
 | `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
 | `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
 | `--context` | a fresh `ctx_…` per task | Context id this run's task runs under. Two runs given the same id continue one [conversation record](workdir.md#the-conversation-record), whichever session directory each got. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011) |
-| `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) — or, under [`transport: process`](manifest.md#transport-process), hands the harness the session id that context's [harness session map](workdir.md#harness-session-map) holds — even when the capsule declares `lifecycle.conversation: stateless`. A context with neither refuses the launch with [`E-RUN-017`](diagnostics.md#e-run-017). Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015). Reads the named session's `trace.jsonl` only as far as its first task, so a session whose process was killed — leaving the file ending mid-record — still resumes, while [`mur trace show`](#mur-trace-show) over that same file reports [`E-TRC-001`](diagnostics.md) |
+| `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) — or, under [`transport: process`](manifest.md#transport-process), hands the harness the session id that context's [harness session map](workdir.md#harness-session-map) holds — even when the capsule declares `lifecycle.conversation: stateless`. A context with neither refuses the launch with [`E-RUN-017`](diagnostics.md#e-run-017). Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015). Reads the named session's `trace.jsonl` only as far as its first task, so a session whose process was killed — leaving the file ending mid-record — still resumes. [`mur trace show`](#mur-trace-show) over that same file skips the torn last line and says so |
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018), and `compact` under [`transport: process`](manifest.md#transport-process) — where the harness holds the history and murmur has none to summarize — with [`E-RUN-037`](diagnostics.md#e-run-037) |
 | <span id="run-forget-session">`--forget-session`</span> | off | Drop the harness session `--context` names, then run this launch's first task as a new conversation under the same context id. The answer to [`E-RUN-036`](diagnostics.md#e-run-036), where the harness no longer holds the conversation a context names and every later task in it fails the same way. The entry is deleted from the [harness session map](workdir.md#harness-session-map) and the run's trace records a `harness_session_forgotten` event naming the context, the id that was dropped and `requested_by: "cli"`; asked for a context with no entry, it drops nothing and records nothing. Applies to the launch's first task and to no later one. Requires `--context`, and cannot be combined with `--resume`, which asks for the opposite. Only [`transport: process`](manifest.md#transport-process) has a harness session, so every other transport refuses the launch with [`E-RUN-039`](diagnostics.md#e-run-039) |
 | `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
@@ -2271,6 +2296,21 @@ mur trace show <formation-id> [--workdir <dir>]
 | `--body` | — | Print the body behind one hash and nothing else. Selectors below |
 | `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name, as the Wire section numbers it. Must name exactly one turn. Required with those four, invalid without `--body` |
 
+A trace no `session_end` closed — a session killed outright, or one still running — is shown from
+the lines it has, and the command exits `0`:
+
+| Line | Reads |
+|---|---|
+| `status:` | `ended without a session_end (last event: <event type> at <RFC 3339 UTC time>)` |
+| `duration:` | From the first line's timestamp to the last line's, followed by `(first to last event)` |
+| `totals:` | `counted from the events recorded; no session_end recorded the session's own`. The turn, token, tool-call and shell-call totals below are counted from the trace's `inference`, `tool_call`, `shell` and `shell_detached` lines |
+
+A final line that is not valid JSON — what a process killed mid-write leaves — is skipped, and the
+`status:` line ends with `line <n>, the last, is not valid JSON and was skipped`. A malformed line
+anywhere else, or a trace with no `session_start`, fails with [`E-TRC-001`](diagnostics.md) naming
+the file. [`mur trace diff`](#mur-trace-diff) and [`mur trace report`](#mur-trace-report) compare
+recorded totals, so they refuse a trace with no `session_end` or a torn line.
+
 Output sections, in the order they are printed:
 
 | Section | Printed | Contents |
@@ -2396,12 +2436,18 @@ command against that root.
 | No session under any searched root names the formation | [`E-TRC-002`](diagnostics.md) `no session under <root>, <root>… belongs to formation <formation-id>` |
 | `--body` or `--turn` with a formation id | [`E-TRC-001`](diagnostics.md) |
 
-A member killed before it wrote `session_end` cannot be summarized on its own. Its
-`mur trace show` fails with [`E-TRC-001`](diagnostics.md), and the message names its
-formation and the command that lists it:
+A member killed before it wrote `session_end` is shown from the lines it has, like any trace
+with no ending. Its Session section still carries its `formation:` line and the Formation section
+follows:
 
 ```text
-error[E-TRC-001]: /home/me/.murmur/formations/frm_019f01a93ff27c1e9a3b5d0c4e8f2a61/writer/.murmur/ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0/trace.jsonl: no session_end event found; this session is a member of formation frm_019f01a93ff27c1e9a3b5d0c4e8f2a61 — `mur trace show frm_019f01a93ff27c1e9a3b5d0c4e8f2a61` lists the formation
+session:    ses_019f01a95a0b7e21a3c4d5e6f7a8b9c0
+formation:  frm_019f01a93ff27c1e9a3b5d0c4e8f2a61
+capsule:    writer v0.1.0
+model:      claude-sonnet-4-5
+status:     ended without a session_end (last event: inference at 2026-10-07T09:14:03.512Z)
+duration:   41.2s  (first to last event)
+totals:     counted from the events recorded; no session_end recorded the session's own
 ```
 
 #### Printing one recorded body { #mur-trace-show-body }

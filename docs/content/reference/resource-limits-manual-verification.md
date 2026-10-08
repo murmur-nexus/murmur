@@ -106,8 +106,9 @@ runtime:
 3. enables `memory`, `pids`, `cpu` (and `io`, if delegated) in that base's `cgroup.subtree_control`
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;
-4. creates `<base>/murmur-<session_id>` and writes `memory.max`, `pids.max`, `cpu.max` (fatal on
-   failure) and `io.max` (non-fatal, reported in
+4. creates `<base>/murmur-<session_id>` and writes `memory.max`, `memory.swap.max` (`0`),
+   `pids.max`, `cpu.max` (fatal on failure; a `memory.swap.max` the kernel does not expose is
+   skipped) and `io.max` (non-fatal, reported in
    [`io_max`](resource-limits.md#io-max-report) and by
    [`W-SEC-021`](diagnostics.md#w-sec-021));
 5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
@@ -125,7 +126,8 @@ Inspect a live scope while a capsule runs:
 ```bash
 CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
 ls -d "$CG"/murmur-*
-cat "$CG"/murmur-*/memory.max "$CG"/murmur-*/pids.max "$CG"/murmur-*/cpu.max
+cat "$CG"/murmur-*/memory.max "$CG"/murmur-*/memory.swap.max "$CG"/murmur-*/pids.max \
+    "$CG"/murmur-*/cpu.max
 ```
 
 ## The test capsule
@@ -211,6 +213,7 @@ Confirm the cgroup scope exists for this run too:
 CG=/sys/fs/cgroup$(grep '^0::' /proc/self/cgroup | cut -d: -f3)
 cat "$CG"/murmur-*/pids.max     # expected: 256 (default)
 cat "$CG"/murmur-*/memory.max   # expected: 4294967296 (default, 4 GiB)
+cat "$CG"/murmur-*/memory.swap.max  # expected: 0
 ```
 
 ---
@@ -321,7 +324,9 @@ mur run --manifest murmur.yaml --task 'run this shell command: s=""; while :; do
 
 **Expected:**
 
-- the process is killed at ~256 MiB (the declared `cgroup_memory_bytes`), not at host exhaustion;
+- the process is killed at ~256 MiB (the declared `cgroup_memory_bytes`), not at host exhaustion,
+  and on a host with swap active it is killed there rather than pushed out to swap —
+  `memory.swap.current` in the scope stays `0`;
 - nothing *else* on the host is killed — check `dmesg -T | tail -20` and confirm any
   `Memory cgroup out of memory` line names the murmur scope, and that no unrelated process appears;
 - the trace names the limit:
@@ -441,10 +446,12 @@ env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
 spawned:
 
 ```
-error[E-RUN-012]: this capsule can spawn native subprocesses but no cgroup v2 scope could be
-created to bound them: cannot create a child cgroup under /sys/fs/cgroup/... ; the unit `mur`
-runs under needs `Delegate=yes` for memory, pids, cpu and io
+error[E-RUN-012]: this capsule can spawn native subprocesses but no cgroup v2 scope could be created to bound them ({reason}); on Linux the runtime refuses to launch rather than run a subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user delegation requirement at https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
+  hint: the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, cpu and io — see https://docs.murmur.nexus/reference/resource-limits/#platform-behavior
 ```
+
+`{reason}` names what the host is missing, such as the delegated cgroup directory or a
+controller the runtime needs.
 
 Confirm no shell subprocess ran at all — `workdir/<session_id>/trace.jsonl` must contain no
 `shell` event.

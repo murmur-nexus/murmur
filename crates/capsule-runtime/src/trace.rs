@@ -119,6 +119,9 @@ pub(crate) struct TraceWriter {
     /// so a task's turns number straight through its reopens and continuations. Reset at both
     /// task boundaries, so a run outside any task frame starts at 0.
     task_agent_turns: u32,
+    /// Counted hook `run-inference` lines (`origin` present) written since `task_start`: the part
+    /// of [`Self::task_turns`] no agent-loop turn spent. Reset with the other per-task counters.
+    task_hook_inferences: u32,
     task_start_instant: Option<Instant>,
     pub(crate) active_task_id: Option<String>,
     /// How many `task_failed` lines this writer has written, so a caller can tell whether one run
@@ -1936,6 +1939,7 @@ impl TraceWriter {
             task_tool_calls: 0,
             task_shell_calls: 0,
             task_agent_turns: 0,
+            task_hook_inferences: 0,
             task_start_instant: None,
             active_task_id: None,
             task_failures_written: 0,
@@ -2353,6 +2357,9 @@ impl TraceWriter {
         self.total_input_tokens = self.total_input_tokens.saturating_add(input_tokens);
         self.total_output_tokens = self.total_output_tokens.saturating_add(output_tokens);
         self.task_turns = self.task_turns.saturating_add(1);
+        if origin.is_some() {
+            self.task_hook_inferences = self.task_hook_inferences.saturating_add(1);
+        }
         self.task_input_tokens = self.task_input_tokens.saturating_add(input_tokens);
         self.task_output_tokens = self.task_output_tokens.saturating_add(output_tokens);
         Ok(())
@@ -2730,6 +2737,7 @@ impl TraceWriter {
         self.task_tool_calls = 0;
         self.task_shell_calls = 0;
         self.task_agent_turns = 0;
+        self.task_hook_inferences = 0;
         self.task_start_instant = Some(Instant::now());
         self.active_task_id = Some(task_id.to_string());
 
@@ -2949,8 +2957,18 @@ impl TraceWriter {
     /// agent-loop attempts have run since the last [`Self::write_task_start`]. Read by
     /// the reopen loop to compute the remaining `max_turns` budget for the next attempt
     /// so reopening never grants turns past the capsule's ceiling.
+    ///
+    /// A hook's counted `run-inference` call is one of them. `inference.max_turns` is the cap on
+    /// inference calls per task, and `task_end.turns` and `session_end.total_turns` count the
+    /// same calls; a hook that calls `run-inference` every turn is per-task spend that the cap
+    /// exists to bound, and the spend ceiling is per capsule, not per task.
     pub(crate) fn task_turns(&self) -> u32 {
         self.task_turns
+    }
+
+    /// How many of [`Self::task_turns`] were hook `run-inference` calls.
+    pub(crate) fn task_hook_inferences(&self) -> u32 {
+        self.task_hook_inferences
     }
 
     /// The number the active task's next agent-loop turn takes: how many agent-loop `inference`
@@ -6315,6 +6333,7 @@ mod tests {
         }
         assert_eq!(w.task_agent_turns(), 2);
         assert_eq!(w.task_turns(), 3);
+        assert_eq!(w.task_hook_inferences(), 1);
         w.write_task_end("tsk_1", "completed", 0).await.unwrap();
         assert_eq!(
             w.task_agent_turns(),

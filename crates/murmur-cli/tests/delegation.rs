@@ -1163,11 +1163,16 @@ fn parse_events(trace: &str) -> Vec<Value> {
 
 /// The child's own `trace.jsonl`, found from the parent's side exactly as an operator would:
 /// the child directory the parent composed, then the session directory beneath it.
-fn child_events(child_dir: &Path, child_session_id: &str) -> Vec<Value> {
-    let path = child_dir
+fn child_trace_path(child_dir: &Path, child_session_id: &str) -> PathBuf {
+    child_dir
         .join(".murmur")
         .join(child_session_id)
-        .join("trace.jsonl");
+        .join("trace.jsonl")
+}
+
+/// The events in the child's [`child_trace_path`], in file order.
+fn child_events(child_dir: &Path, child_session_id: &str) -> Vec<Value> {
+    let path = child_trace_path(child_dir, child_session_id);
     parse_events(
         &std::fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!("the child kept no trace at {} ({error})", path.display())
@@ -2305,6 +2310,10 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
         completion["detail"], "the parent ended this delegation",
         "{completion}"
     );
+    common::assert_trace_ends_canceled(&child_trace_path(
+        &child_dir,
+        launch["child_session_id"].as_str().unwrap_or_default(),
+    ));
 
     // And the parent is still answering for itself, and taking work.
     assert_eq!(agent_card_status(&parent.url), 200);
@@ -2482,6 +2491,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
             .any(|event| event["event_type"] == "spawner_ended"),
         "the child saw its spawner end"
     );
+    common::assert_trace_ends_canceled(&child_trace_path(&child_dir, child_session_id));
 
     assert_eq!(agent_card_status(&parent.url), 200);
     parent.server.push(end_turn_response("after the cancel"));

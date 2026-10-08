@@ -99,6 +99,21 @@ const CHILD_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// those need, and a second `wait` on one child is not a thing two owners can both do.
 const CHILD_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long a child sent `SIGTERM` on purpose is given to wind down before it is `SIGKILL`ed.
+///
+/// The child's own `SIGTERM` teardown cancels its task and writes `session_end`, so within this
+/// grace its trace says how it ended. Kept under `mur stop`'s default `--timeout`, so a parent
+/// that is stopping can end its children and still exit inside its own grace.
+///
+/// Shorter than the child's own [`crate::runtime::TERMINATE_TEARDOWN_DEADLINE`]: a child whose
+/// teardown runs past this grace (a long async-hook drain) is `SIGKILL`ed before it writes
+/// `session_end`, and `mur trace show` reports its trace as ended without one.
+pub const CHILD_END_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a child that has been sent `SIGTERM` is polled for its exit during
+/// [`CHILD_END_GRACE`].
+const CHILD_END_POLL: Duration = Duration::from_millis(20);
+
 /// What the parent's runtime needs in order to start one approved child.
 ///
 /// Carries no manifest and no capability declaration: what the child holds is decided by the
@@ -167,6 +182,10 @@ struct ChildProcess {
     deliberate: bool,
     /// The exit status, once anyone has observed it.
     status: Option<ExitStatus>,
+    /// When `SIGTERM` was sent, so a child signalled ahead of its reap — see
+    /// [`LaunchedChild::begin_ending`] — is given one [`CHILD_END_GRACE`] in all, not one per
+    /// call.
+    terminated_at: Option<Instant>,
     /// The write end of the child's spawner lifeline, open for as long as the child is this
     /// process's to end. Closed once the child is observed ended, when it is ended deliberately
     /// — by [`LaunchedChild::shutdown`], `Drop` or the completion watcher's deadline — or when
@@ -190,7 +209,9 @@ impl ChildProcess {
     /// return the cached status rather than block.
     fn poll(&mut self) -> Option<Ending> {
         if self.deliberate {
-            return Some(Ending::Deliberate);
+            // A child still winding down from `SIGTERM` has not ended yet: whatever it records
+            // meanwhile must land before the watcher records the ending over it.
+            return (!self.is_being_ended()).then_some(Ending::Deliberate);
         }
         let Some(child) = self.child.as_mut() else {
             // Reaped by `Drop` after [`LaunchedChild::has_exited`] had already seen the exit:
@@ -211,19 +232,101 @@ impl ChildProcess {
         Some(ending)
     }
 
-    /// Kill and reap, then close the child's lifeline. Idempotent.
-    fn end(&mut self) -> Result<(), std::io::Error> {
-        let Some(mut child) = self.child.take() else {
-            self.close_lifeline();
+    /// Mark the ending deliberate and send `SIGTERM` to a child that has not exited, once. A
+    /// child already seen exited ended on its own and stays so; one found exited here is reaped
+    /// instead, so the signal can never reach a reused pid: an unreaped child's pid stays its own.
+    ///
+    /// Marked under the same lock as the signal, so the watcher never reads a deliberate ending
+    /// that has not been signalled.
+    #[allow(unsafe_code)]
+    fn terminate(&mut self) {
+        if self.status.is_none() {
+            self.deliberate = true;
+        }
+        if self.terminated_at.is_some() {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if let Ok(Some(status)) = child.try_wait() {
+            self.status = Some(status);
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `kill` takes no pointers. `pid` is this process's own unreaped child:
+            // `try_wait` above saw it running, under the lock every reap of it takes, so the pid
+            // cannot have been reused by an unrelated process.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = child.kill();
+        self.terminated_at = Some(Instant::now());
+    }
+
+    /// Whether the child has been sent `SIGTERM` on purpose and not yet reaped: it is winding
+    /// down, and anything it reports meanwhile is about an ending its parent chose.
+    fn is_being_ended(&self) -> bool {
+        self.deliberate && self.status.is_none() && self.terminated_at.is_some()
+    }
+}
+
+/// End the child: `SIGTERM`, up to [`CHILD_END_GRACE`] from that signal for it to exit, then
+/// `SIGKILL`; reap it, then close its lifeline. A child that has already exited is only reaped.
+/// Idempotent.
+///
+/// The lock is held only to signal and to record the reap, never across the grace, so `pid`,
+/// `poll` and [`LaunchedChild::is_being_ended`] still answer while the child winds down. A second
+/// call during that wait returns at once and leaves the reap to the first. The lifeline stays
+/// open until the child is reaped, so a child winding down from `SIGTERM` never also reads its
+/// spawner as gone.
+fn end_process(process: &Mutex<ChildProcess>) -> Result<(), std::io::Error> {
+    let (mut child, signalled) = {
+        let mut process = lock(process);
+        process.terminate();
+        let Some(child) = process.child.take() else {
+            // Taken by an ending still waiting out the grace, which closes the lifeline itself
+            // once it has reaped the child.
+            if process.status.is_some() || process.terminated_at.is_none() {
+                process.close_lifeline();
+            }
             return Ok(());
         };
-        // `kill` on an already-exited process is not an error worth surfacing — the wait below is
-        // what actually retires the entry in the process table.
-        let _ = child.kill();
-        let waited = child.wait();
-        self.close_lifeline();
-        self.status = Some(waited?);
-        Ok(())
+        (child, process.terminated_at)
+    };
+    let waited = match signalled {
+        None => child.wait(),
+        Some(signalled) => loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if signalled.elapsed() < CHILD_END_GRACE => {
+                    std::thread::sleep(CHILD_END_POLL);
+                }
+                // Past the grace, or the handle cannot be polled: `kill` on an already-exited
+                // process is not an error worth surfacing, and the wait is what retires the entry
+                // in the process table.
+                _ => {
+                    let _ = child.kill();
+                    break child.wait();
+                }
+            }
+        },
+    };
+    let mut process = lock(process);
+    process.close_lifeline();
+    match waited {
+        Ok(status) => {
+            process.status = Some(status);
+            Ok(())
+        }
+        // The handle is gone and nothing is left to wait for: the ending is over, with no status.
+        Err(error) => {
+            process.terminated_at = None;
+            Err(error)
+        }
     }
 }
 
@@ -301,17 +404,33 @@ impl LaunchedChild {
         self.stderr_tail.lines()
     }
 
-    /// Terminate the child and reap it. Idempotent: a second call, or a call after `Drop` has
-    /// already run, does nothing.
+    /// Mark the ending deliberate and send the child `SIGTERM`, without waiting for it.
+    ///
+    /// A parent ending several children calls this on each before [`Self::shutdown`] or `Drop` on
+    /// any, so they wind down together and the whole ending waits one [`CHILD_END_GRACE`] rather
+    /// than one per child. A child already exited is left to be reaped.
+    pub fn begin_ending(&self) {
+        lock(&self.process).terminate();
+    }
+
+    /// End the child — `SIGTERM`, up to [`CHILD_END_GRACE`] to exit, then `SIGKILL` — and reap
+    /// it. Idempotent: a second call, or a call after `Drop` has already run, does nothing.
     ///
     /// Marks the ending as deliberate, so the watcher records the delegation as `terminated` and
     /// posts nothing: the only party that would be told is the party that did it.
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
-        let mut process = lock(&self.process);
-        process.deliberate = true;
-        process.end().map_err(|error| {
+        end_process(&self.process).map_err(|error| {
             RuntimeError::Runtime(format!("failed to reap child capsule: {error}"))
         })
+    }
+
+    /// Whether the child is winding down from a deliberate `SIGTERM` and has not been reaped.
+    ///
+    /// The door asks this of a completion that arrives for a delegation still in the set: such a
+    /// completion is the child's own account of a cancel its parent's side chose, posted before
+    /// the launcher's `terminated` record replaces it, and it is not the delegation's outcome.
+    pub fn is_being_ended(&self) -> bool {
+        lock(&self.process).is_being_ended()
     }
 
     /// Whether the completion watcher behind this child has finished: it has seen the child end
@@ -337,16 +456,11 @@ impl LaunchedChild {
 }
 
 impl Drop for LaunchedChild {
-    /// Terminates and reaps, so a parent that returns early — including by panicking — leaves no
-    /// orphaned capsule process behind holding a port and a directory. Deliberate on the same
-    /// terms as [`LaunchedChild::shutdown`]. A child that has already exited is only reaped.
+    /// Ends and reaps as [`LaunchedChild::shutdown`] does, so a parent that returns early —
+    /// including by panicking — leaves no orphaned capsule process behind holding a port and a
+    /// directory. Deliberate on the same terms. A child that has already exited is only reaped.
     fn drop(&mut self) {
-        let mut process = lock(&self.process);
-        // A child already seen exited ended on its own, and the watcher reports it as such.
-        if process.status.is_none() {
-            process.deliberate = true;
-        }
-        let _ = process.end();
+        let _ = end_process(&self.process);
     }
 }
 
@@ -488,6 +602,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
             child: Some(child),
             deliberate: false,
             status: None,
+            terminated_at: None,
             #[cfg(unix)]
             lifeline: Some(lifeline),
         })),
@@ -615,9 +730,7 @@ fn watch_for_completion(
         let mut expired = false;
         let ending = loop {
             if expires_at.is_some_and(|at| Instant::now() >= at) {
-                let mut process = lock(&process);
-                process.deliberate = true;
-                let _ = process.end();
+                let _ = end_process(&process);
                 expired = true;
                 break Ending::Deliberate;
             }
@@ -628,7 +741,14 @@ fn watch_for_completion(
         };
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
-        if let Some(recorded) = delegation::read_completion(&workdir) {
+        // A child ended on purpose may have recorded its own `canceled` completion while it wound
+        // down from `SIGTERM`. That record is not the outcome: the delegation was ended, and the
+        // launcher's record below is written over it.
+        let recorded = match ending {
+            Ending::Exited(_) => delegation::read_completion(&workdir),
+            Ending::Deliberate => None,
+        };
+        if let Some(recorded) = recorded {
             if recorded.delivered {
                 return;
             }
@@ -1420,6 +1540,7 @@ mod tests {
                 child: None,
                 deliberate: false,
                 status: None,
+                terminated_at: None,
                 #[cfg(unix)]
                 lifeline: None,
             })),
@@ -1489,6 +1610,7 @@ mod tests {
                 child: Some(child),
                 deliberate: false,
                 status: None,
+                terminated_at: None,
                 lifeline: Some(lifeline),
             },
             write,
@@ -1499,11 +1621,109 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ending_a_child_closes_its_lifeline() {
-        let (mut process, _) = process_with_lifeline("sleep", &["30"]);
-        process.end().unwrap();
-        assert!(process.lifeline.is_none());
-        assert!(process.status.is_some());
-        process.end().unwrap();
+        let (process, _) = process_with_lifeline("sleep", &["30"]);
+        let process = Mutex::new(process);
+        end_process(&process).unwrap();
+        assert!(lock(&process).lifeline.is_none());
+        assert!(lock(&process).status.is_some());
+        end_process(&process).unwrap();
+    }
+
+    /// A child ended on purpose is sent `SIGTERM` first and given the chance to wind down: a
+    /// child that exits on the signal is reaped with its own exit status, well inside the grace.
+    #[cfg(unix)]
+    #[test]
+    fn ending_a_child_sends_sigterm_and_waits_for_it_to_wind_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("wound-down");
+        let script = format!(
+            "trap 'echo wound-down > {}; exit 7' TERM; sleep 30 & wait",
+            marker.display()
+        );
+        let (process, _) = process_with_lifeline("bash", &["-c", &script]);
+        let process = Mutex::new(process);
+        // Long enough for bash to install its trap before the signal arrives.
+        std::thread::sleep(Duration::from_millis(300));
+        let began = Instant::now();
+        end_process(&process).unwrap();
+        assert!(
+            began.elapsed() < CHILD_END_GRACE,
+            "took {:?}",
+            began.elapsed()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "wound-down"
+        );
+        assert_eq!(
+            lock(&process).status.and_then(|status| status.code()),
+            Some(7)
+        );
+        assert!(lock(&process).lifeline.is_none());
+    }
+
+    /// A child that ignores `SIGTERM` is killed once [`CHILD_END_GRACE`] has passed, and no later.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_ignores_sigterm_is_killed_at_the_grace() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (process, _) =
+            process_with_lifeline("bash", &["-c", "trap '' TERM; while :; do sleep 0.1; done"]);
+        let process = Mutex::new(process);
+        std::thread::sleep(Duration::from_millis(300));
+        let began = Instant::now();
+        end_process(&process).unwrap();
+        let took = began.elapsed();
+        assert!(took >= CHILD_END_GRACE, "killed before the grace: {took:?}");
+        assert!(
+            took < CHILD_END_GRACE + Duration::from_secs(5),
+            "took {took:?}"
+        );
+        assert_eq!(
+            lock(&process).status.and_then(|status| status.signal()),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    /// Children signalled together with [`LaunchedChild::begin_ending`] share one grace: ending
+    /// two that both ignore `SIGTERM` takes one [`CHILD_END_GRACE`], not two.
+    #[cfg(unix)]
+    #[test]
+    fn children_signalled_together_wait_one_grace_between_them() {
+        let wedged = || {
+            let (process, _) =
+                process_with_lifeline("bash", &["-c", "trap '' TERM; while :; do sleep 0.1; done"]);
+            LaunchedChild {
+                workdir: PathBuf::from("/tmp/child"),
+                session_id: "ses_child".to_string(),
+                capsule_url: String::new(),
+                argv: Vec::new(),
+                env: Vec::new(),
+                delegation_id: None,
+                formation_id: None,
+                door_token: None,
+                process: Arc::new(Mutex::new(process)),
+                stderr_tail: Arc::new(StderrTail {
+                    state: Mutex::new(StderrState::default()),
+                    drained: Condvar::new(),
+                }),
+                started: Instant::now(),
+                watcher: None,
+            }
+        };
+        let children = vec![wedged(), wedged()];
+        std::thread::sleep(Duration::from_millis(300));
+        let began = Instant::now();
+        for child in &children {
+            child.begin_ending();
+        }
+        drop(children);
+        let took = began.elapsed();
+        assert!(took >= CHILD_END_GRACE, "took {took:?}");
+        assert!(
+            took < CHILD_END_GRACE * 2,
+            "two children waited a grace each: {took:?}"
+        );
     }
 
     /// A child observed to have exited on its own has its lifeline closed by the observer.
@@ -1639,5 +1859,73 @@ mod tests {
             recorded.detail.as_deref(),
             Some(delegation::PARENT_ENDED_DETAIL)
         );
+    }
+
+    /// A child that records its own completion while it winds down from `SIGTERM` does not
+    /// decide the outcome of a delegation its parent ended: the launcher's `terminated` record is
+    /// written over it, and the child's is never re-posted.
+    #[cfg(unix)]
+    #[test]
+    fn a_completion_the_child_records_while_being_ended_is_overwritten_by_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = DelegationOutcome {
+            delegation_id: "dlg_watched".to_string(),
+            capsule_name: "worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            session_id: "ses_child".to_string(),
+            status: DelegationStatus::Error,
+            result_path: None,
+            workdir: dir.path().display().to_string(),
+            duration_ms: 1,
+            detail: None,
+            reported_by: Reporter::Child,
+            delivered: false,
+            delivery_error: None,
+        };
+        let staged = dir.path().join("own-record.json");
+        std::fs::write(&staged, serde_json::to_vec(&own).unwrap()).unwrap();
+        let script = format!(
+            "trap 'cp {} {}; exit 0' TERM; sleep 30 & wait",
+            staged.display(),
+            dir.path().join(delegation::COMPLETION_FILE).display()
+        );
+        let (process, _) = process_with_lifeline("bash", &["-c", &script]);
+        let mut child = LaunchedChild {
+            workdir: dir.path().to_path_buf(),
+            session_id: "ses_child".to_string(),
+            capsule_url: String::new(),
+            argv: Vec::new(),
+            env: Vec::new(),
+            delegation_id: Some("dlg_watched".to_string()),
+            formation_id: None,
+            door_token: None,
+            process: Arc::new(Mutex::new(process)),
+            stderr_tail: Arc::new(StderrTail {
+                state: Mutex::new(StderrState::default()),
+                drained: Condvar::new(),
+            }),
+            started: Instant::now(),
+            watcher: None,
+        };
+        let watcher = watch_for_completion(
+            &child,
+            SpawnerHandle::for_delegation(&spawner(), "dlg_watched".to_string()),
+            CompletionAddress {
+                url: "http://127.0.0.1:1".to_string(),
+            },
+            "worker",
+            "0.1.0",
+            None,
+        )
+        .expect("the watcher starts");
+        std::thread::sleep(Duration::from_millis(300));
+
+        child.shutdown().unwrap();
+        watcher.join().unwrap();
+        let recorded = delegation::read_completion(dir.path()).expect("the ending is recorded");
+        assert_eq!(recorded.status, DelegationStatus::Terminated);
+        assert_eq!(recorded.reported_by, Reporter::Launcher);
+        assert!(!recorded.delivered);
+        assert_eq!(recorded.delivery_error, None);
     }
 }

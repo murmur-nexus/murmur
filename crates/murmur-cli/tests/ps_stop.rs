@@ -2374,23 +2374,29 @@ fn a_formation_is_accounted_for_after_its_members_end() {
         "{shown}"
     );
 
-    let failed = mur(home.path())
+    // The member killed outright left no `session_end`; its trace still opens, says so, and
+    // names the formation it was part of.
+    let shown = mur(home.path())
         .args(["trace", "show", &killed.session_id(), "--workdir"])
         .arg(&root)
         .assert()
-        .failure()
+        .success()
         .get_output()
-        .stderr
+        .stdout
         .clone();
-    let failed = String::from_utf8_lossy(&failed).to_string();
-    assert!(failed.contains("E-TRC-001"), "{failed}");
-    assert!(failed.contains("no session_end event found"), "{failed}");
+    let shown = String::from_utf8_lossy(&shown).to_string();
     assert!(
-        failed.contains(&format!(
-            "this session is a member of formation {formation} — `mur trace show {formation}` lists the formation"
+        shown.contains(&format!(
+            "session:    {}\nformation:  {formation}\n",
+            killed.session_id()
         )),
-        "{failed}"
+        "{shown}"
     );
+    assert!(
+        shown.contains("status:     ended without a session_end (last event: "),
+        "{shown}"
+    );
+    assert!(shown.contains("\n\n── Formation "), "{shown}");
 }
 
 /// A formation address that names no recorded session, or is not a formation id at all.

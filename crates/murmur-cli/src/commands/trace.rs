@@ -124,6 +124,28 @@ struct TraceRecord {
     event: TraceEvent,
 }
 
+/// The two keys every trace line carries, read for the first and last line of a trace whose
+/// ending is not recorded.
+#[derive(Debug, Default, Deserialize)]
+struct EventStamp {
+    #[serde(default)]
+    event_type: Option<String>,
+    #[serde(default)]
+    timestamp: Option<u64>,
+}
+
+/// What a trace's first and last lines say, for a session no `session_end` closed: a process
+/// killed outright leaves its trace exactly that way, often with its last line half-written.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TraceTail {
+    /// `timestamp` of the first line read.
+    first_timestamp: Option<u64>,
+    /// `event_type` and `timestamp` of the last line read.
+    last_event: Option<(String, u64)>,
+    /// The 1-based number of a final line that is not valid JSON, skipped rather than refused.
+    torn_line: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionStartEvent {
     session_id: String,
@@ -202,6 +224,13 @@ struct InferenceEvent {
     driver_choice: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// The tokens this call counts toward the session's totals. Both absent on a failed call
+    /// that counts toward nothing. Read only for a trace no `session_end` closed, whose totals
+    /// are summed from these.
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
     /// The provider's own counts, each written only when the driver reported it.
     #[serde(default)]
     input_tokens_actual: Option<u64>,
@@ -1156,7 +1185,13 @@ struct TraceMetrics {
     userns_grant: Option<String>,
     system_prompt_source: Option<String>,
     system_prompt_sha256: Option<String>,
+    /// `session_end.exit_status`, or for a trace no `session_end` closed the sentence
+    /// [`unended_status`] builds. Either carries a note naming a skipped torn final line.
     exit_status: String,
+    /// `false` when no `session_end` closed the trace: `duration_ms` then spans its first and
+    /// last lines, and every `total_*` is counted from the lines present rather than read from
+    /// the ending.
+    ending_recorded: bool,
     duration_ms: u64,
     total_turns: u32,
     total_input_tokens: u64,
@@ -1635,9 +1670,28 @@ fn parse_trace_file(path: &Path) -> Result<Vec<TraceEvent>, CliError> {
 /// ignored, an unknown event type becomes [`TraceEvent::Unknown`], and a line that is not
 /// valid JSON aborts with `E-TRC-001` naming `file:line`.
 fn parse_trace_records(path: &Path) -> Result<Vec<TraceRecord>, CliError> {
+    read_trace(path, false).map(|(records, _)| records)
+}
+
+/// [`parse_trace_records`], plus what the trace's first and last lines say, with one exception
+/// to its strictness when `skip_torn_tail` is set: a final line that is not valid JSON — the
+/// shape a writer killed mid-line leaves — is skipped and named in [`TraceTail::torn_line`]. A
+/// malformed line anywhere before it is refused.
+fn read_trace(
+    path: &Path,
+    skip_torn_tail: bool,
+) -> Result<(Vec<TraceRecord>, TraceTail), CliError> {
     let content = fs::read_to_string(path).map_err(|e| trace_read_error(path, &e))?;
+    let last_line = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, _)| i)
+        .last();
 
     let mut events = Vec::new();
+    let mut tail = TraceTail::default();
+    let mut last_read: Option<&str> = None;
     for (i, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -1647,10 +1701,27 @@ fn parse_trace_records(path: &Path) -> Result<Vec<TraceRecord>, CliError> {
             // Identity is read in a second pass over the same line, so the event structs stay
             // payload-only rather than repeating three keys apiece. Every field defaults, so
             // this cannot fail where the event parse succeeded on an object.
-            Ok(event) => events.push(TraceRecord {
-                identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
-                event,
-            }),
+            Ok(event) => {
+                if last_read.is_none() {
+                    tail.first_timestamp = serde_json::from_str::<EventStamp>(line)
+                        .ok()
+                        .and_then(|stamp| stamp.timestamp);
+                }
+                last_read = Some(line);
+                events.push(TraceRecord {
+                    identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
+                    event,
+                });
+            }
+            // Only a line that is not JSON at all is torn: a whole object this build cannot
+            // read as its event is a malformed line wherever it sits.
+            Err(_)
+                if skip_torn_tail
+                    && Some(i) == last_line
+                    && serde_json::from_str::<serde_json::Value>(line).is_err() =>
+            {
+                tail.torn_line = Some(i + 1);
+            }
             Err(err) => {
                 return Err(CliError::new(
                     E_TRC_001,
@@ -1659,8 +1730,11 @@ fn parse_trace_records(path: &Path) -> Result<Vec<TraceRecord>, CliError> {
             }
         }
     }
+    tail.last_event = last_read
+        .and_then(|line| serde_json::from_str::<EventStamp>(line).ok())
+        .and_then(|stamp| Some((stamp.event_type?, stamp.timestamp?)));
 
-    Ok(events)
+    Ok((events, tail))
 }
 
 /// Recognized field names (matched case-insensitively on the *field name* only)
@@ -1769,12 +1843,21 @@ fn plan_run_mut<'a>(runs: &'a mut Vec<PlanRunRecord>, plan_id: &str) -> &'a mut 
     }
 }
 
+/// `tail` is `Some` for `mur trace show`, which reads a trace no `session_end` closed — a session
+/// killed outright, or ended before it could write one — from the lines it has. Every other
+/// caller passes `None`, and such a trace fails `E-TRC-001`.
 fn compute_metrics(
     path: &Path,
     events: Vec<TraceEvent>,
+    tail: Option<&TraceTail>,
 ) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliError> {
     let mut ss: Option<SessionStartEvent> = None;
     let mut se: Option<SessionEndEvent> = None;
+    // Counted from the lines, for a trace whose `session_end` would otherwise carry them.
+    let mut seen_turns = 0u32;
+    let mut seen_input_tokens = 0u64;
+    let mut seen_output_tokens = 0u64;
+    let mut seen_shell_calls = 0u32;
     let mut tool_ok = 0u32;
     let mut tool_error = 0u32;
     let mut tool_latencies: Vec<u64> = Vec::new();
@@ -1843,6 +1926,12 @@ fn compute_metrics(
                         .get_or_insert_with(ProviderTokens::default)
                         .add(&e);
                 }
+                // A failed call that counts toward nothing carries neither token key.
+                if e.decision != "error" || e.input_tokens.is_some() || e.output_tokens.is_some() {
+                    seen_turns += 1;
+                    seen_input_tokens += e.input_tokens.unwrap_or(0);
+                    seen_output_tokens += e.output_tokens.unwrap_or(0);
+                }
                 inference_records.push(InferenceRecord::from_event(e));
             }
             TraceEvent::ToolCall(e) => {
@@ -1902,6 +1991,7 @@ fn compute_metrics(
                 });
             }
             TraceEvent::Shell(e) => {
+                seen_shell_calls += 1;
                 shell_latencies.push(e.duration_ms);
                 *shell_exit_codes.entry(e.exit_code).or_insert(0) += 1;
             }
@@ -1914,9 +2004,8 @@ fn compute_metrics(
                 shell_latencies.push(e.duration_ms);
                 *shell_exit_codes.entry(e.exit_code).or_insert(0) += 1;
             }
-            TraceEvent::ShellDetached(_)
-            | TraceEvent::ShellAbandoned(_)
-            | TraceEvent::ShellLost(_) => {}
+            TraceEvent::ShellDetached(_) => seen_shell_calls += 1,
+            TraceEvent::ShellAbandoned(_) | TraceEvent::ShellLost(_) => {}
             TraceEvent::Compaction(e) => {
                 compaction = Some(CompactionRecord {
                     turn: e.turn,
@@ -2179,20 +2268,40 @@ fn compute_metrics(
             format!("{}: no session_start event found", path.display()),
         )
     })?;
-    let se = se.ok_or_else(|| {
-        // A member killed before it could write its ending is still findable through its
-        // formation, which is the one place the rest of what it was part of is listed.
-        let formation = match &ss.formation_id {
-            Some(id) => format!(
-                "; this session is a member of formation {id} — `mur trace show {id}` lists the formation"
-            ),
-            None => String::new(),
-        };
-        CliError::new(
-            E_TRC_001,
-            format!("{}: no session_end event found{formation}", path.display()),
-        )
-    })?;
+    let ending_recorded = se.is_some();
+    let se = match (se, tail) {
+        (Some(se), _) => se,
+        (None, Some(tail)) => SessionEndEvent {
+            total_turns: seen_turns,
+            total_input_tokens: seen_input_tokens,
+            total_output_tokens: seen_output_tokens,
+            total_tool_calls: tool_ok + tool_error,
+            total_shell_calls: seen_shell_calls,
+            duration_ms: match (tail.first_timestamp, &tail.last_event) {
+                (Some(first), Some((_, last))) => last.saturating_sub(first),
+                _ => 0,
+            },
+            exit_status: unended_status(tail),
+        },
+        (None, None) => {
+            // A member killed before it could write its ending is still findable through its
+            // formation, which is the one place the rest of what it was part of is listed.
+            let formation = match &ss.formation_id {
+                Some(id) => format!(
+                    "; this session is a member of formation {id} — `mur trace show {id}` lists the formation"
+                ),
+                None => String::new(),
+            };
+            return Err(CliError::new(
+                E_TRC_001,
+                format!("{}: no session_end event found{formation}", path.display()),
+            ));
+        }
+    };
+    let exit_status = match tail.and_then(|tail| tail.torn_line) {
+        Some(line) if ending_recorded => format!("{} ({})", se.exit_status, torn_line_note(line)),
+        _ => se.exit_status,
+    };
 
     Ok((
         TraceMetrics {
@@ -2209,7 +2318,8 @@ fn compute_metrics(
             userns_grant: ss.userns_grant,
             system_prompt_source: ss.system_prompt_source,
             system_prompt_sha256: ss.system_prompt_sha256,
-            exit_status: se.exit_status,
+            exit_status,
+            ending_recorded,
             duration_ms: se.duration_ms,
             total_turns: se.total_turns,
             total_input_tokens: se.total_input_tokens,
@@ -2278,7 +2388,60 @@ fn load_metrics(path: &Path) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliErro
             ),
         ));
     }
-    compute_metrics(path, events)
+    compute_metrics(path, events, None)
+}
+
+/// [`load_metrics`] for `mur trace show`, which also reads a trace no `session_end` closed and
+/// one whose final line is torn: a session killed outright leaves its trace that way, and it is
+/// the one trace that says what that session was doing. `mur trace diff` and the multi-session
+/// report compare totals, so they refuse such a trace through [`load_metrics`].
+fn load_metrics_for_show(path: &Path) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliError> {
+    let (records, tail) = read_trace(path, true)?;
+    if records.is_empty() {
+        return Err(CliError::new(
+            E_TRC_001,
+            format!(
+                "{}: trace file is empty (incomplete or zero-event session)",
+                path.display()
+            ),
+        ));
+    }
+    let events = records.into_iter().map(|record| record.event).collect();
+    compute_metrics(path, events, Some(&tail))
+}
+
+/// The `status:` of a trace no `session_end` closed: that it ended without one, and the last
+/// event it did record.
+fn unended_status(tail: &TraceTail) -> String {
+    let last = match &tail.last_event {
+        Some((event_type, timestamp)) => {
+            format!(
+                "last event: {event_type} at {}",
+                fmt_timestamp_ms(*timestamp)
+            )
+        }
+        None => "no event carries a timestamp".to_string(),
+    };
+    match tail.torn_line {
+        Some(line) => format!(
+            "ended without a session_end ({last}; {})",
+            torn_line_note(line)
+        ),
+        None => format!("ended without a session_end ({last})"),
+    }
+}
+
+fn torn_line_note(line: usize) -> String {
+    format!("line {line}, the last, is not valid JSON and was skipped")
+}
+
+/// Unix milliseconds as RFC 3339 UTC, to the millisecond.
+fn fmt_timestamp_ms(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| format!("{timestamp} ms"))
 }
 
 // ── Session resolution ────────────────────────────────────────────────────────
@@ -2497,7 +2660,19 @@ fn print_show(m: &TraceMetrics) {
     capsule_runtime::report_println!("capsule:    {} v{}", m.capsule_name, m.capsule_version);
     capsule_runtime::report_println!("model:      {}", m.model);
     capsule_runtime::report_println!("status:     {}", m.exit_status);
-    capsule_runtime::report_println!("duration:   {}", fmt_dur(m.duration_ms));
+    if m.ending_recorded {
+        capsule_runtime::report_println!("duration:   {}", fmt_dur(m.duration_ms));
+    } else {
+        // The ending is where the runtime records its totals, so with none every total below is
+        // the lines' own count, and says so.
+        capsule_runtime::report_println!(
+            "duration:   {}  (first to last event)",
+            fmt_dur(m.duration_ms)
+        );
+        capsule_runtime::report_println!(
+            "totals:     counted from the events recorded; no session_end recorded the session's own"
+        );
+    }
     if !m.capabilities.is_empty() {
         capsule_runtime::report_println!("{:<11} {}", "capabilities:", m.capabilities.join(", "));
     }
@@ -3474,7 +3649,7 @@ pub(crate) fn run_trace_show(
     if let Some(arg) = &body {
         return print_body(&path, arg, turn);
     }
-    let (metrics, tasks) = load_metrics(&path)?;
+    let (metrics, tasks) = load_metrics_for_show(&path)?;
     print_show(&metrics);
     if tasks.len() > 1 {
         capsule_runtime::report_println!("── Tasks ───────────────────────────────────────");
@@ -5106,6 +5281,80 @@ mod tests {
             }
             other => panic!("expected a shell event, got {other:?}"),
         }
+    }
+
+    const UNENDED_START: &str = r#"{"event_type":"session_start","session_id":"ses_child","timestamp":1791000000000,"capsule_name":"worker","capsule_version":"0.1.0","model":"m","max_turns":5}"#;
+    const UNENDED_TASK: &str = r#"{"event_type":"task_start","event_id":"evt_1","session_id":"ses_child","timestamp":1791000001000,"task_id":"tsk_1","context_id":"ctx_1","source":"a2a","message_parts_bytes":9}"#;
+    const UNENDED_TURN: &str = r#"{"event_type":"inference","event_id":"evt_2","session_id":"ses_child","timestamp":1791000004500,"turn":0,"task_id":"tsk_1","input_tokens":10,"output_tokens":5,"decision":"end_turn","stop_reason":"end_turn","tool_name":null}"#;
+
+    fn trace_of(lines: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        std::fs::write(&path, lines).unwrap();
+        (dir, path)
+    }
+
+    /// A session killed before it wrote `session_end` is read from the lines it left: its status
+    /// names the last event, its duration spans the lines, and its totals are their own count.
+    #[test]
+    fn a_trace_with_no_session_end_shows_how_far_it_got() {
+        let (_dir, path) = trace_of(&format!(
+            "{UNENDED_START}\n{UNENDED_TASK}\n{UNENDED_TURN}\n"
+        ));
+        let (metrics, _) = load_metrics_for_show(&path).expect("an unended trace still shows");
+        assert_eq!(
+            metrics.exit_status,
+            "ended without a session_end (last event: inference at 2026-10-03T04:00:04.500Z)"
+        );
+        assert!(!metrics.ending_recorded);
+        assert_eq!(metrics.duration_ms, 4500);
+        assert_eq!(metrics.total_turns, 1);
+        assert_eq!(
+            (metrics.total_input_tokens, metrics.total_output_tokens),
+            (10, 5)
+        );
+
+        // Every command that compares totals refuses it.
+        let refused = load_metrics(&path)
+            .err()
+            .expect("load_metrics refuses an unended trace");
+        assert_eq!(refused.code, E_TRC_001);
+        assert!(
+            refused.message.contains("no session_end event found"),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// A final line a killed writer left half-written is skipped and named; one anywhere else is
+    /// refused, and so is a trace with no `session_start`.
+    #[test]
+    fn a_torn_final_line_is_skipped_and_named_and_any_other_is_refused() {
+        let torn = r#"{"event_type":"task_end","session_"#;
+        let (_dir, path) = trace_of(&format!("{UNENDED_START}\n{UNENDED_TASK}\n{torn}"));
+        let (metrics, _) = load_metrics_for_show(&path).expect("a torn tail still shows");
+        assert_eq!(
+            metrics.exit_status,
+            "ended without a session_end (last event: task_start at 2026-10-03T04:00:01.000Z; \
+             line 3, the last, is not valid JSON and was skipped)"
+        );
+
+        let (_dir, path) = trace_of(&format!("{UNENDED_START}\n{torn}\n{UNENDED_TASK}\n"));
+        let refused = load_metrics_for_show(&path)
+            .err()
+            .expect("a torn middle line is refused");
+        assert_eq!(refused.code, E_TRC_001);
+        assert!(refused.message.contains(":2:"), "{}", refused.message);
+
+        let (_dir, path) = trace_of(&format!("{UNENDED_TASK}\n{UNENDED_TURN}\n"));
+        let refused = load_metrics_for_show(&path)
+            .err()
+            .expect("no session_start is refused");
+        assert!(
+            refused.message.contains("no session_start event found"),
+            "{}",
+            refused.message
+        );
     }
 
     fn task_row(line: &str) -> String {
