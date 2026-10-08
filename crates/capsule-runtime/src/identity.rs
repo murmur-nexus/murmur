@@ -1723,6 +1723,7 @@ fn handle_message_send(
                 id: task_id,
                 context_id,
                 artifacts: None,
+                metadata: None,
             };
             return JsonRpcResponse::ok(id, task).into_http_response();
         }
@@ -1758,6 +1759,7 @@ fn handle_message_send(
         context_id,
         status: TaskStatus::of(TaskState::Submitted),
         artifacts: None,
+        metadata: None,
     };
     JsonRpcResponse::ok(id, task).into_http_response()
 }

@@ -449,6 +449,10 @@ pub(crate) enum AgentLoopExit {
     /// A person stopped this task. Not a failure: the loop did exactly what it was asked to, and
     /// the session it ran in is untouched.
     Canceled,
+    /// The model ended the task through `end-without-answer`: it had no answer to give the
+    /// formation member that sent it. The task fails; the session is untouched, and the launch's
+    /// outcome is never this.
+    NoAnswer,
 }
 
 impl AgentLoopExit {
@@ -459,6 +463,7 @@ impl AgentLoopExit {
             Self::MaxTurnsReached => "max_turns_reached",
             Self::SpendCeilingReached => "spend_ceiling_reached",
             Self::Canceled => "canceled",
+            Self::NoAnswer => "no_answer",
         }
     }
 }
@@ -476,6 +481,7 @@ pub(crate) fn task_state_for(outcome: &Result<AgentLoopExit, RuntimeError>) -> T
         Ok(AgentLoopExit::Failed)
         | Ok(AgentLoopExit::MaxTurnsReached)
         | Ok(AgentLoopExit::SpendCeilingReached)
+        | Ok(AgentLoopExit::NoAnswer)
         | Err(_) => TaskState::Failed,
     }
 }
@@ -493,14 +499,26 @@ pub(crate) struct AttemptEnding {
     /// The final status's `response`: the accepted answer on a `Completed` ending, `None` on the
     /// others.
     pub(crate) response: Option<String>,
+    /// Whether the attempt ended through `end-without-answer`, which `tasks/get` reports as
+    /// `metadata.murmur.noAnswer`. Only on a `Failed` ending.
+    pub(crate) no_answer: bool,
 }
 
 impl AttemptEnding {
-    fn failed(message: impl Into<String>) -> Self {
+    pub(crate) fn failed(message: impl Into<String>) -> Self {
         Self {
             state: TaskState::Failed,
             message: message.into(),
             response: None,
+            no_answer: false,
+        }
+    }
+
+    /// The ending of an attempt the model ended through `end-without-answer` for `reason`.
+    pub(crate) fn no_answer(reason: impl Into<String>) -> Self {
+        Self {
+            no_answer: true,
+            ..Self::failed(reason)
         }
     }
 }
@@ -1005,6 +1023,17 @@ pub(crate) async fn run_agent_loop(
                 INPUT_TIMEOUT_STATUS_MESSAGE,
             )
             .await;
+        }
+
+        // An accepted `end-without-answer` ends the attempt here, once the turn that called it has
+        // finished its tool calls, rather than asking the provider for a turn the task has given
+        // up. It is no failure of the loop, so it writes no `task_failed`.
+        if let Some(reason) = store_state
+            .member_calls
+            .as_ref()
+            .and_then(|calls| calls.declined())
+        {
+            return finish_no_answer_turn(hooks, trace, otel, workdir, ending, &reason).await;
         }
 
         // Session-level half of the workdir bound. The subprocess spawn paths already refuse to
@@ -2020,6 +2049,16 @@ pub(crate) async fn run_agent_loop(
         }
     }
 
+    // The last allowed turn called `end-without-answer`: the task ends as that call said it
+    // would, not as one that ran out of turns.
+    if let Some(reason) = store_state
+        .member_calls
+        .as_ref()
+        .and_then(|calls| calls.declined())
+    {
+        return finish_no_answer_turn(hooks, trace, otel, workdir, ending, &reason).await;
+    }
+
     record_result(
         hooks,
         workdir,
@@ -2068,6 +2107,25 @@ async fn finish_failed_turn(
     otel.emit_session_end(AgentLoopExit::Failed.as_str()).await;
     *ending = Some(AttemptEnding::failed(status_message));
     Ok(AgentLoopExit::Failed)
+}
+
+/// End one attempt because the model called `end-without-answer` for `reason`: `no answer:
+/// <reason>` as the attempt's result text, and a no-answer [`AttemptEnding`] in `ending`.
+async fn finish_no_answer_turn(
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    workdir: &Path,
+    ending: &mut Option<AttemptEnding>,
+    reason: &str,
+) -> Result<AgentLoopExit, RuntimeError> {
+    record_result(hooks, workdir, &format!("no answer: {reason}"))
+        .map_err(RuntimeError::AgentLoopFailed)?;
+    flush_hook_dispatch_faults(hooks, trace).await;
+    otel.emit_session_end(AgentLoopExit::NoAnswer.as_str())
+        .await;
+    *ending = Some(AttemptEnding::no_answer(reason));
+    Ok(AgentLoopExit::NoAnswer)
 }
 
 /// An agent-loop driver call that failed, as its `inference` record names it.
@@ -2175,6 +2233,7 @@ async fn finish_canceled_turn(
         state: TaskState::Canceled,
         message: crate::cancel::CANCELED_STATUS_MESSAGE.into(),
         response: None,
+        no_answer: false,
     });
 
     AgentLoopExit::Canceled
@@ -2398,6 +2457,7 @@ async fn finish_completed_turn(
         state: TaskState::Completed,
         message: SESSION_ENDED_STATUS_MESSAGE.into(),
         response: Some(final_text),
+        no_answer: false,
     });
     Ok(AgentLoopExit::Ok)
 }
@@ -6477,6 +6537,7 @@ forgery: {prompt}"
             AgentLoopExit::SpendCeilingReached.as_str(),
             "spend_ceiling_reached"
         );
+        assert_eq!(AgentLoopExit::NoAnswer.as_str(), "no_answer");
     }
 
     /// Every outcome an attempt can end with, read as the A2A state its task is left in: only a
@@ -6489,6 +6550,7 @@ forgery: {prompt}"
             (Ok(AgentLoopExit::MaxTurnsReached), TaskState::Failed),
             (Ok(AgentLoopExit::SpendCeilingReached), TaskState::Failed),
             (Ok(AgentLoopExit::Canceled), TaskState::Canceled),
+            (Ok(AgentLoopExit::NoAnswer), TaskState::Failed),
             (
                 Err(RuntimeError::AgentLoopFailed("boom".into())),
                 TaskState::Failed,

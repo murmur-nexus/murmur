@@ -107,6 +107,11 @@ pub(crate) struct A2aTask {
     pub status: TaskStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<Vec<A2aArtifact>>,
+    /// `{"murmur": {...}}` for a terminal task with something to say about answers it lacks:
+    /// `noAnswer: true` for one ended through `end-without-answer`, and `noAnswerBelow`, the
+    /// members further down that gave it none. Absent when it has neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +173,29 @@ struct TaskEnding {
     message: String,
     /// The task's response text, kept only for a `completed` task.
     response: Option<String>,
+    /// Whether the task ended through `end-without-answer`.
+    no_answer: bool,
+    /// `(member, status)` for each member further down that gave the task no answer.
+    no_answer_below: Vec<(String, String)>,
+}
+
+impl TaskEnding {
+    /// The `metadata` `tasks/get` carries for this ending, or `None` when it says nothing.
+    fn metadata(&self) -> Option<serde_json::Value> {
+        let mut murmur = serde_json::Map::new();
+        if self.no_answer {
+            murmur.insert("noAnswer".to_string(), serde_json::Value::Bool(true));
+        }
+        if !self.no_answer_below.is_empty() {
+            let below = self
+                .no_answer_below
+                .iter()
+                .map(|(member, status)| serde_json::json!({"member": member, "status": status}))
+                .collect();
+            murmur.insert("noAnswerBelow".to_string(), serde_json::Value::Array(below));
+        }
+        (!murmur.is_empty()).then(|| serde_json::json!({ "murmur": murmur }))
+    }
 }
 
 /// The name of the artifact a completed task's response is carried in over `tasks/get`.
@@ -368,14 +396,25 @@ impl TaskRegistry {
     }
 
     /// Record how `task_id` ended: its final status's `message`, and its `response` when it
-    /// completed. A response on any other state is not kept.
-    pub(crate) fn record_ending(&mut self, task_id: &str, message: &str, response: Option<&str>) {
+    /// completed. A response on any other state is not kept. `no_answer` is whether it ended
+    /// through `end-without-answer`, and `no_answer_below` the `(member, status)` of each member
+    /// further down that gave it no answer.
+    pub(crate) fn record_ending(
+        &mut self,
+        task_id: &str,
+        message: &str,
+        response: Option<&str>,
+        no_answer: bool,
+        no_answer_below: &[(String, String)],
+    ) {
         let completed = matches!(self.history.get(task_id), Some((TaskState::Completed, _)));
         self.endings.insert(
             task_id.to_string(),
             TaskEnding {
                 message: message.to_string(),
                 response: response.filter(|_| completed).map(str::to_string),
+                no_answer,
+                no_answer_below: no_answer_below.to_vec(),
             },
         );
     }
@@ -651,6 +690,7 @@ impl TaskRegistry {
                     message,
                 },
                 artifacts,
+                metadata: ending.and_then(TaskEnding::metadata),
             }
         })
     }
@@ -798,7 +838,7 @@ mod tests {
     fn a_completed_task_carries_its_response_artifact_and_status_message() {
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Completed);
-        r.record_ending("tsk_1", "done", Some("the answer is 4"));
+        r.record_ending("tsk_1", "done", Some("the answer is 4"), false, &[]);
         let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
         assert_eq!(
             task,
@@ -818,12 +858,63 @@ mod tests {
         );
     }
 
+    /// A task ended through `end-without-answer` carries `metadata.murmur.noAnswer` and the
+    /// members further down that gave it none; a completed task with members missing below it
+    /// carries its response and `noAnswerBelow` but no `noAnswer`; any other ending carries no
+    /// `metadata` at all.
+    #[test]
+    fn a_no_answer_ending_carries_its_metadata_and_no_other_ending_does() {
+        let below = [("q".to_string(), "timed_out".to_string())];
+        let mut r = running_registry("tsk_1");
+        r.finish_task(TaskState::Failed);
+        r.record_ending("tsk_1", "q gave no answer", None, true, &below);
+        let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
+        assert_eq!(task["status"]["state"], "failed");
+        assert_eq!(
+            task["status"]["message"]["parts"][0]["text"],
+            "q gave no answer"
+        );
+        assert_eq!(
+            task["metadata"],
+            serde_json::json!({"murmur": {
+                "noAnswer": true,
+                "noAnswerBelow": [{"member": "q", "status": "timed_out"}],
+            }})
+        );
+
+        let mut r = running_registry("tsk_2");
+        r.finish_task(TaskState::Completed);
+        r.record_ending("tsk_2", "session ended", Some("none came"), false, &below);
+        let task = serde_json::to_value(r.get_task("tsk_2").unwrap()).unwrap();
+        assert_eq!(
+            task["artifacts"],
+            serde_json::json!([{"name": "response", "parts": [{"text": "none came"}]}])
+        );
+        assert_eq!(
+            task["metadata"],
+            serde_json::json!({"murmur": {
+                "noAnswerBelow": [{"member": "q", "status": "timed_out"}],
+            }})
+        );
+
+        for state in [TaskState::Completed, TaskState::Failed] {
+            let mut r = running_registry("tsk_3");
+            r.finish_task(state);
+            r.record_ending("tsk_3", "ended", Some("4"), false, &[]);
+            let task = serde_json::to_value(r.get_task("tsk_3").unwrap()).unwrap();
+            assert!(task.get("metadata").is_none(), "{task}");
+        }
+        let r = running_registry("tsk_4");
+        let task = serde_json::to_value(r.get_task("tsk_4").unwrap()).unwrap();
+        assert!(task.get("metadata").is_none(), "{task}");
+    }
+
     /// A task that did not complete carries its message and no response, whatever was passed.
     #[test]
     fn a_failed_task_carries_its_status_message_and_no_response() {
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Failed);
-        r.record_ending("tsk_1", "the driver failed", Some("partial"));
+        r.record_ending("tsk_1", "the driver failed", Some("partial"), false, &[]);
         let task = r.get_task("tsk_1").unwrap();
         assert!(task.artifacts.is_none());
         let message = task.status.message.unwrap();
@@ -837,7 +928,7 @@ mod tests {
         let mut r = running_registry("tsk_1");
         r.finish_task(TaskState::Completed);
         assert!(r.get_task("tsk_1").unwrap().artifacts.is_none());
-        r.record_ending("tsk_1", "ok", Some(""));
+        r.record_ending("tsk_1", "ok", Some(""), false, &[]);
         let task = r.get_task("tsk_1").unwrap();
         assert!(task.artifacts.is_none());
         assert_eq!(task.status.message.unwrap().parts[0].text, "ok");

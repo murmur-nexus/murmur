@@ -328,11 +328,13 @@ impl A2aStream {
                 state: TaskState::Completed,
                 message: SESSION_ENDED_STATUS_MESSAGE.to_string(),
                 response: Some(self.result.clone()),
+                no_answer: false,
             },
             TaskState::Canceled => AttemptEnding {
                 state: TaskState::Canceled,
                 message: canceled_message(self.harness_killed).to_string(),
                 response: None,
+                no_answer: false,
             },
             _ => AttemptEnding {
                 state: TaskState::Failed,
@@ -344,6 +346,7 @@ impl A2aStream {
                     Err(error) => failure_message(error),
                 },
                 response: None,
+                no_answer: false,
             },
         }
     }

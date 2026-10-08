@@ -1032,6 +1032,16 @@ mod tests {
         assert!(!worker_prompt.contains("call-member"), "{worker_prompt}");
     }
 
+    /// The worker calls nobody, so its prompt names neither tool a member with callees has.
+    #[test]
+    fn the_worker_prompt_names_neither_member_tool() {
+        let (_, _, worker, _) = files(&default_choice());
+        let prompt = worker.inference.unwrap().system_prompt.unwrap();
+        for tool in ["call-member", "end-without-answer"] {
+            assert!(!prompt.contains(tool), "{tool}: {prompt}");
+        }
+    }
+
     #[test]
     fn lifecycles_are_stated() {
         let (_, lead, worker, scaffold) = files(&default_choice());

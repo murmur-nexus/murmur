@@ -90,6 +90,28 @@ pub(crate) struct MemberCallRecord {
     pub(crate) delivered: bool,
     /// How many offers of the task the callee turned away busy: one per `member_call_busy`.
     pub(crate) busy_offers: u32,
+    /// The members further down the callee reported as giving it no answer.
+    pub(crate) no_answer_below: Vec<NoAnswerBelow>,
+}
+
+/// One member a `member_call` line's callee reported as giving it no answer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct NoAnswerBelow {
+    pub(crate) member: String,
+    pub(crate) status: String,
+}
+
+/// How a call row names the members its callee reported with no answer, or `None` for none:
+/// `no answer below: q (timed_out), r (rejected)`.
+pub(crate) fn no_answer_below_note(below: &[NoAnswerBelow]) -> Option<String> {
+    (!below.is_empty()).then(|| {
+        let named = below
+            .iter()
+            .map(|entry| format!("{} ({})", entry.member, entry.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("no answer below: {named}")
+    })
 }
 
 /// One `member_call_start` line: a `call-member` call whose callee holds the task.
@@ -137,6 +159,8 @@ pub(crate) struct MemberCallLine {
     pub(crate) delivered: bool,
     #[serde(default)]
     pub(crate) timestamp: u64,
+    #[serde(default)]
+    pub(crate) no_answer_below: Vec<NoAnswerBelow>,
 }
 
 /// The first call with `call_id` its callee does not yet hold.
@@ -170,6 +194,7 @@ pub(crate) fn fold_member_call_busy(calls: &mut Vec<MemberCallRecord>, line: Mem
             duration_ms: 0,
             delivered: false,
             busy_offers: 1,
+            no_answer_below: Vec::new(),
         }),
     }
 }
@@ -190,6 +215,7 @@ pub(crate) fn fold_member_call_start(calls: &mut Vec<MemberCallRecord>, line: Me
             duration_ms: 0,
             delivered: false,
             busy_offers: 0,
+            no_answer_below: Vec::new(),
         }),
     }
 }
@@ -205,6 +231,7 @@ pub(crate) fn fold_member_call(calls: &mut Vec<MemberCallRecord>, line: MemberCa
             call.status = Some(line.status);
             call.duration_ms = line.duration_ms;
             call.delivered = line.delivered;
+            call.no_answer_below = line.no_answer_below;
             if call.member_task_id.is_none() {
                 call.member_task_id = line.member_task_id;
             }
@@ -219,6 +246,7 @@ pub(crate) fn fold_member_call(calls: &mut Vec<MemberCallRecord>, line: MemberCa
             duration_ms: line.duration_ms,
             delivered: line.delivered,
             busy_offers: 0,
+            no_answer_below: line.no_answer_below,
         }),
     }
 }
@@ -499,6 +527,8 @@ pub(crate) struct FormationCall {
     pub(crate) member_task_id: Option<String>,
     /// How many offers of the task the callee turned away busy.
     pub(crate) busy_offers: u32,
+    /// The members further down the callee reported as giving it no answer.
+    pub(crate) no_answer_below: Vec<NoAnswerBelow>,
 }
 
 /// Every `call-member` call `members` record, once each, in display order.
@@ -556,6 +586,7 @@ pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> 
                 calling_task_id: Some(call.calling_task_id.clone()),
                 member_task_id: call.member_task_id.clone(),
                 busy_offers: call.busy_offers,
+                no_answer_below: call.no_answer_below.clone(),
             });
         }
     }
@@ -575,6 +606,7 @@ pub(crate) fn formation_calls(members: &[RecordedMember]) -> Vec<FormationCall> 
                 calling_task_id: None,
                 member_task_id: Some(task.task_id.clone()),
                 busy_offers: 0,
+                no_answer_below: Vec::new(),
             });
         }
     }
@@ -1216,6 +1248,7 @@ mod tests {
                 status: Some("completed".into()),
                 duration_ms: 5000,
                 delivered: true,
+                no_answer_below: Vec::new(),
                 busy_offers: 2,
             }
         );
@@ -1441,6 +1474,7 @@ mod tests {
                     status: Some("completed".to_string()),
                     duration_ms: 1,
                     delivered: true,
+                    no_answer_below: Vec::new(),
                     busy_offers: 0,
                 })
                 .collect(),

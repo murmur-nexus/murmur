@@ -342,7 +342,7 @@ The call row comes from three records. In `lead`'s trace,
 |---|---|
 | `call_id` | `mcl_…`, the same on both records |
 | `member_task_id` | `worker`'s task id for this call |
-| `status` | `completed`: `worker` finished the task |
+| `status` | `completed`: `worker` finished the task. A call that brought no answer reads `failed`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer` — see [`member_call`](../reference/observability-schemas.md#member-call) |
 | `duration_ms` | From the call to `worker`'s answer |
 | `output` | `worker`'s answer, as `lead`'s model received it |
 | `delivered` | `true`: the answer reached `lead`'s task |
@@ -498,6 +498,6 @@ session resumed by hand belongs to no formation. See
 | Egress | The caller's `capabilities.network.allow` lists `localhost` |
 | Key | `mur config set -g credentials.<KEY_VAR> <your key>`, first of the `Next:` steps |
 | Launch | `mur run --roster crew --task "…"` starts the peers, waits for each door, then starts the entry member |
-| Hand-off | `call-member` returns at once: started when the callee holds the task, or busy when it has no room, and the runtime keeps offering a busy callee the task. The answer, or word that none came, comes back into the caller's same task |
+| Hand-off | `call-member` returns at once: started when the callee holds the task, or busy when it has no room, and the runtime keeps offering a busy callee the task. The answer, or word that none came, comes back into the caller's same task. A member with nothing to give ends its task with `end-without-answer`, and its caller's call ends `no_answer` |
 | Trace | `mur trace show frm_<id>` from the roster's directory lists every member by roster name and every call: who called whom, how it ended, whether the answer was delivered, and how many offers a busy callee turned away. Behind each call row, `member_call` in the caller's trace and `a2a_task_received` with `caller_member` in the callee's |
 | End | The entry member exits after its task; every other member records `formation_ended` and exits; the launcher exits with the entry member's status |

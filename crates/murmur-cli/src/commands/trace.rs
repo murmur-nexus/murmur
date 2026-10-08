@@ -15,8 +15,8 @@ use capsule_runtime::{formation::FORMATION_ID_PREFIX, FormationId};
 use crate::error::{CliError, E_IO_001, E_IO_003};
 use crate::formation_trace::{
     fold_member_call, fold_member_call_busy, fold_member_call_start, formation_calls,
-    search_formation, CallEnding, FormationCall, FormationSearch, MemberCallBusyLine,
-    MemberCallLine, MemberCallRecord, MemberCallStartLine, RecordedMember,
+    no_answer_below_note, search_formation, CallEnding, FormationCall, FormationSearch,
+    MemberCallBusyLine, MemberCallLine, MemberCallRecord, MemberCallStartLine, RecordedMember,
 };
 use crate::session_address::{self, ses_entries, SessionQuery};
 
@@ -1328,6 +1328,9 @@ fn member_call_show_row(call: &MemberCallRecord) -> String {
     );
     if call.busy_offers > 0 {
         row.push_str(&format!("  {}", busy_note(call.busy_offers)));
+    }
+    if let Some(note) = no_answer_below_note(&call.no_answer_below) {
+        row.push_str(&format!("  {note}"));
     }
     row
 }
@@ -3651,6 +3654,7 @@ fn formation_call_lines(calls: &[FormationCall]) -> Vec<String> {
                 .map(|gap| gap.note(&call.caller, &call.callee))
                 .into_iter()
                 .chain((call.busy_offers > 0).then(|| busy_note(call.busy_offers)))
+                .chain(no_answer_below_note(&call.no_answer_below))
                 .collect::<Vec<_>>()
                 .join("; ");
             [id, pair, status, duration, delivery.to_string(), note]
@@ -3997,13 +4001,16 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.member_task_id
         ),
         TraceEvent::MemberCall(e) => format!(
-            "{}{}  {}  {}  {}{}",
+            "{}{}  {}  {}  {}{}{}",
             kind("member_call"),
             e.member,
             e.call_id,
             e.status,
             fmt_dur(e.duration_ms),
-            if e.delivered { "" } else { "  not delivered" }
+            if e.delivered { "" } else { "  not delivered" },
+            no_answer_below_note(&e.no_answer_below)
+                .map(|note| format!("  {note}"))
+                .unwrap_or_default()
         ),
         TraceEvent::TaskFailed(e) => {
             let reason: String = e.reason.chars().take(120).collect();
@@ -5664,7 +5671,56 @@ mod tests {
             calling_task_id: None,
             member_task_id: None,
             busy_offers: 0,
+            no_answer_below: Vec::new(),
         }
+    }
+
+    /// A `member_call` that names members its callee had no answer from carries them, as `no
+    /// answer below: …`, on its `steps` row, its Member calls row and its formation call row; a
+    /// line without the field renders as before.
+    #[test]
+    fn a_call_with_no_answer_below_names_those_members_on_every_row() {
+        let no_answer = r#"{"event_type":"member_call","event_id":"evt_9","parent_id":"evt_1","session_id":"s","timestamp":9,"task_id":"tsk_lead","call_id":"mcl_1","member":"p","member_task_id":"tsk_p","status":"no_answer","duration_ms":2500,"output":"q gave no answer","truncated":false,"delivered":true,"no_answer_below":[{"member":"q","status":"timed_out"},{"member":"r","status":"rejected"}]}"#;
+        let plain = r#"{"event_type":"member_call","event_id":"evt_10","parent_id":"evt_1","session_id":"s","timestamp":10,"task_id":"tsk_lead","call_id":"mcl_2","member":"w","member_task_id":"tsk_w","status":"completed","duration_ms":3,"output":"ok","truncated":false,"delivered":true}"#;
+        assert_eq!(
+            row(no_answer),
+            "member_call p  mcl_1  no_answer  2.5s  no answer below: q (timed_out), r (rejected)"
+        );
+        assert_eq!(row(plain), "member_call w  mcl_2  completed  3ms");
+
+        let mut calls = Vec::new();
+        for line in [no_answer, plain] {
+            let TraceEvent::MemberCall(e) = serde_json::from_str::<TraceEvent>(line).unwrap()
+            else {
+                unreachable!("a member_call line");
+            };
+            fold_member_call(&mut calls, e);
+        }
+        let rows: Vec<String> = calls.iter().map(member_call_show_row).collect();
+        assert_eq!(
+            rows,
+            [
+                "mcl_1  p  tsk_p  no_answer in 2.5s  no answer below: q (timed_out), r (rejected)",
+                "mcl_2  w  tsk_w  completed in 3ms",
+            ]
+        );
+
+        let below = calls[0].no_answer_below.clone();
+        let ended = CallEnding::Ended {
+            status: "no_answer".to_string(),
+            duration_ms: 2500,
+            delivered: true,
+        };
+        let listed = formation_call_lines(&[FormationCall {
+            busy_offers: 1,
+            no_answer_below: below,
+            ..formation_call(0, Some("mcl_1"), ("lead", "p"), ended, None)
+        }]);
+        assert_eq!(
+            listed,
+            ["mcl_1  lead → p  no_answer  2.5s  delivered  busy ×1; no answer below: q (timed_out), \
+              r (rejected)"]
+        );
     }
 
     /// A call row reads `<call id>  <caller> → <callee>  <status>  <duration>  <delivery>` and its
