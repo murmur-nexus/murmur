@@ -304,13 +304,13 @@ until it finishes or the formation ends.
 
 `end-without-answer` exists exactly where [`call-member`](#call-member) does. It ends the running
 task without an answer, when the member has none to give — usually because a member it called
-gave it none. The member that sent the task is then told so by the runtime, rather than reading a
-reply that stands in for an answer.
+gave it none. The runtime then tells the member that sent the task, in its own words, that no
+answer came.
 
 | Aspect | Behaviour |
 |---|---|
 | Input | `{"reason": "<text>"}`, required. The reason is the task's status message |
-| Description | `End the task you are working on without an answer, when you have none to give — usually because a member you called gave you none. `reason` says why, in a sentence; it is passed to the member that sent you the task. The runtime tells that member plainly that you gave no answer, and names each member you called that gave you none. Use it instead of replying. It is refused while a call you made is still out, and for a task no formation member sent you.` |
+| Description | Tells the model to use it instead of replying when it has no answer to give, usually because a member it called gave it none; that `reason` is passed to the member that sent the task; that the runtime tells that member plainly no answer came and names each member called that gave none; and that it is refused while a call is still out and for a task no formation member sent |
 | Accepted | `passed`, summary `Ending task without an answer`, `data` `{"status": "ending", "caller": "<caller>"}`, then the note `[end-without-answer] This task ends without an answer once this turn's tool calls finish, and <caller> is told you gave none.` The other tool calls of the same turn still run |
 | Policy | The call passes the same `on-tool-call` decision point as every tool call |
 | Plans | Not callable from a plan step |

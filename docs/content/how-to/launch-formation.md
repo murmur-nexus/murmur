@@ -342,7 +342,7 @@ The call row comes from three records. In `lead`'s trace,
 |---|---|
 | `call_id` | `mcl_…`, the same on both records |
 | `member_task_id` | `worker`'s task id for this call |
-| `status` | `completed`: `worker` finished the task. A call that brought no answer reads `failed`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer` — see [`member_call`](../reference/observability-schemas.md#member-call) |
+| `status` | `completed`: `worker` finished the task. A call that brought no answer reads `failed`, `canceled`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer` — see [`member_call`](../reference/observability-schemas.md#member-call) |
 | `duration_ms` | From the call to `worker`'s answer |
 | `output` | `worker`'s answer, as `lead`'s model received it |
 | `delivered` | `true`: the answer reached `lead`'s task |

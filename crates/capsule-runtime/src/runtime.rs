@@ -258,11 +258,9 @@ async fn run_task_with_reopens(
     // What the next attempt continues with: `None` until a hook reopens the task or handed-off
     // work reports back.
     let mut continuation: Option<agent::Continuation> = None;
-    // The calls and delegations this task makes are this task's: put it in scope, with the flag
-    // that cancels it, until this function returns. Dropping the delegation scope ends any
-    // sub-capsule still held for it, on every way out of this function.
     // The formation member that sent the task, which `end-without-answer` reports to; `None` for
-    // a task no formation token submitted, and on the `task.md` paths.
+    // a task no formation token submitted, and on the `task.md` paths. The registry lock is
+    // released here, before `scope_task` takes the member-calls lock.
     let caller = agent_task_id
         .as_deref()
         .zip(state.a2a_task_registry.as_ref())
@@ -272,6 +270,9 @@ async fn run_task_with_reopens(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry.submitter(task_id).map(str::to_string)
         });
+    // The calls and delegations this task makes are this task's: put it in scope, with the flag
+    // that cancels it, until this function returns. Dropping the delegation scope ends any
+    // sub-capsule still held for it, on every way out of this function.
     let _calls_scope = state
         .member_calls
         .clone()
