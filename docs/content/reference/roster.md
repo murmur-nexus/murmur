@@ -287,7 +287,10 @@ receive a result. A wound-down member reports no error of its own:
 |---|---:|---|
 | Was running a task | 0 | `formation_ended`. The task itself ends `canceled`, and its `out/result.txt` holds the [`canceled:` line](workdir.md#session-workdir-files) |
 | Was idle | 0 | `ok` |
-| Had already begun ending on a `SIGTERM` | 1 | `canceled`, with [`E-RUN-040`](diagnostics.md#e-run-040), as any `SIGTERM` ends a running task |
+
+A member already ending on a `SIGTERM` when its lifeline closed ends as that `SIGTERM` ends it: a
+task it was running ends the session `canceled`, with [`E-RUN-040`](diagnostics.md#e-run-040) and
+exit code 1.
 
 A launch whose entry member completed therefore prints no `E-RUN-040` from any member, and exits
 with the entry member's `0`.
