@@ -1,10 +1,9 @@
 name: wit-components
 
-# Names the committed WASM components a WIT change has left behind, in a job whose name says so.
-# Without it a version bump surfaces as an unrelated test failure ten files away, such as a
-# process driver fixture that no longer loads. `cargo test --workspace` runs the same comparison
+# Names the committed WASM components a WIT change has left behind, in a job whose name says so,
+# with the command that rebuilds each. `cargo test --workspace` runs the same comparison
 # (`every_committed_component_matches_the_wit_it_builds_against`), so cargo-test in ci.yml fails
-# too; this job is where the failure carries the command that fixes it.
+# too, but among unrelated fixture failures.
 #
 # Path-filtered to the WIT tree, and in a workflow of its own because GitHub's `paths` filter
 # applies to a whole workflow, not to one job. Only a change under crates/capsule-runtime/wit/
@@ -35,10 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      # Check mode only. Rebuilding is the bump author's job, on their own machine or a card's
-      # worktree, so the author of every committed binary stays a person rather than this
-      # runner, whose toolchain is whatever the image ships that day. The check needs no wasm
-      # target and no libseccomp.
+      # Check mode only. The bump author rebuilds and commits the components, so every committed
+      # binary has a person as its author rather than this runner, whose toolchain is whatever
+      # the image ships that day. The check needs no wasm target and no libseccomp.
       - name: Committed components match the WIT they build against
         shell: bash
         run: |

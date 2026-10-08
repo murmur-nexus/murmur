@@ -17,9 +17,7 @@ mod rebuild;
 
 pub use check::{check, judge, unlisted_components, CheckReport, Entry, Outcome};
 pub use list::{find_component, parse_list, read_list, Component, ListError};
-pub use rebuild::{
-    rebuild, rebuild_selection, wasm_target, RebuildOutcome, RebuildReport, Toolchain,
-};
+pub use rebuild::{rebuild, rebuild_selection, wasm_target, RebuildOutcome, RebuildReport};
 
 /// The list of committed components, relative to the repository root.
 pub const LIST_PATH: &str = "crates/capsule-runtime/wit/components.list";

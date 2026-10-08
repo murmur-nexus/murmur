@@ -20,21 +20,14 @@ const RUSTFLAGS_VARIABLES: [&str; 3] = [
     "CARGO_BUILD_RUSTFLAGS",
 ];
 
-/// The compiler a rebuild uses: `$RUSTC` when set, else `rustc` on `PATH`, the same one the
-/// nested `cargo build` picks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Toolchain {
-    pub rustc: OsString,
-    /// `rustc -V`, trimmed.
-    pub version: String,
-}
-
-/// Finds the compiler and checks that [`WASM_TARGET`] is installed in its sysroot, which is
-/// where rustup puts a target: `<rustc --print sysroot>/lib/rustlib/wasm32-wasip2`.
+/// Checks that [`WASM_TARGET`] is installed in the compiler's sysroot, which is where rustup puts
+/// a target: `<rustc --print sysroot>/lib/rustlib/wasm32-wasip2`. The compiler is `$RUSTC` when
+/// set, else `rustc` on `PATH`, the same one the nested `cargo build` picks. Returns its
+/// `rustc -V`, trimmed.
 ///
 /// Errors when `rustc` cannot be run, and when the target is missing; the second error names the
 /// `rustc -V` in use and the `rustup target add` line that installs it.
-pub fn wasm_target() -> Result<Toolchain, String> {
+pub fn wasm_target() -> Result<String, String> {
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let shown = Path::new(&rustc).display().to_string();
     let run = |args: &[&str]| -> Result<String, String> {
@@ -62,7 +55,7 @@ pub fn wasm_target() -> Result<Toolchain, String> {
             sysroot.display()
         ));
     }
-    Ok(Toolchain { rustc, version })
+    Ok(version)
 }
 
 /// What a rebuild did with one component.
@@ -249,15 +242,31 @@ fn build_and_copy(
         .map_err(|err| format!("could not run cargo: {err}"))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut wasm = None;
+    let mut read_error = None;
     for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|err| format!("could not read cargo's output: {err}"))?;
-        if let Some(path) = built_wasm(&line) {
-            wasm = Some(path);
+        match line {
+            Ok(line) => {
+                if let Some(path) = built_wasm(&line) {
+                    wasm = Some(path);
+                }
+            }
+            Err(err) => {
+                read_error = Some(err);
+                break;
+            }
         }
+    }
+    // Reap cargo on every path: an early return would leave it running with nobody reading its
+    // output.
+    if read_error.is_some() {
+        let _ = child.kill();
     }
     let status = child
         .wait()
         .map_err(|err| format!("could not wait for cargo: {err}"))?;
+    if let Some(err) = read_error {
+        return Err(format!("could not read cargo's output: {err}"));
+    }
     if !status.success() {
         return Err(format!("cargo build failed ({status})"));
     }

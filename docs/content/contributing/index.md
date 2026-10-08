@@ -117,6 +117,36 @@ since a CI runner provides neither; the job's step summary reports how many test
 that reason and points at
 `docs/content/reference/resource-limits-manual-verification.md`, which covers them by hand.
 
+## Changing a WIT interface
+
+The repository commits compiled WASM components (test fixtures and the escape-conformance
+driver), each built against a WIT directory under `crates/capsule-runtime/wit/`. A component built
+against an interface version the tree no longer declares stops loading, so a version bump has to
+rebuild every component that uses the bumped package.
+[`components.list`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/components.list)
+names each committed component, the WIT directory it builds against, and the crate it is built
+from.
+
+Run these from the repository root:
+
+| Command | What it does |
+|---|---|
+| `scripts/rebuild-components.sh --check` | Writes nothing. Names every component whose `murmur:*` interface versions differ from the ones its WIT directory declares, with the command that rebuilds it, and exits 1 if any differ |
+| `scripts/rebuild-components.sh <name>` | Rebuilds one component from source and copies it over its committed file |
+| `scripts/rebuild-components.sh` | Rebuilds every component the list does not mark `frozen:` |
+
+Rebuilding needs the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`). The check does
+not need it. Commit the files a rebuild rewrites. A rebuild can change a component's bytes without
+changing its interfaces, for example when you build with a different Rust toolchain, so to keep
+the diff small, commit only the components `--check` named before the rebuild.
+
+The same check runs in `cargo test --workspace`, and as the `wit-components` CI job on any pull
+request that changes `crates/capsule-runtime/wit/`. Both also fail on a committed `.wasm` under
+`crates/` that no line in `components.list` names, so a new committed component needs a line
+there. The columns are described at the top of the file. The full bump procedure, including the
+`default-artifacts` rebuild, is in
+[`wit/VERSIONING.md`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/VERSIONING.md).
+
 ## Optional allocator features
 
 A default build of `mur` uses the system allocator. Two optional features on `murmur-cli` swap in

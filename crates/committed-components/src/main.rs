@@ -85,8 +85,8 @@ fn run() -> u8 {
             return COULD_NOT_RUN;
         }
     }
-    let toolchain = match wasm_target() {
-        Ok(toolchain) => toolchain,
+    let rustc_version = match wasm_target() {
+        Ok(version) => version,
         Err(err) => {
             eprintln!("error: {err}");
             return COULD_NOT_RUN;
@@ -99,7 +99,7 @@ fn run() -> u8 {
             return COULD_NOT_RUN;
         }
     };
-    println!("{}", toolchain.version);
+    println!("{rustc_version}");
     let report = match rebuild(&repo_root, &list, name.as_deref(), &mut io::stdout()) {
         Ok(report) => report,
         Err(err) => {

@@ -169,15 +169,6 @@ impl CheckReport {
                 .any(|entry| matches!(entry.outcome, Outcome::Stale(_) | Outcome::Failed(_)))
     }
 
-    /// The names of the stale components, in list order.
-    pub fn stale(&self) -> Vec<&str> {
-        self.entries
-            .iter()
-            .filter(|entry| matches!(entry.outcome, Outcome::Stale(_)))
-            .map(|entry| entry.component.name.as_str())
-            .collect()
-    }
-
     /// One line per current or frozen component, a block per stale one naming each mismatch and
     /// the command that rebuilds it, a line per failed or unlisted one, then a count. Ends with
     /// the full-rebuild line when anything is stale.
