@@ -348,6 +348,7 @@ impl Response {
 
 /// Sends one request with `headers` and reads the response head, then the body: up to
 /// `content-length` when given, otherwise until the connection closes or goes quiet for a second.
+/// A `POST /` exchange is checked against A2A v1.0 by [`super::wire_recorder::record_post`].
 pub fn request(
     addr: &str,
     method: &str,
@@ -405,10 +406,14 @@ pub fn request(
             let _ = reader.read_to_end(&mut body_bytes);
         }
     }
+    let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+    if method == "POST" && path == "/" {
+        super::wire_recorder::record_post(headers, body, status, &response_headers, &body_text);
+    }
     Response {
         status,
         headers: response_headers,
-        body: String::from_utf8_lossy(&body_bytes).to_string(),
+        body: body_text,
     }
 }
 

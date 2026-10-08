@@ -255,7 +255,7 @@ fn agent_card_served_at_well_known_path() {
     let card: Value = serde_json::from_str(&card_json).expect("agent card should be valid JSON");
 
     assert_eq!(
-        common::a2a_card_conformance::check_agent_card(&card),
+        common::a2a_conformance::check_agent_card(&card),
         Ok(()),
         "the served card is an A2A v1.0 AgentCard: {card:#}"
     );

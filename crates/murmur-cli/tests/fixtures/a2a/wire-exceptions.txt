@@ -1,0 +1,36 @@
+# Every A2A v1.0 wire check the door fails today. The recorder in tests/common/wire_recorder.rs
+# checks each JSON-RPC exchange the common door helpers make against the vendored a2a.proto, and a
+# failing check whose key is not listed here fails the test that made it.
+#
+# One line per exception, whitespace-separated: <method> <part> <subject> <card> <why…>
+#   method   the v1.0 method (or murmur extension method) for header, params, result and event;
+#            the name as sent on the wire for method and envelope
+#   part     method, header, envelope, params, result or event
+#   subject  the qualified message for params, result and event; the header name for header;
+#            `-` for method and envelope
+#   card     the part-5 card whose change removes the line
+#   why      the rest of the line
+#
+# The list can only shrink: the census in tests/a2a_wire_conformance.rs fails when a listed
+# exception no longer occurs, so a card removes its lines when it lands. f2ef8db1 empties it.
+message/send method - 0229ba70 0.3 name; v1.0 is SendMessage
+message/stream method - 0229ba70 0.3 name; v1.0 is SendStreamingMessage
+tasks/get method - 0229ba70 0.3 name; v1.0 is GetTask
+tasks/cancel method - 0229ba70 0.3 name; v1.0 is CancelTask
+agent/getAuthenticatedExtendedCard method - 0229ba70 0.3 name; v1.0 is GetExtendedAgentCard
+SendMessage header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
+SendStreamingMessage header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
+GetTask header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
+CancelTask header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
+GetExtendedAgentCard header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
+stream/watch header A2A-Version 0229ba70 accepted without A2A-Version: 1.0; 0229ba70 negotiates on every method
+session/stop header A2A-Version 0229ba70 accepted without A2A-Version: 1.0; 0229ba70 negotiates on every method
+GetExtendedAgentCard result lf.a2a.v1.AgentCard 0229ba70 the extended card is the 0.3 shape
+SendMessage params lf.a2a.v1.SendMessageRequest 27678569 role "user", not ROLE_USER
+SendStreamingMessage params lf.a2a.v1.SendMessageRequest 27678569 role "user", not ROLE_USER
+GetTask params lf.a2a.v1.GetTaskRequest 27678569 the door accepts tasks/get without an id and answers its active task; GetTaskRequest requires id
+SendMessage result lf.a2a.v1.SendMessageResponse 27678569 a bare task, not {"task": …}; kebab-case state
+GetTask result lf.a2a.v1.Task 27678569 kebab-case states, artifacts without artifactId, role "agent"
+CancelTask result lf.a2a.v1.Task 27678569 kebab-case states, artifacts without artifactId, role "agent"
+SendStreamingMessage event lf.a2a.v1.StreamResponse 54148d84 murmur SSE frames, not JSON-RPC StreamResponse events
+stream/watch event lf.a2a.v1.StreamResponse 2eea2c25 murmur SSE frames; 2eea2c25 moves the watch stream onto 54148d84's shapes

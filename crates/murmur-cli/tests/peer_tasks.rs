@@ -568,7 +568,7 @@ fn the_card_states_the_peer_task_posture() {
         let capsule = Capsule::launch(name, &extra);
         let card = capsule.card();
         assert_eq!(
-            common::a2a_card_conformance::check_agent_card(&card),
+            common::a2a_conformance::check_agent_card(&card),
             Ok(()),
             "{card:#}"
         );

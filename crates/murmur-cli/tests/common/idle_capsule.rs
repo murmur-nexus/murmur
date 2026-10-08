@@ -209,18 +209,29 @@ fn stage_agent(
 // ── raw SSE reading ────────────────────────────────────────────────────────────
 
 /// Open a `stream/watch` connection and return the socket, positioned at the first byte
-/// of the HTTP response.
+/// of the HTTP response. [`LineReader`] checks the response it reads against A2A v1.0.
 pub fn open_watch(addr: &str, last_event_id: u64) -> TcpStream {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}"#;
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nLast-Event-ID: {last_event_id}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+    let last_event_id = last_event_id.to_string();
+    let headers = [
+        ("Content-Type", "application/json"),
+        ("Accept", "text/event-stream"),
+        ("Last-Event-ID", last_event_id.as_str()),
+    ];
+    let mut request = format!("POST / HTTP/1.1\r\nHost: {addr}\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!(
+        "Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
-    );
+    ));
 
     let stream = TcpStream::connect(addr).expect("should connect to capsule");
     stream
         .set_read_timeout(Some(Duration::from_millis(250)))
         .unwrap();
+    super::wire_recorder::watch_opened(&stream, body, &headers);
     (&stream).write_all(request.as_bytes()).unwrap();
     (&stream).flush().unwrap();
     stream
@@ -270,6 +281,7 @@ impl<'a> LineReader<'a> {
                 Err(_) => break,
             }
         }
+        super::wire_recorder::stream_lines(self.stream, &lines);
         lines
     }
 }
@@ -292,6 +304,8 @@ pub fn sse_body(lines: &[(Instant, String)]) -> Vec<(Instant, String)> {
 
 // ── task submission ────────────────────────────────────────────────────────────
 
+/// `POST /` with `body`, returning the response body as JSON, or `{"_raw": body}` when it is not.
+/// The exchange is checked against A2A v1.0 by [`super::wire_recorder::record_post`].
 pub fn http_post_json(addr: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let request = format!(
@@ -302,15 +316,33 @@ pub fn http_post_json(addr: &str, body: &str) -> Value {
     stream.flush().unwrap();
 
     let mut reader = BufReader::new(&stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).unwrap();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .unwrap_or(0);
+    let mut response_headers = Vec::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         if line.trim().is_empty() {
             break;
         }
+        if let Some((name, value)) = line.trim_end().split_once(':') {
+            response_headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
     }
     let mut response_body = String::new();
     reader.read_to_string(&mut response_body).ok();
+    super::wire_recorder::record_post(
+        &[("Content-Type", "application/json")],
+        body,
+        status,
+        &response_headers,
+        &response_body,
+    );
     serde_json::from_str(&response_body)
         .unwrap_or_else(|_| serde_json::json!({"_raw": response_body}))
 }

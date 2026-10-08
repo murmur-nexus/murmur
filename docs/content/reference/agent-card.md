@@ -2,7 +2,7 @@
 
 Every capsule serves an [A2A](https://a2a-protocol.org) v1.0 `AgentCard` at
 `GET /.well-known/agent-card.json` on its HTTP listener. The card parses as `lf.a2a.v1.AgentCard`,
-as defined by [`a2a.proto` at `v1.0.0`](https://github.com/a2aproject/A2A/blob/v1.0.0/specification/a2a.proto),
+as defined by [`a2a.proto` at `v1.0.1`](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto),
 under a strict protobuf JSON parser. It names the session answering the address, states what the
 capsule may do, lists what its listener answers, and names the frames its stream can send.
 

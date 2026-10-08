@@ -2171,7 +2171,7 @@ mod tests {
     }
 
     fn assert_conforms(card: &Value) {
-        if let Err(errors) = crate::a2a_card_conformance::check_agent_card(card) {
+        if let Err(errors) = crate::a2a_conformance::check_agent_card(card) {
             panic!("the card does not conform to lf.a2a.v1.AgentCard: {errors:#?}\n{card:#}");
         }
     }
