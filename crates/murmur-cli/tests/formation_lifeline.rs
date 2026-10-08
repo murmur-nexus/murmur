@@ -13,6 +13,7 @@ mod common;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,8 +21,8 @@ use std::time::{Duration, Instant};
 use capsule_runtime::formation::{FORMATION_ID_ENV, FORMATION_PEERS_ENV};
 use capsule_runtime::{FormationId, MemberLifeline, FORMATION_LIFELINE_ENV};
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, rpc, wait_for_requests, AUTHENTICATION_YAML,
-    QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, message, rpc, wait_completed, wait_for_requests,
+    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use common::{
     assert_wound_down_by_formation, event_kinds as kinds, read_whole_trace as read_trace,
@@ -38,6 +39,10 @@ const EXIT_LIMIT: Duration = Duration::from_secs(25);
 const READY_LIMIT: Duration = Duration::from_secs(120);
 
 const LIFELINE_CLOSED: &str = "formation lifeline closed";
+
+/// What `out/result.txt` holds once a task that ran ends `canceled`.
+const CANCELED_RESULT: &str =
+    "canceled: the task was canceled before it completed, so it has no result";
 
 /// A queue/sleep agent with an authenticated door, against `server`.
 fn member_project(server: &ScriptedServer) -> TempDir {
@@ -219,15 +224,29 @@ impl Member {
 
     /// `message/send` under the operator token; the task id.
     fn send_task(&self) -> String {
-        let sent = rpc(
-            &self.url(),
-            Some(&self.token()),
-            "message/send",
-            message("m-held", "hold"),
-        );
+        self.send(message("m-held", "hold"))
+    }
+
+    fn send(&self, message: Value) -> String {
+        let sent = rpc(&self.url(), Some(&self.token()), "message/send", message);
         assert_eq!(sent.status, 200, "{sent:?}");
         sent.json()["result"]["id"].as_str().unwrap().to_string()
     }
+
+    /// The session's `out/result.txt`, or `None` when nothing wrote it.
+    fn result_text(&self) -> Option<String> {
+        std::fs::read_to_string(self.session_dir().join("out").join("result.txt")).ok()
+    }
+}
+
+/// The `exit_status` of the trace's one `session_end`.
+fn session_exit_status(events: &[Value]) -> Value {
+    let ends: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event_type"] == "session_end")
+        .collect();
+    assert_eq!(ends.len(), 1, "{:?}", kinds(events));
+    ends[0]["exit_status"].clone()
 }
 
 impl Drop for Member {
@@ -252,13 +271,18 @@ fn an_idle_member_winds_down_when_its_lifeline_closes() {
     assert_eq!(member.startup["formation_id"], formation.as_str());
 
     member.close_lifeline();
-    member.assert_exits_within(EXIT_LIMIT);
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    assert_eq!(status.code(), Some(0), "{}", member.stderr());
     let events = member.trace();
     assert_wound_down_by_formation(&events, formation.as_str());
     let tail = kinds(&events);
     assert_eq!(&tail[tail.len() - 2..], ["formation_ended", "session_end"]);
+    // Nothing was running, so the formation's end cancelled nothing.
+    assert_eq!(session_exit_status(&events), "ok");
+    assert_eq!(member.result_text(), None, "an idle member wrote a result");
     let stderr = member.stderr();
     assert!(stderr.contains(LIFELINE_CLOSED), "{stderr}");
+    assert!(!stderr.contains("error["), "{stderr}");
     assert!(!stderr.contains("SIGTERM received"), "{stderr}");
     assert!(!stderr.contains("W-RUN-007"), "{stderr}");
 }
@@ -301,9 +325,15 @@ fn a_member_mid_task_cancels_it_when_its_lifeline_closes() {
             thread::sleep(Duration::from_millis(50));
         }
     }
-    member.assert_exits_within(EXIT_LIMIT);
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    let stderr = member.stderr();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains(LIFELINE_CLOSED), "{stderr}");
+    assert!(!stderr.contains("error["), "{stderr}");
     let events = member.trace();
     assert_wound_down_by_formation(&events, formation.as_str());
+    assert_eq!(session_exit_status(&events), "formation_ended");
+    assert_eq!(member.result_text().as_deref(), Some(CANCELED_RESULT));
     let ended = position(&events, "formation_ended").unwrap();
     let canceled = events
         .iter()
@@ -324,6 +354,125 @@ fn a_member_mid_task_cancels_it_when_its_lifeline_closes() {
         kinds(&events)
     );
     assert_eq!(server.requests().len(), 1, "the task asked its model again");
+}
+
+#[test]
+fn a_cancelled_task_does_not_leave_an_earlier_answer_as_its_result() {
+    let home = driver_home();
+    // The first task is answered at once; the second is held until the formation ends.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    let server = ScriptedServer::start_answering(2, move |_| {
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            end_turn(1, "first answer")
+        } else {
+            thread::sleep(Duration::from_secs(120));
+            end_turn(2, "late")
+        }
+    });
+    let formation = FormationId::mint();
+    let mut member = Member::start(home.path(), &server, Some(&formation), true, &[]);
+
+    let first = member.send(message("m-first", "answer"));
+    wait_completed(&member.url(), Some(&member.token()), &first);
+    let events = member.trace();
+    assert!(
+        events.iter().any(|event| event["event_type"] == "task_end"
+            && event["task_id"] == first
+            && event["exit_status"] == "ok"),
+        "{:?}",
+        kinds(&events)
+    );
+    assert_eq!(member.result_text().as_deref(), Some("first answer"));
+
+    let second = member.send(message("m-second", "hold"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while asked.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the second task never asked its model"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    member.close_lifeline();
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    let stderr = member.stderr();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("error["), "{stderr}");
+    let events = member.trace();
+    assert_wound_down_by_formation(&events, formation.as_str());
+    assert!(
+        events.iter().any(|event| event["event_type"] == "task_end"
+            && event["task_id"] == second
+            && event["exit_status"] == "canceled"),
+        "{:?}",
+        kinds(&events)
+    );
+    assert_eq!(session_exit_status(&events), "formation_ended");
+    assert_eq!(member.result_text().as_deref(), Some(CANCELED_RESULT));
+}
+
+/// A `tasks/cancel` is a cancel of one task, not of the session: the member keeps serving, its
+/// result file says the cancelled task has none, and when its lifeline later closes on an idle
+/// session it ends `ok`.
+#[test]
+fn a_cancelled_task_leaves_a_sleeping_members_ending_alone() {
+    let home = driver_home();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    let server = ScriptedServer::start_answering(2, move |_| {
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            end_turn(1, "first answer")
+        } else {
+            thread::sleep(Duration::from_secs(120));
+            end_turn(2, "late")
+        }
+    });
+    let formation = FormationId::mint();
+    let mut member = Member::start(home.path(), &server, Some(&formation), true, &[]);
+    let session_id = member.session_id();
+
+    let first = member.send(message("m-first", "answer"));
+    wait_completed(&member.url(), Some(&member.token()), &first);
+    let second = member.send(message("m-second", "hold"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while asked.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the second task never asked its model"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let canceled = rpc(
+        &member.url(),
+        Some(&member.token()),
+        "tasks/cancel",
+        json!({ "id": second }),
+    );
+    assert_eq!(canceled.json()["result"]["status"]["state"], "canceled");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !member
+        .trace()
+        .iter()
+        .any(|event| event["event_type"] == "task_end" && event["task_id"] == second)
+    {
+        assert!(Instant::now() < deadline, "the cancelled task never ended");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(member.result_text().as_deref(), Some(CANCELED_RESULT));
+    assert!(member.door_session_id().contains(&session_id));
+    assert!(
+        member.child.try_wait().unwrap().is_none(),
+        "the cancel ended the session"
+    );
+
+    member.close_lifeline();
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    let stderr = member.stderr();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("error["), "{stderr}");
+    assert_eq!(session_exit_status(&member.trace()), "ok");
 }
 
 #[test]
@@ -581,9 +730,12 @@ fn eof_then_one_sigterm_still_ends_through_the_teardown() {
     member.close_lifeline();
     thread::sleep(Duration::from_millis(300));
     signal(member.pid(), libc::SIGTERM);
-    member.assert_exits_within(EXIT_LIMIT);
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    // The formation's end began the termination; the `SIGTERM` after it changes nothing.
+    assert_eq!(status.code(), Some(0), "{}", member.stderr());
     let events = member.trace();
     assert_wound_down_by_formation(&events, formation.as_str());
+    assert_eq!(session_exit_status(&events), "formation_ended");
     assert!(
         events
             .iter()
@@ -605,8 +757,12 @@ fn sigterm_then_eof_writes_no_formation_ended() {
     signal(member.pid(), libc::SIGTERM);
     thread::sleep(Duration::from_millis(300));
     member.close_lifeline();
-    member.assert_exits_within(EXIT_LIMIT);
+    let status = member.assert_exits_within(EXIT_LIMIT);
+    // A `SIGTERM` cancel is a cancel, whatever closes after it.
+    assert_eq!(status.code(), Some(1), "{}", member.stderr());
     let events = member.trace();
+    assert_eq!(session_exit_status(&events), "canceled");
+    assert_eq!(member.result_text().as_deref(), Some(CANCELED_RESULT));
     assert!(
         position(&events, "formation_ended").is_none(),
         "{:?}",
@@ -621,6 +777,24 @@ fn sigterm_then_eof_writes_no_formation_ended() {
     let stderr = member.stderr();
     assert!(stderr.contains("SIGTERM received"), "{stderr}");
     assert!(!stderr.contains(LIFELINE_CLOSED), "{stderr}");
+    assert_eq!(
+        stderr
+            .matches("error[E-RUN-040]: the task ended canceled: the task was canceled")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("error[").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(
+            "the task was canceled before it completed, so out/result.txt holds no result"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("result text is in out/result.txt"),
+        "{stderr}"
+    );
 }
 
 #[test]

@@ -719,6 +719,29 @@ impl StagedSession {
 pub struct LaunchResult {
     pub session_id: String,
     pub workdir: PathBuf,
+    /// How a launch that reports no error ended.
+    pub ending: LaunchEnding,
+}
+
+/// How a launch that reports no error ended. A launch whose task did not complete for any other
+/// reason is a [`crate::RuntimeError::TaskDidNotComplete`], not an ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchEnding {
+    /// Every task the launch ran completed, or it ran none: `session_end.exit_status` `ok`.
+    Completed,
+    /// The session's formation ended while it was running a task, and the wind-down that followed
+    /// cancelled that task: `session_end.exit_status` `formation_ended`.
+    FormationEnded,
+}
+
+impl LaunchEnding {
+    /// The `exit_status` `session_end` and `on-session-end` carry for this ending.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "ok",
+            Self::FormationEnded => "formation_ended",
+        }
+    }
 }
 
 pub fn capability_policy_from_runtime_manifest(

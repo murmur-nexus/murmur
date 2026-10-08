@@ -60,6 +60,12 @@ pub(crate) const PHASE_PLAN: &str = "plan";
 /// cannot tell from the frame which one ran the task.
 pub(crate) const CANCELED_STATUS_MESSAGE: &str = "task canceled";
 
+/// What `out/result.txt` holds once a task that ran ends `canceled`, so the file never presents
+/// an earlier attempt's text — the same task's interim reply, or an earlier task's answer — as
+/// the cancelled task's result.
+pub(crate) const CANCELED_RESULT_TEXT: &str =
+    "canceled: the task was canceled before it completed, so it has no result";
+
 // ── CancelSignal ──────────────────────────────────────────────────────────────
 
 /// One task's "a person stopped this" flag, shared by the door that sets it and every wait inside

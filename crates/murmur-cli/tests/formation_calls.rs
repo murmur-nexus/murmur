@@ -664,6 +664,135 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
     }
 }
 
+/// A peer whose call went unanswered ended a turn with an interim reply and is continuing when the
+/// entry member completes. The formation's end cancels the peer's task, which is not an error:
+/// the launcher reports nothing but the entry member's `0`, the peer ends `formation_ended`, and
+/// its `out/result.txt` says the task was canceled rather than holding the interim reply.
+#[test]
+fn a_member_its_formation_ended_reports_formation_ended_and_no_stale_result() {
+    const CANCELED_RESULT: &str =
+        "canceled: the task was canceled before it completed, so it has no result";
+    let (release_lead, lead_released) = mpsc::channel::<()>();
+    let lead_released = Mutex::new(lead_released);
+    let lead = Model::new(move |n| match n {
+        1 => call_members(&[("p", "work it out")]),
+        2 => end_turn(2, "waiting on p"),
+        _ => {
+            let _ = lead_released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(120));
+            end_turn(n, "lead done")
+        }
+    });
+    let p = Model::new(|n| match n {
+        1 => call_members(&[("q", "help")]),
+        2 => end_turn(2, "interim 42"),
+        _ => {
+            thread::sleep(Duration::from_secs(120));
+            end_turn(n, "too late")
+        }
+    });
+    let (q, _never) = Model::held("never");
+    let project = Project::new(
+        vec![
+            Member {
+                name: "lead",
+                entry: true,
+                allow: Some("localhost"),
+                max_turns: None,
+                model: lead,
+            },
+            Member {
+                name: "p",
+                entry: false,
+                allow: Some("localhost"),
+                max_turns: None,
+                model: p,
+            },
+            Member {
+                name: "q",
+                entry: false,
+                allow: None,
+                max_turns: None,
+                model: q,
+            },
+        ],
+        "reachability:\n  - from: lead\n    to: [p]\n  - from: p\n    to: [q]\n",
+    );
+
+    let _lock = launch_lock();
+    let mut launcher = project.launch(
+        "call p",
+        &[(
+            capsule_runtime::delegation_plane::DELEGATION_TIMEOUT_ENV,
+            "2",
+        )],
+    );
+    let formation = launcher.next_json().1;
+    let formation_id = formation["formation_id"].as_str().unwrap().to_string();
+    let readiness = launcher.next_json().1;
+
+    // p's call to q timed out after p's turn ended with its interim reply, and p is continuing.
+    project.await_requests("p", 3);
+    let p_session = session_dirs(&project.member_dir(&formation_id, "p").join(".murmur"))
+        .pop()
+        .unwrap();
+    let p_result = p_session.join("out").join("result.txt");
+    assert_eq!(std::fs::read_to_string(&p_result).unwrap(), "interim 42");
+    release_lead.send(()).unwrap();
+
+    let status = launcher.wait();
+    let said = format!("{}\n{}", launcher.stdout().join("\n"), launcher.stderr());
+    assert_eq!(status.code(), Some(0), "{said}");
+    assert!(!said.contains("E-RUN-040"), "{said}");
+    assert!(!said.contains("error["), "{said}");
+    assert!(
+        said.contains("[p] [capsule-runtime] formation lifeline closed"),
+        "{said}"
+    );
+    assert_no_member_remains(
+        project.path(),
+        &reported_pids(&formation, Some(&readiness)),
+        Duration::from_secs(30),
+    );
+
+    assert_eq!(std::fs::read_to_string(&p_result).unwrap(), CANCELED_RESULT);
+    let p_trace = project.trace_of(&formation_id, "p");
+    let p_end = records(&p_trace, "task_end");
+    assert_eq!(
+        p_end.last().unwrap()["exit_status"],
+        "canceled",
+        "{p_trace:?}"
+    );
+    assert_eq!(
+        records(&p_trace, "session_end")[0]["exit_status"],
+        "formation_ended"
+    );
+
+    let shown = Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["trace", "show", &formation_id])
+        .current_dir(project.path())
+        .env("HOME", project.home.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&shown.stdout).to_string();
+    assert!(shown.status.success(), "{stdout}");
+    let status_of = |member: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("ses_") && line.split_whitespace().nth(1) == Some(member))
+            .unwrap_or_else(|| panic!("no row for {member}: {stdout}"))
+            .split_whitespace()
+            .nth(3)
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(status_of("lead"), "ok", "{stdout}");
+    assert_eq!(status_of("p"), "formation_ended", "{stdout}");
+    assert_eq!(status_of("q"), "formation_ended", "{stdout}");
+}
+
 /// A lead that ends its last allowed turn with a call still out does not wait for the answer it
 /// has no turn to read: the call is recorded `abandoned`, undelivered, and the formation ends
 /// without waiting out the bound for handed-off work.

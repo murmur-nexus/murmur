@@ -49,6 +49,8 @@ pub(crate) enum RunStatus {
     Success,
     Failed,
     Trapped,
+    /// The session's formation ended while it was running a task, which the wind-down cancelled.
+    FormationEnded,
     /// The session ran and its task did not complete. Carries the task's `exit_status`, never
     /// `"ok"`: `failed`, `max_turns_reached`, `spend_ceiling_reached` or `canceled`.
     TaskEnded(&'static str),
@@ -61,6 +63,7 @@ impl RunStatus {
             Self::Success => "ok",
             Self::Failed => "failed",
             Self::Trapped => "trapped",
+            Self::FormationEnded => capsule_runtime::LaunchEnding::FormationEnded.as_str(),
             Self::TaskEnded(exit_status) => exit_status,
         }
     }

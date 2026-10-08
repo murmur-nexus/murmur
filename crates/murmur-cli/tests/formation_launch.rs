@@ -1091,6 +1091,17 @@ fn the_entry_members_end_or_the_launchers_signal_ends_the_formation() {
             let planner_trace = project.trace_of("planner");
             assert_wound_down(&planner_trace, id);
             assert_task_canceled(&planner_trace);
+            // The entry member is a member: its formation's end cancelled its task, which is not
+            // an error of its own, while the launcher still reports the signal.
+            let session_end = planner_trace
+                .iter()
+                .find(|event| event["event_type"] == "session_end")
+                .unwrap();
+            assert_eq!(
+                session_end["exit_status"], "formation_ended",
+                "{session_end}"
+            );
+            assert!(!stderr.contains("error[E-RUN-040]"), "{stderr}");
         } else {
             for peer in ["coder", "reviewer"] {
                 assert!(

@@ -525,7 +525,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` \| `"formation_ended"` — the launch's outcome, which is the status [`mur run`](cli.md#mur-run-status) prints. The first [task that decides the launch](cli.md#mur-run-status) and ended anything but `"ok"` sets it, and no later run replaces it. `"formation_ended"`: a formation member was running a task when its [formation ended](roster.md#launch-stop), and the wind-down canceled that task |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 

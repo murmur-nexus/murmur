@@ -281,7 +281,19 @@ The launcher sends no member `SIGTERM`. A member whose lifeline closes winds dow
 3. 20 seconds after its lifeline closed, it exits with status 143 wherever its teardown is.
 
 Work in flight is cancelled, not finished: the formation's task is over, and nothing remains to
-receive a result.
+receive a result. A wound-down member reports no error of its own:
+
+| The member, when its lifeline closed | Exit code | `session_end.exit_status` and `status:` |
+|---|---:|---|
+| Was running a task | 0 | `formation_ended`. The task itself ends `canceled`, and its `out/result.txt` holds the [`canceled:` line](workdir.md#session-workdir-files) |
+| Was idle | 0 | `ok` |
+
+A member already ending on a `SIGTERM` when its lifeline closed ends as that `SIGTERM` ends it: a
+task it was running ends the session `canceled`, with [`E-RUN-040`](diagnostics.md#e-run-040) and
+exit code 1.
+
+A launch whose entry member completed therefore prints no `E-RUN-040` from any member, and exits
+with the entry member's `0`.
 
 | When | What happens |
 |---|---|

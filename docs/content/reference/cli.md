@@ -1254,7 +1254,8 @@ When the session ends, `mur run` prints one `status:` line and exits:
 | `failed` | 1 | Ran a task that failed — a failed driver call, a response it could not act on, a compaction hook error, a `request-input` wait past `lifecycle.input_timeout_secs` — and prints [`E-RUN-040`](diagnostics.md#e-run-040) with the reason. Also the status of a launch that could not run at all, with that error's own code |
 | `max_turns_reached` | 1 | Ran a task that used every turn `inference.max_turns` allows, and prints `E-RUN-040` |
 | `spend_ceiling_reached` | 1 | Ran a task a [spend ceiling](manifest.md#inference-max-session-tokens) stopped, and prints `E-RUN-040` |
-| `canceled` | 1 | Ran a task that was canceled — by `tasks/cancel`, `session/stop`, [`mur stop`](#mur-stop) or `SIGTERM` — and prints `E-RUN-040` |
+| `canceled` | 1 | Ran a task that was canceled — by `tasks/cancel`, `session/stop`, [`mur stop`](#mur-stop), `SIGTERM`, or the end of the session that [delegated](roost-api.md#spawner-lifeline) it — and prints `E-RUN-040` |
+| `formation_ended` | 0 | Was a formation member running a task when its formation ended, and the [wind-down](roster.md#launch-stop) canceled that task. Prints no error. The task itself still ends `canceled` |
 | `trapped` | 1 | Ran a script capsule that stopped with an error |
 
 The tasks that decide the outcome:

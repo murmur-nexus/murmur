@@ -12,8 +12,9 @@ use std::{
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
     launch_session_handling_sigterm, preopen_reports, probe_io_max, requires_process_bounding,
-    stage_session, state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LifecycleOverride,
-    LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest, TaskAcceptance,
+    stage_session, state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LaunchEnding,
+    LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
+    TaskAcceptance,
 };
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
@@ -971,7 +972,11 @@ pub(crate) fn run_run(
             }
         }) {
             Ok(launched) => {
-                print_run_output(&launched.session_id, &launched.workdir, RunStatus::Success);
+                print_run_output(
+                    &launched.session_id,
+                    &launched.workdir,
+                    run_status_for_ending(launched.ending),
+                );
                 Ok(())
             }
             Err(error) => {
@@ -991,6 +996,14 @@ fn started_by_hand_in_a_formation(
     spawn_grant_stdin: bool,
 ) -> bool {
     has_formation_id && !has_lifeline && !spawn_grant_stdin
+}
+
+/// The `status:` line `mur run` prints for a launch that ended `ending`.
+fn run_status_for_ending(ending: LaunchEnding) -> RunStatus {
+    match ending {
+        LaunchEnding::Completed => RunStatus::Success,
+        LaunchEnding::FormationEnded => RunStatus::FormationEnded,
+    }
 }
 
 /// The `status:` line `mur run` prints for a launch that returned `error`.
@@ -1417,8 +1430,42 @@ mod tests {
                 .starts_with("error[E-RUN-040]: the task ended canceled: the task was canceled"),
             "{rendered}"
         );
-        assert!(rendered.contains("out/result.txt"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "the task was canceled before it completed, so out/result.txt holds no result"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("result text is in out/result.txt"),
+            "{rendered}"
+        );
         assert!(rendered.contains("mur trace show"), "{rendered}");
+    }
+
+    #[test]
+    fn a_task_that_did_not_complete_otherwise_keeps_the_result_text_hint() {
+        let rendered = CliError::from(RuntimeError::TaskDidNotComplete {
+            exit_status: "failed",
+            reason: "boom".to_string(),
+        })
+        .to_string();
+        assert!(
+            rendered.contains("the task's result text is in out/result.txt"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_launch_its_formation_ended_prints_formation_ended() {
+        assert_eq!(
+            run_status_for_ending(LaunchEnding::FormationEnded).as_str(),
+            "formation_ended"
+        );
+        assert_eq!(
+            run_status_for_ending(LaunchEnding::Completed).as_str(),
+            "ok"
+        );
     }
 
     #[test]

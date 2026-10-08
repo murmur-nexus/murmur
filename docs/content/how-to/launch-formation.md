@@ -463,7 +463,9 @@ other member's lifeline, and the formation is over:
     {"event_type":"formation_ended","event_id":"evt_01a11002b48f78b1ad023e951090a20d","parent_id":"evt_01a11002969c75d28c8244f84ad1425f","session_id":"ses_01a11002968476428a785ab0b3ae4fbb","timestamp":1791269975183,"formation_id":"frm_01a1100295f47ea3b227ddf4612759f3"}
     ```
 
-2. `worker` cancels anything still in flight, ends its session and exits.
+2. `worker` cancels anything still in flight, ends its session and exits `0`. Its `session_end`
+   says `ok` when it was idle, as here, and `formation_ended` when the formation's end canceled a
+   task it was running; neither prints an error.
 3. The launcher exits with `lead`'s exit status: `0` here, because `lead`'s task ended `ok`.
 
 Nothing of the formation is left running:
