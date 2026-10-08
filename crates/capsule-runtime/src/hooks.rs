@@ -2179,6 +2179,38 @@ pub(crate) mod test_support {
         .expect("compaction double instantiates")
     }
 
+    /// A runtime whose one `on-inference` hook, `caller`, calls `run-inference` through `ctx`
+    /// on every agent-loop turn.
+    pub(crate) async fn inference_calling_hooks(
+        engine: &wasmtime::Engine,
+        workdir: &Path,
+        ctx: std::sync::Arc<crate::inference_import::HookInferenceCtx>,
+    ) -> HookRuntime {
+        HookRuntime::new(
+            engine,
+            workdir,
+            workdir,
+            vec![tests::staged_double_named(
+                "caller",
+                HookBinding::OnInference,
+                tests::hook_inference_caller_double(engine),
+            )],
+            super::SessionContextData {
+                capsule_name: "test-capsule".to_string(),
+                capsule_version: "0.1.0".to_string(),
+                session_id: "sess-test".to_string(),
+                model: "test-model".to_string(),
+                capabilities: Vec::new(),
+            },
+            super::HookEnvVars::default(),
+            crate::limits::ExecutionLimits::default(),
+            Ok(ctx),
+            None,
+        )
+        .await
+        .expect("a hook importing murmur:runtime/inference links")
+    }
+
     /// A runtime with no hook bound, so a compaction is declined for want of a replacement.
     pub(crate) async fn no_hooks(engine: &wasmtime::Engine, workdir: &Path) -> HookRuntime {
         tests::new_with_hooks(engine, workdir, workdir, Vec::new())
@@ -3650,7 +3682,7 @@ mod tests {
     /// string>` lays `ok`/`err` payloads at the same offset (record align 8 →
     /// discriminant at 0, payload at 8), so one code path copies either string's
     /// `(ptr, len)` into the artifact.
-    fn hook_inference_caller_double(engine: &wasmtime::Engine) -> Component {
+    pub(super) fn hook_inference_caller_double(engine: &wasmtime::Engine) -> Component {
         let stubs = REQUIRED_HOOK_FNS
             .iter()
             .filter(|n| **n != "on-inference")

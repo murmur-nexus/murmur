@@ -50,3 +50,4 @@ pub mod probe;
 pub mod record;
 pub mod runner;
 pub mod verdict;
+pub mod work_root;

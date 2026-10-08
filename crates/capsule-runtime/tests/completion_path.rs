@@ -973,6 +973,10 @@ fn a_childs_spawner_handle_carries_no_trust_class() {
 
 /// A delegation the parent ends itself is recorded as `terminated` and posted to nobody: the only
 /// party that would be told is the party that did it.
+///
+/// The child winds down from `SIGTERM` and may record and post its own account first; the
+/// launcher's record is written over it once the watcher has seen the child reaped, so the record
+/// is read only after the watcher has finished.
 #[test]
 fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
     if capsule_runtime::skip_without_host_support(
@@ -995,17 +999,15 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
     let delegation_id = child.delegation_id.clone().expect("a delegated launch");
     let workdir = child.workdir.clone();
     child.shutdown().expect("the parent ends the delegation");
+    wait_for(
+        "the watcher to record the ending",
+        Duration::from_secs(60),
+        || child.watcher_finished(),
+    );
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let completion = loop {
-        if let Ok(raw) = std::fs::read_to_string(workdir.join("completion.json")) {
-            if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
-                break parsed;
-            }
-        }
-        assert!(Instant::now() < deadline, "no completion.json was recorded");
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let raw = std::fs::read_to_string(workdir.join("completion.json"))
+        .expect("the watcher recorded completion.json");
+    let completion: Value = serde_json::from_str(&raw).expect("completion.json parses");
 
     assert_eq!(completion["status"], DelegationStatus::Terminated.as_str());
     assert_eq!(completion["reported_by"], Reporter::Launcher.as_str());
@@ -1053,6 +1055,13 @@ fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
     let delegation_id = child.delegation_id.clone().expect("a delegated launch");
     let pid = child.pid();
 
+    // The child winds down from the watcher's `SIGTERM` and may record its own account first; the
+    // watcher's record is written over it, so it is read once the watcher has finished.
+    wait_for(
+        "the watcher to record the ending",
+        Duration::from_secs(90),
+        || child.watcher_finished(),
+    );
     let completion = wait_for_refused_completion(&child.workdir);
     assert_eq!(completion["status"], DelegationStatus::Terminated.as_str());
     assert_eq!(completion["reported_by"], Reporter::Launcher.as_str());

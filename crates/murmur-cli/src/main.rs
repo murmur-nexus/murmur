@@ -602,7 +602,9 @@ fn main() {
         cmd = cmd.mut_subcommand("topology", |sc| sc.hide(true));
     }
 
-    let matches = cmd.get_matches();
+    let matches = cmd
+        .try_get_matches()
+        .unwrap_or_else(|e| exit_on_parse_error(&e));
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     let result = match cli.command {
@@ -890,6 +892,33 @@ fn main() {
                 ));
             }
         }
+    }
+}
+
+/// Exit as `clap::Error::exit` does, except that help or version text standard output refuses
+/// for a reason other than a gone reader, such as `ENOSPC` on a redirect to a full disk, fails
+/// with `E-IO-003` and exit 1 instead of exit 0.
+///
+/// Only `DisplayHelp` and `DisplayVersion` go to stdout; every other kind, including
+/// `DisplayHelpOnMissingArgumentOrSubcommand`, is a usage error clap writes to stderr with exit 2.
+/// `Error::print` writes the text itself so the stream and the colour choice (the command's
+/// `ColorChoice`, then `anstream`'s terminal and `NO_COLOR`/`CLICOLOR` checks on stdout) stay
+/// clap's own.
+fn exit_on_parse_error(err: &clap::Error) -> ! {
+    if err.use_stderr() {
+        err.exit();
+    }
+    let written = err
+        .print()
+        .and_then(|()| std::io::Write::flush(&mut std::io::stdout()));
+    match written {
+        Err(failure) if failure.kind() != std::io::ErrorKind::BrokenPipe => {
+            exit_with_error(&error::CliError::new(
+                error::E_IO_003,
+                format!("failed to write to standard output: {failure}"),
+            ))
+        }
+        _ => std::process::exit(err.exit_code()),
     }
 }
 

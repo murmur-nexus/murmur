@@ -420,6 +420,49 @@ fn await_delegation(root: &Path, session_id: &str) -> Delegation {
     }
 }
 
+/// `mur trace show` on the child's own trace: it opens, exits 0, and returns what it printed.
+fn trace_show(delegation: &Delegation) -> String {
+    let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["trace", "show"])
+        .arg(delegation.child_session.join("trace.jsonl"))
+        .env_remove("NEXUS_API_KEY")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "mur trace show refused the child's trace:\n{}\n{stdout}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// `mur trace show` names how the child ended: its trace's own `session_end.exit_status`, and
+/// for a child wound down by its spawner lifeline, the `Spawner ended` row too.
+fn assert_trace_show_names_the_ending(delegation: &Delegation, by_spawner: bool) {
+    let events = delegation.trace();
+    let ended = events
+        .iter()
+        .rev()
+        .find(|event| event["event_type"] == "session_end")
+        .unwrap_or_else(|| panic!("the child wrote no session_end: {:?}", kinds(&events)));
+    let status = ended["exit_status"].as_str().unwrap();
+    let shown = trace_show(delegation);
+    assert!(
+        shown
+            .lines()
+            .any(|line| line == format!("status:     {status}")),
+        "{shown}"
+    );
+    assert_eq!(
+        shown
+            .lines()
+            .any(|line| line.starts_with("spawner_ended  ")),
+        by_spawner,
+        "{shown}"
+    );
+}
+
 /// How long until no process names `delegation`'s directory, failing past `limit`.
 fn gone_within(delegation: &Delegation, since: Instant, limit: Duration) -> Duration {
     loop {
@@ -503,6 +546,7 @@ fn a_parent_killed_outright_takes_its_child_with_it() {
         took.as_millis()
     );
     assert_wound_down_by_spawner(&delegation, &parent.session_id());
+    assert_trace_show_names_the_ending(&delegation, true);
     let start = &delegation.trace()[0];
     assert_eq!(start["event_type"], "session_start");
     assert!(start.get("formation_id").is_none(), "{start}");
@@ -601,6 +645,27 @@ fn assert_ended_by_its_parents_task(child: &Delegation, parent: &Delegation) {
         !child_kinds.iter().any(|kind| kind == "spawner_ended"),
         "{child_kinds:?}"
     );
+    assert_ended_on_sigterm(child);
+}
+
+/// A child its parent ended on purpose wound down from `SIGTERM` within the grace: its trace
+/// closes with a `canceled` `session_end`, and `mur trace show` says so.
+fn assert_ended_on_sigterm(child: &Delegation) {
+    let events = child.trace();
+    assert_eq!(
+        kinds(&events).last(),
+        Some(&"session_end"),
+        "{:?}",
+        kinds(&events)
+    );
+    assert_eq!(
+        events.last().unwrap()["exit_status"],
+        "canceled",
+        "{}",
+        events.last().unwrap()
+    );
+    let shown = trace_show(child);
+    assert!(shown.contains("\nstatus:     canceled\n"), "{shown}");
 }
 
 // ── A parent that exits on its own ────────────────────────────────────────────
@@ -886,6 +951,7 @@ fn a_parent_stopped_while_it_waits_ends_its_child_first() {
     .unwrap();
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
+    assert_ended_on_sigterm(&delegation);
 }
 
 // ── A parent running a plan ───────────────────────────────────────────────────
@@ -995,6 +1061,7 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
     .unwrap();
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
+    assert_ended_on_sigterm(&delegation);
 }
 
 /// `SIGKILL` of a capsule whose plan is waiting on a `capsule` step's sub-capsule. Nothing in the
@@ -1031,6 +1098,7 @@ fn a_parent_killed_mid_plan_takes_the_plan_steps_child_with_it() {
         took.as_millis()
     );
     assert_wound_down_by_spawner(&delegation, &parent.session_id());
+    assert_trace_show_names_the_ending(&delegation, true);
     assert!(
         !delegation.child_dir().join("completion.json").exists(),
         "a launcher killed outright recorded nothing, and the child reports to nobody"

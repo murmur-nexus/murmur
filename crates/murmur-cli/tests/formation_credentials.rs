@@ -131,7 +131,6 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     assert!(got.json()["result"]["id"].is_string(), "{got:?}");
     // Every other method is the ordinary scope refusal, naming the member credential.
     for (method, path, scope) in [
-        ("tasks/cancel", "/", "tasks/cancel"),
         ("session/stop", "/", "session/stop"),
         ("", "/resources/files/x", "resources/files"),
     ] {
@@ -239,7 +238,37 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     );
     assert_eq!(operator.status, 200, "{operator:?}");
 
-    // (f) A member that does not consent refuses a peer task on a valid formation token.
+    // (f) `tasks/cancel` reaches the tasks the member submitted itself, and no other: the
+    // operator's task is `-32001`, as an id the door never held would be.
+    let operator_task = operator.json()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let not_its_own = rpc(
+        &coder.addr,
+        Some(&token),
+        "tasks/cancel",
+        json!({"id": operator_task}),
+    );
+    assert_eq!(not_its_own.status, 200, "{not_its_own:?}");
+    assert_eq!(
+        not_its_own.json()["error"]["code"],
+        -32001,
+        "{not_its_own:?}"
+    );
+    let canceled = rpc(
+        &coder.addr,
+        Some(&token),
+        "tasks/cancel",
+        json!({"id": task_id}),
+    );
+    assert_eq!(canceled.status, 200, "{canceled:?}");
+    assert!(
+        canceled.json()["error"].is_null() && canceled.json()["result"]["id"] == task_id.as_str(),
+        "{canceled:?}"
+    );
+
+    // (g) A member that does not consent refuses a peer task on a valid formation token.
     let auditor = door(
         &home,
         &server.endpoint,

@@ -1619,6 +1619,14 @@ fn handle_completion(
             &format!("no task in this session is waiting for delegation {delegation_id}"),
         )
         .into_http_response(),
+        Arrival::BeingEnded => JsonRpcResponse::err(
+            req.id,
+            -32004,
+            &format!(
+                "delegation {delegation_id} is being ended by this session; its launcher records                  the outcome"
+            ),
+        )
+        .into_http_response(),
     }
 }
 
@@ -1652,9 +1660,14 @@ fn handle_jsonrpc(
         DoorMethod::TasksGet => {
             handle_tasks_get(id, &req.params, task_registry, caller_member.as_deref())
         }
-        DoorMethod::TasksCancel => {
-            handle_tasks_cancel(id, &req.params, task_registry, detached, live_delegations)
-        }
+        DoorMethod::TasksCancel => handle_tasks_cancel(
+            id,
+            &req.params,
+            task_registry,
+            caller_member.as_deref(),
+            detached,
+            live_delegations,
+        ),
         DoorMethod::SessionStop => {
             handle_session_stop(id, task_registry, detached, live_delegations, session_id)
         }
@@ -1824,10 +1837,15 @@ fn handle_tasks_get(
 /// Every outcome but one is a JSON-RPC `result`. A task that had already ended is returned
 /// unchanged, because "do no more work on this" is already true of it. Only an id this capsule
 /// never held is an error, and it is the same `-32001` `tasks/get` answers with.
+///
+/// A formation member — `caller_member` — cancels only the tasks it submitted itself, on the
+/// visibility rule [`handle_tasks_get`] reads by: any other id gets that same `-32001`, and
+/// nothing is cancelled.
 fn handle_tasks_cancel(
     id: Value,
     params: &Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
+    caller_member: Option<&str>,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
 ) -> String {
@@ -1838,6 +1856,9 @@ fn handle_tasks_cancel(
 
     let (outcome, task) = {
         let mut reg = task_registry.lock().unwrap();
+        if caller_member.is_some_and(|member| reg.submitter(&task_id) != Some(member)) {
+            return JsonRpcResponse::err(id, -32001, "Task not found").into_http_response();
+        }
         let outcome = reg.request_cancel(&task_id);
         (outcome, reg.get_task(&task_id))
     };
@@ -3088,6 +3109,49 @@ mod tests {
         let reg = task_registry.lock().unwrap();
         assert_eq!(reg.pending_count, 0);
         assert!(reg.history.is_empty(), "the refused id is not held");
+    }
+
+    /// A formation member cancels a task it submitted itself, and gets `-32001` — with nothing
+    /// cancelled — for a task another member or the operator submitted.
+    #[test]
+    fn a_formation_member_cancels_only_the_tasks_it_submitted() {
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        {
+            let mut reg = task_registry.lock().unwrap();
+            reg.enqueue("tsk_mine", "ctx_mine");
+            reg.record_submitter("tsk_mine", "planner");
+            reg.enqueue("tsk_theirs", "ctx_theirs");
+            reg.record_submitter("tsk_theirs", "reviewer");
+            reg.enqueue("tsk_operator", "ctx_operator");
+        }
+        let live = LiveDelegations::new();
+        let cancel = |task_id: &str| {
+            response_json(&handle_tasks_cancel(
+                serde_json::json!(1),
+                &serde_json::json!({"id": task_id}),
+                &task_registry,
+                Some("planner"),
+                None,
+                &live,
+            ))
+        };
+
+        let canceled = cancel("tsk_mine");
+        assert_eq!(
+            canceled["result"]["status"]["state"], "canceled",
+            "{canceled}"
+        );
+        for other in ["tsk_theirs", "tsk_operator"] {
+            let refused = cancel(other);
+            assert_eq!(refused["error"]["code"], -32001, "{refused}");
+            assert_eq!(refused["error"]["message"], "Task not found", "{refused}");
+            let state = task_registry.lock().unwrap().get_task(other).unwrap();
+            assert_ne!(
+                serde_json::to_value(&state).unwrap()["status"]["state"],
+                "canceled",
+                "{other} was cancelled by a member that did not submit it"
+            );
+        }
     }
 
     /// A task refused when the session closed reads `rejected` over `tasks/get`.

@@ -70,9 +70,10 @@ let the entry member call it; the answer comes back into the entry member's own 
 [The entry member](../reference/roster.md#entry-member).
 
 The launcher issues every credential, and the runtime attaches a member's credential to its calls,
-so no model ever sees it. A formation credential reaches exactly two methods on the door it was
-issued for: `message/send`, which starts a task, and `tasks/get`, which reads the state of a task
-the calling member started. It reaches nothing that cancels or stops a task. See
+so no model ever sees it. A formation credential reaches exactly three methods on the door it was
+issued for: `message/send`, which starts a task, `tasks/get`, which reads the state of a task the
+calling member started, and `tasks/cancel`, which cancels one. It reaches no other member's task,
+and nothing that stops the session. See
 [What a door answers](../reference/roster.md#enforcement-door).
 
 ## How a formation ends { #lifeline }

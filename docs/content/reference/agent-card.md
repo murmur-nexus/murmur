@@ -170,8 +170,8 @@ scope: every valid token may read the extended card.
 Every authenticated caller shares the session's one task and context space. A scope limits which
 methods a token reaches, not which tasks: a credential holding `message/stream`, `tasks/get` or
 `stream/watch` sees every task on the session. The one exception is a
-[formation token](roster.md#formation-token): it reaches [`tasks/get`](#tasks-get) only for the
-tasks its member submitted, and does not reach `message/stream`.
+[formation token](roster.md#formation-token): it reaches [`tasks/get`](#tasks-get) and
+`tasks/cancel` only for the tasks its member submitted, and does not reach `message/stream`.
 
 ### What the door answers { #door-authentication }
 

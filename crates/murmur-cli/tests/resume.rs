@@ -762,17 +762,36 @@ fn a_torn_final_trace_line_still_resumes() {
         "run 1's conversation must be in front of the model: {second}"
     );
 
-    // The resolver's early stop does not soften `parse_trace_records`: a command whose subject
-    // *is* the whole file refuses the same trace, naming the line it tore on.
+    // `mur trace show` reads the same trace, skipping the torn final line and naming it in the
+    // status rather than refusing the whole file.
     let show = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", f.home.path())
         .args(["trace", "show", trace.to_str().unwrap()])
         .assert()
+        .success();
+    let stdout = String::from_utf8(show.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(&format!(
+            "line {torn_line}, the last, is not valid JSON and was skipped"
+        )),
+        "the status must name the torn line: {stdout}"
+    );
+
+    // A command that compares totals still refuses it, naming the line it tore on.
+    let diff = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", f.home.path())
+        .args([
+            "trace",
+            "diff",
+            trace.to_str().unwrap(),
+            trace.to_str().unwrap(),
+        ])
+        .assert()
         .failure();
-    let stderr = String::from_utf8(show.get_output().stderr.clone()).unwrap();
+    let stderr = String::from_utf8(diff.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("E-TRC-001"), "{stderr}");
-    assert!(stderr.contains(trace.to_str().unwrap()), "{stderr}");
     assert!(
         stderr.contains(&format!(":{torn_line}:")),
         "the refusal must name the torn line: {stderr}"

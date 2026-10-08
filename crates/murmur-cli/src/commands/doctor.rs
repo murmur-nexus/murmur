@@ -525,6 +525,76 @@ fn report_install(policy: &capsule_runtime::CapabilityPolicy) {
     capsule_runtime::report_println!();
 }
 
+/// Prints the aggregate memory ceiling `capabilities.resources.cgroup_memory_bytes` gives the
+/// capsule's native subprocess tree, as the cgroup files a launch writes: `memory.max` and
+/// `memory.swap.max`.
+///
+/// The swap value is [`capsule_runtime::SCOPE_SWAP_MAX`], the constant the scope is written from,
+/// and whether this kernel has a `memory.swap.max` to write is asked of the cgroups this process
+/// can see rather than assumed. A report, never a verdict: an unbounded swap on this host reaches
+/// no `fixes` entry, because a launch proceeds there too.
+fn report_memory_bound(policy: &capsule_runtime::CapabilityPolicy) {
+    capsule_runtime::report_println!("Memory bound");
+    capsule_runtime::report_print!(
+        "{}",
+        render_memory_bound(
+            policy.resources.cgroup_memory_bytes,
+            cfg!(target_os = "linux"),
+            &capsule_runtime::probe_swap_control(),
+            capsule_runtime::active_swap_areas(),
+        )
+    );
+    capsule_runtime::report_println!();
+}
+
+/// The `Memory bound` block's lines, split from [`report_memory_bound`] so every host answer can be
+/// rendered on any host.
+fn render_memory_bound(
+    cgroup_memory_bytes: u64,
+    linux: bool,
+    swap: &capsule_runtime::SwapControl,
+    active_swap_areas: Option<usize>,
+) -> String {
+    use capsule_runtime::SwapControl;
+    let mut out = format!("  cgroup_memory_bytes: {cgroup_memory_bytes}\n");
+    if !linux {
+        out.push_str(
+            "  not applied on this host: cgroup bounds are Linux-only, so the native subprocess \
+             tree is bounded by rlimits alone\n",
+        );
+        return out;
+    }
+    out.push_str(&format!("  memory.max {cgroup_memory_bytes}\n"));
+    let swap_state = match active_swap_areas {
+        Some(0) => "no swap is active (/proc/swaps lists no swap area)".to_string(),
+        Some(1) => "swap is active (/proc/swaps lists 1 swap area)".to_string(),
+        Some(areas) => format!("swap is active (/proc/swaps lists {areas} swap areas)"),
+        None => "whether swap is active is unknown (/proc/swaps is unreadable)".to_string(),
+    };
+    match swap {
+        SwapControl::Exposed => {
+            out.push_str(&format!(
+                "  memory.swap.max {}\n",
+                capsule_runtime::SCOPE_SWAP_MAX
+            ));
+        }
+        SwapControl::Absent => {
+            out.push_str(&format!(
+                "  memory.swap.max: swap is not bounded on this host — this kernel exposes no \
+                 memory.swap.max, so memory.max bounds resident memory only; {swap_state}\n"
+            ));
+        }
+        SwapControl::Unknown => {
+            out.push_str(&format!(
+                "  memory.swap.max {} where this kernel exposes it — no cgroup this process can \
+                 see has the memory controller, so whether it does is unknown; {swap_state}\n",
+                capsule_runtime::SCOPE_SWAP_MAX
+            ));
+        }
+    }
+    out
+}
+
 /// The daemon binary a delegating capsule needs, under the name the installer puts on `PATH` and
 /// the name `docs/content/reference/roost-api.md` starts.
 const ROOST_BINARY: &str = "mur-roost";
@@ -1525,6 +1595,10 @@ pub(crate) fn run_doctor(bind_addr: &str) -> Result<(), CliError> {
     // `--explain-scope` prints from.
     report_install(&capability_policy);
 
+    // The memory ceiling `capabilities.resources` gives the native subprocess tree, as the cgroup
+    // files a launch writes it to.
+    report_memory_bound(&capability_policy);
+
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
     // doctor checks against it too; when it is absent doctor reports presence only,
     // exactly as before. A lockfile that exists but cannot be read is a hard failure
@@ -1830,6 +1904,33 @@ mod tests {
             artifact_version: artifact_version.map(str::to_string),
             served_version: served_version.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn the_memory_bound_names_both_cgroup_files_where_swap_can_be_bounded() {
+        use capsule_runtime::SwapControl;
+        assert_eq!(
+            render_memory_bound(268_435_456, true, &SwapControl::Exposed, Some(1)),
+            "  cgroup_memory_bytes: 268435456\n  memory.max 268435456\n  memory.swap.max 0\n"
+        );
+        let absent = render_memory_bound(268_435_456, true, &SwapControl::Absent, Some(1));
+        assert!(absent.contains("  memory.max 268435456\n"), "{absent}");
+        assert!(
+            absent.contains("swap is not bounded on this host"),
+            "{absent}"
+        );
+        assert!(
+            absent.contains("swap is active (/proc/swaps lists 1 swap area)"),
+            "{absent}"
+        );
+        let no_swap = render_memory_bound(268_435_456, true, &SwapControl::Absent, Some(0));
+        assert!(no_swap.contains("no swap is active"), "{no_swap}");
+        let elsewhere = render_memory_bound(268_435_456, false, &SwapControl::Unknown, None);
+        assert!(
+            elsewhere.contains("cgroup bounds are Linux-only"),
+            "{elsewhere}"
+        );
+        assert!(!elsewhere.contains("memory.max"), "{elsewhere}");
     }
 
     #[test]

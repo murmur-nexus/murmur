@@ -55,8 +55,11 @@ checkpoints.
 ## Turn limit (`inference.max_turns`)
 
 The turn limit caps how many inference calls a single task may make. It defaults to **10**
-and is set per-capsule in the manifest. When the limit is reached, the loop exits with
-`exit_status: "max_turns_reached"`. The task did not complete: `tasks/get` reads `failed`, and
+and is set per-capsule in the manifest. A hook's `run-inference` call — a compaction hook's
+summary, say — is an inference call the task made, so it counts as well: the task's turn count,
+`task_end.turns`, includes it. When the limit is reached, the loop exits with
+`exit_status: "max_turns_reached"`, and the task's failure message names the limit, the turns the
+task used by the numbers `mur trace show` prints, and how many of the calls were a hook's. The task did not complete: `tasks/get` reads `failed`, and
 [`mur run`](../reference/cli.md#mur-run-status) exits `1`.
 
 ## Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }
@@ -110,8 +113,8 @@ harness session), and the seed is applied. Nothing to continue means:
 This repeats up to the reopen limit set by `lifecycle.max_task_reopens` (default **1**; `0`
 disables reopening entirely — unlike `inference.max_turns`, an explicit `0` is accepted).
 Reopening never grants extra turns: every attempt of a task shares one cumulative turn count
-against the capsule's `inference.max_turns` limit, so each attempt is handed only the turns
-earlier attempts left unspent. A task cannot out-run its turn budget just because a hook keeps
+against the capsule's `inference.max_turns` limit — hooks' `run-inference` calls included — so
+each attempt is handed only the turns earlier attempts left unspent. A task cannot out-run its turn budget just because a hook keeps
 asking for another try.
 
 If the reopen limit or the turn limit is used up while a hook still wants to reopen, the task

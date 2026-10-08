@@ -174,6 +174,9 @@ pub(super) struct ProcessEventSink<'a> {
     workdir: PathBuf,
     /// This attempt's remaining turn budget, already net of the turns earlier attempts spent.
     max_turns: u32,
+    /// The task-wide ceiling, `inference.max_turns` as declared, which a run that opens one turn
+    /// too many names.
+    task_max_turns: u32,
     /// How many turns have opened in this run.
     turns: u32,
     /// The task-wide number this run's first turn takes: the agent-loop turns earlier attempts of
@@ -213,10 +216,27 @@ pub(super) struct ProcessEventSink<'a> {
     gateways: GatewayTable,
 }
 
+/// The `harness_failed` `max-turns` message: the turn the harness opened, by the task-wide number
+/// `mur trace show` prints, and the ceiling it is past — with the turns earlier attempts of the
+/// task already used, when there were any.
+fn turn_budget_exceeded_message(turn: u32, ceiling: u32, used_before: u32) -> String {
+    let earlier = match used_before {
+        0 => String::new(),
+        1 => "; earlier attempts of this task used 1 of them".to_string(),
+        n => format!("; earlier attempts of this task used {n} of them"),
+    };
+    format!(
+        "the harness opened turn {turn}, past the {ceiling} turns inference.max_turns allows \
+         this task{earlier}"
+    )
+}
+
 impl<'a> ProcessEventSink<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         workdir: &Path,
         max_turns: u32,
+        task_max_turns: u32,
         first_turn: u32,
         session: RunSession,
         spend: Arc<SpendMeter>,
@@ -226,6 +246,7 @@ impl<'a> ProcessEventSink<'a> {
         Self {
             workdir: workdir.to_path_buf(),
             max_turns,
+            task_max_turns,
             turns: 0,
             first_turn,
             open: None,
@@ -614,10 +635,10 @@ impl<'a> ProcessEventSink<'a> {
         }
         self.turns += 1;
         if self.turns > self.max_turns {
-            let message = format!(
-                "the harness opened turn {} with {} left in this attempt's inference.max_turns \
-                 budget",
-                self.turns, self.max_turns
+            let message = turn_budget_exceeded_message(
+                self.first_turn + self.turns - 1,
+                self.task_max_turns,
+                self.task_max_turns.saturating_sub(self.max_turns),
             );
             let _ = trace
                 .write_harness_failed("max-turns", &message, "runtime")
@@ -933,6 +954,9 @@ mod tests {
         _dir: tempfile::TempDir,
         workdir: PathBuf,
         max_turns: u32,
+        /// The task-wide ceiling the sink names; [`Self::max_turns`] unless a test continues a
+        /// task.
+        task_max_turns: u32,
         /// The task-wide number the sink's first turn takes; 0 unless a test continues a task.
         first_turn: u32,
         /// The session policy and plan this harness runs under. Held rather than the `RunSession`
@@ -972,6 +996,12 @@ mod tests {
         /// `first_turn` turns.
         fn continuing_from(mut self, first_turn: u32) -> Self {
             self.first_turn = first_turn;
+            self
+        }
+
+        /// The same harness, under a task-wide `inference.max_turns` of `ceiling`.
+        fn under_ceiling(mut self, ceiling: u32) -> Self {
+            self.task_max_turns = ceiling;
             self
         }
 
@@ -1055,6 +1085,7 @@ mod tests {
                 _dir: dir,
                 workdir: workdir.clone(),
                 max_turns,
+                task_max_turns: max_turns,
                 first_turn: 0,
                 policy,
                 plan,
@@ -1083,6 +1114,7 @@ mod tests {
             let mut sink = ProcessEventSink::new(
                 &self.workdir,
                 self.max_turns,
+                self.task_max_turns,
                 self.first_turn,
                 session,
                 Arc::clone(&self.spend),
@@ -1105,6 +1137,7 @@ mod tests {
             let mut sink = ProcessEventSink::new(
                 &self.workdir,
                 self.max_turns,
+                self.task_max_turns,
                 self.first_turn,
                 session,
                 Arc::clone(&self.spend),
@@ -1554,6 +1587,48 @@ mod tests {
         let failed = h.of_type("harness_failed").await;
         assert_eq!(failed[0]["kind"], "max-turns");
         assert_eq!(failed[0]["source"], "runtime");
+    }
+
+    /// A continued attempt that opens a turn past its budget names that turn as `mur trace show`
+    /// numbers it across the task, the task-wide ceiling, and the turns earlier attempts used.
+    #[tokio::test]
+    async fn a_turn_past_the_budget_names_the_task_wide_turn_and_the_ceiling() {
+        let mut h = Harness::new(2).await.continuing_from(3).under_ceiling(5);
+        let outcome = h
+            .feed(vec![
+                tool_call("c1", "t"),
+                tool_result("c1", false),
+                tool_call("c2", "t"),
+                tool_result("c2", false),
+                text("a third turn"),
+            ])
+            .await;
+        let expected = "the harness opened turn 5, past the 5 turns inference.max_turns allows \
+                        this task; earlier attempts of this task used 3 of them";
+        match outcome {
+            SinkOutcome::TurnBudgetExceeded(RuntimeError::HarnessTurnFailed {
+                kind,
+                message,
+                ..
+            }) => {
+                assert_eq!(kind, "max-turns");
+                assert_eq!(message, expected);
+            }
+            _ => panic!("a turn past the budget must end the run"),
+        }
+        let failed = h.of_type("harness_failed").await;
+        assert_eq!(failed[0]["message"], expected, "{}", failed[0]);
+        let turns: Vec<Json> = h
+            .of_type("inference")
+            .await
+            .into_iter()
+            .map(|record| record["turn"].clone())
+            .collect();
+        assert_eq!(
+            turns,
+            [3, 4],
+            "the turn named is the one after the last recorded"
+        );
     }
 
     #[tokio::test]

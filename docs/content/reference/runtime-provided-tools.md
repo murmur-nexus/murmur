@@ -154,7 +154,8 @@ The call then ends in one of these ways:
 | The member answers `rejected` for another reason, or another terminal state | Ends with that status and sentence |
 | Two offers in a row get no answer | Ends `unreachable` |
 | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) passes while the member is still busy | Ends `rejected`, never held: `<member> stayed busy with other work for the whole <N>s this call may wait and never took the task; it was offered the task <k> times. Nothing was done on it.` |
-| The calling task ends | Ends `abandoned`, never held: `the calling task ended before <member> took the task; <member> was busy and was never handed it`. No further offer is sent |
+| The calling task ends between offers | Ends `abandoned`, never held: `the calling task ended before <member> took the task; <member> was busy and was never handed it`. No further offer is sent |
+| The calling task ends while an offer is on its way | The task's end waits up to 6 seconds for the member's answer to that offer. Taken: ends `abandoned` with the member's task id, `the calling task ended just after <member> took the task; a cancel was sent to <member>`, and the runtime sends that task `tasks/cancel`. Turned away busy: its `member_call_busy` is written first, and the call ends as above. No answer within the wait: ends `abandoned`, `the calling task ended while an offer to <member> was in flight; <member> may hold the task`. No further offer is sent |
 
 Only a refusal with exactly the message `task rejected: capsule is busy` is offered again; any
 other refusal ends the call in the same turn.

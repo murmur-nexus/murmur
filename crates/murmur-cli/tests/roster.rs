@@ -309,7 +309,8 @@ fn s1_doctor_prints_the_admitted_roster_and_passes() {
             format!(
                 "  warning[W-ROS-001]: roster.yaml lets 2 members call 'coder' (planner, reviewer), \
                  but it holds 1 task at once \u{2014} lifecycle.task_acceptance: single \u{2014} so a \
-                 call that arrives while it is busy is rejected; lifecycle.task_acceptance: queue \
+                 call that arrives while it is busy waits and is offered again, and is rejected \
+                 only if it stays busy until the call's deadline; lifecycle.task_acceptance: queue \
                  with lifecycle.queue_depth: 1 would hold them all ({W_ROS_001_LINK})"
             ),
         ]
@@ -1034,7 +1035,8 @@ fn three_callers_warning() -> String {
     format!(
         "  warning[W-ROS-001]: roster.yaml lets 3 members call 'target' (lead, a, b), but it holds \
          2 tasks at once \u{2014} one running and lifecycle.queue_depth: 1 waiting \u{2014} so a call \
-         that arrives while it is full is rejected; lifecycle.queue_depth: 2 would hold them all \
+         that arrives while it is full waits and is offered again, and is rejected only if it \
+         stays full until the call's deadline; lifecycle.queue_depth: 2 would hold them all \
          ({W_ROS_001_LINK})"
     )
 }

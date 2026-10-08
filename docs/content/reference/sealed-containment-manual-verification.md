@@ -727,6 +727,62 @@ claims and the result must not be recorded as a pass.
 
 ## Recording the result
 
+### Run of 2026-10-08 — `resource-memory-hog` with swap bounded
+
+The capsule's cgroup scope now writes `memory.swap.max` = `0` beside `memory.max`. This run checks
+that the 2026-10-06 swap finding below is closed, on a host with swap on.
+
+**Host.** Same machine as the 2026-10-06 run: `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP
+PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04, bare metal, non-root `uid=1000`,
+`kernel.apparmor_restrict_unprivileged_userns=0`, CPython 3.12.3. Swap on: `/swapfile`, 32 GB,
+active (`swapon --show`).
+
+**Invocation.** From the repository root:
+
+```bash
+cargo build --release -p murmur-cli -p escape-conformance
+./target/release/escape-conformance --class scoped --mur ./target/release/mur --record-dir <dir>/scoped
+./target/release/escape-conformance --class sealed --mur ./target/release/mur --record-dir <dir>/sealed
+```
+
+| class | `achieved:` | exit | record |
+|---|---|---|---|
+| `scoped` | `sealed` | `0` | `escape-conformance-scoped-20261008T064014Z.md` |
+| `sealed` | `sealed` | `0` | `escape-conformance-sealed-20261008T064104Z.md` |
+
+The `scoped` record's `## Summary`, verbatim:
+
+| category | asserted | passed | failed | recorded but not asserted |
+|---|---|---|---|---|
+| **boundary** (a failure here is an escape) | 23 | 23 | 0 | 0 |
+| **resource_exhaustion** (a failure here is denial of service, never an escape) | 5 | 5 | 0 | 0 |
+
+The `sealed` record's `## Summary`, verbatim:
+
+| category | asserted | passed | failed | recorded but not asserted |
+|---|---|---|---|---|
+| **boundary** (a failure here is an escape) | 21 | 21 | 0 | 2 |
+| **resource_exhaustion** (a failure here is denial of service, never an escape) | 5 | 5 | 0 | 0 |
+
+`resource-memory-hog` at both classes:
+
+| case | expected | actual | result |
+|---|---|---|---|
+| `resource-memory-hog` | CONTAINED | CONTAINED | PASS |
+
+with evidence `the shell tool exited 137 — the ceiling killed the process … resource_limit:
+cgroup_memory_bytes`. A scope the runtime created on the same host reads `memory.swap.max` `0`
+(`cargo test -p capsule-runtime cgroup::tests -- --nocapture`, test
+`a_required_scope_is_created_whatever_cgroup_this_process_inherited`), and `mur doctor` for a
+manifest declaring `cgroup_memory_bytes: 268435456` prints:
+
+```text
+Memory bound
+  cgroup_memory_bytes: 268435456
+  memory.max 268435456
+  memory.swap.max 0
+```
+
 ### Run of 2026-10-06 — the escape-conformance gate through its own process driver (card `6bd3a744`)
 
 Since the process-driver contract, every escape-conformance run had been refused at preflight with

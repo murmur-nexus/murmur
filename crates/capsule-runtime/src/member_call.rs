@@ -12,8 +12,9 @@
 //! with backoff, until it takes it, and polls the callee's `tasks/get` until the task ends. Offering
 //! and answering share one bound, the shared bound for handed-off work; the call also ends when
 //! the door stops answering or the caller's task gives up on it. Its outcome lands in the session's
-//! [`MemberCalls`], and the task loop continues the caller's task with it. No call is ever
-//! cancelled at the callee: a formation token carries no `tasks/cancel`.
+//! [`MemberCalls`], and the task loop continues the caller's task with it. A call is cancelled at
+//! the callee in one case only: the callee took the task from an offer that was in flight when
+//! the calling task ended, and nothing would ever read its answer.
 //!
 //! **Nothing real reaches the model.** Every text here that a model or a trace can read names the
 //! callee by its roster name. The callee's real door URL, its port and the token never appear: a
@@ -21,7 +22,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -41,8 +42,14 @@ const MEMBER_CALL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const UNREACHABLE_AFTER_FAILED_POLLS: u32 = 2;
 
 /// The deadline each of a watcher's requests gets: short, so a hung door costs a watcher one poll
-/// rather than the whole bound.
+/// rather than the whole bound. Re-offers to a busy callee and the cancel of a task taken after
+/// the call was abandoned use it too: every door a watcher reaches is a formation peer on
+/// loopback, which answers in milliseconds or not at all.
 const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`MemberCalls::account_for_all`] waits for a re-offer in flight to settle: the
+/// request's own bound, and a margin for the watcher to record what it learned.
+const OFFER_SETTLE_BOUND: Duration = Duration::from_secs(6);
 
 /// How long after a busy refusal a watcher offers the task again the first time. Each later wait
 /// doubles, up to [`BUSY_OFFER_MAX_DELAY`].
@@ -267,7 +274,13 @@ pub(crate) fn send_task(
     call_id: &str,
     task: &str,
 ) -> Result<String, StartFailure> {
-    offer_task(route, call_id, call_id, task)
+    offer_task(
+        route,
+        call_id,
+        call_id,
+        task,
+        crate::http_client::DEFAULT_TIMEOUT,
+    )
 }
 
 /// [`send_task`] as one offer of the call `call_id`: the JSON-RPC request carries `request_id`,
@@ -277,6 +290,7 @@ fn offer_task(
     call_id: &str,
     request_id: &str,
     task: &str,
+    timeout: Duration,
 ) -> Result<String, StartFailure> {
     let body = json!({
         "jsonrpc": "2.0",
@@ -291,19 +305,18 @@ fn offer_task(
         }
     });
     let member = &route.member;
-    let answer =
-        door_request(route, &body, crate::http_client::DEFAULT_TIMEOUT).map_err(|error| {
-            let kind = match error {
-                DoorRequestError::Transport(_) => StartFailureKind::Transport,
-                DoorRequestError::Refused(_) | DoorRequestError::Answered(_) => {
-                    StartFailureKind::Refused
-                }
-            };
-            StartFailure {
-                kind,
-                ..StartFailure::failed(error.into_text())
+    let answer = door_request(route, &body, timeout).map_err(|error| {
+        let kind = match error {
+            DoorRequestError::Transport(_) => StartFailureKind::Transport,
+            DoorRequestError::Refused(_) | DoorRequestError::Answered(_) => {
+                StartFailureKind::Refused
             }
-        })?;
+        };
+        StartFailure {
+            kind,
+            ..StartFailure::failed(error.into_text())
+        }
+    })?;
     if let Some(error) = answer.get("error") {
         return Err(StartFailure::failed(format!(
             "{member}'s door refused the task with JSON-RPC error {}: {}",
@@ -523,6 +536,12 @@ struct Outstanding {
     started: Instant,
     /// Raised to stop the call's watcher at its next poll.
     abandon: Arc<AtomicBool>,
+    /// A re-offer of the task is on its way to the callee and its answer has not been recorded.
+    /// Set under the calls lock only while `abandon` is clear, so an abandoned call sends nothing.
+    offer_in_flight: bool,
+    /// The callee took the task from an offer that was in flight when the call was abandoned;
+    /// its watcher sends that task a `tasks/cancel`.
+    taken_after_abandon: bool,
 }
 
 #[derive(Default)]
@@ -588,6 +607,8 @@ impl Calls {
 /// every call before the task's `on-task-end`, which leaves it empty whenever no task runs.
 pub(crate) struct MemberCalls {
     calls: Mutex<Calls>,
+    /// Signalled under `calls` each time a watcher clears [`Outstanding::offer_in_flight`].
+    offer_settled: Condvar,
     /// Woken by a watcher each time an outcome arrives.
     arrival: tokio::sync::Notify,
     /// The bound each call is watched for.
@@ -671,6 +692,7 @@ impl MemberCalls {
     pub(crate) fn new(deadline: Duration) -> Self {
         Self {
             calls: Mutex::new(Calls::default()),
+            offer_settled: Condvar::new(),
             arrival: tokio::sync::Notify::new(),
             deadline,
         }
@@ -882,6 +904,8 @@ impl MemberCalls {
                 member_task_id: member_task_id.clone(),
                 started,
                 abandon: Arc::clone(&abandon),
+                offer_in_flight: false,
+                taken_after_abandon: false,
             });
         }
         let trace = trace.zip(tokio::runtime::Handle::try_current().ok());
@@ -1004,21 +1028,49 @@ impl MemberCalls {
     /// [`Self::unanswered`]: an abandoned call as `abandoned`, an undelivered outcome by its own
     /// status, except that an undelivered answer is `abandoned` too, since it never reached the
     /// model.
+    ///
+    /// A re-offer already on its way to a busy callee is waited for, up to
+    /// [`OFFER_SETTLE_BOUND`], so the abandoned call says whether the callee took the task. Its
+    /// watcher writes any `member_call_busy` line before it settles the offer, so none lands after
+    /// the call's `member_call`. Waits on the calls lock alone, never holding the trace mutex the
+    /// watcher takes first.
     pub(crate) fn account_for_all(&self) -> LeftBehind {
         let mut calls = self.lock();
+        for call in &calls.outstanding {
+            call.abandon.store(true, Ordering::SeqCst);
+        }
+        let settle_by = Instant::now() + OFFER_SETTLE_BOUND;
+        while calls.outstanding.iter().any(|call| call.offer_in_flight) {
+            let now = Instant::now();
+            if now >= settle_by {
+                break;
+            }
+            calls = self
+                .offer_settled
+                .wait_timeout(calls, settle_by - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
         let abandoned: Vec<MemberCallOutcome> = calls
             .outstanding
             .drain(..)
             .map(|call| {
-                call.abandon.store(true, Ordering::SeqCst);
                 let member = &call.member;
                 MemberCallOutcome {
-                    output: match &call.member_task_id {
-                        Some(_) => format!(
+                    output: match (&call.member_task_id, call.offer_in_flight) {
+                        (_, true) => format!(
+                            "the calling task ended while an offer to {member} was in flight; \
+                             {member} may hold the task"
+                        ),
+                        (Some(_), false) if call.taken_after_abandon => format!(
+                            "the calling task ended just after {member} took the task; a cancel \
+                             was sent to {member}"
+                        ),
+                        (Some(_), false) => format!(
                             "the calling task ended before {member}'s answer arrived; {member} \
                              was not cancelled and may still be working"
                         ),
-                        None => format!(
+                        (None, false) => format!(
                             "the calling task ended before {member} took the task; {member} was \
                              busy and was never handed it"
                         ),
@@ -1099,6 +1151,50 @@ struct Watcher {
     trace: Option<(CallTrace, tokio::runtime::Handle)>,
 }
 
+/// A point in a watcher's offer loop a test can run code at, to force one interleaving with the
+/// calling task.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static BEFORE_OFFER: Mutex<Vec<(String, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` once, on the watcher's thread, the next time the watcher of `call_id` has woken
+    /// to offer the task again and has not yet marked the offer in flight.
+    pub(crate) fn run_before_offer(call_id: &str, hook: impl FnOnce() + Send + 'static) {
+        BEFORE_OFFER
+            .lock()
+            .unwrap()
+            .push((call_id.to_string(), Box::new(hook)));
+    }
+
+    pub(super) fn before_offer(call_id: &str) {
+        let hook = {
+            let mut hooks = BEFORE_OFFER.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(id, _)| id == call_id)
+                .map(|at| hooks.remove(at).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// What recording a task the member took from a re-offer found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taken {
+    /// The call is outstanding and its watcher polls the task.
+    Held,
+    /// The calling task abandoned the call while the offer was in flight.
+    AfterAbandon,
+    /// The call is no longer outstanding.
+    Gone,
+}
+
 /// How offering a busy member the task again ended.
 enum Offered {
     /// The member holds the task under this id.
@@ -1177,21 +1273,37 @@ impl Watcher {
                     ),
                 ));
             }
+            #[cfg(test)]
+            test_seam::before_offer(&self.call_id);
+            if !self.begin_offer() {
+                return Offered::Abandoned;
+            }
             let request_id = format!("{}-{}", self.call_id, offers + 1);
-            match offer_task(&self.route, &self.call_id, &request_id, task) {
+            match offer_task(
+                &self.route,
+                &self.call_id,
+                &request_id,
+                task,
+                POLL_REQUEST_TIMEOUT,
+            ) {
                 Ok(member_task_id) => {
-                    return if self.held(&member_task_id) {
-                        Offered::Held(member_task_id)
-                    } else {
-                        Offered::Abandoned
+                    return match self.held(&member_task_id) {
+                        Taken::Held => Offered::Held(member_task_id),
+                        Taken::AfterAbandon => {
+                            self.cancel_member_task(&member_task_id);
+                            Offered::Abandoned
+                        }
+                        Taken::Gone => Offered::Abandoned,
                     };
                 }
                 Err(failure) if failure.kind == StartFailureKind::Busy => {
                     failed_offers = 0;
                     offers += 1;
                     self.write_busy(offers);
+                    self.settle_offer();
                 }
                 Err(failure) if failure.kind == StartFailureKind::Transport => {
+                    self.settle_offer();
                     failed_offers += 1;
                     if failed_offers >= UNREACHABLE_AFTER_FAILED_POLLS {
                         return Offered::Ended(self.ended(
@@ -1202,7 +1314,8 @@ impl Watcher {
                     }
                 }
                 Err(failure) => {
-                    return Offered::Ended(self.ended(None, failure.status, failure.reason))
+                    self.settle_offer();
+                    return Offered::Ended(self.ended(None, failure.status, failure.reason));
                 }
             }
             delay = (delay * 2).min(BUSY_OFFER_MAX_DELAY);
@@ -1216,14 +1329,49 @@ impl Watcher {
         Duration::from_millis(hasher.finish() % (BUSY_OFFER_MAX_JITTER_MS + 1))
     }
 
-    /// Record that the member now holds the task as `member_task_id`, and write its
-    /// `member_call_start`. `false` when the call is no longer outstanding: the calling task gave
-    /// up on it first.
+    /// Mark an offer of this call in flight, under the calls lock. `false`, and nothing marked,
+    /// once the call is abandoned or no longer outstanding: no offer is sent after that.
+    fn begin_offer(&self) -> bool {
+        let mut calls = self.calls.lock();
+        let Some(call) = calls
+            .outstanding
+            .iter_mut()
+            .find(|call| call.call_id == self.call_id)
+        else {
+            return false;
+        };
+        if call.abandon.load(Ordering::SeqCst) {
+            return false;
+        }
+        call.offer_in_flight = true;
+        true
+    }
+
+    /// Clear this call's in-flight offer and wake [`MemberCalls::account_for_all`]. Called only
+    /// once whatever the offer's answer writes to the trace has been written.
+    fn settle_offer(&self) {
+        let mut calls = self.calls.lock();
+        if let Some(call) = calls
+            .outstanding
+            .iter_mut()
+            .find(|call| call.call_id == self.call_id)
+        {
+            call.offer_in_flight = false;
+        }
+        drop(calls);
+        self.calls.offer_settled.notify_all();
+    }
+
+    /// Record that the member now holds the task as `member_task_id`, settle the offer that
+    /// carried it, and write its `member_call_start`. [`Taken::AfterAbandon`] when the calling
+    /// task gave up on the call while that offer was in flight; [`Taken::Gone`] when the call is
+    /// no longer outstanding at all.
     ///
     /// The trace is held from before the call is marked held until its line is written, so the
     /// call's `member_call` — written by the task loop once it accounts for the call — always
     /// follows it.
-    fn held(&self, member_task_id: &str) -> bool {
+    fn held(&self, member_task_id: &str) -> Taken {
+        let taken = std::cell::Cell::new(Taken::Gone);
         let mark = || {
             let mut calls = self.calls.lock();
             let Some(call) = calls
@@ -1234,18 +1382,66 @@ impl Watcher {
                 return false;
             };
             call.member_task_id = Some(member_task_id.to_string());
+            call.offer_in_flight = false;
+            if call.abandon.load(Ordering::SeqCst) {
+                call.taken_after_abandon = true;
+                taken.set(Taken::AfterAbandon);
+            } else {
+                taken.set(Taken::Held);
+            }
+            drop(calls);
+            self.calls.offer_settled.notify_all();
             true
         };
-        let Some((trace, runtime)) = &self.trace else {
-            return mark();
+        match &self.trace {
+            None => {
+                mark();
+            }
+            Some((trace, runtime)) => {
+                runtime.block_on(trace.appender.write_member_call_start_if(
+                    &trace.task_id,
+                    &self.call_id,
+                    &self.route.member,
+                    member_task_id,
+                    mark,
+                ));
+            }
+        }
+        taken.get()
+    }
+
+    /// Cancel `member_task_id` at the member's door: the member took it from an offer that was in
+    /// flight when the calling task ended, and nothing will read its answer. A cancel the door
+    /// does not confirm is logged and otherwise ignored; the call is recorded `abandoned` either
+    /// way.
+    fn cancel_member_task(&self, member_task_id: &str) {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": format!("{}-cancel", self.call_id),
+            "method": "tasks/cancel",
+            "params": { "id": member_task_id },
+        });
+        let member = &self.route.member;
+        let refused = match door_request(&self.route, &body, POLL_REQUEST_TIMEOUT) {
+            Ok(answer) => answer.get("error").map(|error| {
+                format!(
+                    "JSON-RPC error {}: {}",
+                    error.get("code").map(Value::to_string).unwrap_or_default(),
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no message")
+                )
+            }),
+            Err(error) => Some(error.into_text()),
         };
-        runtime.block_on(trace.appender.write_member_call_start_if(
-            &trace.task_id,
-            &self.call_id,
-            &self.route.member,
-            member_task_id,
-            mark,
-        ))
+        if let Some(reason) = refused {
+            crate::runtime_err!(
+                "[capsule-runtime] call {}: {member} took the task after the calling task ended, \
+                 and its cancel was not confirmed: {reason}",
+                self.call_id
+            );
+        }
     }
 
     /// Write the `member_call_busy` for the `offer`th busy refusal.
@@ -1285,9 +1481,9 @@ impl Watcher {
                     held,
                     MemberCallStatus::TimedOut,
                     format!(
-                        "{member} did not answer within {}s. Its task was not cancelled — a \
-                         formation call cannot cancel the task it handed over — and {member} may \
-                         still be working on it",
+                        "{member} did not answer within {}s. Its task was not cancelled — a call \
+                         that runs out its bound leaves the task it handed over running — and \
+                         {member} may still be working on it",
                         self.calls.deadline().as_secs()
                     ),
                 ));
@@ -1796,6 +1992,8 @@ pub(crate) mod tests {
             member_task_id: Some(format!("tsk_{call_id}")),
             started: Instant::now(),
             abandon: Arc::new(AtomicBool::new(false)),
+            offer_in_flight: false,
+            taken_after_abandon: false,
         }
     }
 

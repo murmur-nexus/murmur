@@ -321,37 +321,71 @@ fn a_failed_command_keeps_exit_one_with_both_streams_closed() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// Run `args` with stdout on `/dev/full`, where every write fails with `ENOSPC`, and assert the
+/// command failed with `E-IO-003` on stderr.
+#[cfg(target_os = "linux")]
+fn assert_a_full_disk_fails_with_e_io_003(scratch: &Scratch, args: &[&str]) {
+    let full = fs::File::options().write(true).open("/dev/full").unwrap();
+    let output = run(scratch.mur(args), Stdio::from(full), Stdio::piped());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_survived(output.status, &stderr, 1, &format!("mur {args:?}"));
+    assert!(stderr.contains("E-IO-003"), "mur {args:?}:\n{stderr}");
+    assert!(
+        stderr.contains("failed to write to standard output"),
+        "mur {args:?}:\n{stderr}"
+    );
+}
+
 /// A stdout that refuses writes for a reason other than a gone reader fails a successful command.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_full_disk_on_stdout_fails_the_command_with_e_io_003() {
-    use std::io::Read;
-
     let scratch = Scratch::new();
     let trace = scratch.file("trace-a.jsonl", FIXTURE_A);
-    let full = fs::File::options().write(true).open("/dev/full").unwrap();
-    let mut child = scratch
-        .mur(&["trace", "show", trace.to_str().unwrap()])
-        .stdout(Stdio::from(full))
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    let status = child.wait().unwrap();
-    assert!(!stderr.contains("panicked at"), "{stderr}");
-    assert_eq!(status.signal(), None, "{stderr}");
-    assert_eq!(status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("E-IO-003"), "{stderr}");
+    assert_a_full_disk_fails_with_e_io_003(&scratch, &["trace", "show", trace.to_str().unwrap()]);
+}
+
+/// Help and version text are written before any command runs, and a full disk fails them the same
+/// way.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_full_disk_fails_help_and_version_with_e_io_003() {
+    let scratch = Scratch::new();
+    let cases: [&[&str]; 4] = [
+        &["--help"],
+        &["--version"],
+        &["help", "run"],
+        &["run", "--help"],
+    ];
+    for args in cases {
+        assert_a_full_disk_fails_with_e_io_003(&scratch, args);
+    }
+}
+
+#[test]
+fn head_takes_one_line_of_help() {
+    let scratch = Scratch::new();
+    let mur = mur_path();
+    assert_head_takes_one_line(&scratch, &format!("'{}' --help | head -1", mur.display()));
+}
+
+/// A usage error is not report output: clap writes it to stderr and exits 2, with nothing on
+/// stdout.
+#[test]
+fn a_usage_error_keeps_clap_s_message_and_exit_two() {
+    let scratch = Scratch::new();
+    let output = run(
+        scratch.mur(&["--no-such-flag"]),
+        Stdio::piped(),
+        Stdio::piped(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_survived(output.status, &stderr, 2, "mur --no-such-flag");
     assert!(
-        stderr.contains("failed to write to standard output"),
+        stderr.starts_with("error: unexpected argument '--no-such-flag' found"),
         "{stderr}"
     );
+    assert!(output.stdout.is_empty(), "{output:?}");
 }
 
 /// `mur doctor` on a manifest with an unrecognized key, which makes it write a `W-SEC-019`

@@ -1175,6 +1175,32 @@ fn child_events(child_dir: &Path, child_session_id: &str) -> Vec<Value> {
     )
 }
 
+/// A child its parent's task ended on purpose wound down from `SIGTERM`: its own trace closes with
+/// a `canceled` `session_end`, and `mur trace show` opens it, exits 0 and says so.
+fn assert_child_trace_shows_canceled(child_dir: &Path, child_session_id: &str) {
+    let events = child_events(child_dir, child_session_id);
+    let last = events.last().expect("the child's trace has lines");
+    assert_eq!(last["event_type"], "session_end", "{last}");
+    assert_eq!(last["exit_status"], "canceled", "{last}");
+    let path = child_dir
+        .join(".murmur")
+        .join(child_session_id)
+        .join("trace.jsonl");
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["trace", "show"])
+        .arg(&path)
+        .env_remove("NEXUS_API_KEY")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "mur trace show refused the child's trace: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("\nstatus:     canceled\n"), "{stdout}");
+}
+
 /// Assert that no outcome became a task of its own: no `completion`-origin `task_start`, and no
 /// `task_start` naming a delegation.
 fn assert_no_completion_task(parent: &Parent) {
@@ -2305,6 +2331,10 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
         completion["detail"], "the parent ended this delegation",
         "{completion}"
     );
+    assert_child_trace_shows_canceled(
+        &child_dir,
+        launch["child_session_id"].as_str().unwrap_or_default(),
+    );
 
     // And the parent is still answering for itself, and taking work.
     assert_eq!(agent_card_status(&parent.url), 200);
@@ -2482,6 +2512,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
             .any(|event| event["event_type"] == "spawner_ended"),
         "the child saw its spawner end"
     );
+    assert_child_trace_shows_canceled(&child_dir, child_session_id);
 
     assert_eq!(agent_card_status(&parent.url), 200);
     parent.server.push(end_turn_response("after the cancel"));

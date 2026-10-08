@@ -54,9 +54,10 @@ pub struct RunnerConfig {
     /// The `escape-conformance-driver` artifact `driver_artifact::build_artifact` packed for this
     /// run, installed into every case's project store before its `mur run`.
     pub driver_artifact: PathBuf,
-    /// Root under which each case gets its own directory. Kept after the run: it holds the
-    /// generated manifest, the probe source, `mur`'s stdout/stderr and the session trace, and the
-    /// record points at it per case.
+    /// Root under which each case gets its own directory, as
+    /// `crate::work_root::prepare_work_root` returned it: empty but for its marker when the run
+    /// starts. Kept after the run: it holds the generated manifest, the probe source, `mur`'s
+    /// stdout/stderr and the session trace, and the record points at it per case.
     pub work_root: PathBuf,
     /// Wall-clock ceiling for one case's `mur run`.
     pub timeout: Duration,
@@ -79,6 +80,27 @@ pub struct CaseOutcome {
     pub detail: String,
     pub passed: bool,
     pub case_dir: PathBuf,
+    /// How far the run got before it was graded. `classify_preflight` reads it.
+    pub reach: RunReach,
+}
+
+/// How far one case's run got, independent of the verdict it was graded on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunReach {
+    /// The case directory could not be staged, so nothing was launched.
+    NotStaged,
+    /// Staged, but the launch command could not be spawned.
+    NotLaunched,
+    /// `mur run` was spawned and then exited or was killed.
+    Ran {
+        /// Killed at `RunnerConfig::timeout`.
+        timed_out: bool,
+        /// The first `REFUSAL_CODES` entry found in `mur`'s output, as the whole code: `E-MAN-003`
+        /// rather than the `E-MAN-` prefix it was matched on.
+        refusal_code: Option<String>,
+        /// The probe driver's summary line, `None` when it left none.
+        tool_result: Option<String>,
+    },
 }
 
 /// Derives the host directories `python3` needs outside the workdir, by asking the interpreter.
@@ -547,10 +569,8 @@ fn excerpt(text: &str, needle: &str) -> String {
 /// caller treats an `Err` as a refusal — exit non-zero, no record — for the same reason the
 /// containment-class gate does: a run in which nothing could execute would report every asserted
 /// case as a failure, and "twenty-three boundary escapes" is a far more damaging false statement
-/// than "this harness declined to measure anything here".
-///
-/// The hint on failure names the one cause seen so far in practice, because it is invisible from
-/// the outside and costs an afternoon to rediscover.
+/// than "this harness declined to measure anything here". The refusal carries the hint for the
+/// check that failed, from `classify_preflight` and `preflight_hint`.
 pub fn preflight(
     config: &RunnerConfig,
     class: murmur_artifact::ContainmentClass,
@@ -559,34 +579,179 @@ pub fn preflight(
     if outcome.verdict == Verdict::Succeeded {
         return Ok(outcome.detail);
     }
-    Err(format!(
+    Err(preflight_refusal(&outcome))
+}
+
+/// The refusal `preflight` returns for an outcome that did not report `SUCCESS`.
+pub fn preflight_refusal(outcome: &CaseOutcome) -> String {
+    let check = classify_preflight(outcome);
+    format!(
         "REFUSED — no probe can run on this host, so nothing can be measured.\n\n\
-         The preflight capsule could not start its interpreter:\n\
+         The preflight capsule failed the {} check:\n\
          \x20 {}\n\n\
          Every case would report INCONCLUSIVE and every asserted case would fail, which would \
          read as a boundary escape when in fact nothing was exercised. No record file was \
          written.\n\n\
-         Known cause worth checking first — `capabilities.shell.allow` is enforced by Landlock \
-         `Execute` rights (`sandbox::linux_enforce::apply_landlock_scope`), so a binary reachable \
-         on this host but absent from the derived grant set gets EACCES on `execve` before it \
-         runs, and the tool result reads exactly `Permission denied (os error 13)`. The two shapes \
-         that produce it: an interpreter whose real path `resolve_exec_allowlist` did not resolve \
-         at launch (check `PATH` as `mur` sees it), and an interpreter whose stdlib or shared \
-         libraries live outside both the workdir and the derived `DT_NEEDED` closure — which is \
-         what `capabilities.shell.interpreter_runtime` and `.staged_runtime` exist to declare. \
-         Note also that nothing the capsule writes into its own workdir can be executed at all \
-         unless the manifest declares `capabilities.filesystem.workdir_exec: true`; a preflight \
-         that stages its interpreter into the workdir needs that key.\n\
-         A manifest refusal (`E-MAN-*`) means the generated manifest no longer meets the manifest \
-         contract `mur run` enforces; `cargo test -p escape-conformance` reproduces it without a \
-         host.\n\
-         (Before the exec supervisor was retired this hint named `prctl(PR_SET_DUMPABLE, 0)` and \
-         a `/proc/<pid>/mem` read instead. That mechanism is gone: nothing reads the child's \
-         memory any more, and the dumpable restore went with it.)\n\n\
+         {}\n\n\
          Artifacts for this preflight run: {}",
+        check.name(),
         outcome.detail,
+        preflight_hint(&check),
         outcome.case_dir.display()
-    ))
+    )
+}
+
+/// The step of the preflight case that failed, in the order a run reaches them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightCheck {
+    /// The case directory could not be written, or the driver artifact not installed into it.
+    Stage,
+    /// `mur run` could not be spawned (`code: None`) or refused the case with a diagnostic that
+    /// is not a harness failure.
+    Launch { code: Option<String> },
+    /// The `probe-driver` harness never reported a tool result: `mur` named a harness failure
+    /// (`HARNESS_CODES`), the case hit its timeout, or the driver left no summary.
+    Harness {
+        code: Option<String>,
+        timed_out: bool,
+    },
+    /// The tool call reached `execve` and the kernel refused the interpreter with `EACCES`.
+    InterpreterExec,
+    /// The tool call ran, and the probe left no `SUCCESS` verdict in `probe::PROBE_FILE`.
+    ProbeFile,
+}
+
+impl PreflightCheck {
+    /// The check's name as the refusal and its hint print it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PreflightCheck::Stage => "stage",
+            PreflightCheck::Launch { .. } => "launch",
+            PreflightCheck::Harness { .. } => "harness",
+            PreflightCheck::InterpreterExec => "interpreter exec",
+            PreflightCheck::ProbeFile => "probe file",
+        }
+    }
+}
+
+/// `mur` diagnostics that mean the harness failed rather than that `mur run` refused the capsule:
+/// `E-RUN-006` the harness binary was not found, `E-RUN-033` the harness reported a failed turn,
+/// `E-RUN-034` a driver call failed, `E-RUN-035` the harness went quiet past the inactivity limit.
+const HARNESS_CODES: [&str; 4] = ["E-RUN-006", "E-RUN-033", "E-RUN-034", "E-RUN-035"];
+
+/// How the kernel's `EACCES` reads in a tool result: `io::Error`'s rendering of errno 13.
+const EXEC_DENIED: &str = "Permission denied (os error 13)";
+
+/// Which preflight check `outcome` failed. Meaningful only for an outcome that did not report
+/// `SUCCESS`; one that did classifies as [`PreflightCheck::ProbeFile`].
+///
+/// An `EACCES` in the tool result wins over every diagnostic code: it is the tool call's own
+/// account of why the interpreter never ran.
+pub fn classify_preflight(outcome: &CaseOutcome) -> PreflightCheck {
+    let (timed_out, refusal_code, tool_result) = match &outcome.reach {
+        RunReach::NotStaged => return PreflightCheck::Stage,
+        RunReach::NotLaunched => return PreflightCheck::Launch { code: None },
+        RunReach::Ran {
+            timed_out,
+            refusal_code,
+            tool_result,
+        } => (*timed_out, refusal_code, tool_result),
+    };
+    if tool_result
+        .as_deref()
+        .is_some_and(|result| result.contains(EXEC_DENIED))
+    {
+        return PreflightCheck::InterpreterExec;
+    }
+    match refusal_code {
+        Some(code) if HARNESS_CODES.contains(&code.as_str()) => PreflightCheck::Harness {
+            code: Some(code.clone()),
+            timed_out,
+        },
+        Some(code) => PreflightCheck::Launch {
+            code: Some(code.clone()),
+        },
+        None if timed_out
+            || tool_result
+                .as_deref()
+                .is_none_or(|result| result.starts_with("probe-driver failed")) =>
+        {
+            PreflightCheck::Harness {
+                code: None,
+                timed_out,
+            }
+        }
+        None => PreflightCheck::ProbeFile,
+    }
+}
+
+/// What to check first when the preflight failed `check`. Starts `Failed check: <name>.`
+pub fn preflight_hint(check: &PreflightCheck) -> String {
+    let name = check.name();
+    match check {
+        PreflightCheck::Stage => format!(
+            "Failed check: {name}. The harness could not write the preflight case's directory, or \
+             `mur install` could not install the {driver} artifact into it, so `mur run` never \
+             started. The error above names the step; check that the work root is writable and \
+             that `mur install` accepts the archive packed into the work root.",
+            driver = driver_artifact::DRIVER_NAME
+        ),
+        PreflightCheck::Launch { code: None } => format!(
+            "Failed check: {name}. The launch command could not be spawned at all. Check the \
+             `--mur` path, and that `systemd-run` is on PATH when `--systemd-scope` is on."
+        ),
+        PreflightCheck::Launch { code: Some(code) } if code.starts_with("E-MAN-") => format!(
+            "Failed check: {name}. `mur run` refused the generated manifest with `{code}`: it no \
+             longer meets the manifest contract `mur run` enforces. \
+             `cargo test -p escape-conformance` reproduces it without a host."
+        ),
+        PreflightCheck::Launch { code: Some(code) } if code == "E-RUN-012" => format!(
+            "Failed check: {name}. `mur run` refused the capsule with `E-RUN-012`: it can spawn \
+             subprocesses and no cgroup v2 scope could be delegated to bound them. `mur` asks the \
+             systemd user session for a delegated scope, and otherwise needs the cgroup it \
+             inherited to carry `Delegate=yes`. Leave `--systemd-scope` on, or run the harness \
+             itself under `systemd-run --user --scope --property=Delegate=yes`, and check that \
+             the systemd user manager is running for this user."
+        ),
+        PreflightCheck::Launch { code: Some(code) } => format!(
+            "Failed check: {name}. `mur run` refused the preflight capsule with `{code}`. The \
+             diagnostics reference explains the code; `mur-stderr.txt` in the case directory \
+             carries the full message."
+        ),
+        PreflightCheck::Harness { code, timed_out } => {
+            let cause = match (code, timed_out) {
+                (_, true) => "the case hit its `--timeout-secs` ceiling and was killed".to_string(),
+                (Some(code), false) => format!("`mur` reported `{code}`"),
+                (None, false) => "the harness left no summary of its tool call".to_string(),
+            };
+            format!(
+                "Failed check: {name}. The `probe-driver` harness never reported a tool result: \
+                 {cause}. Check that `--probe-driver` names this build's `probe-driver`, read \
+                 `mur-stderr.txt` and `probe-driver.txt` in the case directory, and on a loaded \
+                 host raise `--timeout-secs`."
+            )
+        }
+        PreflightCheck::InterpreterExec => format!(
+            "Failed check: {name}. The tool result reads `{EXEC_DENIED}`: the kernel refused \
+             `execve` of the interpreter. `capabilities.shell.allow` is enforced by Landlock \
+             `Execute` rights (`sandbox::linux_enforce::apply_landlock_scope`), so a binary \
+             reachable on this host but absent from the derived grant set gets EACCES before it \
+             runs. The two shapes that produce it: an interpreter whose real path \
+             `resolve_exec_allowlist` did not resolve at launch (check `PATH` as `mur` sees it), \
+             and an interpreter whose stdlib or shared libraries live outside both the workdir and \
+             the derived `DT_NEEDED` closure — which is what \
+             `capabilities.shell.interpreter_runtime` and `.staged_runtime` exist to declare. \
+             Nothing the capsule writes into its own workdir can be executed unless the manifest \
+             declares `capabilities.filesystem.workdir_exec: true`."
+        ),
+        PreflightCheck::ProbeFile => format!(
+            "Failed check: {name}. The tool call ran, but the probe left no `SUCCESS` verdict in \
+             `wd/{probe_file}`. The tool result above carries the probe's own output: a Python \
+             traceback means the probe script failed, an exit code with no output means it was \
+             killed before writing.",
+            probe_file = probe::PROBE_FILE
+        ),
+    }
 }
 
 /// What `mur` prints when it refused or abandoned a case's run, matched as substrings of its
@@ -622,6 +787,7 @@ pub fn run_case(
                 detail: format!("could not stage the case: {err}"),
                 passed: !expectation.gates(),
                 case_dir: config.work_root.join(case.id),
+                reach: RunReach::NotStaged,
             };
         }
     };
@@ -640,31 +806,32 @@ pub fn run_case(
                 detail: format!("could not launch `{}`: {err}", argv.join(" ")),
                 passed: !expectation.gates(),
                 case_dir,
+                reach: RunReach::NotLaunched,
             };
         }
     };
 
     let output = session_output(&case_dir, &workdir);
-    let mut launch_refusal = REFUSAL_CODES
-        .into_iter()
-        .find(|code| output.contains(code))
-        .map(|code| excerpt(&output, code));
-    // What the tool call itself came back with. When the probe never ran, this is usually the
-    // only description of why — `mur run` reports `status: ok` for a session whose single tool
-    // call was refused, so the exit code says nothing.
-    if let Ok(driver) = fs::read_to_string(&driver_log) {
-        let driver = driver.trim();
+    let refusal_prefix = REFUSAL_CODES.into_iter().find(|code| output.contains(code));
+    let refusal_code = refusal_prefix.map(|prefix| whole_code(&output, prefix));
+    let mut launch_refusal = refusal_prefix.map(|code| excerpt(&output, code));
+    // What the tool call returned, whatever happened. When the probe was killed mid-case this is
+    // the only description of how it died, and it is the difference between a diagnosable result
+    // and a bare INCONCLUSIVE.
+    let tool_result = fs::read_to_string(&driver_log)
+        .ok()
+        .map(|text| text.trim().to_string());
+    // When the probe never ran, the tool result is usually the only description of why — `mur
+    // run` reports `status: ok` for a session whose single tool call was refused, so the exit
+    // code says nothing.
+    if let Some(driver) = &tool_result {
         if driver.contains("isError=true") || driver.contains("probe-driver failed") {
             launch_refusal = Some(format!("probe-driver: {driver}"));
         }
     }
-
-    // What the tool call returned, whatever happened. When the probe was killed mid-case this is
-    // the only description of how it died, and it is the difference between a diagnosable result
-    // and a bare INCONCLUSIVE.
-    let driver_summary = fs::read_to_string(&driver_log)
-        .map(|text| text.trim().to_string())
-        .unwrap_or_else(|_| "the probe driver left no record of its tool call".to_string());
+    let driver_summary = tool_result
+        .clone()
+        .unwrap_or_else(|| "the probe driver left no record of its tool call".to_string());
 
     let (verdict, mut detail) = match case.evidence {
         Evidence::ProbeFile => match read_probe_file(&workdir) {
@@ -769,7 +936,22 @@ pub fn run_case(
         detail: crate::record::sanitize_cell(&detail),
         passed,
         case_dir,
+        reach: RunReach::Ran {
+            timed_out,
+            refusal_code,
+            tool_result,
+        },
     }
+}
+
+/// The whole diagnostic code at the first occurrence of `prefix` in `output`: `E-MAN-` in
+/// `error[E-MAN-003]: …` reads back as `E-MAN-003`.
+fn whole_code(output: &str, prefix: &str) -> String {
+    let start = output.find(prefix).unwrap_or_default();
+    output[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect()
 }
 
 #[cfg(test)]
@@ -792,6 +974,203 @@ mod tests {
             systemd_scope: false,
             interpreter_dirs: vec![("/usr/lib/python3".to_string(), true)],
         }
+    }
+
+    #[test]
+    fn a_second_run_on_one_work_root_grades_only_its_own_files() {
+        let work_root =
+            crate::work_root::prepare_work_root(&crate::work_root::tests::scratch_path("rerun"))
+                .expect("a fresh work root");
+
+        // The files a first run leaves at the paths `stage`, the probe and the driver use.
+        let case_dir = work_root.join(cases::PREFLIGHT.id);
+        let workdir = case_dir.join("wd");
+        let session = workdir.join(".murmur").join("sess-earlier");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            workdir.join(probe::PROBE_FILE),
+            "VERDICT=SUCCESS\nDETAIL=from the earlier run\n",
+        )
+        .unwrap();
+        fs::write(
+            driver_log_path(&case_dir),
+            "case=preflight tool=python3 :: isError=false :: Exit code: 0\n",
+        )
+        .unwrap();
+        fs::write(
+            session.join("trace.jsonl"),
+            "{\"resource_limit\":\"cgroup_pids_max\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_probe_file(&workdir).map(|(verdict, _)| verdict),
+            Some(Verdict::Succeeded)
+        );
+        assert_eq!(trace_files(&workdir).len(), 1);
+
+        let again = crate::work_root::prepare_work_root(&work_root).expect("a marked work root");
+        assert_eq!(again, work_root);
+        assert!(read_probe_file(&workdir).is_none());
+        assert!(!driver_log_path(&case_dir).exists());
+        assert!(trace_files(&workdir).is_empty());
+        assert!(trace_resource_limit(&workdir).is_none());
+        assert!(work_root.join(crate::work_root::WORK_ROOT_MARKER).is_file());
+        fs::remove_dir_all(&work_root).unwrap();
+    }
+
+    fn preflight_outcome(detail: &str, reach: RunReach) -> CaseOutcome {
+        CaseOutcome {
+            case: &cases::PREFLIGHT,
+            expectation: Expectation::Must(Verdict::Succeeded),
+            verdict: Verdict::Inconclusive,
+            detail: detail.to_string(),
+            passed: false,
+            case_dir: PathBuf::from("/tmp/escape-conformance-test/preflight"),
+            reach,
+        }
+    }
+
+    fn ran(timed_out: bool, refusal_code: Option<&str>, tool_result: Option<&str>) -> RunReach {
+        RunReach::Ran {
+            timed_out,
+            refusal_code: refusal_code.map(str::to_string),
+            tool_result: tool_result.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn each_preflight_check_gets_its_own_hint() {
+        let refused_exec = "case=preflight tool=python3 :: isError=true :: $ python3 ec-probe.py \
+                            Permission denied (os error 13)";
+        let traceback = "case=preflight tool=python3 :: isError=false :: $ python3 ec-probe.py \
+                         Exit code: 1 Stdout:  Stderr: Traceback (most recent call last):";
+        let table = [
+            (
+                preflight_outcome(
+                    "could not stage the case: none of [\"/bin/x\"] exists on this host",
+                    RunReach::NotStaged,
+                ),
+                PreflightCheck::Stage,
+            ),
+            (
+                preflight_outcome(
+                    "could not launch `/nonexistent/mur run`: No such file or directory",
+                    RunReach::NotLaunched,
+                ),
+                PreflightCheck::Launch { code: None },
+            ),
+            (
+                preflight_outcome(
+                    "the probe wrote no verdict file [mur reported: error[E-MAN-003]: …]",
+                    ran(false, Some("E-MAN-003"), None),
+                ),
+                PreflightCheck::Launch {
+                    code: Some("E-MAN-003".to_string()),
+                },
+            ),
+            (
+                preflight_outcome(
+                    "the probe wrote no verdict file [mur reported: error[E-RUN-012]: …]",
+                    ran(false, Some("E-RUN-012"), None),
+                ),
+                PreflightCheck::Launch {
+                    code: Some("E-RUN-012".to_string()),
+                },
+            ),
+            (
+                preflight_outcome(
+                    "the probe wrote no verdict file [mur reported: error[E-RUN-033]: …]",
+                    ran(false, Some("E-RUN-033"), None),
+                ),
+                PreflightCheck::Harness {
+                    code: Some("E-RUN-033".to_string()),
+                    timed_out: false,
+                },
+            ),
+            (
+                preflight_outcome(
+                    "[case exceeded the 300s ceiling and was killed] the probe wrote no verdict \
+                     file",
+                    ran(true, None, None),
+                ),
+                PreflightCheck::Harness {
+                    code: None,
+                    timed_out: true,
+                },
+            ),
+            (
+                preflight_outcome(
+                    "the probe wrote no verdict file; the tool call reported: the probe driver \
+                     left no record of its tool call",
+                    ran(false, None, None),
+                ),
+                PreflightCheck::Harness {
+                    code: None,
+                    timed_out: false,
+                },
+            ),
+            (
+                preflight_outcome(
+                    &format!("the probe wrote no verdict file [mur reported: probe-driver: {refused_exec}]"),
+                    ran(false, None, Some(refused_exec)),
+                ),
+                PreflightCheck::InterpreterExec,
+            ),
+            (
+                preflight_outcome(
+                    &format!("the probe wrote no verdict file; the tool call reported: {traceback}"),
+                    ran(false, None, Some(traceback)),
+                ),
+                PreflightCheck::ProbeFile,
+            ),
+        ];
+
+        for (outcome, expected) in &table {
+            let check = classify_preflight(outcome);
+            assert_eq!(&check, expected, "{}", outcome.detail);
+
+            let hint = preflight_hint(&check);
+            assert!(
+                hint.starts_with(&format!("Failed check: {}.", check.name())),
+                "{hint}"
+            );
+            assert_eq!(
+                hint.contains("Execute"),
+                check == PreflightCheck::InterpreterExec,
+                "only an interpreter exec failure points at Landlock `Execute`: {hint}"
+            );
+            assert!(!hint.contains("PR_SET_DUMPABLE"), "{hint}");
+
+            let refusal = preflight_refusal(outcome);
+            assert!(refusal.starts_with(
+                "REFUSED — no probe can run on this host, so nothing can be measured."
+            ));
+            assert!(refusal.contains(&hint));
+            assert!(refusal.contains(&outcome.detail));
+            assert!(refusal.contains("/tmp/escape-conformance-test/preflight"));
+        }
+
+        let hint_for = |code: &str| {
+            preflight_hint(&PreflightCheck::Launch {
+                code: Some(code.to_string()),
+            })
+        };
+        assert!(hint_for("E-MAN-003").contains("cargo test -p escape-conformance"));
+        let cgroup = hint_for("E-RUN-012");
+        assert!(cgroup.contains("Delegate=yes"), "{cgroup}");
+        assert!(cgroup.contains("--systemd-scope"), "{cgroup}");
+        assert!(hint_for("E-CAP-001").contains("E-CAP-001"));
+    }
+
+    #[test]
+    fn a_refusal_prefix_reads_back_as_the_whole_code() {
+        let output =
+            "starting\nerror[E-MAN-003]: capabilities.shell.allow names a missing binary\n";
+        assert_eq!(whole_code(output, "E-MAN-"), "E-MAN-003");
+        assert_eq!(
+            whole_code("error[E-RUN-012]: no scope", "E-RUN-012"),
+            "E-RUN-012"
+        );
     }
 
     #[test]

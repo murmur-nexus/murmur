@@ -689,6 +689,13 @@ cargo build --release -p murmur-cli -p escape-conformance
 `--list-cases` prints the registry with each case's expectation per class, and `--help` lists the
 remaining options.
 
+Each run stages its cases under a work root: the directory `--work-root` names, or a new
+`escape-conformance-work-<stamp>` directory next to the record. A work root carries a
+`.escape-conformance-work-root` marker file, and a marked work root is emptied before a run reuses
+it, so every case is graded only on files its own run wrote. A non-empty directory without the
+marker is refused with exit `1`; clear it with the `rm -rf` command the refusal prints, or pass an
+empty directory.
+
 The run needs:
 
 - a built `mur` binary;
@@ -711,6 +718,9 @@ The exit code separates a refusal from a failure, and an escape from a ceiling t
 | `2` | refused — this host cannot back the class, a prerequisite is missing, or no probe could run | none |
 | `3` | a boundary case failed — a containment escape | written |
 | `4` | boundary clean, a resource ceiling did not hold — denial of service | written |
+
+When no probe can run, the refusal names the check the preflight case failed — `stage`, `launch`,
+`harness`, `interpreter exec` or `probe file` — and what to check first for it.
 
 ### The manual procedures
 

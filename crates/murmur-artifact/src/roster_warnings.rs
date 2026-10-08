@@ -10,8 +10,9 @@
 ///
 /// Callers are counted from the roster's expanded reachability, one per calling member, and
 /// compared with what the called member's `lifecycle` holds at once. A call that arrives while
-/// the member is full is rejected, but calls may never overlap in practice, so the roster is
-/// admitted and the formation launches.
+/// the member is full waits and is offered again, and is rejected only if the member stays full
+/// until the call's deadline; calls may never overlap in practice, so the roster is admitted and
+/// the formation launches.
 pub const W_ROS_001: &str = "W-ROS-001";
 
 /// Builds the doc link for a `W-ROS-*` code, e.g. `.../diagnostics/#w-ros-001`.
