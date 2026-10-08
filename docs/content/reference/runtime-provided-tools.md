@@ -8,7 +8,7 @@ The model sees no difference. A runtime-provided tool has the same manifest shap
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
 and what decides whether it may run.
 
-## The seven
+## The eight
 
 Each one appears only when the declaration in the second column is present.
 
@@ -21,6 +21,7 @@ Each one appears only when the declaration in the second column is present.
 | `submit-plan` | [`capabilities.plan.submit`](manifest.md#field-capabilities) | Runs one plan of steps against this session's own tools and returns every step's result — see [Plans](plans.md) |
 | `switch-driver` | [`control.agent_settings: [inference.driver]`](manifest.md#field-control) | Selects the [driver choice](manifest.md#inference-alternates) the agent's next inference call is served by — see [`switch-driver`](#switch-driver) |
 | `call-member` | A [`reachability`](roster.md#reachability) rule in the formation's `roster.yaml` that lets this member call another | Hands one task to another formation member and returns at once, started or busy; the answer arrives later in the same task — see [`call-member`](#call-member) |
+| `end-without-answer` | The same rule as `call-member` | Ends a task another formation member sent without an answer, and the runtime tells that member none came — see [`end-without-answer`](#end-without-answer) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -28,9 +29,9 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver` and `call-member`
-are answered before the tool allowlist is consulted. The allowlist governs which tool *artifacts*
-may run; it has no say over these six.
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`
+and `end-without-answer` are answered before the tool allowlist is consulted. The allowlist governs
+which tool *artifacts* may run; it has no say over these seven.
 
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
 nothing under `workdir/tools/<name>/`, so:
@@ -41,7 +42,7 @@ nothing under `workdir/tools/<name>/`, so:
 
 So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
 it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, for
-`switch-driver`, for `call-member`, and for their grants.
+`switch-driver`, for `call-member` and `end-without-answer`, and for their grants.
 
 `capabilities.plan.submit` also decides whether the model is told *when* to plan: the runtime's
 plan guidance is part of the system prompt exactly when the tool exists.
@@ -51,8 +52,8 @@ are additionally checked against that list again at dispatch.
 
 ## Reserved names
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver` and `call-member`
-are reserved.
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member`
+and `end-without-answer` are reserved.
 A capsule declaring an artifact under one of them is refused at staging, before any artifact is
 pulled, with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
 `manage.pull()` of that name.
@@ -124,7 +125,7 @@ adds the runtime's own note on the line after the closing marker, outside the fe
 |---|---|
 | `started` | `[call-member] <member> is now working on call <call_id>. Its answer is not in this result and no tool fetches it: the runtime adds it to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling <member> again before its answer arrives is refused.` |
 | `busy` | `[call-member] <member> is busy with other work and has not taken call <call_id> yet. The runtime keeps offering it the task for up to <N>s and adds <member>'s answer, or word that it stayed busy, to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling <member> again before then is refused.` `<N>` is the call's deadline in seconds |
-| `rejected`, `failed` | `[call-member] Call <call_id> to <member> ended <status>, with no answer from <member>. Do not present an answer of your own as <member>'s.` |
+| `rejected`, `failed` | `[call-member] Call <call_id> to <member> ended <status>, with no answer from <member>. Do not present an answer of your own as <member>'s.` For a task another formation member sent, followed by ` If you have no answer to give without <member>, call end-without-answer with the reason: the runtime then tells <caller> plainly that you gave none.` |
 
 A door's `rejected` answer reads as one sentence:
 
@@ -158,12 +159,13 @@ The call then ends in one of these ways:
 Only a refusal with exactly the message `task rejected: capsule is busy` is offered again; any
 other refusal ends the call in the same turn.
 
-Three calls are refused as a tool error, with nothing sent and nothing recorded as a member call:
+Four calls are refused as a tool error, with nothing sent and nothing recorded as a member call:
 
 | Call | Error |
 |---|---|
 | A `member` the roster does not let this capsule call | Names the members it may call |
 | A call made while no task is running | Says the tool is answered only while a task runs |
+| A call made after [`end-without-answer`](#end-without-answer) was accepted in this task | `'call-member' makes no call from a task that is ending without an answer.` |
 | A `member` that already holds a call from this task whose answer has not been delivered | One of the two texts below, naming the earlier call |
 
 | The earlier call's answer | Error text |
@@ -216,6 +218,13 @@ critic did not answer within 600s. …
 | `completed` | `[call-member] call <call_id> to <member> ended completed:` |
 | Any other | `[call-member] call <call_id> to <member> ended <status>, with no answer from <member>:` |
 
+A call ends `no_answer` when the member ended its task with
+[`end-without-answer`](#end-without-answer): its task is `failed` and its `tasks/get` result
+carries [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata). A member's
+`tasks/get` result may also name, in `metadata.murmur.noAnswerBelow`, the members further down
+that gave it no answer. The runtime reads those names only for a `completed` or `no_answer` call,
+keeps at most 8, and keeps only a roster member name with a status other than `completed`.
+
 A member has no answer when its latest call in this task did not end `completed`, whether that
 call ended in its own tool call or in a continuation. Each such member is named, with that call's
 id and status, in one line after every fence:
@@ -224,16 +233,36 @@ id and status, in one line after every fence:
 [call-member] No answer came from: <member> (call <call_id>, <status>), <member> (call <call_id>, <status>). What you asked of them has not been done by them: do not present an answer of your own as theirs.
 ```
 
-A later call to the same member that completes removes it from that line. The message's last line:
+A member that reported members further down with no answer is named in the further-down form:
 
-| Members with no answer | Last line |
+```text
+<member> (call <call_id>, <status>; further down, no answer came from <name> (<status>), <name> (<status>))
+```
+
+A member whose latest call ended `completed` while it reported members further down with no
+answer has answered with a gap. Its answer is fenced as usual, and it gets a line of its own after
+the no-answer line:
+
+```text
+[call-member] <member> (call <call_id>) answered without an answer from <name> (<status>), <name> (<status>): any part of its answer that stands in for theirs is <member>'s own, not theirs.
+```
+
+A later call to the same member that completes with nothing missing below it removes it from
+both lines. The message's last line:
+
+| Members with no answer, or with a gap | Last line |
 |---|---|
 | None | `[call-member] Every call this task made has ended, and the answers are above. Answer the task with them now; call a member again only to give it new work.` |
 | One or more | `[call-member] Every call this task made has ended. Answer the task with the answers you have and say plainly which part has no answer, or call a member again if another attempt could succeed.` |
 
+For a task another formation member sent, the second line continues with
+` If you have no answer to give, call end-without-answer with the reason instead: the runtime then tells <caller> plainly that you gave none.`
+The entry member's task has no formation caller, so its lines never name the tool.
+
 | Ending | Output |
 |---|---|
 | `completed` | The member's answer: its task's `response` artifact |
+| `no_answer` | The member's reason, its task's status message, or `<member> ended its task without an answer` |
 | `failed`, `canceled`, `rejected` | The member's task's status message, or for a member that stayed busy, the runtime's sentence from [A busy member](#call-member-busy) |
 | `timed_out` | The member did not answer within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); it was not cancelled and may still be working |
 | `unreachable` | The member's door stopped answering |
@@ -271,3 +300,52 @@ No call is ever cancelled at the member: a formation token cannot call `tasks/ca
 that times out, or is abandoned after the member took the task, leaves the member's task running
 until it finishes or the formation ends.
 
+## `end-without-answer` { #end-without-answer }
+
+`end-without-answer` exists exactly where [`call-member`](#call-member) does. It ends the running
+task without an answer, when the member has none to give — usually because a member it called
+gave it none. The runtime then tells the member that sent the task, in its own words, that no
+answer came.
+
+| Aspect | Behaviour |
+|---|---|
+| Input | `{"reason": "<text>"}`, required. The reason is the task's status message |
+| Description | Tells the model to use it instead of replying when it has no answer to give, usually because a member it called gave it none; that `reason` is passed to the member that sent the task; that the runtime tells that member plainly no answer came and names each member called that gave none; and that it is refused while a call is still out and for a task no formation member sent |
+| Accepted | `passed`, summary `Ending task without an answer`, `data` `{"status": "ending", "caller": "<caller>"}`, then the note `[end-without-answer] This task ends without an answer once this turn's tool calls finish, and <caller> is told you gave none.` The other tool calls of the same turn still run |
+| Policy | The call passes the same `on-tool-call` decision point as every tool call |
+| Plans | Not callable from a plan step |
+
+It is refused as a tool error, checked in this order:
+
+| Case | Error text |
+|---|---|
+| The session is no formation member with a callee | `'end-without-answer' is answered only for a formation member that roster.yaml lets call another; this session is not one` |
+| No task is running | `'end-without-answer' is answered only while a task runs; this session is running none` |
+| No formation member sent the task, as for the entry member's task | `'end-without-answer' ends only a task another formation member sent; no formation member sent this one. Reply in text, saying plainly which part has no answer.` |
+| A call this task made is being sent, is outstanding, or has an answer not yet delivered | `Call <call_id> to <member> is still out; its answer arrives after you end your turn. Call end-without-answer only when no call is left to wait for.` |
+| `reason` is missing or blank | `'end-without-answer' needs a reason: say in a sentence why you have no answer.` |
+| The task has already accepted one | `This task is already ending without an answer.` |
+
+### How the task ends { #end-without-answer-ending }
+
+Once the turn's tool calls finish, the attempt ends with no further inference call. Under
+[`transport: process`](manifest.md#transport-process), an attempt whose harness kept going after
+the call and finished ends the same way.
+
+| Surface | What it shows |
+|---|---|
+| A2A state | `failed`, with the reason as its status message |
+| `tasks/get` | [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata), and `metadata.murmur.noAnswerBelow` naming each member further down this task had no answer from |
+| `out/result.txt` | `no answer: <reason>` |
+| [`task_end.exit_status`](observability-schemas.md#task-end) and the `on-task-end` exit status | `no_answer` |
+| `task_failed` | None is written |
+| The caller's call | Ends `no_answer` — see [How the answer arrives](#call-member-answer) |
+| The launch | A `no_answer` task never decides `session_end.exit_status` or the launch's exit code |
+
+An `on-task-end` hook may reopen the task; the reopened attempt may answer, or end without an
+answer again. A caller that is not a formation member reads an ordinary `failed` task with a
+status message.
+
+A task that answers in text while a member it called gave no answer completes as usual. Its
+`tasks/get` result carries `metadata.murmur.noAnswerBelow` naming those members, and its caller
+reads its answer with a gap line.

@@ -43,6 +43,11 @@ when the roster lets it call another:
    caller's model continues with it. A call that ends with no answer — the member stayed busy,
    timed out or failed — is named by the runtime as giving no answer, and the caller's model is
    told not to present an answer of its own as that member's.
+5. A member that has no answer to give, because a member it called gave it none, ends its task
+   with [`end-without-answer`](../reference/runtime-provided-tools.md#end-without-answer) instead
+   of replying. Its caller is then told, in the runtime's own words, that no answer came from it,
+   and which member further down gave none. A member that replies anyway after a missing answer
+   has its reply delivered with a line saying which members it answered without.
 
 A second call to a member is refused, with nothing sent, until the first call's answer has been
 delivered. A call carries text only, so whatever the other member needs goes in the task text. See

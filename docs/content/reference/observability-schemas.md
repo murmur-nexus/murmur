@@ -581,13 +581,13 @@ session's trace through `reconciled_task_id`. A delegated sub-capsule's outcome 
 is delivered into the task that made the delegation, which writes the terminal `delegation` line
 before its own `task_end`.
 
-**`task_end`** — written after the agent loop returns and any hook-requested reopens are resolved,
+**`task_end`**{ #task-end } — written after the agent loop returns and any hook-requested reopens are resolved,
 for every task, on every exit path
 
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task); `"no_answer"` if the model ended it with [`end-without-answer`](runtime-provided-tools.md#end-without-answer) |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
@@ -718,11 +718,12 @@ delivered to the calling task, or left behind when that task ended
 | `call_id` | string | As on `member_call_start` |
 | `member` | string | The called member's roster name |
 | `member_task_id` | string | As on `member_call_start`. Absent for a call the member never held |
-| `status` | string | `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned` — see below |
+| `status` | string | `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable`, `abandoned` or `no_answer` — see below |
 | `duration_ms` | u64 | From the tool call to this outcome |
 | `output` | string | The member's answer for `completed`, its task's status message for `failed`, `canceled` and `rejected`, or why the call ended otherwise. At most 64 KiB and a cut marker |
 | `truncated` | bool | Whether `output` was cut |
 | `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that ended within its tool call, as a continuation for any other. `false` for every `abandoned` call, and for an answer that arrived when the task did not wait for it — see [How the answer arrives](runtime-provided-tools.md#call-member-answer) |
+| `no_answer_below` | array of `{"member", "status"}` | The members further down the member reported as giving it no answer, from its [`tasks/get` metadata](agent-card.md#no-answer-metadata). Only on a `completed` or `no_answer` call; absent when empty |
 
 | `status` | Meaning |
 |---|---|
@@ -731,12 +732,19 @@ delivered to the calling task, or left behind when that task ended
 | `failed`, with no `member_task_id` | Every other call that never started: the caller's `capabilities.network.allow` does not reach the member's door, the door's address never arrived, the door answered an error, or it could not be reached |
 | `timed_out` | The member had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); its task was not cancelled |
 | `unreachable` | The member's door stopped answering |
+| `no_answer` | The member ended its task with [`end-without-answer`](runtime-provided-tools.md#end-without-answer): it is `failed`, and `output` is its reason |
 | `abandoned` | The calling task ended before the answer arrived. There is no `member_task_id` when the task ended while a busy member was still being offered the task, or was cancelled while the member's door was being reached. Always `delivered: false` |
 
 No member call line carries the member's door address or a token.
 
 ```json
 {"event_type":"member_call","event_id":"evt_01a106502c377c72bcc0f222268e783d","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107279927,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c5","member":"worker","member_task_id":"tsk_01a106502a41745381369d93d349d695","status":"completed","duration_ms":504,"output":"WORKER-0123456789abcdef0123456789abcdef","truncated":false,"delivered":true}
+```
+
+A call to a member that ended without an answer because its own call timed out:
+
+```json
+{"event_type":"member_call","event_id":"evt_01a106502c377c72bcc0f222268e783e","parent_id":"evt_01a10650283b7a82bd5a5b81e6aa7554","session_id":"ses_01a10650282f7610a69952ba1dee5781","timestamp":1791107282511,"task_id":"tsk_01a10650283e7881b7a192a438359df9","call_id":"mcl_01a106502a3f7d4189618000400406c6","member":"p","member_task_id":"tsk_01a106502a41745381369d93d349d696","status":"no_answer","duration_ms":3088,"output":"q gave no answer","truncated":false,"delivered":true,"no_answer_below":[{"member":"q","status":"timed_out"}]}
 ```
 
 **`task_failed`**{ #task-failed } — written once per task attempt that failed, before that task's

@@ -426,6 +426,7 @@ answers the header with `-32602` without starting a task — see
 | `status.message` | On a terminal task — `completed`, `failed`, `canceled` or `rejected` — whose final status said something: a message from the agent with one text part, the same text as the task's final [`status` frame](streaming-protocol.md#one-final-status) |
 | `artifacts: [{"name": "response", …}]` | On a `completed` task that produced a response: its answer, as one text part |
 | `artifacts: [{"name": "prompt", …}]` | On an `input-required` task: the question it is waiting on |
+| `metadata.murmur` | On a terminal task with something to say about answers it lacks — see [No-answer metadata](#no-answer-metadata) |
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
@@ -440,6 +441,27 @@ held — is answered `-32001 Task not found`. Every other credential reads every
 
 A `message/send` the door has no room for answers a `rejected` task whose `status.message` says
 why: `task rejected: capsule is busy`, or `task rejected: the session is closing`.
+
+##### No-answer metadata { #no-answer-metadata }
+
+A formation member's task says, in `metadata.murmur`, which answers it lacks. `metadata` is absent
+when neither key is present.
+
+| Key | Type | Present |
+|---|---|---|
+| `noAnswer` | `true` | On a `failed` task the member ended with [`end-without-answer`](runtime-provided-tools.md#end-without-answer). Absent otherwise |
+| `noAnswerBelow` | array of `{"member": "<roster name>", "status": "<status>"}` | On a terminal task when a member it called gave it no answer: each such member, then each member those reported below them, each once, at most 8. `status` is a [`member_call`](observability-schemas.md#member-call) status other than `completed`. Absent when empty |
+
+```json
+{"id": "tsk_…", "contextId": "ctx_…",
+ "status": {"state": "failed",
+            "message": {"messageId": "msg_tsk_…_status", "role": "agent", "parts": [{"text": "q gave no answer"}]}},
+ "metadata": {"murmur": {"noAnswer": true,
+                         "noAnswerBelow": [{"member": "q", "status": "timed_out"}]}}}
+```
+
+A completed task with `noAnswerBelow` keeps its `response` artifact. A caller that is not a
+formation member can ignore `metadata`: the task reads as an ordinary `failed` or `completed` one.
 
 ### Capsule extension { #murmur-capsule-v1 }
 

@@ -811,9 +811,12 @@ fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (Str
                         ),
                     ));
                 }
-                // The agent's own switch is a decision it makes in a turn, which a plan step is
-                // not: the step would change the model under the turn that submitted the plan.
-                if tool == crate::runtime::SWITCH_DRIVER_TOOL {
+                // The agent's own switch, and ending its task without an answer, are decisions
+                // it makes in a turn, which a plan step is not: the step would change the model,
+                // or end the task, under the turn that submitted the plan.
+                if tool == crate::runtime::SWITCH_DRIVER_TOOL
+                    || tool == crate::runtime::END_WITHOUT_ANSWER_TOOL
+                {
                     return Err((
                         step.id.clone(),
                         format!("'{tool}' is not callable from inside a plan"),
@@ -1516,6 +1519,33 @@ mod tests {
         let path = workdir.join("plan.json");
         fs::write(&path, serde_json::to_string(&plan).unwrap()).unwrap();
         path
+    }
+
+    /// The tools that are a turn's own decisions — switching the model, ending the task without
+    /// an answer — are refused as plan steps, before any step runs.
+    #[test]
+    fn a_turn_s_own_decisions_are_not_callable_from_a_plan() {
+        let dir = tempdir().unwrap();
+        let invoke = |_: &str, _: ToolInput| -> Result<ToolResult, String> {
+            panic!("a refused plan ran a step")
+        };
+        let ctx = test_ctx(dir.path().to_path_buf(), &invoke);
+        for tool in [
+            crate::runtime::SWITCH_DRIVER_TOOL,
+            crate::runtime::END_WITHOUT_ANSWER_TOOL,
+        ] {
+            let plan: PlanFile = serde_json::from_value(json!({
+                "id": "p", "steps": [{"id": "s1", "tool": tool, "input": {"reason": "none"}}],
+            }))
+            .unwrap();
+            assert_eq!(
+                validate_plan(&plan, &ctx).unwrap_err(),
+                (
+                    "s1".to_string(),
+                    format!("'{tool}' is not callable from inside a plan")
+                )
+            );
+        }
     }
 
     #[test]

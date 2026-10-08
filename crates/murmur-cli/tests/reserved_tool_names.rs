@@ -16,11 +16,12 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 const CAPSULE_NAME: &str = "reserved-name-capsule";
-const RESERVED: [&str; 4] = [
+const RESERVED: [&str; 5] = [
     "share-file",
     "fetch-peer-file",
     "delegate-task",
     "submit-plan",
+    "end-without-answer",
 ];
 
 /// An agent capsule declaring one tool artifact under `artifact_name`, plus whatever extra

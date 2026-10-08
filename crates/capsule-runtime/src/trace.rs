@@ -1751,7 +1751,8 @@ struct MemberCallEvent {
     /// Absent, not null, for a call the callee never held.
     #[serde(skip_serializing_if = "Option::is_none")]
     member_task_id: Option<String>,
-    /// `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable` or `abandoned`.
+    /// `completed`, `failed`, `canceled`, `rejected`, `timed_out`, `unreachable`, `abandoned` or
+    /// `no_answer`.
     status: String,
     duration_ms: u64,
     /// The callee's answer, its status message, or why the call ended.
@@ -1760,6 +1761,18 @@ struct MemberCallEvent {
     /// Whether the calling task received `output`: as the tool result for a call that never
     /// started, as a continuation for one that did.
     delivered: bool,
+    /// The members further down that gave the callee no answer, as its `tasks/get` reported them.
+    /// Absent when it reported none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    no_answer_below: Vec<NoAnswerBelow>,
+}
+
+/// One member a callee reported as giving it no answer.
+#[derive(Serialize)]
+struct NoAnswerBelow {
+    member: String,
+    /// A `member_call` status other than `completed`.
+    status: String,
 }
 
 /// One delegation, written when it ends.
@@ -4015,6 +4028,14 @@ impl ResourceTraceAppender {
             output: outcome.output.clone(),
             truncated: outcome.truncated,
             delivered,
+            no_answer_below: outcome
+                .below
+                .iter()
+                .map(|(member, status)| NoAnswerBelow {
+                    member: member.clone(),
+                    status: status.as_str().to_string(),
+                })
+                .collect(),
         };
         self.append(&event).await;
     }

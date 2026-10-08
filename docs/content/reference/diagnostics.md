@@ -1296,11 +1296,12 @@ rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 
 ### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
 
-`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver` and `call-member`
-are answered by the runtime itself, so an artifact cannot be declared under any of them:
+`share-file`, `fetch-peer-file`, `delegate-task`, `submit-plan`, `switch-driver`, `call-member` and
+`end-without-answer` are answered by the runtime itself, so an artifact cannot be declared under
+any of them:
 
 ```text
-error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member
+error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task, submit-plan, switch-driver, call-member, end-without-answer
   hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see https://docs.murmur.nexus/reference/runtime-provided-tools/
 ```
 
