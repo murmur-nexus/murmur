@@ -1623,7 +1623,8 @@ fn handle_completion(
             req.id,
             -32004,
             &format!(
-                "delegation {delegation_id} is being ended by this session; its launcher records                  the outcome"
+                "delegation {delegation_id} is being ended by this session; its launcher \
+                 records the outcome"
             ),
         )
         .into_http_response(),
@@ -1777,6 +1778,12 @@ fn handle_message_send(
     JsonRpcResponse::ok(id, task).into_http_response()
 }
 
+/// Whether `caller_member` may read or cancel `task_id`: the operator (`None`) reaches every
+/// task, a formation member only the tasks it submitted itself.
+fn visible_to(reg: &TaskRegistry, task_id: &str, caller_member: Option<&str>) -> bool {
+    caller_member.is_none_or(|member| reg.submitter(task_id) == Some(member))
+}
+
 /// `tasks/get`: one task's state, and how it ended once it has.
 ///
 /// A formation member — `caller_member`, from the formation token the door let in — reads only
@@ -1791,10 +1798,6 @@ fn handle_tasks_get(
     caller_member: Option<&str>,
 ) -> String {
     let requested_id = params.get("id").and_then(Value::as_str).map(str::to_string);
-    let visible = |reg: &TaskRegistry, task_id: &str| match caller_member {
-        Some(member) => reg.submitter(task_id) == Some(member),
-        None => true,
-    };
 
     let Some(task_id) = requested_id else {
         // Backward compat: if no id provided, return the active slot's task if any
@@ -1812,7 +1815,7 @@ fn handle_tasks_get(
                 };
                 match reg
                     .get_task(&active_id)
-                    .filter(|_| visible(&reg, &active_id))
+                    .filter(|_| visible_to(&reg, &active_id, caller_member))
                 {
                     Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
                     None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
@@ -1822,7 +1825,10 @@ fn handle_tasks_get(
     };
 
     let reg = task_registry.lock().unwrap();
-    match reg.get_task(&task_id).filter(|_| visible(&reg, &task_id)) {
+    match reg
+        .get_task(&task_id)
+        .filter(|_| visible_to(&reg, &task_id, caller_member))
+    {
         Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
         None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
     }
@@ -1838,8 +1844,8 @@ fn handle_tasks_get(
 /// unchanged, because "do no more work on this" is already true of it. Only an id this capsule
 /// never held is an error, and it is the same `-32001` `tasks/get` answers with.
 ///
-/// A formation member — `caller_member` — cancels only the tasks it submitted itself, on the
-/// visibility rule [`handle_tasks_get`] reads by: any other id gets that same `-32001`, and
+/// A formation member — `caller_member` — cancels only the tasks it submitted itself, by the
+/// same [`visible_to`] rule `tasks/get` reads by: any other id gets that same `-32001`, and
 /// nothing is cancelled.
 fn handle_tasks_cancel(
     id: Value,
@@ -1856,7 +1862,7 @@ fn handle_tasks_cancel(
 
     let (outcome, task) = {
         let mut reg = task_registry.lock().unwrap();
-        if caller_member.is_some_and(|member| reg.submitter(&task_id) != Some(member)) {
+        if !visible_to(&reg, &task_id, caller_member) {
             return JsonRpcResponse::err(id, -32001, "Task not found").into_http_response();
         }
         let outcome = reg.request_cancel(&task_id);

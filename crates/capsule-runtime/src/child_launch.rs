@@ -102,10 +102,12 @@ const CHILD_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a child sent `SIGTERM` on purpose is given to wind down before it is `SIGKILL`ed.
 ///
 /// The child's own `SIGTERM` teardown cancels its task and writes `session_end`, so within this
-/// grace its trace says how it ended. It sits under `mur stop`'s default grace for the parent
-/// (`--timeout`, 10 s), so a parent that is stopping can end its children and still exit inside
-/// its own grace, and under the child's own [`crate::runtime::TERMINATE_TEARDOWN_DEADLINE`], so it
-/// bounds a child that ignores `SIGTERM` rather than one tearing down normally.
+/// grace its trace says how it ended. Kept under `mur stop`'s default `--timeout`, so a parent
+/// that is stopping can end its children and still exit inside its own grace.
+///
+/// Shorter than the child's own [`crate::runtime::TERMINATE_TEARDOWN_DEADLINE`]: a child whose
+/// teardown runs past this grace (a long async-hook drain) is `SIGKILL`ed before it writes
+/// `session_end`, and `mur trace show` reports its trace as ended without one.
 pub const CHILD_END_GRACE: Duration = Duration::from_secs(5);
 
 /// How often a child that has been sent `SIGTERM` is polled for its exit during
@@ -230,10 +232,17 @@ impl ChildProcess {
         Some(ending)
     }
 
-    /// Send `SIGTERM` to a child that has not exited, once. A child already exited is reaped
+    /// Mark the ending deliberate and send `SIGTERM` to a child that has not exited, once. A
+    /// child already seen exited ended on its own and stays so; one found exited here is reaped
     /// instead, so the signal can never reach a reused pid: an unreaped child's pid stays its own.
+    ///
+    /// Marked under the same lock as the signal, so the watcher never reads a deliberate ending
+    /// that has not been signalled.
     #[allow(unsafe_code)]
     fn terminate(&mut self) {
+        if self.status.is_none() {
+            self.deliberate = true;
+        }
         if self.terminated_at.is_some() {
             return;
         }
@@ -277,11 +286,6 @@ impl ChildProcess {
 fn end_process(process: &Mutex<ChildProcess>) -> Result<(), std::io::Error> {
     let (mut child, signalled) = {
         let mut process = lock(process);
-        // Marked under the same lock as the signal, so the watcher never reads a deliberate
-        // ending that has not been signalled. A child already seen exited ended on its own.
-        if process.status.is_none() {
-            process.deliberate = true;
-        }
         process.terminate();
         let Some(child) = process.child.take() else {
             // Taken by an ending still waiting out the grace, which closes the lifeline itself
@@ -406,11 +410,7 @@ impl LaunchedChild {
     /// any, so they wind down together and the whole ending waits one [`CHILD_END_GRACE`] rather
     /// than one per child. A child already exited is left to be reaped.
     pub fn begin_ending(&self) {
-        let mut process = lock(&self.process);
-        if process.status.is_none() {
-            process.deliberate = true;
-        }
-        process.terminate();
+        lock(&self.process).terminate();
     }
 
     /// End the child — `SIGTERM`, up to [`CHILD_END_GRACE`] to exit, then `SIGKILL` — and reap

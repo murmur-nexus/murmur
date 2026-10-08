@@ -645,27 +645,7 @@ fn assert_ended_by_its_parents_task(child: &Delegation, parent: &Delegation) {
         !child_kinds.iter().any(|kind| kind == "spawner_ended"),
         "{child_kinds:?}"
     );
-    assert_ended_on_sigterm(child);
-}
-
-/// A child its parent ended on purpose wound down from `SIGTERM` within the grace: its trace
-/// closes with a `canceled` `session_end`, and `mur trace show` says so.
-fn assert_ended_on_sigterm(child: &Delegation) {
-    let events = child.trace();
-    assert_eq!(
-        kinds(&events).last(),
-        Some(&"session_end"),
-        "{:?}",
-        kinds(&events)
-    );
-    assert_eq!(
-        events.last().unwrap()["exit_status"],
-        "canceled",
-        "{}",
-        events.last().unwrap()
-    );
-    let shown = trace_show(child);
-    assert!(shown.contains("\nstatus:     canceled\n"), "{shown}");
+    common::assert_trace_ends_canceled(&child.child_session.join("trace.jsonl"));
 }
 
 // ── A parent that exits on its own ────────────────────────────────────────────
@@ -951,7 +931,7 @@ fn a_parent_stopped_while_it_waits_ends_its_child_first() {
     .unwrap();
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
-    assert_ended_on_sigterm(&delegation);
+    common::assert_trace_ends_canceled(&delegation.child_session.join("trace.jsonl"));
 }
 
 // ── A parent running a plan ───────────────────────────────────────────────────
@@ -1061,7 +1041,7 @@ fn a_parent_stopped_mid_plan_ends_the_plan_steps_child_first() {
     .unwrap();
     assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
-    assert_ended_on_sigterm(&delegation);
+    common::assert_trace_ends_canceled(&delegation.child_session.join("trace.jsonl"));
 }
 
 /// `SIGKILL` of a capsule whose plan is waiting on a `capsule` step's sub-capsule. Nothing in the

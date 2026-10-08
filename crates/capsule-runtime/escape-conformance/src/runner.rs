@@ -95,8 +95,8 @@ pub enum RunReach {
     Ran {
         /// Killed at `RunnerConfig::timeout`.
         timed_out: bool,
-        /// The first `REFUSAL_CODES` entry found in `mur`'s output, as the whole code: `E-MAN-003`
-        /// rather than the `E-MAN-` prefix it was matched on.
+        /// The first `LAUNCH_REFUSAL_CODES` or `HARNESS_CODES` entry found in `mur`'s output, as
+        /// the whole code: `E-MAN-003` rather than the `E-MAN-` prefix it was matched on.
         refusal_code: Option<String>,
         /// The probe driver's summary line, `None` when it left none.
         tool_result: Option<String>,
@@ -754,20 +754,10 @@ pub fn preflight_hint(check: &PreflightCheck) -> String {
     }
 }
 
-/// What `mur` prints when it refused or abandoned a case's run, matched as substrings of its
-/// output. `E-MAN-` matches every manifest code. Harness codes: `E-RUN-006` the harness binary
-/// was not found, `E-RUN-033` the harness reported a failed turn, `E-RUN-034` a driver call
-/// failed, `E-RUN-035` the harness went quiet past the inactivity limit.
-const REFUSAL_CODES: [&str; 8] = [
-    "E-RUN-012",
-    "E-RUN-007",
-    "E-RUN-008",
-    "E-MAN-",
-    "E-RUN-006",
-    "E-RUN-033",
-    "E-RUN-034",
-    "E-RUN-035",
-];
+/// What `mur` prints when it refused a case's launch, matched as substrings of its output.
+/// `E-MAN-` matches every manifest code. Searched before [`HARNESS_CODES`], which together with
+/// these are the refusal codes a run is read for.
+const LAUNCH_REFUSAL_CODES: [&str; 4] = ["E-RUN-012", "E-RUN-007", "E-RUN-008", "E-MAN-"];
 
 /// Runs one case end to end and grades it.
 pub fn run_case(
@@ -812,7 +802,10 @@ pub fn run_case(
     };
 
     let output = session_output(&case_dir, &workdir);
-    let refusal_prefix = REFUSAL_CODES.into_iter().find(|code| output.contains(code));
+    let refusal_prefix = LAUNCH_REFUSAL_CODES
+        .into_iter()
+        .chain(HARNESS_CODES)
+        .find(|code| output.contains(code));
     let refusal_code = refusal_prefix.map(|prefix| whole_code(&output, prefix));
     let mut launch_refusal = refusal_prefix.map(|code| excerpt(&output, code));
     // What the tool call returned, whatever happened. When the probe was killed mid-case this is

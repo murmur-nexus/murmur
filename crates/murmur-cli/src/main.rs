@@ -886,10 +886,7 @@ fn main() {
         Err(err) => exit_with_error(&err),
         Ok(()) => {
             if let Some(failure) = capsule_runtime::diagnostic::stdout_failure() {
-                exit_with_error(&error::CliError::new(
-                    error::E_IO_003,
-                    format!("failed to write to standard output: {failure}"),
-                ));
+                exit_on_stdout_failure(&failure);
             }
         }
     }
@@ -913,13 +910,18 @@ fn exit_on_parse_error(err: &clap::Error) -> ! {
         .and_then(|()| std::io::Write::flush(&mut std::io::stdout()));
     match written {
         Err(failure) if failure.kind() != std::io::ErrorKind::BrokenPipe => {
-            exit_with_error(&error::CliError::new(
-                error::E_IO_003,
-                format!("failed to write to standard output: {failure}"),
-            ))
+            exit_on_stdout_failure(&failure)
         }
         _ => std::process::exit(err.exit_code()),
     }
+}
+
+/// Fail a command whose standard output refused a write with `E-IO-003` and exit 1.
+fn exit_on_stdout_failure(failure: &impl std::fmt::Display) -> ! {
+    exit_with_error(&error::CliError::new(
+        error::E_IO_003,
+        format!("failed to write to standard output: {failure}"),
+    ))
 }
 
 /// Report a failed command and exit 1.

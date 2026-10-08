@@ -2,12 +2,11 @@
 
 !!! warning "Status: **PARTIAL — 2026-08-06.** Scenarios 1–5 and 7 pass through live capsule sessions on Ubuntu 24.04; scenario 7 covers the capability-grant reason only. Scenario 6's answer — `CAP_SYS_PTRACE` is not required — was measured with a user-namespace substitute for `docker run`; the two-arm `docker run` comparison has not been run."
 
-    This procedure must be run by hand, on a real Linux host. CI runners never resolve to an
-    enforcement tier where the network namespace is created, so a green `cargo build`,
-    `cargo test` or `cargo clippy` says nothing about this boundary and must not be reported as if
-    it did — see [What the automated suite does not establish](#what-this-deliberately-is-not).
+    This procedure must be run by hand, on a real Linux host: a green `cargo build`, `cargo test`
+    or `cargo clippy` says nothing about this boundary — see
+    [What the automated suite does not establish](#what-this-deliberately-is-not).
 
-    Every run so far is recorded in [Recording the result](#recording-the-result), with the host,
+    Every run is recorded in [Recording the result](#recording-the-result), with the host,
     the date and what was observed. Read that section before treating this page as a clean pass.
 
 ## What is being verified { #what-this-verifies }
@@ -272,30 +271,19 @@ runtime. Setting `capabilities.network.unix_sockets: true` lifts this rule for t
 
 ## Scenario 6 — does a container still need `CAP_SYS_PTRACE`? { #scenario-6 }
 
-**Answer: no.** The runtime's `ptrace_may_access`-gated reads are gone:
+**Answer: no.** No decision the runtime takes reads a subprocess's memory, so none depends on the
+kernel's `ptrace_may_access` check:
 
 - `connect`/`sendto` are decided by the network namespace and the egress proxy;
 - `execve`/`execveat` are decided by Landlock `Execute` rights on the path the kernel resolved;
-- the seccomp filter carries no notify rule, so nothing in the runtime reads another process's
-  memory through `/proc/<pid>/mem`.
+- the seccomp filter carries no notify rule, so no syscall is stopped for the runtime to inspect.
 
 The runtime process marks itself non-dumpable at startup and every subprocess inherits that flag
 and keeps it. With no reader, nothing needs a dumpable subprocess or `CAP_SYS_PTRACE`. What a
 container does need is `--cap-add SYS_ADMIN`, to create the capsule's network namespace; without it
 the launch refuses with `E-CAP-005`.
 
-### 6a — no `/proc/<pid>/mem` reader remains { #scenario-6a }
-
-From a murmur checkout:
-
-```bash
-grep -rn 'read_sockaddr_ip_from_child\|read_cstr_from_child' crates/capsule-runtime/src/
-grep -rn 'ScmpAction::Notify' crates/capsule-runtime/src/
-```
-
-**Expected:** no matches for either.
-
-### 6b — the capability matrix, without a container runtime { #scenario-6b }
+### 6a — the capability matrix, without a container runtime { #scenario-6a }
 
 `ptrace_may_access` on a subprocess passes either for a same-uid caller on a **dumpable** target
 or for a caller holding `CAP_SYS_PTRACE` in the target's user namespace. The matrix runs an
@@ -324,7 +312,7 @@ unshare -Ur capsh --drop=cap_sys_ptrace -- -c '<binary> <probe> --exact --nocapt
 `CAP_SYS_PTRACE`, the combination in which any memory read of the subprocess fails with
 `Permission denied (os error 13)`; their passing is the negative result.
 
-### 6c — the two-arm `docker run` comparison { #scenario-6c }
+### 6b — the two-arm `docker run` comparison { #scenario-6b }
 
 What the substitute does not reproduce is Docker's two other defaults, the `docker-default`
 AppArmor profile and the default seccomp profile. Neither is a capability, and
@@ -520,7 +508,7 @@ behaviour recorded under [Known limits](#known-limits).
 
 **Host.** `Linux 7.0.0-28-generic`, x86_64, Ubuntu 24.04, no container runtime
 (`command -v docker podman` → nothing), so the `docker run` arms were replaced by the
-[6b](#scenario-6b) substitute. The runtime process was made non-dumpable first, as in production.
+[6a](#scenario-6a) substitute. The runtime process was made non-dumpable first, as in production.
 
 At this date the runtime's exec check read the executable path from the subprocess's memory, and
 the subprocess re-enabled its own dumpable flag before exec so that the read could pass without a
@@ -567,31 +555,18 @@ FAILED
 **Result: `CAP_SYS_PTRACE` is not required.** Configs 1–3 pass. Controls B and C fail with
 `Permission denied (os error 13)`, and control A shows `CAP_SYS_PTRACE` alone turns that back into
 a pass, so the capability was the deciding variable and configs 1–3 are a real negative. The
-two-arm `docker run` comparison in [6c](#scenario-6c) is PENDING.
+two-arm `docker run` comparison in [6b](#scenario-6b) is PENDING.
 
 ### Pending
 
 | Scenario | What remains | Needs |
 |---|---|---|
-| [6c](#scenario-6c) | The two-arm `docker run` comparison | A host with a container runtime |
+| [6b](#scenario-6b) | The two-arm `docker run` comparison | A host with a container runtime |
 | [7](#scenario-7) | The kernel-support-missing reason | A host that can be set to `user.max_user_namespaces=0`, or a kernel built with `CONFIG_USER_NS=n` |
 
 ## Known limits { #known-limits }
 
-- **Only proxy-reachable ports work.** The namespace binds a listener for each port the allowlist
-  implies, and connections are relayed by address. A destination on a port no allow entry names has
-  no listener and is refused by the kernel, so an allowlist of `https://api.example.com` does not
-  make `api.example.com:22` reachable. The failure looks like a network fault rather than a policy
-  decision.
-- **IPv4 only, and a dual-stack name's real IPv6 address is still handed out.** The namespace
-  installs no IPv6 route, so an IPv6 destination fails with `ENETUNREACH` whatever DNS said. The
-  resolver answers `AAAA` with no records only when the name has no IPv6 address upstream; a
-  dual-stack name's real `AAAA` records are returned unchanged. A client that tries IPv6 first pays
-  a fallback-to-IPv4 delay but is granted nothing. A capsule whose allowlisted host is IPv6-only
-  cannot reach it.
-- **The address→name binding has a lifetime.** A connection is matched to a name through the
-  answer the runtime's own resolver gave. The binding lasts five minutes, longer than the
-  60-second TTL on the synthesised record. A client that caches an address far past its TTL and connects much later is
-  checked against the launch-time address set instead, as a literal address is.
+- **Network reach.** The namespace's port, IPv4 and address→name binding limits are listed in
+  [Network reach limits](containment.md#network-reach-limits).
 - **`/proc` is the host's on the `sealed` tier**, so process metadata visibility is as
   [`sealed`'s `/proc` exception](containment.md#field-containment) describes.

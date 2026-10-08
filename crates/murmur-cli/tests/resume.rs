@@ -778,7 +778,7 @@ fn a_torn_final_trace_line_still_resumes() {
         "the status must name the torn line: {stdout}"
     );
 
-    // A command that compares totals still refuses it, naming the line it tore on.
+    // A command that compares totals refuses it, naming the line it tore on.
     let diff = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", f.home.path())

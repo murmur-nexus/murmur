@@ -392,15 +392,18 @@ and usually well under a second per level. With the default [`--max-depth`](#the
 | The delegating task ends any other way while the child is still running | The task ends the child, and records it `terminated` |
 | The [delegation deadline](#bounds) passes | The child is ended, and the task continues with a `terminated` outcome |
 
-Ending a child sends it `SIGTERM` and gives it 5 seconds to wind down before `SIGKILL`. In that
-time the child cancels its task and writes `session_end` — `canceled` when it was mid-task, `ok`
-when it was idle — so `mur trace show` on its trace says how it ended; it writes no
-`spawner_ended`. A task that ends several children signals them all at once, so the whole ending
-waits one 5-second grace. A child still running after the grace, or one killed together with a
-parent that was itself killed, leaves a trace with no `session_end`, which
-[`mur trace show`](cli.md#mur-trace-show) reads as `ended without a session_end` and names its last
-event. Whatever the child records about itself while it winds down, its `completion.json` is the
-launcher's `terminated` record, written once the child has exited.
+Ending a child sends it `SIGTERM` and gives it 5 seconds to wind down before `SIGKILL`. A task
+that ends several children signals them all at once, so the whole ending waits one 5-second grace.
+What the child's own trace records depends on how it went down:
+
+| The child | Its trace |
+|---|---|
+| Exits within the 5 seconds, mid-task | Its task cancelled, then `session_end` with `exit_status: canceled`, and no `spawner_ended` |
+| Exits within the 5 seconds, idle | `session_end` with `exit_status: ok`, and no `spawner_ended` |
+| Is still running after the 5 seconds, or is killed together with a parent that was itself killed | No `session_end`. [`mur trace show`](cli.md#mur-trace-show) reads it as `ended without a session_end` and names its last event |
+
+Whatever the child records about itself, its `completion.json` is the launcher's `terminated`
+record, written once the child has exited.
 
 A plan `capsule` step's child is ended the same way when the step returns, which it does within
 about a second of the delegating task being cancelled, and otherwise ends with the parent's

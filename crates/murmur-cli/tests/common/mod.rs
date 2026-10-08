@@ -40,6 +40,34 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
+/// A capsule its parent ended on purpose wound down from `SIGTERM`: the trace at `trace_path`
+/// closes with a `canceled` `session_end`, and `mur trace show` opens it, exits 0 and says so.
+pub fn assert_trace_ends_canceled(trace_path: &Path) {
+    let contents = fs::read_to_string(trace_path)
+        .unwrap_or_else(|error| panic!("no trace at {} ({error})", trace_path.display()));
+    let last: Value = contents
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .expect("the trace has lines");
+    assert_eq!(last["event_type"], "session_end", "{last}");
+    assert_eq!(last["exit_status"], "canceled", "{last}");
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["trace", "show"])
+        .arg(trace_path)
+        .env_remove("NEXUS_API_KEY")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "mur trace show refused the trace: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("\nstatus:     canceled\n"), "{stdout}");
+}
+
 /// The first file named `name` anywhere beneath `root`, for tests that have to find a session's
 /// `trace.jsonl` without knowing the session id the run chose.
 pub fn find_file(root: &Path, name: &str) -> Option<PathBuf> {

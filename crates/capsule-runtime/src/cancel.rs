@@ -451,7 +451,7 @@ impl Drop for DelegationScope {
     }
 }
 
-/// Send every child among `delegations` that has not reported `SIGTERM`, before any is waited
+/// Send `SIGTERM` to every child among `delegations` that has not reported, before any is waited
 /// for, so ending them all together waits one [`crate::child_launch::CHILD_END_GRACE`] rather
 /// than one per child. Each is then ended and reaped by whoever ends it — its handle's
 /// `shutdown` or `Drop`. An arrived child is left alone: it is already exiting on its own.

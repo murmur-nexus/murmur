@@ -6,8 +6,8 @@ use std::fs::File;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 
-/// A version line `ENOSPC` refused fails the run: the installer's smoke run reads exit 0 as a
-/// binary that starts.
+/// A version line `ENOSPC` refused fails the run with exit 1, so exit 0 means the line was
+/// written.
 #[test]
 fn a_full_disk_on_stdout_fails_version_with_e_io_003() {
     let full = File::options().write(true).open("/dev/full").unwrap();

@@ -891,8 +891,9 @@ Fix: murmur-tool-git: native binary is built for darwin-aarch64 — reinstall mu
 
 ### Memory bound { #doctor-memory-bound }
 
-The `Memory bound` block shows the ceiling the capsule's native subprocess tree runs under on this
-host, as the cgroup scope files a launch writes:
+The `Memory bound` block shows `capabilities.resources.cgroup_memory_bytes`, the aggregate memory
+bound on the capsule's native subprocess tree, as the cgroup scope files a launch on this host
+writes:
 
 ```text
 Memory bound
@@ -908,10 +909,9 @@ Memory bound
 | `memory.swap.max 0` | The scope's swap ceiling. Swap is bounded at zero, so a tree over `memory.max` is OOM-killed rather than pushed out to swap |
 | `memory.swap.max: swap is not bounded on this host — …` | This kernel exposes no `memory.swap.max` — swap support compiled out, or swap accounting off at boot — so `memory.max` bounds resident memory only. The line ends saying whether `/proc/swaps` lists an active swap area |
 | `memory.swap.max 0 where this kernel exposes it — …` | No cgroup this process can see has the memory controller, so whether the kernel exposes the file is unknown. The line ends saying whether swap is active |
-| `not applied on this host: cgroup bounds are Linux-only, …` | Off Linux, in place of the three cgroup lines |
+| `not applied on this host: cgroup bounds are Linux-only, …` | Off Linux, in place of the `memory.max` and `memory.swap.max` lines |
 
-The block is a report: none of its lines changes the exit code. A scope is created only for a
-capsule that can start a native subprocess.
+A scope is created only for a capsule that can start a native subprocess.
 
 ### Lock integrity
 
@@ -2309,7 +2309,7 @@ A final line that is not valid JSON — what a process killed mid-write leaves �
 `status:` line ends with `line <n>, the last, is not valid JSON and was skipped`. A malformed line
 anywhere else, or a trace with no `session_start`, fails with [`E-TRC-001`](diagnostics.md) naming
 the file. [`mur trace diff`](#mur-trace-diff) and [`mur trace report`](#mur-trace-report) compare
-recorded totals, so they keep refusing a trace with no `session_end` or a torn line.
+recorded totals, so they refuse a trace with no `session_end` or a torn line.
 
 Output sections, in the order they are printed:
 

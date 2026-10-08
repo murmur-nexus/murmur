@@ -189,7 +189,6 @@ pub fn active_swap_areas() -> Option<usize> {
 }
 
 /// Count the device lines in `/proc/swaps` contents, below its one header line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn count_swap_areas(contents: &str) -> usize {
     contents
         .lines()

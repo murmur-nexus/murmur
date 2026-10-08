@@ -1676,7 +1676,7 @@ fn parse_trace_records(path: &Path) -> Result<Vec<TraceRecord>, CliError> {
 /// [`parse_trace_records`], plus what the trace's first and last lines say, with one exception
 /// to its strictness when `skip_torn_tail` is set: a final line that is not valid JSON — the
 /// shape a writer killed mid-line leaves — is skipped and named in [`TraceTail::torn_line`]. A
-/// malformed line anywhere before it is refused as ever.
+/// malformed line anywhere before it is refused.
 fn read_trace(
     path: &Path,
     skip_torn_tail: bool,
@@ -2394,7 +2394,7 @@ fn load_metrics(path: &Path) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliErro
 /// [`load_metrics`] for `mur trace show`, which also reads a trace no `session_end` closed and
 /// one whose final line is torn: a session killed outright leaves its trace that way, and it is
 /// the one trace that says what that session was doing. `mur trace diff` and the multi-session
-/// report compare totals, so they keep refusing such a trace through [`load_metrics`].
+/// report compare totals, so they refuse such a trace through [`load_metrics`].
 fn load_metrics_for_show(path: &Path) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliError> {
     let (records, tail) = read_trace(path, true)?;
     if records.is_empty() {
@@ -5314,7 +5314,7 @@ mod tests {
             (10, 5)
         );
 
-        // Every command that compares totals still refuses it.
+        // Every command that compares totals refuses it.
         let refused = load_metrics(&path)
             .err()
             .expect("load_metrics refuses an unended trace");
@@ -5327,7 +5327,7 @@ mod tests {
     }
 
     /// A final line a killed writer left half-written is skipped and named; one anywhere else is
-    /// still refused, and so is a trace with no `session_start`.
+    /// refused, and so is a trace with no `session_start`.
     #[test]
     fn a_torn_final_line_is_skipped_and_named_and_any_other_is_refused() {
         let torn = r#"{"event_type":"task_end","session_"#;

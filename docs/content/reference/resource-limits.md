@@ -63,7 +63,7 @@ Three mechanisms enforce the block, in descending order of portability:
 | Mechanism | Fields | Platforms | Notes |
 |---|---|---|---|
 | `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field. `max_processes` applies only to a process with no cgroup scope; see [`max_processes` by platform](#max-processes-headroom) |
-| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host |
+| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `cgroup_memory_bytes` is the scope's `memory.max`, and its `memory.swap.max` is `0`, so the ceiling bounds the tree's whole footprint rather than only its resident memory. On a kernel built without swap support, or booted with swap accounting off, a scope has no `memory.swap.max`: the launch proceeds with swap unbounded, and [`mur doctor`](cli.md#doctor-memory-bound) reports it. `cgroup_pids_max` is the process bound for a subprocess in a scope: it counts only the capsule's own tree, where `RLIMIT_NPROC` counts every thread the user account owns on the host |
 | A periodic workdir-size check | `workdir_max_bytes` | Every platform | The workdir is walked every 10 seconds, and the cadence has no manifest field, so a breach is caught within one interval rather than at the moment it happens. It ends the session with `E-RUN-013` and blocks any further subprocess |
 
 ### `max_processes` by platform { #max-processes-headroom }
@@ -102,12 +102,11 @@ not enforce `RLIMIT_DATA`.
 ### Whether the I/O ceiling applied { #io-max-report }
 
 `cgroup_io_bytes_per_sec` is the one cgroup limit whose failure does not refuse a launch.
-`memory.max`, `memory.swap.max`, `pids.max` and `cpu.max` are settable on any cgroup v2 host once
-the controllers are delegated, so a failure there means the bound genuinely does not exist and the
-session must not start. A kernel built without swap support, or booted with swap accounting off,
-gives a scope no `memory.swap.max` at all; there the launch proceeds with swap unbounded, and
-[`mur doctor`](cli.md#mur-doctor) reports it. `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block device behind it
-— tmpfs, overlayfs, FUSE and network mounts — has none to name. A capsule that saturates disk
+`memory.max`, `pids.max` and `cpu.max`, and `memory.swap.max` wherever the kernel has it, are
+settable on any cgroup v2 host once the controllers are delegated, so a failure there means the
+bound genuinely does not exist and the session must not start. `io.max` names a block device by
+`MAJ:MIN`, and a filesystem with no block device behind it — tmpfs, overlayfs, FUSE and network
+mounts — has none to name. A capsule that saturates disk
 bandwidth is slow; one that exhausts memory or pids is fatal.
 
 Every session reports what became of the ceiling, in an `io_max` object carried by

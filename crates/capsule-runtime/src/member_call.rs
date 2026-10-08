@@ -49,7 +49,7 @@ const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long [`MemberCalls::account_for_all`] waits for a re-offer in flight to settle: the
 /// request's own bound, and a margin for the watcher to record what it learned.
-const OFFER_SETTLE_BOUND: Duration = Duration::from_secs(6);
+const OFFER_SETTLE_BOUND: Duration = POLL_REQUEST_TIMEOUT.saturating_add(Duration::from_secs(1));
 
 /// How long after a busy refusal a watcher offers the task again the first time. Each later wait
 /// doubles, up to [`BUSY_OFFER_MAX_DELAY`].
@@ -283,6 +283,18 @@ pub(crate) fn send_task(
     )
 }
 
+/// A door's JSON-RPC `error` object as `JSON-RPC error <code>: <message>`.
+fn rpc_error_text(error: &Value) -> String {
+    format!(
+        "JSON-RPC error {}: {}",
+        error.get("code").map(Value::to_string).unwrap_or_default(),
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("no message")
+    )
+}
+
 /// [`send_task`] as one offer of the call `call_id`: the JSON-RPC request carries `request_id`,
 /// and the message is the call's own whichever offer carries it.
 fn offer_task(
@@ -319,12 +331,8 @@ fn offer_task(
     })?;
     if let Some(error) = answer.get("error") {
         return Err(StartFailure::failed(format!(
-            "{member}'s door refused the task with JSON-RPC error {}: {}",
-            error.get("code").map(Value::to_string).unwrap_or_default(),
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("no message")
+            "{member}'s door refused the task with {}",
+            rpc_error_text(error)
         )));
     }
     let task_id = answer
@@ -1423,16 +1431,7 @@ impl Watcher {
         });
         let member = &self.route.member;
         let refused = match door_request(&self.route, &body, POLL_REQUEST_TIMEOUT) {
-            Ok(answer) => answer.get("error").map(|error| {
-                format!(
-                    "JSON-RPC error {}: {}",
-                    error.get("code").map(Value::to_string).unwrap_or_default(),
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("no message")
-                )
-            }),
+            Ok(answer) => answer.get("error").map(rpc_error_text),
             Err(error) => Some(error.into_text()),
         };
         if let Some(reason) = refused {
@@ -1511,12 +1510,8 @@ impl Watcher {
                     held,
                     MemberCallStatus::Failed,
                     format!(
-                        "{member}'s door answered tasks/get with JSON-RPC error {}: {}",
-                        error.get("code").map(Value::to_string).unwrap_or_default(),
-                        error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("no message")
+                        "{member}'s door answered tasks/get with {}",
+                        rpc_error_text(error)
                     ),
                 ));
             }

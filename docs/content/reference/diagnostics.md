@@ -1096,7 +1096,7 @@ Two host conditions produce it, and the refusal text names which one:
 
 | Reason reported | What to do |
 |---|---|
-| The kernel provides unprivileged user namespaces but this host withholds them — AppArmor's `restrict_unprivileged_userns` is on and the shipped profile is not confining `mur`, `unshare` was refused outright (the container case), or the namespace could not be owned or configured | Install and load the AppArmor profile shipped with `mur`, or run outside the container restriction. The refusal text names the exact command for the host it printed on |
+| The kernel provides unprivileged user namespaces but this host withholds them — AppArmor's `restrict_unprivileged_userns` is on and the shipped profile is not confining `mur`, `unshare` was refused outright (the container case), or the namespace could not be owned or configured | Install and load the AppArmor profile shipped with `mur`. Inside a container, add `--cap-add SYS_ADMIN` to the container invocation — the one capability the namespace needs — or create the network namespace outside the container and run `mur` inside it. The refusal text names the exact command for the host it printed on |
 | The kernel does not provide the mechanism at all — `CONFIG_USER_NS=n`, or `user.max_user_namespaces=0` | Enable user namespaces on the host |
 
 This applies to **every** Linux capsule that can spawn a subprocess, including one whose
@@ -1886,8 +1886,8 @@ A member holds a fixed number of tasks at once, set by its own
 [`lifecycle`](manifest.md#field-lifecycle). A call that arrives while it holds that many waits:
 the calling member's [`call-member`](runtime-provided-tools.md#call-member) offers the task again
 with backoff until the member takes it, and ends the call `rejected` only if the member stays full
-until the call's deadline. A member that holds no task never takes one, so every call to it ends
-`rejected` at its deadline. See [A busy member](runtime-provided-tools.md#call-member-busy).
+until the call's deadline. A member the table below gives 0 tasks never takes one, so every call
+to it ends `rejected` at its deadline. See [A busy member](runtime-provided-tools.md#call-member-busy).
 
 | `lifecycle.task_acceptance` | Tasks held at once |
 |---|---|

@@ -279,7 +279,7 @@ If it did not fire:
 fired:      no
 ```
 
-A compaction event is not a turn, but `inference.max_turns` counts inference calls: a compaction hook that summarizes through `run-inference` spends one of the task's turns on each call it makes, and a hook that replaces the context without calling `run-inference` spends none. The model continues from where it left off with the condensed history.
+`inference.max_turns` counts inference calls, so a compaction hook that summarizes through `run-inference` spends one of the task's turns on each call it makes, and a hook that replaces the context without calling `run-inference` spends none. The model continues from where it left off with the condensed history.
 
 ---
 

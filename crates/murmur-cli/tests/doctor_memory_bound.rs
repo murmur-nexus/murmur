@@ -87,12 +87,16 @@ fn doctor_reports_the_declared_memory_ceiling_and_a_zero_swap_bound() {
     }
 }
 
-/// On this repository's Linux development hosts the user cgroup tree carries the memory
-/// controller, so the probe is expected to answer rather than give up.
+/// Where this kernel exposes `memory.swap.max`, the block prints both cgroup values exactly. A
+/// host whose probe answers otherwise is covered by the test above.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_linux_host_with_a_memory_controller_shows_both_values() {
     if capsule_runtime::probe_swap_control() != capsule_runtime::SwapControl::Exposed {
+        eprintln!(
+            "[SKIP-HOST] a_linux_host_with_a_memory_controller_shows_both_values: this kernel \
+             exposes no memory.swap.max to this process's cgroups"
+        );
         return;
     }
     let home = TempDir::new().unwrap();
