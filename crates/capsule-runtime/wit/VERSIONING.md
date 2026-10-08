@@ -361,9 +361,19 @@ failure with a known fix is preferable to a compatibility layer that accretes
 one shim per bump and is never removed.
 
 Practically, this means the cost of a bump is paid at bump time, by whoever
-makes it: bump the version here, rebuild the artifacts in `default-artifacts`
-(see the sync note in [README.md](README.md)), and republish. Do not reach for
-a fallback to defer that work.
+makes it:
+
+1. Bump the version here.
+2. Rebuild this repository's own committed components with
+   `scripts/rebuild-components.sh` from the repository root, and commit them.
+   `scripts/rebuild-components.sh --check` names every one the bump left
+   stale, with the command that rebuilds it; the components and the WIT
+   subtree each builds against are listed in
+   [components.list](components.list).
+3. Rebuild the artifacts in `default-artifacts` (see the sync note in
+   [README.md](README.md)), and republish.
+
+Do not reach for a fallback to defer that work.
 
 If you are reviewing a change that adds a version fallback of any kind — a
 compat struct mirroring an old shape, a `match` on a legacy version, a

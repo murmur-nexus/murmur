@@ -21,8 +21,8 @@ report travels through the gateway rather than a file. Every lifecycle event ret
 
 ## Rebuild
 
+From the repository root:
+
 ```bash
-cd src/gateway-probe-hook
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/gateway_probe_hook_fixture.wasm ../../hook/gateway-probe-hook.wasm
+scripts/rebuild-components.sh gateway-probe-hook
 ```

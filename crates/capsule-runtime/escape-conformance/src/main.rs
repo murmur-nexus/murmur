@@ -410,8 +410,8 @@ fn run() -> Result<u8, String> {
         eprintln!(
             "\nREFUSED — the embedded {}@{} does not export the process driver interface this \
              runtime accepts.\n  {err}\n\n\
-             Rebuild it as crates/capsule-runtime/escape-conformance/driver/README.md describes, \
-             then rebuild this binary. No record file was written.",
+             Rebuild it by running `scripts/rebuild-components.sh escape-conformance-driver` \
+             from the repository root, then rebuild this binary. No record file was written.",
             driver_artifact::DRIVER_NAME,
             driver_artifact::DRIVER_VERSION
         );

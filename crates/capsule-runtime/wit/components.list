@@ -1,0 +1,68 @@
+# Every committed WASM component in this repository, one per line.
+#
+# scripts/rebuild-components.sh reads this file. With no argument it rebuilds every line that is
+# not frozen and copies the result over the committed output; with --check it writes nothing and
+# names every non-frozen component whose murmur:* interface versions differ from the ones its WIT
+# subtree declares. A test (crates/committed-components) runs the same check and also fails on a
+# committed .wasm under crates/ that no line names, so adding a committed component means adding
+# a line here.
+#
+# Columns, separated by whitespace:
+#
+#   name      what the command calls the component: `scripts/rebuild-components.sh <name>`
+#   wit       the WIT directory its wit_bindgen::generate! names as `path:`; the check compares
+#             the component against the `package murmur:*` declarations under it
+#   source    the cargo package it is built from (a directory holding Cargo.toml)
+#   features  cargo features to build it with, comma-separated
+#   output    the committed .wasm the build is copied over
+#
+# Paths are relative to the repository root, and `-` means none. A line may end with
+# `frozen: <reason>`, running to the end of the line: the command never builds or writes a frozen
+# component, and the check reports it as skipped with the reason. A non-frozen line names a wit
+# directory and a source; a frozen line may write `-` for either.
+#
+# Lines starting with `#` and blank lines are ignored.
+
+continuation-driver         crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/continuation-driver/src/continuation-driver    -            crates/murmur-cli/tests/fixtures/continuation-driver/tool/continuation-driver.wasm
+env-report-driver           crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/env-report-driver/src/env-report-driver        -            crates/murmur-cli/tests/fixtures/env-report-driver/tool/env-report-driver.wasm
+formation-probe             crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/formation-probe/src/formation-probe            -            crates/murmur-cli/tests/fixtures/formation-probe/tool/formation-probe.wasm
+gateway-probe               crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/gateway-probe/src/gateway-probe                -            crates/murmur-cli/tests/fixtures/gateway-probe/tool/gateway-probe.wasm
+capsule-gateway-probe       crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/gateway-probe/src/capsule-gateway-probe        -            crates/murmur-cli/tests/fixtures/gateway-probe/capsule/capsule-gateway-probe.wasm
+gateway-probe-hook          crates/capsule-runtime/wit/hook                         crates/murmur-cli/tests/fixtures/gateway-probe-hook/src/gateway-probe-hook      -            crates/murmur-cli/tests/fixtures/gateway-probe-hook/hook/gateway-probe-hook.wasm
+graduation-capsule          crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/graduation/src/graduation-capsule              -            crates/murmur-cli/tests/fixtures/graduation/capsule/capsule.wasm
+jsonl-line-count            crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/graduation/src/jsonl-line-count                -            crates/murmur-cli/tests/fixtures/graduation/tool/jsonl-line-count.wasm
+request-input-tool          crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/input-required/src/request-input-tool          -            crates/murmur-cli/tests/fixtures/input-required/tool/request-input-tool.wasm
+process-driver              crates/capsule-runtime/wit/process-driver               crates/murmur-cli/tests/fixtures/process-driver/src/process-driver              -            crates/murmur-cli/tests/fixtures/process-driver/tool/process-driver.wasm
+process-driver-signal       crates/capsule-runtime/wit/process-driver               crates/murmur-cli/tests/fixtures/process-driver/src/process-driver              signal-int   crates/murmur-cli/tests/fixtures/process-driver/tool/process-driver-signal.wasm
+process-driver-unsupported  crates/capsule-runtime/wit/process-driver               crates/murmur-cli/tests/fixtures/process-driver/src/process-driver              unsupported  crates/murmur-cli/tests/fixtures/process-driver/tool/process-driver-unsupported.wasm
+process-driver-no-usage     crates/capsule-runtime/wit/process-driver               crates/murmur-cli/tests/fixtures/process-driver/src/process-driver              no-usage     crates/murmur-cli/tests/fixtures/process-driver/tool/process-driver-no-usage.wasm
+capsule-allowlisted         crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-allowlisted                    -            crates/murmur-cli/tests/fixtures/run/components/capsule-allowlisted.wasm
+capsule-config-echo         crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-config-echo                    -            crates/murmur-cli/tests/fixtures/run/components/capsule-config-echo.wasm
+capsule-env-echo            crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-env-echo                       -            crates/murmur-cli/tests/fixtures/run/components/capsule-env-echo.wasm
+capsule-filesystem-escape   crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-filesystem-escape              -            crates/murmur-cli/tests/fixtures/run/components/capsule-filesystem-escape.wasm
+capsule-memory-balloon      crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-memory-balloon                 -            crates/murmur-cli/tests/fixtures/run/components/capsule-memory-balloon.wasm
+capsule-network-attempt     crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-network-attempt                -            crates/murmur-cli/tests/fixtures/run/components/capsule-network-attempt.wasm
+capsule-path-reader         crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-path-reader                    -            crates/murmur-cli/tests/fixtures/run/components/capsule-path-reader.wasm
+capsule-sleep-input         crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-sleep-input                    -            crates/murmur-cli/tests/fixtures/run/components/capsule-sleep-input.wasm
+capsule-sleep-long          crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-sleep-long                     -            crates/murmur-cli/tests/fixtures/run/components/capsule-sleep-long.wasm
+capsule-spin-loop           crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-spin-loop                      -            crates/murmur-cli/tests/fixtures/run/components/capsule-spin-loop.wasm
+capsule-state-probe         crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-state-probe                    -            crates/murmur-cli/tests/fixtures/run/components/capsule-state-probe.wasm
+capsule-state-writer        crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-state-writer                   -            crates/murmur-cli/tests/fixtures/run/components/capsule-state-writer.wasm
+capsule-unlisted            crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/capsule-unlisted                       -            crates/murmur-cli/tests/fixtures/run/components/capsule-unlisted.wasm
+config-echo                 crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/config-echo                            -            crates/murmur-cli/tests/fixtures/run/components/config-echo.wasm
+echo-tool                   crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/echo-tool                              -            crates/murmur-cli/tests/fixtures/run/components/echo-tool.wasm
+state-writer                crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/run/src/state-writer                           -            crates/murmur-cli/tests/fixtures/run/components/state-writer.wasm
+streaming-driver            crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/streaming-driver/src/streaming-driver          -            crates/murmur-cli/tests/fixtures/streaming-driver/tool/streaming-driver.wasm
+tool-progress-driver        crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/tool-progress-driver/src/tool-progress-driver  -            crates/murmur-cli/tests/fixtures/tool-progress-driver/tool/tool-progress-driver.wasm
+truncation-driver           crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/truncation-driver/src/truncation-driver        -            crates/murmur-cli/tests/fixtures/truncation-driver/tool/truncation-driver.wasm
+usage-driver                crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/usage-driver/src/usage-driver                  -            crates/murmur-cli/tests/fixtures/usage-driver/tool/usage-driver.wasm
+wire-digest-driver          crates/capsule-runtime/wit/guest                        crates/murmur-cli/tests/fixtures/wire-digest-driver/src/wire-digest-driver      -            crates/murmur-cli/tests/fixtures/wire-digest-driver/tool/wire-digest-driver.wasm
+escape-conformance-driver   crates/capsule-runtime/wit/process-driver               crates/capsule-runtime/escape-conformance/driver                                -            crates/capsule-runtime/escape-conformance/driver/escape_conformance_driver.wasm
+
+# Frozen.
+process-driver-v1           crates/murmur-cli/tests/fixtures/process-driver-v1/wit  crates/murmur-cli/tests/fixtures/process-driver-v1/src/process-driver-v1        -            crates/murmur-cli/tests/fixtures/process-driver-v1/tool/process-driver-v1.wasm  frozen: built against its own frozen wit/ at the retired murmur:driver/process@0.1.0 so the refusal stays testable; never rebuild it to follow an interface change
+process-driver-v2           crates/murmur-cli/tests/fixtures/process-driver-v2/wit  crates/murmur-cli/tests/fixtures/process-driver-v2/src/process-driver-v2        -            crates/murmur-cli/tests/fixtures/process-driver-v2/tool/process-driver-v2.wasm  frozen: built against its own frozen wit/ at the retired murmur:driver/process@0.2.0 so the refusal stays testable; never rebuild it to follow an interface change
+streaming-driver-text       crates/capsule-runtime/wit/guest                        -                                                                               -            crates/murmur-cli/tests/fixtures/streaming-driver-text/tool/streaming-driver.wasm  frozen: imports the retired murmur:text/chunks@0.1.0; no source exists and a rebuild against the current tree would no longer import it
+murmur-driver-anthropic     crates/capsule-runtime/wit/guest                        -                                                                               -            crates/murmur-cli/tests/fixtures/drivers/anthropic/driver/murmur-driver-anthropic.wasm  frozen: built in default-artifacts and copied in; see crates/murmur-cli/tests/fixtures/drivers/src/README.md
+murmur-driver-openai        crates/capsule-runtime/wit/guest                        -                                                                               -            crates/murmur-cli/tests/fixtures/drivers/openai/driver/murmur-driver-openai.wasm  frozen: built in default-artifacts and copied in; see crates/murmur-cli/tests/fixtures/drivers/src/README.md
+happy-tool-placeholder      -                                                       -                                                                               -            crates/murmur-cli/tests/fixtures/happy/tool.wasm  frozen: not a component; holds the text wasm-bytes-placeholder

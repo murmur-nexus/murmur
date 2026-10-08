@@ -12,6 +12,12 @@ so this file records who binds what. Versioning policy lives in
 | `process-driver/` | `wasmtime::component::bindgen!({ path: "wit/process-driver", world: "process-driver" })` in `src/bindings.rs` — the host-side view of the process driver contract (`murmur:driver/process`) — **and** process drivers in the out-of-repo `default-artifacts` repository, which vendors this tree the same way as `hook/`. |
 | `guest/` | `wit_bindgen::generate!` in guest components: the test fixtures under `crates/murmur-cli/tests/fixtures/*/src/*` (worlds `tool`, `capsule`) **and the out-of-repo `default-artifacts` repository**, which vendors this tree (drivers, tools, and hooks there compile against its copy — see below). |
 | top-level `*.wit`, `worlds.wit`, `host.wit` | Nothing compiles these. They are the reference copies quoted by `docs/content/reference/wit-interfaces.md`. Keep them byte-identical to the bindgen copies of the same package (same version ⇒ same content, doc comments included). |
+| `components.list` | `scripts/rebuild-components.sh` and the `committed-components` crate's test. One line per WASM component committed to this repository: the subtree above it builds against, its source crate, and its committed path. |
+
+A change to any subtree here can leave a committed component built against an
+interface version the tree no longer declares.
+`scripts/rebuild-components.sh --check` names each one, and
+`scripts/rebuild-components.sh <name>` rebuilds it.
 
 ## The out-of-repo consumer
 

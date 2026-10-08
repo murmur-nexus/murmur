@@ -10,8 +10,8 @@ The committed `tool/env-report-driver.wasm` is built from `src/env-report-driver
 
 ## Rebuild
 
+From the repository root:
+
 ```bash
-cd src/env-report-driver
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/env_report_driver_fixture.wasm ../../tool/env-report-driver.wasm
+scripts/rebuild-components.sh env-report-driver
 ```

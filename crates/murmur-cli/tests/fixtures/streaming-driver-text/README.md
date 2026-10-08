@@ -17,3 +17,6 @@ they stood at that commit, when `wit/guest/deps/murmur-text/stream.wit` still de
 
 **Do not rebuild it.** There is no source here: the `murmur:text` WIT it was built from is gone
 from the tree, and a rebuild against the current tree would no longer import it.
+`crates/capsule-runtime/wit/components.list` lists it frozen, so `scripts/rebuild-components.sh`
+skips it, and `--check` reports it as skipped with the `murmur:text` interface that differs from
+the tree.

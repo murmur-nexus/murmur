@@ -26,8 +26,8 @@ peers=<value of MURMUR_FORMATION_PEERS, or absent>
 
 ## Rebuild
 
+From the repository root:
+
 ```bash
-cd src/formation-probe
-cargo build --target wasm32-wasip2 --release
-cp target/wasm32-wasip2/release/formation_probe_fixture.wasm ../../tool/formation-probe.wasm
+scripts/rebuild-components.sh formation-probe
 ```

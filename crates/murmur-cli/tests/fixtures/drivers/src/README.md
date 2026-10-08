@@ -2,6 +2,11 @@
 
 These fixture WASM files are built from the `default-artifacts` repository and copied here manually.
 
+Both copies are listed frozen in `crates/capsule-runtime/wit/components.list`, so
+`scripts/rebuild-components.sh` skips them. Its `--check` reports a `murmur:*` interface either one
+carries that `crates/capsule-runtime/wit/guest` no longer declares; that is the sign a WIT bump
+needs the build and copy below.
+
 ## Build in `default-artifacts`
 
 ```bash

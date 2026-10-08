@@ -122,7 +122,7 @@ pub use unknown_manifest_keys::{
 };
 pub use wit_contract::{
     extract_wit_contracts, wit_contracts_from_artifact_bytes, wit_contracts_from_artifact_reader,
-    ContractDirection, UnservedInterface, WitContractError, WitContracts,
+    wit_package_declarations, ContractDirection, UnservedInterface, WitContractError, WitContracts,
 };
 pub use zip_guard::{
     max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,
