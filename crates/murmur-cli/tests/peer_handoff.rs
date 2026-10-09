@@ -124,7 +124,7 @@ fn redeem(addr: &str, handle: &str, audience: &str) -> HttpResponse {
 fn http_post_json(addr: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -312,7 +312,7 @@ impl Capsule {
     /// Submits a task and waits for it to reach a terminal state.
     fn run_task(&self, id: &str, text: &str) {
         let body = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
             "params": {"message": {"messageId": id, "role": "user", "parts": [{"text": text}]}}
         })
         .to_string();
@@ -325,7 +325,7 @@ impl Capsule {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let body = json!({
-                "jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}
+                "jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}
             })
             .to_string();
             let response = http_post_json(&self.url, &body);

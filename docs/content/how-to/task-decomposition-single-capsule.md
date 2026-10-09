@@ -212,7 +212,7 @@ Router rules:
 - If a dispatch returns an error, report it in text and stop. Do not retry.
 
 Dispatch shape:
--s -X POST http://localhost:52222 -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"message/send","params":{"message":{"messageId":"task-N","role":"user","parts":[{"text":"[EXECUTE] ..."}]}},"id":N}'
+-s -X POST http://localhost:52222 -H "Content-Type: application/json" -H "A2A-Version: 1.0" -d '{"jsonrpc":"2.0","method":"SendMessage","params":{"message":{"messageId":"task-N","role":"user","parts":[{"text":"[EXECUTE] ..."}]}},"id":N}'
 ```
 
 The router completes in two turns: one to fire all dispatches in parallel, one to confirm submission and stop. It never calls any tool other than curl and never reads files — the task text arrives in the incoming message itself.

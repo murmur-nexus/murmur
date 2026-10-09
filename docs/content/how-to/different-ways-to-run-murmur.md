@@ -189,10 +189,11 @@ Send it a message over JSON-RPC:
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-001",

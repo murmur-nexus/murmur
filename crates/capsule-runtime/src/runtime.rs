@@ -198,7 +198,7 @@ fn resolve_versioned_iface<T>(
 /// When `agent_task_id` is `Some`, this function is the one writer of the task's `final:true`
 /// `status` frame, and writes exactly one, after the last `on-task-end` dispatch, after
 /// `task_end` is in the trace and after the registry slot records the terminal state — so the
-/// frame, `tasks/get` and `task_end` agree. Its state, message and response are the last
+/// frame, `GetTask` and `task_end` agree. Its state, message and response are the last
 /// attempt's [`agent::AttemptEnding`], or the reopen refusal when the budget ran out. An attempt
 /// writes no final frame of its own; between two attempts the stream gets one non-final
 /// `working` frame naming the hook and carrying `status.reopen`, the reopen's 1-based ordinal.
@@ -678,9 +678,9 @@ async fn run_task_with_reopens(
 /// `agent_task_id` is `Some` — the registry slot finished and the task's one `final:true` status
 /// written from `ending`.
 ///
-/// An accepted `tasks/cancel` the loop did not observe has already recorded `canceled`, which
+/// An accepted `CancelTask` the loop did not observe has already recorded `canceled`, which
 /// [`TaskRegistry::finish_task`] keeps; the frame then says `canceled` too, so it never disagrees
-/// with `tasks/get`.
+/// with `GetTask`.
 ///
 /// A task that ends `canceled`, after that override, gets [`write_canceled_result`] in `workdir`
 /// before its final frame, so a client that reads `out/result.txt` on seeing the frame finds the
@@ -720,7 +720,7 @@ async fn end_task(
         .into_iter()
         .map(|(member, status)| (member, status.as_str().to_string()))
         .collect();
-    // The ending `tasks/get` reports is recorded under the lock the terminal state is, after the
+    // The ending `GetTask` reports is recorded under the lock the terminal state is, after the
     // cancel override, so it is the one the final frame below says.
     let ending = match state.a2a_task_registry.as_ref() {
         None => ending,
@@ -3787,7 +3787,7 @@ fn launch(
                                             &task_id,
                                             seed,
                                             // No A2A task, so nothing a person can address a
-                                            // `tasks/cancel` to; only `SIGTERM` cancels it.
+                                            // `CancelTask` to; only `SIGTERM` cancels it.
                                             Some(terminating.clone()),
                                         )
                                         .await;
@@ -4256,7 +4256,7 @@ fn launch(
                                     break 'task_loop;
                                 }
                                 // Queue+sleep: clear task.md and wait for next task. A peer's
-                                // task reports its own outcome through `tasks/get` and its
+                                // task reports its own outcome through `GetTask` and its
                                 // stream; it does not decide how a long-lived session ends.
                                 let _ = tokio::fs::remove_file(&workdir_task_md).await;
                                 continue 'task_loop;
@@ -8828,7 +8828,7 @@ impl CapsuleStoreState {
     /// Answered here, in-process, before the allowlist, like `call-member`: it exists exactly where
     /// `call-member` does. It only records the decline in the session's
     /// [`MemberCalls`](crate::member_call::MemberCalls); the agent loop ends the attempt at its
-    /// next turn boundary, and the task loop records the ending `tasks/get` reports. A refusal
+    /// next turn boundary, and the task loop records the ending `GetTask` reports. A refusal
     /// comes back to the model as a tool error. The second value is the runtime's note after the
     /// result.
     fn dispatch_end_without_answer(
@@ -11096,7 +11096,7 @@ enum Woke {
 /// `task_start`, no `on-task-start`, no request to the provider, and no `task_end`, because it
 /// never ran. The `PHASE_QUEUED` record is its ending.
 ///
-/// The final status event is the only thing that closes a `message/stream` connection on this
+/// The final status event is the only thing that closes a `SendStreamingMessage` connection on this
 /// task: it never reaches an agent loop, so nothing else would.
 async fn record_canceled_before_start(
     task: &IncomingTask,
@@ -11345,7 +11345,7 @@ async fn close_lanes_on_termination(
 /// `Rejected`, starting nothing. Runs once, after the task loop has ended.
 ///
 /// A refused task gets one `task_rejected` record and one buffered final `rejected` status
-/// frame, which is what closes a `message/stream` connection on it. It gets no `task_start`,
+/// frame, which is what closes a `SendStreamingMessage` connection on it. It gets no `task_start`,
 /// `task_end`, hook dispatch or provider request, and it is not folded into the launch outcome.
 ///
 /// The registry is closed before the channel is drained, under the lock the door enqueues under,
@@ -21243,7 +21243,7 @@ mod member_call_tests {
             assert_eq!(header("x-murmur-task-origin"), ["peer"]);
             assert_eq!(header("x-murmur-task-trust"), ["trusted"]);
             let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
-            assert_eq!(sent["method"], "message/send");
+            assert_eq!(sent["method"], "SendMessage");
             let message = &sent["params"]["message"];
             assert_eq!(message["role"], "user");
             assert_eq!(message["parts"][0]["text"], "add 2 and 2");
@@ -21678,7 +21678,7 @@ mod member_call_tests {
         );
     }
 
-    /// The door's answer to `message/send`: it holds the task as `task_id`.
+    /// The door's answer to `SendMessage`: it holds the task as `task_id`.
     fn held(task_id: &str) -> (&'static str, String) {
         (
             "200 OK",
@@ -21688,7 +21688,7 @@ mod member_call_tests {
         )
     }
 
-    /// The door's answer to `message/send`: it does not take the task, with `message`.
+    /// The door's answer to `SendMessage`: it does not take the task, with `message`.
     fn rejected(message: &str) -> (&'static str, String) {
         (
             "200 OK",
@@ -21699,7 +21699,7 @@ mod member_call_tests {
         )
     }
 
-    /// The door's answer to `message/send` when it has no room for the task.
+    /// The door's answer to `SendMessage` when it has no room for the task.
     fn busy() -> (&'static str, String) {
         rejected(crate::a2a::REJECTED_BUSY_MESSAGE)
     }
@@ -21829,7 +21829,7 @@ mod member_call_tests {
         let bodies = sent_bodies(&seen);
         let offers: Vec<&serde_json::Value> = bodies
             .iter()
-            .filter(|body| body["method"] == "message/send")
+            .filter(|body| body["method"] == "SendMessage")
             .collect();
         let ids: std::collections::HashSet<String> =
             offers.iter().map(|body| body["id"].to_string()).collect();
@@ -21956,7 +21956,7 @@ mod member_call_tests {
         assert_eq!(calls.counts(), (0, 0));
     }
 
-    /// The door's answer to `tasks/cancel`: the task is cancelled.
+    /// The door's answer to `CancelTask`: the task is cancelled.
     fn cancel_accepted(task_id: &str) -> (&'static str, String) {
         (
             "200 OK",
@@ -21990,7 +21990,7 @@ mod member_call_tests {
 
     /// A re-offer in flight when the calling task ends, which the member then takes: the task's
     /// accounting waits for it, records the call `abandoned` with the member's task id and says a
-    /// cancel was sent, and the watcher sends that task one `tasks/cancel`. The call's
+    /// cancel was sent, and the watcher sends that task one `CancelTask`. The call's
     /// `member_call_start` precedes its `member_call`, and no `member_call_busy` follows it.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_offer_taken_after_the_calling_task_ended_is_recorded_and_cancelled() {
@@ -22043,10 +22043,11 @@ mod member_call_tests {
         let bodies = sent_bodies(&seen);
         let cancels: Vec<&serde_json::Value> = bodies
             .iter()
-            .filter(|body| body["method"] == "tasks/cancel")
+            .filter(|body| body["method"] == "CancelTask")
             .collect();
         assert_eq!(cancels.len(), 1, "{bodies:?}");
         assert_eq!(cancels[0]["params"]["id"], "tsk_late");
+        assert_every_request_names_a2a_1_0(&seen);
         assert_eq!(
             sent_tasks(&seen).len(),
             2,
@@ -22129,7 +22130,7 @@ mod member_call_tests {
     }
 
     /// A call abandoned after its watcher has woken to offer the task again, and before it marks
-    /// the offer in flight, sends nothing: no `message/send` reaches the door after the first.
+    /// the offer in flight, sends nothing: no `SendMessage` reaches the door after the first.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_call_abandoned_between_the_wait_and_the_offer_sends_nothing() {
         let (port, seen) = stand_in_door(vec![busy(), held("tsk_never")]);
@@ -22171,7 +22172,7 @@ mod member_call_tests {
         );
     }
 
-    /// The door's answer to `tasks/get`: the task completed with `text`.
+    /// The door's answer to `GetTask`: the task completed with `text`.
     fn completed(task_id: &str, text: &str) -> (&'static str, String) {
         (
             "200 OK",
@@ -22182,14 +22183,14 @@ mod member_call_tests {
         )
     }
 
-    /// The `message/send` bodies a door received, as the tasks they carried.
+    /// The `SendMessage` bodies a door received, as the tasks they carried.
     fn sent_tasks(seen: &Mutex<Vec<Seen>>) -> Vec<String> {
         seen.lock()
             .unwrap()
             .iter()
             .filter_map(|request| {
                 let body: serde_json::Value = serde_json::from_str(&request.body).ok()?;
-                (body["method"] == "message/send").then(|| {
+                (body["method"] == "SendMessage").then(|| {
                     body["params"]["message"]["parts"][0]["text"]
                         .as_str()
                         .unwrap()
@@ -22366,6 +22367,47 @@ mod member_call_tests {
         assert_eq!(sent_tasks(&seen), ["first", "second"]);
         assert_eq!(events(dir.path(), "member_call").len(), 1);
         assert_eq!(events(dir.path(), "member_call_start").len(), 1);
+    }
+
+    /// Every request a stand-in door read carried `A2A-Version: 1.0`, once.
+    fn assert_every_request_names_a2a_1_0(seen: &Mutex<Vec<Seen>>) {
+        for request in seen.lock().unwrap().iter() {
+            let versions: Vec<&str> = request
+                .headers
+                .iter()
+                .filter(|(name, _)| name == "a2a-version")
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(versions, ["1.0"], "{request:?}");
+        }
+    }
+
+    /// A member call offers its task with `SendMessage` and polls it with `GetTask`, each naming
+    /// A2A 1.0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_call_offers_and_polls_with_a2a_1_0_requests() {
+        let (port, seen) = stand_in_door(vec![held("tsk_1"), completed("tsk_1", "four")]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = calling_state(
+            dir.path(),
+            member(&["worker"], &format!("http://localhost:{port}")),
+            &["localhost"],
+        )
+        .await;
+        state
+            .dispatch_call_member(call("worker", "first"))
+            .await
+            .unwrap();
+        let calls = state.member_calls.clone().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), calls.wait_for_outcome())
+            .await
+            .unwrap();
+        let methods: Vec<serde_json::Value> = sent_bodies(&seen)
+            .into_iter()
+            .map(|body| body["method"].clone())
+            .collect();
+        assert_eq!(methods, ["SendMessage", "GetTask"]);
+        assert_every_request_names_a2a_1_0(&seen);
     }
 
     /// Once its answer is taken for delivery, a member may be called again with new work.
@@ -22631,7 +22673,7 @@ mod member_call_tests {
             .unwrap();
     }
 
-    /// The door's answer to `tasks/get`: `task_id` ended `state`, with `message`, a `response`
+    /// The door's answer to `GetTask`: `task_id` ended `state`, with `message`, a `response`
     /// artifact of `response`, and `metadata`, each when given.
     fn ended_task(
         task_id: &str,
@@ -22658,7 +22700,7 @@ mod member_call_tests {
         )
     }
 
-    /// The outcome a call to `p` ends in when p's door answers `tasks/get` with `answer`.
+    /// The outcome a call to `p` ends in when p's door answers `GetTask` with `answer`.
     async fn outcome_of(answer: (&'static str, String)) -> crate::member_call::MemberCallOutcome {
         let (port, _seen) = stand_in_door(vec![held("tsk_p"), answer]);
         let dir = tempfile::tempdir().unwrap();

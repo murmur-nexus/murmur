@@ -1,9 +1,9 @@
 //! Integration tests for what a streaming client sees of a task its `on-task-end` hooks reopen.
 //!
 //! Every task that runs ends in exactly one `status` frame with `"final":true`, written after the
-//! hooks have had their say and agreeing with `tasks/get` and the trace's `task_end`. Between two
+//! hooks have had their say and agreeing with `GetTask` and the trace's `task_end`. Between two
 //! attempts the stream carries one non-final `working` frame naming the hook, with `status.reopen`
-//! set to the reopen's ordinal. `message/stream` closes on its own task's final status only.
+//! set to the reopen's ordinal. `SendStreamingMessage` closes on its own task's final status only.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -31,7 +31,7 @@ const REOPEN_ALWAYS_HOOK: &str = "reopen-always";
 const TOOL_NAME: &str = "request-input-tool";
 const TOOL_VERSION: &str = "0.1.0";
 
-/// How long a `message/stream` is read before a test gives up on the capsule closing it.
+/// How long a `SendStreamingMessage` is read before a test gives up on the capsule closing it.
 const STREAM_DEADLINE: Duration = Duration::from_secs(60);
 
 // ── capsules ───────────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ impl Frame {
     }
 }
 
-/// What one `message/stream` connection received.
+/// What one `SendStreamingMessage` connection received.
 struct Stream {
     frames: Vec<Frame>,
     /// Whether the capsule closed the connection before the deadline.
@@ -214,13 +214,13 @@ impl Stream {
     }
 }
 
-/// Send `message/stream` for a new task and return the connection, positioned at the first byte
+/// Send `SendStreamingMessage` for a new task and return the connection, positioned at the first byte
 /// of the HTTP response.
 fn open_message_stream(addr: &str, message_id: &str, text: &str) -> TcpStream {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {
             "message": {
                 "messageId": message_id,
@@ -231,7 +231,7 @@ fn open_message_stream(addr: &str, message_id: &str, text: &str) -> TcpStream {
     })
     .to_string();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
     );
     let stream = TcpStream::connect(addr).expect("should connect to capsule");
@@ -341,7 +341,7 @@ fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Frame> {
 
 fn task_state(addr: &str, task_id: &str) -> String {
     let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": task_id}
+        "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": task_id}
     });
     http_post_json(addr, &body.to_string())["result"]["status"]["state"]
         .as_str()
@@ -552,7 +552,7 @@ fn an_input_timeout_ends_the_task_with_one_failed_status() {
     assert_eq!(task_state(&capsule.url, &stream.own_task_id()), "failed");
 }
 
-/// The same timeout on a task a hook reopens is not the task's end: `tasks/get` never reads
+/// The same timeout on a task a hook reopens is not the task's end: `GetTask` never reads
 /// `failed`, no `failed` frame is written, and the reopened attempt's answer is the one final
 /// `completed` status.
 #[test]
@@ -562,14 +562,14 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
         true,
     );
 
-    // Every state `tasks/get` answers for the active task while the stream is open.
+    // Every state `GetTask` answers for the active task while the stream is open.
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let poller = {
         let (seen, stop, url) = (Arc::clone(&seen), Arc::clone(&stop), capsule.url.clone());
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let body = r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{}}"#;
+                let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{}}"#;
                 let response = http_post_json(&url, body);
                 if let Some(state) = response["result"]["status"]["state"].as_str() {
                     seen.lock().unwrap().push(state.to_string());
@@ -603,7 +603,7 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     );
     assert!(
         !seen.iter().any(|state| state == "failed"),
-        "tasks/get never reads failed: {seen:?}"
+        "GetTask never reads failed: {seen:?}"
     );
     assert_eq!(task_state(&capsule.url, &task_id), "completed");
     assert_eq!(
@@ -612,7 +612,7 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     );
 }
 
-/// `message/stream` forwards other tasks' frames but closes on its own task's final status.
+/// `SendStreamingMessage` forwards other tasks' frames but closes on its own task's final status.
 /// B, opened while A runs, receives A's final status and stays open until its own.
 #[test]
 fn message_stream_closes_on_its_own_tasks_final_status() {

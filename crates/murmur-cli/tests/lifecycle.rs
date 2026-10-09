@@ -163,7 +163,7 @@ fn http_post_json_with_headers(
 ) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
     for (name, value) in headers {
@@ -197,7 +197,7 @@ fn message_send_body(message_id: &str, text: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": message_id,
@@ -209,7 +209,7 @@ fn message_send_body(message_id: &str, text: &str) -> String {
     .to_string()
 }
 
-/// Capsule with task_acceptance: none runs from task.md but HTTP message/send returns -32601.
+/// Capsule with task_acceptance: none runs from task.md but HTTP SendMessage returns -32601.
 #[test]
 fn lifecycle_none_rejects_message_send() {
     let server = end_turn_server("none mode done");
@@ -248,7 +248,7 @@ fn lifecycle_none_rejects_message_send() {
     );
     assert_eq!(
         response["error"]["code"], -32601,
-        "task_acceptance: none should reject message/send with -32601; got: {response}"
+        "task_acceptance: none should reject SendMessage with -32601; got: {response}"
     );
 
     handle.join().expect("launch thread should not panic");
@@ -630,7 +630,7 @@ fn lifecycle_override_forces_none() {
     );
     assert_eq!(
         response["error"]["code"], -32601,
-        "overridden-to-none lifecycle should reject message/send with -32601; got: {response}"
+        "overridden-to-none lifecycle should reject SendMessage with -32601; got: {response}"
     );
 
     handle.join().expect("launch thread should not panic");
@@ -1563,21 +1563,21 @@ fn queue_exit_lifecycle() -> LifecycleConfig {
     }
 }
 
-/// `message/send` of `text`, returning the task id and the state it was answered with.
+/// `SendMessage` of `text`, returning the task id and the state it was answered with.
 fn send_task(addr: &str, message_id: &str, text: &str) -> (String, String) {
     let response = http_post_json(addr, "/", &message_send_body(message_id, text));
     let task_id = response["result"]["id"]
         .as_str()
-        .unwrap_or_else(|| panic!("message/send returned no task id: {response}"))
+        .unwrap_or_else(|| panic!("SendMessage returned no task id: {response}"))
         .to_string();
     let state = response["result"]["status"]["state"]
         .as_str()
-        .unwrap_or_else(|| panic!("message/send returned no state: {response}"))
+        .unwrap_or_else(|| panic!("SendMessage returned no state: {response}"))
         .to_string();
     (task_id, state)
 }
 
-/// Open a `message/stream` for `text` and read it until the server closes it, returning every
+/// Open a `SendStreamingMessage` for `text` and read it until the server closes it, returning every
 /// `status` frame's data in order. `headers_tx` fires once the response headers have arrived,
 /// which the door writes directly before it enqueues the task.
 fn stream_until_closed(
@@ -1588,7 +1588,7 @@ fn stream_until_closed(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {"message": {"messageId": "m-stream", "role": "user", "parts": [{"text": text}]}}
     })
     .to_string();
@@ -1597,7 +1597,7 @@ fn stream_until_closed(
         stream
             .write_all(
                 format!(
-                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),
@@ -1755,7 +1755,7 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
     assert!(stdout.contains(&task_c), "{stdout}");
 }
 
-/// A refused task reads `rejected` over `tasks/get` for as long as the door is up, a cancel of it
+/// A refused task reads `rejected` over `GetTask` for as long as the door is up, a cancel of it
 /// is a cancel of any ended task, and the closed door refuses new work without recording it.
 ///
 /// The `on-session-end` hook spins until its deadline, which holds teardown — and so the door —
@@ -1799,12 +1799,12 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
         let got = http_post_json(
             &capsule_url,
             "/",
-            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": task_b}})
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": task_b}})
                 .to_string(),
         );
         let state = got["result"]["status"]["state"]
             .as_str()
-            .unwrap_or_else(|| panic!("tasks/get answered no state: {got}"))
+            .unwrap_or_else(|| panic!("GetTask answered no state: {got}"))
             .to_string();
         let done = state == "rejected";
         seen.push(state);
@@ -1813,7 +1813,7 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "tasks/get never read rejected: {seen:?}"
+            "GetTask never read rejected: {seen:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -1830,18 +1830,17 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
     let canceled = http_post_json(
         &capsule_url,
         "/",
-        &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/cancel", "params": {"id": task_b}})
+        &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": task_b}})
             .to_string(),
     );
-    assert!(canceled.get("error").is_none(), "{canceled}");
-    assert_eq!(canceled["result"]["id"], task_b.as_str(), "{canceled}");
     assert_eq!(
-        canceled["result"]["status"]["state"], "rejected",
-        "an ended task is returned unchanged: {canceled}"
+        canceled["error"]["code"], -32002,
+        "an ended task is not cancelable: {canceled}"
     );
-    assert!(
-        canceled["result"].get("artifacts").is_none(),
-        "no residue on an ended task: {canceled}"
+    assert_eq!(
+        canceled["error"]["data"][0]["metadata"],
+        serde_json::json!({"taskId": task_b, "state": "rejected"}),
+        "{canceled}"
     );
 
     // The trapped hook is reported as a hook fault; the launch result is not this test's subject.

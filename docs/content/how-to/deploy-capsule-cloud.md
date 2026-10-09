@@ -183,7 +183,7 @@ A 200 response confirms the capsule is running:
   "description": "Murmur capsule my-agent 0.1.0",
   "version": "0.1.0",
   "supportedInterfaces": [
-    { "url": "http://localhost:9000", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+    { "url": "http://localhost:9000", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
   ],
   "capabilities": {
     "streaming": true,
@@ -195,7 +195,7 @@ A 200 response confirms the capsule is running:
         "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
           "peerTasks": false
         }
       },
@@ -213,7 +213,7 @@ A 200 response confirms the capsule is running:
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
         "required": false,
         "params": {
           "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
@@ -249,10 +249,11 @@ The deployed capsule accepts standard A2A messages at its public URL. Send a tas
 ```bash
 curl -s -X POST http://1.2.3.4:9000 \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-001",

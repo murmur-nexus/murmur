@@ -5,12 +5,15 @@
 //
 // Its input is optional `{"names": ["coder", "reviewer"]}`; without it, the names are the ones
 // `MURMUR_FORMATION_PEERS` lists. For each name, in order, it sends
-// `GET http://<name>.formation.invalid/.well-known/agent-card.json` and one JSON-RPC `message/send`
-// as `POST http://<name>.formation.invalid/`. Its summary is one line per name:
+// `GET http://<name>.formation.invalid/.well-known/agent-card.json` and one JSON-RPC `SendMessage`
+// as `POST http://<name>.formation.invalid/`, each with `A2A-Version: 1.0`. Its summary is one line
+// per name:
 //
-//   <name> card=<status|refused:<error>> send=<status|refused:<error>>
+//   <name> card=<status|refused:<error>> send=<status|status:<code>|status:-|refused:<error>>
 //
-// where `refused:<error>` is the request's failure as wasi-http reported it, and then the line
+// where `send=<status>` means the body carried a JSON-RPC `result`, `<status>:<code>` that it
+// carried an `error` with that code, `<status>:-` that it carried neither, and `refused:<error>`
+// is the request's failure as wasi-http reported it. Then the line
 // `peers=<MURMUR_FORMATION_PEERS, or absent>`.
 
 wit_bindgen::generate!({
@@ -25,14 +28,23 @@ use wasip2::io::streams::StreamError;
 
 const FORMATION_PEERS: &str = "MURMUR_FORMATION_PEERS";
 const PEER_DOMAIN: &str = "formation.invalid";
-const SEND_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"role":"user","messageId":"formation-probe","parts":[{"kind":"text","text":"hello from a formation member"}]}}}"#;
+const A2A_VERSION: (&str, &[u8]) = ("a2a-version", b"1.0");
+const SEND_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"user","messageId":"formation-probe","parts":[{"kind":"text","text":"hello from a formation member"}]}}}"#;
 
 struct FormationProbe;
 
-/// Sends one request to `authority` and returns the response status.
-fn request(method: Method, authority: &str, path: &str, body: Option<&str>) -> Result<u16, String> {
+/// Sends one request to `authority` and returns the response status and body.
+fn request(
+    method: Method,
+    authority: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, Vec<u8>), String> {
     let fields = Fields::new();
-    let mut headers = vec![("accept", b"application/json".to_vec())];
+    let mut headers = vec![
+        ("accept", b"application/json".to_vec()),
+        (A2A_VERSION.0, A2A_VERSION.1.to_vec()),
+    ];
     if let Some(body) = body {
         headers.push(("content-type", b"application/json".to_vec()));
         headers.push(("content-length", body.len().to_string().into_bytes()));
@@ -76,19 +88,38 @@ fn request(method: Method, authority: &str, path: &str, body: Option<&str>) -> R
     let status = response.status();
     let incoming = response.consume().map_err(|()| "consume")?;
     let stream = incoming.stream().map_err(|()| "incoming stream")?;
+    let mut received = Vec::new();
     loop {
         match stream.blocking_read(64 * 1024) {
-            Ok(_) => {}
+            Ok(chunk) => received.extend_from_slice(&chunk),
             Err(StreamError::Closed) => break,
             Err(e) => return Err(format!("read: {e:?}")),
         }
     }
-    Ok(status)
+    Ok((status, received))
 }
 
-fn outcome(result: Result<u16, String>) -> String {
+fn outcome(result: Result<(u16, Vec<u8>), String>) -> String {
     match result {
-        Ok(status) => status.to_string(),
+        Ok((status, _)) => status.to_string(),
+        Err(error) => format!("refused:{error}"),
+    }
+}
+
+/// The status, and whether the JSON-RPC body carried a `result`, an `error` and its code, or
+/// neither.
+fn rpc_outcome(result: Result<(u16, Vec<u8>), String>) -> String {
+    match result {
+        Ok((status, body)) => {
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            if body.get("result").is_some() {
+                status.to_string()
+            } else if let Some(code) = body.pointer("/error/code") {
+                format!("{status}:{code}")
+            } else {
+                format!("{status}:-")
+            }
+        }
         Err(error) => format!("refused:{error}"),
     }
 }
@@ -101,7 +132,7 @@ fn probe(name: &str) -> String {
         "/.well-known/agent-card.json",
         None,
     ));
-    let send = outcome(request(Method::Post, &authority, "/", Some(SEND_BODY)));
+    let send = rpc_outcome(request(Method::Post, &authority, "/", Some(SEND_BODY)));
     format!("{name} card={card} send={send}")
 }
 

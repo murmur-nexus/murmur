@@ -431,7 +431,7 @@ impl LiveCapsule {
         }
     }
 
-    /// One A2A `message/send` under `context`, waited out to completion.
+    /// One A2A `SendMessage` under `context`, waited out to completion.
     fn send(&self, message_id: &str, context: &str, text: &str, task_number: usize) {
         self.send_with(message_id, context, text, task_number, &[]);
     }
@@ -449,7 +449,7 @@ impl LiveCapsule {
         self.wait_for_task_ends(task_number);
     }
 
-    /// One A2A `message/send` under `context`, returning the id of the task it started without
+    /// One A2A `SendMessage` under `context`, returning the id of the task it started without
     /// waiting for it.
     fn send_only(
         &self,
@@ -469,17 +469,18 @@ impl LiveCapsule {
             .to_string()
     }
 
-    /// One A2A `message/stream` under `context`, read to its terminal frame. Returns every
+    /// One A2A `SendStreamingMessage` under `context`, read to its terminal frame. Returns every
     /// `(event, data)` pair the connection carried.
     fn stream(&self, message_id: &str, context: &str, text: &str) -> Vec<(String, Value)> {
         let stream = TcpStream::connect(&self.url).expect("should connect for SSE");
-        let body = send_body(message_id, context, text).replace("message/send", "message/stream");
+        let body =
+            send_body(message_id, context, text).replace("SendMessage", "SendStreamingMessage");
         {
             let mut writer = &stream;
             writer
                 .write_all(
                     format!(
-                        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: \
+                        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: \
                          text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
                         self.url,
                         body.len()
@@ -523,7 +524,7 @@ impl LiveCapsule {
             &serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 3,
-                "method": "tasks/cancel",
+                "method": "CancelTask",
                 "params": {"id": task_id}
             })
             .to_string(),
@@ -593,12 +594,12 @@ impl LiveCapsule {
     }
 }
 
-/// The JSON-RPC body of one `message/send`.
+/// The JSON-RPC body of one `SendMessage`.
 fn send_body(message_id: &str, context: &str, text: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": message_id,
@@ -618,7 +619,7 @@ fn post(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{extra}Content-Length: \
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n{extra}Content-Length: \
          {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );

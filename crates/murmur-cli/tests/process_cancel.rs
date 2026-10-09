@@ -328,7 +328,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut writer = &stream;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     writer.write_all(request.as_bytes()).unwrap();
@@ -385,7 +385,7 @@ fn send_message(addr: &str, message_id: &str, text: &str, context_id: &str) -> V
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {
                 "messageId": message_id,
                 "contextId": context_id,
@@ -400,7 +400,7 @@ fn send_message(addr: &str, message_id: &str, text: &str, context_id: &str) -> V
 fn tasks_get(addr: &str, task_id: &str) -> Value {
     http_post_json(
         addr,
-        &json!({"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}})
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}})
             .to_string(),
     )
 }
@@ -408,18 +408,18 @@ fn tasks_get(addr: &str, task_id: &str) -> Value {
 fn tasks_cancel(addr: &str, task_id: &str) -> Value {
     http_post_json(
         addr,
-        &json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/cancel", "params": {"id": task_id}})
+        &json!({"jsonrpc": "2.0", "id": 3, "method": "CancelTask", "params": {"id": task_id}})
             .to_string(),
     )
 }
 
-/// The id of whichever task holds the active slot — `message/stream` never reports one.
+/// The id of whichever task holds the active slot — `SendStreamingMessage` never reports one.
 fn active_task_id(addr: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let response = http_post_json(
             addr,
-            &json!({"jsonrpc": "2.0", "id": 4, "method": "tasks/get", "params": {}}).to_string(),
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "GetTask", "params": {}}).to_string(),
         );
         if let Some(id) = response["result"]["id"].as_str() {
             return id.to_string();
@@ -449,19 +449,19 @@ fn poll_until_state(addr: &str, task_id: &str, expected: &str, timeout: Duration
 
 // ── One streamed task ─────────────────────────────────────────────────────────
 
-/// An open `message/stream` connection, read to its terminal frame.
+/// An open `SendStreamingMessage` connection, read to its terminal frame.
 struct Stream {
     reader: BufReader<TcpStream>,
 }
 
 impl Stream {
-    /// Submit a task on a `message/stream` connection and read past its headers.
+    /// Submit a task on a `SendStreamingMessage` connection and read past its headers.
     fn open(addr: &str, context_id: &str) -> Self {
         let stream = TcpStream::connect(addr).expect("should connect for SSE");
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/stream",
+            "method": "SendStreamingMessage",
             "params": {"message": {
                 "messageId": "msg-stream",
                 "contextId": context_id,
@@ -475,7 +475,7 @@ impl Stream {
             writer
                 .write_all(
                     format!(
-                        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
                         body.len()
                     )
                     .as_bytes(),
@@ -895,10 +895,10 @@ fn s5_a_cancelled_task_writes_exactly_one_terminal_status() {
 
 // ── S6: the agent card ────────────────────────────────────────────────────────
 
-/// Every process driver capsule's door lists `tasks/cancel`, because every one can be stopped.
+/// Every process driver capsule's door lists `CancelTask`, because every one can be stopped.
 #[test]
 fn s6_a_process_capsule_advertises_cancellation() {
-    println!("S6: a process capsule's card lists tasks/cancel");
+    println!("S6: a process capsule's card lists CancelTask");
     let capsule = Built::new("process-cancel-card", "happy").launch();
     let card = http_get(&capsule.url, "/.well-known/agent-card.json");
 
@@ -907,7 +907,7 @@ fn s6_a_process_capsule_advertises_cancellation() {
         "the fixture driver reports streams-text: {card}"
     );
     assert!(
-        common::card_door_methods(&card).contains(&"tasks/cancel"),
+        common::card_door_methods(&card).contains(&"CancelTask"),
         "{card}"
     );
 }

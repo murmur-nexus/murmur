@@ -30,11 +30,11 @@ const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
 const ALL_METHODS: [&str; 6] = [
-    "message/send",
-    "message/stream",
+    "SendMessage",
+    "SendStreamingMessage",
     "stream/watch",
-    "tasks/get",
-    "tasks/cancel",
+    "GetTask",
+    "CancelTask",
     "session/stop",
 ];
 
@@ -117,7 +117,7 @@ fn post_jsonrpc(addr: &str, body: &Value) -> Value {
     let body = body.to_string();
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -138,7 +138,7 @@ fn post_stream_head(addr: &str, body: &Value) -> HttpResponse {
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -359,15 +359,15 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
     assert_eq!(common::card_capsule_params(&card)["planes"], json!([]));
     assert_eq!(card["capabilities"]["streaming"], true);
 
-    let sent = post_jsonrpc(&capsule.url, &rpc("message/send", message_params("m-send")));
-    assert_ne!(sent["error"]["code"], -32601, "message/send: {sent}");
+    let sent = post_jsonrpc(&capsule.url, &rpc("SendMessage", message_params("m-send")));
+    assert_ne!(sent["error"]["code"], -32601, "SendMessage: {sent}");
     let task_id = sent["result"]["id"]
         .as_str()
-        .unwrap_or_else(|| panic!("message/send should start a task; got {sent}"))
+        .unwrap_or_else(|| panic!("SendMessage should start a task; got {sent}"))
         .to_string();
 
-    for method in ["message/stream", "stream/watch"] {
-        let params = if method == "message/stream" {
+    for method in ["SendStreamingMessage", "stream/watch"] {
+        let params = if method == "SendStreamingMessage" {
             message_params("m-stream")
         } else {
             json!({})
@@ -381,14 +381,14 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
         );
     }
 
-    let got = post_jsonrpc(&capsule.url, &rpc("tasks/get", json!({"id": task_id})));
-    assert_ne!(got["error"]["code"], -32601, "tasks/get: {got}");
-    assert_eq!(got["result"]["id"], task_id.as_str(), "tasks/get: {got}");
+    let got = post_jsonrpc(&capsule.url, &rpc("GetTask", json!({"id": task_id})));
+    assert_ne!(got["error"]["code"], -32601, "GetTask: {got}");
+    assert_eq!(got["result"]["id"], task_id.as_str(), "GetTask: {got}");
 
-    let cancelled = post_jsonrpc(&capsule.url, &rpc("tasks/cancel", json!({"id": task_id})));
+    let cancelled = post_jsonrpc(&capsule.url, &rpc("CancelTask", json!({"id": task_id})));
     assert_ne!(
         cancelled["error"]["code"], -32601,
-        "tasks/cancel: {cancelled}"
+        "CancelTask: {cancelled}"
     );
 
     // Asked before `session/stop`, while the session is certainly still answering.
@@ -415,7 +415,7 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
 
     assert_eq!(
         common::card_door_methods(&card),
-        ["stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+        ["stream/watch", "GetTask", "CancelTask", "session/stop"]
     );
     assert_eq!(
         common::card_stream_frames(&card),
@@ -431,30 +431,27 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
             "connection-ack",
             "capsule-closed"
         ],
-        "no message/stream, so no error frame: {card}"
+        "no SendStreamingMessage, so no error frame: {card}"
     );
     assert_eq!(card["capabilities"]["streaming"], false);
     assert_eq!(card["skills"], json!([]), "no task can be started: {card}");
     common::assert_a2a_agent_card(&card);
 
     for (method, params) in [
-        ("message/send", message_params("m-send")),
-        ("message/stream", message_params("m-stream")),
+        ("SendMessage", message_params("m-send")),
+        ("SendStreamingMessage", message_params("m-stream")),
     ] {
         let refused = post_jsonrpc(&capsule.url, &rpc(method, params));
         assert_eq!(refused["error"]["code"], -32601, "{method}: {refused}");
         assert_eq!(refused["error"]["message"], "Method not found");
     }
 
-    let got = post_jsonrpc(
-        &capsule.url,
-        &rpc("tasks/get", json!({"id": "tsk_unknown"})),
-    );
+    let got = post_jsonrpc(&capsule.url, &rpc("GetTask", json!({"id": "tsk_unknown"})));
     assert!(
         got["error"].is_object(),
         "an unknown task is an error: {got}"
     );
-    assert_ne!(got["error"]["code"], -32601, "tasks/get: {got}");
+    assert_ne!(got["error"]["code"], -32601, "GetTask: {got}");
 }
 
 // ── S3: a plane is listed exactly when it is declared, and a listed plane serves ─

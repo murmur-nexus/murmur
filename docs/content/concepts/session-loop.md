@@ -60,7 +60,7 @@ summary, say — is an inference call the task made, so it counts as well: the t
 `task_end.turns`, includes it. When the limit is reached, the loop exits with
 `exit_status: "max_turns_reached"`, and the task's failure message names the limit, the turns the
 task used by the numbers `mur trace show` prints, and how many of the calls were a hook's. The
-task did not complete: `tasks/get` reads `failed`, and
+task did not complete: `GetTask` reads `failed`, and
 [`mur run`](../reference/cli.md#mur-run-status) exits `1`.
 
 ## Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }

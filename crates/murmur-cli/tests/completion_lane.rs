@@ -140,12 +140,12 @@ impl Running {
         }
     }
 
-    /// One `message/send`, with whatever headers the caller wants stamped on it.
+    /// One `SendMessage`, with whatever headers the caller wants stamped on it.
     fn post(&self, message_id: &str, text: &str, headers: &[(&str, &str)]) -> Value {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {
                 "message": {
                     "messageId": message_id,
@@ -171,7 +171,7 @@ impl Running {
 fn post_json(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
     let mut stream = TcpStream::connect(addr).expect("the capsule accepts a connection");
     let mut request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
     for (name, value) in headers {
@@ -200,10 +200,17 @@ fn post_json(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
     serde_json::from_str(&response).unwrap_or_else(|_| serde_json::json!({"_raw": response}))
 }
 
-/// The refusal a door gives a completion for a delegation no task here is waiting for: JSON-RPC
-/// `-32004`, naming the delegation.
+/// The refusal a door gives a completion for a delegation no task here is waiting for: murmur's
+/// `-31002` `COMPLETION_NOT_AWAITED`, naming the delegation.
 fn assert_refused_as_unwaited(response: &Value, delegation_id: &str) {
-    assert_eq!(response["error"]["code"], -32004, "{response}");
+    assert_eq!(response["error"]["code"], -31002, "{response}");
+    let info = &response["error"]["data"][0];
+    assert_eq!(info["reason"], "COMPLETION_NOT_AWAITED", "{response}");
+    assert_eq!(info["domain"], "murmur.nexus", "{response}");
+    assert_eq!(
+        info["metadata"]["delegationId"], delegation_id,
+        "{response}"
+    );
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains(delegation_id) && message.contains("no task"),
@@ -226,7 +233,7 @@ fn submitted(response: &Value, label: &str) -> String {
 // ── 3. A completion nobody waits for is refused, and queues nothing ───────────
 
 /// A completion posted while a person's task runs, naming a delegation no task here started, is
-/// refused with `-32004` and never queued: the peer task posted after it is the only other task
+/// refused with `-31002` and never queued: the peer task posted after it is the only other task
 /// that runs, after the person's.
 ///
 /// The first task arrives as `task.md`, which is the only way a task reaches the `user` lane.

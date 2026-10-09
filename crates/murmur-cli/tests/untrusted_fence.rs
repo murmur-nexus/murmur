@@ -496,7 +496,7 @@ fn event_origin_task_payload_is_fenced() {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "fence-msg",
@@ -557,7 +557,7 @@ fn user_origin_task_payload_is_not_fenced() {
 fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();

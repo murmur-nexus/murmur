@@ -533,13 +533,13 @@ impl SseEvent {
     }
 }
 
-/// Open a `message/stream` connection and read until the first `status` frame with
+/// Open a `SendStreamingMessage` connection and read until the first `status` frame with
 /// `"final":true`. A `text` frame with `"final":true` is not terminal.
 fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {
             "message": {
                 "messageId": "parity-1",
@@ -550,7 +550,7 @@ fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
     })
     .to_string();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
     );
 
@@ -930,7 +930,7 @@ fn thinking_reaches_the_client_once() {
     assert_eq!(thinking[0]["final"], false);
 }
 
-/// S6. A process capsule's card advertises what its transport can do: `tasks/cancel` on the door
+/// S6. A process capsule's card advertises what its transport can do: `CancelTask` on the door
 /// extension, which every transport supports, and streaming, which is its driver's answer.
 #[test]
 fn a_process_capsule_advertises_cancellation_and_streaming() {
@@ -945,13 +945,13 @@ fn a_process_capsule_advertises_cancellation_and_streaming() {
 
     assert_eq!(card["capabilities"]["streaming"], true, "{card}");
     assert!(
-        common::card_door_methods(&card).contains(&"tasks/cancel"),
-        "the door answers tasks/cancel: {card}"
+        common::card_door_methods(&card).contains(&"CancelTask"),
+        "the door answers CancelTask: {card}"
     );
     assert_eq!(common::card_stream_frames(&card), PROCESS_FRAMES, "{card}");
 }
 
-/// The stream extension's `params.frames` of an http capsule that serves `message/stream`.
+/// The stream extension's `params.frames` of an http capsule that serves `SendStreamingMessage`.
 const HTTP_FRAMES: [&str; 11] = [
     "status",
     "artifact",
@@ -967,7 +967,7 @@ const HTTP_FRAMES: [&str; 11] = [
 ];
 
 /// The stream extension's `params.frames` of a `transport: process` capsule that serves
-/// `message/stream`.
+/// `SendStreamingMessage`.
 const PROCESS_FRAMES: [&str; 11] = [
     "status",
     "artifact",

@@ -818,7 +818,7 @@ fn an_authenticated_door_names_mur_token_after_the_url_line() {
     let sent = rpc(
         &addr,
         Some(&operator),
-        "message/send",
+        "SendMessage",
         message("m-1", "hello"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");

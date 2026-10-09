@@ -118,6 +118,19 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid network config for '{field}': {message}"),
         ),
+        RuntimeManifestError::RetiredDoorScope {
+            field,
+            scope,
+            replacement,
+        } => {
+            let hint = retired_door_scope_hint(&scope, replacement);
+            let error = RuntimeManifestError::RetiredDoorScope {
+                field,
+                scope,
+                replacement,
+            };
+            CliError::with_hint(E_MAN_003, error.to_string(), hint)
+        }
         RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid trace config for '{field}': {message}"),
@@ -131,6 +144,19 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_IO_003,
             format!("failed to read {MANIFEST_FILENAME} at {path}: {source}"),
         ),
+    }
+}
+
+/// The hint under a credential scope that names an A2A 0.3 method: the scope to write instead, or,
+/// for a method no scope gates, that the credential lists nothing for it.
+fn retired_door_scope_hint(scope: &str, replacement: &str) -> String {
+    if murmur_artifact::DOOR_SCOPES.contains(&replacement) {
+        format!("write '{replacement}' in place of '{scope}'")
+    } else {
+        format!(
+            "remove '{scope}': every authenticated caller may call {replacement}, so a credential \
+             lists no scope for it"
+        )
     }
 }
 

@@ -381,18 +381,21 @@ fn a_parents_runtime_launches_an_approved_child_as_a_separate_process() {
             &json!({
                 "jsonrpc": "2.0",
                 "id": "child-launch-1",
-                "method": "message/send",
+                "method": "SendMessage",
                 "params": {"message": {"messageId": "m-1", "role": "user",
                                        "parts": [{"text": "hello"}]}}
             })
             .to_string(),
         ),
-        &[],
+        &[(
+            capsule_runtime::A2A_VERSION_HEADER,
+            capsule_runtime::A2A_PROTOCOL_VERSION,
+        )],
     )
-    .expect("the child answers message/send");
+    .expect("the child answers SendMessage");
     assert!(
         response["result"]["id"].as_str().is_some(),
-        "message/send returned {response}"
+        "SendMessage returned {response}"
     );
 
     child.shutdown().unwrap();

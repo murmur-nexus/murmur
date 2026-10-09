@@ -47,7 +47,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication) or one declared beside a non-empty `capabilities.spawn.allow`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [E-MAN-003](#e-man-003) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
@@ -166,6 +166,32 @@ section that explains it.
 | `W-SEC-032` | The A2A door is exposed off loopback and `network.authentication` is not declared | [W-SEC-032](#w-sec-032) |
 
 ---
+
+## Manifest errors
+
+### E-MAN-003 — a manifest value the runtime rejects { #e-man-003 }
+
+A field in `murmur.yaml` has the wrong type, or a value of the right type the runtime refuses. The
+message names the field and the value; the cases are listed in the [index](#index), and a
+`gateway.api_key: ${NAME}` that nothing holds is explained under
+[Where `${NAME}` is read from](config.md#credentials-precedence).
+
+A credential scope that is an A2A 0.3 method name is refused, and the hint names the scope to write
+in its place:
+
+```text
+error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authentication.credentials.watcher.scopes': 'tasks/get' is the A2A 0.3 name of a door method, and the door answers A2A 1.0 names only
+  hint: write 'GetTask' in place of 'tasks/get'
+```
+
+`agent/getAuthenticatedExtendedCard` has no replacement scope:
+
+```text
+  hint: remove 'agent/getAuthenticatedExtendedCard': every authenticated caller may call GetExtendedAgentCard, so a credential lists no scope for it
+```
+
+The scopes are listed under
+[`network.authentication`](manifest.md#field-network-authentication).
 
 ## Capability errors
 
@@ -752,7 +778,7 @@ store:
 
 ```text
 error[E-RUN-036]: the harness 'claude-code' could not continue session 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55, which context 'ctx_0193f2…' names: no conversation found with session id 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55 (that id is recorded in /home/you/.murmur/conversations/shey/ctx_0193f2…/harness-session.json)
-  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or the header `x-murmur-forget-session: true` on the next message/send or message/stream — see https://docs.murmur.nexus/reference/cli/
+  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or the header `x-murmur-forget-session: true` on the next SendMessage or SendStreamingMessage — see https://docs.murmur.nexus/reference/cli/
 ```
 
 The map entry is left exactly as it was. Starting a new conversation instead would be silent memory
@@ -814,7 +840,7 @@ error[E-RUN-039]: --forget-session forgets the harness session a context names, 
   hint: a harness owns the conversation only under inference.transport: process, so that is the only transport with a session to forget; every other one keeps its conversation record here, which `mur conversation rm` removes — see https://docs.murmur.nexus/reference/cli/
 ```
 
-The door refuses the header on `message/send` and `message/stream` with JSON-RPC `-32602`, and
+The door refuses the header on `SendMessage` and `SendStreamingMessage` with JSON-RPC `-32602`, and
 starts no task.
 
 ### E-RUN-040 — the task did not complete { #e-run-040 }
@@ -833,7 +859,7 @@ error[E-RUN-040]: the task ended failed: {"error":"driver: failed to parse Anthr
 | `failed` | The `reason` of the run's [`task_failed`](observability-schemas.md#task-failed) line, whose `cause` names the kind of failure |
 | `max_turns_reached` | That the task used every turn `inference.max_turns` allows |
 | `spend_ceiling_reached` | That a spend ceiling refused the next inference call. The [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line names which ceiling and the numbers |
-| `canceled` | That the task was canceled, by `tasks/cancel`, `session/stop`, `mur stop`, `SIGTERM` or the end of the session that delegated it. A task canceled by its formation's end is no error: the member ends [`formation_ended`](cli.md#mur-run-status) |
+| `canceled` | That the task was canceled, by `CancelTask`, `session/stop`, `mur stop`, `SIGTERM` or the end of the session that delegated it. A task canceled by its formation's end is no error: the member ends [`formation_ended`](cli.md#mur-run-status) |
 
 For `canceled` the hint says there is no result to read:
 
@@ -3083,7 +3109,7 @@ address or hostname are off it. A capsule with no `inference:` block serves no d
 warns. `mur run` and `mur doctor` print the same bytes for the same manifest and address.
 
 ```text
-warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call message/send, message/stream, stream/watch, tasks/get, tasks/cancel, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
+warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call SendMessage, SendStreamingMessage, stream/watch, GetTask, CancelTask, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
 ```
 
 **Why it matters:** a public door answers every caller that reaches the port. Anyone on the network

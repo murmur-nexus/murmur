@@ -727,7 +727,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let request = format!(
-        "POST / HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST / HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -780,7 +780,7 @@ fn json_launch_answers_its_door_after_the_supervisor_stops_reading() {
         &serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {
                 "messageId": "msg-1",
                 "role": "user",
@@ -859,7 +859,7 @@ fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
         &serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {
                 "messageId": "msg-1",
                 "role": "user",
@@ -967,7 +967,7 @@ fn an_authenticated_capsule_readiness_line_says_auth_and_carries_no_token() {
     let sent = rpc(
         &addr,
         Some(&operator),
-        "message/send",
+        "SendMessage",
         message("m-1", "hello"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");

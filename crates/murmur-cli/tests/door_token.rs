@@ -157,7 +157,7 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
         let operator = operator.trim_end();
 
         // The operator token drives the door.
-        let sent = rpc(&addr, Some(operator), "message/send", message("m-1", "hi"));
+        let sent = rpc(&addr, Some(operator), "SendMessage", message("m-1", "hi"));
         assert_eq!(sent.status, 200, "{sent:?}");
         let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
         wait_completed(&addr, Some(operator), &task_id);
@@ -167,9 +167,9 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
         assert!(ok, "{stderr}");
         let watcher = watcher.trim_end();
         assert!(watcher.starts_with("mdt1.") && watcher != operator);
-        let got = rpc(&addr, Some(watcher), "tasks/get", json!({"id": task_id}));
+        let got = rpc(&addr, Some(watcher), "GetTask", json!({"id": task_id}));
         assert_eq!(got.status, 200, "{got:?}");
-        let refused = rpc(&addr, Some(watcher), "message/send", message("m-2", "no"));
+        let refused = rpc(&addr, Some(watcher), "SendMessage", message("m-2", "no"));
         assert_eq!(refused.status, 403, "{refused:?}");
 
         // The record holds every token, at 0600.

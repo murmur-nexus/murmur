@@ -10,7 +10,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{collections::BTreeSet, time::Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use common::{
     a2a_conformance::WirePart,
@@ -81,11 +84,18 @@ fn wire_exceptions_list_is_well_formed() {
 #[test]
 fn the_door_fails_exactly_the_listed_exceptions() {
     begin_census();
-    let server = common::ScriptedServer::start(vec![
-        end_turn(1, "sent"),
-        end_turn(2, "streamed"),
-        end_turn(3, "spare"),
-    ]);
+    // Every provider answer takes a moment, so a task queued behind a running one is still
+    // `submitted` when it is cancelled. Short enough that a stream never goes the second quiet
+    // `request` reads it until.
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            end_turn(1, "sent"),
+            end_turn(2, "running"),
+            end_turn(3, "streamed"),
+            end_turn(4, "spare"),
+        ],
+        Duration::from_millis(400),
+    );
     let home = driver_home();
     let project = agent_project(
         &server.endpoint,
@@ -107,18 +117,18 @@ fn the_door_fails_exactly_the_listed_exceptions() {
     let sent = rpc(
         &addr,
         token,
-        "message/send",
+        "SendMessage",
         message("m-census-send", "send"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["id"]
         .as_str()
-        .unwrap_or_else(|| panic!("message/send answered no task: {sent:?}"))
+        .unwrap_or_else(|| panic!("SendMessage answered no task: {sent:?}"))
         .to_string();
     wait_completed(&addr, token, &task_id);
 
     // Without an `id`, the door answers its active task.
-    let active = rpc(&addr, token, "tasks/get", json!({}));
+    let active = rpc(&addr, token, "GetTask", json!({}));
     assert_eq!(active.status, 200, "{active:?}");
     assert_eq!(
         active.json()["result"]["id"],
@@ -126,20 +136,56 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         "{active:?}"
     );
 
-    let canceled = rpc(&addr, token, "tasks/cancel", json!({"id": task_id}));
+    // A task that has ended is not cancelable, and is left as it ended.
+    let ended = rpc(&addr, token, "CancelTask", json!({"id": task_id}));
+    assert_eq!(ended.status, 200, "{ended:?}");
+    assert_eq!(ended.json()["error"]["code"], -32002, "{ended:?}");
+    assert_eq!(
+        ended.json()["error"]["data"][0]["metadata"]["state"],
+        "completed",
+        "{ended:?}"
+    );
+
+    // A task queued behind a running one is live, and its cancel is accepted.
+    let running = rpc(
+        &addr,
+        token,
+        "SendMessage",
+        message("m-census-running", "running"),
+    );
+    let running_id = running.json()["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("SendMessage answered no task: {running:?}"))
+        .to_string();
+    let queued = rpc(
+        &addr,
+        token,
+        "SendMessage",
+        message("m-census-queued", "queued"),
+    );
+    let queued_id = queued.json()["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("SendMessage answered no task: {queued:?}"))
+        .to_string();
+    let canceled = rpc(&addr, token, "CancelTask", json!({"id": queued_id}));
     assert_eq!(canceled.status, 200, "{canceled:?}");
-    assert!(canceled.json().get("result").is_some(), "{canceled:?}");
+    assert_eq!(
+        canceled.json()["result"]["status"]["state"],
+        "canceled",
+        "{canceled:?}"
+    );
+    wait_completed(&addr, token, &running_id);
 
     let streamed = rpc(
         &addr,
         token,
-        "message/stream",
+        "SendStreamingMessage",
         message("m-census-stream", "stream"),
     );
     assert_eq!(streamed.status, 200, "{streamed:?}");
     assert!(
         streamed.body.contains("data:"),
-        "message/stream wrote no events: {streamed:?}"
+        "SendStreamingMessage wrote no events: {streamed:?}"
     );
 
     let watched = rpc(&addr, token, "stream/watch", json!({}));
@@ -149,16 +195,11 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         "stream/watch wrote no events: {watched:?}"
     );
 
-    let card = rpc(
-        &addr,
-        token,
-        "agent/getAuthenticatedExtendedCard",
-        json!({}),
-    );
+    let card = rpc(&addr, token, "GetExtendedAgentCard", json!({}));
     assert_eq!(card.status, 200, "{card:?}");
     assert!(card.json().get("result").is_some(), "{card:?}");
 
-    let unknown = rpc(&addr, token, "tasks/get", json!({"id": "tsk_no_such_task"}));
+    let unknown = rpc(&addr, token, "GetTask", json!({"id": "tsk_no_such_task"}));
     assert_eq!(unknown.status, 200, "{unknown:?}");
     assert_eq!(unknown.json()["error"]["code"], -32001, "{unknown:?}");
 

@@ -347,7 +347,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut writer = &stream;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     writer.write_all(request.as_bytes()).unwrap();
@@ -406,7 +406,7 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {
                 "messageId": message_id,
                 "role": "user",

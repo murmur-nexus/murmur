@@ -353,7 +353,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut writer = &stream;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     writer.write_all(request.as_bytes()).unwrap();
@@ -383,7 +383,7 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {
                 "messageId": message_id,
                 "role": "user",
@@ -401,7 +401,7 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
 fn tasks_get(addr: &str, task_id: &str) -> Value {
     http_post_json(
         addr,
-        &json!({"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}})
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}})
             .to_string(),
     )
 }
@@ -1728,7 +1728,7 @@ fn session_stop_answers_and_leaves_the_door_up() {
 }
 
 /// A capsule with nothing running still emits `residue`, as an empty array — the one place this
-/// differs from `tasks/cancel`, which omits the key. A session stop has to be able to say
+/// differs from `CancelTask`, which omits the key. A session stop has to be able to say
 /// "nothing" as a positive fact.
 #[test]
 fn session_stop_always_emits_the_residue_key() {

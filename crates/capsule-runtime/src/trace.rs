@@ -1706,12 +1706,12 @@ struct MemberCallStartEvent {
     call_id: String,
     /// The callee's roster name.
     member: String,
-    /// The task the callee's door holds, as its `tasks/get` names it.
+    /// The task the callee's door holds, as its `GetTask` names it.
     member_task_id: String,
 }
 
 /// One offer of a `call-member` call that the callee's door turned away busy: it answered
-/// `message/send` with `rejected` and [`crate::a2a::REJECTED_BUSY_MESSAGE`]. The first is written
+/// `SendMessage` with `rejected` and [`crate::a2a::REJECTED_BUSY_MESSAGE`]. The first is written
 /// as the tool call returns, each later one by the call's watcher as it offers the task again.
 ///
 /// Carries the callee's roster name, never its door's URL or the token the call presented.
@@ -1764,7 +1764,7 @@ struct MemberCallEvent {
     /// Whether the calling task received `output`: as the tool result for a call that never
     /// started, as a continuation for one that did.
     delivered: bool,
-    /// The members further down that gave the callee no answer, as its `tasks/get` reported them.
+    /// The members further down that gave the callee no answer, as its `GetTask` reported them.
     /// Absent when it reported none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     no_answer_below: Vec<NoAnswerBelow>,

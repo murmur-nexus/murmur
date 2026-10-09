@@ -1,7 +1,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::a2a::A2aTask;
+use crate::a2a::{A2aTask, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 use crate::origin::{stamp_for_peer, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 
 pub(crate) struct OutgoingMessage {
@@ -10,7 +10,7 @@ pub(crate) struct OutgoingMessage {
     pub text: String,
 }
 
-/// Send an A2A message/send JSON-RPC request to a peer capsule.
+/// Send an A2A SendMessage JSON-RPC request to a peer capsule.
 ///
 /// `peer_url` is in "localhost:{port}" or "http://localhost:{port}" format.
 /// `traceparent` is the W3C traceparent header value (omitted if None).
@@ -37,7 +37,7 @@ pub(crate) async fn send_a2a_message(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": message.message_id,
@@ -54,7 +54,7 @@ pub(crate) async fn send_a2a_message(
         .map_err(|e| format!("failed to connect to {peer_url}: {e}"))?;
 
     let mut request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{A2A_VERSION_HEADER}: {A2A_PROTOCOL_VERSION}\r\n",
         body.len()
     );
     if let Some(token) = authorization {
@@ -312,7 +312,8 @@ mod tests {
     use super::*;
     use crate::origin::{TaskOrigin, TrustClass};
 
-    /// Accept one connection, read the request head, and answer a minimal `message/send` result.
+    /// Accept one connection, read the request head and body, and answer a minimal `SendMessage`
+    /// result. Returns the head followed by the body.
     async fn capture_one_request(listener: tokio::net::TcpListener) -> String {
         let (mut stream, _) = listener.accept().await.expect("peer should connect");
         let mut head = Vec::new();
@@ -323,6 +324,17 @@ mod tests {
                 Err(_) => break,
             }
         }
+        let length = String::from_utf8_lossy(&head)
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|length| length.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let mut request_body = vec![0u8; length];
+        let _ = stream.read_exact(&mut request_body).await;
+        head.extend_from_slice(&request_body);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "req_1",
@@ -365,6 +377,19 @@ mod tests {
             context_id: None,
             text: "hello".to_string(),
         }
+    }
+
+    /// The guest's message goes out as an A2A 1.0 `SendMessage`, naming its version.
+    #[tokio::test]
+    async fn outbound_send_is_a_v1_send_message_naming_its_version() {
+        let request = request_head_for(None).await;
+        let (head, body) = request.split_once("\r\n\r\n").expect("a head and a body");
+        assert!(
+            head.contains("\r\nA2A-Version: 1.0\r\n"),
+            "head was:\n{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+        assert_eq!(body["method"], "SendMessage");
     }
 
     /// A door that does not consent answers this runtime's peer message with `403`, and the

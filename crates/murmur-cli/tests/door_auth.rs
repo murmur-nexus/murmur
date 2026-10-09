@@ -118,7 +118,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     assert_eq!(extensions[0]["uri"], common::DOOR_EXTENSION_URI);
     assert_eq!(extensions[1]["uri"], common::STREAM_EXTENSION_URI);
     assert!(!common::card_stream_frames(&card).is_empty(), "{card:#}");
-    assert!(common::card_door_methods(&card).contains(&"agent/getAuthenticatedExtendedCard"));
+    assert!(common::card_door_methods(&card).contains(&"GetExtendedAgentCard"));
     assert_eq!(card["capabilities"]["extendedAgentCard"], true);
     assert_eq!(
         card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"],
@@ -129,7 +129,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     }
 
     // No header: 401 before anything is looked at, and nothing reaches the task loop.
-    let refused = rpc(&addr, None, "message/send", message("m-none", "hello"));
+    let refused = rpc(&addr, None, "SendMessage", message("m-none", "hello"));
     assert_refused(&refused, 401, "unauthenticated", &realm);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(event_count(&workdir, "task_start"), 0);
@@ -145,7 +145,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
             "POST",
             "/",
             &[("Authorization", presented.as_str())],
-            &json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": message("m-bad", "hello")}).to_string(),
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": message("m-bad", "hello")}).to_string(),
         );
         assert_refused(&refused, 401, "invalid_token", &invalid);
     }
@@ -157,8 +157,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
             ("Authorization", &bearer(&operator)),
             ("Authorization", &bearer(&operator)),
         ],
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "x"}})
-            .to_string(),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": "x"}}).to_string(),
     );
     assert_refused(&twice, 401, "invalid_token", &invalid);
     // The scheme name is matched without regard to case.
@@ -167,8 +166,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         "POST",
         "/",
         &[("authorization", &format!("bearer {watcher}"))],
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "x"}})
-            .to_string(),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": "x"}}).to_string(),
     );
     assert_eq!(lower.status, 200, "{lower:?}");
 
@@ -176,7 +174,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     let forbidden = rpc(
         &addr,
         Some(&watcher),
-        "message/send",
+        "SendMessage",
         message("m-w", "hello"),
     );
     assert_refused(
@@ -184,23 +182,18 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         403,
         "insufficient_scope",
         &format!(
-            "Bearer realm=\"{CAPSULE_NAME}\", error=\"insufficient_scope\", scope=\"message/send\""
+            "Bearer realm=\"{CAPSULE_NAME}\", error=\"insufficient_scope\", scope=\"SendMessage\""
         ),
     );
     let text = forbidden.json()["message"].as_str().unwrap().to_string();
     assert!(
-        text.contains("watcher") && text.contains("message/send"),
+        text.contains("watcher") && text.contains("SendMessage"),
         "{text}"
     );
     assert_eq!(event_count(&workdir, "task_start"), 0);
 
     // In scope, every real error is unchanged.
-    let missing = rpc(
-        &addr,
-        Some(&watcher),
-        "tasks/get",
-        json!({"id": "tsk_nope"}),
-    );
+    let missing = rpc(&addr, Some(&watcher), "GetTask", json!({"id": "tsk_nope"}));
     assert_eq!(missing.status, 200, "{missing:?}");
     assert_eq!(missing.json()["error"]["code"], -32001, "{missing:?}");
     let unknown = rpc(&addr, Some(&watcher), "tasks/list", json!({}));
@@ -211,33 +204,36 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     let sent = rpc(
         &addr,
         Some(&operator),
-        "message/send",
+        "SendMessage",
         message("m-op", "hello"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
     wait_completed(&addr, Some(&operator), &task_id);
-    let seen = rpc(&addr, Some(&watcher), "tasks/get", json!({"id": task_id}));
+    let seen = rpc(&addr, Some(&watcher), "GetTask", json!({"id": task_id}));
     assert_eq!(
         seen.json()["result"]["status"]["state"],
         "completed",
         "{seen:?}"
     );
 
-    // The extended card: any valid token, in A2A 0.3 shape.
-    let refused = rpc(&addr, None, "agent/getAuthenticatedExtendedCard", json!({}));
+    // The extended card: any valid token, the v1.0 card with the capsule extension.
+    let refused = rpc(&addr, None, "GetExtendedAgentCard", json!({}));
     assert_refused(&refused, 401, "unauthenticated", &realm);
-    let extended = rpc(
-        &addr,
-        Some(&watcher),
-        "agent/getAuthenticatedExtendedCard",
-        json!({}),
-    );
+    let extended = rpc(&addr, Some(&watcher), "GetExtendedAgentCard", json!({}));
     assert_eq!(extended.status, 200, "{extended:?}");
     let extended = extended.json()["result"].clone();
-    assert_eq!(extended["protocolVersion"], "0.3.0");
-    assert_eq!(extended["url"], format!("http://{addr}"));
-    assert_eq!(extended["supportsAuthenticatedExtendedCard"], true);
+    assert_eq!(
+        common::a2a_conformance::check_agent_card(&extended),
+        Ok(()),
+        "{extended:#}"
+    );
+    assert_eq!(extended["supportedInterfaces"][0]["protocolVersion"], "1.0");
+    assert_eq!(
+        extended["supportedInterfaces"][0]["url"],
+        format!("http://{addr}")
+    );
+    assert_eq!(extended["capabilities"]["extendedAgentCard"], true);
     assert_eq!(
         common::card_capsule_params(&extended)["sessionId"],
         session_id.as_str()
@@ -266,7 +262,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     );
 
     // The streaming methods are refused before any stream opens.
-    for method in ["message/stream", "stream/watch"] {
+    for method in ["SendStreamingMessage", "stream/watch"] {
         let refused = rpc(&addr, None, method, message("m-s", "hello"));
         assert_refused(&refused, 401, "unauthenticated", &realm);
         assert_ne!(refused.header("content-type"), Some("text/event-stream"));
@@ -344,28 +340,23 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
         .as_str()
         .unwrap()
         .is_empty());
-    assert!(!common::card_door_methods(&card).contains(&"agent/getAuthenticatedExtendedCard"));
+    assert!(!common::card_door_methods(&card).contains(&"GetExtendedAgentCard"));
 
     for token in [None, Some("garbage")] {
-        let sent = rpc(&addr, token, "message/send", message("m-public", "hello"));
+        let sent = rpc(&addr, token, "SendMessage", message("m-public", "hello"));
         assert_eq!(sent.status, 200, "{sent:?}");
         let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
         wait_completed(&addr, None, &task_id);
     }
 
     for token in [None, Some("garbage")] {
-        let answer = rpc(
-            &addr,
-            token,
-            "agent/getAuthenticatedExtendedCard",
-            json!({}),
-        );
+        let answer = rpc(&addr, token, "GetExtendedAgentCard", json!({}));
         assert_eq!(answer.status, 200, "{answer:?}");
         let error = &answer.json()["error"];
-        assert_eq!(error["code"], -32007, "{answer:?}");
+        assert_eq!(error["code"], -32004, "{answer:?}");
         assert_eq!(
-            error["message"],
-            "Authenticated Extended Card is not configured"
+            error["data"][0]["reason"], "UNSUPPORTED_OPERATION",
+            "{answer:?}"
         );
     }
     let absent = request(&addr, "GET", "/no-such-path", &[], "");
@@ -411,7 +402,7 @@ fn public_door_warning_names_what_a_stranger_reaches() {
         "{line}"
     );
     for named in [
-        "message/send, message/stream, stream/watch, tasks/get, tasks/cancel, session/stop",
+        "SendMessage, SendStreamingMessage, stream/watch, GetTask, CancelTask, session/stop",
         "the session id",
         "tools []",
         "shell: false",
@@ -487,7 +478,7 @@ fn tokens_stay_out_of_the_session() {
     let sent = rpc(
         &addr,
         Some(&tokens[0]),
-        "message/send",
+        "SendMessage",
         message("m-env", "read env"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
@@ -498,7 +489,7 @@ fn tokens_stay_out_of_the_session() {
     let refused = rpc(
         &addr,
         Some(&tokens[1]),
-        "message/send",
+        "SendMessage",
         message("m-no", "no"),
     );
     assert_eq!(refused.status, 403);
@@ -554,4 +545,63 @@ fn tokens_stay_out_of_the_session() {
         assert!(!stderr.contains(token.as_str()), "stderr carries a token");
     }
     assert!(!stderr.contains("mdt1."), "stderr carries a token");
+}
+
+// ── Retired scopes ────────────────────────────────────────────────────────────
+
+/// A credential scope that is an A2A 0.3 method name is refused at load by `mur run` and
+/// `mur doctor` alike, with a hint naming what replaces it. Never launched: every case refuses at
+/// manifest parse, before an artifact is looked for.
+#[test]
+fn a_retired_scope_is_refused_naming_its_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    for (retired, hint) in [
+        ("tasks/get", "write 'GetTask' in place of 'tasks/get'"),
+        (
+            "message/send",
+            "write 'SendMessage' in place of 'message/send'",
+        ),
+        (
+            "message/stream",
+            "write 'SendStreamingMessage' in place of 'message/stream'",
+        ),
+        (
+            "tasks/cancel",
+            "write 'CancelTask' in place of 'tasks/cancel'",
+        ),
+        (
+            "agent/getAuthenticatedExtendedCard",
+            "every authenticated caller may call GetExtendedAgentCard, so a credential lists no \
+             scope for it",
+        ),
+    ] {
+        let project = agent_project(
+            "http://127.0.0.1:1",
+            CAPSULE_NAME,
+            "",
+            &format!(
+                "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+                 watcher:\n        scopes: [{retired}]\n"
+            ),
+        );
+        for args in [
+            &["run", "--manifest", "murmur.yaml", "--explain-scope"][..],
+            &["doctor"][..],
+        ] {
+            let output = common::door_capsule::mur(home.path(), &[])
+                .current_dir(project.path())
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{retired} {args:?}: {stderr}");
+            assert!(stderr.contains("E-MAN-003"), "{retired} {args:?}: {stderr}");
+            assert!(stderr.contains(retired), "{retired} {args:?}: {stderr}");
+            let hint_line = stderr
+                .lines()
+                .find(|line| line.trim_start().starts_with("hint:"))
+                .unwrap_or_else(|| panic!("no hint line for {retired} {args:?}: {stderr}"));
+            assert!(hint_line.contains(hint), "{retired} {args:?}: {hint_line}");
+        }
+    }
 }

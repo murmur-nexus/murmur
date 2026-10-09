@@ -537,7 +537,7 @@ mod tests {
                 },
                 DoorCredential {
                     name: "watcher".to_string(),
-                    scopes: vec!["tasks/get".to_string(), "stream/watch".to_string()],
+                    scopes: vec!["GetTask".to_string(), "stream/watch".to_string()],
                 },
             ],
         }
@@ -573,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             payload(&auth.tokens()[2].1),
-            json!({"credential": "watcher", "scopes": ["tasks/get", "stream/watch"]})
+            json!({"credential": "watcher", "scopes": ["GetTask", "stream/watch"]})
         );
         let raw = mac_token::payload_segment(DOOR_TOKEN_TAG, auth.tokens()[1].1.expose()).unwrap();
         assert_eq!(
@@ -607,17 +607,17 @@ mod tests {
         }
         let watcher = auth.verify(&[&header(&auth.tokens()[2].1)]).unwrap();
         assert_eq!(watcher.credential(), "watcher");
-        assert!(watcher.allows("tasks/get"));
+        assert!(watcher.allows("GetTask"));
         assert!(watcher.allows("stream/watch"));
-        assert!(!watcher.allows("message/send"));
+        assert!(!watcher.allows("SendMessage"));
         assert_eq!(
-            watcher.require("message/send"),
+            watcher.require("SendMessage"),
             Err(AuthRefusal::InsufficientScope {
                 credential: "watcher".to_string(),
-                scope: "message/send".to_string(),
+                scope: "SendMessage".to_string(),
             })
         );
-        assert_eq!(watcher.require("tasks/get"), Ok(()));
+        assert_eq!(watcher.require("GetTask"), Ok(()));
     }
 
     #[test]
@@ -698,10 +698,10 @@ mod tests {
             (
                 AuthRefusal::InsufficientScope {
                     credential: "watcher".to_string(),
-                    scope: "message/send".to_string(),
+                    scope: "SendMessage".to_string(),
                 },
                 403,
-                "Bearer realm=\"my-agent\", error=\"insufficient_scope\", scope=\"message/send\"",
+                "Bearer realm=\"my-agent\", error=\"insufficient_scope\", scope=\"SendMessage\"",
                 "insufficient_scope",
             ),
         ];
@@ -718,7 +718,7 @@ mod tests {
         let body: Value = serde_json::from_slice(
             &AuthRefusal::InsufficientScope {
                 credential: "watcher".to_string(),
-                scope: "message/send".to_string(),
+                scope: "SendMessage".to_string(),
             }
             .response(realm)
             .body,
@@ -726,7 +726,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             body["message"],
-            "credential 'watcher' does not reach message/send"
+            "credential 'watcher' does not reach SendMessage"
         );
     }
 
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(grant.formation_caller(), Some("planner"));
         assert_eq!(
             FORMATION_CALL_SCOPES,
-            ["message/send", "tasks/get", "tasks/cancel"]
+            ["SendMessage", "GetTask", "CancelTask"]
         );
         for scope in DOOR_SCOPES {
             assert_eq!(
@@ -767,12 +767,12 @@ mod tests {
                 scope: "session/stop".to_string(),
             })
         );
-        assert!(!grant.allows("message/stream"));
+        assert!(!grant.allows("SendStreamingMessage"));
         assert_eq!(
-            grant.require("message/stream"),
+            grant.require("SendStreamingMessage"),
             Err(AuthRefusal::InsufficientScope {
                 credential: "member:planner".to_string(),
-                scope: "message/stream".to_string(),
+                scope: "SendStreamingMessage".to_string(),
             })
         );
         let operator = coder.verify(&[&header(coder.operator_token())]).unwrap();
@@ -845,7 +845,7 @@ mod tests {
         use crate::identity::DoorMethod;
         let mut from_methods: Vec<&str> = DoorMethod::ALL
             .into_iter()
-            .filter(|method| *method != DoorMethod::GetAuthenticatedExtendedCard)
+            .filter(|method| *method != DoorMethod::GetExtendedAgentCard)
             .map(DoorMethod::wire_name)
             .collect();
         from_methods.push(RESOURCES_FILES_SCOPE);
@@ -862,7 +862,23 @@ mod tests {
         for method in DoorMethod::ALL {
             assert_eq!(
                 method.scope(),
-                (method != DoorMethod::GetAuthenticatedExtendedCard).then(|| method.wire_name())
+                (method != DoorMethod::GetExtendedAgentCard).then(|| method.wire_name())
+            );
+        }
+    }
+
+    /// A retired scope names no method the door serves and no scope a token carries, and what
+    /// replaces it is a method the door serves.
+    #[test]
+    fn door_auth_retired_scopes_name_no_live_method() {
+        use crate::identity::DoorMethod;
+        let wire_names: Vec<&str> = DoorMethod::ALL.map(DoorMethod::wire_name).to_vec();
+        for (retired, replacement) in murmur_artifact::RETIRED_DOOR_SCOPES {
+            assert!(!wire_names.contains(retired), "{retired} is served");
+            assert!(!DOOR_SCOPES.contains(retired), "{retired} is a scope");
+            assert!(
+                wire_names.contains(replacement),
+                "{retired} is replaced by {replacement}, which the door does not serve"
             );
         }
     }
@@ -915,10 +931,10 @@ mod tests {
             line,
             format!(
                 "warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is \
-                 not declared — any caller that reaches it can call message/send, message/stream, \
-                 stream/watch, tasks/get, tasks/cancel, session/stop, and the agent card publishes \
-                 to any A2A client the session id, tools [bash], shell: true, network: true and \
-                 planes [files] ({})",
+                 not declared — any caller that reaches it can call SendMessage, \
+                 SendStreamingMessage, stream/watch, GetTask, CancelTask, session/stop, and the \
+                 agent card publishes to any A2A client the session id, tools [bash], shell: \
+                 true, network: true and planes [files] ({})",
                 security_warning_link(W_SEC_032)
             )
         );
@@ -932,7 +948,7 @@ mod tests {
             "{published}"
         );
         assert!(
-            published.contains("can call stream/watch, tasks/get, tasks/cancel, session/stop,"),
+            published.contains("can call stream/watch, GetTask, CancelTask, session/stop,"),
             "{published}"
         );
     }
@@ -957,11 +973,11 @@ mod tests {
         );
         let authenticated = manifest(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-             watcher: {scopes: [tasks/get, stream/watch]}\n      reader: {scopes: [resources/files]}\n",
+             watcher: {scopes: [GetTask, stream/watch]}\n      reader: {scopes: [resources/files]}\n",
         );
         assert_eq!(
             door_posture(&authenticated),
-            "door: bearer — operator, reader (resources/files), watcher (tasks/get, stream/watch)"
+            "door: bearer — operator, reader (resources/files), watcher (GetTask, stream/watch)"
         );
     }
 }

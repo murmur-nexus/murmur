@@ -377,12 +377,12 @@ A formation token carries exactly these scopes:
 
 | Scope | Lets the caller |
 |---|---|
-| `message/send` | Start a task |
-| `tasks/get` | Read the state of a task the calling member started; any other id is `-32001 Task not found`, as [Agent Card: `tasks/get`](agent-card.md#tasks-get) describes |
-| `tasks/cancel` | Cancel a task the calling member started; any other id is `-32001 Task not found`, and nothing is cancelled. The runtime sends it only for a task a member took just after the calling task ended — see [A busy member](runtime-provided-tools.md#call-member-busy) |
+| `SendMessage` | Start a task |
+| `GetTask` | Read the state of a task the calling member started; any other id is `-32001 Task not found`, as [Agent Card: `GetTask`](agent-card.md#tasks-get) describes |
+| `CancelTask` | Cancel a task the calling member started; any other id is `-32001 Task not found`, and nothing is cancelled. The runtime sends it only for a task a member took just after the calling task ended — see [A busy member](runtime-provided-tools.md#call-member-busy) |
 
-A formation token does not reach `message/stream`: a `message/stream` connection carries the frames
-of every task the door runs, other members' included, as
+A formation token does not reach `SendStreamingMessage`: a `SendStreamingMessage` connection
+carries the frames of every task the door runs, other members' included, as
 [Streaming Protocol: Endpoints](streaming-protocol.md#endpoints) describes.
 
 The operator token and declared credentials work as they do outside a formation. A peer task is
@@ -464,7 +464,7 @@ A member's agent calls another member with the runtime-provided
 lets it call someone. A call is made from a running task, and names the member and states the task
 in full:
 
-1. The member's door gets the task as a `message/send`, carrying the caller's formation token. The
+1. The member's door gets the task as a `SendMessage`, carrying the caller's formation token. The
    tool call returns as soon as the door holds the task, or at once when the member is busy, in
    which case the runtime keeps offering it the task until it takes it or the call's deadline
    passes — see [A busy member](runtime-provided-tools.md#call-member-busy).
@@ -489,8 +489,8 @@ capabilities:
 A member the roster lets call others, whose grant reaches no such door, prints
 [`W-RUN-008`](diagnostics.md#w-run-008) at launch, and every call it makes fails.
 
-The caller's runtime reads the answer from the member's [`tasks/get`](agent-card.md#tasks-get).
-On a formation token, `tasks/get` answers only the tasks the calling member submitted.
+The caller's runtime reads the answer from the member's [`GetTask`](agent-card.md#tasks-get).
+On a formation token, `GetTask` answers only the tasks the calling member submitted.
 
 ### What each member learns { #enforcement-learns }
 

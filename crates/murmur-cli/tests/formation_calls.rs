@@ -569,7 +569,7 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
             .to_string();
         let token = project.door_token(peer["session_id"].as_str().unwrap());
         let addr = peer["url"].as_str().unwrap().trim_start_matches("http://");
-        let task = rpc(addr, Some(&token), "tasks/get", json!({"id": task_id})).json();
+        let task = rpc(addr, Some(&token), "GetTask", json!({"id": task_id})).json();
         assert_eq!(task["result"]["status"]["state"], "working", "{task}");
 
         release_lead.send(()).unwrap();
@@ -1967,7 +1967,7 @@ fn two_tier_formation_trace_names_every_call() {
         let answer = rpc(
             addr,
             Some(&token),
-            "message/send",
+            "SendMessage",
             common::door_capsule::message(&format!("m-op-{sent}"), "OPERATOR-TASK"),
         )
         .json();
@@ -2242,7 +2242,7 @@ fn chain(
     (project, release_lead, never)
 }
 
-/// `p`'s one task's id and `tasks/get` result, read over p's door with its operator token.
+/// `p`'s one task's id and `GetTask` result, read over p's door with its operator token.
 fn p_task(project: &Project, formation_id: &str, formation: &Value) -> Value {
     let p_trace = project.trace_of(formation_id, "p");
     let task_id = records(&p_trace, "a2a_task_received")[0]["task_id"]
@@ -2257,7 +2257,7 @@ fn p_task(project: &Project, formation_id: &str, formation: &Value) -> Value {
         .unwrap();
     let token = project.door_token(peer["session_id"].as_str().unwrap());
     let addr = peer["url"].as_str().unwrap().trim_start_matches("http://");
-    rpc(addr, Some(&token), "tasks/get", json!({"id": task_id})).json()
+    rpc(addr, Some(&token), "GetTask", json!({"id": task_id})).json()
 }
 
 /// The row of `mur trace show <formation_id>`'s call list for `pair`.

@@ -35,16 +35,6 @@ const AGENT_CARD_MESSAGE: &str = "lf.a2a.v1.AgentCard";
 /// The message every SSE event of a streaming method carries as its JSON-RPC `result`.
 const STREAM_RESPONSE_MESSAGE: &str = "lf.a2a.v1.StreamResponse";
 
-/// The door's A2A 0.3 method names and the v1.0 method each one is measured as. Every request
-/// under one of these names is a `method` violation of its own.
-pub(crate) const LEGACY_METHOD_NAMES: [(&str, &str); 5] = [
-    ("message/send", "SendMessage"),
-    ("message/stream", "SendStreamingMessage"),
-    ("tasks/get", "GetTask"),
-    ("tasks/cancel", "CancelTask"),
-    ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
-];
-
 /// The murmur extension methods the door serves beside the A2A ones, each with whether it
 /// streams. Their envelopes and stream events are checked; their params and unary results are
 /// murmur's own and are not.
@@ -166,8 +156,6 @@ impl Violation {
 pub(crate) enum MethodKind {
     /// A v1.0 method under its own name.
     V1,
-    /// A v1.0 method under its A2A 0.3 name, from [`LEGACY_METHOD_NAMES`].
-    Legacy,
     /// A murmur extension method, from [`EXTENSION_METHODS`].
     Extension,
 }
@@ -183,26 +171,14 @@ pub(crate) struct ResolvedMethod {
     pub(crate) spec: Option<&'static MethodSpec>,
 }
 
-/// The method `wire_name` is measured as, or `None` when it is neither a v1.0 method, an A2A 0.3
-/// name of one, nor a murmur extension method.
+/// The method `wire_name` is measured as, or `None` when it is neither a v1.0 method nor a murmur
+/// extension method.
 pub(crate) fn resolve_method(wire_name: &str) -> Option<ResolvedMethod> {
     let methods = v1_methods().ok()?;
     let find = |name: &str| methods.iter().find(|spec| spec.name == name);
     if let Some(spec) = find(wire_name) {
         return Some(ResolvedMethod {
             kind: MethodKind::V1,
-            name: spec.name.as_str(),
-            streaming: spec.streaming,
-            spec: Some(spec),
-        });
-    }
-    if let Some((_, v1_name)) = LEGACY_METHOD_NAMES
-        .iter()
-        .find(|(legacy, _)| *legacy == wire_name)
-    {
-        let spec = find(v1_name)?;
-        return Some(ResolvedMethod {
-            kind: MethodKind::Legacy,
             name: spec.name.as_str(),
             streaming: spec.streaming,
             spec: Some(spec),
@@ -220,7 +196,7 @@ pub(crate) fn resolve_method(wire_name: &str) -> Option<ResolvedMethod> {
 }
 
 /// Every violation a JSON-RPC request raises: its envelope, its method name, and, for a v1.0
-/// method or a 0.3 name of one, its `params` as the method's request message. Absent `params`
+/// method, its `params` as the method's request message. Absent `params`
 /// are checked as `{}`. An extension method's params are not measured.
 pub(crate) fn check_request(request: &Value) -> Vec<Violation> {
     let wire = wire_method(request);
@@ -289,18 +265,6 @@ pub(crate) fn check_request(request: &Value) -> Vec<Violation> {
         );
         return violations;
     };
-    if resolved.kind == MethodKind::Legacy {
-        push(
-            &mut violations,
-            method,
-            WirePart::Method,
-            "-",
-            vec![format!(
-                "`{method}` is the A2A 0.3 name; v1.0 calls it `{}`",
-                resolved.name
-            )],
-        );
-    }
     let empty = Value::Object(Default::default());
     // Non-object params are already an envelope violation; there is no message to check.
     let measured = match params {
@@ -321,7 +285,7 @@ pub(crate) fn check_request(request: &Value) -> Vec<Violation> {
 }
 
 /// Every violation a JSON-RPC response to `request` raises: its envelope, and, for a unary v1.0
-/// method or a 0.3 name of one, its `result` as the method's response message. A `result` on a
+/// method, its `result` as the method's response message. A `result` on a
 /// streaming method is an envelope violation. An extension method's result is not measured.
 pub(crate) fn check_response(request: &Value, response: &Value) -> Vec<Violation> {
     let wire = wire_method(request);
@@ -413,6 +377,10 @@ const STANDARD_ERROR_CODES: [i64; 5] = [-32700, -32600, -32601, -32602, -32603];
 /// The A2A-specific JSON-RPC error codes, inclusive.
 const A2A_ERROR_CODES: std::ops::RangeInclusive<i64> = -32099..=-32001;
 
+/// The codes JSON-RPC 2.0 reserves for itself, inclusive. Every code outside it is the
+/// application's, which A2A calls a JSON-RPC custom error.
+const RESERVED_ERROR_CODES: std::ops::RangeInclusive<i64> = -32768..=-32000;
+
 /// The codes a response may answer with a `null` id: the request could not be read far enough to
 /// learn its id.
 const NULL_ID_ERROR_CODES: [i64; 2] = [-32700, -32600];
@@ -476,9 +444,13 @@ fn error_object_errors(error: &Value) -> Vec<String> {
     match object.get("code") {
         Some(Value::Number(number)) if number.is_i64() => {
             let code = number.as_i64().unwrap_or_default();
-            if !STANDARD_ERROR_CODES.contains(&code) && !A2A_ERROR_CODES.contains(&code) {
+            if RESERVED_ERROR_CODES.contains(&code)
+                && !STANDARD_ERROR_CODES.contains(&code)
+                && !A2A_ERROR_CODES.contains(&code)
+            {
                 errors.push(format!(
-                    "`error.code` {code} is neither a standard JSON-RPC code nor in the A2A range {}..={}",
+                    "`error.code` {code} is reserved by JSON-RPC 2.0 and is neither a standard \
+                     code nor in the A2A range {}..={}",
                     A2A_ERROR_CODES.start(),
                     A2A_ERROR_CODES.end()
                 ));

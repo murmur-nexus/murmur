@@ -1270,7 +1270,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
 /// cannot become task text.
 ///
 /// Whatever this returns becomes the child's first user message verbatim: `DelegationPlane`
-/// sends it as the sole text part of an A2A `message/send`, the receiving runtime writes that
+/// sends it as the sole text part of an A2A `SendMessage`, the receiving runtime writes that
 /// text to `task.md`, and `agent::read_task` pushes it at the model. Nothing on the receiving
 /// side parses a task envelope, so an envelope is not structure — it is prose that happens to be
 /// JSON, and it spends the child's first turn on decoding. A capsule step's `input` is therefore

@@ -7,9 +7,9 @@
 //!
 //! The children are launched by this test process, not by a task of the parent, so no task in the
 //! parent is waiting for any of them: the parent's door refuses every completion here with
-//! `-32004`, and the child records that refusal. Delivery into a delegating task is exercised end
-//! to end by `murmur-cli`'s `delegation` and `spawner_lifeline_kill` suites, where the parent's own
-//! model makes the delegation.
+//! `-31002` (`COMPLETION_NOT_AWAITED`), and the child records that refusal. Delivery into a
+//! delegating task is exercised end to end by `murmur-cli`'s `delegation` and
+//! `spawner_lifeline_kill` suites, where the parent's own model makes the delegation.
 //!
 //! One daemon, one registry and one `HOME` are shared by the whole suite, because `HOME` is
 //! process-wide and a child resolves its artifacts through it. Each case gets its own parent
@@ -478,7 +478,7 @@ fn wait_for_refused_completion(workdir: &Path) -> Value {
     }
 }
 
-/// The refusal a parent's door gives a completion no task of its is waiting for: `-32004`, naming
+/// The refusal a parent's door gives a completion no task of its is waiting for: `-31002`, naming
 /// the delegation.
 fn assert_refused_as_unwaited(completion: &Value, delegation_id: &str) {
     assert_eq!(completion["delivered"], false, "{completion}");
@@ -624,7 +624,7 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
 // ── 2. A finished child's completion reaches a real parent's door ─────────────
 
 /// The child writes its outcome and posts it, and the parent's door answers. No task of the
-/// parent's made this delegation, so the door refuses it with `-32004` naming the delegation, the
+/// parent's made this delegation, so the door refuses it with `-31002` naming the delegation, the
 /// child records the refusal, and the parent starts no task and writes nothing about it. The result
 /// stays in the child's own directory either way.
 #[test]
@@ -706,7 +706,7 @@ fn an_agent_child_whose_task_failed_reports_error() {
             &serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "message/send",
+                "method": "SendMessage",
                 "params": {"message": {
                     "messageId": "msg-1",
                     "role": "user",
@@ -715,7 +715,10 @@ fn an_agent_child_whose_task_failed_reports_error() {
             })
             .to_string(),
         ),
-        &[],
+        &[(
+            capsule_runtime::A2A_VERSION_HEADER,
+            capsule_runtime::A2A_PROTOCOL_VERSION,
+        )],
     );
     assert!(
         sent.as_ref()

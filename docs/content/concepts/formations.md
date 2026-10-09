@@ -71,8 +71,8 @@ let the entry member call it; the answer comes back into the entry member's own 
 
 The launcher issues every credential, and the runtime attaches a member's credential to its calls,
 so no model ever sees it. A formation credential reaches exactly three methods on the door it was
-issued for: `message/send`, which starts a task, `tasks/get`, which reads the state of a task the
-calling member started, and `tasks/cancel`, which cancels one. It reaches no other member's task,
+issued for: `SendMessage`, which starts a task, `GetTask`, which reads the state of a task the
+calling member started, and `CancelTask`, which cancels one. It reaches no other member's task,
 and nothing that stops the session. See
 [What a door answers](../reference/roster.md#enforcement-door).
 
@@ -116,7 +116,7 @@ wire two capsules together by hand, with a pinned port and `curl`, see
 - **Credential rotation.** A formation credential has no expiry, rotation or revocation; the
   credentials end with the formation's one task — see
   [Why a formation credential never expires](../reference/roster.md#enforcement-lifetime).
-- **Cancelling a member's task.** No formation credential reaches `tasks/cancel`. A call that times
+- **Cancelling a member's task.** No formation credential reaches `CancelTask`. A call that times
   out or is abandoned leaves the member's task running until it finishes or the formation ends —
   see [What a door answers](../reference/roster.md#enforcement-door).
 - **Passing files between members.** A peer's directory is in no other member's reach, so content

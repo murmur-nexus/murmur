@@ -74,11 +74,11 @@ pub const FORMATION_ADDRESS_WAIT: Duration = Duration::from_secs(10);
 pub const FORMATION_PEER_DOMAIN: &str = "formation.invalid";
 
 /// Exactly what a valid formation token reaches at the door it was issued for: starting a task,
-/// and reading and cancelling the tasks this member started. The door answers `tasks/get` and
-/// `tasks/cancel` for any other task as it does for an id it never held. No `message/stream`,
+/// and reading and cancelling the tasks this member started. The door answers `GetTask` and
+/// `CancelTask` for any other task as it does for an id it never held. No `SendStreamingMessage`,
 /// whose connection forwards the frames of every task on the door, and nothing that stops the
 /// session or reads files.
-pub const FORMATION_CALL_SCOPES: [&str; 3] = ["message/send", "tasks/get", "tasks/cancel"];
+pub const FORMATION_CALL_SCOPES: [&str; 3] = ["SendMessage", "GetTask", "CancelTask"];
 
 /// The prefix of the door credential a formation token is let in as: `member:<from>`. A declared
 /// credential name cannot contain `:`, so the two never collide.

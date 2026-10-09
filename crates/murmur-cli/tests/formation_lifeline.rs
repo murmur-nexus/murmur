@@ -215,20 +215,20 @@ impl Member {
         let card = rpc(
             &self.url(),
             Some(&self.token()),
-            "agent/getAuthenticatedExtendedCard",
+            "GetExtendedAgentCard",
             json!({}),
         );
         assert_eq!(card.status, 200, "{card:?}");
         card.body
     }
 
-    /// `message/send` under the operator token; the task id.
+    /// `SendMessage` under the operator token; the task id.
     fn send_task(&self) -> String {
         self.send(message("m-held", "hold"))
     }
 
     fn send(&self, message: Value) -> String {
-        let sent = rpc(&self.url(), Some(&self.token()), "message/send", message);
+        let sent = rpc(&self.url(), Some(&self.token()), "SendMessage", message);
         assert_eq!(sent.status, 200, "{sent:?}");
         sent.json()["result"]["id"].as_str().unwrap().to_string()
     }
@@ -311,7 +311,7 @@ fn a_member_mid_task_cancels_it_when_its_lifeline_closes() {
             let got = rpc(
                 &member.url(),
                 Some(&member.token()),
-                "tasks/get",
+                "GetTask",
                 json!({ "id": task_id }),
             );
             let state = got.json()["result"]["status"]["state"].clone();
@@ -413,7 +413,7 @@ fn a_cancelled_task_does_not_leave_an_earlier_answer_as_its_result() {
     assert_eq!(member.result_text().as_deref(), Some(CANCELED_RESULT));
 }
 
-/// A `tasks/cancel` is a cancel of one task, not of the session: the member keeps serving, its
+/// A `CancelTask` is a cancel of one task, not of the session: the member keeps serving, its
 /// result file says the cancelled task has none, and when its lifeline later closes on an idle
 /// session it ends `ok`.
 #[test]
@@ -447,7 +447,7 @@ fn a_cancelled_task_leaves_a_sleeping_members_ending_alone() {
     let canceled = rpc(
         &member.url(),
         Some(&member.token()),
-        "tasks/cancel",
+        "CancelTask",
         json!({ "id": second }),
     );
     assert_eq!(canceled.json()["result"]["status"]["state"], "canceled");

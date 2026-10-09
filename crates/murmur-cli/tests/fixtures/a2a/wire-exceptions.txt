@@ -13,19 +13,6 @@
 #
 # The list can only shrink: the census in tests/a2a_wire_conformance.rs fails when a listed
 # exception no longer occurs, so a card removes its lines when it lands.
-message/send method - 0229ba70 0.3 name; v1.0 is SendMessage
-message/stream method - 0229ba70 0.3 name; v1.0 is SendStreamingMessage
-tasks/get method - 0229ba70 0.3 name; v1.0 is GetTask
-tasks/cancel method - 0229ba70 0.3 name; v1.0 is CancelTask
-agent/getAuthenticatedExtendedCard method - 0229ba70 0.3 name; v1.0 is GetExtendedAgentCard
-SendMessage header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
-SendStreamingMessage header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
-GetTask header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
-CancelTask header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
-GetExtendedAgentCard header A2A-Version 0229ba70 accepted without A2A-Version: 1.0, which v1.0 reads as 0.3
-stream/watch header A2A-Version 0229ba70 accepted without A2A-Version: 1.0; 0229ba70 negotiates on every method
-session/stop header A2A-Version 0229ba70 accepted without A2A-Version: 1.0; 0229ba70 negotiates on every method
-GetExtendedAgentCard result lf.a2a.v1.AgentCard 0229ba70 the extended card is the 0.3 shape
 SendMessage params lf.a2a.v1.SendMessageRequest 27678569 role "user", not ROLE_USER
 SendStreamingMessage params lf.a2a.v1.SendMessageRequest 27678569 role "user", not ROLE_USER
 GetTask params lf.a2a.v1.GetTaskRequest 27678569 the door accepts tasks/get without an id and answers its active task; GetTaskRequest requires id

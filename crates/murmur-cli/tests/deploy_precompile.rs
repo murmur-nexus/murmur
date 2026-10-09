@@ -231,13 +231,13 @@ impl Deployed {
     }
 }
 
-/// One JSON-RPC `message/send` to the capsule's door. The reply is not needed: the upstream
+/// One JSON-RPC `SendMessage` to the capsule's door. The reply is not needed: the upstream
 /// request the task causes is what the tests wait on.
 fn post_task(address: &str) {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {"message": {
             "messageId": "msg-1",
             "role": "user",
@@ -250,7 +250,7 @@ fn post_task(address: &str) {
     };
     let _ = write!(
         stream,
-        "POST / HTTP/1.0\r\nHost: {address}\r\nContent-Type: application/json\r\n\
+        "POST / HTTP/1.0\r\nHost: {address}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     );

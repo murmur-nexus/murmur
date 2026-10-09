@@ -531,7 +531,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut writer = &stream;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     writer.write_all(request.as_bytes()).unwrap();
@@ -560,21 +560,21 @@ fn send_message(addr: &str, message_id: &str, text: &str) -> Value {
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {"messageId": message_id, "role": "user", "parts": [{"text": text}]}}
         })
         .to_string(),
     )
 }
 
-/// Send `text` over `message/stream` and read the connection to its end, returning the last
+/// Send `text` over `SendStreamingMessage` and read the connection to its end, returning the last
 /// `status` event.
 fn stream_message(addr: &str, message_id: &str, text: &str) -> Value {
     let stream = TcpStream::connect(addr).expect("should connect for SSE");
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {"message": {"messageId": message_id, "role": "user", "parts": [{"text": text}]}}
     })
     .to_string();
@@ -583,7 +583,7 @@ fn stream_message(addr: &str, message_id: &str, text: &str) -> Value {
         writer
             .write_all(
                 format!(
-                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),

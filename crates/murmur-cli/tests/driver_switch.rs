@@ -509,7 +509,7 @@ impl Idle {
         let request = json!({
             "jsonrpc": "2.0",
             "id": n,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": {
                 "messageId": format!("switch-{n}"),
                 "role": "user",

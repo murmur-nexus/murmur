@@ -609,7 +609,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
     ] {
         let mut bodies = Vec::new();
         for door in &doors {
-            let refused = rpc(door, token, "message/send", message("msg_s2", "hello"));
+            let refused = rpc(door, token, "SendMessage", message("msg_s2", "hello"));
             assert_eq!(refused.status, 401, "{door} {token:?}: {}", refused.body);
             assert_eq!(refused.json()["error"], code, "{door}: {}", refused.body);
             bodies.push(refused.body);
@@ -626,12 +626,7 @@ fn a_formation_reaches_exactly_what_its_roster_lets_it() {
         let session_id = peer["session_id"].as_str().unwrap();
         let addr = peer["url"].as_str().unwrap().trim_start_matches("http://");
         let token = project.door_token(session_id);
-        let card = rpc(
-            addr,
-            Some(&token),
-            "agent/getAuthenticatedExtendedCard",
-            json!({}),
-        );
+        let card = rpc(addr, Some(&token), "GetExtendedAgentCard", json!({}));
         assert_eq!(card.status, 200, "{}", card.body);
         assert!(card.body.contains(session_id), "{}", card.body);
     }
