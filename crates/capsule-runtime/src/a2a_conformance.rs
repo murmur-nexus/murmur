@@ -301,31 +301,21 @@ pub(crate) fn check_request(request: &Value) -> Vec<Violation> {
             )],
         );
     }
-    if let Some(spec) = resolved.spec {
-        let empty = Value::Object(Default::default());
-        match params {
-            None => {
-                let errors = check_named(&empty, &spec.params, "params");
-                push(
-                    &mut violations,
-                    resolved.name,
-                    WirePart::Params,
-                    &spec.params,
-                    errors,
-                );
-            }
-            Some(params) if params.is_object() => {
-                let errors = check_named(params, &spec.params, "params");
-                push(
-                    &mut violations,
-                    resolved.name,
-                    WirePart::Params,
-                    &spec.params,
-                    errors,
-                );
-            }
-            Some(_) => {}
-        }
+    let empty = Value::Object(Default::default());
+    // Non-object params are already an envelope violation; there is no message to check.
+    let measured = match params {
+        None => Some(&empty),
+        Some(params) => Some(params).filter(|params| params.is_object()),
+    };
+    if let (Some(spec), Some(params)) = (resolved.spec, measured) {
+        let errors = check_named(params, &spec.params, "params");
+        push(
+            &mut violations,
+            resolved.name,
+            WirePart::Params,
+            &spec.params,
+            errors,
+        );
     }
     violations
 }

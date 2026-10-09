@@ -4,7 +4,11 @@
 
 use serde_json::{json, Value};
 
-use crate::a2a_conformance::check_agent_card;
+use crate::a2a_conformance::{
+    check_agent_card, check_message, check_request, check_response, check_stream_event,
+    resolve_method, v1_methods, MethodKind, Violation, WirePart, EXTENSION_METHODS,
+    LEGACY_METHOD_NAMES,
+};
 
 /// A conformant card: the one a capsule `my-agent` 0.1.0 on port 41873 serves.
 fn conformant_card() -> Value {
@@ -228,11 +232,6 @@ fn a2a_card_conformance_does_not_panic_on_malformed_input() {
 }
 
 // ── The wire: any message, the method table, envelopes and stream events ─────────────────────
-
-use crate::a2a_conformance::{
-    check_message, check_request, check_response, check_stream_event, resolve_method, v1_methods,
-    MethodKind, Violation, WirePart, EXTENSION_METHODS, LEGACY_METHOD_NAMES,
-};
 
 fn message_errors(value: &Value, message: &str) -> Vec<String> {
     let mut errors = check_message(value, message)

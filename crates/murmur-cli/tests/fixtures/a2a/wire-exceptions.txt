@@ -1,4 +1,4 @@
-# Every A2A v1.0 wire check the door fails today. The recorder in tests/common/wire_recorder.rs
+# Every A2A v1.0 wire check the door fails. The recorder in tests/common/wire_recorder.rs
 # checks each JSON-RPC exchange the common door helpers make against the vendored a2a.proto, and a
 # failing check whose key is not listed here fails the test that made it.
 #
@@ -8,11 +8,11 @@
 #   part     method, header, envelope, params, result or event
 #   subject  the qualified message for params, result and event; the header name for header;
 #            `-` for method and envelope
-#   card     the part-5 card whose change removes the line
+#   card     the card whose change removes the line
 #   why      the rest of the line
 #
 # The list can only shrink: the census in tests/a2a_wire_conformance.rs fails when a listed
-# exception no longer occurs, so a card removes its lines when it lands. f2ef8db1 empties it.
+# exception no longer occurs, so a card removes its lines when it lands.
 message/send method - 0229ba70 0.3 name; v1.0 is SendMessage
 message/stream method - 0229ba70 0.3 name; v1.0 is SendStreamingMessage
 tasks/get method - 0229ba70 0.3 name; v1.0 is GetTask
