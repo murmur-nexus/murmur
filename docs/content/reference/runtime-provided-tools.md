@@ -302,9 +302,10 @@ outstanding, with every answer and every delegation outcome in one message, answ
 | How often the member's task is read | Every 500 ms, through the member's `GetTask` |
 | Unreachable | Two reads, or two offers, in a row that get no answer |
 
-No call is ever cancelled at the member: a formation token cannot call `CancelTask`. A call
-that times out, or is abandoned after the member took the task, leaves the member's task running
-until it finishes or the formation ends.
+The runtime cancels a member's task only when the member took it just after the calling task
+ended, as the [busy-member table](#call-member-busy) shows. A call that times out, or is abandoned
+while the member works on the task, leaves the member's task running until it finishes or the
+formation ends.
 
 ## `end-without-answer` { #end-without-answer }
 

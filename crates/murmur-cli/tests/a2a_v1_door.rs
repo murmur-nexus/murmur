@@ -116,6 +116,22 @@ fn error_of(response: &Response) -> (Value, Value) {
     (error, data[0].clone())
 }
 
+/// Every task id an event stream's frames name.
+fn stream_task_ids(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .flat_map(|event| {
+            [&event, &event["result"]]
+                .into_iter()
+                .flat_map(|frame| [frame["id"].clone(), frame["taskId"].clone()])
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .filter(|id| id.starts_with("tsk_"))
+        .collect()
+}
+
 /// A JSON-RPC result, or an event stream that wrote at least one event.
 fn assert_served(method: &str, response: &Response) {
     assert_eq!(response.status, 200, "{method}: {response:?}");
@@ -221,7 +237,9 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
     );
     assert_eq!(error_of(&retired).0["code"], -32009, "{retired:?}");
 
-    // The served round: every method under every accepted spelling, `session/stop` last.
+    // The served round: every method under every accepted spelling, `session/stop` last. Every
+    // task it starts is recorded, so the stop can be held to cancelling only those.
+    let mut started: Vec<String> = Vec::new();
     let accepted: [(&str, &str); 4] = [
         ("A2A-Version", "1.0"),
         ("A2A-Version", " 1.0 "),
@@ -240,6 +258,7 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
         );
         assert_served("SendMessage", &sent);
         let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+        started.push(task_id.clone());
         // The task just sent is still live, so its cancel is accepted.
         for method in [
             "GetTask",
@@ -254,11 +273,21 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
                 .unwrap();
             let response = versioned(&addr, token, name, &[version], 1, method, params);
             assert_served(&format!("{method} with {name}: {version:?}"), &response);
+            if method == "SendStreamingMessage" {
+                started.extend(stream_task_ids(&response.body));
+            }
         }
     }
     for (name, version) in accepted {
         let stopped = versioned(&addr, token, name, &[version], 1, "session/stop", json!({}));
         assert_served("session/stop", &stopped);
+        for canceled in stopped.json()["result"]["canceled"].as_array().unwrap() {
+            assert!(
+                started.iter().any(|task| canceled == task.as_str()),
+                "session/stop canceled {canceled}, which the served round did not start: \
+                 {started:?}"
+            );
+        }
     }
 }
 

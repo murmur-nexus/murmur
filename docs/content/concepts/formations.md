@@ -116,9 +116,11 @@ wire two capsules together by hand, with a pinned port and `curl`, see
 - **Credential rotation.** A formation credential has no expiry, rotation or revocation; the
   credentials end with the formation's one task — see
   [Why a formation credential never expires](../reference/roster.md#enforcement-lifetime).
-- **Cancelling a member's task.** No formation credential reaches `CancelTask`. A call that times
-  out or is abandoned leaves the member's task running until it finishes or the formation ends —
-  see [What a door answers](../reference/roster.md#enforcement-door).
+- **Cancelling a member's task.** A formation credential reaches `CancelTask` only for the tasks
+  its member started, and the runtime sends it only for a task a member took just after the
+  calling task ended. A call that times out or is abandoned while the member works leaves the
+  member's task running until it finishes or the formation ends — see
+  [What a door answers](../reference/roster.md#enforcement-door).
 - **Passing files between members.** A peer's directory is in no other member's reach, so content
   goes in the task text — see [Member directories](../reference/roster.md#member-directories).
 - **Resuming a formation.** `mur run --roster` refuses `--resume`, and a member's session resumed

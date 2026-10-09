@@ -459,10 +459,10 @@ pub fn write_completion(workdir: &Path, outcome: &DelegationOutcome) -> Result<(
 ///
 /// A JSON-RPC `SendMessage` carrying [`DelegationOutcome::message_text`], stamped with the A2A
 /// version and the three headers the door reads: the `completion` origin, the delegation id, and
-/// the session the completion is addressed to. The door reads the outcome from [`COMPLETION_FILE`] rather than
-/// from the message; the text is for a reader of the request. Blocking, because both reporters
-/// run outside any async context — the child's is a `Drop` guard at the end of its session, and
-/// the launcher's is a watcher thread.
+/// the session the completion is addressed to. The door reads the outcome from
+/// [`COMPLETION_FILE`] rather than from the message; the text is for a reader of the request.
+/// Blocking, because both reporters run outside any async context — the child's is a `Drop` guard
+/// at the end of its session, and the launcher's is a watcher thread.
 pub fn deliver_completion(
     handle: &SpawnerHandle,
     address: &CompletionAddress,

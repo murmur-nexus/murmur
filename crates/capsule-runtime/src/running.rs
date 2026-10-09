@@ -747,8 +747,9 @@ mod platform {
 /// Layer 3: the session id the door at `record.url` claims on its agent card.
 ///
 /// A record carrying a door token reads the extended card, the only one an authenticated door
-/// names its session on, by `GetExtendedAgentCard`; any other record reads the public card. A card with no capsule extension naming a session — one served by a runtime that
-/// predates the A2A card, among others — names no session, so its capsule reads as unreachable.
+/// names its session on, by `GetExtendedAgentCard`; any other record reads the public card. A
+/// card with no capsule extension naming a session names no session, so its capsule reads as
+/// unreachable.
 fn probe_session_id(record: &RunningRecord) -> Result<String, String> {
     probe_door_session_id(&record.url, record.door_token.as_ref())
 }
