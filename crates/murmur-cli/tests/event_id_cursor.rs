@@ -97,7 +97,7 @@ fn rpc(addr: &str, method: &str, params: Value) -> Value {
 fn wait_for_state(addr: &str, task_id: &str, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let response = rpc(addr, "tasks/get", serde_json::json!({"id": task_id}));
+        let response = rpc(addr, "GetTask", serde_json::json!({"id": task_id}));
         if response["result"]["status"]["state"] == expected {
             return;
         }
@@ -451,7 +451,7 @@ fn every_kind_of_frame_shares_one_sequence() {
     let queued = submit_task(&capsule.url, "event-id-all-2", "cancelled while queued");
     let canceled = rpc(
         &capsule.url,
-        "tasks/cancel",
+        "CancelTask",
         serde_json::json!({"id": queued}),
     );
     assert_eq!(
@@ -462,7 +462,7 @@ fn every_kind_of_frame_shares_one_sequence() {
     wait_for_state(&capsule.url, &first, "input-required");
     let input = rpc(
         &capsule.url,
-        "message/send",
+        "SendMessage",
         serde_json::json!({"message": {"messageId": "event-id-all-input", "role": "user", "parts": [{"text": "option A"}]}}),
     );
     assert!(

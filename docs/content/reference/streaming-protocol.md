@@ -11,12 +11,14 @@ under [What `mur watch` implements](#mur-watch).
 ## Endpoints { #endpoints }
 
 Both endpoints are JSON-RPC methods sent as `POST /` to the capsule's address, with
-`Content-Type: application/json` and a non-empty body. A `POST /` without a JSON content type or
-without a body is answered `404 Not Found`.
+`Content-Type: application/json`, `A2A-Version: 1.0` and a non-empty body. A `POST /` without a
+JSON content type or without a body is answered `404 Not Found`. A request without
+[`A2A-Version: 1.0`](agent-card.md#a2a-version) is answered `-32009` as one JSON body, and no
+stream opens.
 
 | Method | Purpose | Params | Closes when |
 |---|---|---|---|
-| `message/stream` | Submit a task and stream the capsule's frames while it runs | An A2A message, under `params.message` or as `params` itself: `messageId` (string, required), `role` (string, required), `parts` (array of `{"text": …}`, required), `contextId` (string, optional) | The first live `status` frame with `"final":true` whose `id` is the task this connection submitted is written. Also after an `error` frame and after a `rejected` status |
+| `SendStreamingMessage` | Submit a task and stream the capsule's frames while it runs | An A2A message, under `params.message` or as `params` itself: `messageId` (string, required), `role` (string, required), `parts` (array of `{"text": …}`, required), `contextId` (string, optional) | The first live `status` frame with `"final":true` whose `id` is the task this connection submitted is written. Also after an `error` frame and after a `rejected` status |
 | `stream/watch` | Observe every frame the capsule writes, without submitting anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A `final` status does not close it |
 
 On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), both
@@ -30,16 +32,18 @@ Request a `stream/watch`:
 ```bash
 curl -N -X POST http://localhost:52222/ \
   -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
   -H 'Last-Event-ID: 0' \
   -d '{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}'
 ```
 
-Request a `message/stream`:
+Request a `SendStreamingMessage`:
 
 ```bash
 curl -N -X POST http://localhost:52222/ \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"text":"Summarise README.md"}]}}}'
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"text":"Summarise README.md"}]}}}'
 ```
 
 Both answer with these response headers, then the event stream. There is no `content-length`: the
@@ -52,7 +56,7 @@ cache-control: no-cache
 connection: keep-alive
 ```
 
-A `message/stream` sent to a capsule with
+A `SendStreamingMessage` sent to a capsule with
 [`lifecycle.task_acceptance: none`](manifest.md#lifecycle-task-acceptance) is answered with a plain
 JSON-RPC error instead — `HTTP/1.1 200 OK`, `content-type: application/json`, and
 `{"jsonrpc":"2.0","id":…,"error":{"code":-32601,"message":"Method not found"}}`. `stream/watch`
@@ -60,7 +64,7 @@ is served whatever `task_acceptance` says.
 
 Which frames each endpoint can deliver:
 
-| Frame | `message/stream` | `stream/watch` |
+| Frame | `SendStreamingMessage` | `stream/watch` |
 |---|---|---|
 | [`status`](#event-status) | yes | yes |
 | [`status`](#event-status) with state `rejected`, refused at the door | yes, only to the connection that submitted the task | no |
@@ -76,9 +80,9 @@ Which frames each endpoint can deliver:
 | [Heartbeat](#heartbeat) | yes | yes |
 
 Neither endpoint filters by task. Every `status`, `artifact`, `text` and `thinking` frame the
-capsule writes reaches every open connection on either endpoint, so a `message/stream` connection
+capsule writes reaches every open connection on either endpoint, so a `SendStreamingMessage` connection
 carries the frames of other tasks running or queued on the same capsule, their final statuses
-included. Read the `id` key in each frame's `data` to tell tasks apart. A `message/stream`
+included. Read the `id` key in each frame's `data` to tell tasks apart. A `SendStreamingMessage`
 connection closes on the final status of its own task only.
 
 The task id is minted when the task is accepted and appears only in the frames, so a client does
@@ -87,7 +91,7 @@ its final status arrives. To pick out its own frames while the task runs, a clie
 `contextId` of its own in the message — the capsule uses it verbatim and mints one only when it is
 absent — and matches each frame on `context_id` in its `data`.
 
-### What `message/stream` writes, in order
+### What `SendStreamingMessage` writes, in order
 
 1. The response headers.
 2. When the request carried `Last-Event-ID`, the [replay](#replay): a `gap` frame if one applies,
@@ -124,11 +128,11 @@ written before the next frame the connection receives. The connection stays open
 writes the count to its own stderr, as `SSE broadcast lagged by <n> events`; nothing about a lag is
 written to `trace.jsonl`.
 
-On `message/stream`, a lost frame may be the `final` status of the connection's own task, and the
+On `SendStreamingMessage`, a lost frame may be the `final` status of the connection's own task, and the
 connection then stays open until the capsule's stream ends. A client that receives a `lagged` frame
 can learn how its task ended by either of these:
 
-- Call `tasks/get` with the task id, read from one of its own frames.
+- Call `GetTask` with the task id, read from one of its own frames.
 - Open a `stream/watch` with `Last-Event-ID` set to the last id it received, and read the replay
   for the task's final status.
 
@@ -139,7 +143,7 @@ A client that needs every frame reconnects with the id of the last frame it rece
 
 ## Frame vocabulary { #murmur-stream-v1 }
 
-The agent card's stream extension lists every frame type a capsule's `message/stream` and
+The agent card's stream extension lists every frame type a capsule's `SendStreamingMessage` and
 `stream/watch` connections can write. It is an A2A `AgentExtension` with URI
 `https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1` and `required: false`,
 in `capabilities.extensions` after the door and capsule extensions — see
@@ -148,7 +152,7 @@ in `capabilities.extensions` after the door and capsule extensions — see
 
 | Key | Type | Notes |
 |---|---|---|
-| `params.frames` | array of strings | The event types this capsule's `message/stream` and `stream/watch` connections can write, in the order below |
+| `params.frames` | array of strings | The event types this capsule's `SendStreamingMessage` and `stream/watch` connections can write, in the order below |
 
 | Frame | Listed when | A2A counterpart |
 |---|---|---|
@@ -162,7 +166,7 @@ in `capabilities.extensions` after the door and capsule extensions — see
 | [`lagged`](#event-lagged) | Always, on both transports | None — a murmur frame |
 | [`connection-ack`](#event-connection-ack) | Always, on both transports | None — a murmur frame |
 | [`capsule-closed`](#event-capsule-closed) | Always, on both transports | None — a murmur frame |
-| [`error`](#event-error) | Only when the door extension lists `message/stream` | None — a murmur frame |
+| [`error`](#event-error) | Only when the door extension lists `SendStreamingMessage` | None — a murmur frame |
 
 Each capsule computes its own list from the methods its door serves and its
 [`inference.transport`](manifest.md#inference-config). Read the list from the capsule's card rather
@@ -280,13 +284,13 @@ resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
 | `completed` | `true` | `session ended` |
 | `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns inference.max_turns allows (turn 0 to turn <last>)` — `<n>` is `inference.max_turns`, the turn numbers are the ones [`mur trace show`](cli.md#mur-trace-show) prints, and `, and <h> hook run-inference calls` follows the last turn when a hook's [`run-inference`](wit-interfaces.md#murmurruntimeinference) calls counted toward the same limit; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
 | `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed rather than stopping when it was asked |
-| `rejected` | `true` | Refused at the door: `task rejected: capsule is busy` when the capsule has no room for the task, `task rejected: the session is closing` once the session has stopped taking work. Written only to the `message/stream` connection that submitted the task, with no `id:` line, and never buffered. Refused when the session ended: `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under [`mur stop`](cli.md#mur-stop). Written to every connection and buffered with an `id:` like any other `status` |
+| `rejected` | `true` | Refused at the door: `task rejected: capsule is busy` when the capsule has no room for the task, `task rejected: the session is closing` once the session has stopped taking work. Written only to the `SendStreamingMessage` connection that submitted the task, with no `id:` line, and never buffered. Refused when the session ended: `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under [`mur stop`](cli.md#mur-stop). Written to every connection and buffered with an `id:` like any other `status` |
 
 ### One final status { #one-final-status }
 
 Every task the capsule accepts ends in exactly one `status` frame with `"final":true`, whether it
 ran or not. It is the task's last frame, and it is written after
-[`tasks/get`](agent-card.md#tasks-get) answers the same state. For a task that ran, it is
+[`GetTask`](agent-card.md#tasks-get) answers the same state. For a task that ran, it is
 also written after every `on-task-end` hook has run and after `task_end` is in the trace. For a
 task the session refused, it follows the task's
 [`task_rejected`](observability-schemas.md#task-rejected) trace line.
@@ -550,7 +554,7 @@ be running, and only a new connection tells the two apart.
 
 ## `error` { #event-error }
 
-Written on `message/stream` when a request cannot become a task. The connection closes after it.
+Written on `SendStreamingMessage` when a request cannot become a task. The connection closes after it.
 
 | Key | Type | Absent when | Notes |
 |---|---|---|---|
@@ -638,7 +642,7 @@ status refused at the door never enter it.
 
 | Endpoint | `Last-Event-ID` sent | `Last-Event-ID` absent | `Last-Event-ID` not a number |
 |---|---|---|---|
-| `message/stream` | Replays from that id, before the task is submitted | No replay | No replay |
+| `SendStreamingMessage` | Replays from that id, before the task is submitted | No replay | No replay |
 | `stream/watch` | Replays from that id, after `connection-ack` | Replays from `0` | Replays from `0` |
 
 The header name is case-insensitive. A replay from id `N`:
@@ -681,6 +685,7 @@ client that follows them.
 
 | Protocol feature | `mur watch` |
 |---|---|
+| `A2A-Version` | Sends `A2A-Version: 1.0` |
 | `Last-Event-ID` | Sends `Last-Event-ID: 0`, so it replays the buffer on attach |
 | `id:` lines | Read, only to report where a lost connection stopped |
 | Reconnecting | Does not reconnect |

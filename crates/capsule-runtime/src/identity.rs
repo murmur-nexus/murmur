@@ -6,8 +6,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::a2a::{
-    A2aMessage, A2aTask, CancelOutcome, IncomingTask, JsonRpcRequest, JsonRpcResponse,
-    TaskRegistry, TaskState, TaskStatus,
+    A2aError, A2aMessage, A2aTask, CancelOutcome, IncomingTask, JsonRpcRequest, JsonRpcResponse,
+    MurmurError, TaskRegistry, TaskState, TaskStatus, INTERNAL_ERROR, INVALID_PARAMS,
+    METHOD_NOT_FOUND,
 };
 use crate::cancel::{Arrival, LiveDelegations, Residue};
 use crate::control_plane::{handle_control_request, is_control_path, ControlPlane, ControlRequest};
@@ -73,45 +74,47 @@ pub(crate) async fn bind_local_port(
 /// dispatcher, and the card lists it without further change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DoorMethod {
-    MessageSend,
-    MessageStream,
+    SendMessage,
+    SendStreamingMessage,
     StreamWatch,
-    TasksGet,
-    TasksCancel,
+    GetTask,
+    CancelTask,
     SessionStop,
-    GetAuthenticatedExtendedCard,
+    GetExtendedAgentCard,
 }
 
 impl DoorMethod {
     /// Every method, in the order the card lists them.
     pub(crate) const ALL: [DoorMethod; 7] = [
-        DoorMethod::MessageSend,
-        DoorMethod::MessageStream,
+        DoorMethod::SendMessage,
+        DoorMethod::SendStreamingMessage,
         DoorMethod::StreamWatch,
-        DoorMethod::TasksGet,
-        DoorMethod::TasksCancel,
+        DoorMethod::GetTask,
+        DoorMethod::CancelTask,
         DoorMethod::SessionStop,
-        DoorMethod::GetAuthenticatedExtendedCard,
+        DoorMethod::GetExtendedAgentCard,
     ];
 
+    /// The method's name on the wire: the A2A v1.0 name of an A2A method, and murmur's own name of
+    /// `stream/watch` and `session/stop`.
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
-            DoorMethod::MessageSend => "message/send",
-            DoorMethod::MessageStream => "message/stream",
+            DoorMethod::SendMessage => "SendMessage",
+            DoorMethod::SendStreamingMessage => "SendStreamingMessage",
             DoorMethod::StreamWatch => "stream/watch",
-            DoorMethod::TasksGet => "tasks/get",
-            DoorMethod::TasksCancel => "tasks/cancel",
+            DoorMethod::GetTask => "GetTask",
+            DoorMethod::CancelTask => "CancelTask",
             DoorMethod::SessionStop => "session/stop",
-            DoorMethod::GetAuthenticatedExtendedCard => "agent/getAuthenticatedExtendedCard",
+            DoorMethod::GetExtendedAgentCard => "GetExtendedAgentCard",
         }
     }
 
     /// The door-token scope a caller must hold to call this method on an authenticated door: its
-    /// wire name, one of [`murmur_artifact::DOOR_SCOPES`]. `None` for
-    /// `agent/getAuthenticatedExtendedCard`, which every authenticated caller may call.
+    /// wire name, one of [`murmur_artifact::DOOR_SCOPES`]. `None` for `GetExtendedAgentCard`,
+    /// which every authenticated caller may call.
     pub(crate) fn scope(self) -> Option<&'static str> {
         match self {
-            DoorMethod::GetAuthenticatedExtendedCard => None,
+            DoorMethod::GetExtendedAgentCard => None,
             method => Some(method.wire_name()),
         }
     }
@@ -121,9 +124,9 @@ impl DoorMethod {
     ///
     /// The only place a request's method is interpreted and the only place
     /// `lifecycle.task_acceptance` gates one: under `TaskAcceptance::None` neither task-starting
-    /// method is served. `agent/getAuthenticatedExtendedCard` is served only by an `authenticated`
-    /// door, the only kind with an extended card. The match is exact — no case folding, no
-    /// trimming — so a name the card lists is the name to send.
+    /// method is served. `GetExtendedAgentCard` is served only by an `authenticated` door, the only
+    /// kind with an extended card. The match is exact — no case folding, no trimming, no other
+    /// spelling — so a name the card lists is the name to send.
     pub(crate) fn resolve(
         method: &str,
         acceptance: &TaskAcceptance,
@@ -131,8 +134,10 @@ impl DoorMethod {
     ) -> Option<DoorMethod> {
         let resolved = Self::ALL.into_iter().find(|m| m.wire_name() == method)?;
         match (resolved, acceptance) {
-            (DoorMethod::MessageSend | DoorMethod::MessageStream, TaskAcceptance::None) => None,
-            (DoorMethod::GetAuthenticatedExtendedCard, _) if !authenticated => None,
+            (DoorMethod::SendMessage | DoorMethod::SendStreamingMessage, TaskAcceptance::None) => {
+                None
+            }
+            (DoorMethod::GetExtendedAgentCard, _) if !authenticated => None,
             _ => Some(resolved),
         }
     }
@@ -179,8 +184,8 @@ impl TransportKind {
 
 /// What the capsule's inference transport can actually do, beyond what the served method list
 /// already says: whether the card claims `capabilities.streaming`, and which frames the stream
-/// extension lists. Every transport can be stopped, so cancellation is not here: `tasks/cancel`
-/// is served under every acceptance.
+/// extension lists. Every transport can be stopped, so cancellation is not here: `CancelTask` is
+/// served under every acceptance.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransportCapabilities {
     /// Whether the transport emits streaming text frames.
@@ -192,9 +197,9 @@ pub(crate) struct TransportCapabilities {
 /// Whether a connection made with `method` can receive `frame` from a session on `transport`.
 ///
 /// Each frame's arm states which streaming methods carry it and which transports write it. Only
-/// `message/stream` and `stream/watch` write frames; `stream/watch` alone writes the observer's
-/// `connection-ack` and `capsule-closed`, and `message/stream` alone answers a request it cannot
-/// take with `error`.
+/// `SendStreamingMessage` and `stream/watch` write frames; `stream/watch` alone writes the
+/// observer's `connection-ack` and `capsule-closed`, and `SendStreamingMessage` alone answers a
+/// request it cannot take with `error`.
 pub(crate) fn writes_frame(
     method: DoorMethod,
     frame: StreamFrame,
@@ -216,13 +221,13 @@ pub(crate) fn writes_frame(
             StreamFrame::Error => (true, false, &TransportKind::ALL),
         };
     let carried = match method {
-        DoorMethod::MessageStream => on_message_stream,
+        DoorMethod::SendStreamingMessage => on_message_stream,
         DoorMethod::StreamWatch => on_stream_watch,
-        DoorMethod::MessageSend
-        | DoorMethod::TasksGet
-        | DoorMethod::TasksCancel
+        DoorMethod::SendMessage
+        | DoorMethod::GetTask
+        | DoorMethod::CancelTask
         | DoorMethod::SessionStop
-        | DoorMethod::GetAuthenticatedExtendedCard => false,
+        | DoorMethod::GetExtendedAgentCard => false,
     };
     carried && transports.contains(&transport)
 }
@@ -264,17 +269,13 @@ pub(crate) fn served_frames(
 /// `inference.transport: process`.
 pub(crate) const FORGET_SESSION_HEADER: &str = "x-murmur-forget-session";
 
-/// A2A 0.3's `AuthenticatedExtendedCardNotConfiguredError`: what a door with no extended card
-/// answers `agent/getAuthenticatedExtendedCard` with.
-pub(crate) const EXTENDED_CARD_NOT_CONFIGURED: i32 = -32007;
-
 /// What a door declaring `network.authentication` holds: the session's key and tokens, the realm
 /// its challenges name, and the extended card an authenticated caller may read.
 pub(crate) struct DoorGate {
     pub auth: Arc<crate::door_auth::DoorAuth>,
     /// The capsule name.
     pub realm: String,
-    /// The A2A 0.3 extended card, from [`build_agent_cards`].
+    /// The extended card, from [`build_agent_cards`].
     pub extended_card: Value,
 }
 
@@ -298,17 +299,14 @@ pub(crate) const STREAM_EXTENSION_URI: &str =
 const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.";
 
 /// What the stream extension says about itself.
-const STREAM_EXTENSION_DESCRIPTION: &str = "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.";
+const STREAM_EXTENSION_DESCRIPTION: &str = "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.";
 
 /// The id of the one skill a door that starts tasks advertises: running a task.
 pub(crate) const TASK_SKILL_ID: &str = "task";
 
-/// The A2A protocol version the card's JSON-RPC interface declares.
-///
-/// The card's shape is A2A v1.0, but the door answers the 0.3 method names (`message/send`,
-/// `tasks/get`, …) and 0.3 task states, which v1.0 renamed. An `AgentInterface` carries its own
-/// `protocolVersion` so that a v1.0 card can declare an interface at another version.
-pub(crate) const INTERFACE_PROTOCOL_VERSION: &str = "0.3";
+/// The A2A protocol version the card's JSON-RPC interface declares: the one version the door
+/// negotiates.
+pub(crate) const INTERFACE_PROTOCOL_VERSION: &str = crate::a2a::A2A_PROTOCOL_VERSION;
 
 /// The `protocolBinding` of the door's interface.
 const JSONRPC_BINDING: &str = "JSONRPC";
@@ -340,10 +338,10 @@ const TEXT_MODE: &str = "text/plain";
 ///   public card of an authenticated door.
 ///
 /// `capabilities.streaming` is read off the served methods and the transport together: `true`
-/// when `message/stream` is served and the transport streams text. A door that answers a method
+/// when `SendStreamingMessage` is served and the transport streams text. A door that answers a method
 /// whose effect its transport cannot deliver still lists the method and says so here.
 ///
-/// `skills` is the one [`TASK_SKILL_ID`] skill when the door serves `message/send`, and empty
+/// `skills` is the one [`TASK_SKILL_ID`] skill when the door serves `SendMessage`, and empty
 /// otherwise. Installed tools are not skills: a caller cannot invoke one directly.
 pub(crate) fn build_agent_card(
     identity: &CapsuleIdentity,
@@ -362,12 +360,12 @@ pub(crate) fn build_agent_card(
 
     let methods = served_methods(task_acceptance, false);
     let streaming =
-        methods.contains(&DoorMethod::MessageStream.wire_name()) && transport.streams_text;
+        methods.contains(&DoorMethod::SendStreamingMessage.wire_name()) && transport.streams_text;
     let declared_planes: Vec<&str> = [(planes.files, "files"), (planes.peer_files, "peer_files")]
         .into_iter()
         .filter_map(|(declared, name)| declared.then_some(name))
         .collect();
-    let skills: Vec<Value> = if methods.contains(&DoorMethod::MessageSend.wire_name()) {
+    let skills: Vec<Value> = if methods.contains(&DoorMethod::SendMessage.wire_name()) {
         vec![serde_json::json!({
             "id": TASK_SKILL_ID,
             "name": "Run a task",
@@ -443,16 +441,12 @@ fn interface_url(capsule_url: &str) -> String {
 /// The name the card gives the door's one security scheme.
 pub(crate) const BEARER_SCHEME_NAME: &str = "bearer";
 
-/// The A2A protocol version the extended card declares. `agent/getAuthenticatedExtendedCard`
-/// answers on the door's 0.3 interface, so its result is an A2A 0.3 `AgentCard`.
-pub(crate) const EXTENDED_CARD_PROTOCOL_VERSION: &str = "0.3.0";
-
 /// What the bearer scheme says about the token it takes.
 const BEARER_SCHEME_DESCRIPTION: &str =
     "A token this capsule's runtime mints at launch and accepts until the session ends.";
 
 /// The cards a door serves: the public card at `/.well-known/agent-card.json`, and the extended
-/// card `agent/getAuthenticatedExtendedCard` returns when the door authenticates.
+/// card `GetExtendedAgentCard` returns when the door authenticates.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AgentCards {
     pub public: Value,
@@ -464,11 +458,10 @@ pub(crate) struct AgentCards {
 /// With `authentication` `None` the public card is exactly [`build_agent_card`]'s and there is no
 /// extended card. With it declared, the v1.0 card [`build_agent_card`] returns gains
 /// `capabilities.extendedAgentCard: true`, the [`BEARER_SCHEME_NAME`] HTTP scheme with a
-/// requirement any valid token meets, `agent/getAuthenticatedExtendedCard` on the door
-/// extension's methods, and one alternative requirement per served task-starting method on the
-/// [`TASK_SKILL_ID`] skill. The public card is that card without the capsule extension, so it
-/// carries the door and stream extensions; the extended card is that card, whole, in 0.3 shape
-/// through [`v03_agent_card`].
+/// requirement any valid token meets, `GetExtendedAgentCard` on the door extension's methods, and
+/// one alternative requirement per served task-starting method on the [`TASK_SKILL_ID`] skill.
+/// The extended card is that card, whole. The public card is that card without the capsule
+/// extension, so it carries the door and stream extensions.
 // Each argument feeds its own part of the card, and all but `authentication` pass straight through
 // to `build_agent_card`; a wrapper struct would name the argument count rather than a concept.
 #[allow(clippy::too_many_arguments)]
@@ -499,7 +492,7 @@ pub(crate) fn build_agent_cards(
     }
 
     let mut card = authenticated_card(card, task_acceptance);
-    let extended = v03_agent_card(&card);
+    let extended = card.clone();
     if let Some(extensions) = card["capabilities"]["extensions"].as_array_mut() {
         extensions.retain(|extension| extension["uri"] != CAPSULE_EXTENSION_URI);
     }
@@ -530,7 +523,7 @@ fn authenticated_card(mut card: Value, task_acceptance: &TaskAcceptance) -> Valu
             }
         }
     }
-    let task_requirements: Vec<Value> = [DoorMethod::MessageSend, DoorMethod::MessageStream]
+    let task_requirements: Vec<Value> = [DoorMethod::SendMessage, DoorMethod::SendStreamingMessage]
         .into_iter()
         .map(DoorMethod::wire_name)
         .filter(|method| methods.contains(method))
@@ -549,89 +542,6 @@ fn authenticated_card(mut card: Value, task_acceptance: &TaskAcceptance) -> Valu
 /// One v1.0 `SecurityRequirement` naming the bearer scheme with `scopes`.
 fn bearer_requirement(scopes: &[&str]) -> Value {
     serde_json::json!({"schemes": {BEARER_SCHEME_NAME: {"list": scopes}}})
-}
-
-/// The A2A 0.3 `AgentCard` a v1.0 card describes, for the door's 0.3 interface.
-///
-/// Mechanical: `url` is the card's [`jsonrpc_interface_url`], `preferredTransport` is `JSONRPC`,
-/// `capabilities` loses `extendedAgentCard`, which 0.3 carries as
-/// `supportsAuthenticatedExtendedCard`, each `httpAuthSecurityScheme` becomes a
-/// `{"type": "http", …}` scheme, and each list of `securityRequirements`, the card's and every
-/// skill's, becomes a 0.3 `security` list of `{scheme: scopes}` objects. Every other field is
-/// copied. The capsule extension keeps its place, so [`session_id_from_card`] reads either shape.
-pub(crate) fn v03_agent_card(card: &Value) -> Value {
-    let mut capabilities = card["capabilities"].clone();
-    let supports_extended = capabilities
-        .as_object_mut()
-        .and_then(|capabilities| capabilities.remove("extendedAgentCard"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-
-    let security_schemes: serde_json::Map<String, Value> = card["securitySchemes"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(name, scheme)| {
-            let http = scheme.get("httpAuthSecurityScheme")?;
-            let mut v03 = serde_json::Map::new();
-            v03.insert("type".to_string(), Value::from("http"));
-            for field in ["scheme", "description", "bearerFormat"] {
-                if let Some(value) = http.get(field) {
-                    v03.insert(field.to_string(), value.clone());
-                }
-            }
-            Some((name.clone(), Value::Object(v03)))
-        })
-        .collect();
-
-    let skills: Vec<Value> = card["skills"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|skill| {
-            let mut skill = skill.clone();
-            if let Some(object) = skill.as_object_mut() {
-                if let Some(requirements) = object.remove("securityRequirements") {
-                    object.insert("security".to_string(), v03_security(&requirements));
-                }
-            }
-            skill
-        })
-        .collect();
-
-    serde_json::json!({
-        "protocolVersion": EXTENDED_CARD_PROTOCOL_VERSION,
-        "name": card["name"],
-        "description": card["description"],
-        "url": jsonrpc_interface_url(card).unwrap_or_default(),
-        "preferredTransport": JSONRPC_BINDING,
-        "version": card["version"],
-        "capabilities": capabilities,
-        "securitySchemes": security_schemes,
-        "security": v03_security(&card["securityRequirements"]),
-        "defaultInputModes": card["defaultInputModes"],
-        "defaultOutputModes": card["defaultOutputModes"],
-        "skills": skills,
-        "supportsAuthenticatedExtendedCard": supports_extended,
-    })
-}
-
-/// v1.0 `[{"schemes": {name: {"list": [..]}}}]` as 0.3 `[{name: [..]}]`.
-fn v03_security(requirements: &Value) -> Value {
-    requirements
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|requirement| {
-            let flattened: serde_json::Map<String, Value> = requirement["schemes"]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .map(|(name, list)| (name.clone(), list["list"].clone()))
-                .collect();
-            Value::Object(flattened)
-        })
-        .collect()
 }
 
 /// The `params` object of the extension in `card.capabilities.extensions` whose `uri` is `uri`.
@@ -770,7 +680,7 @@ pub(crate) async fn serve_http(
     if accept_failed {
         let _ = shutdown_rx.await;
     }
-    // A `stream/watch` or `message/stream` connection otherwise outlives the session: its
+    // A `stream/watch` or `SendStreamingMessage` connection otherwise outlives the session: its
     // handler holds a broadcast sender, so it never sees the channel close.
     let _ = closing_tx.send(true);
     let drained = async { while connections.join_next().await.is_some() {} };
@@ -919,6 +829,9 @@ async fn handle_connection(
     let mut authorization: Option<String> = None;
     // Every `authorization` header, in order: a door token is refused when more than one is sent.
     let mut authorizations: Vec<String> = Vec::new();
+    // Every `A2A-Version` header, in order: a JSON-RPC request is served only when there is one.
+    let mut a2a_versions: Vec<String> = Vec::new();
+    let a2a_version_prefix = format!("{}:", crate::a2a::A2A_VERSION_HEADER.to_ascii_lowercase());
 
     loop {
         let mut line = String::new();
@@ -937,6 +850,12 @@ async fn handle_connection(
             let value = line.trim_end()["authorization:".len()..].trim().to_string();
             authorizations.push(value.clone());
             authorization = Some(value);
+        } else if lower.starts_with(&a2a_version_prefix) {
+            // Taken from the line as sent, so a refusal names the version exactly as requested.
+            let value = line.trim_end()[a2a_version_prefix.len()..]
+                .trim()
+                .to_string();
+            a2a_versions.push(value);
         } else if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
         } else if lower.starts_with("content-type:") && lower.contains("application/json") {
@@ -1078,42 +997,60 @@ async fn handle_connection(
         }
         let body_str = String::from_utf8_lossy(&body).to_string();
 
+        // The JSON-RPC envelope first: a body that is not a JSON-RPC 2.0 request is a request of
+        // no A2A version.
+        let req = match JsonRpcRequest::from_body(&body_str) {
+            Ok(req) => req,
+            Err(refusal) => {
+                let _ = writer_half
+                    .write_all(refusal.into_http_response().as_bytes())
+                    .await;
+                return;
+            }
+        };
+
+        // Then the version, on every method the door serves, murmur's own and completions among
+        // them: ahead of method resolution, so a client of another version learns that its
+        // version is what is refused rather than its method name, and ahead of the scope, since a
+        // method of an unknown version has no scope to judge. Answered as one JSON body even on a
+        // streaming method, and nothing is started or stopped.
+        if !crate::a2a::accepts_a2a_version(&a2a_versions) {
+            let refusal = crate::a2a::version_not_supported(req.id, &a2a_versions);
+            let _ = writer_half
+                .write_all(refusal.into_http_response().as_bytes())
+                .await;
+            return;
+        }
+
         // A completion is addressed to one session, and this door answers for one session. An
         // address that has outlived the session that made the delegation — a parent that
         // restarted onto the same port — is refused here rather than delivered to whoever
         // answers now. The refusal names the addressed session and not this one: a caller that
         // guessed wrong learns nothing about who is actually here.
         if is_completion && completion_session.as_deref() != Some(session_id.as_str()) {
-            let id = serde_json::from_str::<JsonRpcRequest>(&body_str)
-                .map(|req| req.id)
-                .unwrap_or(Value::Null);
-            let addressed = completion_session.as_deref().unwrap_or("<unaddressed>");
-            let response = JsonRpcResponse::err(
-                id,
-                -32004,
+            let addressed = completion_session.as_deref().unwrap_or("");
+            let shown = if addressed.is_empty() {
+                "<unaddressed>"
+            } else {
+                addressed
+            };
+            let response = JsonRpcResponse::murmur_error(
+                req.id,
+                MurmurError::CompletionMisaddressed,
                 &format!(
-                    "completion is addressed to session {addressed}, which is not the session \
+                    "completion is addressed to session {shown}, which is not the session \
                      running here"
                 ),
+                &[("addressedSession", addressed.to_string())],
             )
             .into_http_response();
             let _ = writer_half.write_all(response.as_bytes()).await;
             return;
         }
 
-        let req = match serde_json::from_str::<JsonRpcRequest>(&body_str) {
-            Ok(req) => req,
-            Err(_) => {
-                let response =
-                    JsonRpcResponse::err(Value::Null, -32700, "Parse error").into_http_response();
-                let _ = writer_half.write_all(response.as_bytes()).await;
-                return;
-            }
-        };
-
         // A sub-capsule's outcome belongs to the task that delegated to it, so it is handed to the
         // session's delegation set here and never becomes a task: ahead of method resolution,
-        // which serves no `message/send` under `task_acceptance: none`, and ahead of the task
+        // which serves no `SendMessage` under `task_acceptance: none`, and ahead of the task
         // registry, which refuses a second task under `single`.
         if is_completion {
             let response = handle_completion(req, delegation_id.as_deref(), &live_delegations);
@@ -1121,27 +1058,43 @@ async fn handle_connection(
             return;
         }
 
-        let resolved = DoorMethod::resolve(&req.method, &task_acceptance, gate.is_some());
-        // Scope is checked once the method is known to be served and before its handler runs: an
-        // unserved method is `-32601` to anyone the door let in, since the card lists what it
-        // serves.
-        if let Some(scope) = resolved.and_then(DoorMethod::scope) {
-            if let Some(refused) = refuse_scope(scope) {
-                let _ = writer_half.write_all(&refused).await;
-                return;
-            }
+        // An unserved method is refused before its scope is judged: it is `-32601` to anyone the
+        // door let in, since the card lists what it serves. A public door has no extended card,
+        // and A2A answers asking one for it as an unsupported operation.
+        let Some(resolved) = DoorMethod::resolve(&req.method, &task_acceptance, gate.is_some())
+        else {
+            let response = if req.method == DoorMethod::GetExtendedAgentCard.wire_name() {
+                JsonRpcResponse::a2a_error(
+                    req.id,
+                    A2aError::UnsupportedOperation,
+                    "this agent serves no extended agent card",
+                    &[],
+                )
+            } else {
+                JsonRpcResponse::err(req.id, METHOD_NOT_FOUND, "Method not found")
+            };
+            let _ = writer_half
+                .write_all(response.into_http_response().as_bytes())
+                .await;
+            return;
+        };
+        if let Some(refused) = resolved.scope().and_then(refuse_scope) {
+            let _ = writer_half.write_all(&refused).await;
+            return;
         }
 
         // A forget writes to this capsule's harness session map, and only a `transport: process`
         // capsule has one. Refused here, on the request that carried it, rather than dropped into
         // a task that would ignore it: a caller that asked for a conversation to be dropped and
         // was answered `completed` would read that as the drop having happened.
-        let starts_a_turn = req.method == DoorMethod::MessageSend.wire_name()
-            || req.method == DoorMethod::MessageStream.wire_name();
+        let starts_a_turn = matches!(
+            resolved,
+            DoorMethod::SendMessage | DoorMethod::SendStreamingMessage
+        );
         if forget_session && starts_a_turn && !forgettable_session {
             let response = JsonRpcResponse::err(
                 req.id,
-                -32602,
+                INVALID_PARAMS,
                 &format!(
                     "{FORGET_SESSION_HEADER} asks this capsule to forget the harness session \
                      this context names, and only a capsule on inference.transport: process has \
@@ -1153,9 +1106,21 @@ async fn handle_connection(
             return;
         }
 
+        // Every method the door serves takes its parameters as one object.
+        if !req.params.is_object() {
+            let response = JsonRpcResponse::err(
+                req.id,
+                INVALID_PARAMS,
+                "Invalid parameters: params must be an object",
+            )
+            .into_http_response();
+            let _ = writer_half.write_all(response.as_bytes()).await;
+            return;
+        }
+
         // The streaming methods own the connection; every other method answers one JSON body.
         let response = match resolved {
-            Some(DoorMethod::MessageStream) => {
+            DoorMethod::SendStreamingMessage => {
                 handle_message_stream(
                     writer_half,
                     req,
@@ -1173,7 +1138,7 @@ async fn handle_connection(
                 .await;
                 return;
             }
-            Some(DoorMethod::StreamWatch) => {
+            DoorMethod::StreamWatch => {
                 handle_stream_watch(
                     writer_half,
                     last_event_id,
@@ -1185,13 +1150,13 @@ async fn handle_connection(
                 .await;
                 return;
             }
-            Some(DoorMethod::GetAuthenticatedExtendedCard) => match gate.as_deref() {
+            DoorMethod::GetExtendedAgentCard => match gate.as_deref() {
                 Some(gate) => JsonRpcResponse::ok(req.id, &gate.extended_card).into_http_response(),
                 None => {
                     unreachable!("resolve serves the extended card only on an authenticated door")
                 }
             },
-            Some(door_method) => handle_jsonrpc(
+            door_method => handle_jsonrpc(
                 door_method,
                 req,
                 &task_registry,
@@ -1204,17 +1169,6 @@ async fn handle_connection(
                 &live_delegations,
                 &session_id,
             ),
-            // A2A 0.3's answer from an agent with no extended card. The card does not list the
-            // method, since the door does not serve it.
-            None if req.method == DoorMethod::GetAuthenticatedExtendedCard.wire_name() => {
-                JsonRpcResponse::err(
-                    req.id,
-                    EXTENDED_CARD_NOT_CONFIGURED,
-                    "Authenticated Extended Card is not configured",
-                )
-                .into_http_response()
-            }
-            None => JsonRpcResponse::err(req.id, -32601, "Method not found").into_http_response(),
         };
         let _ = writer_half.write_all(response.as_bytes()).await;
         return;
@@ -1472,7 +1426,7 @@ async fn write_replay(
     Ok(last_written)
 }
 
-/// The `rejected` status written to a `message/stream` connection the door refuses, busy or
+/// The `rejected` status written to a `SendStreamingMessage` connection the door refuses, busy or
 /// closing. It goes to that one connection and is never buffered, so it carries no `id:` line:
 /// it has no place in the session's sequence, and an id would move a client's resume cursor.
 fn format_rejected_event(event: &TaskStatusUpdateEvent) -> String {
@@ -1577,57 +1531,59 @@ async fn handle_stream_watch(
 ///
 /// Success for a delegation the running task started and has not accounted for, and for one
 /// whose outcome already arrived — a repeat is the watcher retrying a post it could not confirm.
-/// Anything else is `-32004` naming the delegation, which the child records as its
-/// `delivery_error`. The outcome itself is read from the child's `completion.json` by the task
-/// that receives it, never from this message.
+/// Anything else is [`MurmurError::CompletionNotAwaited`] naming the delegation, whose message the
+/// child records as its `delivery_error`. The outcome itself is read from the child's
+/// `completion.json` by the task that receives it, never from this message.
 fn handle_completion(
     req: JsonRpcRequest,
     delegation_id: Option<&str>,
     live_delegations: &LiveDelegations,
 ) -> String {
-    if req.method != DoorMethod::MessageSend.wire_name() {
+    if req.method != DoorMethod::SendMessage.wire_name() {
         return JsonRpcResponse::err(
             req.id,
-            -32601,
+            METHOD_NOT_FOUND,
             &format!(
                 "a completion is posted with {}",
-                DoorMethod::MessageSend.wire_name()
+                DoorMethod::SendMessage.wire_name()
             ),
         )
         .into_http_response();
     }
     let Some(delegation_id) = delegation_id.filter(|id| !id.is_empty()) else {
-        return JsonRpcResponse::err(
+        return JsonRpcResponse::murmur_error(
             req.id,
-            -32004,
+            MurmurError::CompletionNotAwaited,
             &format!(
                 "completion names no delegation in {DELEGATION_ID_HEADER}, so no task in this \
                  session is waiting for it"
             ),
+            &[],
         )
         .into_http_response();
     };
+    let not_awaited = |message: String| {
+        JsonRpcResponse::murmur_error(
+            req.id.clone(),
+            MurmurError::CompletionNotAwaited,
+            &message,
+            &[("delegationId", delegation_id.to_string())],
+        )
+        .into_http_response()
+    };
     match live_delegations.arrive(delegation_id) {
         Arrival::Delivered | Arrival::AlreadyDelivered => JsonRpcResponse::ok(
-            req.id,
+            req.id.clone(),
             serde_json::json!({ "delegation_id": delegation_id, "received": true }),
         )
         .into_http_response(),
-        Arrival::NotOutstanding => JsonRpcResponse::err(
-            req.id,
-            -32004,
-            &format!("no task in this session is waiting for delegation {delegation_id}"),
-        )
-        .into_http_response(),
-        Arrival::BeingEnded => JsonRpcResponse::err(
-            req.id,
-            -32004,
-            &format!(
-                "delegation {delegation_id} is being ended by this session; its launcher \
-                 records the outcome"
-            ),
-        )
-        .into_http_response(),
+        Arrival::NotOutstanding => not_awaited(format!(
+            "no task in this session is waiting for delegation {delegation_id}"
+        )),
+        Arrival::BeingEnded => not_awaited(format!(
+            "delegation {delegation_id} is being ended by this session; its launcher records the \
+             outcome"
+        )),
     }
 }
 
@@ -1648,7 +1604,7 @@ fn handle_jsonrpc(
 ) -> String {
     let id = req.id;
     match method {
-        DoorMethod::MessageSend => handle_message_send(
+        DoorMethod::SendMessage => handle_message_send(
             id,
             &req.params,
             task_registry,
@@ -1658,10 +1614,10 @@ fn handle_jsonrpc(
             forget_session,
             caller_member,
         ),
-        DoorMethod::TasksGet => {
+        DoorMethod::GetTask => {
             handle_tasks_get(id, &req.params, task_registry, caller_member.as_deref())
         }
-        DoorMethod::TasksCancel => handle_tasks_cancel(
+        DoorMethod::CancelTask => handle_tasks_cancel(
             id,
             &req.params,
             task_registry,
@@ -1672,9 +1628,9 @@ fn handle_jsonrpc(
         DoorMethod::SessionStop => {
             handle_session_stop(id, task_registry, detached, live_delegations, session_id)
         }
-        DoorMethod::MessageStream
+        DoorMethod::SendStreamingMessage
         | DoorMethod::StreamWatch
-        | DoorMethod::GetAuthenticatedExtendedCard => {
+        | DoorMethod::GetExtendedAgentCard => {
             unreachable!("handle_connection answers the streaming methods and the extended card")
         }
     }
@@ -1695,7 +1651,7 @@ fn handle_message_send(
     let message: A2aMessage = match serde_json::from_value(msg_value.clone()) {
         Ok(m) => m,
         Err(e) => {
-            return JsonRpcResponse::err(id, -32602, &format!("Invalid params: {e}"))
+            return JsonRpcResponse::err(id, INVALID_PARAMS, &format!("Invalid params: {e}"))
                 .into_http_response();
         }
     };
@@ -1764,7 +1720,7 @@ fn handle_message_send(
         let mut reg = task_registry.lock().unwrap();
         reg.pending_count -= 1;
         reg.history.remove(&task_id);
-        return JsonRpcResponse::err(id, -32603, "internal error: queue send failed")
+        return JsonRpcResponse::err(id, INTERNAL_ERROR, "internal error: queue send failed")
             .into_http_response();
     }
 
@@ -1784,13 +1740,23 @@ fn visible_to(reg: &TaskRegistry, task_id: &str, caller_member: Option<&str>) ->
     caller_member.is_none_or(|member| reg.submitter(task_id) == Some(member))
 }
 
-/// `tasks/get`: one task's state, and how it ended once it has.
+/// The `TaskNotFoundError` answering a request that named `task_id`, or named none.
+fn task_not_found(id: Value, task_id: Option<&str>) -> String {
+    let metadata: Vec<(&str, String)> = task_id
+        .map(|task_id| ("taskId", task_id.to_string()))
+        .into_iter()
+        .collect();
+    JsonRpcResponse::a2a_error(id, A2aError::TaskNotFound, "Task not found", &metadata)
+        .into_http_response()
+}
+
+/// `GetTask`: one task's state, and how it ended once it has.
 ///
 /// A formation member — `caller_member`, from the formation token the door let in — reads only
 /// the tasks it submitted itself. Every other id, another member's task or the operator's
-/// included, gets the same `-32001` an id this capsule never held gets. A formation token reaches
-/// no `message/stream`, whose connection forwards every task's frames, so `tasks/get` is the only
-/// way a member reads a task.
+/// included, gets the same [`A2aError::TaskNotFound`] an id this capsule never held gets. A
+/// formation token reaches no `SendStreamingMessage`, whose connection forwards every task's
+/// frames, so `GetTask` is the only way a member reads a task.
 fn handle_tasks_get(
     id: Value,
     params: &Value,
@@ -1800,27 +1766,19 @@ fn handle_tasks_get(
     let requested_id = params.get("id").and_then(Value::as_str).map(str::to_string);
 
     let Some(task_id) = requested_id else {
-        // Backward compat: if no id provided, return the active slot's task if any
+        // With no id, the active slot's task, if there is one.
         let reg = task_registry.lock().unwrap();
-        return match &reg.active_slot {
-            crate::a2a::TaskSlotState::Empty => {
-                JsonRpcResponse::err(id, -32001, "Task not found").into_http_response()
-            }
-            _ => {
-                // Use get_task on the active slot's task_id
-                let active_id = match &reg.active_slot {
-                    crate::a2a::TaskSlotState::Running { task_id, .. }
-                    | crate::a2a::TaskSlotState::Done { task_id, .. } => task_id.clone(),
-                    crate::a2a::TaskSlotState::Empty => unreachable!(),
-                };
-                match reg
-                    .get_task(&active_id)
-                    .filter(|_| visible_to(&reg, &active_id, caller_member))
-                {
-                    Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
-                    None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
-                }
-            }
+        let active_id = match &reg.active_slot {
+            crate::a2a::TaskSlotState::Empty => return task_not_found(id, None),
+            crate::a2a::TaskSlotState::Running { task_id, .. }
+            | crate::a2a::TaskSlotState::Done { task_id, .. } => task_id.clone(),
+        };
+        return match reg
+            .get_task(&active_id)
+            .filter(|_| visible_to(&reg, &active_id, caller_member))
+        {
+            Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
+            None => task_not_found(id, None),
         };
     };
 
@@ -1830,22 +1788,23 @@ fn handle_tasks_get(
         .filter(|_| visible_to(&reg, &task_id, caller_member))
     {
         Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
-        None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
+        None => task_not_found(id, Some(&task_id)),
     }
 }
 
-/// `tasks/cancel`: stop one task and report what is still running.
+/// `CancelTask`: stop one task and report what is still running.
 ///
 /// Runs on the connection task and never waits for the agent loop: it takes the registry lock,
 /// records the cancellation, snapshots the two work registries and answers. Whether the loop has
 /// noticed yet is not the caller's question — the recorded state is already `canceled`.
 ///
-/// Every outcome but one is a JSON-RPC `result`. A task that had already ended is returned
-/// unchanged, because "do no more work on this" is already true of it. Only an id this capsule
-/// never held is an error, and it is the same `-32001` `tasks/get` answers with.
+/// A live task is answered with its `canceled` state and the residue. A task that had already
+/// ended is left unchanged and answered [`A2aError::TaskNotCancelable`], whose `ErrorInfo` names
+/// the task and the state it ended in, spelled as `GetTask` spells it. An id this capsule never
+/// held is the same [`A2aError::TaskNotFound`] `GetTask` answers with.
 ///
 /// A formation member — `caller_member` — cancels only the tasks it submitted itself, by the
-/// same [`visible_to`] rule `tasks/get` reads by: any other id gets that same `-32001`, and
+/// same [`visible_to`] rule `GetTask` reads by: any other id gets that same `TaskNotFound`, and
 /// nothing is cancelled.
 fn handle_tasks_cancel(
     id: Value,
@@ -1856,25 +1815,34 @@ fn handle_tasks_cancel(
     live_delegations: &LiveDelegations,
 ) -> String {
     let Some(task_id) = params.get("id").and_then(Value::as_str).map(str::to_string) else {
-        return JsonRpcResponse::err(id, -32602, "Invalid params: tasks/cancel requires an id")
-            .into_http_response();
+        return JsonRpcResponse::err(
+            id,
+            INVALID_PARAMS,
+            "Invalid params: CancelTask requires an id",
+        )
+        .into_http_response();
     };
 
     let (outcome, task) = {
         let mut reg = task_registry.lock().unwrap();
         if !visible_to(&reg, &task_id, caller_member) {
-            return JsonRpcResponse::err(id, -32001, "Task not found").into_http_response();
+            return task_not_found(id, Some(&task_id));
         }
         let outcome = reg.request_cancel(&task_id);
         (outcome, reg.get_task(&task_id))
     };
 
     match (outcome, task) {
-        (CancelOutcome::Unknown, _) | (_, None) => {
-            JsonRpcResponse::err(id, -32001, "Task not found").into_http_response()
-        }
+        (CancelOutcome::Unknown, _) | (_, None) => task_not_found(id, Some(&task_id)),
         (CancelOutcome::AlreadyTerminal, Some(task)) => {
-            JsonRpcResponse::ok(id, task).into_http_response()
+            let state = task.status.state.as_str();
+            JsonRpcResponse::a2a_error(
+                id,
+                A2aError::TaskNotCancelable,
+                &format!("Task cannot be canceled: it is already {state}"),
+                &[("taskId", task_id.clone()), ("state", state.to_string())],
+            )
+            .into_http_response()
         }
         (CancelOutcome::Accepted, Some(mut task)) => {
             // Read after the state is recorded, so nothing this snapshot names can have been
@@ -1899,7 +1867,7 @@ fn handle_tasks_cancel(
 ///
 /// Three keys, all three always present. `canceled` lists only the tasks this call moved to
 /// `canceled`, so a second stop answers `[]` rather than an error. `residue` is `[]` when nothing
-/// is running — unlike `tasks/cancel`, which omits the key: a session stop has to be able to say
+/// is running — unlike `CancelTask`, which omits the key: a session stop has to be able to say
 /// "nothing" as a positive fact, because that is the whole answer the operator asked for.
 fn handle_session_stop(
     id: Value,
@@ -2217,7 +2185,7 @@ mod tests {
                 "description": "Murmur capsule my-agent 0.1.0",
                 "version": "0.1.0",
                 "supportedInterfaces": [
-                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
                 ],
                 "capabilities": {
                     "streaming": true,
@@ -2229,7 +2197,7 @@ mod tests {
                             "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
                             "required": false,
                             "params": {
-                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
                                 "peerTasks": false
                             }
                         },
@@ -2247,7 +2215,7 @@ mod tests {
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+                            "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
                             "required": false,
                             "params": {
                                 "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
@@ -2318,17 +2286,17 @@ mod tests {
     }
 
     #[test]
-    fn a2a_card_interface_is_the_door_url_over_http_at_0_3() {
+    fn a2a_card_interface_is_the_door_url_over_http_at_1_0() {
         let card = full_card(&TaskAcceptance::Single);
         assert_eq!(
             card["supportedInterfaces"],
             serde_json::json!([{
                 "url": "http://localhost:41873",
                 "protocolBinding": "JSONRPC",
-                "protocolVersion": "0.3",
+                "protocolVersion": "1.0",
             }])
         );
-        assert_eq!(INTERFACE_PROTOCOL_VERSION, "0.3");
+        assert_eq!(INTERFACE_PROTOCOL_VERSION, "1.0");
         assert_eq!(jsonrpc_interface_url(&card), Some("http://localhost:41873"));
     }
 
@@ -2664,7 +2632,7 @@ mod tests {
                 .as_ref()
                 .expect("an authenticated door has one");
             assert_eq!(door_params(extended)["peerTasks"], accepts_peer_tasks);
-            assert!(door_methods(&cards.public).contains(&"agent/getAuthenticatedExtendedCard"));
+            assert!(door_methods(&cards.public).contains(&"GetExtendedAgentCard"));
         }
         let (refusing, accepting) = (cards_for(false), cards_for(true));
         assert_eq!(
@@ -2682,7 +2650,7 @@ mod tests {
             scheme: murmur_artifact::AuthenticationScheme::Bearer,
             credentials: vec![murmur_artifact::DoorCredential {
                 name: "watcher".to_string(),
-                scopes: vec!["tasks/get".to_string(), "stream/watch".to_string()],
+                scopes: vec!["GetTask".to_string(), "stream/watch".to_string()],
             }],
         }
     }
@@ -2761,13 +2729,10 @@ mod tests {
                                             assert_eq!(cards.extended, None);
                                         }
                                         Some(_) => {
-                                            let extended_v1 = authenticated_card(base, acceptance);
-                                            assert_conforms(&extended_v1);
-                                            assert_eq!(
-                                                cards.extended,
-                                                Some(v03_agent_card(&extended_v1))
-                                            );
-                                            let mut stripped = extended_v1.clone();
+                                            let extended = authenticated_card(base, acceptance);
+                                            assert_conforms(&extended);
+                                            assert_eq!(cards.extended.as_ref(), Some(&extended));
+                                            let mut stripped = extended.clone();
                                             stripped["capabilities"]["extensions"]
                                                 .as_array_mut()
                                                 .unwrap()
@@ -2797,7 +2762,7 @@ mod tests {
                 "description": "Murmur capsule my-agent 0.1.0",
                 "version": "0.1.0",
                 "supportedInterfaces": [
-                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
                 ],
                 "capabilities": {
                     "streaming": true,
@@ -2809,13 +2774,13 @@ mod tests {
                             "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
                             "required": false,
                             "params": {
-                                "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"],
+                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"],
                                 "peerTasks": false
                             }
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+                            "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
                             "required": false,
                             "params": {
                                 "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
@@ -2841,8 +2806,8 @@ mod tests {
                         "description": "Runs one task given as a text message and reports its outcome.",
                         "tags": ["task"],
                         "securityRequirements": [
-                            { "schemes": { "bearer": { "list": ["message/send"] } } },
-                            { "schemes": { "bearer": { "list": ["message/stream"] } } }
+                            { "schemes": { "bearer": { "list": ["SendMessage"] } } },
+                            { "schemes": { "bearer": { "list": ["SendStreamingMessage"] } } }
                         ]
                     }
                 ]
@@ -2851,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    fn a2a_card_extended_card_is_the_documented_0_3_document() {
+    fn a2a_card_extended_card_is_the_documented_v1_document() {
         let cards = full_cards(&TaskAcceptance::Single, Some(&bearer_authentication()));
         let extended = cards
             .extended
@@ -2860,28 +2825,34 @@ mod tests {
         assert_eq!(
             extended,
             serde_json::json!({
-                "protocolVersion": "0.3.0",
                 "name": "my-agent",
                 "description": "Murmur capsule my-agent 0.1.0",
-                "url": "http://localhost:41873",
-                "preferredTransport": "JSONRPC",
                 "version": "0.1.0",
+                "supportedInterfaces": [
+                    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
+                ],
                 "capabilities": {
                     "streaming": true,
                     "pushNotifications": false,
+                    "extendedAgentCard": true,
                     "extensions": [
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.", "required": false,
-                          "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"], "peerTasks": false } },
+                          "params": { "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"], "peerTasks": false } },
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
                           "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
-                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
+                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
                           "params": { "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
                     ]
                 },
                 "securitySchemes": {
-                    "bearer": { "type": "http", "scheme": "Bearer", "description": "A token this capsule's runtime mints at launch and accepts until the session ends." }
+                    "bearer": {
+                        "httpAuthSecurityScheme": {
+                            "scheme": "Bearer",
+                            "description": "A token this capsule's runtime mints at launch and accepts until the session ends."
+                        }
+                    }
                 },
-                "security": [ { "bearer": [] } ],
+                "securityRequirements": [ { "schemes": { "bearer": { "list": [] } } } ],
                 "defaultInputModes": ["text/plain"],
                 "defaultOutputModes": ["text/plain"],
                 "skills": [
@@ -2890,12 +2861,15 @@ mod tests {
                         "name": "Run a task",
                         "description": "Runs one task given as a text message and reports its outcome.",
                         "tags": ["task"],
-                        "security": [ { "bearer": ["message/send"] }, { "bearer": ["message/stream"] } ]
+                        "securityRequirements": [
+                            { "schemes": { "bearer": { "list": ["SendMessage"] } } },
+                            { "schemes": { "bearer": { "list": ["SendStreamingMessage"] } } }
+                        ]
                     }
-                ],
-                "supportsAuthenticatedExtendedCard": true
+                ]
             })
         );
+        assert_conforms(&extended);
         assert_eq!(
             session_id_from_card(&extended),
             Some("ses_019f01a940ce7761854e768ecbe3d399")
@@ -2927,15 +2901,18 @@ mod tests {
             door_methods(&cards.public),
             [
                 "stream/watch",
-                "tasks/get",
-                "tasks/cancel",
+                "GetTask",
+                "CancelTask",
                 "session/stop",
-                "agent/getAuthenticatedExtendedCard"
+                "GetExtendedAgentCard"
             ]
         );
         let extended = cards.extended.unwrap();
         assert_eq!(extended["skills"], serde_json::json!([]));
-        assert_eq!(extended["security"], serde_json::json!([{"bearer": []}]));
+        assert_eq!(
+            extended["securityRequirements"],
+            serde_json::json!([{"schemes": {"bearer": {"list": []}}}])
+        );
     }
 
     #[test]
@@ -2944,7 +2921,7 @@ mod tests {
             let cards = full_cards(acceptance, None);
             assert_eq!(cards.public, full_card(acceptance));
             assert_eq!(cards.extended, None);
-            assert!(!door_methods(&cards.public).contains(&"agent/getAuthenticatedExtendedCard"));
+            assert!(!door_methods(&cards.public).contains(&"GetExtendedAgentCard"));
         }
     }
 
@@ -2983,8 +2960,8 @@ mod tests {
         let card = serde_json::json!({
             "supportedInterfaces": [
                 { "url": "https://grpc.example.com", "protocolBinding": "GRPC", "protocolVersion": "1.0" },
-                { "url": "http://localhost:1", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" },
-                { "url": "http://localhost:2", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" },
+                { "url": "http://localhost:1", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" },
+                { "url": "http://localhost:2", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" },
             ]
         });
         assert_eq!(jsonrpc_interface_url(&card), Some("http://localhost:1"));
@@ -2997,7 +2974,7 @@ mod tests {
             }),
             serde_json::json!({ "supportedInterfaces": [] }),
             serde_json::json!({
-                "supportedInterfaces": [{ "url": "", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }]
+                "supportedInterfaces": [{ "url": "", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }]
             }),
             serde_json::json!({ "url": "localhost:41873" }),
         ] {
@@ -3006,8 +2983,8 @@ mod tests {
     }
 
     /// `streaming` is the served method AND the transport's answer, so a door that answers
-    /// `message/stream` over a transport that streams nothing advertises the method and not the
-    /// capability. `tasks/cancel` is served whatever the transport: every transport can be stopped.
+    /// `SendStreamingMessage` over a transport that streams nothing advertises the method and not the
+    /// capability. `CancelTask` is served whatever the transport: every transport can be stopped.
     #[test]
     fn card_capabilities_are_the_method_and_the_transport() {
         for (transport, streaming) in [
@@ -3027,13 +3004,13 @@ mod tests {
             );
             assert_eq!(card["capabilities"]["streaming"], streaming, "{card}");
             let methods = door_methods(&card);
-            assert!(methods.contains(&"message/stream"), "{card}");
-            assert!(methods.contains(&"tasks/cancel"), "{card}");
+            assert!(methods.contains(&"SendStreamingMessage"), "{card}");
+            assert!(methods.contains(&"CancelTask"), "{card}");
         }
     }
 
     /// A door that starts no task streams nothing, whatever its transport can do: neither
-    /// task-starting method is served under `TaskAcceptance::None`. `tasks/cancel` is served
+    /// task-starting method is served under `TaskAcceptance::None`. `CancelTask` is served
     /// under every acceptance.
     #[test]
     fn a_door_that_starts_no_task_advertises_no_streaming() {
@@ -3047,7 +3024,7 @@ mod tests {
             let card =
                 card_for_transport(&TaskAcceptance::None, DeclaredPlanes::default(), transport);
             assert_eq!(card["capabilities"]["streaming"], false, "{card}");
-            assert!(door_methods(&card).contains(&"tasks/cancel"), "{card}");
+            assert!(door_methods(&card).contains(&"CancelTask"), "{card}");
         }
     }
 
@@ -3085,7 +3062,7 @@ mod tests {
         serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
     }
 
-    /// A closed registry refuses `message/send` whatever room its queue has, and the refused
+    /// A closed registry refuses `SendMessage` whatever room its queue has, and the refused
     /// message never reaches the task loop or the registry.
     #[test]
     fn a_closed_registry_answers_message_send_rejected_and_enqueues_nothing() {
@@ -3118,7 +3095,8 @@ mod tests {
     }
 
     /// A formation member cancels a task it submitted itself, and gets `-32001` — with nothing
-    /// cancelled — for a task another member or the operator submitted.
+    /// cancelled — for a task another member or the operator submitted. Its own task, once ended,
+    /// gets `-32002`.
     #[test]
     fn a_formation_member_cancels_only_the_tasks_it_submitted() {
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
@@ -3158,9 +3136,25 @@ mod tests {
                 "{other} was cancelled by a member that did not submit it"
             );
         }
+
+        // Its own task, once ended, is not cancelable, and is left as it ended.
+        let ended = cancel("tsk_mine");
+        assert_eq!(ended["error"]["code"], -32002, "{ended}");
+        let info = &ended["error"]["data"][0];
+        assert_eq!(info["reason"], "TASK_NOT_CANCELABLE", "{ended}");
+        assert_eq!(
+            info["metadata"],
+            serde_json::json!({"taskId": "tsk_mine", "state": "canceled"})
+        );
+        let unknown = cancel("tsk_never");
+        assert_eq!(unknown["error"]["code"], -32001, "{unknown}");
+        assert_eq!(
+            unknown["error"]["data"][0]["metadata"],
+            serde_json::json!({"taskId": "tsk_never"})
+        );
     }
 
-    /// A task refused when the session closed reads `rejected` over `tasks/get`.
+    /// A task refused when the session closed reads `rejected` over `GetTask`.
     #[test]
     fn tasks_get_serves_a_refused_task_as_rejected() {
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
@@ -3183,7 +3177,7 @@ mod tests {
         assert_eq!(response["result"]["contextId"], "ctx_refused");
     }
 
-    /// A `message/stream` the door refuses because the session is closing is told so, in the
+    /// A `SendStreamingMessage` the door refuses because the session is closing is told so, in the
     /// same unnumbered final frame a busy refusal uses; a busy refusal keeps its own message.
     #[tokio::test]
     async fn message_stream_refused_by_a_closed_registry_says_the_session_is_closing() {
@@ -3209,9 +3203,8 @@ mod tests {
             }
             let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
             let req = JsonRpcRequest {
-                jsonrpc: "2.0".to_string(),
                 id: serde_json::json!(1),
-                method: "message/stream".to_string(),
+                method: "SendStreamingMessage".to_string(),
                 params: message_send_params("msg_refused"),
             };
 
@@ -3292,17 +3285,17 @@ mod tests {
     fn door_method_acceptance_none_serves_no_task_starting_method() {
         assert_eq!(
             served_methods(&TaskAcceptance::None, false),
-            ["stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+            ["stream/watch", "GetTask", "CancelTask", "session/stop"]
         );
         for acceptance in [TaskAcceptance::Single, TaskAcceptance::Queue] {
             assert_eq!(
                 served_methods(&acceptance, false),
                 [
-                    "message/send",
-                    "message/stream",
+                    "SendMessage",
+                    "SendStreamingMessage",
                     "stream/watch",
-                    "tasks/get",
-                    "tasks/cancel",
+                    "GetTask",
+                    "CancelTask",
                     "session/stop"
                 ]
             );
@@ -3313,15 +3306,15 @@ mod tests {
     fn door_method_only_an_authenticated_door_serves_the_extended_card() {
         for acceptance in &ACCEPTANCES {
             assert_eq!(
-                DoorMethod::resolve("agent/getAuthenticatedExtendedCard", acceptance, false),
+                DoorMethod::resolve("GetExtendedAgentCard", acceptance, false),
                 None
             );
             assert_eq!(
-                DoorMethod::resolve("agent/getAuthenticatedExtendedCard", acceptance, true),
-                Some(DoorMethod::GetAuthenticatedExtendedCard)
+                DoorMethod::resolve("GetExtendedAgentCard", acceptance, true),
+                Some(DoorMethod::GetExtendedAgentCard)
             );
             let mut expected = served_methods(acceptance, false);
-            expected.push("agent/getAuthenticatedExtendedCard");
+            expected.push("GetExtendedAgentCard");
             assert_eq!(served_methods(acceptance, true), expected);
         }
     }
@@ -3332,11 +3325,16 @@ mod tests {
             for name in [
                 "tasks/list",
                 "",
-                "Tasks/Get",
-                "TASKS/GET",
-                " tasks/get",
-                "tasks/get ",
-                "tasks/get\n",
+                "getTask",
+                "GETTASK",
+                "message/send",
+                "message/stream",
+                "tasks/get",
+                "tasks/cancel",
+                "agent/getAuthenticatedExtendedCard",
+                " GetTask",
+                "GetTask ",
+                "GetTask\n",
                 "session/stop/",
             ] {
                 for authenticated in [false, true] {
@@ -3358,7 +3356,7 @@ mod tests {
             assert_eq!(methods, served_methods(acceptance, false), "{acceptance:?}");
             assert_eq!(
                 card["capabilities"]["streaming"],
-                methods.contains(&"message/stream"),
+                methods.contains(&"SendStreamingMessage"),
                 "{acceptance:?}"
             );
         }
@@ -3711,7 +3709,7 @@ mod tests {
         assert_buffer_has_no_lagged_frame(&sse_buffer);
     }
 
-    /// A `message/stream` connection that falls behind is told how many live frames it lost, keeps
+    /// A `SendStreamingMessage` connection that falls behind is told how many live frames it lost, keeps
     /// receiving — another task's final status included — and closes on its own task's first live
     /// `final` status.
     ///
@@ -3730,9 +3728,8 @@ mod tests {
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
         let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
             id: serde_json::json!(1),
-            method: "message/stream".to_string(),
+            method: "SendStreamingMessage".to_string(),
             params: serde_json::json!({
                 "message": {
                     "messageId": "msg_lagged",
@@ -3807,7 +3804,7 @@ mod tests {
         assert_buffer_has_no_lagged_frame(&sse_buffer);
     }
 
-    /// The session's last frames are broadcast just before the door closes. A `message/stream`
+    /// The session's last frames are broadcast just before the door closes. A `SendStreamingMessage`
     /// handler that has not yet been scheduled when the close lands still writes the final status
     /// it was sent, and then ends the connection.
     ///
@@ -3827,9 +3824,8 @@ mod tests {
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
         let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
             id: serde_json::json!(1),
-            method: "message/stream".to_string(),
+            method: "SendStreamingMessage".to_string(),
             params: serde_json::json!({
                 "message": {
                     "messageId": "msg_closing",
@@ -4167,8 +4163,8 @@ mod tests {
 
     /// Under every acceptance mode, and with a `single` task busy, a completion for the running
     /// task's delegation is received into the delegation set and starts no task; a repeat is
-    /// answered as the success the first post was; and one nobody is waiting for is refused with
-    /// `-32004` naming the delegation, still starting no task.
+    /// answered as the success the first post was; and one nobody is waiting for is refused,
+    /// naming the delegation, still starting no task.
     #[tokio::test]
     async fn a_completion_is_handed_to_the_delegation_set_and_never_becomes_a_task() {
         for acceptance in ACCEPTANCES {
@@ -4264,5 +4260,109 @@ mod tests {
         assert!(refused.contains("ses_elsewhere"), "{refused}");
         assert_eq!(live.counts(), (1, 0));
         assert!(task_rx.try_recv().is_err());
+    }
+
+    /// One completion posted to the door at `addr` with `headers` beside the version and the
+    /// completion origin: the door's whole JSON-RPC answer.
+    async fn completion_answer(addr: &str, headers: &[(&'static str, &'static str)]) -> Value {
+        let url = format!("http://{addr}/");
+        let mut sent = vec![
+            (
+                crate::a2a::A2A_VERSION_HEADER,
+                crate::a2a::A2A_PROTOCOL_VERSION,
+            ),
+            (PEER_ORIGIN_HEADER, "completion"),
+        ];
+        sent.extend_from_slice(headers);
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": "c1", "method": "SendMessage",
+            "params": {"message": {"messageId": "m", "role": "user", "parts": [{"text": "done"}]}}})
+        .to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::http_client::http_json("POST", &url, Some(&body), &sent).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A completion the door refuses is answered with one of the two murmur codes, outside the
+    /// A2A range, carrying an `ErrorInfo` in the murmur domain: `-31001` naming the session it
+    /// was addressed to and never this one, and `-31002` naming the delegation when it named one.
+    /// No refusal starts a task, and an outstanding delegation is still delivered.
+    #[tokio::test]
+    async fn a_completion_is_refused_with_the_murmur_completion_codes() {
+        let live = Arc::new(LiveDelegations::new());
+        let _scope = live.scope_task("tsk_running");
+        live.register("dlg_waited".to_string(), outstanding("tsk_running"));
+        let (addr, _shutdown, mut task_rx) = serve_test_door_with(
+            TaskAcceptance::Queue,
+            Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue))),
+            Arc::clone(&live),
+            false,
+        )
+        .await;
+        let info = |answer: &Value| answer["error"]["data"][0].clone();
+
+        let misaddressed = completion_answer(
+            &addr,
+            &[
+                (COMPLETION_SESSION_HEADER, "ses_elsewhere"),
+                (DELEGATION_ID_HEADER, "dlg_waited"),
+            ],
+        )
+        .await;
+        assert_eq!(misaddressed["id"], "c1");
+        assert_eq!(misaddressed["error"]["code"], -31001, "{misaddressed}");
+        assert_eq!(info(&misaddressed)["reason"], "COMPLETION_MISADDRESSED");
+        assert_eq!(info(&misaddressed)["domain"], "murmur.nexus");
+        assert_eq!(
+            info(&misaddressed)["metadata"],
+            serde_json::json!({"addressedSession": "ses_elsewhere"})
+        );
+        assert!(
+            !misaddressed.to_string().contains("ses_door"),
+            "{misaddressed}"
+        );
+
+        let unaddressed = completion_answer(&addr, &[(DELEGATION_ID_HEADER, "dlg_waited")]).await;
+        assert_eq!(unaddressed["error"]["code"], -31001, "{unaddressed}");
+        assert_eq!(
+            info(&unaddressed)["metadata"],
+            serde_json::json!({"addressedSession": ""})
+        );
+
+        let unnamed = completion_answer(&addr, &[(COMPLETION_SESSION_HEADER, "ses_door")]).await;
+        assert_eq!(unnamed["error"]["code"], -31002, "{unnamed}");
+        assert_eq!(info(&unnamed)["reason"], "COMPLETION_NOT_AWAITED");
+        assert_eq!(info(&unnamed)["metadata"], serde_json::json!({}));
+
+        let unknown = completion_answer(
+            &addr,
+            &[
+                (COMPLETION_SESSION_HEADER, "ses_door"),
+                (DELEGATION_ID_HEADER, "dlg_nobody"),
+            ],
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], -31002, "{unknown}");
+        assert_eq!(
+            info(&unknown)["metadata"],
+            serde_json::json!({"delegationId": "dlg_nobody"})
+        );
+        assert_eq!(live.counts(), (1, 0), "no refusal touched the delegation");
+
+        let delivered = completion_answer(
+            &addr,
+            &[
+                (COMPLETION_SESSION_HEADER, "ses_door"),
+                (DELEGATION_ID_HEADER, "dlg_waited"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            delivered["result"],
+            serde_json::json!({"delegation_id": "dlg_waited", "received": true})
+        );
+        assert_eq!(live.counts(), (0, 1));
+        assert!(task_rx.try_recv().is_err(), "a completion started a task");
     }
 }

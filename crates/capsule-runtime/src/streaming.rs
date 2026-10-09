@@ -8,7 +8,7 @@ pub(crate) type SseBroadcast = broadcast::Sender<Arc<String>>;
 
 /// Cadence at which an idle SSE connection writes [`SSE_HEARTBEAT_COMMENT`].
 ///
-/// Shared by `message/stream` and `stream/watch` so the two endpoints present one
+/// Shared by `SendStreamingMessage` and `stream/watch` so the two endpoints present one
 /// liveness contract. Not configurable.
 pub(crate) const SSE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -155,7 +155,7 @@ impl StreamArtifact {
 }
 
 /// An SSE event type the capsule's stream writes: the `event:` line of every frame on
-/// `message/stream` and `stream/watch`. Every writer takes one, so this is the whole vocabulary
+/// `SendStreamingMessage` and `stream/watch`. Every writer takes one, so this is the whole vocabulary
 /// the agent card's stream extension is derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamFrame {
@@ -867,10 +867,10 @@ mod tests {
                 ("streaming.rs", "impl StreamFrame" | "wire_name")
                 | ("identity.rs", "writes_frame") => continue,
                 ("identity.rs", "handle_message_stream" | "format_rejected_event") => {
-                    &[DoorMethod::MessageStream]
+                    &[DoorMethod::SendStreamingMessage]
                 }
                 ("identity.rs", "handle_stream_watch") => &[DoorMethod::StreamWatch],
-                _ => &[DoorMethod::MessageStream, DoorMethod::StreamWatch],
+                _ => &[DoorMethod::SendStreamingMessage, DoorMethod::StreamWatch],
             };
             let named = line.code.split("StreamFrame::").skip(1).map(|rest| {
                 rest.split(|c: char| !c.is_alphanumeric())

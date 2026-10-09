@@ -142,7 +142,7 @@ fn http_post_json_with_headers(
 ) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
     for (name, value) in headers {
@@ -196,11 +196,11 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
         .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule_url");
 
-    // Send A2A message/send
+    // Send A2A SendMessage
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "test-msg-1",
@@ -245,7 +245,7 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
         "agent should have responded with the end_turn text; got: {result}"
     );
 
-    // Server is shut down by now; can't query tasks/get after completion.
+    // Server is shut down by now; can't query GetTask after completion.
     // Verify via trace.jsonl instead.
     let trace_content =
         fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default();
@@ -265,7 +265,7 @@ fn a2a_second_message_send_is_rejected() {
         return;
     }
     // Use a two-response server so the session takes at least two round-trips,
-    // giving us time to send a second message/send while the loop is running.
+    // giving us time to send a second SendMessage while the loop is running.
     let server = common::ScriptedServer::start(vec![serde_json::json!({
         "id": "msg_1",
         "type": "message",
@@ -294,7 +294,7 @@ fn a2a_second_message_send_is_rejected() {
     let first_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "msg-first",
@@ -308,14 +308,14 @@ fn a2a_second_message_send_is_rejected() {
     let first_response = http_post_json(&capsule_url, "/", &first_body);
     assert_eq!(
         first_response["result"]["status"]["state"], "submitted",
-        "first message/send should be submitted; got: {first_response}"
+        "first SendMessage should be submitted; got: {first_response}"
     );
 
-    // Second message/send must be rejected
+    // Second SendMessage must be rejected
     let second_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "msg-second",
@@ -329,7 +329,7 @@ fn a2a_second_message_send_is_rejected() {
     let second_response = http_post_json(&capsule_url, "/", &second_body);
     assert_eq!(
         second_response["result"]["status"]["state"], "rejected",
-        "second message/send should be rejected; got: {second_response}"
+        "second SendMessage should be rejected; got: {second_response}"
     );
 
     handle.join().expect("launch thread should not panic");
@@ -345,7 +345,7 @@ fn task_start_line(workdir: &Path) -> Value {
         .unwrap_or_else(|| panic!("no task_start event in:\n{trace}"))
 }
 
-/// Launch a capsule, POST one `message/send` carrying `headers`, and return its `task_start`.
+/// Launch a capsule, POST one `SendMessage` carrying `headers`, and return its `task_start`.
 ///
 /// The capsule consents to peer tasks, so that a `peer` claim reaches classification rather than
 /// the door's consent refusal: `peer_tasks.rs` covers a capsule that does not.
@@ -369,7 +369,7 @@ fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "provenance-msg",
@@ -577,7 +577,7 @@ fn a2a_tasks_get_unknown_method_returns_error() {
     let msg_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 100,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "unblock",
@@ -661,7 +661,7 @@ fn an_event_origin_task_line_is_labelled_fenced() {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": "fence-event-msg",

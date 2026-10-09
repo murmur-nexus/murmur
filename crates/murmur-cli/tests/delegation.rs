@@ -899,7 +899,7 @@ impl Parent {
             message["contextId"] = json!(context_id);
         }
         let body = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
             "params": {"message": message}
         })
         .to_string();
@@ -927,7 +927,7 @@ impl Parent {
 
     fn task_state(&self, task_id: &str) -> String {
         let body = json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}
+            "jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}
         })
         .to_string();
         post_json(&self.url, &body)["result"]["status"]["state"]
@@ -1121,7 +1121,7 @@ fn post_json(url: &str, body: &str) -> Value {
     let authority = url.trim_start_matches("http://").trim_end_matches('/');
     let mut stream = TcpStream::connect(authority).expect("should connect to the capsule");
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -2182,7 +2182,7 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
 
 /// A cancel while the task waits on a delegation names the child and ends it.
 ///
-/// `tasks/cancel` answers at once, and its residue carries the `dlg_` id the `delegation_start`
+/// `CancelTask` answers at once, and its residue carries the `dlg_` id the `delegation_start`
 /// opened, snapshotted before the task ends the child. The task then ends the child itself: the
 /// trace says so after the cancel and before the task's end, the child's own record says its
 /// parent ended it, and the process is gone. The parent goes on taking work.
@@ -2219,7 +2219,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
     let response = post_json(
         &parent.url,
         &json!({
-            "jsonrpc": "2.0", "id": 9, "method": "tasks/cancel", "params": {"id": task_id}
+            "jsonrpc": "2.0", "id": 9, "method": "CancelTask", "params": {"id": task_id}
         })
         .to_string(),
     );
@@ -2265,7 +2265,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
         thread::sleep(Duration::from_millis(100));
     }
     eprintln!(
-        "[measure] tasks/cancel to child gone: {} ms",
+        "[measure] CancelTask to child gone: {} ms",
         started_at.elapsed().as_millis()
     );
 
@@ -2363,7 +2363,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
     let response = post_json(
         &parent.url,
         &json!({
-            "jsonrpc": "2.0", "id": 9, "method": "tasks/cancel", "params": {"id": task_id}
+            "jsonrpc": "2.0", "id": 9, "method": "CancelTask", "params": {"id": task_id}
         })
         .to_string(),
     );
@@ -2402,7 +2402,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
         thread::sleep(Duration::from_millis(50));
     }
     eprintln!(
-        "[measure] tasks/cancel to plan child gone: {} ms",
+        "[measure] CancelTask to plan child gone: {} ms",
         started_at.elapsed().as_millis()
     );
 

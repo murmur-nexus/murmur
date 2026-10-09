@@ -12,17 +12,22 @@ input is optional:
 
 Without `names`, it probes the names `MURMUR_FORMATION_PEERS` lists. For each name, in order, it
 sends `GET http://<name>.formation.invalid/.well-known/agent-card.json` and one JSON-RPC
-`message/send` as `POST http://<name>.formation.invalid/`. It holds no token and no port: the
-member's runtime resolves each virtual address to the callee's real door and presents the callee's
-formation token. Its summary is one line per name, then the variable it was handed:
+`SendMessage` as `POST http://<name>.formation.invalid/`, each with `A2A-Version: 1.0`. It holds no
+token and no port: the member's runtime resolves each virtual address to the callee's real door and
+presents the callee's formation token. Its summary is one line per name, then the variable it was
+handed:
 
 ```text
-<name> card=<status|refused:<error>> send=<status|refused:<error>>
+<name> card=<status|refused:<error>> send=<status|status:<code>|status:-|refused:<error>>
 peers=<value of MURMUR_FORMATION_PEERS, or absent>
 ```
 
-`refused:<error>` is the request's failure as wasi-http reported it, for example
-`refused:ErrorCode::HttpRequestDenied` for a name the member may not call.
+| `send=` | Meaning |
+|---|---|
+| `<status>` | The body carried a JSON-RPC `result`: the callee served the `SendMessage`. |
+| `<status>:<code>` | The body carried a JSON-RPC `error` with that code, such as `200:-32009`. |
+| `<status>:-` | The body carried neither, such as a `403` refusal. |
+| `refused:<error>` | The request's failure as wasi-http reported it, for example `refused:ErrorCode::HttpRequestDenied` for a name the member may not call. |
 
 ## Rebuild
 

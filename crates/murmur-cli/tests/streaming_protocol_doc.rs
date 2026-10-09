@@ -196,7 +196,7 @@ fn rpc(addr: &str, method: &str, params: Value) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -211,7 +211,7 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
         "role": "user",
         "parts": [{"text": text}]
     }});
-    let response = rpc(addr, "message/send", params);
+    let response = rpc(addr, "SendMessage", params);
     response["result"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the door did not accept the task: {response}"))
@@ -278,7 +278,7 @@ impl SseReader {
     /// Sends `body` as a JSON-RPC POST on `stream`, reading nothing yet.
     fn open(mut stream: TcpStream, addr: &str, body: &str) -> Self {
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).unwrap();
@@ -606,7 +606,7 @@ fn flood(server: &common::ScriptedServer, addr: &str) -> String {
     }
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let got = rpc(addr, "tasks/get", json!({"id": last}));
+        let got = rpc(addr, "GetTask", json!({"id": last}));
         if got["result"]["status"]["state"] == "completed" {
             return last;
         }
@@ -730,10 +730,10 @@ fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
     assert_replay_has_no_lagged_frame(&addr, &last_task);
 }
 
-/// A `message/stream` client that stops reading while a capsule writes more than 128 frames is sent
+/// A `SendStreamingMessage` client that stops reading while a capsule writes more than 128 frames is sent
 /// a `lagged` frame carrying the count the runtime reported. Its own task's final status was among
 /// the frames lost, and the connection closes on no other task's: it stays open past the last
-/// task's final status, and `tasks/get` answers how its own task ended.
+/// task's final status, and `GetTask` answers how its own task ended.
 #[test]
 fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
     let server = blocking_reply_then_flood();
@@ -743,7 +743,7 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {"message": {
             "messageId": "block",
             "role": "user",
@@ -796,9 +796,9 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
         "the connection's own final status was delivered, so nothing was lost before it"
     );
     assert_eq!(
-        rpc(&addr, "tasks/get", json!({"id": own_task}))["result"]["status"]["state"],
+        rpc(&addr, "GetTask", json!({"id": own_task}))["result"]["status"]["state"],
         "completed",
-        "tasks/get answers how the connection's own task ended"
+        "GetTask answers how the connection's own task ended"
     );
 
     assert_replay_has_no_lagged_frame(&addr, &last_task);

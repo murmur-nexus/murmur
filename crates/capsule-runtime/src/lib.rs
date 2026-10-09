@@ -141,6 +141,9 @@ pub use cgroup::{
     probe_swap_control, requires_process_bounding, skip_without_host_support, IoMaxReport,
     IoMaxStatus, SwapControl, SCOPE_SWAP_MAX,
 };
+// The door's protocol version and error tables: every client of a door sends the header pair,
+// and names the error it is answered with through `A2aError::from_code`.
+pub use a2a::{A2aError, MurmurError, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 pub use child_launch::{
     child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
     READINESS_TOKENS_FLAG,

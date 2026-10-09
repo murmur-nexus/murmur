@@ -941,7 +941,7 @@ struct RecordedRequest {
 ///
 /// `dispatch_capsule_step` speaks two protocols against this: one `POST /spawn` to mur-roost,
 /// which answers with permission and nothing else, then A2A JSON-RPC against the child this
-/// runtime launched — `message/send` to hand over the task, then `tasks/get` polled until the
+/// runtime launched — `SendMessage` to hand over the task, then `GetTask` polled until the
 /// state is terminal. The child itself is [`StubMur`], which reports this fake's `/capsule` path
 /// as its address, so both halves are served here and routed on the request path.
 ///
@@ -969,7 +969,7 @@ impl FakeRoost {
         Self::start_with(true, true)
     }
 
-    /// A fake whose child accepts its task and then answers `working` to every `tasks/get`, so
+    /// A fake whose child accepts its task and then answers `working` to every `GetTask`, so
     /// the delegation never reaches a terminal state on its own.
     fn never_finishing() -> Self {
         Self::start_with(false, false)
@@ -1037,7 +1037,7 @@ impl FakeRoost {
                         _ => {
                             let id = request.get("id").cloned().unwrap_or(Value::Null);
                             let body = match request.get("method").and_then(Value::as_str) {
-                                Some("message/send") => {
+                                Some("SendMessage") => {
                                     *sent_text.lock().unwrap() = Some(
                                         request["params"]["message"]["parts"][0]["text"]
                                             .as_str()
@@ -1046,12 +1046,12 @@ impl FakeRoost {
                                     );
                                     json!({"jsonrpc": "2.0", "id": id, "result": {"id": "task-1"}})
                                 }
-                                Some("tasks/get") if !finishes => json!({
+                                Some("GetTask") if !finishes => json!({
                                     "jsonrpc": "2.0",
                                     "id": id,
                                     "result": {"id": "task-1", "status": {"state": "working"}}
                                 }),
-                                Some("tasks/get") => json!({
+                                Some("GetTask") => json!({
                                     "jsonrpc": "2.0",
                                     "id": id,
                                     "result": {
@@ -1102,7 +1102,7 @@ impl FakeRoost {
         self.request("/spawn").body
     }
 
-    /// The task text the step handed to the capsule over A2A `message/send`, exactly as it
+    /// The task text the step handed to the capsule over A2A `SendMessage`, exactly as it
     /// travelled in the single text part. This is where a capsule step's input lives — the spawn
     /// call above carries only the capsule's name and version. Returned unparsed: what the
     /// child's model receives is this string, so that is what the tests assert on.

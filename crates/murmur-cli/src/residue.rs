@@ -15,7 +15,7 @@ use serde_json::Value;
 /// the residue has named it.
 ///
 /// A part is either the residue item itself — the shape `session/stop` returns — or an A2A
-/// artifact part wrapping it as JSON text, which is how `tasks/cancel` carries it. Both spellings
+/// artifact part wrapping it as JSON text, which is how `CancelTask` carries it. Both spellings
 /// describe the same item, so both are read here rather than at each caller.
 pub(crate) fn print_residue(parts: &[Value]) {
     for item in parts.iter().filter_map(unwrap_item) {
@@ -52,7 +52,7 @@ fn unwrap_item(part: &Value) -> Option<Value> {
 
 /// Every residue part in an A2A task's `artifacts`, flattened.
 ///
-/// `tasks/cancel` omits the key entirely when nothing is running, so an empty result here means
+/// `CancelTask` omits the key entirely when nothing is running, so an empty result here means
 /// exactly that.
 pub(crate) fn parts_from_artifacts(result: &Value) -> Vec<Value> {
     result

@@ -13,15 +13,120 @@ use tokio::sync::oneshot;
 
 use crate::{cancel::CancelSignal, lanes::TaskLane, origin::TaskProvenance};
 
+// ── A2A protocol version ──────────────────────────────────────────────────────
+
+/// The HTTP header an A2A request names its protocol version in. Matched case-insensitively.
+pub const A2A_VERSION_HEADER: &str = "A2A-Version";
+
+/// The one A2A protocol version the door speaks, and the value every murmur client sends in
+/// [`A2A_VERSION_HEADER`].
+pub const A2A_PROTOCOL_VERSION: &str = "1.0";
+
+/// Whether a request whose [`A2A_VERSION_HEADER`] lines carried `values`, in order, speaks a
+/// version the door serves.
+///
+/// Exactly one line is accepted, holding [`A2A_PROTOCOL_VERSION`] or that version with a patch
+/// number (`1.0.1`), surrounding whitespace aside: a patch number takes no part in negotiation.
+/// No line, an empty value — which A2A reads as 0.3 — and more than one line are refused.
+pub(crate) fn accepts_a2a_version(values: &[String]) -> bool {
+    let [value] = values else {
+        return false;
+    };
+    let value = value.trim();
+    value == A2A_PROTOCOL_VERSION
+        || value
+            .strip_prefix(A2A_PROTOCOL_VERSION)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The `VersionNotSupportedError` answering a request whose [`A2A_VERSION_HEADER`] lines carried
+/// `values`. `requestedVersion` is the values as sent, joined with `, `, and `""` when there were
+/// none.
+pub(crate) fn version_not_supported(id: Value, values: &[String]) -> JsonRpcResponse {
+    let requested = values
+        .iter()
+        .map(|value| value.trim())
+        .collect::<Vec<_>>()
+        .join(", ");
+    JsonRpcResponse::a2a_error(
+        id,
+        A2aError::VersionNotSupported,
+        &format!(
+            "A2A version '{requested}' is not supported; this agent speaks {A2A_PROTOCOL_VERSION}"
+        ),
+        &[
+            ("requestedVersion", requested.clone()),
+            ("supportedVersions", A2A_PROTOCOL_VERSION.to_string()),
+        ],
+    )
+}
+
 // ── JSON-RPC 2.0 envelope types ───────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+/// `-32700`: the body is not JSON.
+pub(crate) const PARSE_ERROR: i32 = -32700;
+/// `-32600`: the body is JSON but not a JSON-RPC 2.0 request.
+pub(crate) const INVALID_REQUEST: i32 = -32600;
+/// `-32601`: the door serves no method of this name.
+pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
+/// `-32602`: the method's parameters are not what it takes.
+pub(crate) const INVALID_PARAMS: i32 = -32602;
+/// `-32603`: the door failed to answer a request it accepted.
+pub(crate) const INTERNAL_ERROR: i32 = -32603;
+
+/// A JSON-RPC 2.0 request, as [`JsonRpcRequest::from_body`] accepts it. Its `jsonrpc` was
+/// `"2.0"`, which is the only version there is to carry.
+#[derive(Debug, Clone)]
 pub(crate) struct JsonRpcRequest {
-    #[allow(dead_code)] // parsed as part of the JSON-RPC 2.0 envelope; not validated
-    pub jsonrpc: String,
+    /// A string or an integer.
     pub id: Value,
     pub method: String,
+    /// The request's `params` as sent, or `{}` when it sent none. Not necessarily an object: a
+    /// method refuses any other value with `-32602` itself.
     pub params: Value,
+}
+
+impl JsonRpcRequest {
+    /// The request `body` carries, or the error that answers it.
+    ///
+    /// A body that is not JSON is `-32700` with `id: null`. A body that is JSON but not a JSON-RPC
+    /// 2.0 request is `-32600`: one that is not an object (a batch among them), whose `jsonrpc` is
+    /// not exactly `"2.0"`, whose `method` is not a string, or whose `id` is absent or neither a
+    /// string nor an integer. That answer echoes the request's `id` when the `id` itself is valid,
+    /// and is `null` otherwise. An omitted `params` reads as `{}`; members beyond the four are
+    /// ignored.
+    pub(crate) fn from_body(body: &str) -> Result<JsonRpcRequest, JsonRpcResponse> {
+        let Ok(value) = serde_json::from_str::<Value>(body) else {
+            return Err(JsonRpcResponse::err(
+                Value::Null,
+                PARSE_ERROR,
+                "Invalid JSON payload",
+            ));
+        };
+        let Value::Object(mut object) = value else {
+            return Err(Self::invalid(Value::Null));
+        };
+        let id = object
+            .remove("id")
+            .filter(|id| id.is_string() || id.is_i64() || id.is_u64());
+        let jsonrpc = object.remove("jsonrpc");
+        let (Some(id), Some("2.0"), Some(Value::String(method))) = (
+            id.clone(),
+            jsonrpc.as_ref().and_then(Value::as_str),
+            object.remove("method"),
+        ) else {
+            return Err(Self::invalid(id.unwrap_or(Value::Null)));
+        };
+        let params = object
+            .remove("params")
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        Ok(JsonRpcRequest { id, method, params })
+    }
+
+    fn invalid(id: Value) -> JsonRpcResponse {
+        JsonRpcResponse::err(id, INVALID_REQUEST, "Request payload validation error")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,8 +135,10 @@ pub(crate) struct JsonRpcResponse {
     pub id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Boxed so a response is small enough to travel in a `Result`'s error variant, which is how
+    /// [`JsonRpcRequest::from_body`] answers a request it refuses.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
+    pub error: Option<Box<JsonRpcError>>,
 }
 
 impl JsonRpcResponse {
@@ -44,15 +151,45 @@ impl JsonRpcResponse {
         }
     }
 
+    /// A JSON-RPC error with no `data`: the standard codes, `-32700` to `-32603`.
     pub(crate) fn err(id: Value, code: i32, message: &str) -> Self {
+        Self::error(id, code, message, None)
+    }
+
+    /// The A2A error `error`, carrying a `google.rpc.ErrorInfo` in the `a2a-protocol.org` domain
+    /// whose `metadata` is `metadata`.
+    pub(crate) fn a2a_error(
+        id: Value,
+        error: A2aError,
+        message: &str,
+        metadata: &[(&str, String)],
+    ) -> Self {
+        let data = error_info(error.reason(), A2A_ERROR_DOMAIN, metadata);
+        Self::error(id, error.code(), message, Some(vec![data]))
+    }
+
+    /// The murmur error `error`, carrying a `google.rpc.ErrorInfo` in the [`MURMUR_ERROR_DOMAIN`]
+    /// whose `metadata` is `metadata`.
+    pub(crate) fn murmur_error(
+        id: Value,
+        error: MurmurError,
+        message: &str,
+        metadata: &[(&str, String)],
+    ) -> Self {
+        let data = error_info(error.reason(), MURMUR_ERROR_DOMAIN, metadata);
+        Self::error(id, error.code(), message, Some(vec![data]))
+    }
+
+    fn error(id: Value, code: i32, message: &str, data: Option<Vec<Value>>) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(JsonRpcError {
+            error: Some(Box::new(JsonRpcError {
                 code,
                 message: message.to_string(),
-            }),
+                data,
+            })),
         }
     }
 
@@ -70,6 +207,138 @@ impl JsonRpcResponse {
 pub(crate) struct JsonRpcError {
     pub code: i32,
     pub message: String,
+    /// One `google.rpc.ErrorInfo` for an A2A or murmur error, and absent for a standard one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<Value>>,
+}
+
+/// The `@type` of the one detail an A2A or murmur error's `data` carries.
+const ERROR_INFO_TYPE: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+
+/// The `ErrorInfo` `domain` of an A2A error.
+pub(crate) const A2A_ERROR_DOMAIN: &str = "a2a-protocol.org";
+
+/// The `ErrorInfo` `domain` of a [`MurmurError`].
+pub(crate) const MURMUR_ERROR_DOMAIN: &str = "murmur.nexus";
+
+/// A `google.rpc.ErrorInfo` detail. `metadata` holds string values only, as `ErrorInfo` requires.
+fn error_info(reason: &str, domain: &str, metadata: &[(&str, String)]) -> Value {
+    let metadata: serde_json::Map<String, Value> = metadata
+        .iter()
+        .map(|(key, value)| (key.to_string(), Value::String(value.clone())))
+        .collect();
+    serde_json::json!({
+        "@type": ERROR_INFO_TYPE,
+        "reason": reason,
+        "domain": domain,
+        "metadata": metadata,
+    })
+}
+
+/// The A2A errors, A2A v1.0 §5.4, in code order.
+///
+/// The door answers four of them: [`Self::TaskNotFound`], [`Self::TaskNotCancelable`],
+/// [`Self::UnsupportedOperation`] and [`Self::VersionNotSupported`]. The others are here so a
+/// client of a door names any error it is answered with through [`Self::from_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum A2aError {
+    TaskNotFound,
+    TaskNotCancelable,
+    PushNotificationNotSupported,
+    UnsupportedOperation,
+    ContentTypeNotSupported,
+    InvalidAgentResponse,
+    ExtendedAgentCardNotConfigured,
+    ExtensionSupportRequired,
+    VersionNotSupported,
+}
+
+impl A2aError {
+    /// Every A2A error, in code order.
+    pub const ALL: [A2aError; 9] = [
+        A2aError::TaskNotFound,
+        A2aError::TaskNotCancelable,
+        A2aError::PushNotificationNotSupported,
+        A2aError::UnsupportedOperation,
+        A2aError::ContentTypeNotSupported,
+        A2aError::InvalidAgentResponse,
+        A2aError::ExtendedAgentCardNotConfigured,
+        A2aError::ExtensionSupportRequired,
+        A2aError::VersionNotSupported,
+    ];
+
+    /// The JSON-RPC `error.code`.
+    pub fn code(self) -> i32 {
+        match self {
+            A2aError::TaskNotFound => -32001,
+            A2aError::TaskNotCancelable => -32002,
+            A2aError::PushNotificationNotSupported => -32003,
+            A2aError::UnsupportedOperation => -32004,
+            A2aError::ContentTypeNotSupported => -32005,
+            A2aError::InvalidAgentResponse => -32006,
+            A2aError::ExtendedAgentCardNotConfigured => -32007,
+            A2aError::ExtensionSupportRequired => -32008,
+            A2aError::VersionNotSupported => -32009,
+        }
+    }
+
+    /// The `ErrorInfo` `reason`: the spec's error name in UPPER_SNAKE_CASE without `Error`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            A2aError::TaskNotFound => "TASK_NOT_FOUND",
+            A2aError::TaskNotCancelable => "TASK_NOT_CANCELABLE",
+            A2aError::PushNotificationNotSupported => "PUSH_NOTIFICATION_NOT_SUPPORTED",
+            A2aError::UnsupportedOperation => "UNSUPPORTED_OPERATION",
+            A2aError::ContentTypeNotSupported => "CONTENT_TYPE_NOT_SUPPORTED",
+            A2aError::InvalidAgentResponse => "INVALID_AGENT_RESPONSE",
+            A2aError::ExtendedAgentCardNotConfigured => "EXTENDED_AGENT_CARD_NOT_CONFIGURED",
+            A2aError::ExtensionSupportRequired => "EXTENSION_SUPPORT_REQUIRED",
+            A2aError::VersionNotSupported => "VERSION_NOT_SUPPORTED",
+        }
+    }
+
+    /// The A2A error whose code is `code`, or `None` for a code A2A does not assign.
+    pub fn from_code(code: i32) -> Option<A2aError> {
+        Self::ALL.into_iter().find(|error| error.code() == code)
+    }
+}
+
+/// The errors a door answers a completion with: murmur's own protocol riding on `SendMessage`
+/// with `x-murmur-task-origin: completion`, so none of them is an A2A error.
+///
+/// Their codes lie outside the range JSON-RPC 2.0 reserves, which leaves them to applications,
+/// and the door extension documents them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MurmurError {
+    /// The completion's `x-murmur-completion-session` is not the session running here.
+    CompletionMisaddressed,
+    /// The completion names no delegation, names one no task here waits for, or names one this
+    /// session is ending.
+    CompletionNotAwaited,
+}
+
+impl MurmurError {
+    /// Every murmur error, in code order.
+    pub const ALL: [MurmurError; 2] = [
+        MurmurError::CompletionMisaddressed,
+        MurmurError::CompletionNotAwaited,
+    ];
+
+    /// The JSON-RPC `error.code`.
+    pub fn code(self) -> i32 {
+        match self {
+            MurmurError::CompletionMisaddressed => -31001,
+            MurmurError::CompletionNotAwaited => -31002,
+        }
+    }
+
+    /// The `ErrorInfo` `reason`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            MurmurError::CompletionMisaddressed => "COMPLETION_MISADDRESSED",
+            MurmurError::CompletionNotAwaited => "COMPLETION_NOT_AWAITED",
+        }
+    }
 }
 
 // ── A2A protocol types ────────────────────────────────────────────────────────
@@ -180,7 +449,7 @@ struct TaskEnding {
 }
 
 impl TaskEnding {
-    /// The `metadata` `tasks/get` carries for this ending, or `None` when it says nothing.
+    /// The `metadata` `GetTask` carries for this ending, or `None` when it says nothing.
     fn metadata(&self) -> Option<serde_json::Value> {
         let mut murmur = serde_json::Map::new();
         if self.no_answer {
@@ -198,7 +467,7 @@ impl TaskEnding {
     }
 }
 
-/// The name of the artifact a completed task's response is carried in over `tasks/get`.
+/// The name of the artifact a completed task's response is carried in over `GetTask`.
 pub(crate) const RESPONSE_ARTIFACT: &str = "response";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,7 +486,7 @@ pub(crate) enum TaskState {
 }
 
 impl TaskState {
-    /// The state's wire spelling, the one `tasks/get` serializes and a stream frame's
+    /// The state's wire spelling, the one `GetTask` serializes and a stream frame's
     /// `status.state` carries.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
@@ -317,7 +586,7 @@ pub(crate) const REJECTED_SESSION_ENDED_MESSAGE: &str =
 pub(crate) const REJECTED_SESSION_STOPPED_MESSAGE: &str =
     "task rejected: the session was stopped before this task started";
 
-/// The `status.message` the door's `message/stream` refusal carries once the registry is closed.
+/// The `status.message` the door's `SendStreamingMessage` refusal carries once the registry is closed.
 pub(crate) const REJECTED_SESSION_CLOSING_MESSAGE: &str = "task rejected: the session is closing";
 
 /// The `status.message` of a task refused because the capsule has no room for it. A `call-member`
@@ -383,7 +652,7 @@ impl TaskRegistry {
     }
 
     /// Record that the formation member `member` submitted `task_id`. Called under the lock the
-    /// task was enqueued under, so no `tasks/get` can see the task without its submitter.
+    /// task was enqueued under, so no `GetTask` can see the task without its submitter.
     pub(crate) fn record_submitter(&mut self, task_id: &str, member: &str) {
         self.submitters
             .insert(task_id.to_string(), member.to_string());
@@ -571,7 +840,7 @@ impl TaskRegistry {
     /// Stop one task: record `Canceled` and raise its signal.
     ///
     /// Called on the door's connection task and never waits for the agent loop to acknowledge —
-    /// the state is written here, so a `tasks/get` that lands next already reads `canceled`
+    /// the state is written here, so a `GetTask` that lands next already reads `canceled`
     /// whatever the loop is in the middle of.
     ///
     /// A cancelled task that was still `submitted` gives its queue slot back immediately: it will
@@ -654,7 +923,7 @@ impl TaskRegistry {
             .map(|(prompt, _)| prompt.as_str())
     }
 
-    /// `task_id` as `tasks/get` reports it.
+    /// `task_id` as `GetTask` reports it.
     ///
     /// An `input-required` task carries its prompt as a `prompt` artifact. A terminal task carries
     /// its final status's message as `status.message`, and a `completed` one its response as a
@@ -1197,5 +1466,244 @@ mod tests {
         r.finish_task(TaskState::Failed);
         // input_waiters should be cleaned up
         assert!(r.get_input_prompt("tsk_001").is_none());
+    }
+
+    #[test]
+    fn a2a_error_table_is_the_spec_table_in_code_order() {
+        let table: Vec<(i32, &str)> = A2aError::ALL
+            .into_iter()
+            .map(|error| (error.code(), error.reason()))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                (-32001, "TASK_NOT_FOUND"),
+                (-32002, "TASK_NOT_CANCELABLE"),
+                (-32003, "PUSH_NOTIFICATION_NOT_SUPPORTED"),
+                (-32004, "UNSUPPORTED_OPERATION"),
+                (-32005, "CONTENT_TYPE_NOT_SUPPORTED"),
+                (-32006, "INVALID_AGENT_RESPONSE"),
+                (-32007, "EXTENDED_AGENT_CARD_NOT_CONFIGURED"),
+                (-32008, "EXTENSION_SUPPORT_REQUIRED"),
+                (-32009, "VERSION_NOT_SUPPORTED"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a2a_error_from_code_round_trips_and_knows_no_other_code() {
+        for error in A2aError::ALL {
+            assert_eq!(A2aError::from_code(error.code()), Some(error));
+        }
+        for code in [-32000, -32010, -32099, -32600, -31001, 0] {
+            assert_eq!(A2aError::from_code(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a2a_murmur_errors_lie_outside_the_reserved_range() {
+        let table: Vec<(i32, &str)> = MurmurError::ALL
+            .into_iter()
+            .map(|error| (error.code(), error.reason()))
+            .collect();
+        assert_eq!(
+            table,
+            [
+                (-31001, "COMPLETION_MISADDRESSED"),
+                (-31002, "COMPLETION_NOT_AWAITED")
+            ]
+        );
+        for error in MurmurError::ALL {
+            assert!(!(-32768..=-32000).contains(&error.code()), "{error:?}");
+        }
+    }
+
+    fn wire(response: &JsonRpcResponse) -> Value {
+        serde_json::to_value(response).unwrap()
+    }
+
+    #[test]
+    fn a2a_error_carries_one_error_info_with_string_metadata() {
+        let response = JsonRpcResponse::a2a_error(
+            Value::from(7),
+            A2aError::TaskNotCancelable,
+            "Task cannot be canceled",
+            &[("taskId", "tsk_1".into()), ("state", "completed".into())],
+        );
+        assert_eq!(
+            wire(&response),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {
+                    "code": -32002,
+                    "message": "Task cannot be canceled",
+                    "data": [{
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "TASK_NOT_CANCELABLE",
+                        "domain": "a2a-protocol.org",
+                        "metadata": {"taskId": "tsk_1", "state": "completed"},
+                    }],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a2a_murmur_error_is_in_the_murmur_domain() {
+        let response = JsonRpcResponse::murmur_error(
+            Value::from("a"),
+            MurmurError::CompletionNotAwaited,
+            "nobody waits",
+            &[],
+        );
+        let error = &wire(&response)["error"];
+        assert_eq!(error["code"], -31002);
+        assert_eq!(error["data"][0]["reason"], "COMPLETION_NOT_AWAITED");
+        assert_eq!(error["data"][0]["domain"], "murmur.nexus");
+        assert_eq!(error["data"][0]["metadata"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn a2a_standard_errors_carry_no_data() {
+        let error = &wire(&JsonRpcResponse::err(
+            Value::Null,
+            -32601,
+            "Method not found",
+        ))["error"];
+        assert!(error.get("data").is_none(), "{error}");
+    }
+
+    fn refusal(body: &str) -> Value {
+        wire(&JsonRpcRequest::from_body(body).expect_err(body))
+    }
+
+    #[test]
+    fn a2a_from_body_reads_a_request_and_defaults_params() {
+        let req = JsonRpcRequest::from_body(
+            r#"{"jsonrpc":"2.0","id":"x","method":"GetExtendedAgentCard","extra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(req.id, Value::from("x"));
+        assert_eq!(req.method, "GetExtendedAgentCard");
+        assert_eq!(req.params, serde_json::json!({}));
+
+        let req = JsonRpcRequest::from_body(
+            r#"{"jsonrpc":"2.0","id":3,"method":"GetTask","params":[1]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.id, Value::from(3));
+        assert_eq!(req.params, serde_json::json!([1]), "a method judges params");
+    }
+
+    #[test]
+    fn a2a_from_body_refuses_what_is_not_json() {
+        let answer = refusal("{not json");
+        assert_eq!(answer["id"], Value::Null);
+        assert_eq!(answer["error"]["code"], -32700);
+        assert_eq!(answer["error"]["message"], "Invalid JSON payload");
+    }
+
+    #[test]
+    fn a2a_from_body_refuses_what_is_not_a_json_rpc_request() {
+        for (body, id) in [
+            (
+                r#"{"jsonrpc":"1.0","id":1,"method":"GetTask"}"#,
+                Value::from(1),
+            ),
+            (r#"{"id":1,"method":"GetTask"}"#, Value::from(1)),
+            (
+                r#"{"jsonrpc":2.0,"id":1,"method":"GetTask"}"#,
+                Value::from(1),
+            ),
+            (
+                r#"[{"jsonrpc":"2.0","id":1,"method":"GetTask"}]"#,
+                Value::Null,
+            ),
+            (r#""GetTask""#, Value::Null),
+            (r#"{"jsonrpc":"2.0","id":"a","method":7}"#, Value::from("a")),
+            (r#"{"jsonrpc":"2.0","id":"a"}"#, Value::from("a")),
+            (
+                r#"{"jsonrpc":"2.0","id":{"a":1},"method":"GetTask"}"#,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"method":"GetTask"}"#,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1.5,"method":"GetTask"}"#,
+                Value::Null,
+            ),
+            (r#"{"jsonrpc":"2.0","method":"GetTask"}"#, Value::Null),
+        ] {
+            let answer = refusal(body);
+            assert_eq!(answer["error"]["code"], -32600, "{body}");
+            assert_eq!(
+                answer["error"]["message"], "Request payload validation error",
+                "{body}"
+            );
+            assert_eq!(answer["id"], id, "{body}");
+        }
+    }
+
+    fn versions(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn a2a_version_accepts_1_0_with_or_without_a_patch() {
+        for value in ["1.0", " 1.0 ", "1.0.0", "1.0.1", "1.0.17"] {
+            assert!(accepts_a2a_version(&versions(&[value])), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a2a_version_refuses_every_other_value_and_more_than_one_line() {
+        for values in [
+            &[][..],
+            &[""],
+            &["0.3"],
+            &["0.3.0"],
+            &["2.0"],
+            &["1"],
+            &["1.1"],
+            &["1.0x"],
+            &["1.0."],
+            &["1.0.a"],
+            &["1.00"],
+            &["v1.0"],
+            &["1.0", "1.0"],
+        ] {
+            assert!(!accepts_a2a_version(&versions(values)), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn a2a_version_refusal_names_what_was_sent() {
+        let answer = wire(&version_not_supported(Value::from(4), &versions(&[])));
+        assert_eq!(answer["id"], 4);
+        assert_eq!(answer["error"]["code"], -32009);
+        let info = &answer["error"]["data"][0];
+        assert_eq!(info["reason"], "VERSION_NOT_SUPPORTED");
+        assert_eq!(info["domain"], "a2a-protocol.org");
+        assert_eq!(
+            info["metadata"],
+            serde_json::json!({"requestedVersion": "", "supportedVersions": "1.0"})
+        );
+
+        let answer = wire(&version_not_supported(Value::Null, &versions(&[" 0.3 "])));
+        assert_eq!(
+            answer["error"]["data"][0]["metadata"]["requestedVersion"],
+            "0.3"
+        );
+        let answer = wire(&version_not_supported(
+            Value::Null,
+            &versions(&["1.0", "1.0"]),
+        ));
+        assert_eq!(
+            answer["error"]["data"][0]["metadata"]["requestedVersion"],
+            "1.0, 1.0"
+        );
     }
 }

@@ -22,8 +22,8 @@ use capsule_runtime::{
     StageRequest, StagedSession, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER,
 };
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, message, request, rpc, Response, AUTHENTICATION_YAML,
-    QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, message, request, rpc, Response, A2A_VERSION,
+    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use murmur_artifact::{load_runtime_manifest, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
@@ -217,16 +217,18 @@ impl Capsule {
 
 // ── Raw requests ──────────────────────────────────────────────────────────────
 
-/// `message/send` on `POST /` carrying `headers`.
+/// `SendMessage` on `POST /` carrying `headers` and the A2A version.
 fn send(addr: &str, headers: &[(&str, &str)], message_id: &str) -> Response {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": message(message_id, "hello from elsewhere"),
     })
     .to_string();
-    request(addr, "POST", "/", headers, &body)
+    let mut headers = headers.to_vec();
+    headers.push(A2A_VERSION);
+    request(addr, "POST", "/", &headers, &body)
 }
 
 /// One request written as given, and every byte of the answer up to the door closing the
@@ -355,34 +357,34 @@ fn the_refusal_is_the_same_bytes_for_every_method_path_and_body() {
 
     let cases: Vec<(&str, &str, &str, String)> = vec![
         (
-            "message/send",
+            "SendMessage",
             "POST",
             "/",
-            rpc_body("message/send", message("m-1", "hi")),
+            rpc_body("SendMessage", message("m-1", "hi")),
         ),
         (
-            "message/stream",
+            "SendStreamingMessage",
             "POST",
             "/",
-            rpc_body("message/stream", message("m-2", "hi")),
+            rpc_body("SendStreamingMessage", message("m-2", "hi")),
         ),
         (
-            "tasks/get real",
+            "GetTask real",
             "POST",
             "/",
-            rpc_body("tasks/get", json!({"id": real_id})),
+            rpc_body("GetTask", json!({"id": real_id})),
         ),
         (
-            "tasks/get missing",
+            "GetTask missing",
             "POST",
             "/",
-            rpc_body("tasks/get", json!({"id": "tsk_doesnotexist"})),
+            rpc_body("GetTask", json!({"id": "tsk_doesnotexist"})),
         ),
         (
-            "tasks/cancel",
+            "CancelTask",
             "POST",
             "/",
-            rpc_body("tasks/cancel", json!({"id": real_id})),
+            rpc_body("CancelTask", json!({"id": real_id})),
         ),
         ("foo/bar", "POST", "/", rpc_body("foo/bar", json!({}))),
         ("malformed", "POST", "/", "{not json".to_string()),
@@ -413,7 +415,7 @@ fn the_refusal_is_the_same_bytes_for_every_method_path_and_body() {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     write!(
         stream,
-        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+        "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n\
          Content-Length: 10000000\r\n{}: peer\r\n{}: trusted\r\n\r\n",
         capsule.addr, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER
     )
@@ -427,7 +429,7 @@ fn the_refusal_is_the_same_bytes_for_every_method_path_and_body() {
     );
 
     // The real task is untouched by the refused cancel.
-    let task = rpc(&capsule.addr, None, "tasks/get", json!({"id": real_id}));
+    let task = rpc(&capsule.addr, None, "GetTask", json!({"id": real_id}));
     assert_eq!(task.status, 200, "{task:?}");
     assert_ne!(task.json()["result"]["status"]["state"], "canceled");
 }
@@ -472,7 +474,7 @@ fn a_capsule_that_does_not_consent_still_serves_events_completions_planes_and_it
         "{completion:?}"
     );
     let answer = completion.json();
-    assert_eq!(answer["error"]["code"], -32004, "{answer}");
+    assert_eq!(answer["error"]["code"], -31002, "{answer}");
     assert!(
         answer["error"]["message"]
             .as_str()
@@ -582,7 +584,7 @@ fn the_card_states_the_peer_task_posture() {
             let extended = rpc(
                 &capsule.addr,
                 Some(operator),
-                "agent/getAuthenticatedExtendedCard",
+                "GetExtendedAgentCard",
                 json!({}),
             );
             assert_eq!(extended.status, 200, "{extended:?}");

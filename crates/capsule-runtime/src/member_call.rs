@@ -9,7 +9,7 @@
 //!
 //! **Return at once.** The tool call returns once the callee's door holds the task, or once a busy
 //! door has turned it away. A watcher thread per call then offers a busy callee the task again,
-//! with backoff, until it takes it, and polls the callee's `tasks/get` until the task ends. Offering
+//! with backoff, until it takes it, and polls the callee's `GetTask` until the task ends. Offering
 //! and answering share one bound, the shared bound for handed-off work; the call also ends when
 //! the door stops answering or the caller's task gives up on it. Its outcome lands in the session's
 //! [`MemberCalls`], and the task loop continues the caller's task with it. A call is cancelled at
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::a2a::{A2aError, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 use crate::cancel::CancelSignal;
 use crate::formation_credentials::{virtual_url, FormationMember, FormationToken};
 use crate::network_policy::{NetworkAllowRule, RequestTarget};
@@ -172,10 +173,16 @@ impl CallHeaders {
         ))
     }
 
+    /// Every header a request to the callee's door carries: `bearer` as `Authorization`, the
+    /// A2A version, and these.
     fn with_bearer<'a>(&'a self, bearer: &'a str) -> Vec<(&'a str, &'a str)> {
-        std::iter::once(("Authorization", bearer))
-            .chain(self.0.iter().map(|(name, value)| (*name, value.as_str())))
-            .collect()
+        [
+            ("Authorization", bearer),
+            (A2A_VERSION_HEADER, A2A_PROTOCOL_VERSION),
+        ]
+        .into_iter()
+        .chain(self.0.iter().map(|(name, value)| (*name, value.as_str())))
+        .collect()
     }
 }
 
@@ -262,7 +269,7 @@ impl CallRoute {
     }
 }
 
-/// Hand `task` to `route.member` as a `message/send`, and return the id of the task its door
+/// Hand `task` to `route.member` as a `SendMessage`, and return the id of the task its door
 /// holds.
 ///
 /// "Holds" means the answer carries `result.id` and a state that is not terminal. Every other
@@ -281,6 +288,28 @@ pub(crate) fn send_task(
         task,
         crate::http_client::DEFAULT_TIMEOUT,
     )
+}
+
+/// Why the door's answer to a `CancelTask` did not confirm it, or `None` when it did: a `result`,
+/// or `TaskNotCancelable`, which says the task had already ended and leaves nothing to stop.
+fn unconfirmed_cancel(answer: Result<Value, DoorRequestError>) -> Option<String> {
+    match answer {
+        Ok(answer) => answer
+            .get("error")
+            .filter(|error| {
+                error_code(error).and_then(A2aError::from_code) != Some(A2aError::TaskNotCancelable)
+            })
+            .map(rpc_error_text),
+        Err(error) => Some(error.into_text()),
+    }
+}
+
+/// A door's JSON-RPC `error` object's `code`, when it is one.
+fn error_code(error: &Value) -> Option<i32> {
+    error
+        .get("code")
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
 }
 
 /// A door's JSON-RPC `error` object as `JSON-RPC error <code>: <message>`.
@@ -307,7 +336,7 @@ fn offer_task(
     let body = json!({
         "jsonrpc": "2.0",
         "id": request_id,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": format!("msg_{call_id}"),
@@ -371,7 +400,7 @@ fn offer_task(
 /// Why a call did not start: how its `member_call` record ends it, and the sentence for the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartFailure {
-    /// [`MemberCallStatus::Rejected`] when the door answered `message/send` with the state
+    /// [`MemberCallStatus::Rejected`] when the door answered `SendMessage` with the state
     /// `rejected` (busy, or its session closing); [`MemberCallStatus::Failed`] for every other way
     /// a call fails to start.
     pub(crate) status: MemberCallStatus,
@@ -401,7 +430,7 @@ impl StartFailure {
     }
 }
 
-/// The one sentence a door's `rejected` answer to `message/send` reads as. `message` is the
+/// The one sentence a door's `rejected` answer to `SendMessage` reads as. `message` is the
 /// door's status message; a leading `task rejected: ` is dropped, since the sentence already says
 /// so.
 pub(crate) fn rejection_sentence(member: &str, message: Option<&str>) -> String {
@@ -436,7 +465,7 @@ pub(crate) enum MemberCallStatus {
     Failed,
     /// The callee's task was cancelled at the callee.
     Canceled,
-    /// The callee refused the task: its door answered `message/send` with `rejected` (busy, or its
+    /// The callee refused the task: its door answered `SendMessage` with `rejected` (busy, or its
     /// session closing) and never held it, or it rejected a task it held.
     Rejected,
     /// The shared bound for handed-off work passed with the callee still working.
@@ -508,7 +537,7 @@ pub(crate) struct MemberCallOutcome {
     pub(crate) truncated: bool,
     /// From the tool call that started it to this outcome.
     pub(crate) duration_ms: u64,
-    /// The members further down that gave the callee no answer, as its `tasks/get` metadata
+    /// The members further down that gave the callee no answer, as its `GetTask` metadata
     /// reported them; read only for `completed` and `no_answer`, empty otherwise.
     pub(crate) below: Vec<(String, MemberCallStatus)>,
 }
@@ -548,7 +577,7 @@ struct Outstanding {
     /// Set under the calls lock only while `abandon` is clear, so an abandoned call sends nothing.
     offer_in_flight: bool,
     /// The callee took the task from an offer that was in flight when the call was abandoned;
-    /// its watcher sends that task a `tasks/cancel`.
+    /// its watcher sends that task a `CancelTask`.
     taken_after_abandon: bool,
 }
 
@@ -1419,22 +1448,20 @@ impl Watcher {
     }
 
     /// Cancel `member_task_id` at the member's door: the member took it from an offer that was in
-    /// flight when the calling task ended, and nothing will read its answer. A cancel the door
-    /// does not confirm is logged and otherwise ignored; the call is recorded `abandoned` either
-    /// way.
+    /// flight when the calling task ended, and nothing will read its answer. A task the door
+    /// answers had already ended leaves nothing to stop. Any other cancel the door does not
+    /// confirm is logged and otherwise ignored; the call is recorded `abandoned` either way.
     fn cancel_member_task(&self, member_task_id: &str) {
         let body = json!({
             "jsonrpc": "2.0",
             "id": format!("{}-cancel", self.call_id),
-            "method": "tasks/cancel",
+            "method": "CancelTask",
             "params": { "id": member_task_id },
         });
         let member = &self.route.member;
-        let refused = match door_request(&self.route, &body, POLL_REQUEST_TIMEOUT) {
-            Ok(answer) => answer.get("error").map(rpc_error_text),
-            Err(error) => Some(error.into_text()),
-        };
-        if let Some(reason) = refused {
+        if let Some(reason) =
+            unconfirmed_cancel(door_request(&self.route, &body, POLL_REQUEST_TIMEOUT))
+        {
             crate::runtime_err!(
                 "[capsule-runtime] call {}: {member} took the task after the calling task ended, \
                  and its cancel was not confirmed: {reason}",
@@ -1464,7 +1491,7 @@ impl Watcher {
         let body = json!({
             "jsonrpc": "2.0",
             "id": self.call_id,
-            "method": "tasks/get",
+            "method": "GetTask",
             "params": { "id": member_task_id },
         });
         let held = Some(member_task_id);
@@ -1510,7 +1537,7 @@ impl Watcher {
                     held,
                     MemberCallStatus::Failed,
                     format!(
-                        "{member}'s door answered tasks/get with {}",
+                        "{member}'s door answered GetTask with {}",
                         rpc_error_text(error)
                     ),
                 ));
@@ -1569,7 +1596,7 @@ impl Watcher {
     }
 }
 
-/// What a callee's ended task says, in its `tasks/get` metadata, about answers it lacks: whether it
+/// What a callee's ended task says, in its `GetTask` metadata, about answers it lacks: whether it
 /// ended through `end-without-answer` (`metadata.murmur.noAnswer`, the JSON `true` only), and the
 /// members further down that gave it none (`metadata.murmur.noAnswerBelow`).
 ///
@@ -2678,5 +2705,35 @@ pub(crate) mod tests {
         assert_eq!(calls.decline("again").unwrap(), "lead");
         calls.begin_task("tsk_c", None);
         assert_eq!((calls.declined(), calls.caller()), (None, None));
+    }
+
+    /// A cancel the door answers with a task, or with `TaskNotCancelable` for a task that had
+    /// already ended, is confirmed and logs nothing. Any other answer is unconfirmed, named.
+    #[test]
+    fn a_cancel_of_an_ended_task_is_confirmed() {
+        let ended = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32002,
+            "message": "Task cannot be canceled: it is already completed"}});
+        assert_eq!(unconfirmed_cancel(Ok(ended)), None);
+        let canceled = json!({"jsonrpc": "2.0", "id": 1, "result": {"id": "tsk_1"}});
+        assert_eq!(unconfirmed_cancel(Ok(canceled)), None);
+        let unknown = json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32001,
+            "message": "Task not found"}});
+        assert_eq!(
+            unconfirmed_cancel(Ok(unknown)).as_deref(),
+            Some("JSON-RPC error -32001: Task not found")
+        );
+        assert_eq!(
+            unconfirmed_cancel(Err(DoorRequestError::Transport("gone".to_string()))).as_deref(),
+            Some("gone")
+        );
+    }
+
+    /// Every request to a callee's door names A2A 1.0, beside its bearer and the call headers.
+    #[test]
+    fn every_member_call_request_names_a2a_1_0() {
+        let headers = CallHeaders::new(None, Some("00-trace".to_string()));
+        let sent = headers.with_bearer("Bearer t");
+        assert!(sent.contains(&("A2A-Version", "1.0")), "{sent:?}");
+        assert!(sent.contains(&("Authorization", "Bearer t")), "{sent:?}");
     }
 }

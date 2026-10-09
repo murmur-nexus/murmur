@@ -21,8 +21,14 @@ pub const DRIVER_VERSION: &str = "0.1.4";
 /// `network.authentication` with a `watcher` that may read tasks and watch, and a `reader` that
 /// may read the operator resource plane.
 pub const AUTHENTICATION_YAML: &str = "network:\n  authentication:\n    scheme: bearer\n    \
-     credentials:\n      watcher:\n        scopes: [tasks/get, stream/watch]\n      \
+     credentials:\n      watcher:\n        scopes: [GetTask, stream/watch]\n      \
      reader:\n        scopes: [resources/files]\n";
+
+/// The `A2A-Version` header every JSON-RPC request to a door carries.
+pub const A2A_VERSION: (&str, &str) = (
+    capsule_runtime::A2A_VERSION_HEADER,
+    capsule_runtime::A2A_PROTOCOL_VERSION,
+);
 
 /// Stages the capsule `manifest` describes from `home`'s store, in process, declaring what its
 /// `network.authentication` block declares — as the formation member `member`, or as none.
@@ -346,7 +352,8 @@ impl Response {
     }
 }
 
-/// Sends one request with `headers` and reads the response head, then the body: up to
+/// Sends one request with exactly `headers`, adding none, and reads the response head, then the
+/// body: up to
 /// `content-length` when given, otherwise until the connection closes or goes quiet for a second.
 /// A `POST /` exchange is checked against A2A v1.0 by [`super::wire_recorder::record_post`].
 pub fn request(
@@ -417,28 +424,29 @@ pub fn request(
     }
 }
 
-/// One JSON-RPC call on `POST /`, presenting `token` as a bearer token when given.
+/// One JSON-RPC call on `POST /` naming A2A 1.0, presenting `token` as a bearer token when given.
 pub fn rpc(addr: &str, token: Option<&str>, method: &str, params: Value) -> Response {
     let authorization = token.map(|token| format!("Bearer {token}"));
     let headers: Vec<(&str, &str)> = authorization
         .as_deref()
         .map(|value| ("Authorization", value))
         .into_iter()
+        .chain([A2A_VERSION])
         .collect();
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
     request(addr, "POST", "/", &headers, &body)
 }
 
-/// `message/send` params carrying `text`.
+/// `SendMessage` params carrying `text`.
 pub fn message(message_id: &str, text: &str) -> Value {
     json!({"message": {"messageId": message_id, "role": "user", "parts": [{"text": text}]}})
 }
 
-/// Polls `tasks/get` under `token` until the task reaches `completed`, and returns it.
+/// Polls `GetTask` under `token` until the task reaches `completed`, and returns it.
 pub fn wait_completed(addr: &str, token: Option<&str>, task_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let response = rpc(addr, token, "tasks/get", json!({"id": task_id}));
+        let response = rpc(addr, token, "GetTask", json!({"id": task_id}));
         assert_eq!(response.status, 200, "{response:?}");
         let task = response.json();
         if task["result"]["status"]["state"] == "completed" {
@@ -516,7 +524,7 @@ pub fn authenticated_capsule_with_a_task_in_flight(
     let sent = rpc(
         &run.url(),
         Some(&run.token("operator")),
-        "message/send",
+        "SendMessage",
         message("m-held", "hold"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");

@@ -73,7 +73,7 @@ fn send_with(addr: &str, authorization: &str, headers: &[(&str, &str)]) -> Respo
         "POST",
         "/",
         &all,
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": message("m", "hello")})
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": message("m", "hello")})
             .to_string(),
     )
 }
@@ -116,17 +116,12 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     let sent = rpc(
         &coder.addr,
         Some(&token),
-        "message/send",
+        "SendMessage",
         message("m-a", "hi"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
-    let got = rpc(
-        &coder.addr,
-        Some(&token),
-        "tasks/get",
-        json!({"id": task_id}),
-    );
+    let got = rpc(&coder.addr, Some(&token), "GetTask", json!({"id": task_id}));
     assert_eq!(got.status, 200, "{got:?}");
     assert!(got.json()["result"]["id"].is_string(), "{got:?}");
     // Every other method is the ordinary scope refusal, naming the member credential.
@@ -155,11 +150,11 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         );
     }
     // A stream connection forwards every task's frames on the door, so a formation token is
-    // refused `message/stream` before any task starts or any event stream opens.
+    // refused `SendStreamingMessage` before any task starts or any event stream opens.
     let streamed = rpc(
         &coder.addr,
         Some(&token),
-        "message/stream",
+        "SendStreamingMessage",
         message("m-s", "hi"),
     );
     assert_eq!(streamed.status, 403, "{streamed:?}");
@@ -167,12 +162,14 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     assert_eq!(body["error"], "insufficient_scope", "{streamed:?}");
     let text = body["message"].as_str().unwrap();
     assert!(
-        text.contains("member:planner") && text.contains("message/stream"),
+        text.contains("member:planner") && text.contains("SendStreamingMessage"),
         "{text}"
     );
     assert_eq!(
         streamed.header("www-authenticate"),
-        Some("Bearer realm=\"coder\", error=\"insufficient_scope\", scope=\"message/stream\"")
+        Some(
+            "Bearer realm=\"coder\", error=\"insufficient_scope\", scope=\"SendStreamingMessage\""
+        )
     );
     assert_eq!(streamed.header("content-type"), Some("application/json"));
 
@@ -233,12 +230,12 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     let operator = rpc(
         &coder.addr,
         Some(&coder.operator),
-        "message/send",
+        "SendMessage",
         message("m-op", "hi"),
     );
     assert_eq!(operator.status, 200, "{operator:?}");
 
-    // (f) `tasks/cancel` reaches the tasks the member submitted itself, and no other: the
+    // (f) `CancelTask` reaches the tasks the member submitted itself, and no other: the
     // operator's task is `-32001`, as an id the door never held would be.
     let operator_task = operator.json()["result"]["id"]
         .as_str()
@@ -247,7 +244,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     let not_its_own = rpc(
         &coder.addr,
         Some(&token),
-        "tasks/cancel",
+        "CancelTask",
         json!({"id": operator_task}),
     );
     assert_eq!(not_its_own.status, 200, "{not_its_own:?}");
@@ -259,7 +256,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     let canceled = rpc(
         &coder.addr,
         Some(&token),
-        "tasks/cancel",
+        "CancelTask",
         json!({"id": task_id}),
     );
     assert_eq!(canceled.status, 200, "{canceled:?}");
@@ -321,11 +318,11 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     }
 }
 
-/// Polls `tasks/get` under `token` until `task_id` reaches a terminal state, and returns it.
+/// Polls `GetTask` under `token` until `task_id` reaches a terminal state, and returns it.
 fn wait_terminal(addr: &str, token: &str, task_id: &str) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let task = rpc(addr, Some(token), "tasks/get", json!({"id": task_id})).json();
+        let task = rpc(addr, Some(token), "GetTask", json!({"id": task_id})).json();
         let state = task["result"]["status"]["state"]
             .as_str()
             .unwrap_or_default();
@@ -340,7 +337,7 @@ fn wait_terminal(addr: &str, token: &str, task_id: &str) -> Value {
     }
 }
 
-/// A finished task answers `tasks/get` with how it ended — a completed one with its `response`
+/// A finished task answers `GetTask` with how it ended — a completed one with its `response`
 /// artifact, a failed one with its `status.message` — and a formation member reads only the tasks
 /// it submitted itself. Another member's task is the same `-32001` an unknown id is; the
 /// operator reads every task.
@@ -375,7 +372,7 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
     let sent = rpc(
         &coder.addr,
         Some(&planner),
-        "message/send",
+        "SendMessage",
         message("m-1", "answer"),
     );
     let completed_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
@@ -395,7 +392,7 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
     let sent = rpc(
         &coder.addr,
         Some(&planner),
-        "message/send",
+        "SendMessage",
         message("m-2", "fail"),
     );
     let failed_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
@@ -413,7 +410,7 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
     let unknown = rpc(
         &coder.addr,
         Some(&reviewer),
-        "tasks/get",
+        "GetTask",
         json!({"id": "tsk_none"}),
     );
     assert_eq!(unknown.json()["error"]["code"], -32001, "{unknown:?}");
@@ -421,15 +418,14 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         let refused = rpc(
             &coder.addr,
             Some(&reviewer),
-            "tasks/get",
+            "GetTask",
             json!({"id": task_id}),
         );
         assert_eq!(refused.status, 200, "{refused:?}");
-        assert_eq!(
-            refused.json()["error"],
-            unknown.json()["error"],
-            "{refused:?}"
-        );
+        // The error an unknown id gets, naming the id asked for.
+        let mut expected = unknown.json()["error"].clone();
+        expected["data"][0]["metadata"]["taskId"] = json!(task_id);
+        assert_eq!(refused.json()["error"], expected, "{refused:?}");
         assert!(refused.json().get("result").is_none(), "{refused:?}");
     }
 
@@ -438,7 +434,7 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         let read = rpc(
             &coder.addr,
             Some(&coder.operator),
-            "tasks/get",
+            "GetTask",
             json!({"id": task_id}),
         );
         assert_eq!(read.json()["result"], as_submitter["result"], "{read:?}");

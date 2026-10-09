@@ -96,7 +96,7 @@ member. A member the roster lets call nobody, and a session in no formation, has
 |---|---|
 | Input | `{"member": "<name>", "task": "<text>"}`, both required. The schema's `member` is an `enum` of the members this one may call, in roster order |
 | Description | Tells the model that `task` is the whole of what the member is told, so any file content it needs goes in the task text; that the call returns at once with a call id, started when the member holds the task or busy when it has no room, in which case the runtime keeps offering the task until the member takes it or the call's deadline passes; that the answer arrives in the conversation after the turn ends, so it should not wait or poll; and that a second call to a member before its answer has arrived is refused |
-| Sent | One `message/send` to the member's door, carrying `task` as one text part, the formation token, and the calling task's trust class with origin `peer`. The model never sees the door's address or the token |
+| Sent | One `SendMessage` to the member's door, carrying `task` as one text part, the formation token, and the calling task's trust class with origin `peer`. The model never sees the door's address or the token |
 | Egress | The member's door is checked against this capsule's own [`capabilities.network.allow`](manifest.md#network-allow-entries), which must list `localhost` — see [Giving a member work](roster.md#member-calls). Without it, every call fails and staging prints [`W-RUN-008`](diagnostics.md#w-run-008) |
 | Trace | One [`member_call_busy`](observability-schemas.md#member-call-busy) per offer the member turns away busy, [`member_call_start`](observability-schemas.md#member-call-start) when the member holds the task, and one [`member_call`](observability-schemas.md#member-call) per call once it is accounted for |
 
@@ -140,7 +140,7 @@ A door's `rejected` answer reads as one sentence:
 A busy member's call is outstanding from the moment the tool call returns, and the runtime, not
 the model, offers the member the task again:
 
-1. Each offer is a new `message/send` carrying the same task text.
+1. Each offer is a new `SendMessage` carrying the same task text.
 2. The second offer comes 1 second after the first refusal. Each later wait doubles, up to 8
    seconds, plus up to 250 ms of jitter.
 3. Each offer the member turns away busy writes its own
@@ -155,7 +155,7 @@ The call then ends in one of these ways:
 | Two offers in a row get no answer | Ends `unreachable` |
 | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) passes while the member is still busy | Ends `rejected`, never held: `<member> stayed busy with other work for the whole <N>s this call may wait and never took the task; it was offered the task <k> times. Nothing was done on it.` |
 | The calling task ends between offers | Ends `abandoned`, never held: `the calling task ended before <member> took the task; <member> was busy and was never handed it` |
-| The calling task ends while an offer is on its way, and the member takes the task | Ends `abandoned` with the member's task id: `the calling task ended just after <member> took the task; a cancel was sent to <member>`. The runtime sends that task `tasks/cancel` |
+| The calling task ends while an offer is on its way, and the member takes the task | Ends `abandoned` with the member's task id: `the calling task ended just after <member> took the task; a cancel was sent to <member>`. The runtime sends that task `CancelTask` |
 | The calling task ends while an offer is on its way, and the member turns it away busy | Writes that offer's `member_call_busy`, then ends as when the calling task ends between offers |
 | The calling task ends while an offer is on its way, and the member does not answer within 6 seconds | Ends `abandoned`: `the calling task ended while an offer to <member> was in flight; <member> may hold the task` |
 
@@ -225,9 +225,9 @@ critic did not answer within 600s. …
 | Any other | `[call-member] call <call_id> to <member> ended <status>, with no answer from <member>:` |
 
 A call ends `no_answer` when the member ended its task with
-[`end-without-answer`](#end-without-answer): its task is `failed` and its `tasks/get` result
+[`end-without-answer`](#end-without-answer): its task is `failed` and its `GetTask` result
 carries [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata). A member's
-`tasks/get` result may also name, in `metadata.murmur.noAnswerBelow`, the members further down
+`GetTask` result may also name, in `metadata.murmur.noAnswerBelow`, the members further down
 that gave it no answer. The runtime reads those names only for a `completed` or `no_answer` call,
 keeps at most 8, and keeps only a roster member name with a status other than `completed`.
 
@@ -299,12 +299,13 @@ outstanding, with every answer and every delegation outcome in one message, answ
 | Bound | Value |
 |---|---|
 | How long a call may take, [offering a busy member the task](#call-member-busy) and waiting for its answer together | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600 seconds, or `MURMUR_DELEGATION_TIMEOUT_SECS` — the bound delegations use |
-| How often the member's task is read | Every 500 ms, through the member's `tasks/get` |
+| How often the member's task is read | Every 500 ms, through the member's `GetTask` |
 | Unreachable | Two reads, or two offers, in a row that get no answer |
 
-No call is ever cancelled at the member: a formation token cannot call `tasks/cancel`. A call
-that times out, or is abandoned after the member took the task, leaves the member's task running
-until it finishes or the formation ends.
+The runtime cancels a member's task only when the member took it just after the calling task
+ended, as the [busy-member table](#call-member-busy) shows. A call that times out, or is abandoned
+while the member works on the task, leaves the member's task running until it finishes or the
+formation ends.
 
 ## `end-without-answer` { #end-without-answer }
 
@@ -341,7 +342,7 @@ the call and finished ends the same way.
 | Surface | What it shows |
 |---|---|
 | A2A state | `failed`, with the reason as its status message |
-| `tasks/get` | [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata), and `metadata.murmur.noAnswerBelow` naming each member further down this task had no answer from |
+| `GetTask` | [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata), and `metadata.murmur.noAnswerBelow` naming each member further down this task had no answer from |
 | `out/result.txt` | `no answer: <reason>` |
 | [`task_end.exit_status`](observability-schemas.md#task-end) and the `on-task-end` exit status | `no_answer` |
 | `task_failed` | None is written |
@@ -353,5 +354,5 @@ answer again. A caller that is not a formation member reads an ordinary `failed`
 status message.
 
 A task that answers in text while a member it called gave no answer completes as usual. Its
-`tasks/get` result carries `metadata.murmur.noAnswerBelow` naming those members, and its caller
+`GetTask` result carries `metadata.murmur.noAnswerBelow` naming those members, and its caller
 reads its answer with a gap line.

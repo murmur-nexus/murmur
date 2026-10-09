@@ -9,7 +9,7 @@ use crate::live_address::Target;
 
 /// Connect to a capsule's SSE observer endpoint (`stream/watch`) and print events to stdout.
 ///
-/// Unlike `message/stream`, this does not submit a task. It passively observes the capsule's
+/// Unlike `SendStreamingMessage`, this does not submit a task. It passively observes the capsule's
 /// SSE stream, including any events buffered since the capsule started. The process stays
 /// connected across task turns. It returns `Ok` only on `capsule-closed`; a stream that ends any
 /// other way is `E_IO_003`, because the capsule behind it may still be running.
@@ -35,8 +35,10 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
     .to_string();
 
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\n{}Content-Type: application/json\r\nAccept: text/event-stream\r\nLast-Event-ID: 0\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\n{}{}: {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nLast-Event-ID: 0\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
         super::cancel::authorization_line(target.door_token().as_ref()),
+        capsule_runtime::A2A_VERSION_HEADER,
+        capsule_runtime::A2A_PROTOCOL_VERSION,
         body.len(),
         body
     );

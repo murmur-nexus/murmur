@@ -24,7 +24,7 @@
 //! Two reporters, one arrival path. The child reports for itself at the end of its own session;
 //! the completion watcher behind the parent's [`crate::child_launch::LaunchedChild`] reports for
 //! a child that could not. Both write [`COMPLETION_FILE`] into the child's directory and both post
-//! the same JSON-RPC `message/send` to the parent's A2A door. The door hands it to the task that
+//! the same JSON-RPC `SendMessage` to the parent's A2A door. The door hands it to the task that
 //! made the delegation, which reads this file and continues its conversation with
 //! [`outcomes_message`]; it never becomes a task of its own. A completion that cannot be
 //! delivered is recorded in that file with `delivered: false` and the refusal's reason, and a
@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::a2a::{A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 use crate::errors::RuntimeError;
 use crate::http_client::http_json;
 use crate::origin::{TaskOrigin, PEER_ORIGIN_HEADER};
@@ -456,12 +457,12 @@ pub fn write_completion(workdir: &Path, outcome: &DelegationOutcome) -> Result<(
 
 /// Post one completion to the parent's A2A door.
 ///
-/// A JSON-RPC `message/send` carrying [`DelegationOutcome::message_text`], stamped with the three
-/// headers the door reads: the `completion` origin, the delegation id, and the session the
-/// completion is addressed to. The door reads the outcome from [`COMPLETION_FILE`] rather than
-/// from the message; the text is for a reader of the request. Blocking, because both reporters
-/// run outside any async context — the child's is a `Drop` guard at the end of its session, and
-/// the launcher's is a watcher thread.
+/// A JSON-RPC `SendMessage` carrying [`DelegationOutcome::message_text`], stamped with the A2A
+/// version and the three headers the door reads: the `completion` origin, the delegation id, and
+/// the session the completion is addressed to. The door reads the outcome from
+/// [`COMPLETION_FILE`] rather than from the message; the text is for a reader of the request.
+/// Blocking, because both reporters run outside any async context — the child's is a `Drop` guard
+/// at the end of its session, and the launcher's is a watcher thread.
 pub fn deliver_completion(
     handle: &SpawnerHandle,
     address: &CompletionAddress,
@@ -470,7 +471,7 @@ pub fn deliver_completion(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": format!("req_{}", uuid::Uuid::now_v7().simple()),
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": format!("msg_{}", uuid::Uuid::now_v7().simple()),
@@ -487,6 +488,7 @@ pub fn deliver_completion(
         &address.url,
         Some(&body),
         &[
+            (A2A_VERSION_HEADER, A2A_PROTOCOL_VERSION),
             (PEER_ORIGIN_HEADER, TaskOrigin::Completion.as_str()),
             (DELEGATION_ID_HEADER, handle.delegation_id.as_str()),
             (COMPLETION_SESSION_HEADER, handle.session_id.as_str()),
@@ -797,6 +799,45 @@ mod tests {
         let read = read_completion(dir.path()).expect("the record exists");
         assert_eq!(read.status, DelegationStatus::Terminated);
         assert_eq!(read.reported_by, Reporter::Launcher);
+    }
+
+    /// A completion is an A2A 1.0 `SendMessage`, naming the version beside the three completion
+    /// headers.
+    #[test]
+    fn a_completion_is_an_a2a_1_0_send_message() {
+        let (addr, sent) = crate::http_client::capture::answer_one(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1,
+                "result": {"delegation_id": "dlg_0001", "received": true}})
+            .to_string(),
+        );
+        let to = CompletionAddress {
+            url: format!("http://{addr}"),
+        };
+        deliver_completion(&handle(), &to, &outcome()).unwrap();
+        let sent = sent.join().unwrap();
+        assert_eq!(sent.method(), "SendMessage");
+        assert_eq!(sent.header("a2a-version"), ["1.0"]);
+        assert_eq!(sent.header(PEER_ORIGIN_HEADER), ["completion"]);
+        assert_eq!(sent.header(DELEGATION_ID_HEADER), ["dlg_0001"]);
+        assert_eq!(sent.header(COMPLETION_SESSION_HEADER), ["ses_parent"]);
+    }
+
+    /// A completion the parent's door refuses is not delivered, and the door's message is the
+    /// reason, whatever the code.
+    #[test]
+    fn a_refused_completion_reports_the_door_s_message() {
+        let (addr, _sent) = crate::http_client::capture::answer_one(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -31002,
+                "message": "no task in this session is waiting for delegation dlg_0001"}})
+            .to_string(),
+        );
+        let to = CompletionAddress {
+            url: format!("http://{addr}"),
+        };
+        assert_eq!(
+            deliver_completion(&handle(), &to, &outcome()),
+            Err("no task in this session is waiting for delegation dlg_0001".to_string())
+        );
     }
 
     /// A completion with nowhere to go is recorded rather than dropped.

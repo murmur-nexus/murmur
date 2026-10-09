@@ -186,8 +186,9 @@ If the harness has lost a conversation Murmur is still naming, the next task in 
     ```bash
     curl -s localhost:41234 \
       -H 'content-type: application/json' \
+      -H 'A2A-Version: 1.0' \
       -H 'x-murmur-forget-session: true' \
-      -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","contextId":"ctx_0193f2","role":"user","parts":[{"text":"carry on"}]}}}'
+      -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m1","contextId":"ctx_0193f2","role":"user","parts":[{"text":"carry on"}]}}}'
     ```
 
 Either way the entry is deleted, the turn runs as a new conversation under the same context id, and the trace records a `harness_session_forgotten` event naming the context, the id that was dropped and who asked. The flag applies to the launch's first task, and the header to the message that carried it. Only this transport has a harness session, so a forget asked of any other capsule is refused with [`E-RUN-039`](../reference/diagnostics.md#e-run-039).

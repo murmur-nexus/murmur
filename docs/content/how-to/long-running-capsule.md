@@ -149,10 +149,11 @@ Send the first task:
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-001",
@@ -185,10 +186,11 @@ Send a second task while the first is still running. Use the same `contextId` to
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 2,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-002",
@@ -216,12 +218,13 @@ To start a separate, independent thread, use a different `contextId`. Each `cont
 
 ## Step 5 — poll task status
 
-Use `tasks/get` with the task ID from step 3:
+Use `GetTask` with the task ID from step 3:
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"id":"<your_task_id>"}}'
+  -H "A2A-Version: 1.0" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"GetTask","params":{"id":"<your_task_id>"}}'
 ```
 
 `state` progresses through: `submitted` → `working` → `completed` | `failed`. If you poll after the task has finished you will see `completed` or `failed` directly — `working` is only visible during active processing.
@@ -238,7 +241,7 @@ curl -s -X POST http://localhost:$PORT \
 }
 ```
 
-`tasks/get` can look up **any task by ID** from the capsule's `TaskRegistry`, including tasks that have already finished — you are not limited to the currently-running task.
+`GetTask` can look up **any task by ID** from the capsule's `TaskRegistry`, including tasks that have already finished — you are not limited to the currently-running task.
 
 ---
 
@@ -340,4 +343,4 @@ This is useful for running the same capsule in both ephemeral mode (CI) and pers
 | `conversation: threaded` | Tasks sharing a `contextId` accumulate history — each task sees the full prior exchange for that thread |
 | `conversation: stateless` (default) | Every task starts with a blank context regardless of `contextId` |
 | Shutdown | External only — host closes the task channel or process receives SIGTERM; no idle self-exit |
-| `tasks/get` + task ID | Look up any task — current or historical — from the `TaskRegistry` |
+| `GetTask` + task ID | Look up any task — current or historical — from the `TaskRegistry` |

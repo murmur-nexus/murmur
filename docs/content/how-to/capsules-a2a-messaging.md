@@ -269,10 +269,11 @@ With the worker capsule running, the orchestrator capsule (or any HTTP client) c
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-001",
@@ -283,6 +284,9 @@ curl -s -X POST http://localhost:$PORT \
     }
   }'
 ```
+
+The door speaks A2A v1.0: every JSON-RPC request carries `A2A-Version: 1.0`, and one without it is
+answered with error [`-32009`](../reference/agent-card.md#a2a-version) and starts nothing.
 
 Response:
 
@@ -308,7 +312,7 @@ mur watch @1
 [running-capsule records](../reference/cli.md#running-capsule-records). Name an older one by the
 last four characters of its session id, or reach a capsule directly with `mur watch --url localhost:$PORT`.
 
-To consume the same events from your own client, send `stream/watch` or `message/stream` to the
+To consume the same events from your own client, send `stream/watch` or `SendStreamingMessage` to the
 capsule's address. [Streaming Protocol](../reference/streaming-protocol.md) lists both endpoints and
 every frame they write.
 
@@ -316,12 +320,13 @@ every frame they write.
 
 ## Step 6 — poll the task status
 
-Use the task ID returned in step 5 with `tasks/get`:
+Use the task ID returned in step 5 with `GetTask`:
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"<your-task-id>"}}'
+  -H "A2A-Version: 1.0" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"<your-task-id>"}}'
 ```
 
 `state` progresses through: `submitted` → `working` → `completed` | `failed` | `canceled`.
@@ -330,7 +335,7 @@ curl -s -X POST http://localhost:$PORT \
 |---|---|
 | `completed` | Finished its work. A reply cut off at `inference.max_tokens` still counts |
 | `failed` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
-| `canceled` | Was stopped with `tasks/cancel`, `session/stop` or `mur stop` |
+| `canceled` | Was stopped with `CancelTask`, `session/stop` or `mur stop` |
 
 ```json
 {
@@ -357,14 +362,15 @@ Poll until `state` is `completed` or `failed`. The task registry on the worker c
 
 ## Cancelling a running task
 
-`tasks/cancel` stops one task. The worker capsule's session, its conversation and its queue keep
+`CancelTask` stops one task. The worker capsule's session, its conversation and its queue keep
 going — queued tasks proceed and the capsule keeps answering — so this is not a way to shut a
 capsule down.
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"id":"<your-task-id>"}}'
+  -H "A2A-Version: 1.0" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"CancelTask","params":{"id":"<your-task-id>"}}'
 ```
 
 The work in flight is stopped rather than waited out — the inference call is dropped, and under
@@ -404,9 +410,34 @@ same `contextId` resumes the same harness session. When the harness had to be ki
 status says so — `task canceled; the harness was killed and its session may not resume cleanly` —
 because a harness cut off mid-turn may not be able to continue that session.
 
-Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` returns
-that state and changes nothing. A task id the capsule never held is the one error: JSON-RPC code
-`-32001`, `Task not found`.
+Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` changes
+nothing, and is answered with JSON-RPC error `-32002`, `TaskNotCancelableError`, whose `ErrorInfo`
+metadata names the task and the state it ended in:
+
+```json
+{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "error":
+    {
+        "code": -32002,
+        "message": "Task cannot be canceled: it is already completed",
+        "data":
+        [
+            {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "TASK_NOT_CANCELABLE",
+                "domain": "a2a-protocol.org",
+                "metadata": { "taskId": "tsk_019ed5211c827f63a8fe4be623277c55", "state": "completed" }
+            }
+        ]
+    }
+}
+```
+
+`mur cancel` reports such a task as `nothing to cancel` and exits `0`. A task id the capsule never
+held is answered `-32001`, `Task not found`. Both errors are listed under
+[Agent Card: Errors](../reference/agent-card.md#errors).
 
 ### What the cancel names { #what-the-cancel-left-running }
 
@@ -456,6 +487,7 @@ reports, and ends nothing.
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{"jsonrpc":"2.0","id":4,"method":"session/stop","params":{}}'
 ```
 
@@ -479,10 +511,10 @@ curl -s -X POST http://localhost:$PORT \
 |---|---|
 | `session_id` | The session this door answers for |
 | `canceled` | The task ids this call moved to `canceled`, sorted. Empty when nothing was still running |
-| `residue` | One object per thing the session leaves running, in the same vocabulary `tasks/cancel` uses. Empty when nothing is |
+| `residue` | One object per thing the session leaves running, in the same vocabulary `CancelTask` uses. Empty when nothing is |
 
 All three keys are always present. `residue` is `[]` rather than absent when nothing is running,
-which is the one place this differs from `tasks/cancel`: a session stop has to be able to say
+which is the one place this differs from `CancelTask`: a session stop has to be able to say
 "nothing" as a positive fact, because that is the whole answer the caller asked for. Issued a
 second time the method returns an empty `canceled` array rather than an error, so a retried stop is
 not a failure.
@@ -535,7 +567,7 @@ When OTel tracing is configured, the `traceparent` header links the worker capsu
 | Worker capsule takes tasks from other capsules | `exports.peer_tasks.accept: true` in the worker capsule manifest |
 | Orchestrator capsule can reach worker capsule | `capabilities.network.allow` must include the worker capsule's URL |
 | Network policy enforcement | Any peer URL not in `network.allow` is rejected before TCP connection |
-| Task ID | Returned by the message call; use it with `tasks/get` to poll status and `tasks/cancel` to stop it |
-| Stopping one task | `tasks/cancel`, or `mur cancel <session> <task-id>`; the session, its conversation and its queue keep running |
+| Task ID | Returned by the message call; use it with `GetTask` to poll status and `CancelTask` to stop it |
+| Stopping one task | `CancelTask`, or `mur cancel <session> <task-id>`; the session, its conversation and its queue keep running |
 | Ending the session | `mur stop <session>`, which calls `session/stop` for the account of what is still running and then signals the process. `session/stop` on its own cancels and reports without ending anything |
 | Trace | Both capsules write independent `trace.jsonl` files; `a2a_task_received` appears on the worker capsule side, `a2a_send` on the orchestrator capsule side |

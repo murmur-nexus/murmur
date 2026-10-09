@@ -694,8 +694,8 @@ impl From<RuntimeError> for CliError {
                      is, so the next task in this context fails the same way rather than answering \
                      from nothing. Ask for it to be dropped and this context starts a new \
                      conversation: `mur run --context <id> --forget-session`, or the header \
-                     `x-murmur-forget-session: true` on the next message/send or message/stream — \
-                     see ",
+                     `x-murmur-forget-session: true` on the next SendMessage or \
+                     SendStreamingMessage — see ",
                     murmur_artifact::docs_reference_url!("cli/")
                 ),
             ),

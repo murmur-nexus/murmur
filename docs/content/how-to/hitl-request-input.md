@@ -155,10 +155,11 @@ Send a task that will require a human decision:
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-001",
@@ -189,12 +190,13 @@ Save the task `id` — you will need it to detect the pause.
 
 ## Step 4 — detect when the agent is waiting
 
-Poll `tasks/get` with the task ID until the state changes to `input-required`:
+Poll `GetTask` with the task ID until the state changes to `input-required`:
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"<your_task_id>"}}'
+  -H "A2A-Version: 1.0" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"<your_task_id>"}}'
 ```
 
 While the agent is waiting, the response includes the question it formed:
@@ -228,10 +230,11 @@ Send a message to the same capsule URL:
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -d '{
     "jsonrpc": "2.0",
     "id": 3,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "reply-001",
@@ -256,7 +259,7 @@ The answer is delivered directly to the suspended tool call. The agent receives 
 }
 ```
 
-Poll `tasks/get` again until `state` reaches `completed` or `failed`.
+Poll `GetTask` again until `state` reaches `completed` or `failed`.
 
 ---
 
@@ -281,7 +284,7 @@ When the deadline passes, the tool call fails and the attempt ends. The task the
 | `murmur-tool-request-input` | WASM tool artifact; `runtime: tool`; platform-independent |
 | `prompt` parameter | The question the model asks the operator; string, required |
 | Task state while waiting | `"input-required"` |
-| Where to read the question | `result.artifacts[0].parts[0].text` from `tasks/get` |
+| Where to read the question | `result.artifacts[0].parts[0].text` from `GetTask` |
 | How to resume the agent | Send a message to the same capsule URL |
 | State after reply | `"working"` immediately; poll until `"completed"` |
 | `lifecycle.input_timeout_secs` | Integer seconds to wait for a reply; absent = wait indefinitely |

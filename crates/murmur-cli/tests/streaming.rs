@@ -1,4 +1,4 @@
-//! Integration tests for SSE streaming (message/stream endpoint).
+//! Integration tests for SSE streaming (SendStreamingMessage endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -208,7 +208,7 @@ struct SseEvent {
     data: String,
 }
 
-/// Open a message/stream connection, optionally with Last-Event-ID, and collect all
+/// Open a SendStreamingMessage connection, optionally with Last-Event-ID, and collect all
 /// SSE events until a final=true event or timeout. Returns the collected events.
 fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration) -> Vec<SseEvent> {
     let msg_id = format!(
@@ -222,7 +222,7 @@ fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration)
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {
             "message": {
                 "messageId": msg_id,
@@ -239,7 +239,7 @@ fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration)
     }
 
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{extra_headers}\r\n{}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{extra_headers}\r\n{}",
         body.len(),
         body
     );
@@ -583,7 +583,7 @@ fn streaming_agent_card_has_streaming_capability() {
         "agent card should include capabilities.streaming: true; got: {card}"
     );
     assert!(
-        common::card_door_methods(&card).contains(&"tasks/cancel"),
+        common::card_door_methods(&card).contains(&"CancelTask"),
         "an http capsule can stop a task, and its card says so; got: {card}"
     );
 

@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::a2a::{A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 use crate::child_launch::{
     launch_child_capsule, workdir_relative_to, ChildLaunchRequest, LaunchedChild,
 };
@@ -70,6 +71,14 @@ pub const DELEGATION_RESULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// For an operator whose sub-capsules legitimately run longer than the capsule declared, and for a
 /// value below it. A value that is not a positive integer is ignored and the declared bound stands.
 pub const DELEGATION_TIMEOUT_ENV: &str = "MURMUR_DELEGATION_TIMEOUT_SECS";
+
+/// The headers of every request to a child's door: the A2A version, and `authorization` as
+/// `Authorization` when there is one.
+fn door_headers(authorization: Option<&str>) -> Vec<(&str, &str)> {
+    std::iter::once((A2A_VERSION_HEADER, A2A_PROTOCOL_VERSION))
+        .chain(authorization.map(|value| ("Authorization", value)))
+        .collect()
+}
 
 /// How long the task delivery is retried while the child's listener comes up.
 ///
@@ -802,16 +811,13 @@ impl DelegationPlane {
             );
         }
         let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
-        // Present on every call to a child that declares `network.authentication`.
+        // `Authorization` is present on every call to a child that declares
+        // `network.authentication`.
         let authorization = child
             .door_token
             .as_ref()
             .map(crate::door_auth::bearer_header);
-        let headers: Vec<(&str, &str)> = authorization
-            .as_deref()
-            .map(|value| ("Authorization", value))
-            .into_iter()
-            .collect();
+        let headers = door_headers(authorization.as_deref());
 
         // Step 3: deliver the task as the child's first user message.
         let task_id = match deliver_task(
@@ -828,13 +834,6 @@ impl DelegationPlane {
 
         // Step 4: wait for a terminal state, bounded. On expiry the parent stops waiting; what
         // happens to the child is decided below.
-        let poll_body = json!({
-            "jsonrpc": "2.0",
-            "id": delegation_id,
-            "method": "tasks/get",
-            "params": { "id": task_id }
-        })
-        .to_string();
         let poll_deadline = Instant::now() + self.result_timeout;
         loop {
             if stopped() {
@@ -861,7 +860,7 @@ impl DelegationPlane {
                 return canceled(&mut child);
             }
 
-            let task = match http_json("POST", &capsule_url, Some(&poll_body), &headers) {
+            let task = match poll_task(&capsule_url, &headers, &delegation_id, &task_id) {
                 Ok(task) => task,
                 Err(error) => {
                     return outcome(
@@ -925,6 +924,24 @@ impl DelegationPlane {
     }
 }
 
+/// One `GetTask` for the child's task `task_id`, sent with `headers`: the child's answer, or the
+/// transport error.
+fn poll_task(
+    capsule_url: &str,
+    headers: &[(&str, &str)],
+    delegation_id: &str,
+    task_id: &str,
+) -> Result<Value, String> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": delegation_id,
+        "method": "GetTask",
+        "params": { "id": task_id }
+    })
+    .to_string();
+    http_json("POST", capsule_url, Some(&body), headers)
+}
+
 /// Deliver the task as the child's first user message, backing off while its listener comes up.
 ///
 /// A child reports its URL when it binds, but the first connection can still land between the bind
@@ -945,7 +962,7 @@ fn deliver_task(
     let send_body = json!({
         "jsonrpc": "2.0",
         "id": delegation_id,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": format!("msg_{delegation_id}"),
@@ -956,11 +973,7 @@ fn deliver_task(
     })
     .to_string();
     let authorization = door_token.map(crate::door_auth::bearer_header);
-    let headers: Vec<(&str, &str)> = authorization
-        .as_deref()
-        .map(|value| ("Authorization", value))
-        .into_iter()
-        .collect();
+    let headers = door_headers(authorization.as_deref());
     let send_deadline = Instant::now() + SEND_DEADLINE;
     let mut delay = Duration::from_millis(100);
     let sent = loop {
@@ -1221,6 +1234,51 @@ mod tests {
         .await
         .expect_err("the same door refuses a peer message");
         assert!(refused.contains("403 peer_not_accepted"), "{refused}");
+    }
+
+    /// The task goes to the child as an A2A 1.0 `SendMessage`, and is polled with `GetTask`, each
+    /// naming the version beside the child's bearer.
+    #[test]
+    fn a_delegation_hands_over_and_polls_with_a2a_1_0_requests() {
+        use crate::http_client::capture::answer_one;
+
+        let (addr, sent) = answer_one(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"id": "tsk_child", "contextId": "c",
+                "status": {"state": "submitted"}}})
+            .to_string(),
+        );
+        let token = crate::door_auth::DoorToken::new("tok".to_string());
+        let task_id = deliver_task(
+            &format!("http://{addr}"),
+            Some(&token),
+            "dlg_0000000000000001",
+            &request(),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(task_id, "tsk_child");
+        let sent = sent.join().unwrap();
+        assert_eq!(sent.method(), "SendMessage");
+        assert_eq!(sent.header("a2a-version"), ["1.0"]);
+        assert_eq!(sent.header("authorization"), ["Bearer tok"]);
+
+        let (addr, sent) = answer_one(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"id": "tsk_child", "contextId": "c",
+                "status": {"state": "working"}}})
+            .to_string(),
+        );
+        let authorization = crate::door_auth::bearer_header(&token);
+        poll_task(
+            &format!("http://{addr}"),
+            &door_headers(Some(&authorization)),
+            "dlg_0000000000000001",
+            "tsk_child",
+        )
+        .unwrap();
+        let sent = sent.join().unwrap();
+        assert_eq!(sent.method(), "GetTask");
+        assert_eq!(sent.header("a2a-version"), ["1.0"]);
+        assert_eq!(sent.header("authorization"), ["Bearer tok"]);
     }
 
     /// A plane that was never told this capsule's own address cannot start a delegation: the

@@ -2205,8 +2205,10 @@ fn door_posture_names_every_credential() {
     let project = agent_project("http://127.0.0.1:9", "doctor-auth", "", AUTHENTICATION_YAML);
     let doctor = doctor_stdout(home.path(), project.path(), &["--bind", "0.0.0.0"]);
     assert!(
-        doctor.lines().any(|line| line
-            == "door: bearer — operator, reader (resources/files), watcher (tasks/get, stream/watch)"),
+        doctor.lines().any(|line| {
+            line
+            == "door: bearer — operator, reader (resources/files), watcher (GetTask, stream/watch)"
+        }),
         "{doctor}"
     );
     assert!(w_sec_032_lines(&doctor).is_empty(), "{doctor}");

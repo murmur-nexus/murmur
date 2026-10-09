@@ -116,7 +116,7 @@ fn http_get(addr: &str, path: &str) -> HttpResponse {
 fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -132,7 +132,7 @@ fn message_send_body(id: &str, text: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {"messageId": id, "role": "user", "parts": [{"text": text}]}
         }
@@ -184,7 +184,7 @@ impl Capsule {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let body = serde_json::json!({
-                "jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}
+                "jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}
             })
             .to_string();
             let response = http_post_json(&self.url, "/", &body);

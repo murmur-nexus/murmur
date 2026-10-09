@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use crate::a2a_conformance::{
     check_agent_card, check_message, check_request, check_response, check_stream_event,
     resolve_method, v1_methods, MethodKind, Violation, WirePart, EXTENSION_METHODS,
-    LEGACY_METHOD_NAMES,
 };
 
 /// A conformant card: the one a capsule `my-agent` 0.1.0 on port 41873 serves.
@@ -29,7 +28,7 @@ fn conformant_card() -> Value {
                     "description": "Every JSON-RPC method this door answers.",
                     "required": false,
                     "params": {
-                        "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"]
+                        "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"]
                     }
                 },
                 {
@@ -92,7 +91,7 @@ fn a2a_card_conformance_rejects_the_previous_card_shape() {
             "cancellation": true
         },
         "serves": {
-            "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+            "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
             "planes": ["files"]
         }
     });
@@ -253,7 +252,7 @@ fn errors_under(violations: &[Violation], key: &str) -> Vec<String> {
         .clone()
 }
 
-/// The task the door answers `tasks/get` with once a task completes.
+/// The task the door answers `GetTask` with once a task completes.
 fn door_task() -> Value {
     json!({
         "id": "tsk_1",
@@ -718,12 +717,17 @@ fn a2a_wire_conformance_every_message_the_table_names_is_defined() {
 }
 
 #[test]
-fn a2a_wire_conformance_resolves_legacy_and_extension_names() {
-    for (legacy, v1) in LEGACY_METHOD_NAMES {
-        let resolved = resolve_method(legacy).unwrap();
-        assert_eq!((resolved.kind, resolved.name), (MethodKind::Legacy, v1));
+fn a2a_wire_conformance_resolves_v1_and_extension_names() {
+    for v1 in [
+        "SendMessage",
+        "SendStreamingMessage",
+        "GetTask",
+        "CancelTask",
+        "GetExtendedAgentCard",
+    ] {
+        let resolved = resolve_method(v1).unwrap();
+        assert_eq!((resolved.kind, resolved.name), (MethodKind::V1, v1));
         assert_eq!(resolved.spec.unwrap().name, v1);
-        assert_eq!(resolve_method(v1).unwrap().kind, MethodKind::V1);
     }
     for (name, streaming) in EXTENSION_METHODS {
         let resolved = resolve_method(name).unwrap();
@@ -766,34 +770,21 @@ fn a2a_wire_conformance_a_v1_request_raises_nothing() {
 }
 
 #[test]
-fn a2a_wire_conformance_legacy_names_are_method_violations_measured_as_v1() {
-    let send = request(
+fn a2a_wire_conformance_a2a_0_3_names_are_not_v1_methods() {
+    for name in [
         "message/send",
-        json!({"message": {"messageId": "m1", "role": "user", "parts": [{"text": "hi"}]}}),
-    );
-    let violations = check_request(&send);
-    assert_eq!(
-        keys(&violations),
-        [
-            "message/send method -",
-            "SendMessage params lf.a2a.v1.SendMessageRequest"
-        ]
-    );
-    assert_eq!(
-        violations[0].errors,
-        ["`message/send` is the A2A 0.3 name; v1.0 calls it `SendMessage`"]
-    );
-    assert_eq!(
-        violations[1].errors,
-        ["`params.message.role` is \"user\", not a value of Role"]
-    );
-    for (legacy, v1) in LEGACY_METHOD_NAMES {
-        let violations = check_request(&request(legacy, json!({})));
-        assert_eq!(violations[0].key(), format!("{legacy} method -"));
+        "message/stream",
+        "tasks/get",
+        "tasks/cancel",
+        "agent/getAuthenticatedExtendedCard",
+    ] {
+        assert!(resolve_method(name).is_none(), "{name}");
+        let violations = check_request(&request(name, json!({})));
+        assert_eq!(keys(&violations), [format!("{name} method -")]);
         assert_eq!(
             violations[0].errors,
             [format!(
-                "`{legacy}` is the A2A 0.3 name; v1.0 calls it `{v1}`"
+                "`{name}` is not a v1.0 method or a declared murmur extension method"
             )]
         );
     }
@@ -906,7 +897,8 @@ fn a2a_wire_conformance_response_envelope_rules() {
     let error =
         |code: Value| json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": "m"}});
     for code in [
-        -32700, -32600, -32601, -32602, -32603, -32001, -32050, -32099,
+        -32700, -32600, -32601, -32602, -32603, -32001, -32050, -32099, -31001, -31002, -31999,
+        -32769, 500,
     ] {
         assert_eq!(check_response(&get, &error(json!(code))), [], "{code}");
     }
@@ -925,9 +917,9 @@ fn a2a_wire_conformance_response_envelope_rules() {
             json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32001, "message": "m"}}),
             "`id` is null, which only an error -32700 or -32600 may answer; the request's id is 1",
         ),
-        (error(json!(-32000)), "`error.code` -32000 is neither a standard JSON-RPC code nor in the A2A range -32099..=-32001"),
-        (error(json!(-32100)), "`error.code` -32100 is neither a standard JSON-RPC code nor in the A2A range -32099..=-32001"),
-        (error(json!(500)), "`error.code` 500 is neither a standard JSON-RPC code nor in the A2A range -32099..=-32001"),
+        (error(json!(-32000)), "`error.code` -32000 is reserved by JSON-RPC 2.0 and is neither a standard code nor in the A2A range -32099..=-32001"),
+        (error(json!(-32100)), "`error.code` -32100 is reserved by JSON-RPC 2.0 and is neither a standard code nor in the A2A range -32099..=-32001"),
+        (error(json!(-32768)), "`error.code` -32768 is reserved by JSON-RPC 2.0 and is neither a standard code nor in the A2A range -32099..=-32001"),
         (error(json!("-32001")), "`error.code` must be an integer, found \"-32001\""),
         (json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32001}}), "`error.message` must be a string, found nothing"),
         (json!({"jsonrpc": "2.0", "id": 1, "error": "boom"}), "`error` must be a JSON object, found a string"),
@@ -960,7 +952,7 @@ fn a2a_wire_conformance_response_envelope_rules() {
 
 #[test]
 fn a2a_wire_conformance_response_results_are_checked_as_the_method_result() {
-    let get = request("tasks/get", json!({"id": "tsk_1"}));
+    let get = request("GetTask", json!({"id": "tsk_1"}));
     let answer = json!({"jsonrpc": "2.0", "id": 1, "result": door_task()});
     let violations = check_response(&get, &answer);
     assert_eq!(keys(&violations), ["GetTask result lf.a2a.v1.Task"]);
@@ -978,7 +970,7 @@ fn a2a_wire_conformance_response_results_are_checked_as_the_method_result() {
 
 #[test]
 fn a2a_wire_conformance_a_streaming_method_answers_with_events_not_a_result() {
-    for method in ["SendStreamingMessage", "message/stream", "stream/watch"] {
+    for method in ["SendStreamingMessage", "stream/watch"] {
         let answer = json!({"jsonrpc": "2.0", "id": 1, "result": {}});
         let violations = check_response(&request(method, json!({})), &answer);
         assert_eq!(keys(&violations), [format!("{method} envelope -")]);
@@ -996,7 +988,7 @@ fn a2a_wire_conformance_a_streaming_method_answers_with_events_not_a_result() {
 #[test]
 fn a2a_wire_conformance_stream_events() {
     let stream = request(
-        "message/stream",
+        "SendStreamingMessage",
         json!({"message": {"messageId": "m1", "role": "user", "parts": [{"text": "hi"}]}}),
     );
     let event = json!({"jsonrpc": "2.0", "id": 1, "result": {"statusUpdate": {
@@ -1067,7 +1059,7 @@ fn a2a_wire_conformance_never_panics() {
         json!("é∂ƒ"),
         json!([null, {}]),
         json!({"jsonrpc": "2.0", "id": [], "method": {}, "params": "x", "result": 1, "error": []}),
-        json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {"parts": [{"raw": "é", "data": null}], "role": 99}}}),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {"message": {"parts": [{"raw": "é", "data": null}], "role": 99}}}),
         json!({"task": {"status": {"timestamp": "2026-10-08T12:00:00.é"}}}),
         json!({"error": {"code": 9223372036854775807i64, "data": [null, 1]}}),
     ];

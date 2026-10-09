@@ -474,7 +474,7 @@ impl AgentLoopExit {
 
 /// The A2A state a task is left in by an attempt that ended with `outcome`.
 ///
-/// The one classification every surface reads — the registry slot `tasks/get` answers from, and
+/// The one classification every surface reads — the registry slot `GetTask` answers from, and
 /// the process transport's [`AttemptEnding`] — so they cannot disagree about a task. Only a
 /// completed attempt is `Completed`, and only a cancelled one is `Canceled`; a spent turn budget
 /// and a spend-ceiling stop are failures of the task, whatever the session does next.
@@ -503,7 +503,7 @@ pub(crate) struct AttemptEnding {
     /// The final status's `response`: the accepted answer on a `Completed` ending, `None` on the
     /// others.
     pub(crate) response: Option<String>,
-    /// Whether the attempt ended through `end-without-answer`, which `tasks/get` reports as
+    /// Whether the attempt ended through `end-without-answer`, which `GetTask` reports as
     /// `metadata.murmur.noAnswer`. Only on a `Failed` ending.
     pub(crate) no_answer: bool,
 }

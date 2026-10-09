@@ -566,14 +566,14 @@ impl E2eCapsule {
         }
     }
 
-    /// Submit a task with `message/send` under this capsule's one context, returning its id.
+    /// Submit a task with `SendMessage` under this capsule's one context, returning its id.
     fn submit(&self, message_id: &str, text: &str) -> String {
         let response = http_post_json(
             &self.url,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "message/send",
+                "method": "SendMessage",
                 "params": {"message": {
                     "messageId": message_id,
                     "contextId": self.context_id,
@@ -585,14 +585,14 @@ impl E2eCapsule {
         );
         response["result"]["id"]
             .as_str()
-            .unwrap_or_else(|| panic!("message/send did not return a task id: {response}"))
+            .unwrap_or_else(|| panic!("SendMessage did not return a task id: {response}"))
             .to_string()
     }
 
     fn tasks_get(&self, task_id: &str) -> Value {
         http_post_json(
             &self.url,
-            &json!({"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}})
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}})
                 .to_string(),
         )
     }
@@ -600,12 +600,12 @@ impl E2eCapsule {
     fn tasks_cancel(&self, task_id: &str) -> Value {
         http_post_json(
             &self.url,
-            &json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/cancel", "params": {"id": task_id}})
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "CancelTask", "params": {"id": task_id}})
                 .to_string(),
         )
     }
 
-    /// Poll `tasks/get` until the task reaches a terminal state, and return that response.
+    /// Poll `GetTask` until the task reaches a terminal state, and return that response.
     fn wait_for_terminal(&self, task_id: &str, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
@@ -818,7 +818,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     writer
         .write_all(
             format!(
-                "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -904,7 +904,7 @@ impl Watch {
     /// The `status` object of the terminal frame for `task_id`, once it has arrived.
     ///
     /// The answer a turn produced and the reason one failed are carried here and nowhere else:
-    /// `tasks/get` reports a task's state but none of its text, so a case that wants either has
+    /// `GetTask` reports a task's state but none of its text, so a case that wants either has
     /// to be watching the feed while the turn runs.
     fn terminal_status(&mut self, task_id: &str, timeout: Duration) -> Value {
         let is_terminal = |frames: &[(String, Value)]| {

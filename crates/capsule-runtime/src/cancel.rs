@@ -1,7 +1,7 @@
 //! Cancelling one running task without ending the session it runs in.
 //!
 //! Three things live here, because all three are read by both ends of a cancel — the A2A door
-//! answering `tasks/cancel` and the agent loop that stops:
+//! answering `CancelTask` and the agent loop that stops:
 //!
 //! * [`CancelSignal`], the one-way flag a cancelled task's waits race against;
 //! * [`LiveDelegations`], the running task's delegations, which the door delivers outcomes into;

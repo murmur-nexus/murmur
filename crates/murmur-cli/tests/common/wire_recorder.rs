@@ -297,7 +297,7 @@ fn is_event_stream(headers: &[(String, String)]) -> bool {
 }
 
 /// What an accepted request raises beyond its response: [`check_request`], a missing
-/// `A2A-Version: 1.0` header, and a unary method answered with an event stream.
+/// `A2A-Version: 1.0` header (or `1.0.<patch>`), and a unary method answered with an event stream.
 fn accepted_request(request: &Value, headers: &[(&str, &str)], streamed: bool) -> Vec<Violation> {
     let mut violations = check_request(request);
     let wire = request.get("method").and_then(Value::as_str).unwrap_or("-");
@@ -307,7 +307,14 @@ fn accepted_request(request: &Value, headers: &[(&str, &str)], streamed: bool) -
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(VERSION_HEADER))
         .map(|(_, value)| value.trim());
-    if version != Some("1.0") {
+    // A patch number takes no part in negotiation (A2A v1.0.1 specification §3.6).
+    let is_1_0 = |value: &str| {
+        value == "1.0"
+            || value
+                .strip_prefix("1.0.")
+                .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !version.is_some_and(is_1_0) {
         let found = version.map_or("no such header".to_string(), |value| format!("{value:?}"));
         violations.push(Violation {
             method: method.to_string(),

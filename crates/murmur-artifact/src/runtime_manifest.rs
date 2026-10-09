@@ -700,13 +700,28 @@ pub struct NetworkConfig {
 /// name, and `resources/files`, the operator resource plane. The runtime's method table is held
 /// to this list by a test, in both directions.
 pub const DOOR_SCOPES: &[&str] = &[
-    "message/send",
-    "message/stream",
+    "SendMessage",
+    "SendStreamingMessage",
     "stream/watch",
-    "tasks/get",
-    "tasks/cancel",
+    "GetTask",
+    "CancelTask",
     "session/stop",
     "resources/files",
+];
+
+/// The A2A 0.3 method names a credential's `scopes` may not list, each with the A2A 1.0 method
+/// that replaces it. A manifest naming one is refused with [`RuntimeManifestError::RetiredDoorScope`]:
+/// the door serves no 0.3 name, and no token carries one.
+///
+/// A replacement outside [`DOOR_SCOPES`] is a method every authenticated caller may call, which a
+/// credential lists nothing for. A test holds every replacement to the runtime's method table and
+/// every retired name outside it.
+pub const RETIRED_DOOR_SCOPES: &[(&str, &str)] = &[
+    ("message/send", "SendMessage"),
+    ("message/stream", "SendStreamingMessage"),
+    ("tasks/get", "GetTask"),
+    ("tasks/cancel", "CancelTask"),
+    ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
 ];
 
 /// The credential the runtime always mints for an authenticated door, holding every scope in
@@ -1769,6 +1784,18 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidNetworkConfig { field: String, message: String },
+    /// A credential's `scopes` lists an A2A 0.3 method name, one of [`RETIRED_DOOR_SCOPES`].
+    /// `replacement` is the A2A 1.0 method that replaces it.
+    #[error(
+        "{}: invalid network config for '{field}': '{scope}' is the A2A 0.3 name of a door \
+         method, and the door answers A2A 1.0 names only",
+        MANIFEST_FILENAME
+    )]
+    RetiredDoorScope {
+        field: String,
+        scope: String,
+        replacement: &'static str,
+    },
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
@@ -3871,6 +3898,16 @@ fn door_scope_list(
             return Err(refuse("must be a list of scopes".to_string()));
         };
         let scope = scope.trim().to_string();
+        if let Some(&(_, replacement)) = RETIRED_DOOR_SCOPES
+            .iter()
+            .find(|(retired, _)| *retired == scope)
+        {
+            return Err(RuntimeManifestError::RetiredDoorScope {
+                field: field.to_string(),
+                scope,
+                replacement,
+            });
+        }
         if !DOOR_SCOPES.contains(&scope.as_str()) {
             return Err(refuse(format!(
                 "'{scope}' is not a door scope; the scopes are: {}",
@@ -12846,7 +12883,7 @@ mod network_authentication_tests {
     fn network_authentication_with_credentials_parses_sorted_by_name() {
         let auth = network_authentication_of(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-             watcher:\n        scopes: [tasks/get, stream/watch]\n      \
+             watcher:\n        scopes: [GetTask, stream/watch]\n      \
              reader:\n        scopes: [resources/files]\n",
         )
         .unwrap()
@@ -12862,7 +12899,7 @@ mod network_authentication_tests {
                 DoorCredential {
                     name: "watcher".to_string(),
                     // Declared order, not sorted.
-                    scopes: vec!["tasks/get".to_string(), "stream/watch".to_string()],
+                    scopes: vec!["GetTask".to_string(), "stream/watch".to_string()],
                 },
             ]
         );
@@ -12900,7 +12937,7 @@ mod network_authentication_tests {
     #[test]
     fn network_authentication_without_a_scheme_is_refused() {
         let (field, message) = network_authentication_refusal(
-            "network:\n  authentication:\n    credentials:\n      w:\n        scopes: [tasks/get]\n",
+            "network:\n  authentication:\n    credentials:\n      w:\n        scopes: [GetTask]\n",
         );
         assert_eq!(field, "network.authentication.scheme");
         assert!(message.contains("required"), "{message}");
@@ -12932,7 +12969,7 @@ mod network_authentication_tests {
         ] {
             let (field, message) = network_authentication_refusal(&format!(
                 "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-                 '{name}':\n        scopes: [tasks/get]\n"
+                 '{name}':\n        scopes: [GetTask]\n"
             ));
             assert_eq!(field, "network.authentication.credentials", "{name}");
             assert!(message.contains(name), "{message}");
@@ -12941,7 +12978,7 @@ mod network_authentication_tests {
         for name in ["w", "a-b_c9", longest.as_str()] {
             network_authentication_of(&format!(
                 "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-                 {name}:\n        scopes: [tasks/get]\n"
+                 {name}:\n        scopes: [GetTask]\n"
             ))
             .unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
         }
@@ -12971,20 +13008,60 @@ mod network_authentication_tests {
         assert!(message.contains("tasks/list"), "{message}");
         assert!(message.contains("resources/files"), "{message}");
 
-        let (got, message) = network_authentication_refusal(&credential(
-            "        scopes: [agent/getAuthenticatedExtendedCard]\n",
-        ));
+        let (got, message) =
+            network_authentication_refusal(&credential("        scopes: [GetExtendedAgentCard]\n"));
         assert_eq!(got, field);
-        assert!(
-            message.contains("agent/getAuthenticatedExtendedCard"),
-            "{message}"
-        );
+        assert!(message.contains("GetExtendedAgentCard"), "{message}");
 
         let (got, message) = network_authentication_refusal(&credential(
-            "        scopes: [tasks/get, stream/watch, tasks/get]\n",
+            "        scopes: [GetTask, stream/watch, GetTask]\n",
         ));
         assert_eq!(got, field);
         assert!(message.contains("more than once"), "{message}");
+    }
+
+    #[test]
+    fn network_authentication_refuses_a_retired_scope_naming_its_replacement() {
+        let field = "network.authentication.credentials.watcher.scopes";
+        for (retired, replacement) in [
+            ("message/send", "SendMessage"),
+            ("message/stream", "SendStreamingMessage"),
+            ("tasks/get", "GetTask"),
+            ("tasks/cancel", "CancelTask"),
+            ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
+        ] {
+            let error = network_authentication_of(&format!(
+                "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+                 watcher:\n        scopes: [stream/watch, {retired}]\n"
+            ))
+            .unwrap_err();
+            let rendered = error.to_string();
+            match error {
+                RuntimeManifestError::RetiredDoorScope {
+                    field: got_field,
+                    scope,
+                    replacement: got_replacement,
+                } => {
+                    assert_eq!(got_field, field);
+                    assert_eq!(scope, retired);
+                    assert_eq!(got_replacement, replacement);
+                }
+                other => panic!("expected RetiredDoorScope for {retired}, got {other:?}"),
+            }
+            assert!(rendered.contains(retired), "{rendered}");
+            assert!(rendered.contains(field), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn network_authentication_accepts_the_v1_scopes() {
+        let auth = network_authentication_of(
+            "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+             watcher:\n        scopes: [GetTask, stream/watch]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.credentials[0].scopes, ["GetTask", "stream/watch"]);
     }
 
     #[test]
@@ -13030,8 +13107,8 @@ mod network_authentication_tests {
     fn network_authentication_unknown_keys_are_reported_at_their_full_path() {
         let keys: Vec<(String, String, Option<String>)> = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.1.0\nnetwork:\n  authentication:\n    scheme: bearer\n    \
-             schemes: x\n    credentials:\n      watcher:\n        scopes: [tasks/get]\n        \
-             scope: [tasks/get]\n",
+             schemes: x\n    credentials:\n      watcher:\n        scopes: [GetTask]\n        \
+             scope: [GetTask]\n",
         )
         .unwrap()
         .unknown_keys

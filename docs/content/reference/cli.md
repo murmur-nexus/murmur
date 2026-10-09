@@ -1279,7 +1279,7 @@ When the session ends, `mur run` prints one `status:` line and exits:
 | `failed` | 1 | Ran a task that failed — a failed driver call, a response it could not act on, a compaction hook error, a `request-input` wait past `lifecycle.input_timeout_secs` — and prints [`E-RUN-040`](diagnostics.md#e-run-040) with the reason. Also the status of a launch that could not run at all, with that error's own code |
 | `max_turns_reached` | 1 | Ran a task that used every turn `inference.max_turns` allows, and prints `E-RUN-040` |
 | `spend_ceiling_reached` | 1 | Ran a task a [spend ceiling](manifest.md#inference-max-session-tokens) stopped, and prints `E-RUN-040` |
-| `canceled` | 1 | Ran a task that was canceled — by `tasks/cancel`, `session/stop`, [`mur stop`](#mur-stop), `SIGTERM`, or the end of the session that [delegated](roost-api.md#spawner-lifeline) it — and prints `E-RUN-040` |
+| `canceled` | 1 | Ran a task that was canceled — by `CancelTask`, `session/stop`, [`mur stop`](#mur-stop), `SIGTERM`, or the end of the session that [delegated](roost-api.md#spawner-lifeline) it — and prints `E-RUN-040` |
 | `formation_ended` | 0 | Was a formation member running a task when its formation ended, and the [wind-down](roster.md#launch-stop) canceled that task. Prints no error. The task itself still ends `canceled` |
 | `trapped` | 1 | Ran a script capsule that stopped with an error |
 
@@ -1288,7 +1288,7 @@ The tasks that decide the outcome:
 - the task `--task` or `task.md` gives the launch, under every lifecycle;
 - an A2A task, when the capsule ends after it (`lifecycle.after_task: exit`, or `task_acceptance: single`), or while the session is closing out.
 
-A peer's task on a capsule that sleeps between tasks reports through `tasks/get` and its stream,
+A peer's task on a capsule that sleeps between tasks reports through `GetTask` and its stream,
 and leaves the launch's status alone. The first deciding task that did not complete sets the
 status, and no later run replaces it. The trace's `session_end.exit_status` carries the same value.
 
@@ -1876,7 +1876,7 @@ mur cancel --url <host:port> <TASK_ID>
 | Argument | Default | Description |
 |---|---|---|
 | `SESSION` | — | A [session address](#session-addresses) naming a running capsule |
-| `TASK_ID` | — | The `tsk_` id `message/send` returned, or the one `tasks/get` reports |
+| `TASK_ID` | — | The `tsk_` id `SendMessage` returned, or the one `GetTask` reports |
 | `--url` | — | A capsule's address, reached without resolving anything. Takes the place of `SESSION` |
 
 | Environment variable | Read by | Holds |
@@ -1901,8 +1901,18 @@ running: wrk_9f2a1c  detached shell  sleep 30
 ended:   dlg_7b31de  delegation  worker@0.1.0
 ```
 
-Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` reports
-that state and changes nothing.
+Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` changes
+nothing. The door answers [`-32002`](agent-card.md#errors), and the command prints the state the
+task ended in, names no residue, and exits `0`:
+
+```text
+task:    tsk_0199c4e2f1b7712a9d3e4f5061728394
+state:   completed
+nothing to cancel: the task had already ended
+```
+
+A task id the capsule never held fails the command with `E-IO-003`:
+`cancel of <id> failed: Task not found`.
 
 Exit codes:
 
@@ -2025,7 +2035,7 @@ both go to stderr. Standard output carries one `door:` line alone, when the caps
 
 | Row | Description |
 |---|---|
-| `url` | Public A2A endpoint — `http://<VM_PUBLIC_IP>:<PORT>`. Use for `message/send`, `tasks/get`, and `/.well-known/agent-card.json`. |
+| `url` | Public A2A endpoint — `http://<VM_PUBLIC_IP>:<PORT>`. Use for `SendMessage`, `GetTask`, and `/.well-known/agent-card.json`. |
 | `dep` | The deployment ID, abbreviated to its `dep_` prefix and first 8 hex characters. The full `dep_` + UUID v7 is stored in `~/.murmur/deployments.json` and listed by [`mur deploy ls`](#mur-deploy-ls); `mur destroy` accepts any unambiguous prefix. |
 | `time` | Elapsed wall-clock seconds |
 

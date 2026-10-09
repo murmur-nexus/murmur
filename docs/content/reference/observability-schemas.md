@@ -587,7 +587,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task); `"no_answer"` if the model ended it with [`end-without-answer`](runtime-provided-tools.md#end-without-answer) |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task); `"no_answer"` if the model ended it with [`end-without-answer`](runtime-provided-tools.md#end-without-answer) |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
@@ -597,7 +597,7 @@ for every task, on every exit path
 | `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
 
 **`task_canceled`**{ #task-canceled } — written where the agent loop stopped because a person
-called [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
+called [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
 
 | Field | Type | Notes |
 |---|---|---|
@@ -613,7 +613,7 @@ A command named in `detached_work_ids` keeps the lifecycle it already had. A del
 `delegation_ids` is then ended by the cancelled task, which closes it with a `delegation` line
 (`outcome: terminated`, `reason: the delegating task was cancelled`) before its `task_end`. The
 arrays are a snapshot taken where the loop stopped, so they may differ from the `residue` artifact
-the `tasks/cancel` response carried, which was taken when that response was sent.
+the `CancelTask` response carried, which was taken when that response was sent.
 
 **`task_rejected`**{ #task-rejected } — written once per task the session refused because it
 stopped taking work while the task was still queued, as described under
@@ -723,7 +723,7 @@ delivered to the calling task, or left behind when that task ended
 | `output` | string | The member's answer for `completed`, its task's status message for `failed`, `canceled` and `rejected`, or why the call ended otherwise. At most 64 KiB and a cut marker |
 | `truncated` | bool | Whether `output` was cut |
 | `delivered` | bool | Whether the calling task received `output`: as the tool result for a call that ended within its tool call, as a continuation for any other. `false` for every `abandoned` call, and for an answer that arrived when the task did not wait for it — see [How the answer arrives](runtime-provided-tools.md#call-member-answer) |
-| `no_answer_below` | array of `{"member", "status"}` | The members further down the member reported as giving it no answer, from its [`tasks/get` metadata](agent-card.md#no-answer-metadata). Only on a `completed` or `no_answer` call; absent when empty |
+| `no_answer_below` | array of `{"member", "status"}` | The members further down the member reported as giving it no answer, from its [`GetTask` metadata](agent-card.md#no-answer-metadata). Only on a `completed` or `no_answer` call; absent when empty |
 
 | `status` | Meaning |
 |---|---|

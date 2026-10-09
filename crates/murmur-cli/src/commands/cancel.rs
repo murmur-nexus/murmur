@@ -19,13 +19,15 @@ const DOOR_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Stop one running task on a capsule without ending its session.
 ///
-/// A thin caller of the A2A door's `tasks/cancel`: it composes one JSON-RPC request, prints what
+/// A thin caller of the A2A door's `CancelTask`: it composes one JSON-RPC request, prints what
 /// came back, and decides nothing. What a cancel means — which state the task lands in, what is
 /// left running — is the runtime's answer, reproduced here.
 ///
 /// Exits 0 for every task the capsule holds, including one that had already ended: "do no more
 /// work on this" is already true of a completed task, so there is nothing to report as a failure.
-/// A task id the capsule never held is the one error.
+/// The door answers such a task `TaskNotCancelable`, whose `ErrorInfo` names the task and the
+/// state it ended in, and those are printed in place of a result. A task id the capsule never held
+/// is the one error.
 pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError> {
     let addr = target
         .url()
@@ -35,7 +37,7 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "tasks/cancel",
+        "method": "CancelTask",
         "params": {"id": task_id}
     })
     .to_string();
@@ -43,6 +45,12 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
     let response = post_json(addr, &body, target.door_token().as_ref())?;
 
     if let Some(error) = response.get("error") {
+        if let Some((id, state)) = already_ended(error) {
+            capsule_runtime::report_println!("task:    {id}");
+            capsule_runtime::report_println!("state:   {state}");
+            capsule_runtime::report_println!("nothing to cancel: the task had already ended");
+            return Ok(());
+        }
         let message = error
             .get("message")
             .and_then(Value::as_str)
@@ -77,6 +85,27 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
     Ok(())
 }
 
+/// The task and the state it ended in, from a JSON-RPC `error` that is `TaskNotCancelable`: the
+/// `metadata` of its `google.rpc.ErrorInfo`. `None` for any other error.
+fn already_ended(error: &Value) -> Option<(&str, &str)> {
+    let code = error.get("code").and_then(Value::as_i64)?;
+    if capsule_runtime::A2aError::from_code(i32::try_from(code).ok()?)
+        != Some(capsule_runtime::A2aError::TaskNotCancelable)
+    {
+        return None;
+    }
+    let metadata = error
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|detail| detail.get("reason").and_then(Value::as_str) == Some("TASK_NOT_CANCELABLE"))?
+        .get("metadata")?;
+    Some((
+        metadata.get("taskId")?.as_str()?,
+        metadata.get("state")?.as_str()?,
+    ))
+}
+
 /// One JSON-RPC POST to the capsule's door, parsed.
 ///
 /// Shared with `mur stop`, which asks the same door a different method. Both deadlines are held
@@ -84,8 +113,10 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
 /// would otherwise leave the command waiting on it forever, and `mur stop` has two more steps to
 /// run whatever the door does.
 ///
-/// `door_token` is presented as `Authorization: Bearer` when given. A `401` or `403` is an error
-/// naming the status and [`capsule_runtime::DOOR_TOKEN_ENV`].
+/// Every request names [`capsule_runtime::A2A_PROTOCOL_VERSION`] in
+/// [`capsule_runtime::A2A_VERSION_HEADER`]. `door_token` is presented as `Authorization: Bearer`
+/// when given. A `401` or `403` is an error naming the status and
+/// [`capsule_runtime::DOOR_TOKEN_ENV`].
 pub(crate) fn post_json(
     addr: &str,
     body: &str,
@@ -96,8 +127,10 @@ pub(crate) fn post_json(
     let mut writer = &stream;
 
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\n{}{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         authorization_line(door_token),
+        capsule_runtime::A2A_VERSION_HEADER,
+        capsule_runtime::A2A_PROTOCOL_VERSION,
         body.len()
     );
     writer

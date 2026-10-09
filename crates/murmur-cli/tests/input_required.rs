@@ -215,7 +215,7 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
     stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -244,7 +244,7 @@ fn send_message(addr: &str, msg_id: &str, text: &str) -> Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": msg_id,
@@ -261,17 +261,17 @@ fn tasks_get(addr: &str, task_id: &str) -> Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
-        "method": "tasks/get",
+        "method": "GetTask",
         "params": {"id": task_id}
     })
     .to_string();
     http_post_json(addr, "/", &body)
 }
 
-/// Poll `tasks/get` with no `id` param — which returns whichever task holds the active
+/// Poll `GetTask` with no `id` param — which returns whichever task holds the active
 /// slot — until a task exists, and return its id.
 ///
-/// Lets a caller that submitted a task over `message/stream` learn the server-assigned
+/// Lets a caller that submitted a task over `SendStreamingMessage` learn the server-assigned
 /// task id, which that method never reports back over the wire.
 fn discover_active_task_id(addr: &str, timeout: Duration) -> String {
     let deadline = std::time::Instant::now() + timeout;
@@ -279,7 +279,7 @@ fn discover_active_task_id(addr: &str, timeout: Duration) -> String {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
-            "method": "tasks/get",
+            "method": "GetTask",
             "params": {}
         })
         .to_string();
@@ -294,7 +294,7 @@ fn discover_active_task_id(addr: &str, timeout: Duration) -> String {
     }
 }
 
-/// Poll tasks/get until the task reaches the expected state, or timeout.
+/// Poll GetTask until the task reaches the expected state, or timeout.
 fn poll_until_state(addr: &str, task_id: &str, expected_state: &str, timeout: Duration) -> Value {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -375,7 +375,7 @@ fn read_line_before(
     }
 }
 
-/// Subscribe to `message/stream` for a new task and read the response head, both before
+/// Subscribe to `SendStreamingMessage` for a new task and read the response head, both before
 /// `deadline`. The returned reader is positioned at the first SSE line.
 fn open_sse_stream(
     addr: &str,
@@ -386,7 +386,7 @@ fn open_sse_stream(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {
             "message": {
                 "messageId": msg_id,
@@ -398,7 +398,7 @@ fn open_sse_stream(
     .to_string();
 
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
         body.len(),
         body
     );
@@ -475,7 +475,7 @@ fn collect_sse_events_until(
     }
 }
 
-/// Subscribe to `message/stream` for a new task and collect SSE events until a terminal
+/// Subscribe to `SendStreamingMessage` for a new task and collect SSE events until a terminal
 /// `status` event arrives, the peer closes the stream, or `timeout` elapses, reporting which.
 /// `timeout` bounds the whole collection, not each read, and starts before the connect.
 fn collect_sse_stream(
@@ -585,7 +585,7 @@ fn input_required_task_suspends_loop() {
     handle.join().expect("launch thread should not panic");
 }
 
-/// Test 2: Delivering input via message/send resumes the suspended task and
+/// Test 2: Delivering input via SendMessage resumes the suspended task and
 /// the task eventually reaches completed state.
 #[test]
 fn input_required_resumes_on_message_send() {
@@ -617,7 +617,7 @@ fn input_required_resumes_on_message_send() {
         Duration::from_secs(30),
     );
 
-    // Deliver input: the second message/send should be routed to the waiting task
+    // Deliver input: the second SendMessage should be routed to the waiting task
     let resume_resp = send_message(&capsule_url, "msg-2", "option A");
     let resume_state = resume_resp["result"]["status"]["state"]
         .as_str()
@@ -630,7 +630,7 @@ fn input_required_resumes_on_message_send() {
     handle.join().expect("launch thread should not panic");
 }
 
-/// Test 3: A message/send while the task is in working (not input-required) state
+/// Test 3: A SendMessage while the task is in working (not input-required) state
 /// is rejected — the standard single-task rejection still applies.
 #[test]
 fn input_required_working_state_rejects_message() {
@@ -679,7 +679,7 @@ fn input_required_working_state_rejects_message() {
 }
 
 /// Test 4: When input_timeout_secs elapses with no response, the task is `failed` on
-/// `tasks/get`, the attempt ends without asking the provider for another turn, and the trace
+/// `GetTask`, the attempt ends without asking the provider for another turn, and the trace
 /// says why. A queue capsule that sleeps between tasks keeps the door up to read.
 #[test]
 fn input_required_timeout_transitions_to_failed() {
@@ -886,8 +886,8 @@ fn assert_input_timeout_recorded(trace: &[Value], task_id: &str) {
     assert_eq!(trace[position("task_end")]["exit_status"], "failed");
 }
 
-/// Test 5: message/stream SSE stream receives an input-required status event
-/// (with final:false), and after delivering input via message/send the stream
+/// Test 5: SendStreamingMessage SSE stream receives an input-required status event
+/// (with final:false), and after delivering input via SendMessage the stream
 /// eventually sees a completed final event.
 #[test]
 fn input_required_sse_emits_state_event() {
@@ -919,10 +919,10 @@ fn input_required_sse_emits_state_event() {
         )
     });
 
-    // message/stream never reports the task id, so read it off the active slot.
+    // SendStreamingMessage never reports the task id, so read it off the active slot.
     let task_id = discover_active_task_id(&capsule_url, Duration::from_secs(30));
 
-    // Input may only be delivered once the task has actually suspended: a message/send
+    // Input may only be delivered once the task has actually suspended: a SendMessage
     // that lands while the task is still working is rejected as a concurrent task, and
     // the suspended task then waits for input that never arrives.
     poll_until_state(

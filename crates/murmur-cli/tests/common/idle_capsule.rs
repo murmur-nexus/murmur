@@ -217,6 +217,7 @@ pub fn open_watch(addr: &str, last_event_id: u64) -> TcpStream {
         ("Content-Type", "application/json"),
         ("Accept", "text/event-stream"),
         ("Last-Event-ID", last_event_id.as_str()),
+        super::door_capsule::A2A_VERSION,
     ];
     let mut request = format!("POST / HTTP/1.1\r\nHost: {addr}\r\n");
     for (name, value) in headers {
@@ -304,12 +305,14 @@ pub fn sse_body(lines: &[(Instant, String)]) -> Vec<(Instant, String)> {
 
 // ── task submission ────────────────────────────────────────────────────────────
 
-/// `POST /` with `body`, returning the response body as JSON, or `{"_raw": body}` when it is not.
-/// The exchange is checked against A2A v1.0 by [`super::wire_recorder::record_post`].
+/// `POST /` with `body` and `A2A-Version: 1.0`, returning the response body as JSON, or
+/// `{"_raw": body}` when it is not. The exchange is checked against A2A v1.0 by
+/// [`super::wire_recorder::record_post`].
 pub fn http_post_json(addr: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
+    let (version, supported) = super::door_capsule::A2A_VERSION;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{version}: {supported}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).unwrap();
@@ -337,7 +340,10 @@ pub fn http_post_json(addr: &str, body: &str) -> Value {
     let mut response_body = String::new();
     reader.read_to_string(&mut response_body).ok();
     super::wire_recorder::record_post(
-        &[("Content-Type", "application/json")],
+        &[
+            ("Content-Type", "application/json"),
+            super::door_capsule::A2A_VERSION,
+        ],
         body,
         status,
         &response_headers,
@@ -347,12 +353,12 @@ pub fn http_post_json(addr: &str, body: &str) -> Value {
         .unwrap_or_else(|_| serde_json::json!({"_raw": response_body}))
 }
 
-/// Submit a task with `message/send`, assert it was accepted, and return its id.
+/// Submit a task with `SendMessage`, assert it was accepted, and return its id.
 pub fn submit_task(addr: &str, message_id: &str, text: &str) -> String {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
                 "messageId": message_id,

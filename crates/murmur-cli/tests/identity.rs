@@ -270,7 +270,7 @@ fn agent_card_served_at_well_known_path() {
         serde_json::json!({
             "url": format!("http://{capsule_url}"),
             "protocolBinding": "JSONRPC",
-            "protocolVersion": "0.3",
+            "protocolVersion": "1.0",
         })
     );
     let capsule = common::card_capsule_params(&card);

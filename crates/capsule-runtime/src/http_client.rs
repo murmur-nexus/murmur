@@ -158,6 +158,89 @@ fn unresolved(addr: &str, resolution: &Resolution) -> String {
     }
 }
 
+/// A stand-in door for client tests: it answers one request and hands back what it was sent.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread::JoinHandle;
+
+    /// One request as the stand-in read it.
+    #[derive(Debug)]
+    pub(crate) struct Captured {
+        /// The request line, such as `POST / HTTP/1.1`.
+        pub(crate) request_line: String,
+        /// Every header, its name lowercased, in the order sent.
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: String,
+    }
+
+    impl Captured {
+        /// Every value sent under `name`, matched without regard to case.
+        pub(crate) fn header(&self, name: &str) -> Vec<&str> {
+            self.headers
+                .iter()
+                .filter(|(sent, _)| sent.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+                .collect()
+        }
+
+        /// The body's JSON-RPC `method`.
+        pub(crate) fn method(&self) -> String {
+            serde_json::from_str::<serde_json::Value>(&self.body)
+                .ok()
+                .and_then(|body| body["method"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        }
+    }
+
+    /// Listen on loopback, answer the first request with `200` and the JSON `answer`, and return
+    /// the address (`127.0.0.1:port`) and what that request was.
+    pub(crate) fn answer_one(answer: String) -> (String, JoinHandle<Captured>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = Vec::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                let (name, value) = (name.to_ascii_lowercase(), value.trim().to_string());
+                if name == "content-length" {
+                    length = value.parse().unwrap();
+                }
+                headers.push((name, value));
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = stream;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{answer}",
+                    answer.len()
+                )
+                .as_bytes(),
+            );
+            Captured {
+                request_line: request_line.trim_end().to_string(),
+                headers,
+                body: String::from_utf8(body).unwrap(),
+            }
+        });
+        (addr, handle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};

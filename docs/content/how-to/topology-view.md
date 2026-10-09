@@ -347,11 +347,12 @@ Send the worker a task with the traceparent header and capture the task ID:
 ```bash
 TASK_ID=$(curl -s -X POST "http://${WORKER_URL}" \
   -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
   -H "traceparent: 00-${PING_TRACE}-${PING_SPAN}-01" \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
         "messageId": "msg-001",
@@ -364,13 +365,14 @@ TASK_ID=$(curl -s -X POST "http://${WORKER_URL}" \
 echo "Task: $TASK_ID"
 ```
 
-Poll `tasks/get` until the session completes:
+Poll `GetTask` until the session completes:
 
 ```bash
 while true; do
   STATE=$(curl -s -X POST "http://${WORKER_URL}" \
     -H "Content-Type: application/json" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tasks/get\",\"params\":{\"id\":\"${TASK_ID}\"}}" \
+    -H "A2A-Version: 1.0" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"GetTask\",\"params\":{\"id\":\"${TASK_ID}\"}}" \
     | jq -r '.result.status.state')
   echo "State: $STATE"
   [ "$STATE" = "completed" ] || [ "$STATE" = "failed" ] && break

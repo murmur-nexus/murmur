@@ -191,7 +191,7 @@ network:
     scheme: bearer      # required in the block; the only scheme
     credentials:        # optional; tokens narrower than the operator token
       watcher:
-        scopes: [tasks/get, stream/watch]
+        scopes: [GetTask, stream/watch]
 
 context:
   max_tokens: 200000   # enables context compaction; omit to disable
@@ -953,17 +953,30 @@ token.
 
 | Scope | Reaches |
 |---|---|
-| `message/send` | Starting a task with `message/send` |
-| `message/stream` | Starting a task with `message/stream`; the connection carries [every task's frames](streaming-protocol.md#endpoints) while it is open |
+| `SendMessage` | Starting a task with `SendMessage` |
+| `SendStreamingMessage` | Starting a task with `SendStreamingMessage`; the connection carries [every task's frames](streaming-protocol.md#endpoints) while it is open |
 | `stream/watch` | Watching every task on the session |
-| `tasks/get` | Reading any task on the session |
-| `tasks/cancel` | Cancelling any task on the session |
+| `GetTask` | Reading any task on the session |
+| `CancelTask` | Cancelling any task on the session |
 | `session/stop` | Cancelling every task and reporting the residue |
 | `resources/files` | The [operator resource plane](resource-plane.md#operator-plane) under `/resources/files` |
 
-A scope names a method, not a task: every authenticated caller shares the session's tasks. What the
-door answers each caller, and the public and extended cards, are in
-[Agent Card: Security](agent-card.md#security).
+A scope names a method, not a task: every authenticated caller shares the session's tasks.
+`GetExtendedAgentCard` takes no scope: every valid token reaches it. What the door answers each
+caller, and the public and extended cards, are in [Agent Card: Security](agent-card.md#security).
+
+A scope that is an A2A 0.3 method name is refused with `E-MAN-003`, and the hint names the scope to
+write in its place:
+
+| Retired scope | Write instead |
+|---|---|
+| `message/send` | `SendMessage` |
+| `message/stream` | `SendStreamingMessage` |
+| `tasks/get` | `GetTask` |
+| `tasks/cancel` | `CancelTask` |
+| `agent/getAuthenticatedExtendedCard` | Nothing: remove it |
+
+See [Agent Card: Migrating from A2A 0.3](agent-card.md#migrating-a2a-0-3).
 
 A capsule declaring both `network.authentication` and a non-empty `capabilities.spawn.allow` is
 refused with `E-MAN-003`: a delegated child posts its outcome to its parent's door, and a child
@@ -1161,7 +1174,7 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.task_acceptance` | `none \| single \| queue` | no | Default: `single`. How the capsule accepts incoming A2A tasks — see [`lifecycle.task_acceptance`](#lifecycle-task-acceptance). |
 | `lifecycle.after_task` | `exit \| sleep` | no | Default: `exit`. What the capsule does after completing a task — see [`lifecycle.after_task`](#lifecycle-after-task). |
 | `lifecycle.queue_depth` | integer | no | Default: `1`. Maximum number of pending, not-yet-started tasks the capsule holds under `task_acceptance: queue`. Tasks beyond this limit receive `state: "rejected"`. For a [roster](roster.md) member, [`W-ROS-001`](diagnostics.md#w-ros-001) warns when more members may call it than it holds at once. |
-| `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `message/send` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
+| `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `SendMessage` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
@@ -1586,7 +1599,7 @@ inference:
 | Turn limit | One model action — a message or a tool call — is one turn, bounded by `inference.max_turns`. A turn past the limit ends the run with [`E-RUN-033`](diagnostics.md#e-run-033). |
 | Inactivity limit | A run with neither a line of harness output nor a tool call for 600 seconds is killed with [`E-RUN-035`](diagnostics.md#e-run-035). A harness that is working is never interrupted for taking a long time. |
 | Interrupt grace | A harness sent a graceful interrupt has 10 seconds to end on its own before it is killed. Both this and the inactivity limit are fixed, not manifest settings. |
-| Cancellation | [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) interrupts the harness the way the driver's `describe()` declares: `stdin-message` writes the launch plan's interrupt bytes to its stdin, `signal-int` sends it `SIGINT`, and `unsupported` kills it outright. A graceful interrupt gets the interrupt grace above. The task is `canceled` either way, and the capsule, its queue and its conversation keep going. |
+| Cancellation | [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) interrupts the harness the way the driver's `describe()` declares: `stdin-message` writes the launch plan's interrupt bytes to its stdin, `signal-int` sends it `SIGINT`, and `unsupported` kills it outright. A graceful interrupt gets the interrupt grace above. The task is `canceled` either way, and the capsule, its queue and its conversation keep going. |
 | Result | The harness's final result text is written to `out/result.txt`. A turn the harness reports as failed is [`E-RUN-033`](diagnostics.md#e-run-033), naming why. |
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. |
 | Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
@@ -2126,7 +2139,7 @@ not run: running it would contradict `after_task: exit`.
 
 | Task | What it gets |
 |---|---|
-| Accepted, never started, when the session stops taking work | State `rejected` over [`tasks/get`](agent-card.md#murmur-door-v1), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
+| Accepted, never started, when the session stops taking work | State `rejected` over [`GetTask`](agent-card.md#murmur-door-v1), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
 | Cancelled while still queued | Stays `canceled`, with its `task_canceled` trace line. Never `rejected` |
 | A message arriving after the session stops taking work | Answered `rejected` at the door. Nothing is recorded in the trace |
 
@@ -2136,13 +2149,13 @@ them. To have queued work run, declare `task_acceptance: queue` with `after_task
 
 ### `lifecycle.input_timeout_secs` { #lifecycle-input-timeout-secs }
 
-Controls how long the capsule waits for a `message/send` reply after a WASM tool component calls
+Controls how long the capsule waits for a `SendMessage` reply after a WASM tool component calls
 `murmur:task/task#request-input`.
 
 | Value | Behaviour |
 |---|---|
 | absent (default) | Wait indefinitely — the task stays in `input-required` state until a reply arrives or the process is killed. |
-| `N` (positive integer) | If no `message/send` arrives within `N` seconds, the tool call fails and the attempt ends. The task ends `failed`, and its [final status](streaming-protocol.md#one-final-status) carries message `input-timeout`, unless an `on-task-end` hook reopens it. |
+| `N` (positive integer) | If no `SendMessage` arrives within `N` seconds, the tool call fails and the attempt ends. The task ends `failed`, and its [final status](streaming-protocol.md#one-final-status) carries message `input-timeout`, unless an `on-task-end` hook reopens it. |
 
 Example — require a reply within 5 minutes:
 

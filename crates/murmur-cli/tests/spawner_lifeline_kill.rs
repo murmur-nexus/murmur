@@ -322,7 +322,7 @@ impl Parent {
         let sent = rpc(
             &self.url(),
             None,
-            "message/send",
+            "SendMessage",
             message("m-delegate", "delegate"),
         );
         assert_eq!(sent.status, 200, "{sent:?}");

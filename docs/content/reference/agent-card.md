@@ -16,7 +16,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
   "description": "Murmur capsule my-agent 0.1.0",
   "version": "0.1.0",
   "supportedInterfaces": [
-    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
   ],
   "capabilities": {
     "streaming": true,
@@ -28,7 +28,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
         "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop"],
+          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
           "peerTasks": false
         }
       },
@@ -46,7 +46,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
         "required": false,
         "params": {
           "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
@@ -110,37 +110,29 @@ One interface: the JSON-RPC door at `POST /`.
 |---|---|
 | `url` | `http://<host:port>` — the address this capsule's listener answers on. The door speaks plain HTTP |
 | `protocolBinding` | `JSONRPC` |
-| `protocolVersion` | `0.3` |
+| `protocolVersion` | `1.0` |
 
-The card's shape is A2A v1.0; the interface is declared at A2A `0.3` because the door answers the
-0.3 method names and task states:
-
-| The door answers | A2A v1.0 name, answered with `-32601 Method not found` |
-|---|---|
-| `message/send` | `SendMessage` |
-| `message/stream` | `SendStreamingMessage` |
-| `tasks/get` | `GetTask` |
-| `tasks/cancel` | `CancelTask` |
-
-Task states are kebab-case (`input-required`), as in A2A 0.3.
+The door answers A2A v1.0 method names, and serves a JSON-RPC request only when it names version
+`1.0` in its [`A2A-Version`](#a2a-version) header. Task states are spelled in kebab-case:
+`submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled`.
 
 ## `capabilities` { #capabilities }
 
 | Key | Type | Value |
 |---|---|---|
-| `capabilities.streaming` | boolean | `true` when the [door extension](#murmur-door-v1) lists `message/stream` and the capsule's inference transport streams text |
+| `capabilities.streaming` | boolean | `true` when the [door extension](#murmur-door-v1) lists `SendStreamingMessage` and the capsule's inference transport streams text |
 | `capabilities.pushNotifications` | boolean | `false` |
 | `capabilities.extendedAgentCard` | boolean | `false` on a public door, where every caller gets this card. `true` on an [authenticated door](#security) |
 | `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), the [capsule extension](#murmur-capsule-v1), then the [stream extension](#stream-extension). An authenticated door's public card carries the door extension, then the stream extension |
 
 `streaming` is the door's answer and the transport's together: a door that answers
-`message/stream` over a transport that streams nothing lists the method on the door extension and
-reports `false` here.
+`SendStreamingMessage` over a transport that streams nothing lists the method on the door extension
+and reports `false` here.
 
 | Transport | `streaming` |
 |---|---|
-| `http` | `true` when `message/stream` is served |
-| `process` | `true` when `message/stream` is served and the [process driver](manifest.md#process-driver) reports `streams-text` |
+| `http` | `true` when `SendStreamingMessage` is served |
+| `process` | `true` when `SendStreamingMessage` is served and the [process driver](manifest.md#process-driver) reports `streams-text` |
 
 ## Security { #security }
 
@@ -149,7 +141,7 @@ Who may call the door is set by [`network.authentication`](manifest.md#field-net
 | Manifest | Door | `securitySchemes` | `securityRequirements` | Extended card |
 |---|---|---|---|---|
 | No `network.authentication` | Public: answers every caller that reaches the port, and ignores `Authorization` | `{}` | `[]` | None |
-| `network.authentication.scheme: bearer` | Authenticated: every request but the public card presents a token | `bearer`, an HTTP `Bearer` scheme | Any valid token | The public card plus the capsule extension, in A2A 0.3 shape |
+| `network.authentication.scheme: bearer` | Authenticated: every request but the public card presents a token | `bearer`, an HTTP `Bearer` scheme | Any valid token | The authenticated card with the capsule extension — see [The extended card](#extended-card) |
 
 A public door's card is exactly the card at the top of this page.
 
@@ -164,48 +156,25 @@ prints them. A token is valid until the session ends; a restart or a `--resume` 
 | Each name under `network.authentication.credentials` | The scopes that credential lists | One per declared credential |
 
 A scope is a door method's name, or `resources/files` for the
-[operator plane](resource-plane.md#operator-plane). `agent/getAuthenticatedExtendedCard` needs no
-scope: every valid token may read the extended card.
+[operator plane](resource-plane.md#operator-plane):
+
+| Scope | Reaches |
+|---|---|
+| `SendMessage` | [`SendMessage`](#murmur-door-v1) |
+| `SendStreamingMessage` | `SendStreamingMessage` |
+| `stream/watch` | `stream/watch` |
+| `GetTask` | [`GetTask`](#tasks-get) |
+| `CancelTask` | `CancelTask` |
+| `session/stop` | `session/stop` |
+| `resources/files` | The [operator plane](resource-plane.md#operator-plane) |
+
+`GetExtendedAgentCard` needs no scope: every valid token may read the extended card.
 
 Every authenticated caller shares the session's one task and context space. A scope limits which
-methods a token reaches, not which tasks: a credential holding `message/stream`, `tasks/get` or
+methods a token reaches, not which tasks: a credential holding `SendStreamingMessage`, `GetTask` or
 `stream/watch` sees every task on the session. The one exception is a
-[formation token](roster.md#formation-token): it reaches [`tasks/get`](#tasks-get) and
-`tasks/cancel` only for the tasks its member submitted, and does not reach `message/stream`.
-
-### What the door answers { #door-authentication }
-
-The door checks, in this order, on every request:
-
-1. `GET /.well-known/agent-card.json`, the [peer plane](resource-plane.md#peer-plane) under
-   `/resources/peer/` and the [control surface](control-surface.md), which takes its own token,
-   are served without a door token.
-2. The token, on a door declaring `network.authentication`, before the path, the body or the
-   method is read. A refusal here says nothing about whether a task, a file or a path exists.
-3. Peer consent: a request carrying `x-murmur-task-origin: peer` is refused unless the capsule
-   declares [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks). Checked on
-   every door, before the path, the body or the method is read.
-4. The scope of a method the door serves, or of the operator plane, on a door declaring
-   `network.authentication`.
-5. The request itself, whose errors — `-32001 Task not found`, `-32601`, `-32602`, `-32004`, HTTP
-   `404` — reach an admitted caller unchanged.
-
-A refusal at steps 2 to 4 is an HTTP status and a JSON body, never a JSON-RPC envelope:
-
-| Case | Status | `www-authenticate` | Body `error` |
-|---|---|---|---|
-| No `Authorization` header | `401` | `Bearer realm="<capsule name>"` | `unauthenticated` |
-| An `Authorization` header that is not `Bearer <token>`, a token this session did not mint, or more than one `Authorization` header | `401` | `Bearer realm="<capsule name>", error="invalid_token"` | `invalid_token` |
-| A peer-origin request to a capsule that does not accept peer tasks | `403` | None | `peer_not_accepted` |
-| A valid token whose credential lacks the scope | `403` | `Bearer realm="<capsule name>", error="insufficient_scope", scope="<scope>"` | `insufficient_scope` |
-
-The body is `{"error": "<code>", "message": "<sentence>"}`. The `insufficient_scope` message names
-the credential and the scope it lacks: `credential 'watcher' does not reach message/send`. The
-`peer_not_accepted` response is byte-identical for every request it refuses. The scheme name
-`Bearer` matches in any case; the token matches exactly.
-
-The door speaks plain HTTP, so a token sent across a network travels in clear text. Put a TLS
-terminator in front of a door that is reached off the host.
+[formation token](roster.md#formation-token): it reaches [`GetTask`](#tasks-get) and
+`CancelTask` only for the tasks its member submitted, and does not reach `SendStreamingMessage`.
 
 ### The public card of an authenticated door { #authenticated-public-card }
 
@@ -217,7 +186,7 @@ terminator in front of a door that is reached off the host.
   "description": "Murmur capsule my-agent 0.1.0",
   "version": "0.1.0",
   "supportedInterfaces": [
-    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "0.3" }
+    { "url": "http://localhost:41873", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" }
   ],
   "capabilities": {
     "streaming": true,
@@ -229,13 +198,13 @@ terminator in front of a door that is reached off the host.
         "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"],
+          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"],
           "peerTasks": false
         }
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
         "required": false,
         "params": {
           "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
@@ -261,8 +230,8 @@ terminator in front of a door that is reached off the host.
       "description": "Runs one task given as a text message and reports its outcome.",
       "tags": ["task"],
       "securityRequirements": [
-        { "schemes": { "bearer": { "list": ["message/send"] } } },
-        { "schemes": { "bearer": { "list": ["message/stream"] } } }
+        { "schemes": { "bearer": { "list": ["SendMessage"] } } },
+        { "schemes": { "bearer": { "list": ["SendStreamingMessage"] } } }
       ]
     }
   ]
@@ -275,76 +244,204 @@ It differs from a public door's card in these keys:
 |---|---|
 | `capabilities.extendedAgentCard` | `true` |
 | `capabilities.extensions` | The door extension, then the stream extension. The [capsule extension](#murmur-capsule-v1) is on the extended card |
-| Door extension `params.methods` | Gains `agent/getAuthenticatedExtendedCard` |
+| Door extension `params.methods` | Gains `GetExtendedAgentCard` |
 | `securitySchemes` | `bearer`: an `httpAuthSecurityScheme` with scheme `Bearer` |
 | `securityRequirements` | `[{"schemes": {"bearer": {"list": []}}}]`: any valid token |
-| `task` skill `securityRequirements` | One alternative per served task-starting method, `message/send` then `message/stream`, each naming the scope it needs |
+| `task` skill `securityRequirements` | One requirement per served task-starting method, `SendMessage` then `SendStreamingMessage`, each naming the scope it needs |
 
 ### The extended card { #extended-card }
 
-`agent/getAuthenticatedExtendedCard` returns the extended card as its JSON-RPC `result`, to any
-valid token. The method answers on the door's A2A 0.3 interface, so the result is an A2A 0.3
-`AgentCard`: an A2A client that picks the `0.3` interface validates it as one. It is the
-authenticated door's v1.0 card with the capsule extension kept, converted to 0.3 field names:
+`GetExtendedAgentCard` returns the extended card as its JSON-RPC `result`, to any valid token. It
+takes no `params`:
 
-```json
-{
-  "protocolVersion": "0.3.0",
-  "name": "my-agent",
-  "description": "Murmur capsule my-agent 0.1.0",
-  "url": "http://localhost:41873",
-  "preferredTransport": "JSONRPC",
-  "version": "0.1.0",
-  "capabilities": {
-    "streaming": true,
-    "pushNotifications": false,
-    "extensions": [
-      { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.", "required": false,
-        "params": { "methods": ["message/send", "message/stream", "stream/watch", "tasks/get", "tasks/cancel", "session/stop", "agent/getAuthenticatedExtendedCard"], "peerTasks": false } },
-      { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
-        "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
-      { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "Every server-sent event type this capsule's message/stream and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.", "required": false,
-        "params": { "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"] } }
-    ]
-  },
-  "securitySchemes": {
-    "bearer": { "type": "http", "scheme": "Bearer", "description": "A token this capsule's runtime mints at launch and accepts until the session ends." }
-  },
-  "security": [ { "bearer": [] } ],
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
-  "skills": [
-    {
-      "id": "task",
-      "name": "Run a task",
-      "description": "Runs one task given as a text message and reports its outcome.",
-      "tags": ["task"],
-      "security": [ { "bearer": ["message/send"] }, { "bearer": ["message/stream"] } ]
-    }
-  ],
-  "supportsAuthenticatedExtendedCard": true
-}
+```bash
+curl -s -X POST http://localhost:41873/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"GetExtendedAgentCard"}'
 ```
 
-| 0.3 key | From the v1.0 card |
+The result is an A2A v1.0 `AgentCard`: the
+[public card of the authenticated door](#authenticated-public-card) with the
+[capsule extension](#murmur-capsule-v1) added.
+
+| Key | Value on the extended card |
 |---|---|
-| `url` | `supportedInterfaces[0].url` |
-| `preferredTransport` | `JSONRPC` |
-| `protocolVersion` | `0.3.0` |
-| `capabilities` | `capabilities`, without `extendedAgentCard` |
-| `supportsAuthenticatedExtendedCard` | `capabilities.extendedAgentCard` |
-| `securitySchemes.bearer` | `{"type": "http", "scheme": …, "description": …}` |
-| `security`, and each skill's `security` | `securityRequirements`, each `{"schemes": {name: {"list": […]}}}` as `{name: […]}` |
+| `capabilities.extensions` | The door extension, the capsule extension, then the stream extension |
+| Every other key | As on the authenticated door's public card: the `bearer` scheme, `securityRequirements`, `capabilities.extendedAgentCard: true`, and `supportedInterfaces` declaring `protocolVersion` `1.0` |
 
-The capsule extension's `params.sessionId` is at the same path in both shapes.
+The capsule extension's `params.sessionId` is at the same path on a public door's card and on the
+extended card.
 
-A public door has no extended card. It answers `agent/getAuthenticatedExtendedCard` with the A2A
-0.3 error `-32007 Authenticated Extended Card is not configured`, and its card does not list the
-method.
+A public door has no extended card. It answers `GetExtendedAgentCard` with
+[`-32004`](#errors) `UnsupportedOperationError`, and its card does not list the method.
+
+## The JSON-RPC door { #door }
+
+Every JSON-RPC request is one `POST /` with `content-type: application/json`, a JSON-RPC 2.0 body,
+and an [`A2A-Version: 1.0`](#a2a-version) header:
+
+```http
+POST / HTTP/1.1
+Content-Type: application/json
+A2A-Version: 1.0
+
+{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"tsk_…"}}
+```
+
+The methods are listed in the [door extension](#murmur-door-v1).
+
+### What the door answers { #door-authentication }
+
+The door checks, in this order, on every request:
+
+1. `GET /.well-known/agent-card.json`, the [peer plane](resource-plane.md#peer-plane) under
+   `/resources/peer/` and the [control surface](control-surface.md), which takes its own token,
+   are served without a door token.
+2. The token, on a door declaring `network.authentication`, before the path, the body or the
+   method is read. A refusal here says nothing about whether a task, a file or a path exists.
+3. Peer consent: a request carrying `x-murmur-task-origin: peer` is refused unless the capsule
+   declares [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks). Checked on
+   every door, before the path, the body or the method is read.
+4. The [operator plane](resource-plane.md#operator-plane) under `/resources/files`: the
+   `resources/files` scope on a door declaring `network.authentication`, then the plane.
+5. Anything but a `POST /` with `content-type: application/json` and a body is answered `404`.
+6. A body that is not JSON: `-32700` `Invalid JSON payload`, with `id: null`.
+7. A body that is not a [JSON-RPC 2.0 request](#jsonrpc-request): `-32600`
+   `Request payload validation error`.
+8. The [`A2A-Version`](#a2a-version) header: `-32009` unless it names `1.0`.
+9. A [completion](roost-api.md#how-it-travels), a request carrying
+   `x-murmur-task-origin: completion`: addressed to another session, `-31001`; otherwise the door
+   answers it — see [Completion errors](#murmur-errors).
+10. The method: `-32601` `Method not found` for a method the
+    [door extension](#murmur-door-v1) does not list. A public door answers `GetExtendedAgentCard`
+    with `-32004` instead.
+11. The scope of the method, on a door declaring `network.authentication`.
+12. On `SendMessage` and `SendStreamingMessage`, an
+    [`x-murmur-forget-session: true`](#request-headers) the capsule cannot act on: `-32602`.
+13. `params` that is present and is not an object: `-32602`.
+14. The method itself, whose errors are listed under [Errors](#errors).
+
+A refusal at steps 2, 3, 4 and 11 is an HTTP status and a JSON body, never a JSON-RPC envelope:
+
+| Case | Status | `www-authenticate` | Body `error` |
+|---|---|---|---|
+| No `Authorization` header | `401` | `Bearer realm="<capsule name>"` | `unauthenticated` |
+| An `Authorization` header that is not `Bearer <token>`, a token this session did not mint, or more than one `Authorization` header | `401` | `Bearer realm="<capsule name>", error="invalid_token"` | `invalid_token` |
+| A peer-origin request to a capsule that does not accept peer tasks | `403` | None | `peer_not_accepted` |
+| A valid token whose credential lacks the scope | `403` | `Bearer realm="<capsule name>", error="insufficient_scope", scope="<scope>"` | `insufficient_scope` |
+
+The body is `{"error": "<code>", "message": "<sentence>"}`. The `insufficient_scope` message names
+the credential and the scope it lacks: `credential 'watcher' does not reach SendMessage`. The
+`peer_not_accepted` response is byte-identical for every request it refuses. The scheme name
+`Bearer` matches in any case; the token matches exactly.
+
+Every answer from step 6 on is a JSON-RPC response with HTTP status `200`, except a scope refusal at
+step 11.
+
+The door speaks plain HTTP, so a token sent across a network travels in clear text. Put a TLS
+terminator in front of a door that is reached off the host.
+
+### JSON-RPC request { #jsonrpc-request }
+
+| Member | Required | Accepted |
+|---|---:|---|
+| `jsonrpc` | yes | Exactly `"2.0"` |
+| `method` | yes | A string, matched exactly against the [door extension](#murmur-door-v1)'s method names |
+| `id` | yes | A string or an integer. A request without one, a notification, is refused |
+| `params` | no | An object. Omitted, it reads as `{}` |
+
+The body is one object; a batch array is refused. Members beyond these four are ignored. A refusal
+at step 7 echoes the request's `id` when the `id` itself is valid, and is `null` otherwise.
+
+### `A2A-Version` { #a2a-version }
+
+Every JSON-RPC request names the A2A version it speaks in the `A2A-Version` HTTP header. The door
+speaks `1.0`.
+
+| `A2A-Version` header | Door |
+|---|---|
+| `1.0`, or `1.0.<digits>` such as `1.0.1` | Serves the request |
+| Absent or empty, which A2A reads as version `0.3` | `-32009` |
+| Any other value: `0.3`, `1`, `1.1`, `2.0`, `1.0x` | `-32009` |
+| More than one `A2A-Version` header line, whatever their values | `-32009` |
+
+The header name matches in any case, and surrounding whitespace in the value is ignored. A query
+parameter does not set the version.
+
+Every method is negotiated: the A2A methods, `stream/watch`, `session/stop` and completions alike.
+The refusal is one JSON body, also on `SendStreamingMessage` and `stream/watch`, and nothing is
+started or stopped:
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "error": {"code": -32009,
+           "message": "A2A version '' is not supported; this agent speaks 1.0",
+           "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                     "reason": "VERSION_NOT_SUPPORTED",
+                     "domain": "a2a-protocol.org",
+                     "metadata": {"requestedVersion": "", "supportedVersions": "1.0"}}]}}
+```
+
+`GET /.well-known/agent-card.json`, the [resource plane](resource-plane.md), the peer plane and the
+[control surface](control-surface.md) read no `A2A-Version`.
+
+Every request murmur itself sends to a door carries `A2A-Version: 1.0`: `mur ps`, `mur watch`,
+`mur cancel`, `mur stop`, [`call-member`](runtime-provided-tools.md#call-member),
+[`delegate-task`](roost-api.md#the-delegation-tool) and its completions, a
+[plan's `capsule` step](plans.md), and [`murmur:message/send`](wit-interfaces.md#message-send).
+
+### Errors { #errors }
+
+The standard JSON-RPC errors carry no `data`:
+
+| Code | Message | Answers |
+|---|---|---|
+| `-32700` | `Invalid JSON payload` | A body that is not JSON. `id` is `null` |
+| `-32600` | `Request payload validation error` | A body that is not a [JSON-RPC 2.0 request](#jsonrpc-request) |
+| `-32601` | `Method not found` | A method the door extension does not list |
+| `-32602` | Names the parameter | `params` that is not an object, a `SendMessage` whose message does not parse, a `CancelTask` with no `id`, or an `x-murmur-forget-session` the capsule cannot act on |
+| `-32603` | Names the failure | A request the door accepted and could not hand to the session |
+
+Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo`:
+
+| Key | Value |
+|---|---|
+| `@type` | `type.googleapis.com/google.rpc.ErrorInfo` |
+| `reason` | The error's reason, below |
+| `domain` | `a2a-protocol.org` |
+| `metadata` | An object of string values, below. `{}` when the error has none |
+
+| Code | Error | `reason` | The door answers it | `metadata` |
+|---|---|---|---|---|
+| `-32001` | `TaskNotFoundError` | `TASK_NOT_FOUND` | On `GetTask` and `CancelTask` for an id this session never held or a [formation token](roster.md#formation-token) does not reach, and on `GetTask` with no `id` when the session holds no task | `taskId`, when the request named an id |
+| `-32002` | `TaskNotCancelableError` | `TASK_NOT_CANCELABLE` | On `CancelTask` for a task that had already ended. The task is left unchanged | `taskId`; `state`, the state it ended in, spelled as `GetTask` spells it: `completed`, `failed`, `rejected` or `canceled` |
+| `-32003` | `PushNotificationNotSupportedError` | `PUSH_NOTIFICATION_NOT_SUPPORTED` | Never | — |
+| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door | `{}` |
+| `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | Never | — |
+| `-32006` | `InvalidAgentResponseError` | `INVALID_AGENT_RESPONSE` | Never | — |
+| `-32007` | `ExtendedAgentCardNotConfiguredError` | `EXTENDED_AGENT_CARD_NOT_CONFIGURED` | Never | — |
+| `-32008` | `ExtensionSupportRequiredError` | `EXTENSION_SUPPORT_REQUIRED` | Never | — |
+| `-32009` | `VersionNotSupportedError` | `VERSION_NOT_SUPPORTED` | On any request whose [`A2A-Version`](#a2a-version) is not `1.0` | `requestedVersion`, the header's value as sent: `""` when it was absent, and every line's value joined with `, ` when there was more than one; `supportedVersions`, `1.0` |
+
+```json
+{"jsonrpc": "2.0", "id": 3,
+ "error": {"code": -32002,
+           "message": "Task cannot be canceled: it is already completed",
+           "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                     "reason": "TASK_NOT_CANCELABLE",
+                     "domain": "a2a-protocol.org",
+                     "metadata": {"taskId": "tsk_…", "state": "completed"}}]}}
+```
+
+A completion's errors, `-31001` and `-31002`, are murmur's own and are listed under
+[Completion errors](#murmur-errors).
+
 
 ## `skills` { #skills }
 
-A door that serves `message/send` advertises one skill: running a task. Under
+A door that serves `SendMessage` advertises one skill: running a task. Under
 [`lifecycle.task_acceptance: none`](manifest.md#lifecycle-task-acceptance) no task can be started,
 and `skills` is `[]`.
 
@@ -386,28 +483,35 @@ and `session/stop` are murmur methods, not A2A methods. Methods appear in this o
 
 | Method | Answers | Listed when |
 |---|---|---|
-| `message/send` | Starts a task, or delivers input to a task waiting for it, and returns the task | `lifecycle.task_acceptance` is `single` or `queue` |
-| `message/stream` | Starts a task and streams its events as `text/event-stream` | `lifecycle.task_acceptance` is `single` or `queue` |
+| `SendMessage` | Starts a task, or delivers input to a task waiting for it, and returns the task | `lifecycle.task_acceptance` is `single` or `queue` |
+| `SendStreamingMessage` | Starts a task and streams its events as `text/event-stream` | `lifecycle.task_acceptance` is `single` or `queue` |
 | `stream/watch` | Streams this session's events as an observer, without starting a task | Always |
-| `tasks/get` | Returns the task named by `params.id` | Always |
-| `tasks/cancel` | Cancels the task named by `params.id` | Always |
+| `GetTask` | Returns the task named by `params.id` | Always |
+| `CancelTask` | Cancels the task named by `params.id`. A task that had already ended is left unchanged and answered [`-32002`](#errors) | Always |
 | `session/stop` | Cancels every live task and reports what the session leaves running | Always |
-| `agent/getAuthenticatedExtendedCard` | Returns the [extended card](#extended-card) | The capsule declares [`network.authentication`](manifest.md#field-network-authentication) |
+| `GetExtendedAgentCard` | Returns the [extended card](#extended-card) | The capsule declares [`network.authentication`](manifest.md#field-network-authentication) |
 
 See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
-answers `message/send` and `message/stream` with `-32601`, so neither is listed,
+answers `SendMessage` and `SendStreamingMessage` with `-32601`, so neither is listed,
 `capabilities.streaming` is `false` and `skills` is `[]`.
+
+| Door | `params.methods` |
+|---|---|
+| Public | `SendMessage`, `SendStreamingMessage`, `stream/watch`, `GetTask`, `CancelTask`, `session/stop` |
+| Authenticated | The public door's six, then `GetExtendedAgentCard` |
+| Public, `task_acceptance: none` | `stream/watch`, `GetTask`, `CancelTask`, `session/stop` |
+| Authenticated, `task_acceptance: none` | `stream/watch`, `GetTask`, `CancelTask`, `session/stop`, `GetExtendedAgentCard` |
 
 The card endpoint itself is not listed.
 
 #### Request headers { #request-headers }
 
-The door reads `x-murmur-*` request headers alongside the JSON-RPC body. One of them changes what
-the methods that start a turn do:
+The door reads `x-murmur-*` request headers alongside the JSON-RPC body and the
+[`A2A-Version`](#a2a-version) header. One of them changes what the methods that start a turn do:
 
 | Header | Read on | Effect |
 |---|---|---|
-| `x-murmur-forget-session` | `message/send`, `message/stream` | `true` drops the harness session this request's context names before the turn, so the turn starts a new conversation under the same context id |
+| `x-murmur-forget-session` | `SendMessage`, `SendStreamingMessage` | `true` drops the harness session this request's context names before the turn, so the turn starts a new conversation under the same context id |
 
 Only the value `true` asks for it; every other value, and the header's absence, are the same
 request. A capsule on any transport but
@@ -416,9 +520,37 @@ answers the header with `-32602` without starting a task — see
 [`E-RUN-039`](diagnostics.md#e-run-039). What the forget does, and what it records, is
 [what removes an entry](workdir.md#what-removes-an-entry).
 
-#### `tasks/get` { #tasks-get }
+#### Completion errors { #murmur-errors }
 
-`tasks/get` answers the task `params.id` names, running or finished, as an A2A `Task`:
+A [completion](roost-api.md#how-it-travels) is a `SendMessage` carrying
+`x-murmur-task-origin: completion`, which a sub-capsule posts to the session that delegated to it.
+The door refuses one with a murmur error:
+
+| Code | `reason` | Answers a completion that | `metadata` |
+|---|---|---|---|
+| `-31001` | `COMPLETION_MISADDRESSED` | Names, in `x-murmur-completion-session`, a session other than the one running here | `addressedSession`: the session the completion named, `""` when it named none. Never the session running here |
+| `-31002` | `COMPLETION_NOT_AWAITED` | Names no delegation in `x-murmur-delegation-id`, names one no task here waits for, or names one this session is ending | `delegationId`, when the completion named one |
+
+Each carries `error.data` with one `google.rpc.ErrorInfo`, shaped as an [A2A error's](#errors), in
+the domain `murmur.nexus`. The codes lie outside the range JSON-RPC 2.0 reserves, `-32768` to
+`-32000`; A2A calls such codes JSON-RPC custom errors. The child records the refusal's `message`
+as its `delivery_error`.
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "error": {"code": -31002,
+           "message": "no task in this session is waiting for delegation dlg_…",
+           "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                     "reason": "COMPLETION_NOT_AWAITED",
+                     "domain": "murmur.nexus",
+                     "metadata": {"delegationId": "dlg_…"}}]}}
+```
+
+A completion sent with any method but `SendMessage` is answered `-32601`.
+
+#### `GetTask` { #tasks-get }
+
+`GetTask` answers the task `params.id` names, running or finished, as an A2A `Task`:
 
 | Key | Present |
 |---|---|
@@ -435,11 +567,11 @@ answers the header with `-32602` without starting a task — see
  "artifacts": [{"name": "response", "parts": [{"text": "four"}]}]}
 ```
 
-On a [formation token](roster.md#formation-token), `tasks/get` answers only the tasks the calling
+On a [formation token](roster.md#formation-token), `GetTask` answers only the tasks the calling
 member submitted. Any other id — another member's task, the operator's, or one the session never
 held — is answered `-32001 Task not found`. Every other credential reads every task.
 
-A `message/send` the door has no room for answers a `rejected` task whose `status.message` says
+A `SendMessage` the door has no room for answers a `rejected` task whose `status.message` says
 why: `task rejected: capsule is busy`, or `task rejected: the session is closing`.
 
 ##### No-answer metadata { #no-answer-metadata }
@@ -497,7 +629,7 @@ with a refusal. Planes appear in this order:
 
 URI: `https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1`
 
-`params.frames` lists every frame type the capsule's `message/stream` and `stream/watch`
+`params.frames` lists every frame type the capsule's `SendStreamingMessage` and `stream/watch`
 connections can write. Its key and the frame list are on the streaming protocol page, under
 [Frame vocabulary](streaming-protocol.md#murmur-stream-v1). It is on the public card of every door,
 authenticated or not.
@@ -505,7 +637,7 @@ authenticated or not.
 ## A card with no `supportedInterfaces` { #no-supported-interfaces }
 
 A card without `supportedInterfaces` comes from a runtime at v0.4.0 or earlier, which serves the
-[previous card](#migrating). A capsule serving it is reachable over the same methods, and:
+[previous card](#migrating). A capsule serving it answers the method names of its own version, and:
 
 | Reader | Result |
 |---|---|
@@ -528,8 +660,30 @@ Where each key of the card served by v0.4.0 and earlier is on this card:
 | `capabilities.shell` | Capsule extension `params.shell` |
 | `capabilities.network` | Capsule extension `params.network` |
 | `capabilities.streaming` | `capabilities.streaming`, derived the same way |
-| `capabilities.cancellation` | Removed. It was `true` on every card; the door extension's `params.methods` lists `tasks/cancel` |
+| `capabilities.cancellation` | Removed. It was `true` on every card; the door extension's `params.methods` lists `CancelTask` |
 | `serves.methods` | Door extension `params.methods`, same values and order |
 | `serves.planes` | Capsule extension `params.planes`, same values and order |
 
 Find an extension by its `uri` in `capabilities.extensions`, not by its position.
+
+## Migrating from A2A 0.3 { #migrating-a2a-0-3 }
+
+The door speaks A2A v1.0 only. A client written for a door that declared `protocolVersion` `0.3`
+changes these:
+
+| A2A 0.3 door | A2A v1.0 door |
+|---|---|
+| No `A2A-Version` header | `A2A-Version: 1.0` on every JSON-RPC request. A request without it is answered [`-32009`](#a2a-version) |
+| `message/send` | `SendMessage` |
+| `message/stream` | `SendStreamingMessage` |
+| `tasks/get` | `GetTask` |
+| `tasks/cancel` | `CancelTask` |
+| `agent/getAuthenticatedExtendedCard`, answering an A2A 0.3 `AgentCard` | `GetExtendedAgentCard`, answering an A2A v1.0 `AgentCard` — see [The extended card](#extended-card). A public door answers it `-32004`, where a 0.3 door answered `-32007` |
+| `supportedInterfaces[0].protocolVersion` `0.3` | `1.0` |
+| `tasks/cancel` on a task that had already ended answers the task | `CancelTask` answers [`-32002`](#errors) and leaves the task unchanged |
+| A completion refused with `-32004` | [`-31001` or `-31002`](#murmur-errors). `-32004` is `UnsupportedOperationError` only |
+| Errors without `data` | Every A2A error carries an [`ErrorInfo`](#errors) |
+| Credential scopes `message/send`, `message/stream`, `tasks/get`, `tasks/cancel` | `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`. A manifest listing a 0.3 name is refused — see [`network.authentication.credentials`](manifest.md#field-network-authentication) |
+
+The 0.3 method names are answered `-32601` `Method not found`. `stream/watch`, `session/stop` and
+the `x-murmur-*` headers keep their names.

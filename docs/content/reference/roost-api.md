@@ -388,7 +388,7 @@ and usually well under a second per level. With the default [`--max-depth`](#the
 | Ending | Effect on a `delegate-task` child |
 |---|---|
 | The parent's process is killed | The child winds down |
-| The delegating task is cancelled — `tasks/cancel`, `session/stop`, or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task ends the child before it ends, and records it `terminated` |
+| The delegating task is cancelled — `CancelTask`, `session/stop`, or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task ends the child before it ends, and records it `terminated` |
 | The delegating task ends any other way while the child is still running | The task ends the child, and records it `terminated` |
 | The [delegation deadline](#bounds) passes | The child is ended, and the task continues with a `terminated` outcome |
 
@@ -509,12 +509,12 @@ records `terminated`, with a `reason` naming why:
 
 | Why the task ended it | `reason` |
 |---|---|
-| The task was cancelled, by `tasks/cancel` or by the session winding down | `the delegating task was cancelled` |
+| The task was cancelled, by `CancelTask` or by the session winding down | `the delegating task was cancelled` |
 | The attempt finished with no inference turn left | `the delegating task had no inference turn left to read this outcome` |
 | The attempt ended any other way | `the delegating task ended <exit status> before this sub-capsule finished` |
 | No outcome arrived within the backstop below | `no outcome reached the delegating task within <N>s of this sub-capsule starting` |
 
-A cancel's `task_canceled` record and its `tasks/cancel` residue name every delegation that was in
+A cancel's `task_canceled` record and its `CancelTask` residue name every delegation that was in
 flight, taken before the task ends them.
 
 ### Bounds
@@ -539,7 +539,7 @@ the two want opposite things:
 | Delegated to by | [`lifecycle.after_task`](manifest.md#lifecycle-after-task) | Why |
 |---|---|---|
 | `delegate-task` | `exit` | A sub-capsule reports its outcome when its session ends. One that sleeps between tasks never ends, so its parent hears from it only when the child-watch bound stops it |
-| A plan's `capsule` step | `sleep` | The step reads the answer with an A2A `tasks/get` after the task completes, so the sub-capsule has to still be listening |
+| A plan's `capsule` step | `sleep` | The step reads the answer with an A2A `GetTask` after the task completes, so the sub-capsule has to still be listening |
 
 ---
 
@@ -592,11 +592,12 @@ describe the delivery rather than the outcome.
 
 ### How it travels
 
-One JSON-RPC `message/send` to the parent's `POST /`, carrying the fields above as its message
-text, with three request headers.
+One JSON-RPC `SendMessage` to the parent's `POST /`, carrying the fields above as its message
+text, with four request headers.
 
 | Header | Value |
 |---|---|
+| `A2A-Version` | `1.0` |
 | `x-murmur-task-origin` | `completion` |
 | `x-murmur-delegation-id` | The `delegation_id` of the injected handle |
 | `x-murmur-completion-session` | The `session_id` of the injected handle |
@@ -607,11 +608,15 @@ outcome from the child's `completion.json`, not from the message.
 
 | Completion | Door's answer |
 |---|---|
-| `x-murmur-completion-session` is not the session running there — a parent that restarted onto the same address | JSON-RPC error `-32004`: `completion is addressed to session <id>, which is not the session running here` |
+| `x-murmur-completion-session` is not the session running there — a parent that restarted onto the same address | JSON-RPC error `-31001` `COMPLETION_MISADDRESSED`: `completion is addressed to session <id>, which is not the session running here` |
 | Names a delegation the running task is waiting for, or one already received | A JSON-RPC result, `{"delegation_id": "dlg_…", "received": true}` |
-| Names any other delegation, including one its task has already ended | JSON-RPC error `-32004`: `no task in this session is waiting for delegation dlg_…` |
+| Names no delegation | JSON-RPC error `-31002` `COMPLETION_NOT_AWAITED`: `completion names no delegation in x-murmur-delegation-id, so no task in this session is waiting for it` |
+| Names a delegation this session is ending | JSON-RPC error `-31002` `COMPLETION_NOT_AWAITED`: `delegation dlg_… is being ended by this session; its launcher records the outcome` |
+| Names any other delegation, including one its task has already ended | JSON-RPC error `-31002` `COMPLETION_NOT_AWAITED`: `no task in this session is waiting for delegation dlg_…` |
 
-The child records an error answer as its `delivery_error`. Both delegation headers are read only
+Both errors carry a `google.rpc.ErrorInfo` in the domain `murmur.nexus`; their reasons and
+metadata are listed under [Agent Card: Completion errors](agent-card.md#murmur-errors). The child
+records an error answer's `message` as its `delivery_error`. Both delegation headers are read only
 for a request classified `completion`, and ignored on every other path.
 
 ### Who reports, and what happens when nobody can

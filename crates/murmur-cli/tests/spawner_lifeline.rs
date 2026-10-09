@@ -237,12 +237,12 @@ impl Session {
         read_trace(&self.session_dir().join("trace.jsonl"))
     }
 
-    /// `message/send` under the operator token; the task id.
+    /// `SendMessage` under the operator token; the task id.
     fn send_task(&self) -> String {
         let sent = rpc(
             &self.url(),
             Some(&self.token()),
-            "message/send",
+            "SendMessage",
             message("m-held", "hold"),
         );
         assert_eq!(sent.status, 200, "{sent:?}");
@@ -253,7 +253,7 @@ impl Session {
         let card = rpc(
             &self.url(),
             Some(&self.token()),
-            "agent/getAuthenticatedExtendedCard",
+            "GetExtendedAgentCard",
             json!({}),
         );
         assert_eq!(card.status, 200, "{card:?}");

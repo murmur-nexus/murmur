@@ -99,7 +99,7 @@ only once the last attempt has failed.
 ## When the task is cancelled { #when-the-task-is-cancelled }
 
 A plan runs inside the task that called `submit-plan`, and stops when that task is cancelled — by
-`tasks/cancel`, [`mur cancel`](cli.md#mur-cancel), or [`mur stop`](cli.md#mur-stop) and `SIGTERM`
+`CancelTask`, [`mur cancel`](cli.md#mur-cancel), or [`mur stop`](cli.md#mur-stop) and `SIGTERM`
 ending the session. The capsule itself keeps running.
 
 | Step, when the cancel lands | What happens |

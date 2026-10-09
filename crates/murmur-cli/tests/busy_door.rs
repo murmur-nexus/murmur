@@ -269,7 +269,7 @@ fn message_send(message_id: &str, text: &str) -> String {
     json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {"message": {
             "messageId": message_id,
             "role": "user",
@@ -352,7 +352,7 @@ fn post_json(addr: &str, body: &str, budget: Duration) -> Result<Value, String> 
     let response = exchange(
         addr,
         &format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
         budget,
@@ -369,7 +369,7 @@ fn open_watch(addr: &str) -> (TcpStream, Instant) {
     (&stream)
         .write_all(
             format!(
-                "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -497,12 +497,12 @@ fn every_door_path_answers_while_the_turn_is_busy() {
     let started = Instant::now();
     let got = post_json(
         &capsule.url(),
-        &json!({"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}})
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}})
             .to_string(),
         PROBE_BUDGET,
     )
-    .unwrap_or_else(|e| panic!("tasks/get went unanswered mid-turn: {e}"));
-    eprintln!("[busy-door] tasks/get answered in {:?}", started.elapsed());
+    .unwrap_or_else(|e| panic!("GetTask went unanswered mid-turn: {e}"));
+    eprintln!("[busy-door] GetTask answered in {:?}", started.elapsed());
     assert_eq!(got["result"]["status"]["state"], "working", "{got}");
 
     let started = Instant::now();
@@ -511,9 +511,9 @@ fn every_door_path_answers_while_the_turn_is_busy() {
         &message_send("spin-2", "a second task"),
         PROBE_BUDGET,
     )
-    .unwrap_or_else(|e| panic!("message/send went unanswered mid-turn: {e}"));
+    .unwrap_or_else(|e| panic!("SendMessage went unanswered mid-turn: {e}"));
     eprintln!(
-        "[busy-door] message/send answered in {:?}",
+        "[busy-door] SendMessage answered in {:?}",
         started.elapsed()
     );
     assert_eq!(sent["result"]["status"]["state"], "submitted", "{sent}");

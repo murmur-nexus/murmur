@@ -3140,7 +3140,7 @@ mod tests {
     fn door_lines_name_the_command_that_reads_a_token_on_the_target() {
         let manifest = door_manifest(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-             watcher: {scopes: [tasks/get]}\n      auditor: {scopes: [tasks/get]}\n",
+             watcher: {scopes: [GetTask]}\n      auditor: {scopes: [GetTask]}\n",
         );
         // A remote `mur` that still printed tokens is never echoed.
         let start_info = serde_json::json!({

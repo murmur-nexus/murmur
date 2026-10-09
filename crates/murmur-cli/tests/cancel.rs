@@ -260,7 +260,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let mut writer = &stream;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     writer.write_all(request.as_bytes()).unwrap();
@@ -298,7 +298,7 @@ fn send_message(addr: &str, message_id: &str, text: &str, context_id: Option<&st
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "message/send",
+            "method": "SendMessage",
             "params": {"message": message}
         })
         .to_string(),
@@ -311,7 +311,7 @@ fn tasks_get(addr: &str, task_id: &str) -> Value {
         &json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "tasks/get",
+            "method": "GetTask",
             "params": {"id": task_id}
         })
         .to_string(),
@@ -324,7 +324,7 @@ fn tasks_cancel(addr: &str, task_id: &str) -> Value {
         &json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "tasks/cancel",
+            "method": "CancelTask",
             "params": {"id": task_id}
         })
         .to_string(),
@@ -481,7 +481,7 @@ fn network(server: &common::ScriptedServer) -> String {
 
 // ── 2. The stream closes cleanly ──────────────────────────────────────────────
 
-/// The final `canceled` status is the only thing that closes a `message/stream` connection on a
+/// The final `canceled` status is the only thing that closes a `SendStreamingMessage` connection on a
 /// cancelled task, so a client's `for await` ends rather than hanging.
 #[test]
 fn cancel_closes_the_stream_with_a_final_canceled_status() {
@@ -496,7 +496,7 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/stream",
+        "method": "SendStreamingMessage",
         "params": {"message": {"messageId": "msg-1", "role": "user", "parts": [{"text": "go"}]}}
     })
     .to_string();
@@ -505,7 +505,7 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
         writer
             .write_all(
                 format!(
-                    "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                    "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
                     capsule.url,
                     body.len()
                 )
@@ -565,13 +565,13 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
     );
 }
 
-/// The id of whichever task holds the active slot — `message/stream` never reports one.
+/// The id of whichever task holds the active slot — `SendStreamingMessage` never reports one.
 fn tasks_get_active_id(addr: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let response = http_post_json(
             addr,
-            &json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/get", "params": {}}).to_string(),
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "GetTask", "params": {}}).to_string(),
         );
         if let Some(id) = response["result"]["id"].as_str() {
             return id.to_string();
@@ -966,10 +966,10 @@ fn cancel_from_input_required_reaches_canceled() {
 
 // ── 8. Terminal tasks and unknown ids ─────────────────────────────────────────
 
-/// Cancelling a task that has already ended is a clean no-op with a `result`, and only an id this
-/// capsule never held is an error.
+/// Cancelling a task that has already ended is refused `TaskNotCancelable` and leaves the task as
+/// it ended; an id this capsule never held is `TaskNotFound`.
 #[test]
-fn cancelling_a_terminal_task_is_a_clean_no_op() {
+fn cancelling_a_terminal_task_is_not_cancelable_and_changes_nothing() {
     let server = common::ScriptedServer::start(vec![
         end_turn_response("msg_1", "done"),
         end_turn_response("msg_2", "also done"),
@@ -989,13 +989,20 @@ fn cancelling_a_terminal_task_is_a_clean_no_op() {
 
     for attempt in 0..2 {
         let response = tasks_cancel(&capsule.url, &done_task);
-        assert!(
-            response.get("error").is_none(),
-            "attempt {attempt} answered with an error: {response}"
+        assert_eq!(
+            response["error"]["code"], -32002,
+            "attempt {attempt}: {response}"
+        );
+        let info = &response["error"]["data"][0];
+        assert_eq!(info["reason"], "TASK_NOT_CANCELABLE", "{response}");
+        assert_eq!(
+            info["metadata"],
+            json!({"taskId": done_task, "state": "completed"}),
+            "{response}"
         );
         assert_eq!(
-            response["result"]["status"]["state"], "completed",
-            "attempt {attempt}: {response}"
+            tasks_get(&capsule.url, &done_task)["result"]["status"]["state"],
+            "completed"
         );
     }
 
@@ -1003,7 +1010,7 @@ fn cancelling_a_terminal_task_is_a_clean_no_op() {
     assert_eq!(unknown["error"]["code"], -32001, "{unknown}");
     assert_eq!(unknown["error"]["message"], "Task not found", "{unknown}");
 
-    // A second cancel of an already-cancelled task is the same clean no-op.
+    // A second cancel of an already-cancelled task is not cancelable either.
     let server_two = common::ScriptedServer::start_with_delay(
         vec![end_turn_response("msg_1", "never delivered")],
         Duration::from_secs(20),
@@ -1019,12 +1026,15 @@ fn cancelling_a_terminal_task_is_a_clean_no_op() {
         "canceled"
     );
     let again = tasks_cancel(&capsule_two.url, &slow_task);
-    assert!(again.get("error").is_none(), "{again}");
-    assert_eq!(again["result"]["status"]["state"], "canceled", "{again}");
+    assert_eq!(again["error"]["code"], -32002, "{again}");
+    assert_eq!(
+        again["error"]["data"][0]["metadata"]["state"], "canceled",
+        "{again}"
+    );
 }
 
 /// `mur cancel` against an unknown id fails with the door's own wording; against a completed task
-/// it exits 0 and reports `completed`.
+/// it exits 0, reports the task as `completed` and says there was nothing to cancel.
 #[test]
 fn mur_cancel_reports_unknown_and_completed_tasks() {
     let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "done")]);
@@ -1043,8 +1053,12 @@ fn mur_cancel_reports_unknown_and_completed_tasks() {
         .stdout
         .clone();
     let stdout = String::from_utf8_lossy(&stdout).to_string();
-    assert!(stdout.contains(&task_id), "{stdout}");
-    assert!(stdout.contains("completed"), "{stdout}");
+    assert!(stdout.contains(&format!("task:    {task_id}")), "{stdout}");
+    assert!(stdout.contains("state:   completed"), "{stdout}");
+    assert!(
+        stdout.contains("nothing to cancel: the task had already ended"),
+        "{stdout}"
+    );
 
     let failure = mur()
         .args(["cancel", "--url", &capsule.url, "tsk_doesnotexist"])

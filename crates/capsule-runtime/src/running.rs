@@ -747,9 +747,9 @@ mod platform {
 /// Layer 3: the session id the door at `record.url` claims on its agent card.
 ///
 /// A record carrying a door token reads the extended card, the only one an authenticated door
-/// names its session on, by `agent/getAuthenticatedExtendedCard`; any other record reads the
-/// public card. A card with no capsule extension naming a session — one served by a runtime that
-/// predates the A2A card, among others — names no session, so its capsule reads as unreachable.
+/// names its session on, by `GetExtendedAgentCard`; any other record reads the public card. A
+/// card with no capsule extension naming a session names no session, so its capsule reads as
+/// unreachable.
 fn probe_session_id(record: &RunningRecord) -> Result<String, String> {
     probe_door_session_id(&record.url, record.door_token.as_ref())
 }
@@ -766,12 +766,16 @@ pub(crate) fn probe_door_session_id(
     let addr = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
+    let version = (
+        crate::a2a::A2A_VERSION_HEADER,
+        crate::a2a::A2A_PROTOCOL_VERSION,
+    );
     let card = match token {
         Some(token) => {
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": crate::identity::DoorMethod::GetAuthenticatedExtendedCard.wire_name(),
+                "method": crate::identity::DoorMethod::GetExtendedAgentCard.wire_name(),
                 "params": {},
             })
             .to_string();
@@ -780,7 +784,7 @@ pub(crate) fn probe_door_session_id(
                 "POST",
                 &format!("http://{addr}/"),
                 Some(&body),
-                &[("Authorization", authorization.as_str())],
+                &[("Authorization", authorization.as_str()), version],
                 PROBE_CONNECT_TIMEOUT,
                 PROBE_READ_TIMEOUT,
             )?;
@@ -792,7 +796,7 @@ pub(crate) fn probe_door_session_id(
             "GET",
             &format!("http://{addr}/.well-known/agent-card.json"),
             None,
-            &[("Accept", "application/json")],
+            &[("Accept", "application/json"), version],
             PROBE_CONNECT_TIMEOUT,
             PROBE_READ_TIMEOUT,
         )?,
@@ -1473,6 +1477,37 @@ mod home_tests {
             home.join(".murmur").join(RUNNING_DIR)
         );
         assert!(!home.join(".murmur").exists());
+    }
+
+    /// The door probe reads the extended card with `GetExtendedAgentCard` when it holds a token,
+    /// and the public card otherwise, naming A2A 1.0 on both.
+    #[test]
+    fn the_door_probe_names_a2a_1_0_on_both_cards() {
+        use crate::http_client::capture::answer_one;
+
+        let card = serde_json::json!({"capabilities": {"extensions": [{
+            "uri": crate::identity::CAPSULE_EXTENSION_URI,
+            "params": {"sessionId": "ses_probe"}}]}});
+        let (addr, sent) =
+            answer_one(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": card}).to_string());
+        let token = crate::door_auth::DoorToken::new("tok".to_string());
+        assert_eq!(
+            probe_door_session_id(&addr, Some(&token)).unwrap(),
+            "ses_probe"
+        );
+        let sent = sent.join().unwrap();
+        assert_eq!(sent.request_line, "POST / HTTP/1.1");
+        assert_eq!(sent.method(), "GetExtendedAgentCard");
+        assert_eq!(sent.header("a2a-version"), ["1.0"]);
+
+        let (addr, sent) = answer_one(card.to_string());
+        assert_eq!(probe_door_session_id(&addr, None).unwrap(), "ses_probe");
+        let sent = sent.join().unwrap();
+        assert_eq!(
+            sent.request_line,
+            "GET /.well-known/agent-card.json HTTP/1.1"
+        );
+        assert_eq!(sent.header("a2a-version"), ["1.0"]);
     }
 
     fn record(session_id: &str) -> RunningRecord {
