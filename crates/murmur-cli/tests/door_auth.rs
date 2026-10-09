@@ -109,7 +109,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     assert_eq!(card.status, 200, "{card:?}");
     let card = card.json();
     assert_eq!(
-        common::a2a_card_conformance::check_agent_card(&card),
+        common::a2a_conformance::check_agent_card(&card),
         Ok(()),
         "{card:#}"
     );

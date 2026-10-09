@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
-/// The strict `lf.a2a.v1.AgentCard` check the runtime's own tests use, compiled from the same
-/// file so a served card is judged against the same vendored `a2a.proto`.
-#[path = "../../../capsule-runtime/src/a2a_card_conformance.rs"]
-pub mod a2a_card_conformance;
+/// The strict A2A v1.0 checks the runtime's own tests use, compiled from the same file so a served
+/// card and every exchange [`wire_recorder`] records are judged against the same vendored
+/// `a2a.proto`.
+#[path = "../../../capsule-runtime/src/a2a_conformance.rs"]
+pub mod a2a_conformance;
 pub mod door_capsule;
 pub mod formation;
 pub mod github_release;
@@ -16,6 +17,7 @@ pub mod loopback_target;
 #[path = "../../../capsule-runtime/src/pinned_port.rs"]
 pub mod pinned_port;
 pub mod recording_upstream;
+pub mod wire_recorder;
 
 use std::{
     collections::HashSet,
@@ -1133,7 +1135,7 @@ pub fn card_capsule_params(card: &Value) -> &serde_json::Map<String, Value> {
 
 /// Fails the test with every error a strict `lf.a2a.v1.AgentCard` parse of `card` raises.
 pub fn assert_a2a_agent_card(card: &Value) {
-    if let Err(errors) = a2a_card_conformance::check_agent_card(card) {
+    if let Err(errors) = a2a_conformance::check_agent_card(card) {
         panic!("the served card is not an A2A v1.0 AgentCard: {errors:#?}\n{card:#}");
     }
 }

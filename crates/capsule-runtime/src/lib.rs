@@ -5,9 +5,9 @@
 
 pub(crate) mod a2a;
 #[cfg(test)]
-mod a2a_card_conformance;
+mod a2a_conformance;
 #[cfg(test)]
-mod a2a_card_conformance_tests;
+mod a2a_conformance_tests;
 pub(crate) mod agent;
 #[cfg(feature = "alloc-bench")]
 pub mod alloc_bench;
