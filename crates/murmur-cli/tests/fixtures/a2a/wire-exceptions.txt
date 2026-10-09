@@ -13,11 +13,5 @@
 #
 # The list can only shrink: the census in tests/a2a_wire_conformance.rs fails when a listed
 # exception no longer occurs, so a card removes its lines when it lands.
-SendMessage params lf.a2a.v1.SendMessageRequest 27678569 role "user", not ROLE_USER
-SendStreamingMessage params lf.a2a.v1.SendMessageRequest 27678569 role "user", not ROLE_USER
-GetTask params lf.a2a.v1.GetTaskRequest 27678569 the door accepts tasks/get without an id and answers its active task; GetTaskRequest requires id
-SendMessage result lf.a2a.v1.SendMessageResponse 27678569 a bare task, not {"task": …}; kebab-case state
-GetTask result lf.a2a.v1.Task 27678569 kebab-case states, artifacts without artifactId, role "agent"
-CancelTask result lf.a2a.v1.Task 27678569 kebab-case states, artifacts without artifactId, role "agent"
 SendStreamingMessage event lf.a2a.v1.StreamResponse 54148d84 murmur SSE frames, not JSON-RPC StreamResponse events
 stream/watch event lf.a2a.v1.StreamResponse 2eea2c25 murmur SSE frames; 2eea2c25 moves the watch stream onto 54148d84's shapes

@@ -709,8 +709,8 @@ fn an_agent_child_whose_task_failed_reports_error() {
                 "method": "SendMessage",
                 "params": {"message": {
                     "messageId": "msg-1",
-                    "role": "user",
-                    "parts": [{"text": "Say hello."}]
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "Say hello.", "mediaType": "text/plain"}]
                 }}
             })
             .to_string(),
@@ -722,7 +722,7 @@ fn an_agent_child_whose_task_failed_reports_error() {
     );
     assert!(
         sent.as_ref()
-            .is_some_and(|sent| sent["result"]["id"].is_string()),
+            .is_some_and(|sent| sent["result"]["task"]["id"].is_string()),
         "the child took the task: {sent:?}"
     );
 

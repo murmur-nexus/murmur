@@ -204,8 +204,8 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
         "params": {
             "message": {
                 "messageId": "test-msg-1",
-                "role": "user",
-                "parts": [{"text": "echo hello from A2A"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "echo hello from A2A", "mediaType": "text/plain"}]
             }
         }
     })
@@ -222,13 +222,13 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
         response["error"].is_null(),
         "should have no error; got: {response}"
     );
-    let task = &response["result"];
+    let task = &response["result"]["task"];
     assert!(
         task["id"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
         "task id should be present; got: {response}"
     );
     assert_eq!(
-        task["status"]["state"], "submitted",
+        task["status"]["state"], "TASK_STATE_SUBMITTED",
         "task state should be submitted; got: {response}"
     );
 
@@ -298,8 +298,8 @@ fn a2a_second_message_send_is_rejected() {
         "params": {
             "message": {
                 "messageId": "msg-first",
-                "role": "user",
-                "parts": [{"text": "first task"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "first task", "mediaType": "text/plain"}]
             }
         }
     })
@@ -307,7 +307,7 @@ fn a2a_second_message_send_is_rejected() {
 
     let first_response = http_post_json(&capsule_url, "/", &first_body);
     assert_eq!(
-        first_response["result"]["status"]["state"], "submitted",
+        first_response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "first SendMessage should be submitted; got: {first_response}"
     );
 
@@ -319,8 +319,8 @@ fn a2a_second_message_send_is_rejected() {
         "params": {
             "message": {
                 "messageId": "msg-second",
-                "role": "user",
-                "parts": [{"text": "should be rejected"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "should be rejected", "mediaType": "text/plain"}]
             }
         }
     })
@@ -328,7 +328,7 @@ fn a2a_second_message_send_is_rejected() {
 
     let second_response = http_post_json(&capsule_url, "/", &second_body);
     assert_eq!(
-        second_response["result"]["status"]["state"], "rejected",
+        second_response["result"]["task"]["status"]["state"], "TASK_STATE_REJECTED",
         "second SendMessage should be rejected; got: {second_response}"
     );
 
@@ -373,15 +373,15 @@ fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
         "params": {
             "message": {
                 "messageId": "provenance-msg",
-                "role": "user",
-                "parts": [{"text": "classify me"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "classify me", "mediaType": "text/plain"}]
             }
         }
     })
     .to_string();
     let response = http_post_json_with_headers(&capsule_url, "/", &body, headers);
     assert_eq!(
-        response["result"]["status"]["state"], "submitted",
+        response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "an origin claim must not change the JSON-RPC response; got: {response}"
     );
 
@@ -581,8 +581,8 @@ fn a2a_tasks_get_unknown_method_returns_error() {
         "params": {
             "message": {
                 "messageId": "unblock",
-                "role": "user",
-                "parts": [{"text": "proceed"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "proceed", "mediaType": "text/plain"}]
             }
         }
     })
@@ -665,14 +665,17 @@ fn an_event_origin_task_line_is_labelled_fenced() {
         "params": {
             "message": {
                 "messageId": "fence-event-msg",
-                "role": "user",
-                "parts": [{"text": "classify me"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "classify me", "mediaType": "text/plain"}]
             }
         }
     })
     .to_string();
     let response = http_post_json(&capsule_url, "/", &body);
-    assert_eq!(response["result"]["status"]["state"], "submitted");
+    assert_eq!(
+        response["result"]["task"]["status"]["state"],
+        "TASK_STATE_SUBMITTED"
+    );
 
     let launched = handle.join().expect("launch thread should not panic");
     let task_start = task_start_line(&launched.workdir);

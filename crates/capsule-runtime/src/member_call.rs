@@ -27,7 +27,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::a2a::{A2aError, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
+use crate::a2a::{
+    user_message, A2aError, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION,
+    A2A_VERSION_HEADER,
+};
 use crate::cancel::CancelSignal;
 use crate::formation_credentials::{virtual_url, FormationMember, FormationToken};
 use crate::network_policy::{NetworkAllowRule, RequestTarget};
@@ -337,13 +340,7 @@ fn offer_task(
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "SendMessage",
-        "params": {
-            "message": {
-                "messageId": format!("msg_{call_id}"),
-                "role": "user",
-                "parts": [{"text": task}],
-            }
-        }
+        "params": { "message": user_message(&format!("msg_{call_id}"), None, task) }
     });
     let member = &route.member;
     let answer = door_request(route, &body, timeout).map_err(|error| {
@@ -364,36 +361,46 @@ fn offer_task(
             rpc_error_text(error)
         )));
     }
-    let task_id = answer
-        .pointer("/result/id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty());
-    let state = answer
-        .pointer("/result/status/state")
-        .and_then(Value::as_str);
-    match (task_id, state) {
-        (Some(task_id), Some("submitted" | "working" | "input-required")) => {
-            Ok(task_id.to_string())
+    let task = match answer.get("result").map(SendMessageResult::from_result) {
+        Some(Ok(SendMessageResult::Task(task))) => task,
+        Some(Ok(SendMessageResult::Message(message))) => {
+            return Err(StartFailure::failed(format!(
+                "{member} answered with a message and started no task: {message}"
+            )))
         }
-        (_, Some("rejected")) => {
-            let message = status_message(&answer);
+        Some(Err(error)) => {
+            return Err(StartFailure::failed(format!(
+                "{member}'s door answered the task with no task it could read: {error}"
+            )))
+        }
+        None => {
+            return Err(StartFailure::failed(format!(
+                "{member}'s door answered the task with no task id and no state"
+            )))
+        }
+    };
+    match task.status.state {
+        TaskState::Submitted | TaskState::Working | TaskState::InputRequired
+            if !task.id.is_empty() =>
+        {
+            Ok(task.id)
+        }
+        TaskState::Rejected => {
+            let message = task.status_text();
             Err(StartFailure {
                 status: MemberCallStatus::Rejected,
-                reason: rejection_sentence(member, message.as_deref()),
-                kind: if message.as_deref() == Some(crate::a2a::REJECTED_BUSY_MESSAGE) {
+                reason: rejection_sentence(member, message),
+                kind: if message == Some(crate::a2a::REJECTED_BUSY_MESSAGE) {
                     StartFailureKind::Busy
                 } else {
                     StartFailureKind::Refused
                 },
             })
         }
-        (_, Some(state)) => Err(StartFailure::failed(match status_message(&answer) {
-            Some(message) => format!("{member} answered the task {state}: {message}"),
-            None => format!("{member} answered the task {state}"),
+        ref state => Err(StartFailure::failed(match task.status_text() {
+            Some(message) => format!("{member} answered the task {}: {message}", state.as_str()),
+            None => format!("{member} answered the task {}", state.as_str()),
         })),
-        _ => Err(StartFailure::failed(format!(
-            "{member}'s door answered the task with no task id and no state"
-        ))),
     }
 }
 
@@ -444,14 +451,6 @@ pub(crate) fn rejection_sentence(member: &str, message: Option<&str>) -> String 
         }
         None => format!("{member} did not take the task"),
     }
-}
-
-/// The text of `result.status.message`, when the answer carries one.
-fn status_message(answer: &Value) -> Option<String> {
-    answer
-        .pointer("/result/status/message/parts/0/text")
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 // ── Outcomes ──────────────────────────────────────────────────────────────────
@@ -510,13 +509,13 @@ impl MemberCallStatus {
     }
 
     /// The status a terminal A2A task state ends a call in, or `None` for a live state.
-    fn of_task_state(state: &str) -> Option<Self> {
+    fn of_task_state(state: &TaskState) -> Option<Self> {
         match state {
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "canceled" => Some(Self::Canceled),
-            "rejected" => Some(Self::Rejected),
-            _ => None,
+            TaskState::Completed => Some(Self::Completed),
+            TaskState::Failed => Some(Self::Failed),
+            TaskState::Canceled => Some(Self::Canceled),
+            TaskState::Rejected => Some(Self::Rejected),
+            TaskState::Submitted | TaskState::Working | TaskState::InputRequired => None,
         }
     }
 }
@@ -1542,30 +1541,34 @@ impl Watcher {
                     ),
                 ));
             }
-            let state = answer
-                .pointer("/result/status/state")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let Some(status) = MemberCallStatus::of_task_state(state) else {
+            // An answer that is not a task is read as one still running, and the poll goes on
+            // until the call's bound.
+            let Some(task) = answer
+                .get("result")
+                .and_then(|result| serde_json::from_value::<A2aTask>(result.clone()).ok())
+            else {
+                continue;
+            };
+            let Some(status) = MemberCallStatus::of_task_state(&task.status.state) else {
                 continue;
             };
             let (no_answer, below) = read_no_answer_metadata(&answer);
+            let status_message = || task.status_text().map(str::to_string);
             let (status, output, below) = match status {
-                MemberCallStatus::Completed => (
-                    status,
-                    response_artifact(&answer).unwrap_or_default(),
-                    below,
-                ),
+                MemberCallStatus::Completed => {
+                    (status, response_artifact(&task).unwrap_or_default(), below)
+                }
                 MemberCallStatus::Failed if no_answer => (
                     MemberCallStatus::NoAnswer,
-                    status_message(&answer)
+                    status_message()
                         .unwrap_or_else(|| format!("{member} ended its task without an answer")),
                     below,
                 ),
                 _ => (
                     status,
-                    status_message(&answer)
-                        .unwrap_or_else(|| format!("{member}'s task ended {state}")),
+                    status_message().unwrap_or_else(|| {
+                        format!("{member}'s task ended {}", task.status.state.as_str())
+                    }),
                     Vec::new(),
                 ),
             };
@@ -1627,17 +1630,10 @@ pub(crate) fn read_no_answer_metadata(answer: &Value) -> (bool, Vec<(String, Mem
     (no_answer, below)
 }
 
-/// The text of a completed task's `response` artifact.
-fn response_artifact(answer: &Value) -> Option<String> {
-    answer
-        .pointer("/result/artifacts")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|artifact| {
-            artifact.get("name").and_then(Value::as_str) == Some(crate::a2a::RESPONSE_ARTIFACT)
-        })
-        .and_then(|artifact| artifact.pointer("/parts/0/text"))
-        .and_then(Value::as_str)
+/// The text of a completed task's `response` artifact, found by its `artifactId`.
+fn response_artifact(task: &A2aTask) -> Option<String> {
+    task.artifact(crate::a2a::RESPONSE_ARTIFACT)?
+        .first_text()
         .map(str::to_string)
 }
 

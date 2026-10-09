@@ -208,12 +208,15 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         message("m-op", "hello"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_completed(&addr, Some(&operator), &task_id);
     let seen = rpc(&addr, Some(&watcher), "GetTask", json!({"id": task_id}));
     assert_eq!(
         seen.json()["result"]["status"]["state"],
-        "completed",
+        "TASK_STATE_COMPLETED",
         "{seen:?}"
     );
 
@@ -345,7 +348,10 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
     for token in [None, Some("garbage")] {
         let sent = rpc(&addr, token, "SendMessage", message("m-public", "hello"));
         assert_eq!(sent.status, 200, "{sent:?}");
-        let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+        let task_id = sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         wait_completed(&addr, None, &task_id);
     }
 
@@ -482,7 +488,10 @@ fn tokens_stay_out_of_the_session() {
         message("m-env", "read env"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_completed(&addr, Some(&tokens[1]), &task_id);
 
     // A refusal on the way: its body carries no token either.

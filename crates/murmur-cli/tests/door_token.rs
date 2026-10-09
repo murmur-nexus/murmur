@@ -159,7 +159,10 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
         // The operator token drives the door.
         let sent = rpc(&addr, Some(operator), "SendMessage", message("m-1", "hi"));
         assert_eq!(sent.status, 200, "{sent:?}");
-        let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+        let task_id = sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         wait_completed(&addr, Some(operator), &task_id);
 
         // A declared credential reads and is refused what its scopes do not grant.

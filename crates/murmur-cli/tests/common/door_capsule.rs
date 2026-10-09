@@ -37,7 +37,29 @@ pub fn stage_door(
     manifest: &Path,
     member: Option<Arc<capsule_runtime::FormationMember>>,
 ) -> capsule_runtime::StagedSession {
+    stage_door_with(home, manifest, member, false)
+}
+
+/// [`stage_door`] with every `runtime: tool` artifact the manifest lists offered to the model.
+pub fn stage_door_with_tools(home: &TempDir, manifest: &Path) -> capsule_runtime::StagedSession {
+    stage_door_with(home, manifest, None, true)
+}
+
+fn stage_door_with(
+    home: &TempDir,
+    manifest: &Path,
+    member: Option<Arc<capsule_runtime::FormationMember>>,
+    allow_tools: bool,
+) -> capsule_runtime::StagedSession {
     let runtime_manifest = murmur_artifact::load_runtime_manifest(manifest).unwrap();
+    let allowlisted_tools = runtime_manifest
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            allow_tools && matches!(artifact.runtime, murmur_artifact::ArtifactRuntime::Tool)
+        })
+        .map(|artifact| artifact.name.clone())
+        .collect();
     let artifacts = runtime_manifest
         .artifacts
         .iter()
@@ -63,7 +85,7 @@ pub fn stage_door(
             capsule_version: runtime_manifest.version.clone(),
             capsule_component_bytes: Vec::new(),
             artifacts,
-            allowlisted_tools: Default::default(),
+            allowlisted_tools,
             lock_expectations: None,
             capability_policy: capsule_runtime::capability_policy_from_runtime_manifest(
                 &runtime_manifest,
@@ -437,19 +459,20 @@ pub fn rpc(addr: &str, token: Option<&str>, method: &str, params: Value) -> Resp
     request(addr, "POST", "/", &headers, &body)
 }
 
-/// `SendMessage` params carrying `text`.
+/// `SendMessage` params carrying `text` from `ROLE_USER`.
 pub fn message(message_id: &str, text: &str) -> Value {
-    json!({"message": {"messageId": message_id, "role": "user", "parts": [{"text": text}]}})
+    json!({"message": {"messageId": message_id, "role": "ROLE_USER",
+        "parts": [{"text": text, "mediaType": "text/plain"}]}})
 }
 
-/// Polls `GetTask` under `token` until the task reaches `completed`, and returns it.
+/// Polls `GetTask` under `token` until the task reaches `TASK_STATE_COMPLETED`, and returns it.
 pub fn wait_completed(addr: &str, token: Option<&str>, task_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let response = rpc(addr, token, "GetTask", json!({"id": task_id}));
         assert_eq!(response.status, 200, "{response:?}");
         let task = response.json();
-        if task["result"]["status"]["state"] == "completed" {
+        if task["result"]["status"]["state"] == "TASK_STATE_COMPLETED" {
             return task;
         }
         assert!(
@@ -528,7 +551,10 @@ pub fn authenticated_capsule_with_a_task_in_flight(
         message("m-held", "hold"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_requests(&server, 1);
     (run, server, project, task_id)
 }

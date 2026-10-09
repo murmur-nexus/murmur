@@ -246,7 +246,10 @@ impl Session {
             message("m-held", "hold"),
         );
         assert_eq!(sent.status, 200, "{sent:?}");
-        sent.json()["result"]["id"].as_str().unwrap().to_string()
+        sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     fn door_session_id(&self) -> String {

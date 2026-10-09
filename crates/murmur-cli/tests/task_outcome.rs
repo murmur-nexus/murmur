@@ -637,9 +637,13 @@ fn send_message(addr: &str, text: &str) -> String {
     let sent = rpc(
         addr,
         "SendMessage",
-        json!({"message": {"messageId": "msg-1", "role": "user", "parts": [{"text": text}]}}),
+        json!({"message": {
+            "messageId": "msg-1",
+            "role": "ROLE_USER",
+            "parts": [{"text": text, "mediaType": "text/plain"}]
+        }}),
     );
-    sent["result"]["id"]
+    sent["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage returned no task id: {sent}"))
         .to_string()
@@ -668,7 +672,11 @@ fn stream_to_end(addr: &str, text: &str) -> (String, Value) {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendStreamingMessage",
-        "params": {"message": {"messageId": "msg-1", "role": "user", "parts": [{"text": text}]}}
+        "params": {"message": {
+            "messageId": "msg-1",
+            "role": "ROLE_USER",
+            "parts": [{"text": text}]
+        }}
     })
     .to_string();
     {
@@ -774,15 +782,15 @@ fn s5_a_failed_a2a_task_reads_failed_on_tasks_get() {
     let capsule = Capsule::launch(staged);
 
     let task_id = send_message(&capsule.url, TASK);
-    poll_until_state(&capsule.url, &task_id, "failed");
+    poll_until_state(&capsule.url, &task_id, "TASK_STATE_FAILED");
     let trace = capsule.trace();
     let task = TaskRecords::of_task(&trace, &task_id);
     task.sole_failure("driver_error");
     assert_eq!(task.task_end_status(), "failed");
 }
 
-/// On the door: a spent turn budget leaves the task `failed`, the state its stream already
-/// closed with.
+/// On the door: a spent turn budget leaves the task `TASK_STATE_FAILED`, the `failed` its stream
+/// already closed with.
 #[test]
 fn s8_a_spent_turn_budget_reads_failed_on_tasks_get() {
     let server = common::ScriptedServer::start(vec![tool_call("msg_1")]);
@@ -795,7 +803,7 @@ fn s8_a_spent_turn_budget_reads_failed_on_tasks_get() {
     let capsule = Capsule::launch(staged);
 
     let task_id = send_message(&capsule.url, TASK);
-    poll_until_state(&capsule.url, &task_id, "failed");
+    poll_until_state(&capsule.url, &task_id, "TASK_STATE_FAILED");
     let trace = capsule.trace();
     let task = TaskRecords::of_task(&trace, &task_id);
     assert_eq!(task.task_end_status(), "max_turns_reached");
@@ -826,7 +834,7 @@ fn s10_a_cancelled_task_ends_the_launch_canceled() {
     }
     let canceled = rpc(&capsule.url, "CancelTask", json!({"id": task_id}));
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
 

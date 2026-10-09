@@ -224,8 +224,8 @@ fn open_message_stream(addr: &str, message_id: &str, text: &str) -> TcpStream {
         "params": {
             "message": {
                 "messageId": message_id,
-                "role": "user",
-                "parts": [{"text": text}]
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }
         }
     })
@@ -339,6 +339,7 @@ fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Frame> {
 
 // ── tasks and trace ────────────────────────────────────────────────────────────
 
+/// `task_id`'s state as `GetTask` answers it: a `TASK_STATE_*` name, or empty on an error.
 fn task_state(addr: &str, task_id: &str) -> String {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": task_id}
@@ -347,6 +348,16 @@ fn task_state(addr: &str, task_id: &str) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The task the session trace's first `task_start` names, once there is one.
+fn first_started_task_id(workdir: &Path) -> Option<String> {
+    fs::read_to_string(workdir.join("trace.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|record| record["event_type"] == "task_start")
+        .and_then(|record| record["task_id"].as_str().map(str::to_string))
 }
 
 /// The session trace's records of `event_type` for `task_id`.
@@ -437,7 +448,7 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
         "a stream/watch replay shows the live stream's frames, boundary and final status included"
     );
 
-    assert_eq!(task_state(&capsule.url, &task_id), "completed");
+    assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
     assert_eq!(
         trace_records(&capsule.workdir, &task_id, "task_reopened").len(),
         1
@@ -477,7 +488,7 @@ fn a_task_refused_a_reopen_is_told_it_failed_once() {
     let task_id = stream.own_task_id();
     assert_first_boundary(&stream, &task_id, REOPEN_ALWAYS_HOOK);
 
-    assert_eq!(task_state(&capsule.url, &task_id), "failed");
+    assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_FAILED");
     let end = trace_records(&capsule.workdir, &task_id, "task_end");
     assert_eq!(end.len(), 1);
     assert_eq!(end[0]["exit_status"], "reopen_budget_exhausted");
@@ -511,7 +522,7 @@ fn a_failed_attempt_that_is_reopened_is_not_reported_failed() {
     let task_id = stream.own_task_id();
     assert_first_boundary(&stream, &task_id, REOPEN_ONCE_HOOK);
 
-    assert_eq!(task_state(&capsule.url, &task_id), "completed");
+    assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
     assert_eq!(
         trace_records(&capsule.workdir, &task_id, "task_failed").len(),
         1,
@@ -549,12 +560,15 @@ fn an_input_timeout_ends_the_task_with_one_failed_status() {
     );
     assert!(asked < stream.frames.len() - 1);
     assert!(stream.boundaries().is_empty(), "{:#?}", stream.frames);
-    assert_eq!(task_state(&capsule.url, &stream.own_task_id()), "failed");
+    assert_eq!(
+        task_state(&capsule.url, &stream.own_task_id()),
+        "TASK_STATE_FAILED"
+    );
 }
 
 /// The same timeout on a task a hook reopens is not the task's end: `GetTask` never reads
-/// `failed`, no `failed` frame is written, and the reopened attempt's answer is the one final
-/// `completed` status.
+/// `TASK_STATE_FAILED`, no `failed` frame is written, and the reopened attempt's answer is the one
+/// final `completed` status.
 #[test]
 fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     let capsule = launch_with_input_tool(
@@ -562,17 +576,22 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
         true,
     );
 
-    // Every state `GetTask` answers for the active task while the stream is open.
+    // Every state `GetTask` answers for the streamed task while the stream is open, from the
+    // moment the trace names it: the stream itself reports no id until it closes.
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let poller = {
-        let (seen, stop, url) = (Arc::clone(&seen), Arc::clone(&stop), capsule.url.clone());
+        let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
+        let (url, workdir) = (capsule.url.clone(), capsule.workdir.clone());
         std::thread::spawn(move || {
+            let mut task_id = None;
             while !stop.load(Ordering::Relaxed) {
-                let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{}}"#;
-                let response = http_post_json(&url, body);
-                if let Some(state) = response["result"]["status"]["state"].as_str() {
-                    seen.lock().unwrap().push(state.to_string());
+                task_id = task_id.or_else(|| first_started_task_id(&workdir));
+                if let Some(task_id) = &task_id {
+                    let state = task_state(&url, task_id);
+                    if !state.is_empty() {
+                        seen.lock().unwrap().push(state);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -598,14 +617,15 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
 
     let seen = seen.lock().unwrap();
     assert!(
-        seen.iter().any(|state| state == "input-required"),
+        seen.iter()
+            .any(|state| state == "TASK_STATE_INPUT_REQUIRED"),
         "the poller saw the wait: {seen:?}"
     );
     assert!(
-        !seen.iter().any(|state| state == "failed"),
-        "GetTask never reads failed: {seen:?}"
+        !seen.iter().any(|state| state == "TASK_STATE_FAILED"),
+        "GetTask never reads TASK_STATE_FAILED: {seen:?}"
     );
-    assert_eq!(task_state(&capsule.url, &task_id), "completed");
+    assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
     assert_eq!(
         trace_records(&capsule.workdir, &task_id, "task_failed")[0]["cause"],
         "input_timeout"

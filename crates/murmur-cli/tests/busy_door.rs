@@ -222,7 +222,7 @@ fn start_spin(capsule: &Capsule) -> String {
         Duration::from_secs(30),
     )
     .unwrap_or_else(|e| panic!("submitting the spinning task failed: {e}"));
-    let task_id = response["result"]["id"]
+    let task_id = response["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the door did not accept the task: {response}"))
         .to_string();
@@ -272,8 +272,8 @@ fn message_send(message_id: &str, text: &str) -> String {
         "method": "SendMessage",
         "params": {"message": {
             "messageId": message_id,
-            "role": "user",
-            "parts": [{"text": text}]
+            "role": "ROLE_USER",
+            "parts": [{"text": text, "mediaType": "text/plain"}]
         }}
     })
     .to_string()
@@ -503,7 +503,10 @@ fn every_door_path_answers_while_the_turn_is_busy() {
     )
     .unwrap_or_else(|e| panic!("GetTask went unanswered mid-turn: {e}"));
     eprintln!("[busy-door] GetTask answered in {:?}", started.elapsed());
-    assert_eq!(got["result"]["status"]["state"], "working", "{got}");
+    assert_eq!(
+        got["result"]["status"]["state"], "TASK_STATE_WORKING",
+        "{got}"
+    );
 
     let started = Instant::now();
     let sent = post_json(
@@ -516,7 +519,10 @@ fn every_door_path_answers_while_the_turn_is_busy() {
         "[busy-door] SendMessage answered in {:?}",
         started.elapsed()
     );
-    assert_eq!(sent["result"]["status"]["state"], "submitted", "{sent}");
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+        "{sent}"
+    );
 
     let (watch, opened) = open_watch(&capsule.url());
     read_until_line(&watch, "event: connection-ack", opened, PROBE_BUDGET)

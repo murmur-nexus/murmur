@@ -543,8 +543,8 @@ fn collect_sse_events(addr: &str, timeout: Duration) -> Vec<SseEvent> {
         "params": {
             "message": {
                 "messageId": "parity-1",
-                "role": "user",
-                "parts": [{"text": "do the parity thing"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "do the parity thing", "mediaType": "text/plain"}]
             }
         }
     })

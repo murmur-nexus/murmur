@@ -577,13 +577,13 @@ impl E2eCapsule {
                 "params": {"message": {
                     "messageId": message_id,
                     "contextId": self.context_id,
-                    "role": "user",
-                    "parts": [{"text": text}]
+                    "role": "ROLE_USER",
+                    "parts": [{"text": text, "mediaType": "text/plain"}]
                 }}
             })
             .to_string(),
         );
-        response["result"]["id"]
+        response["result"]["task"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("SendMessage did not return a task id: {response}"))
             .to_string()
@@ -611,7 +611,13 @@ impl E2eCapsule {
         loop {
             let response = self.tasks_get(task_id);
             let state = response["result"]["status"]["state"].as_str().unwrap_or("");
-            if matches!(state, "completed" | "failed" | "canceled" | "rejected") {
+            if matches!(
+                state,
+                "TASK_STATE_COMPLETED"
+                    | "TASK_STATE_FAILED"
+                    | "TASK_STATE_CANCELED"
+                    | "TASK_STATE_REJECTED"
+            ) {
                 return response;
             }
             assert!(
@@ -968,7 +974,7 @@ fn a_coding_task_edits_a_file_through_the_bridge_and_completes() {
     let task = capsule.submit("msg-edit", "Write the marker into notes/e2e.md.");
     let response = capsule.wait_for_terminal(&task, TURN_TIMEOUT);
     assert_eq!(
-        response["result"]["status"]["state"], "completed",
+        response["result"]["status"]["state"], "TASK_STATE_COMPLETED",
         "the task should have completed: {response}"
     );
     watch.wait_for(Duration::from_secs(10), |frames| {
@@ -1097,14 +1103,14 @@ fn a_second_task_in_the_same_context_resumes_the_same_session() {
     let first = capsule.submit("msg-1", &format!("Remember the word {SECRET}."));
     let response = capsule.wait_for_terminal(&first, TURN_TIMEOUT);
     assert_eq!(
-        response["result"]["status"]["state"], "completed",
+        response["result"]["status"]["state"], "TASK_STATE_COMPLETED",
         "the first task should have completed: {response}"
     );
 
     let second = capsule.submit("msg-2", "What word did I ask you to remember?");
     let response = capsule.wait_for_terminal(&second, TURN_TIMEOUT);
     assert_eq!(
-        response["result"]["status"]["state"], "completed",
+        response["result"]["status"]["state"], "TASK_STATE_COMPLETED",
         "the second task should have completed: {response}"
     );
 
@@ -1162,7 +1168,7 @@ fn a_cancel_mid_turn_ends_canceled_and_the_next_task_still_resumes() {
     capsule.tasks_cancel(&task);
     let response = capsule.wait_for_terminal(&task, TURN_TIMEOUT);
     assert_eq!(
-        response["result"]["status"]["state"], "canceled",
+        response["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "the canceled task ended in another state: {response}"
     );
 
@@ -1194,7 +1200,7 @@ fn a_cancel_mid_turn_ends_canceled_and_the_next_task_still_resumes() {
     let next = capsule.submit("msg-after-cancel", "Are you still there?");
     let response = capsule.wait_for_terminal(&next, TURN_TIMEOUT);
     assert_eq!(
-        response["result"]["status"]["state"], "completed",
+        response["result"]["status"]["state"], "TASK_STATE_COMPLETED",
         "the task after the cancel should have completed: {response}"
     );
 
@@ -1238,7 +1244,7 @@ fn assert_turn_failure(name: &str, scenario: &str, kind: &str) {
     let task = capsule.submit("msg-fail", "Do the thing.");
     let response = capsule.wait_for_terminal(&task, TURN_TIMEOUT);
     assert_eq!(
-        response["result"]["status"]["state"], "failed",
+        response["result"]["status"]["state"], "TASK_STATE_FAILED",
         "a {scenario} should fail the task, never complete it: {response}"
     );
 

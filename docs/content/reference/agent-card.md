@@ -56,8 +56,8 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
   },
   "securitySchemes": {},
   "securityRequirements": [],
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/plain", "application/json"],
   "skills": [
     {
       "id": "task",
@@ -96,8 +96,8 @@ Every key below is present on every card this runtime serves.
 | `capabilities` | object | See [`capabilities`](#capabilities) |
 | `securitySchemes` | object | `{}`, or the `bearer` scheme on an authenticated door — see [Security](#security) |
 | `securityRequirements` | array | `[]`, or one requirement on an authenticated door — see [Security](#security) |
-| `defaultInputModes` | array of strings | `["text/plain"]`. The door reads text parts only |
-| `defaultOutputModes` | array of strings | `["text/plain"]`. The door writes text parts only |
+| `defaultInputModes` | array of strings | `["text/plain", "application/json"]`. The door reads text parts and data parts — see [Parts](#parts) |
+| `defaultOutputModes` | array of strings | `["text/plain", "application/json"]`. The door writes text parts, and data parts in a cancel's `residue` artifact |
 | `skills` | array of objects | See [`skills`](#skills). Empty under `lifecycle.task_acceptance: none` |
 
 The card carries no `provider`, `documentationUrl`, `iconUrl` or `signatures`.
@@ -113,8 +113,8 @@ One interface: the JSON-RPC door at `POST /`.
 | `protocolVersion` | `1.0` |
 
 The door answers A2A v1.0 method names, and serves a JSON-RPC request only when it names version
-`1.0` in its [`A2A-Version`](#a2a-version) header. Task states are spelled in kebab-case:
-`submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled`.
+`1.0` in its [`A2A-Version`](#a2a-version) header. Tasks, messages and parts have the A2A v1.0
+ProtoJSON shape — see [Tasks and messages](#tasks-and-messages).
 
 ## `capabilities` { #capabilities }
 
@@ -221,8 +221,8 @@ methods a token reaches, not which tasks: a credential holding `SendStreamingMes
     }
   },
   "securityRequirements": [ { "schemes": { "bearer": { "list": [] } } } ],
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/plain", "application/json"],
   "skills": [
     {
       "id": "task",
@@ -401,7 +401,7 @@ The standard JSON-RPC errors carry no `data`:
 | `-32700` | `Invalid JSON payload` | A body that is not JSON. `id` is `null` |
 | `-32600` | `Request payload validation error` | A body that is not a [JSON-RPC 2.0 request](#jsonrpc-request) |
 | `-32601` | `Method not found` | A method the door extension does not list |
-| `-32602` | Names the parameter | `params` that is not an object, a `SendMessage` whose message does not parse, a `CancelTask` with no `id`, or an `x-murmur-forget-session` the capsule cannot act on |
+| `-32602` | Names the parameter | `params` that is not an object, a message the door cannot [read in full](#message), a message naming a waiting task in another `contextId`, a `GetTask` or `CancelTask` with no `id`, or an `x-murmur-forget-session` the capsule cannot act on |
 | `-32603` | Names the failure | A request the door accepted and could not hand to the session |
 
 Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo`:
@@ -415,11 +415,11 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 
 | Code | Error | `reason` | The door answers it | `metadata` |
 |---|---|---|---|---|
-| `-32001` | `TaskNotFoundError` | `TASK_NOT_FOUND` | On `GetTask` and `CancelTask` for an id this session never held or a [formation token](roster.md#formation-token) does not reach, and on `GetTask` with no `id` when the session holds no task | `taskId`, when the request named an id |
-| `-32002` | `TaskNotCancelableError` | `TASK_NOT_CANCELABLE` | On `CancelTask` for a task that had already ended. The task is left unchanged | `taskId`; `state`, the state it ended in, spelled as `GetTask` spells it: `completed`, `failed`, `rejected` or `canceled` |
+| `-32001` | `TaskNotFoundError` | `TASK_NOT_FOUND` | On `GetTask`, `CancelTask`, and a message whose `taskId` names an id this session never held or a [formation token](roster.md#formation-token) does not reach | `taskId` |
+| `-32002` | `TaskNotCancelableError` | `TASK_NOT_CANCELABLE` | On `CancelTask` for a task that had already ended. The task is left unchanged | `taskId`; `state`, the state it ended in, spelled as `GetTask` spells it: `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` or `TASK_STATE_CANCELED` |
 | `-32003` | `PushNotificationNotSupportedError` | `PUSH_NOTIFICATION_NOT_SUPPORTED` | Never | — |
-| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door | `{}` |
-| `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | Never | — |
+| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door, with `{}`. On a message whose `taskId` names a task that is not waiting for input — see [Continuing a task](#task-id) | `taskId` and `state`, on a message naming a task |
+| `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | On a message carrying a `raw` or `url` part — see [Parts](#parts) | `partIndex`, the first file part's 0-based index; `mediaType`, when that part declared one |
 | `-32006` | `InvalidAgentResponseError` | `INVALID_AGENT_RESPONSE` | Never | — |
 | `-32007` | `ExtendedAgentCardNotConfiguredError` | `EXTENDED_AGENT_CARD_NOT_CONFIGURED` | Never | — |
 | `-32008` | `ExtensionSupportRequiredError` | `EXTENSION_SUPPORT_REQUIRED` | Never | — |
@@ -428,15 +428,192 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 ```json
 {"jsonrpc": "2.0", "id": 3,
  "error": {"code": -32002,
-           "message": "Task cannot be canceled: it is already completed",
+           "message": "Task cannot be canceled: it is already TASK_STATE_COMPLETED",
            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
                      "reason": "TASK_NOT_CANCELABLE",
                      "domain": "a2a-protocol.org",
-                     "metadata": {"taskId": "tsk_…", "state": "completed"}}]}}
+                     "metadata": {"taskId": "tsk_…", "state": "TASK_STATE_COMPLETED"}}]}}
+```
+
+```json
+{"jsonrpc": "2.0", "id": 4,
+ "error": {"code": -32005,
+           "message": "message.parts[1] is a url part; this agent reads text and data parts only",
+           "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                     "reason": "CONTENT_TYPE_NOT_SUPPORTED",
+                     "domain": "a2a-protocol.org",
+                     "metadata": {"partIndex": "1", "mediaType": "application/pdf"}}]}}
 ```
 
 A completion's errors, `-31001` and `-31002`, are murmur's own and are listed under
 [Completion errors](#murmur-errors).
+
+### Tasks and messages { #tasks-and-messages }
+
+Every task, message, part and artifact on the JSON-RPC door is A2A v1.0 ProtoJSON: camelCase field
+names and enum value names. The door reads field names and enum values in that spelling only.
+
+#### Task states { #task-states }
+
+| `status.state` on the wire | Meaning | Murmur's word |
+|---|---|---|
+| `TASK_STATE_SUBMITTED` | Accepted and queued | `submitted` |
+| `TASK_STATE_WORKING` | Running | `working` |
+| `TASK_STATE_INPUT_REQUIRED` | Waiting for a reply — see [Continuing a task](#task-id) | `input-required` |
+| `TASK_STATE_COMPLETED` | Ended with an answer | `completed` |
+| `TASK_STATE_FAILED` | Ended without one | `failed` |
+| `TASK_STATE_REJECTED` | Refused, busy or closing, and never run | `rejected` |
+| `TASK_STATE_CANCELED` | Stopped by `CancelTask` or `session/stop` | `canceled` |
+
+The door never produces `TASK_STATE_AUTH_REQUIRED`: it authenticates a request before any task
+exists, so no task waits for authentication.
+
+Murmur's word is the spelling of every murmur interface: the [stream frames](streaming-protocol.md),
+[`murmur:message/send`](wit-interfaces.md#message-send)'s `task-result.state`, `mur` output and the
+trace.
+
+#### Messages { #message }
+
+`SendMessage` and `SendStreamingMessage` take `params.message`, an A2A `Message`. The door reads it
+in full or refuses it; no part is skipped.
+
+| Field | Required | Accepted |
+|---|---:|---|
+| `messageId` | yes | A non-empty string |
+| `role` | yes | `ROLE_USER` only. A message to this agent is from the user |
+| `parts` | yes | A non-empty array of [parts](#parts) |
+| `taskId` | no | A string naming the task this message continues — see [Continuing a task](#task-id). `""` names none |
+| `contextId` | no | A string. A new task without one is given a fresh `ctx_…` |
+| `referenceTaskIds` | no | An array of non-empty strings naming at most 16 distinct tasks — see [Referenced tasks](#reference-task-ids) |
+| `metadata`, `extensions` | no | Ignored |
+
+The checks run in this order, and the first failure answers:
+
+1. `params.message` is an object. A bare message as `params` is refused.
+2. `messageId`, `role`, then `parts`, as in the table.
+3. Every part sets exactly one of `text`, `raw`, `url` and `data`.
+4. `text`, `raw`, `url`, `mediaType` and `filename` are strings where present.
+5. `taskId` and `contextId`, then `referenceTaskIds`, as in the table.
+6. The first `raw` or `url` part: [`-32005`](#errors).
+
+Steps 1 to 5 answer `-32602`. Every refusal comes before the door looks up a task or starts one: a
+refused message starts no task, writes no trace record, reaches no model and delivers nothing to a
+waiting task. Unknown fields are ignored.
+
+#### Parts { #parts }
+
+| Part | The door | The agent receives |
+|---|---|---|
+| `{"text": "…"}` | Reads it, whatever its `mediaType` | The text |
+| `{"data": <any JSON>}` | Reads it, `null` included, whatever its `mediaType` | The value in a fenced block — see below |
+| `{"raw": "…"}`, `{"url": "…"}` | Refuses the message with `-32005` | Nothing |
+
+| Part field | The agent receives |
+|---|---|
+| `mediaType`, `filename` | On a data part, in the fence's opening line. Not on a text part |
+| `metadata` | Never |
+
+The agent reads the parts in order, joined by a newline. A data part is its value pretty-printed in a
+Markdown code fence labelled `data`, followed by `media-type=<mediaType>` and `filename=<filename>`
+when the part has them. Whitespace, backticks and `=` in those values become `_`. The fence is one
+backtick longer than the longest run of backticks in the value, and at least three, so nothing in the
+value closes it:
+
+`````text
+summarise
+````data media-type=application/json
+{
+  "note": "a ``` b",
+  "rows": [
+    1,
+    2
+  ]
+}
+````
+`````
+
+A task whose [trust class](../concepts/access-control.md#task-origin-and-trust-class) is untrusted
+has the whole text, fence included, wrapped in the [untrusted fence](untrusted-fence.md).
+
+Every text part the door writes has `mediaType` `text/plain`, and every data part
+`application/json`.
+
+#### Continuing a task { #task-id }
+
+`SendMessage` and `SendStreamingMessage` route a message by the task its `taskId` names:
+
+| The message names | Answer |
+|---|---|
+| No task, or `""` | A new task: `TASK_STATE_SUBMITTED`, or `TASK_STATE_REJECTED` when the door has no room or the session is closing |
+| A task this session never held, or one a formation token does not reach | [`-32001`](#errors) |
+| A task that has ended | [`-32004`](#errors), naming its state. Send a new message without `taskId`, in the same `contextId`, to start a new task |
+| A `TASK_STATE_SUBMITTED` or `TASK_STATE_WORKING` task | `-32004`, naming its state. A task takes a message only while it waits in `TASK_STATE_INPUT_REQUIRED` |
+| A `TASK_STATE_INPUT_REQUIRED` task, with a `contextId` other than the task's | `-32602` |
+| A `TASK_STATE_INPUT_REQUIRED` task | The message's text is the task's reply, and the task is answered in `TASK_STATE_WORKING`. The door's capacity is not consulted |
+
+A message that names no task never reaches a waiting one. `SendStreamingMessage` answers each
+refusal as one JSON body before any event, except a new task refused for room, which is a `rejected`
+[status frame](streaming-protocol.md). A stream that continues a task ends on that task's final
+status.
+
+#### Referenced tasks { #reference-task-ids }
+
+`referenceTaskIds` names tasks the message refers to. Each id is kept once, in first-occurrence
+order, recorded on the task's [`task_start`](observability-schemas.md#task-start-record), and named to the
+agent in a block after the parts, as each task stood when the message arrived:
+
+`````text
+<the parts>
+
+Referenced tasks:
+- tsk_a: completed
+```response
+four
+```
+- tsk_b: failed: the driver failed
+- tsk_c: working
+- tsk_d: not a task this capsule holds
+`````
+
+| Referenced task | Its line |
+|---|---|
+| Live | `- <id>: <state>` |
+| `completed`, with a response | `- <id>: completed`, then the response in a fence labelled `response` |
+| Ended otherwise, with a final status message | `- <id>: <state>: <message>`, the message on one line |
+| Never held, or one a formation token does not reach | `- <id>: not a task this capsule holds` |
+
+States are [murmur's words](#task-states). A message without `referenceTaskIds` gets no block.
+
+#### Answers { #send-message-response }
+
+`SendMessage` answers a `SendMessageResponse`: `{"task": <Task>}` for a new, rejected or continued
+task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door accepted:
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "result": {"task": {"id": "tsk_…", "contextId": "ctx_…",
+                     "status": {"state": "TASK_STATE_SUBMITTED"}}}}
+```
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "result": {"message": {"messageId": "msg_dlg_…_received", "contextId": "ctx_…",
+                        "role": "ROLE_AGENT",
+                        "parts": [{"data": {"delegation_id": "dlg_…", "received": true},
+                                   "mediaType": "application/json"}]}}}
+```
+
+`SendMessage` answers as soon as the task is accepted, whatever `configuration.returnImmediately`
+says: A2A v1.0 has a request without it wait for a terminal or interrupted state. Poll
+[`GetTask`](#tasks-get), or read the task's frames with `SendStreamingMessage`. The door ignores
+`configuration`, push notification configs and `tenant`.
+
+A message from the agent — a task's `status.message`, a completion's acknowledgement — has `role`
+`ROLE_AGENT`. A task's `status.message` also carries its `contextId` and `taskId`.
+
+Every artifact carries an `artifactId`, which is its name: `response`, `prompt` or `residue`. Each
+occurs at most once in a task, and its id is the same on every read.
+
 
 
 ## `skills` { #skills }
@@ -550,29 +727,55 @@ A completion sent with any method but `SendMessage` is answered `-32601`.
 
 #### `GetTask` { #tasks-get }
 
-`GetTask` answers the task `params.id` names, running or finished, as an A2A `Task`:
+`GetTask` answers the task `params.id` names, running or finished, as an A2A `Task`. `params.id`
+is required: a `GetTask` without one, or with `""`, is answered `-32602` `GetTask requires an id`.
+`historyLength` is accepted and ignored; a task carries no `history`.
 
 | Key | Present |
 |---|---|
 | `id`, `contextId`, `status.state` | Always |
-| `status.message` | On a terminal task — `completed`, `failed`, `canceled` or `rejected` — whose final status said something: a message from the agent with one text part, the same text as the task's final [`status` frame](streaming-protocol.md#one-final-status) |
-| `artifacts: [{"name": "response", …}]` | On a `completed` task that produced a response: its answer, as one text part |
-| `artifacts: [{"name": "prompt", …}]` | On an `input-required` task: the question it is waiting on |
+| `status.message` | On a terminal task — `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED` or `TASK_STATE_REJECTED` — whose final status said something: a `ROLE_AGENT` message with one text part, the same text as the task's final [`status` frame](streaming-protocol.md#one-final-status) |
+| `artifacts: [{"artifactId": "response", …}]` | On a `TASK_STATE_COMPLETED` task that produced a response: its answer, as one text part |
+| `artifacts: [{"artifactId": "prompt", …}]` | On a `TASK_STATE_INPUT_REQUIRED` task: the question it is waiting on |
 | `metadata.murmur` | On a terminal task with something to say about answers it lacks — see [No-answer metadata](#no-answer-metadata) |
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
- "status": {"state": "completed",
-            "message": {"messageId": "msg_tsk_…_status", "role": "agent", "parts": [{"text": "session ended"}]}},
- "artifacts": [{"name": "response", "parts": [{"text": "four"}]}]}
+ "status": {"state": "TASK_STATE_COMPLETED",
+            "message": {"messageId": "msg_tsk_…_status", "contextId": "ctx_…", "taskId": "tsk_…",
+                        "role": "ROLE_AGENT",
+                        "parts": [{"text": "session ended", "mediaType": "text/plain"}]}},
+ "artifacts": [{"artifactId": "response", "name": "response",
+                "parts": [{"text": "four", "mediaType": "text/plain"}]}]}
+```
+
+```json
+{"id": "tsk_…", "contextId": "ctx_…",
+ "status": {"state": "TASK_STATE_INPUT_REQUIRED"},
+ "artifacts": [{"artifactId": "prompt", "name": "prompt",
+                "parts": [{"text": "Which branch?", "mediaType": "text/plain"}]}]}
+```
+
+`CancelTask` on a live task answers the task in `TASK_STATE_CANCELED`, with a `residue` artifact
+naming what the session still runs, one data part per item, when anything is:
+
+```json
+{"id": "tsk_…", "contextId": "ctx_…",
+ "status": {"state": "TASK_STATE_CANCELED"},
+ "artifacts": [{"artifactId": "residue", "name": "residue",
+                "parts": [{"data": {"kind": "detached_shell", "work_id": "wrk_…",
+                                    "binary": "sleep", "command": "sleep 30",
+                                    "started_at_ms": 1760000000000},
+                           "mediaType": "application/json"}]}]}
 ```
 
 On a [formation token](roster.md#formation-token), `GetTask` answers only the tasks the calling
 member submitted. Any other id — another member's task, the operator's, or one the session never
 held — is answered `-32001 Task not found`. Every other credential reads every task.
 
-A `SendMessage` the door has no room for answers a `rejected` task whose `status.message` says
-why: `task rejected: capsule is busy`, or `task rejected: the session is closing`.
+A `SendMessage` the door has no room for answers a `TASK_STATE_REJECTED` task whose
+`status.message` says why: `task rejected: capsule is busy`, or
+`task rejected: the session is closing`.
 
 ##### No-answer metadata { #no-answer-metadata }
 
@@ -586,8 +789,10 @@ when neither key is present.
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
- "status": {"state": "failed",
-            "message": {"messageId": "msg_tsk_…_status", "role": "agent", "parts": [{"text": "q gave no answer"}]}},
+ "status": {"state": "TASK_STATE_FAILED",
+            "message": {"messageId": "msg_tsk_…_status", "contextId": "ctx_…", "taskId": "tsk_…",
+                        "role": "ROLE_AGENT",
+                        "parts": [{"text": "q gave no answer", "mediaType": "text/plain"}]}},
  "metadata": {"murmur": {"noAnswer": true,
                          "noAnswerBelow": [{"member": "q", "status": "timed_out"}]}}}
 ```
@@ -684,6 +889,13 @@ changes these:
 | A completion refused with `-32004` | [`-31001` or `-31002`](#murmur-errors). `-32004` is `UnsupportedOperationError` only |
 | Errors without `data` | Every A2A error carries an [`ErrorInfo`](#errors) |
 | Credential scopes `message/send`, `message/stream`, `tasks/get`, `tasks/cancel` | `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`. A manifest listing a 0.3 name is refused — see [`network.authentication.credentials`](manifest.md#field-network-authentication) |
+| Task states `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled` | [`TASK_STATE_*`](#task-states) |
+| `role: "user"`, `role: "agent"` | `ROLE_USER`, `ROLE_AGENT`. A message with `role: "user"` is refused |
+| `message/send` answering a bare task | `SendMessage` answering [`{"task": …}`](#send-message-response) |
+| A reply reaching whichever task waited for input | A reply names its task in [`taskId`](#task-id) |
+| A part with `kind`, and a file or data part skipped | A part sets one of `text`, `raw`, `url` or `data`. A data part is [read](#parts); a file part is refused with `-32005` |
+| Artifacts without an id | Every artifact carries an [`artifactId`](#send-message-response) |
+| `tasks/get` without an `id` answering the active task | `GetTask` requires an [`id`](#tasks-get) |
 
 The 0.3 method names are answered `-32601` `Method not found`. `stream/watch`, `session/stop` and
 the `x-murmur-*` headers keep their names.

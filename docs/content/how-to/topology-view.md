@@ -357,11 +357,11 @@ TASK_ID=$(curl -s -X POST "http://${WORKER_URL}" \
       "message": {
         "messageId": "msg-001",
         "contextId": "ctx-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Reply with the single word pong."}]
       }
     }
-  }' | jq -r '.result.id')
+  }' | jq -r '.result.task.id')
 echo "Task: $TASK_ID"
 ```
 
@@ -375,7 +375,7 @@ while true; do
     -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"GetTask\",\"params\":{\"id\":\"${TASK_ID}\"}}" \
     | jq -r '.result.status.state')
   echo "State: $STATE"
-  [ "$STATE" = "completed" ] || [ "$STATE" = "failed" ] && break
+  [ "$STATE" = "TASK_STATE_COMPLETED" ] || [ "$STATE" = "TASK_STATE_FAILED" ] && break
   sleep 2
 done
 ```

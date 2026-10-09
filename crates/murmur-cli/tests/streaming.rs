@@ -226,8 +226,8 @@ fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration)
         "params": {
             "message": {
                 "messageId": msg_id,
-                "role": "user",
-                "parts": [{"text": "streaming test task"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "streaming test task", "mediaType": "text/plain"}]
             }
         }
     })

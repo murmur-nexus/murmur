@@ -163,7 +163,7 @@ curl -s -X POST http://localhost:$PORT \
     "params": {
       "message": {
         "messageId": "msg-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Deploy the latest build. Confirm the target environment before proceeding."}]
       }
     }
@@ -177,20 +177,22 @@ Response:
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "id": "tsk_01jw...",
-    "contextId": "ctx_01jw...",
-    "status": { "state": "submitted" }
+    "task": {
+      "id": "tsk_01jw...",
+      "contextId": "ctx_01jw...",
+      "status": { "state": "TASK_STATE_SUBMITTED" }
+    }
   }
 }
 ```
 
-Save the task `id` — you will need it to detect the pause.
+Save the task `id` at `result.task.id`: you need it to detect the pause and to answer.
 
 ---
 
 ## Step 4 — detect when the agent is waiting
 
-Poll `GetTask` with the task ID until the state changes to `input-required`:
+Poll `GetTask` with the task ID until the state changes to `TASK_STATE_INPUT_REQUIRED`:
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
@@ -208,11 +210,17 @@ While the agent is waiting, the response includes the question it formed:
   "result": {
     "id": "tsk_01jw...",
     "contextId": "ctx_01jw...",
-    "status": { "state": "input-required" },
+    "status": { "state": "TASK_STATE_INPUT_REQUIRED" },
     "artifacts": [
       {
+        "artifactId": "prompt",
         "name": "prompt",
-        "parts": [{ "text": "Which environment should I deploy to? (staging, production)" }]
+        "parts": [
+          {
+            "text": "Which environment should I deploy to? (staging, production)",
+            "mediaType": "text/plain"
+          }
+        ]
       }
     ]
   }
@@ -225,7 +233,7 @@ The agent's question is at `result.artifacts[0].parts[0].text`. Read it and deci
 
 ## Step 5 — send your answer
 
-Send a message to the same capsule URL:
+Send a message to the same capsule URL, naming the waiting task in `taskId`:
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
@@ -238,7 +246,8 @@ curl -s -X POST http://localhost:$PORT \
     "params": {
       "message": {
         "messageId": "reply-001",
-        "role": "user",
+        "taskId": "<your_task_id>",
+        "role": "ROLE_USER",
         "parts": [{"text": "staging"}]
       }
     }
@@ -252,14 +261,20 @@ The answer is delivered directly to the suspended tool call. The agent receives 
   "jsonrpc": "2.0",
   "id": 3,
   "result": {
-    "id": "tsk_01jw...",
-    "contextId": "ctx_01jw...",
-    "status": { "state": "working" }
+    "task": {
+      "id": "tsk_01jw...",
+      "contextId": "ctx_01jw...",
+      "status": { "state": "TASK_STATE_WORKING" }
+    }
   }
 }
 ```
 
-Poll `GetTask` again until `state` reaches `completed` or `failed`.
+A message without `taskId` starts a new task instead, and never reaches the waiting one. A reply
+naming a task that is not waiting is refused: see
+[Continuing a task](../reference/agent-card.md#task-id).
+
+Poll `GetTask` again until `state` reaches `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED`.
 
 ---
 
@@ -283,8 +298,8 @@ When the deadline passes, the tool call fails and the attempt ends. The task the
 |---|---|
 | `murmur-tool-request-input` | WASM tool artifact; `runtime: tool`; platform-independent |
 | `prompt` parameter | The question the model asks the operator; string, required |
-| Task state while waiting | `"input-required"` |
+| Task state while waiting | `"TASK_STATE_INPUT_REQUIRED"` |
 | Where to read the question | `result.artifacts[0].parts[0].text` from `GetTask` |
-| How to resume the agent | Send a message to the same capsule URL |
-| State after reply | `"working"` immediately; poll until `"completed"` |
+| How to resume the agent | Send a message to the same capsule URL whose `taskId` names the waiting task |
+| State after reply | `"TASK_STATE_WORKING"` immediately; poll until `"TASK_STATE_COMPLETED"` |
 | `lifecycle.input_timeout_secs` | Integer seconds to wait for a reply; absent = wait indefinitely |

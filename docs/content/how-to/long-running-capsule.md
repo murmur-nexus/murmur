@@ -100,7 +100,7 @@ Start from a working agent manifest (inference block, driver artifact, network a
 
 **What each field does:**
 
-- `task_acceptance: queue` — the capsule accepts incoming messages even while a task is running, up to `queue_depth` pending tasks at a time. Without this, a second call while the capsule is busy gets `state: "rejected"` immediately.
+- `task_acceptance: queue` — the capsule accepts incoming messages even while a task is running, up to `queue_depth` pending tasks at a time. Without this, a second call while the capsule is busy is answered immediately with a task in `TASK_STATE_REJECTED`.
 - `after_task: sleep` — instead of exiting when a task finishes, the capsule parks on the queue channel and waits for the next task. This is what keeps it alive between tasks.
 - `queue_depth: 2` — sets the buffer to 2 pending tasks; you can use any positive integer. While one task is running, incoming messages queue up to this limit; any message that arrives when the buffer is full is rejected immediately.
 - `conversation: threaded` — when two tasks share the same `contextId`, the second task picks up the full conversation history left by the first, giving the model a continuous thread. Omit this field (or set it to `stateless`) to keep every task independent regardless of `contextId`.
@@ -158,7 +158,7 @@ curl -s -X POST http://localhost:$PORT \
       "message": {
         "messageId": "msg-001",
         "contextId": "ctx-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Here are some scores: alice=92, bob=85, carol=78, dave=91. How many entries are there?"}]
       }
     }
@@ -172,14 +172,16 @@ Response:
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
-    "id": "tsk_019e23bd122f77e291a065f9481325cb",
-    "contextId": "ctx-001",
-    "status": { "state": "submitted" }
+    "task": {
+      "id": "tsk_019e23bd122f77e291a065f9481325cb",
+      "contextId": "ctx-001",
+      "status": { "state": "TASK_STATE_SUBMITTED" }
+    }
   }
 }
 ```
 
-Save the returned `id` — that is the **task ID** you will use to poll status.
+Save the returned `result.task.id` — that is the **task ID** you will use to poll status.
 
 Send a second task while the first is still running. Use the same `contextId` to continue the conversation thread:
 
@@ -195,14 +197,14 @@ curl -s -X POST http://localhost:$PORT \
       "message": {
         "messageId": "msg-002",
         "contextId": "ctx-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Who has the highest score?"}]
       }
     }
   }'
 ```
 
-Because `queue_depth: 2`, this second task is accepted and queued. A third task sent at the same moment would receive `state: "rejected"`.
+Because `queue_depth: 2`, this second task is accepted and queued. A third task sent at the same moment would be answered in `TASK_STATE_REJECTED`.
 
 When task 2 runs, the agent receives the full history from task 1 — the scores list and the answer about the count — so it can answer the follow-up without the data being repeated. Each completed task also writes a per-task result file alongside the shared `out/result.txt`:
 
@@ -218,7 +220,7 @@ To start a separate, independent thread, use a different `contextId`. Each `cont
 
 ## Step 5 — poll task status
 
-Use `GetTask` with the task ID from step 3:
+Use `GetTask` with the task ID from step 4:
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
@@ -227,7 +229,7 @@ curl -s -X POST http://localhost:$PORT \
   -d '{"jsonrpc":"2.0","id":3,"method":"GetTask","params":{"id":"<your_task_id>"}}'
 ```
 
-`state` progresses through: `submitted` → `working` → `completed` | `failed`. If you poll after the task has finished you will see `completed` or `failed` directly — `working` is only visible during active processing.
+`status.state` progresses through `TASK_STATE_SUBMITTED` → `TASK_STATE_WORKING` → `TASK_STATE_COMPLETED` | `TASK_STATE_FAILED`. If you poll after the task has finished you will see `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED` directly — `TASK_STATE_WORKING` is only visible during active processing. [Task states](../reference/agent-card.md#task-states) lists every state.
 
 ```json
 {
@@ -236,7 +238,7 @@ curl -s -X POST http://localhost:$PORT \
   "result": {
     "id": "tsk_019e23bd122f77e291a065f9481325cb",
     "contextId": "ctx-001",
-    "status": { "state": "working" }
+    "status": { "state": "TASK_STATE_WORKING" }
   }
 }
 ```

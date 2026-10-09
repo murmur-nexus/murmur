@@ -223,8 +223,8 @@ A 200 response confirms the capsule is running:
   },
   "securitySchemes": {},
   "securityRequirements": [],
-  "defaultInputModes": ["text/plain"],
-  "defaultOutputModes": ["text/plain"],
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/plain", "application/json"],
   "skills": [
     {
       "id": "task",
@@ -257,7 +257,7 @@ curl -s -X POST http://1.2.3.4:9000 \
     "params": {
       "message": {
         "messageId": "msg-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Hello from the cloud."}]
       }
     }

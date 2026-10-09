@@ -561,7 +561,7 @@ loop has exited, on every exit path
 
 A script capsule writes these lines, before its buffered `a2a_send` lines, after its `run` returns.
 
-**`task_start`** — written at the start of each task, before the agent loop runs
+**`task_start`**{ #task-start-record } — written at the start of each task, before the agent loop runs
 
 | Field | Type | Notes |
 |---|---|---|
@@ -571,7 +571,9 @@ A script capsule writes these lines, before its buffered `a2a_send` lines, after
 | `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
-| `message_parts_bytes` | u64 | Byte length of the task message text |
+| `message_parts_bytes` | u64 | Byte length of the task message text: for an A2A task, the text the agent reads, with each data part fenced and the referenced-tasks block appended — see [Parts](agent-card.md#parts) |
+| `part_kinds` | array of strings | `"text"` \| `"data"` for each part of the A2A message the task arrived as, in order. Absent on a task that did not arrive over the door |
+| `reference_task_ids` | array of strings | The message's [`referenceTaskIds`](agent-card.md#reference-task-ids), each once, in first-occurrence order. Absent when it referenced none |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for
 `task.md` tasks. A `"detached_shell"` task follows the `shell_completed` line that enqueued it and

@@ -570,7 +570,10 @@ fn an_unanswered_call_times_out_and_an_ended_task_abandons_its_calls() {
         let token = project.door_token(peer["session_id"].as_str().unwrap());
         let addr = peer["url"].as_str().unwrap().trim_start_matches("http://");
         let task = rpc(addr, Some(&token), "GetTask", json!({"id": task_id})).json();
-        assert_eq!(task["result"]["status"]["state"], "working", "{task}");
+        assert_eq!(
+            task["result"]["status"]["state"], "TASK_STATE_WORKING",
+            "{task}"
+        );
 
         release_lead.send(()).unwrap();
         let status = launcher.wait();
@@ -1971,7 +1974,7 @@ fn two_tier_formation_trace_names_every_call() {
             common::door_capsule::message(&format!("m-op-{sent}"), "OPERATOR-TASK"),
         )
         .json();
-        if answer["result"]["status"]["state"] == "rejected" {
+        if answer["result"]["task"]["status"]["state"] == "TASK_STATE_REJECTED" {
             break;
         }
         if sent == 1 {
@@ -2310,7 +2313,10 @@ fn a_member_with_no_answer_from_below_ends_without_one_and_its_caller_is_told() 
         assert!(p_continued.contains(said), "{said}: {p_continued}");
     }
     let task = p_task(&project, &formation_id, &formation);
-    assert_eq!(task["result"]["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["result"]["status"]["state"], "TASK_STATE_FAILED",
+        "{task}"
+    );
     assert_eq!(
         task["result"]["metadata"]["murmur"]["noAnswer"], true,
         "{task}"
@@ -2390,7 +2396,10 @@ fn a_member_that_answers_without_a_callee_is_completed_with_a_gap() {
 
     project.await_requests("lead", 3);
     let task = p_task(&project, &formation_id, &formation);
-    assert_eq!(task["result"]["status"]["state"], "completed", "{task}");
+    assert_eq!(
+        task["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{task}"
+    );
     assert!(task["result"]["metadata"]["murmur"]
         .get("noAnswer")
         .is_none());
@@ -2452,7 +2461,10 @@ fn a_decline_on_the_last_allowed_turn_ends_without_an_answer() {
 
     project.await_requests("lead", 3);
     let task = p_task(&project, &formation_id, &formation);
-    assert_eq!(task["result"]["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["result"]["status"]["state"], "TASK_STATE_FAILED",
+        "{task}"
+    );
     assert_eq!(
         task["result"]["metadata"]["murmur"]["noAnswer"], true,
         "{task}"

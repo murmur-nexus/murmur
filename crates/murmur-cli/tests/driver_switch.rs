@@ -512,15 +512,15 @@ impl Idle {
             "method": "SendMessage",
             "params": {"message": {
                 "messageId": format!("switch-{n}"),
-                "role": "user",
+                "role": "ROLE_USER",
                 "contextId": CONTEXT,
-                "parts": [{"text": text}]
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }}
         })
         .to_string();
         let response = http_post_json(&self.addr(), &request);
         assert_eq!(
-            response["result"]["status"]["state"], "submitted",
+            response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
             "{response}"
         );
         wait_for_task_ends(&self.workdir(), n);

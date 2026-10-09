@@ -1901,6 +1901,10 @@ running: wrk_9f2a1c  detached shell  sleep 30
 ended:   dlg_7b31de  delegation  worker@0.1.0
 ```
 
+The `state:` line is the task's state in murmur's word, mapped from the
+[`TASK_STATE_*` name](agent-card.md#task-states) the door answers; a value that is no A2A v1.0
+state is printed as sent.
+
 Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` changes
 nothing. The door answers [`-32002`](agent-card.md#errors), and the command prints the state the
 task ended in, names no residue, and exits `0`:

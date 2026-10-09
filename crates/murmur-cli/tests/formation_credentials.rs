@@ -120,7 +120,10 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         message("m-a", "hi"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let got = rpc(&coder.addr, Some(&token), "GetTask", json!({"id": task_id}));
     assert_eq!(got.status, 200, "{got:?}");
     assert!(got.json()["result"]["id"].is_string(), "{got:?}");
@@ -237,7 +240,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
 
     // (f) `CancelTask` reaches the tasks the member submitted itself, and no other: the
     // operator's task is `-32001`, as an id the door never held would be.
-    let operator_task = operator.json()["result"]["id"]
+    let operator_task = operator.json()["result"]["task"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -326,7 +329,13 @@ fn wait_terminal(addr: &str, token: &str, task_id: &str) -> Value {
         let state = task["result"]["status"]["state"]
             .as_str()
             .unwrap_or_default();
-        if matches!(state, "completed" | "failed" | "canceled" | "rejected") {
+        if matches!(
+            state,
+            "TASK_STATE_COMPLETED"
+                | "TASK_STATE_FAILED"
+                | "TASK_STATE_CANCELED"
+                | "TASK_STATE_REJECTED"
+        ) {
             return task;
         }
         assert!(
@@ -375,19 +384,26 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         "SendMessage",
         message("m-1", "answer"),
     );
-    let completed_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let completed_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let completed = wait_terminal(&coder.addr, &planner, &completed_id);
     assert_eq!(
-        completed["result"]["status"]["state"], "completed",
+        completed["result"]["status"]["state"], "TASK_STATE_COMPLETED",
         "{completed}"
     );
     assert_eq!(
         completed["result"]["artifacts"],
-        json!([{"name": "response", "parts": [{"text": "PLANNER-ANSWER"}]}]),
+        json!([{
+            "artifactId": "response",
+            "name": "response",
+            "parts": [{"text": "PLANNER-ANSWER", "mediaType": "text/plain"}]
+        }]),
         "{completed}"
     );
     let message_of = |task: &Value| task["result"]["status"]["message"].clone();
-    assert_eq!(message_of(&completed)["role"], "agent", "{completed}");
+    assert_eq!(message_of(&completed)["role"], "ROLE_AGENT", "{completed}");
 
     let sent = rpc(
         &coder.addr,
@@ -395,9 +411,15 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         "SendMessage",
         message("m-2", "fail"),
     );
-    let failed_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let failed_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let failed = wait_terminal(&coder.addr, &planner, &failed_id);
-    assert_eq!(failed["result"]["status"]["state"], "failed", "{failed}");
+    assert_eq!(
+        failed["result"]["status"]["state"], "TASK_STATE_FAILED",
+        "{failed}"
+    );
     assert!(failed["result"].get("artifacts").is_none(), "{failed}");
     // The final status a task whose driver response could not be read ends with.
     assert_eq!(

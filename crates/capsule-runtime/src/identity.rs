@@ -6,9 +6,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::a2a::{
-    A2aError, A2aMessage, A2aTask, CancelOutcome, IncomingTask, JsonRpcRequest, JsonRpcResponse,
-    MurmurError, TaskRegistry, TaskState, TaskStatus, INTERNAL_ERROR, INVALID_PARAMS,
-    METHOD_NOT_FOUND,
+    read_send_params, A2aError, A2aTask, CancelOutcome, IncomingMessage, IncomingTask,
+    JsonRpcRequest, JsonRpcResponse, MurmurError, Part, Role, TaskRegistry, TaskState, TaskStatus,
+    DATA_MEDIA_TYPE, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, TEXT_MEDIA_TYPE,
 };
 use crate::cancel::{Arrival, LiveDelegations, Residue};
 use crate::control_plane::{handle_control_request, is_control_path, ControlPlane, ControlRequest};
@@ -311,8 +311,8 @@ pub(crate) const INTERFACE_PROTOCOL_VERSION: &str = crate::a2a::A2A_PROTOCOL_VER
 /// The `protocolBinding` of the door's interface.
 const JSONRPC_BINDING: &str = "JSONRPC";
 
-/// The media type of every part the door reads and writes.
-const TEXT_MODE: &str = "text/plain";
+/// The media types of the parts the door reads and writes: text, and JSON data.
+const MEDIA_MODES: [&str; 2] = [TEXT_MEDIA_TYPE, DATA_MEDIA_TYPE];
 
 /// Build the A2A v1.0 `AgentCard` the door serves at `/.well-known/agent-card.json`.
 ///
@@ -421,8 +421,8 @@ pub(crate) fn build_agent_card(
         },
         "securitySchemes": {},
         "securityRequirements": [],
-        "defaultInputModes": [TEXT_MODE],
-        "defaultOutputModes": [TEXT_MODE],
+        "defaultInputModes": MEDIA_MODES,
+        "defaultOutputModes": MEDIA_MODES,
         "skills": skills,
     })
 }
@@ -1126,10 +1126,12 @@ async fn handle_connection(
                     req,
                     &task_registry,
                     &task_tx,
-                    traceparent,
-                    provenance,
-                    forget_session,
-                    caller_member,
+                    MessageSender {
+                        traceparent,
+                        provenance,
+                        forget_session,
+                        caller_member,
+                    },
                     last_event_id,
                     sse_tx,
                     sse_buffer,
@@ -1233,16 +1235,19 @@ fn framed_bytes(response: &ResourceResponse) -> Vec<u8> {
     bytes
 }
 
+/// `SendStreamingMessage`: route the message as [`route_message`] does, then stream the session's
+/// frames until the task it started or continued reaches its final status.
+///
+/// Every refusal [`read_send_params`] or the router answers with is one JSON-RPC body, written
+/// before any SSE head. A new task the registry has no room for is the one refusal written as a
+/// stream: a `rejected` status frame.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message_stream(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     req: JsonRpcRequest,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
-    traceparent: Option<String>,
-    provenance: TaskProvenance,
-    forget_session: bool,
-    caller_member: Option<String>,
+    sender: MessageSender,
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
@@ -1250,11 +1255,25 @@ async fn handle_message_stream(
 ) {
     use tokio::io::AsyncWriteExt;
 
-    // Subscribe to broadcast BEFORE writing headers so we don't miss events
-    // emitted between enqueue and the start of our receive loop.
+    // Subscribe before the message is routed, so no frame the task writes once it is enqueued or
+    // handed its input is missed.
     let mut rx = sse_tx.subscribe();
 
-    // Write SSE response headers immediately
+    let routed = match read_send_params(&req.params) {
+        Ok(message) => route_message(&req.id, message, task_registry, task_tx, sender),
+        Err(refusal) => MessageRoute::Refused(refusal.into_response(req.id.clone())),
+    };
+    let (task_id, rejected) = match routed {
+        MessageRoute::Refused(response) => {
+            let _ = writer
+                .write_all(response.into_http_response().as_bytes())
+                .await;
+            return;
+        }
+        MessageRoute::Started(task) | MessageRoute::Continued(task) => (task.id, None),
+        MessageRoute::Rejected { task, refusal } => (task.id.clone(), Some((task, refusal))),
+    };
+
     let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n\r\n";
     if writer.write_all(headers.as_bytes()).await.is_err() {
         return;
@@ -1270,47 +1289,12 @@ async fn handle_message_stream(
         }
     }
 
-    // Parse the A2A message from params
-    let msg_value = req.params.get("message").unwrap_or(&req.params);
-    let message: A2aMessage = match serde_json::from_value(msg_value.clone()) {
-        Ok(m) => m,
-        Err(e) => {
-            let error_data = format!("{{\"error\":\"Invalid params: {e}\"}}");
-            let event_text = format_unnumbered_sse_event(StreamFrame::Error, &error_data);
-            let _ = writer.write_all(event_text.as_bytes()).await;
-            return;
-        }
-    };
-
-    let text = message.extract_text();
-    let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-    let context_id = message
-        .context_id
-        .clone()
-        .unwrap_or_else(|| format!("ctx_{}", uuid::Uuid::now_v7().simple()));
-
-    // Capacity check and enqueue — release lock before any await. `refusal` is the refused
-    // frame's message, read under the lock that decided the refusal.
-    let refusal = {
-        let mut reg = task_registry.lock().unwrap();
-        if reg.can_accept() {
-            reg.enqueue(&task_id, &context_id);
-            if let Some(member) = &caller_member {
-                reg.record_submitter(&task_id, member);
-            }
-            None
-        } else if reg.is_closed() {
-            Some(crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE)
-        } else {
-            Some(crate::a2a::REJECTED_BUSY_MESSAGE)
-        }
-    };
-    if let Some(refusal) = refusal {
+    if let Some((task, refusal)) = rejected {
         let rejected_event = TaskStatusUpdateEvent {
-            id: task_id.clone(),
-            context_id: Some(context_id.clone()),
+            id: task.id,
+            context_id: Some(task.context_id),
             status: StreamStatus {
-                state: "rejected".into(),
+                state: TaskState::Rejected.as_str().into(),
                 message: refusal.into(),
                 response: None,
                 reopen: None,
@@ -1320,32 +1304,6 @@ async fn handle_message_stream(
         let _ = writer
             .write_all(format_rejected_event(&rejected_event).as_bytes())
             .await;
-        return;
-    }
-
-    // Send to agent loop via mpsc
-    let incoming = IncomingTask {
-        task_id: task_id.clone(),
-        context_id,
-        message_id: message.message_id.clone(),
-        message_text: text,
-        traceparent,
-        provenance,
-        source: crate::a2a::SOURCE_A2A,
-        forget_session,
-        caller_member,
-    };
-    if task_tx.try_send(incoming).is_err() {
-        {
-            let mut reg = task_registry.lock().unwrap();
-            reg.pending_count -= 1;
-            reg.history.remove(&task_id);
-        } // lock dropped before await
-        let event_text = format_unnumbered_sse_event(
-            StreamFrame::Error,
-            "{\"error\":\"internal error: queue send failed\"}",
-        );
-        let _ = writer.write_all(event_text.as_bytes()).await;
         return;
     }
 
@@ -1574,7 +1532,7 @@ fn handle_completion(
     match live_delegations.arrive(delegation_id) {
         Arrival::Delivered | Arrival::AlreadyDelivered => JsonRpcResponse::ok(
             req.id.clone(),
-            serde_json::json!({ "delegation_id": delegation_id, "received": true }),
+            serde_json::json!({ "message": completion_received(&req.params, delegation_id) }),
         )
         .into_http_response(),
         Arrival::NotOutstanding => not_awaited(format!(
@@ -1585,6 +1543,23 @@ fn handle_completion(
              outcome"
         )),
     }
+}
+
+/// The message acknowledging a completion for `delegation_id` whose request carried `params`: from
+/// the agent, in the completion's own `contextId` when it named one, holding one data part.
+fn completion_received(params: &Value, delegation_id: &str) -> Value {
+    let mut message = serde_json::json!({
+        "messageId": format!("msg_{delegation_id}_received"),
+        "role": Role::Agent,
+        "parts": [Part::data(serde_json::json!({
+            "delegation_id": delegation_id,
+            "received": true,
+        }))],
+    });
+    if let Some(context_id) = params.pointer("/message/contextId").and_then(Value::as_str) {
+        message["contextId"] = Value::String(context_id.to_string());
+    }
+    message
 }
 
 /// Answers a resolved method that replies with one JSON-RPC body.
@@ -1609,10 +1584,12 @@ fn handle_jsonrpc(
             &req.params,
             task_registry,
             task_tx,
-            traceparent,
-            provenance,
-            forget_session,
-            caller_member,
+            MessageSender {
+                traceparent,
+                provenance,
+                forget_session,
+                caller_member,
+            },
         ),
         DoorMethod::GetTask => {
             handle_tasks_get(id, &req.params, task_registry, caller_member.as_deref())
@@ -1636,102 +1613,218 @@ fn handle_jsonrpc(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_message_send(
-    id: Value,
-    params: &Value,
-    task_registry: &Arc<Mutex<TaskRegistry>>,
+/// What the door read off a message's request besides its body: who sent it, and the headers the
+/// task it starts carries.
+pub(crate) struct MessageSender {
+    pub traceparent: Option<String>,
+    pub provenance: TaskProvenance,
+    pub forget_session: bool,
+    /// The formation member that sent it, when the door let it in on a formation token.
+    pub caller_member: Option<String>,
+}
+
+/// What [`route_message`] did with a message.
+#[derive(Debug)]
+enum MessageRoute {
+    /// A new task, enqueued and handed to the task loop, in `TASK_STATE_SUBMITTED`.
+    Started(A2aTask),
+    /// A new task refused because the capsule has no room for it or its session is closing, in
+    /// `TASK_STATE_REJECTED`. `refusal` is its status message. Nothing was enqueued.
+    Rejected {
+        task: A2aTask,
+        refusal: &'static str,
+    },
+    /// The message went to the task it names, which was waiting for input and is now
+    /// `TASK_STATE_WORKING`.
+    Continued(A2aTask),
+    /// The error answering the message. Nothing was started or delivered.
+    Refused(JsonRpcResponse),
+}
+
+/// Route one message `SendMessage` or `SendStreamingMessage` read, under one registry lock.
+///
+/// | The message names | Route |
+/// |---|---|
+/// | no `taskId` | a new task: [`MessageRoute::Rejected`] when the registry cannot accept one, otherwise [`MessageRoute::Started`] |
+/// | a task the registry does not hold, or one `sender` may not see | `-32001` `TaskNotFoundError` |
+/// | an ended task | `-32004` `UnsupportedOperationError` naming its state |
+/// | a `submitted` or `working` task | `-32004` naming its state: a task takes a message only while it waits for input |
+/// | an `input-required` task in another `contextId` | `-32602` |
+/// | an `input-required` task | [`MessageRoute::Continued`]: the text goes to its waiter, and capacity is not consulted |
+///
+/// The text delivered is [`IncomingMessage::agent_text`] followed by the
+/// [`TaskRegistry::reference_block`] for its `referenceTaskIds`, rendered under the same lock, so
+/// each referenced task is named as it stood when the message arrived. `id` is the request's.
+fn route_message(
+    id: &Value,
+    message: IncomingMessage,
+    task_registry: &Mutex<TaskRegistry>,
     task_tx: &mpsc::Sender<IncomingTask>,
-    traceparent: Option<String>,
-    provenance: TaskProvenance,
-    forget_session: bool,
-    caller_member: Option<String>,
-) -> String {
-    let msg_value = params.get("message").unwrap_or(params);
-    let message: A2aMessage = match serde_json::from_value(msg_value.clone()) {
-        Ok(m) => m,
-        Err(e) => {
-            return JsonRpcResponse::err(id, INVALID_PARAMS, &format!("Invalid params: {e}"))
-                .into_http_response();
-        }
-    };
-
-    let text = message.extract_text();
-
-    // Check if the active task is waiting for input — deliver to it instead of enqueuing.
-    {
-        let mut reg = task_registry.lock().unwrap();
-        if let Some(active_task_id) = reg.active_input_required_task_id() {
-            if reg.deliver_input(&active_task_id, text.clone()).is_ok() {
-                if let Some(task) = reg.get_task(&active_task_id) {
-                    return JsonRpcResponse::ok(id, task).into_http_response();
-                }
-            }
-        }
+    sender: MessageSender,
+) -> MessageRoute {
+    let mut reg = task_registry.lock().unwrap();
+    let caller = sender.caller_member.as_deref();
+    let mut text = message.agent_text();
+    if let Some(block) = reg.reference_block(&message.reference_task_ids, |task_id| {
+        visible_to(&reg, task_id, caller)
+    }) {
+        text = format!("{text}\n\n{block}");
     }
 
+    let Some(task_id) = message.task_id.clone() else {
+        return start_task(id, message, text, &mut reg, task_tx, sender);
+    };
+    let Some((state, task_context)) = reg
+        .history
+        .get(&task_id)
+        .filter(|_| visible_to(&reg, &task_id, caller))
+        .cloned()
+    else {
+        return MessageRoute::Refused(task_not_found_response(id.clone(), Some(&task_id)));
+    };
+    let unsupported = |message: String| {
+        MessageRoute::Refused(JsonRpcResponse::a2a_error(
+            id.clone(),
+            A2aError::UnsupportedOperation,
+            &message,
+            &[
+                ("taskId", task_id.clone()),
+                ("state", state.wire_name().to_string()),
+            ],
+        ))
+    };
+    if state.is_terminal() {
+        return unsupported(format!(
+            "task {task_id} has ended in {}; send a new message without taskId, in the same \
+             contextId, to start a new task",
+            state.wire_name()
+        ));
+    }
+    if state != TaskState::InputRequired {
+        return unsupported(format!(
+            "task {task_id} is {}; this agent takes a message on a task only while it waits in \
+             {}",
+            state.wire_name(),
+            TaskState::InputRequired.wire_name()
+        ));
+    }
+    if let Some(context_id) = message.context_id.as_deref().filter(|c| *c != task_context) {
+        return MessageRoute::Refused(JsonRpcResponse::err(
+            id.clone(),
+            INVALID_PARAMS,
+            &format!(
+                "Invalid params: message.contextId {context_id} does not match task {task_id}, \
+                 whose contextId is {task_context}"
+            ),
+        ));
+    }
+    if reg.deliver_input(&task_id, text).is_err() {
+        return unsupported(format!("task {task_id} is no longer waiting for input"));
+    }
+    match reg.get_task(&task_id) {
+        Some(task) => MessageRoute::Continued(task),
+        None => MessageRoute::Refused(task_not_found_response(id.clone(), Some(&task_id))),
+    }
+}
+
+/// [`route_message`] for a message that names no task: a new task, minted, checked against the
+/// registry's capacity, enqueued and handed to the task loop, all under the caller's lock.
+fn start_task(
+    id: &Value,
+    message: IncomingMessage,
+    text: String,
+    reg: &mut TaskRegistry,
+    task_tx: &mpsc::Sender<IncomingTask>,
+    sender: MessageSender,
+) -> MessageRoute {
     let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
     let context_id = message
         .context_id
         .clone()
         .unwrap_or_else(|| format!("ctx_{}", uuid::Uuid::now_v7().simple()));
 
-    // Capacity check and enqueue under lock
-    {
-        let mut reg = task_registry.lock().unwrap();
-        if !reg.can_accept() {
-            let refusal = if reg.is_closed() {
-                crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE
-            } else {
-                crate::a2a::REJECTED_BUSY_MESSAGE
-            };
-            let task = A2aTask {
-                status: TaskStatus {
-                    state: TaskState::Rejected,
-                    message: Some(crate::a2a::StatusMessage::agent(&task_id, refusal)),
-                },
-                id: task_id,
-                context_id,
-                artifacts: None,
-                metadata: None,
-            };
-            return JsonRpcResponse::ok(id, task).into_http_response();
-        }
-        reg.enqueue(&task_id, &context_id);
-        if let Some(member) = &caller_member {
-            reg.record_submitter(&task_id, member);
-        }
+    if !reg.can_accept() {
+        let refusal = if reg.is_closed() {
+            crate::a2a::REJECTED_SESSION_CLOSING_MESSAGE
+        } else {
+            crate::a2a::REJECTED_BUSY_MESSAGE
+        };
+        let task = A2aTask {
+            status: TaskStatus {
+                state: TaskState::Rejected,
+                message: Some(crate::a2a::StatusMessage::agent(
+                    &task_id,
+                    &context_id,
+                    refusal,
+                )),
+            },
+            id: task_id,
+            context_id,
+            artifacts: None,
+            metadata: None,
+        };
+        return MessageRoute::Rejected { task, refusal };
+    }
+    reg.enqueue(&task_id, &context_id);
+    if let Some(member) = &sender.caller_member {
+        reg.record_submitter(&task_id, member);
     }
 
-    // Send to mpsc (should always succeed — capacity was checked under the same lock)
+    let part_kinds = message.part_kinds();
     let incoming = IncomingTask {
         task_id: task_id.clone(),
         context_id: context_id.clone(),
-        message_id: message.message_id.clone(),
+        message_id: message.message_id,
         message_text: text,
-        traceparent,
-        provenance,
+        traceparent: sender.traceparent,
+        provenance: sender.provenance,
         source: crate::a2a::SOURCE_A2A,
-        forget_session,
-        caller_member,
+        forget_session: sender.forget_session,
+        caller_member: sender.caller_member,
+        reference_task_ids: message.reference_task_ids,
+        part_kinds,
     };
+    // Capacity was checked under this lock, so the channel has room; a failure is unexpected and
+    // takes the task back out of the registry.
     if task_tx.try_send(incoming).is_err() {
-        // Unexpected path — roll back pending count
-        let mut reg = task_registry.lock().unwrap();
         reg.pending_count -= 1;
         reg.history.remove(&task_id);
-        return JsonRpcResponse::err(id, INTERNAL_ERROR, "internal error: queue send failed")
-            .into_http_response();
+        return MessageRoute::Refused(JsonRpcResponse::err(
+            id.clone(),
+            INTERNAL_ERROR,
+            "internal error: queue send failed",
+        ));
     }
 
-    let task = A2aTask {
+    MessageRoute::Started(A2aTask {
         id: task_id,
         context_id,
         status: TaskStatus::of(TaskState::Submitted),
         artifacts: None,
         metadata: None,
+    })
+}
+
+/// `SendMessage`: the message routed as [`route_message`] routes it, answered as a
+/// `SendMessageResponse` holding the task, or as the error refusing it.
+fn handle_message_send(
+    id: Value,
+    params: &Value,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    task_tx: &mpsc::Sender<IncomingTask>,
+    sender: MessageSender,
+) -> String {
+    let message = match read_send_params(params) {
+        Ok(message) => message,
+        Err(refusal) => return refusal.into_response(id).into_http_response(),
     };
-    JsonRpcResponse::ok(id, task).into_http_response()
+    let task = match route_message(&id, message, task_registry, task_tx, sender) {
+        MessageRoute::Started(task)
+        | MessageRoute::Continued(task)
+        | MessageRoute::Rejected { task, .. } => task,
+        MessageRoute::Refused(response) => return response.into_http_response(),
+    };
+    JsonRpcResponse::ok(id, serde_json::json!({ "task": task })).into_http_response()
 }
 
 /// Whether `caller_member` may read or cancel `task_id`: the operator (`None`) reaches every
@@ -1742,15 +1835,20 @@ fn visible_to(reg: &TaskRegistry, task_id: &str, caller_member: Option<&str>) ->
 
 /// The `TaskNotFoundError` answering a request that named `task_id`, or named none.
 fn task_not_found(id: Value, task_id: Option<&str>) -> String {
+    task_not_found_response(id, task_id).into_http_response()
+}
+
+/// [`task_not_found`] as a response.
+fn task_not_found_response(id: Value, task_id: Option<&str>) -> JsonRpcResponse {
     let metadata: Vec<(&str, String)> = task_id
         .map(|task_id| ("taskId", task_id.to_string()))
         .into_iter()
         .collect();
     JsonRpcResponse::a2a_error(id, A2aError::TaskNotFound, "Task not found", &metadata)
-        .into_http_response()
 }
 
-/// `GetTask`: one task's state, and how it ended once it has.
+/// `GetTask`: one task's state, and how it ended once it has. `params.id` is required, and
+/// `historyLength` is ignored: the door keeps no message history, so a task carries none.
 ///
 /// A formation member — `caller_member`, from the formation token the door let in — reads only
 /// the tasks it submitted itself. Every other id, another member's task or the operator's
@@ -1763,23 +1861,14 @@ fn handle_tasks_get(
     task_registry: &Arc<Mutex<TaskRegistry>>,
     caller_member: Option<&str>,
 ) -> String {
-    let requested_id = params.get("id").and_then(Value::as_str).map(str::to_string);
-
-    let Some(task_id) = requested_id else {
-        // With no id, the active slot's task, if there is one.
-        let reg = task_registry.lock().unwrap();
-        let active_id = match &reg.active_slot {
-            crate::a2a::TaskSlotState::Empty => return task_not_found(id, None),
-            crate::a2a::TaskSlotState::Running { task_id, .. }
-            | crate::a2a::TaskSlotState::Done { task_id, .. } => task_id.clone(),
-        };
-        return match reg
-            .get_task(&active_id)
-            .filter(|_| visible_to(&reg, &active_id, caller_member))
-        {
-            Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
-            None => task_not_found(id, None),
-        };
+    let Some(task_id) = params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.is_empty())
+        .map(str::to_string)
+    else {
+        return JsonRpcResponse::err(id, INVALID_PARAMS, "GetTask requires an id")
+            .into_http_response();
     };
 
     let reg = task_registry.lock().unwrap();
@@ -1835,7 +1924,7 @@ fn handle_tasks_cancel(
     match (outcome, task) {
         (CancelOutcome::Unknown, _) | (_, None) => task_not_found(id, Some(&task_id)),
         (CancelOutcome::AlreadyTerminal, Some(task)) => {
-            let state = task.status.state.as_str();
+            let state = task.status.state.wire_name();
             JsonRpcResponse::a2a_error(
                 id,
                 A2aError::TaskNotCancelable,
@@ -2225,8 +2314,8 @@ mod tests {
                 },
                 "securitySchemes": {},
                 "securityRequirements": [],
-                "defaultInputModes": ["text/plain"],
-                "defaultOutputModes": ["text/plain"],
+                "defaultInputModes": ["text/plain", "application/json"],
+                "defaultOutputModes": ["text/plain", "application/json"],
                 "skills": [
                     {
                         "id": "task",
@@ -2337,11 +2426,12 @@ mod tests {
             assert_eq!(card["securityRequirements"], serde_json::json!([]));
             assert_eq!(card["capabilities"]["extendedAgentCard"], false);
             assert_eq!(card["capabilities"]["pushNotifications"], false);
-            assert_eq!(card["defaultInputModes"], serde_json::json!(["text/plain"]));
-            assert_eq!(
-                card["defaultOutputModes"],
-                serde_json::json!(["text/plain"])
-            );
+            for modes in ["defaultInputModes", "defaultOutputModes"] {
+                assert_eq!(
+                    card[modes],
+                    serde_json::json!(["text/plain", "application/json"])
+                );
+            }
         }
     }
 
@@ -2797,8 +2887,8 @@ mod tests {
                     }
                 },
                 "securityRequirements": [ { "schemes": { "bearer": { "list": [] } } } ],
-                "defaultInputModes": ["text/plain"],
-                "defaultOutputModes": ["text/plain"],
+                "defaultInputModes": ["text/plain", "application/json"],
+                "defaultOutputModes": ["text/plain", "application/json"],
                 "skills": [
                     {
                         "id": "task",
@@ -2853,8 +2943,8 @@ mod tests {
                     }
                 },
                 "securityRequirements": [ { "schemes": { "bearer": { "list": [] } } } ],
-                "defaultInputModes": ["text/plain"],
-                "defaultOutputModes": ["text/plain"],
+                "defaultInputModes": ["text/plain", "application/json"],
+                "defaultOutputModes": ["text/plain", "application/json"],
                 "skills": [
                     {
                         "id": "task",
@@ -3051,10 +3141,25 @@ mod tests {
         serde_json::json!({
             "message": {
                 "messageId": message_id,
-                "role": "user",
+                "role": "ROLE_USER",
                 "parts": [{"text": "hello"}]
             }
         })
+    }
+
+    /// The sender of a message the operator sent, carrying no headers.
+    fn operator() -> MessageSender {
+        member(None)
+    }
+
+    /// The sender of a message the formation member `caller` sent, or the operator for `None`.
+    fn member(caller: Option<&str>) -> MessageSender {
+        MessageSender {
+            traceparent: None,
+            provenance: TaskProvenance::derive(TaskOrigin::User, None),
+            forget_session: false,
+            caller_member: caller.map(str::to_string),
+        }
     }
 
     fn response_json(response: &str) -> Value {
@@ -3075,14 +3180,11 @@ mod tests {
             &message_send_params("msg_late"),
             &task_registry,
             &task_tx,
-            None,
-            TaskProvenance::derive(TaskOrigin::User, None),
-            false,
-            None,
+            operator(),
         ));
 
         assert_eq!(
-            response["result"]["status"]["state"], "rejected",
+            response["result"]["task"]["status"]["state"], "TASK_STATE_REJECTED",
             "{response}"
         );
         assert!(
@@ -3122,7 +3224,7 @@ mod tests {
 
         let canceled = cancel("tsk_mine");
         assert_eq!(
-            canceled["result"]["status"]["state"], "canceled",
+            canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
             "{canceled}"
         );
         for other in ["tsk_theirs", "tsk_operator"] {
@@ -3132,7 +3234,7 @@ mod tests {
             let state = task_registry.lock().unwrap().get_task(other).unwrap();
             assert_ne!(
                 serde_json::to_value(&state).unwrap()["status"]["state"],
-                "canceled",
+                "TASK_STATE_CANCELED",
                 "{other} was cancelled by a member that did not submit it"
             );
         }
@@ -3144,7 +3246,7 @@ mod tests {
         assert_eq!(info["reason"], "TASK_NOT_CANCELABLE", "{ended}");
         assert_eq!(
             info["metadata"],
-            serde_json::json!({"taskId": "tsk_mine", "state": "canceled"})
+            serde_json::json!({"taskId": "tsk_mine", "state": "TASK_STATE_CANCELED"})
         );
         let unknown = cancel("tsk_never");
         assert_eq!(unknown["error"]["code"], -32001, "{unknown}");
@@ -3171,10 +3273,334 @@ mod tests {
             None,
         );
 
-        assert!(response.contains(r#""state":"rejected""#), "{response}");
+        assert!(
+            response.contains(r#""state":"TASK_STATE_REJECTED""#),
+            "{response}"
+        );
         let response = response_json(&response);
         assert_eq!(response["result"]["id"], "tsk_refused");
         assert_eq!(response["result"]["contextId"], "ctx_refused");
+    }
+
+    /// `SendMessage` with `message` as the formation member `caller`, or the operator, answered.
+    fn send(
+        registry: &Arc<Mutex<TaskRegistry>>,
+        task_tx: &mpsc::Sender<IncomingTask>,
+        caller: Option<&str>,
+        message: Value,
+    ) -> Value {
+        response_json(&handle_message_send(
+            serde_json::json!(1),
+            &serde_json::json!({ "message": message }),
+            registry,
+            task_tx,
+            member(caller),
+        ))
+    }
+
+    fn naming(task_id: &str, context_id: Option<&str>, text: &str) -> Value {
+        let mut message = serde_json::json!({"messageId": "msg_reply", "role": "ROLE_USER",
+            "taskId": task_id, "parts": [{"text": text}]});
+        if let Some(context_id) = context_id {
+            message["contextId"] = Value::from(context_id);
+        }
+        message
+    }
+
+    /// A registry holding `tsk_wait`, which `planner` submitted and which waits for input in
+    /// `ctx_wait`, with `tsk_done` completed and `tsk_queued` submitted, both by the operator. Its queue is full, so it has no room for a new task.
+    fn routing_registry() -> (Arc<Mutex<TaskRegistry>>, oneshot::Receiver<String>) {
+        let mut reg = TaskRegistry::new(4, TaskAcceptance::Queue);
+        reg.enqueue("tsk_done", "ctx_done");
+        reg.start_task(
+            "tsk_done".to_string(),
+            "ctx_done".to_string(),
+            crate::lanes::TaskLane::User,
+        );
+        reg.finish_task(TaskState::Completed);
+        reg.record_ending("tsk_done", "done", Some("four"), false, &[]);
+        reg.enqueue("tsk_wait", "ctx_wait");
+        reg.record_submitter("tsk_wait", "planner");
+        reg.start_task(
+            "tsk_wait".to_string(),
+            "ctx_wait".to_string(),
+            crate::lanes::TaskLane::User,
+        );
+        let (tx, rx) = oneshot::channel();
+        reg.set_input_required("tsk_wait", "which branch?".to_string(), tx)
+            .unwrap();
+        reg.enqueue("tsk_queued", "ctx_q");
+        reg.queue_depth = 1;
+        (Arc::new(Mutex::new(reg)), rx)
+    }
+
+    fn error_of(answer: &Value) -> (i64, Value) {
+        (
+            answer["error"]["code"].as_i64().unwrap_or_default(),
+            answer["error"]["data"][0]["metadata"].clone(),
+        )
+    }
+
+    /// Each row of the router's table, against one registry.
+    #[test]
+    fn a_message_is_routed_by_the_task_it_names() {
+        let (registry, mut waiter) = routing_registry();
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let state = |task_id: &str| {
+            registry
+                .lock()
+                .unwrap()
+                .get_task(task_id)
+                .unwrap()
+                .status
+                .state
+        };
+
+        // No task, or `""`: a new task, refused here because the registry has no room.
+        for task_id in [None, Some("")] {
+            let mut message = serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                "parts": [{"text": "hi"}]});
+            if let Some(task_id) = task_id {
+                message["taskId"] = Value::from(task_id);
+            }
+            let answer = send(&registry, &task_tx, None, message);
+            assert_eq!(
+                answer["result"]["task"]["status"]["state"], "TASK_STATE_REJECTED",
+                "{answer}"
+            );
+            assert_eq!(state("tsk_wait"), TaskState::InputRequired);
+        }
+
+        // An unknown id, and the operator's view of a task is not a member's.
+        let answer = send(&registry, &task_tx, None, naming("tsk_nope", None, "x"));
+        assert_eq!(
+            error_of(&answer),
+            (-32001, serde_json::json!({"taskId": "tsk_nope"}))
+        );
+        let answer = send(
+            &registry,
+            &task_tx,
+            Some("reviewer"),
+            naming("tsk_wait", None, "x"),
+        );
+        assert_eq!(
+            error_of(&answer),
+            (-32001, serde_json::json!({"taskId": "tsk_wait"}))
+        );
+
+        // An ended task, and a live one that waits for nothing.
+        let answer = send(&registry, &task_tx, None, naming("tsk_done", None, "x"));
+        assert_eq!(
+            error_of(&answer),
+            (
+                -32004,
+                serde_json::json!({"taskId": "tsk_done", "state": "TASK_STATE_COMPLETED"})
+            )
+        );
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("without taskId"),
+            "{answer}"
+        );
+        let answer = send(&registry, &task_tx, None, naming("tsk_queued", None, "x"));
+        assert_eq!(
+            error_of(&answer),
+            (
+                -32004,
+                serde_json::json!({"taskId": "tsk_queued", "state": "TASK_STATE_SUBMITTED"})
+            )
+        );
+
+        // The waiting task in another context.
+        let answer = send(
+            &registry,
+            &task_tx,
+            None,
+            naming("tsk_wait", Some("ctx_other"), "x"),
+        );
+        assert_eq!(answer["error"]["code"], -32602, "{answer}");
+        let text = answer["error"]["message"].as_str().unwrap();
+        assert!(
+            text.contains("ctx_other") && text.contains("ctx_wait"),
+            "{text}"
+        );
+        assert!(waiter.try_recv().is_err(), "nothing was delivered yet");
+
+        // The waiting task, by the member that submitted it, in its own context.
+        let answer = send(
+            &registry,
+            &task_tx,
+            Some("planner"),
+            naming("tsk_wait", Some("ctx_wait"), "main"),
+        );
+        assert_eq!(
+            answer["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
+            "{answer}"
+        );
+        assert_eq!(answer["result"]["task"]["id"], "tsk_wait");
+        assert_eq!(waiter.try_recv().unwrap(), "main");
+        assert!(task_rx.try_recv().is_err(), "no task was started");
+
+        // Now working, it takes no further message.
+        let answer = send(&registry, &task_tx, None, naming("tsk_wait", None, "x"));
+        assert_eq!(
+            error_of(&answer),
+            (
+                -32004,
+                serde_json::json!({"taskId": "tsk_wait", "state": "TASK_STATE_WORKING"})
+            )
+        );
+    }
+
+    /// A message that names no task never reaches the one waiting for input, which is what the
+    /// door did before it read `taskId`.
+    #[test]
+    fn a_message_naming_no_task_never_reaches_a_waiting_one() {
+        let (registry, mut waiter) = routing_registry();
+        registry.lock().unwrap().queue_depth = 4;
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let answer = send(
+            &registry,
+            &task_tx,
+            None,
+            serde_json::json!({"messageId": "m", "role": "ROLE_USER", "parts": [{"text": "hi"}]}),
+        );
+        assert_eq!(
+            answer["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+            "{answer}"
+        );
+        assert!(answer["result"].get("id").is_none(), "{answer}");
+        assert!(waiter.try_recv().is_err());
+        let incoming = task_rx.try_recv().unwrap();
+        assert_eq!(incoming.message_text, "hi");
+        assert_eq!(incoming.part_kinds, ["text"]);
+    }
+
+    /// A continuation's text, and a new task's, carry the reference block, rendered with the
+    /// sender's view of the registry.
+    #[test]
+    fn referenced_tasks_reach_the_task_as_the_sender_may_see_them() {
+        let (registry, mut waiter) = routing_registry();
+        registry.lock().unwrap().queue_depth = 4;
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let mut message = naming("tsk_wait", None, "go");
+        message["referenceTaskIds"] = serde_json::json!(["tsk_done", "tsk_done", "tsk_none"]);
+        let answer = send(&registry, &task_tx, Some("planner"), message);
+        assert_eq!(
+            answer["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
+            "{answer}"
+        );
+        assert_eq!(
+            waiter.try_recv().unwrap(),
+            "go\n\nReferenced tasks:\n\
+             - tsk_done: not a task this capsule holds\n\
+             - tsk_none: not a task this capsule holds"
+        );
+
+        let answer = send(
+            &registry,
+            &task_tx,
+            None,
+            serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                "parts": [{"text": "sum"}, {"data": [1, 2]}],
+                "referenceTaskIds": ["tsk_done", "tsk_done"]}),
+        );
+        assert_eq!(
+            answer["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+            "{answer}"
+        );
+        let incoming = task_rx.try_recv().unwrap();
+        assert_eq!(
+            incoming.message_text,
+            "sum\n```data\n[\n  1,\n  2\n]\n```\n\nReferenced tasks:\n\
+             - tsk_done: completed\n```response\nfour\n```"
+        );
+        assert_eq!(incoming.reference_task_ids, ["tsk_done"]);
+        assert_eq!(incoming.part_kinds, ["text", "data"]);
+    }
+
+    /// A message the door cannot read in full is refused before it is routed: no task, and
+    /// nothing delivered to a waiting one.
+    #[test]
+    fn a_refused_message_starts_nothing_and_delivers_nothing() {
+        let (registry, mut waiter) = routing_registry();
+        registry.lock().unwrap().queue_depth = 4;
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let held = registry.lock().unwrap().history.len();
+        for (parts, code) in [
+            (
+                serde_json::json!([{"url": "https://example.com/x.pdf"}]),
+                -32005,
+            ),
+            (serde_json::json!([{"raw": "aGk="}]), -32005),
+            (serde_json::json!([{"text": 1}]), -32602),
+        ] {
+            for task_id in [None, Some("tsk_wait")] {
+                let mut message =
+                    serde_json::json!({"messageId": "m", "role": "ROLE_USER", "parts": parts});
+                if let Some(task_id) = task_id {
+                    message["taskId"] = Value::from(task_id);
+                }
+                let answer = send(&registry, &task_tx, Some("planner"), message);
+                assert_eq!(answer["error"]["code"], code, "{answer}");
+            }
+        }
+        assert!(waiter.try_recv().is_err());
+        assert!(task_rx.try_recv().is_err());
+        let reg = registry.lock().unwrap();
+        assert_eq!(reg.history.len(), held);
+        assert_eq!(
+            reg.get_task("tsk_wait").unwrap().status.state,
+            TaskState::InputRequired
+        );
+    }
+
+    /// `GetTask` names the task it reads, and nothing else stands in for one.
+    #[test]
+    fn get_task_requires_an_id() {
+        let (registry, _waiter) = routing_registry();
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"id": ""}),
+            serde_json::json!({"id": 7}),
+        ] {
+            let answer = response_json(&handle_tasks_get(
+                serde_json::json!(1),
+                &params,
+                &registry,
+                None,
+            ));
+            assert_eq!(answer["error"]["code"], -32602, "{answer}");
+            assert_eq!(answer["error"]["message"], "GetTask requires an id");
+        }
+        let answer = response_json(&handle_tasks_get(
+            serde_json::json!(1),
+            &serde_json::json!({"id": "tsk_done", "historyLength": 3}),
+            &registry,
+            None,
+        ));
+        assert_eq!(answer["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+    }
+
+    /// A completion is acknowledged with a message from the agent, in the completion's context.
+    #[test]
+    fn a_completion_is_acknowledged_with_an_agent_message() {
+        let params = serde_json::json!({"message": {"contextId": "ctx_parent"}});
+        assert_eq!(
+            completion_received(&params, "dlg_1"),
+            serde_json::json!({
+                "messageId": "msg_dlg_1_received",
+                "contextId": "ctx_parent",
+                "role": "ROLE_AGENT",
+                "parts": [{"data": {"delegation_id": "dlg_1", "received": true},
+                           "mediaType": "application/json"}],
+            })
+        );
+        assert!(completion_received(&serde_json::json!({}), "dlg_1")
+            .get("contextId")
+            .is_none());
     }
 
     /// A `SendStreamingMessage` the door refuses because the session is closing is told so, in the
@@ -3216,10 +3642,7 @@ mod tests {
                 req,
                 &task_registry,
                 &task_tx,
-                None,
-                TaskProvenance::derive(TaskOrigin::User, None),
-                false,
-                None,
+                operator(),
                 None,
                 sse_tx,
                 Arc::clone(&sse_buffer),
@@ -3733,7 +4156,7 @@ mod tests {
             params: serde_json::json!({
                 "message": {
                     "messageId": "msg_lagged",
-                    "role": "user",
+                    "role": "ROLE_USER",
                     "parts": [{"text": "hello"}]
                 }
             }),
@@ -3751,10 +4174,7 @@ mod tests {
                 req,
                 &task_registry,
                 &task_tx,
-                None,
-                TaskProvenance::derive(TaskOrigin::User, None),
-                false,
-                None,
+                operator(),
                 None,
                 sse,
                 buffer,
@@ -3829,7 +4249,7 @@ mod tests {
             params: serde_json::json!({
                 "message": {
                     "messageId": "msg_closing",
-                    "role": "user",
+                    "role": "ROLE_USER",
                     "parts": [{"text": "hello"}]
                 }
             }),
@@ -3847,10 +4267,7 @@ mod tests {
                 req,
                 &task_registry,
                 &task_tx,
-                None,
-                TaskProvenance::derive(TaskOrigin::User, None),
-                false,
-                None,
+                operator(),
                 None,
                 sse,
                 buffer,
@@ -4359,9 +4776,10 @@ mod tests {
         )
         .await;
         assert_eq!(
-            delivered["result"],
+            delivered["result"]["message"]["parts"][0]["data"],
             serde_json::json!({"delegation_id": "dlg_waited", "received": true})
         );
+        assert_eq!(delivered["result"]["message"]["role"], "ROLE_AGENT");
         assert_eq!(live.counts(), (0, 1));
         assert!(task_rx.try_recv().is_err(), "a completion started a task");
     }

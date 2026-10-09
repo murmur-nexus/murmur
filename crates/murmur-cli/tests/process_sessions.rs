@@ -460,10 +460,10 @@ impl LiveCapsule {
     ) -> String {
         let response = post(&self.url, &send_body(message_id, context, text), headers);
         assert_eq!(
-            response["result"]["status"]["state"], "submitted",
+            response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
             "the task should be accepted; got: {response}"
         );
-        response["result"]["id"]
+        response["result"]["task"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("the response names the task it started: {response}"))
             .to_string()
@@ -604,8 +604,8 @@ fn send_body(message_id: &str, context: &str, text: &str) -> String {
             "message": {
                 "messageId": message_id,
                 "contextId": context,
-                "role": "user",
-                "parts": [{"text": text}]
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }
         }
     })

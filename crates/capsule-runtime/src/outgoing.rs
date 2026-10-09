@@ -1,13 +1,37 @@
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::a2a::{A2aTask, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
+use crate::a2a::{
+    murmur_state_name, send_message_member, user_message, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER,
+};
 use crate::origin::{stamp_for_peer, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 
 pub(crate) struct OutgoingMessage {
     pub message_id: String,
     pub context_id: Option<String>,
     pub text: String,
+}
+
+/// The task a peer's door answered a [`send_a2a_message`] with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerTask {
+    pub id: String,
+    pub context_id: String,
+    /// The task's state in murmur's word, mapped from the wire by [`murmur_state_name`]:
+    /// `auth-required` among them, which a peer that is not murmur may answer.
+    pub state: &'static str,
+}
+
+/// The guest's `task-result`, which keeps murmur's words: its `state` is the one the peer's wire
+/// state was mapped to when it was read.
+impl From<PeerTask> for crate::bindings::host::murmur::message::send::TaskResult {
+    fn from(task: PeerTask) -> Self {
+        Self {
+            task_id: task.id,
+            context_id: task.context_id,
+            state: task.state.to_string(),
+        }
+    }
 }
 
 /// Send an A2A SendMessage JSON-RPC request to a peer capsule.
@@ -24,13 +48,16 @@ pub(crate) struct OutgoingMessage {
 /// `authorization` is the formation token the runtime presents for a call to a formation callee,
 /// sent as `Authorization: Bearer <token>`. It is read only at the write, and `None` sends no
 /// `Authorization` at all.
+///
+/// A peer that answers with a message rather than a task, or with a state that is not a
+/// meaningful A2A v1.0 task state, is an `Err` naming what it sent.
 pub(crate) async fn send_a2a_message(
     peer_url: &str,
     message: OutgoingMessage,
     traceparent: Option<String>,
     sender_task: Option<TaskProvenance>,
     authorization: Option<&crate::formation_credentials::FormationToken>,
-) -> Result<A2aTask, String> {
+) -> Result<PeerTask, String> {
     let addr = parse_host_port(peer_url)?;
 
     let request_id = format!("req_{}", uuid::Uuid::now_v7().simple());
@@ -39,12 +66,11 @@ pub(crate) async fn send_a2a_message(
         "id": request_id,
         "method": "SendMessage",
         "params": {
-            "message": {
-                "messageId": message.message_id,
-                "contextId": message.context_id,
-                "role": "user",
-                "parts": [{"text": message.text}]
-            }
+            "message": user_message(
+                &message.message_id,
+                message.context_id.as_deref(),
+                &message.text,
+            )
         }
     })
     .to_string();
@@ -87,8 +113,32 @@ pub(crate) async fn send_a2a_message(
         .get("result")
         .ok_or_else(|| format!("no result in A2A response from {peer_url}"))?;
 
-    serde_json::from_value(result.clone())
-        .map_err(|e| format!("failed to parse A2A task from {peer_url}: {e}"))
+    peer_task(result).map_err(|e| format!("failed to parse A2A task from {peer_url}: {e}"))
+}
+
+/// The task a peer's `SendMessage` `result` holds, or why it holds none murmur can read.
+fn peer_task(result: &serde_json::Value) -> Result<PeerTask, String> {
+    let task = match send_message_member(result)? {
+        ("task", task) => task,
+        (_, message) => {
+            return Err(format!(
+                "it answered a message and started no task: {message}"
+            ))
+        }
+    };
+    let field = |pointer: &str| {
+        task.pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("its task has no {}: {task}", &pointer[1..]))
+    };
+    let (id, context_id, wire) = (field("/id")?, field("/contextId")?, field("/status/state")?);
+    let state =
+        murmur_state_name(wire).ok_or_else(|| format!("its task is in no known state: {wire}"))?;
+    Ok(PeerTask {
+        id: id.to_string(),
+        context_id: context_id.to_string(),
+        state,
+    })
 }
 
 /// The headers every request to a peer presents besides `Authorization`: the provenance stamped
@@ -338,11 +388,11 @@ mod tests {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "req_1",
-            "result": {
+            "result": {"task": {
                 "id": "tsk_peer",
                 "contextId": "ctx_peer",
-                "status": {"state": "submitted"}
-            }
+                "status": {"state": "TASK_STATE_SUBMITTED"}
+            }}
         })
         .to_string();
         let response = format!(
@@ -390,6 +440,13 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
         assert_eq!(body["method"], "SendMessage");
+        let message = &body["params"]["message"];
+        assert_eq!(message["role"], "ROLE_USER");
+        assert_eq!(
+            message["parts"],
+            serde_json::json!([{"text": "hello", "mediaType": "text/plain"}])
+        );
+        assert!(message.get("contextId").is_none(), "{message}");
     }
 
     /// A door that does not consent answers this runtime's peer message with `403`, and the
@@ -417,7 +474,10 @@ mod tests {
         let task = send_a2a_message(&addr, hello(), None, None, None)
             .await
             .expect("a consenting door takes the message");
-        assert_eq!(task.status.state, crate::a2a::TaskState::Submitted);
+        assert_eq!(task.state, "submitted");
+        assert!(task.id.starts_with("tsk_"), "{task:?}");
+        let result = crate::bindings::host::murmur::message::send::TaskResult::from(task);
+        assert_eq!(result.state, "submitted");
         let incoming = task_rx.recv().await.expect("the task reached the loop");
         assert_eq!(incoming.provenance.origin(), TaskOrigin::Peer);
     }
@@ -464,6 +524,76 @@ mod tests {
                 head.contains(&format!("{PEER_TRUST_HEADER}: {expected_trust}\r\n")),
                 "expected {expected_trust} for {sender_task:?}; head was:\n{head}"
             );
+        }
+    }
+
+    /// A peer's answer as `send_a2a_message` reads it: `result`, served once on a local port.
+    async fn answered(result: serde_json::Value) -> Result<PeerTask, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = rest.trim().parse().unwrap();
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).await.unwrap();
+            let answer =
+                serde_json::json!({"jsonrpc": "2.0", "id": "req_1", "result": result}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let task = send_a2a_message(&addr, hello(), None, None, None).await;
+        server.await.unwrap();
+        task
+    }
+
+    fn peer_answer(state: &str) -> serde_json::Value {
+        serde_json::json!({"task": {"id": "tsk_p", "contextId": "ctx_p", "status": {"state": state}}})
+    }
+
+    /// A peer that is not murmur may answer a state this door never produces; the guest reads it
+    /// in murmur's word.
+    #[tokio::test]
+    async fn a_peer_answering_auth_required_reads_as_auth_required() {
+        let task = answered(peer_answer("TASK_STATE_AUTH_REQUIRED"))
+            .await
+            .unwrap();
+        assert_eq!(
+            task,
+            PeerTask {
+                id: "tsk_p".to_string(),
+                context_id: "ctx_p".to_string(),
+                state: "auth-required",
+            }
+        );
+    }
+
+    /// A message rather than a task, or a state that is no task state, is an error naming what
+    /// the peer sent.
+    #[tokio::test]
+    async fn a_peer_answering_no_readable_task_is_an_error_naming_it() {
+        let error = answered(serde_json::json!({"message": {"messageId": "msg_p"}}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("answered a message"), "{error}");
+        assert!(error.contains("msg_p"), "{error}");
+        for state in ["TASK_STATE_UNSPECIFIED", "submitted"] {
+            let error = answered(peer_answer(state)).await.unwrap_err();
+            assert!(error.contains(state), "{error}");
         }
     }
 }
