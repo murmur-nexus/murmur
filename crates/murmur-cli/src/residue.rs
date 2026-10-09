@@ -14,13 +14,22 @@ use serde_json::Value;
 /// delegation is printed `ended:`, because the cancelled task that started it ends its child once
 /// the residue has named it.
 ///
-/// A part is either the residue item itself — the shape `session/stop` returns — or an A2A
-/// artifact part wrapping it as JSON text, which is how `CancelTask` carries it. Both spellings
-/// describe the same item, so both are read here rather than at each caller.
+/// A part is either the residue item itself — the shape `session/stop` returns — or an A2A data
+/// part holding it, which is how `CancelTask` carries it. Both spellings describe the same item,
+/// so both are read here rather than at each caller.
 pub(crate) fn print_residue(parts: &[Value]) {
-    for item in parts.iter().filter_map(unwrap_item) {
-        capsule_runtime::report_println!("{}", residue_line(&item));
+    for line in residue_lines(parts) {
+        capsule_runtime::report_println!("{line}");
     }
+}
+
+/// The lines [`print_residue`] prints.
+pub(crate) fn residue_lines(parts: &[Value]) -> Vec<String> {
+    parts
+        .iter()
+        .filter_map(unwrap_item)
+        .map(|item| residue_line(&item))
+        .collect()
 }
 
 /// The line [`print_residue`] prints for one item.
@@ -42,15 +51,15 @@ fn residue_line(item: &Value) -> String {
     }
 }
 
-/// The item inside an artifact part, or the part itself when it already is one.
+/// The item a data part holds, or the part itself when it already is one.
 fn unwrap_item(part: &Value) -> Option<Value> {
-    match part.get("text").and_then(Value::as_str) {
-        Some(text) => serde_json::from_str(text).ok(),
+    match part.get("data") {
+        Some(item) => item.is_object().then(|| item.clone()),
         None => part.is_object().then(|| part.clone()),
     }
 }
 
-/// Every residue part in an A2A task's `artifacts`, flattened.
+/// Every part of the `residue` artifact in an A2A task's `artifacts`, found by its `artifactId`.
 ///
 /// `CancelTask` omits the key entirely when nothing is running, so an empty result here means
 /// exactly that.
@@ -61,7 +70,9 @@ pub(crate) fn parts_from_artifacts(result: &Value) -> Vec<Value> {
         .map(|artifacts| {
             artifacts
                 .iter()
-                .filter(|artifact| artifact.get("name").and_then(Value::as_str) == Some("residue"))
+                .filter(|artifact| {
+                    artifact.get("artifactId").and_then(Value::as_str) == Some("residue")
+                })
                 .filter_map(|artifact| artifact.get("parts").and_then(Value::as_array))
                 .flatten()
                 .cloned()
@@ -79,9 +90,14 @@ mod tests {
     #[test]
     fn both_part_shapes_unwrap_to_the_same_item() {
         let item = json!({"kind": "detached_shell", "work_id": "wrk_1", "command": "sleep 30"});
-        let wrapped = json!({"text": item.to_string()});
+        let wrapped = json!({"data": item, "mediaType": "application/json"});
         assert_eq!(unwrap_item(&wrapped).unwrap(), item);
         assert_eq!(unwrap_item(&item).unwrap(), item);
+        assert_eq!(
+            unwrap_item(&json!({"text": item.to_string()})),
+            Some(json!({"text": item.to_string()})),
+            "JSON is not parsed out of a text part"
+        );
     }
 
     /// A detached shell command outlives the cancel and reads `running:`; a delegation is ended
@@ -110,12 +126,13 @@ mod tests {
     fn only_the_residue_artifact_contributes_parts() {
         let result = json!({
             "artifacts": [
-                {"name": "other", "parts": [{"text": "{}"}]},
-                {"name": "residue", "parts": [{"text": "{\"kind\":\"delegation\"}"}]},
+                {"artifactId": "other", "name": "residue", "parts": [{"data": {}}]},
+                {"artifactId": "residue", "name": "residue",
+                 "parts": [{"data": {"kind": "delegation"}}]},
             ]
         });
         let parts = parts_from_artifacts(&result);
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0]["text"], "{\"kind\":\"delegation\"}");
+        assert_eq!(parts[0]["data"], json!({"kind": "delegation"}));
     }
 }

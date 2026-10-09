@@ -389,8 +389,8 @@ fn send_message(addr: &str, message_id: &str, text: &str, context_id: &str) -> V
             "params": {"message": {
                 "messageId": message_id,
                 "contextId": context_id,
-                "role": "user",
-                "parts": [{"text": text}]
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }}
         })
         .to_string(),
@@ -411,25 +411,6 @@ fn tasks_cancel(addr: &str, task_id: &str) -> Value {
         &json!({"jsonrpc": "2.0", "id": 3, "method": "CancelTask", "params": {"id": task_id}})
             .to_string(),
     )
-}
-
-/// The id of whichever task holds the active slot — `SendStreamingMessage` never reports one.
-fn active_task_id(addr: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let response = http_post_json(
-            addr,
-            &json!({"jsonrpc": "2.0", "id": 4, "method": "GetTask", "params": {}}).to_string(),
-        );
-        if let Some(id) = response["result"]["id"].as_str() {
-            return id.to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no task ever took the active slot; last response: {response}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 fn poll_until_state(addr: &str, task_id: &str, expected: &str, timeout: Duration) -> Value {
@@ -465,8 +446,8 @@ impl Stream {
             "params": {"message": {
                 "messageId": "msg-stream",
                 "contextId": context_id,
-                "role": "user",
-                "parts": [{"text": "do the thing"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "do the thing", "mediaType": "text/plain"}]
             }}
         })
         .to_string();
@@ -576,6 +557,20 @@ impl Capsule {
         }
     }
 
+    /// The id of the task the trace's first `task_start` names: the task a `SendStreamingMessage`
+    /// started, whose stream reports no id until its first frame.
+    fn active_task_id(&self) -> String {
+        let events = self.wait_for_trace("a task to start", |events| {
+            events.iter().any(|e| e["event_type"] == "task_start")
+        });
+        events
+            .iter()
+            .find(|e| e["event_type"] == "task_start")
+            .and_then(|e| e["task_id"].as_str())
+            .unwrap_or_else(|| panic!("task_start names no task_id: {events:#?}"))
+            .to_string()
+    }
+
     fn one(&self, event_type: &str) -> Value {
         let mut found = self.of_type(event_type);
         assert_eq!(
@@ -631,7 +626,7 @@ fn cancel_now(url: &str, task_id: &str) -> Duration {
     let canceled = tasks_cancel(url, task_id);
     let took = started.elapsed();
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
     assert!(
@@ -652,8 +647,16 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
     let context = "ctx-cancel-1";
 
     let submitted = send_message(&capsule.url, "msg-1", "do the thing", context);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
-    poll_until_state(&capsule.url, &task_id, "working", Duration::from_secs(60));
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    poll_until_state(
+        &capsule.url,
+        &task_id,
+        "TASK_STATE_WORKING",
+        Duration::from_secs(60),
+    );
     let pid = capsule.harness_pid();
 
     cancel_now(&capsule.url, &task_id);
@@ -665,7 +668,7 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
     common::assert_dead_within(pid, REAPED_WITHIN);
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
     let interrupt = capsule.one("harness_interrupt");
     assert_eq!(interrupt["method"], "stdin-message", "{interrupt}");
@@ -690,11 +693,11 @@ fn s1_a_harness_that_honours_the_interrupt_stops_and_the_context_survives() {
     let session_id = harness_session["harness_session_id"].as_str().unwrap();
     capsule.set_profile("happy");
     let second = send_message(&capsule.url, "msg-2", "and now this", context);
-    let second_id = second["result"]["id"].as_str().unwrap().to_string();
+    let second_id = second["result"]["task"]["id"].as_str().unwrap().to_string();
     poll_until_state(
         &capsule.url,
         &second_id,
-        "completed",
+        "TASK_STATE_COMPLETED",
         Duration::from_secs(60),
     );
 
@@ -718,7 +721,7 @@ fn s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace() {
     let capsule = Built::new("process-cancel-ignores", "interrupt-ignores").launch();
 
     let mut stream = Stream::open(&capsule.url, "ctx-cancel-2");
-    let task_id = active_task_id(&capsule.url);
+    let task_id = capsule.active_task_id();
     let pid = capsule.harness_pid();
     let canceled_at = Instant::now();
     cancel_now(&capsule.url, &task_id);
@@ -749,7 +752,7 @@ fn s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace() {
     // And the capsule is still there to answer for it.
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 }
 
@@ -763,7 +766,7 @@ fn s2_mur_trace_show_prints_the_interrupt_under_harness() {
         .launch();
 
     let _stream = Stream::open(&capsule.url, "ctx-cancel-2b");
-    let task_id = active_task_id(&capsule.url);
+    let task_id = capsule.active_task_id();
     let pid = capsule.harness_pid();
     cancel_now(&capsule.url, &task_id);
     capsule.wait_for_trace("the session to end", |events| {
@@ -791,7 +794,7 @@ fn s3_a_harness_interrupted_by_sigint_stops() {
         .launch();
 
     let mut stream = Stream::open(&capsule.url, "ctx-cancel-3");
-    let task_id = active_task_id(&capsule.url);
+    let task_id = capsule.active_task_id();
     let pid = capsule.harness_pid();
     let canceled_at = Instant::now();
     cancel_now(&capsule.url, &task_id);
@@ -831,7 +834,7 @@ fn s4_a_driver_declaring_unsupported_has_its_harness_killed_at_once() {
         .launch();
 
     let mut stream = Stream::open(&capsule.url, "ctx-cancel-4");
-    let task_id = active_task_id(&capsule.url);
+    let task_id = capsule.active_task_id();
     let pid = capsule.harness_pid();
     let canceled_at = Instant::now();
     cancel_now(&capsule.url, &task_id);
@@ -874,7 +877,7 @@ fn s5_a_cancelled_task_writes_exactly_one_terminal_status() {
     let context = "ctx-cancel-5";
 
     let mut stream = Stream::open(&capsule.url, context);
-    let task_id = active_task_id(&capsule.url);
+    let task_id = capsule.active_task_id();
     capsule.harness_pid();
     cancel_now(&capsule.url, &task_id);
 
@@ -925,7 +928,10 @@ fn s8_a_task_stopped_before_its_harness_spawns_leaves_no_harness_records() {
         .launch();
 
     let submitted = send_message(&capsule.url, "msg-1", "do the thing", "ctx-cancel-8");
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // Inside the stalled probe: the run has started and nothing has been spawned.
     std::thread::sleep(Duration::from_secs(2));
     cancel_now(&capsule.url, &task_id);
@@ -945,7 +951,7 @@ fn s8_a_task_stopped_before_its_harness_spawns_leaves_no_harness_records() {
     assert_eq!(capsule.one("task_end")["exit_status"], "canceled");
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 }
 
@@ -960,7 +966,7 @@ fn s9_an_interrupted_run_hands_the_driver_interrupted_true() {
     let capsule = Built::new("process-cancel-classify", "interrupt-ignores").launch();
 
     let mut stream = Stream::open(&capsule.url, "ctx-cancel-9");
-    let task_id = active_task_id(&capsule.url);
+    let task_id = capsule.active_task_id();
     let pid = capsule.harness_pid();
     cancel_now(&capsule.url, &task_id);
 
@@ -984,6 +990,6 @@ fn s9_an_interrupted_run_hands_the_driver_interrupted_true() {
     );
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 }

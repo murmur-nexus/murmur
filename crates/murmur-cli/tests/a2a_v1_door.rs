@@ -257,7 +257,10 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
             message("m-served", "served"),
         );
         assert_served("SendMessage", &sent);
-        let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+        let task_id = sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         started.push(task_id.clone());
         // The task just sent is still live, so its cancel is accepted.
         for method in [
@@ -409,7 +412,10 @@ fn a2a_v1_door_errors_are_the_a2a_table_with_error_info() {
     let token = Some(operator.as_str());
 
     let sent = rpc(&addr, token, "SendMessage", message("m-done", "done"));
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let completed = wait_completed(&addr, token, &task_id);
 
     // Cancelling a task that has ended: not cancelable, and left as it ended.
@@ -422,7 +428,7 @@ fn a2a_v1_door_errors_are_the_a2a_table_with_error_info() {
         info["metadata"],
         json!({"taskId": task_id, "state": completed["result"]["status"]["state"]})
     );
-    assert_eq!(info["metadata"]["state"], "completed");
+    assert_eq!(info["metadata"]["state"], "TASK_STATE_COMPLETED");
     let after = rpc(&addr, token, "GetTask", json!({"id": task_id}));
     assert_eq!(after.json()["result"], completed["result"], "{after:?}");
 

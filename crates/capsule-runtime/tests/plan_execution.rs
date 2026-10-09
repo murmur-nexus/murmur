@@ -969,8 +969,8 @@ impl FakeRoost {
         Self::start_with(true, true)
     }
 
-    /// A fake whose child accepts its task and then answers `working` to every `GetTask`, so
-    /// the delegation never reaches a terminal state on its own.
+    /// A fake whose child accepts its task and then answers `TASK_STATE_WORKING` to every
+    /// `GetTask`, so the delegation never reaches a terminal state on its own.
     fn never_finishing() -> Self {
         Self::start_with(false, false)
     }
@@ -1044,20 +1044,35 @@ impl FakeRoost {
                                             .unwrap_or_default()
                                             .to_string(),
                                     );
-                                    json!({"jsonrpc": "2.0", "id": id, "result": {"id": "task-1"}})
+                                    json!({"jsonrpc": "2.0", "id": id, "result": {"task": {
+                                        "id": "task-1",
+                                        "contextId": "ctx-1",
+                                        "status": {"state": "TASK_STATE_SUBMITTED"}
+                                    }}})
                                 }
                                 Some("GetTask") if !finishes => json!({
                                     "jsonrpc": "2.0",
                                     "id": id,
-                                    "result": {"id": "task-1", "status": {"state": "working"}}
+                                    "result": {
+                                        "id": "task-1",
+                                        "contextId": "ctx-1",
+                                        "status": {"state": "TASK_STATE_WORKING"}
+                                    }
                                 }),
                                 Some("GetTask") => json!({
                                     "jsonrpc": "2.0",
                                     "id": id,
                                     "result": {
                                         "id": "task-1",
-                                        "status": {"state": "completed"},
-                                        "artifacts": [{"parts": [{"text": "worker-output"}]}]
+                                        "contextId": "ctx-1",
+                                        "status": {"state": "TASK_STATE_COMPLETED"},
+                                        "artifacts": [{
+                                            "artifactId": "response",
+                                            "name": "response",
+                                            "parts": [
+                                                {"text": "worker-output", "mediaType": "text/plain"}
+                                            ]
+                                        }]
                                     }
                                 }),
                                 other => panic!("unexpected request {other:?} at {path}"),

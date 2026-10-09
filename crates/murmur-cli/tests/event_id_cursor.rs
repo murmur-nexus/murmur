@@ -387,7 +387,7 @@ fn reconnect_mid_task_receives_every_later_frame_once() {
 
     let second = submit_task(&capsule.url, "event-id-mid-2", "second task");
     wait_for_task_end(&capsule.workdir, &first);
-    wait_for_state(&capsule.url, &second, "working");
+    wait_for_state(&capsule.url, &second, "TASK_STATE_WORKING");
 
     let resumed_conn = open_watch(&capsule.url, last_seen);
     let resumed = read_frames_until(&resumed_conn, |got| {
@@ -455,18 +455,23 @@ fn every_kind_of_frame_shares_one_sequence() {
         serde_json::json!({"id": queued}),
     );
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "the queued task should cancel; got {canceled}"
     );
 
-    wait_for_state(&capsule.url, &first, "input-required");
+    wait_for_state(&capsule.url, &first, "TASK_STATE_INPUT_REQUIRED");
     let input = rpc(
         &capsule.url,
         "SendMessage",
-        serde_json::json!({"message": {"messageId": "event-id-all-input", "role": "user", "parts": [{"text": "option A"}]}}),
+        serde_json::json!({"message": {
+            "messageId": "event-id-all-input",
+            "taskId": first,
+            "role": "ROLE_USER",
+            "parts": [{"text": "option A", "mediaType": "text/plain"}]
+        }}),
     );
     assert!(
-        input["result"]["id"] == first.as_str(),
+        input["result"]["task"]["id"] == first.as_str(),
         "the reply should go to the waiting task; got {input}"
     );
     wait_for_task_end(&capsule.workdir, &first);

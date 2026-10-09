@@ -343,29 +343,194 @@ impl MurmurError {
 
 // ── A2A protocol types ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct A2aMessage {
-    pub message_id: String,
-    pub context_id: Option<String>,
-    #[allow(dead_code)] // part of the A2A Message schema; role validation deferred
-    pub role: String,
-    pub parts: Vec<MessagePart>,
+/// The `mediaType` of every text part murmur builds.
+pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
+
+/// The `mediaType` of every data part murmur builds.
+pub(crate) const DATA_MEDIA_TYPE: &str = "application/json";
+
+/// Who sent a message, A2A v1.0 `Role`, spelled as its ProtoJSON enum name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Role {
+    #[serde(rename = "ROLE_USER")]
+    User,
+    #[serde(rename = "ROLE_AGENT")]
+    Agent,
 }
 
-impl A2aMessage {
-    pub(crate) fn extract_text(&self) -> String {
-        self.parts
-            .iter()
-            .filter_map(|p| p.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n")
+impl Role {
+    /// The role's ProtoJSON name, the one it serializes as.
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::User => "ROLE_USER",
+            Self::Agent => "ROLE_AGENT",
+        }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct MessagePart {
-    pub text: Option<String>,
+/// What one part carries: A2A v1.0 `Part`'s `content` oneof.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PartContent {
+    Text(String),
+    /// Base64 file bytes, as ProtoJSON spells `bytes`. The door refuses a message carrying one.
+    Raw(String),
+    /// A file by reference. The door refuses a message carrying one.
+    Url(String),
+    /// Any JSON value, `null` included.
+    Data(Value),
+}
+
+impl PartContent {
+    /// The content's field name, which is also the kind a `task_start` record lists.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Raw(_) => "raw",
+            Self::Url(_) => "url",
+            Self::Data(_) => "data",
+        }
+    }
+}
+
+/// The four field names of [`PartContent`], in the proto's order.
+const PART_CONTENT_FIELDS: [&str; 4] = ["text", "raw", "url", "data"];
+
+/// One A2A v1.0 `Part`.
+///
+/// Serialized as one object holding exactly one content field beside the optional `mediaType`,
+/// `filename` and `metadata`. Read through [`Part::from_json`], which refuses an object that sets
+/// no content field or more than one, so no part deserializes to nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Part {
+    pub content: PartContent,
+    pub media_type: Option<String>,
+    pub filename: Option<String>,
+    pub metadata: Option<Value>,
+}
+
+impl Part {
+    /// A text part with `mediaType` [`TEXT_MEDIA_TYPE`].
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self::of(PartContent::Text(text.into()), TEXT_MEDIA_TYPE)
+    }
+
+    /// A data part with `mediaType` [`DATA_MEDIA_TYPE`].
+    pub(crate) fn data(value: Value) -> Self {
+        Self::of(PartContent::Data(value), DATA_MEDIA_TYPE)
+    }
+
+    fn of(content: PartContent, media_type: &str) -> Self {
+        Self {
+            content,
+            media_type: Some(media_type.to_string()),
+            filename: None,
+            metadata: None,
+        }
+    }
+
+    /// The part's text, when it is a text part.
+    pub(crate) fn as_text(&self) -> Option<&str> {
+        match &self.content {
+            PartContent::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The part's value, when it is a data part.
+    #[cfg(test)]
+    pub(crate) fn as_data(&self) -> Option<&Value> {
+        match &self.content {
+            PartContent::Data(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The part as ProtoJSON.
+    pub(crate) fn to_json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        let (field, value) = match &self.content {
+            PartContent::Text(text) => ("text", Value::String(text.clone())),
+            PartContent::Raw(raw) => ("raw", Value::String(raw.clone())),
+            PartContent::Url(url) => ("url", Value::String(url.clone())),
+            PartContent::Data(value) => ("data", value.clone()),
+        };
+        object.insert(field.to_string(), value);
+        if let Some(media_type) = &self.media_type {
+            object.insert("mediaType".to_string(), Value::String(media_type.clone()));
+        }
+        if let Some(filename) = &self.filename {
+            object.insert("filename".to_string(), Value::String(filename.clone()));
+        }
+        if let Some(metadata) = &self.metadata {
+            object.insert("metadata".to_string(), metadata.clone());
+        }
+        Value::Object(object)
+    }
+
+    /// Why `value` sets no part content or more than one, or `None` when it sets exactly one.
+    /// A present `null` counts as set, as ProtoJSON reads it.
+    fn content_count_error(value: &Value) -> Option<String> {
+        let Some(object) = value.as_object() else {
+            return Some("is not an object".to_string());
+        };
+        let set: Vec<&str> = PART_CONTENT_FIELDS
+            .into_iter()
+            .filter(|field| object.contains_key(*field))
+            .collect();
+        match set.as_slice() {
+            [_] => None,
+            [] => Some("sets none of text, raw, url and data".to_string()),
+            more => Some(format!(
+                "sets {}; a part sets exactly one of text, raw, url and data",
+                more.join(" and ")
+            )),
+        }
+    }
+
+    /// The part `value` is, or why it is not one: an object setting exactly one of `text`, `raw`,
+    /// `url` and `data`, whose `text`, `raw`, `url`, `mediaType` and `filename` are strings where
+    /// present. Unknown fields are ignored.
+    pub(crate) fn from_json(value: &Value) -> Result<Part, String> {
+        if let Some(error) = Self::content_count_error(value) {
+            return Err(error);
+        }
+        let object = value.as_object().expect("checked to be an object");
+        let string = |field: &str| -> Result<Option<String>, String> {
+            match object.get(field) {
+                None => Ok(None),
+                Some(Value::String(text)) => Ok(Some(text.clone())),
+                Some(_) => Err(format!("{field} is not a string")),
+            }
+        };
+        let content = if let Some(text) = string("text")? {
+            PartContent::Text(text)
+        } else if let Some(raw) = string("raw")? {
+            PartContent::Raw(raw)
+        } else if let Some(url) = string("url")? {
+            PartContent::Url(url)
+        } else {
+            PartContent::Data(object.get("data").cloned().unwrap_or(Value::Null))
+        };
+        Ok(Part {
+            content,
+            media_type: string("mediaType")?,
+            filename: string("filename")?,
+            metadata: object.get("metadata").cloned(),
+        })
+    }
+}
+
+impl Serialize for Part {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Part {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Part::from_json(&value).map_err(|error| serde::de::Error::custom(format!("part {error}")))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,15 +548,46 @@ pub(crate) struct A2aTask {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct A2aArtifact {
-    pub name: String,
-    pub parts: Vec<ArtifactPart>,
+impl A2aTask {
+    /// The artifact whose `artifactId` is `artifact_id`.
+    pub(crate) fn artifact(&self, artifact_id: &str) -> Option<&A2aArtifact> {
+        self.artifacts
+            .as_deref()?
+            .iter()
+            .find(|artifact| artifact.artifact_id == artifact_id)
+    }
+
+    /// The text of the status message, when the status carries one with a text part.
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status.message.as_ref()?.text()
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ArtifactPart {
-    pub text: String,
+/// An A2A v1.0 `Artifact`. Murmur names each artifact it builds once per task, so the name is
+/// also its `artifactId`: unique within the task, and the same on every read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct A2aArtifact {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub name: String,
+    pub parts: Vec<Part>,
+}
+
+impl A2aArtifact {
+    /// The artifact `name`, holding `parts`.
+    pub(crate) fn named(name: &str, parts: Vec<Part>) -> Self {
+        Self {
+            artifact_id: name.to_string(),
+            name: name.to_string(),
+            parts,
+        }
+    }
+
+    /// The text of the first part, when it is a text part.
+    pub(crate) fn first_text(&self) -> Option<&str> {
+        self.parts.first()?.as_text()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,26 +608,32 @@ impl TaskStatus {
     }
 }
 
-/// A task status's message: an A2A message from the agent with one text part, in the shape this
-/// door reads an incoming message in.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// A task status's message: an A2A message from the agent about one task, with one text part.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StatusMessage {
     pub message_id: String,
-    pub role: String,
-    pub parts: Vec<ArtifactPart>,
+    pub context_id: String,
+    pub task_id: String,
+    pub role: Role,
+    pub parts: Vec<Part>,
 }
 
 impl StatusMessage {
-    /// The agent's message `text` about `task_id`.
-    pub(crate) fn agent(task_id: &str, text: &str) -> Self {
+    /// The agent's message `text` about `task_id`, in `context_id`.
+    pub(crate) fn agent(task_id: &str, context_id: &str, text: &str) -> Self {
         Self {
             message_id: format!("msg_{task_id}_status"),
-            role: "agent".to_string(),
-            parts: vec![ArtifactPart {
-                text: text.to_string(),
-            }],
+            context_id: context_id.to_string(),
+            task_id: task_id.to_string(),
+            role: Role::Agent,
+            parts: vec![Part::text(text)],
         }
+    }
+
+    /// The text of the first part, when it is a text part.
+    pub(crate) fn text(&self) -> Option<&str> {
+        self.parts.first()?.as_text()
     }
 }
 
@@ -467,27 +669,70 @@ impl TaskEnding {
     }
 }
 
-/// The name of the artifact a completed task's response is carried in over `GetTask`.
+/// The name and `artifactId` of the artifact a completed task's response is carried in over
+/// `GetTask`.
 pub(crate) const RESPONSE_ARTIFACT: &str = "response";
 
+/// The name and `artifactId` of the artifact an `input-required` task's prompt is carried in.
+pub(crate) const PROMPT_ARTIFACT: &str = "prompt";
+
+/// A task's state.
+///
+/// It has two spellings. On the A2A wire it is the v1.0 ProtoJSON enum name, which serde and
+/// [`Self::wire_name`] give and which is the only spelling it deserializes from. Everywhere murmur
+/// chooses its own words — the guest's `task-result.state`, `mur` output, the stream frames, trace
+/// records and every sentence written for the model — it is [`Self::as_str`].
+///
+/// The door never produces `TASK_STATE_AUTH_REQUIRED`: it authenticates a request before any task
+/// exists, so no task can wait for authentication.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
 pub(crate) enum TaskState {
+    #[serde(rename = "TASK_STATE_SUBMITTED")]
     Submitted,
+    #[serde(rename = "TASK_STATE_WORKING")]
     Working,
+    #[serde(rename = "TASK_STATE_INPUT_REQUIRED")]
     InputRequired,
+    #[serde(rename = "TASK_STATE_COMPLETED")]
     Completed,
+    #[serde(rename = "TASK_STATE_FAILED")]
     Failed,
+    #[serde(rename = "TASK_STATE_REJECTED")]
     Rejected,
     /// A person stopped this task. Terminal, and distinct from `Failed`: nothing went wrong, the
-    /// work was called off. Spelled `"canceled"` on the wire, which is the A2A protocol's own
-    /// spelling.
+    /// work was called off.
+    #[serde(rename = "TASK_STATE_CANCELED")]
     Canceled,
 }
 
 impl TaskState {
-    /// The state's wire spelling, the one `GetTask` serializes and a stream frame's
-    /// `status.state` carries.
+    /// Every state, in the proto's order.
+    #[cfg(test)]
+    pub(crate) const ALL: [TaskState; 7] = [
+        TaskState::Submitted,
+        TaskState::Working,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+        TaskState::InputRequired,
+        TaskState::Rejected,
+    ];
+
+    /// The state's A2A v1.0 ProtoJSON name, the one it serializes as.
+    pub(crate) fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Submitted => "TASK_STATE_SUBMITTED",
+            Self::Working => "TASK_STATE_WORKING",
+            Self::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+            Self::Completed => "TASK_STATE_COMPLETED",
+            Self::Failed => "TASK_STATE_FAILED",
+            Self::Rejected => "TASK_STATE_REJECTED",
+            Self::Canceled => "TASK_STATE_CANCELED",
+        }
+    }
+
+    /// The state in murmur's own word, the one a stream frame's `status.state`, the guest's
+    /// `task-result.state` and `mur` output carry.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Submitted => "submitted",
@@ -509,6 +754,303 @@ impl TaskState {
             Self::Submitted | Self::Working | Self::InputRequired => false,
             Self::Completed | Self::Failed | Self::Rejected | Self::Canceled => true,
         }
+    }
+}
+
+/// Murmur's word for the A2A v1.0 task state `wire`, or `None` for `TASK_STATE_UNSPECIFIED` and
+/// anything that is not a v1.0 state name.
+///
+/// Total over the eight meaningful v1.0 states, `TASK_STATE_AUTH_REQUIRED` among them, which is
+/// `auth-required`, A2A 0.3's word for it: a peer that is not murmur may answer it, though this
+/// door never does. This is how a state read off the wire reaches the guest and `mur` output.
+pub fn murmur_state_name(wire: &str) -> Option<&'static str> {
+    Some(match wire {
+        "TASK_STATE_SUBMITTED" => "submitted",
+        "TASK_STATE_WORKING" => "working",
+        "TASK_STATE_COMPLETED" => "completed",
+        "TASK_STATE_FAILED" => "failed",
+        "TASK_STATE_CANCELED" => "canceled",
+        "TASK_STATE_INPUT_REQUIRED" => "input-required",
+        "TASK_STATE_REJECTED" => "rejected",
+        "TASK_STATE_AUTH_REQUIRED" => "auth-required",
+        _ => return None,
+    })
+}
+
+// ── Incoming messages ─────────────────────────────────────────────────────────
+
+/// The most distinct task ids one message may name in `referenceTaskIds`.
+pub(crate) const MAX_REFERENCE_TASK_IDS: usize = 16;
+
+/// A `SendMessage` or `SendStreamingMessage` message the door read in full, as
+/// [`read_send_params`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IncomingMessage {
+    pub message_id: String,
+    pub context_id: Option<String>,
+    /// The task this message continues. An empty `taskId` reads as `None`.
+    pub task_id: Option<String>,
+    /// `referenceTaskIds` with duplicates collapsed to their first occurrence.
+    pub reference_task_ids: Vec<String>,
+    /// Text and data parts only: a message carrying any other part is refused.
+    pub parts: Vec<Part>,
+}
+
+/// Why the door refused a message, and so answered no task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MessageRefusal {
+    /// `-32602`: the message is not an A2A v1.0 message. The text says what is wrong.
+    InvalidParams(String),
+    /// `-32005` `ContentTypeNotSupportedError`: the part at `part_index` is a file part, `raw` or
+    /// `url`, which this door does not read.
+    ContentTypeNotSupported {
+        part_index: usize,
+        kind: &'static str,
+        media_type: Option<String>,
+    },
+}
+
+impl MessageRefusal {
+    /// The JSON-RPC error answering request `id` with this refusal.
+    pub(crate) fn into_response(self, id: Value) -> JsonRpcResponse {
+        match self {
+            Self::InvalidParams(message) => {
+                JsonRpcResponse::err(id, INVALID_PARAMS, &format!("Invalid params: {message}"))
+            }
+            Self::ContentTypeNotSupported {
+                part_index,
+                kind,
+                media_type,
+            } => {
+                let mut metadata = vec![("partIndex", part_index.to_string())];
+                if let Some(media_type) = &media_type {
+                    metadata.push(("mediaType", media_type.clone()));
+                }
+                JsonRpcResponse::a2a_error(
+                    id,
+                    A2aError::ContentTypeNotSupported,
+                    &format!(
+                        "message.parts[{part_index}] is a {kind} part; this agent reads text and \
+                         data parts only"
+                    ),
+                    &metadata,
+                )
+            }
+        }
+    }
+}
+
+/// The message a `SendMessage` or `SendStreamingMessage` request's `params` carries, or why it is
+/// refused.
+///
+/// Read by hand rather than by serde, in this order, each failure `-32602` but the last:
+/// `params.message` is an object; `messageId` is a non-empty string; `role` is `ROLE_USER`; `parts`
+/// is a non-empty array; every part sets exactly one of `text`, `raw`, `url` and `data`; `text`,
+/// `raw`, `url`, `mediaType` and `filename` are strings where present; `taskId` and `contextId`
+/// are strings where present; `referenceTaskIds` is an array of non-empty strings naming at most
+/// [`MAX_REFERENCE_TASK_IDS`] distinct tasks. Then the first `raw` or `url` part is
+/// [`MessageRefusal::ContentTypeNotSupported`]. Unknown fields are ignored.
+pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, MessageRefusal> {
+    let invalid = |message: String| Err(MessageRefusal::InvalidParams(message));
+    let Some(message) = params.get("message").and_then(Value::as_object) else {
+        return invalid("params.message must be an A2A Message object".to_string());
+    };
+    let message_id = match message.get("messageId") {
+        Some(Value::String(id)) if !id.is_empty() => id.clone(),
+        _ => return invalid("message.messageId must be a non-empty string".to_string()),
+    };
+    if message.get("role").and_then(Value::as_str) != Some(Role::User.wire_name()) {
+        return invalid(format!(
+            "message.role must be {}: a message to this agent is from the user",
+            Role::User.wire_name()
+        ));
+    }
+    let raw_parts = match message.get("parts") {
+        Some(Value::Array(parts)) if !parts.is_empty() => parts,
+        _ => return invalid("message.parts must be a non-empty array".to_string()),
+    };
+    for (index, part) in raw_parts.iter().enumerate() {
+        if let Some(error) = Part::content_count_error(part) {
+            return invalid(format!("message.parts[{index}] {error}"));
+        }
+    }
+    let mut parts = Vec::with_capacity(raw_parts.len());
+    for (index, part) in raw_parts.iter().enumerate() {
+        match Part::from_json(part) {
+            Ok(part) => parts.push(part),
+            Err(error) => return invalid(format!("message.parts[{index}].{error}")),
+        }
+    }
+    let optional_string = |field: &str| -> Result<Option<String>, MessageRefusal> {
+        match message.get(field) {
+            None => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => Err(MessageRefusal::InvalidParams(format!(
+                "message.{field} must be a string"
+            ))),
+        }
+    };
+    let task_id = optional_string("taskId")?.filter(|id| !id.is_empty());
+    let context_id = optional_string("contextId")?;
+    let reference_task_ids = match message.get("referenceTaskIds") {
+        None => Vec::new(),
+        Some(Value::Array(ids)) => {
+            let mut distinct: Vec<String> = Vec::new();
+            for id in ids {
+                match id {
+                    Value::String(id) if !id.is_empty() => {
+                        if !distinct.contains(id) {
+                            distinct.push(id.clone());
+                        }
+                    }
+                    _ => {
+                        return invalid(
+                            "message.referenceTaskIds must hold non-empty strings".to_string(),
+                        )
+                    }
+                }
+            }
+            if distinct.len() > MAX_REFERENCE_TASK_IDS {
+                return invalid(format!(
+                    "message.referenceTaskIds names {} tasks; at most {MAX_REFERENCE_TASK_IDS} \
+                     may be referenced",
+                    distinct.len()
+                ));
+            }
+            distinct
+        }
+        Some(_) => return invalid("message.referenceTaskIds must be an array".to_string()),
+    };
+    if let Some((part_index, part)) = parts
+        .iter()
+        .enumerate()
+        .find(|(_, part)| matches!(part.content, PartContent::Raw(_) | PartContent::Url(_)))
+    {
+        return Err(MessageRefusal::ContentTypeNotSupported {
+            part_index,
+            kind: part.content.kind(),
+            media_type: part.media_type.clone(),
+        });
+    }
+    Ok(IncomingMessage {
+        message_id,
+        context_id,
+        task_id,
+        reference_task_ids,
+        parts,
+    })
+}
+
+impl IncomingMessage {
+    /// The message as the agent reads it: each part in order, joined by `"\n"`. A text part is its
+    /// text; a data part is its value pretty-printed in a code fence labelled `data`, with the
+    /// part's `mediaType` and `filename` when it has them. No part's `metadata` is rendered.
+    pub(crate) fn agent_text(&self) -> String {
+        self.parts
+            .iter()
+            .map(|part| match &part.content {
+                PartContent::Text(text) => text.clone(),
+                PartContent::Data(value) => {
+                    let mut label = "data".to_string();
+                    if let Some(media_type) = &part.media_type {
+                        label.push_str(&format!(" media-type={}", fence_label_value(media_type)));
+                    }
+                    if let Some(filename) = &part.filename {
+                        label.push_str(&format!(" filename={}", fence_label_value(filename)));
+                    }
+                    let body = serde_json::to_string_pretty(value).unwrap_or_default();
+                    code_fence(&label, &body)
+                }
+                PartContent::Raw(_) | PartContent::Url(_) => {
+                    unreachable!("read_send_params refuses every file part")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The kind of each part, in order: `text` or `data`.
+    pub(crate) fn part_kinds(&self) -> Vec<&'static str> {
+        self.parts.iter().map(|part| part.content.kind()).collect()
+    }
+}
+
+/// `body` in a Markdown code fence whose opening line is the fence followed by `label`. The fence
+/// is a run of backticks one longer than the longest run in `body`, and at least three, so nothing
+/// in `body` can close it.
+pub(crate) fn code_fence(label: &str, body: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in body.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}{label}\n{body}\n{fence}")
+}
+
+/// `value` as one token of a fence's opening line: whitespace, backticks and `=` become `_`.
+fn fence_label_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || c == '`' || c == '=' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+// ── Client helpers ────────────────────────────────────────────────────────────
+
+/// The A2A v1.0 message a murmur client sends a door: from `ROLE_USER`, with one text part.
+/// `contextId` is written only when given.
+pub(crate) fn user_message(message_id: &str, context_id: Option<&str>, text: &str) -> Value {
+    let mut message = serde_json::json!({
+        "messageId": message_id,
+        "role": Role::User.wire_name(),
+        "parts": [Part::text(text).to_json()],
+    });
+    if let Some(context_id) = context_id {
+        message["contextId"] = Value::String(context_id.to_string());
+    }
+    message
+}
+
+/// A `SendMessageResponse`, as a door's `SendMessage` `result` carries it: the oneof of a task and
+/// a message.
+#[derive(Debug, Clone)]
+pub(crate) enum SendMessageResult {
+    Task(A2aTask),
+    /// The message, as sent. Murmur reads nothing in it.
+    Message(Value),
+}
+
+impl SendMessageResult {
+    /// The member `result` sets, or why it is not a `SendMessageResponse`: it sets both members or
+    /// neither, or its `task` is not a v1.0 task.
+    pub(crate) fn from_result(result: &Value) -> Result<SendMessageResult, String> {
+        match send_message_member(result)? {
+            ("task", task) => serde_json::from_value(task.clone())
+                .map(SendMessageResult::Task)
+                .map_err(|error| format!("its task is not an A2A task: {error}")),
+            (_, message) => Ok(SendMessageResult::Message(message.clone())),
+        }
+    }
+}
+
+/// Which member of the `SendMessageResponse` oneof `result` sets, `"task"` or `"message"`, with
+/// its value, or why it sets neither or both.
+pub(crate) fn send_message_member(result: &Value) -> Result<(&'static str, &Value), String> {
+    match (result.get("task"), result.get("message")) {
+        (Some(task), None) => Ok(("task", task)),
+        (None, Some(message)) => Ok(("message", message)),
+        (Some(_), Some(_)) => Err("it answered both a task and a message".to_string()),
+        (None, None) => Err(format!(
+            "it answered neither a task nor a message: {result}"
+        )),
     }
 }
 
@@ -539,9 +1081,8 @@ pub(crate) enum TaskSlotState {
         /// variant, so it cannot name a lane no task is running in.
         lane: TaskLane,
     },
-    Done {
-        task_id: String,
-    },
+    /// The last task that ran has ended.
+    Done,
 }
 
 // ── TaskRegistry — multi-task history tracker ─────────────────────────────────
@@ -709,7 +1250,7 @@ impl TaskRegistry {
     pub(crate) fn active_lane(&self) -> Option<TaskLane> {
         match self.active_slot {
             TaskSlotState::Running { lane, .. } => Some(lane),
-            TaskSlotState::Empty | TaskSlotState::Done { .. } => None,
+            TaskSlotState::Empty | TaskSlotState::Done => None,
         }
     }
 
@@ -736,8 +1277,8 @@ impl TaskRegistry {
             Some((TaskState::Canceled, _)) => TaskState::Canceled,
             _ => final_state,
         };
-        self.history.insert(tid.clone(), (final_state.clone(), cid));
-        self.active_slot = TaskSlotState::Done { task_id: tid };
+        self.history.insert(tid, (final_state.clone(), cid));
+        self.active_slot = TaskSlotState::Done;
         Some(final_state)
     }
 
@@ -807,17 +1348,6 @@ impl TaskRegistry {
         // Sending may fail if the receiver was dropped (timeout path), which is fine.
         let _ = tx.send(text);
         Ok(())
-    }
-
-    /// Return the task_id of the active task if it is currently in InputRequired state.
-    pub(crate) fn active_input_required_task_id(&self) -> Option<String> {
-        if let TaskSlotState::Running { ref task_id, .. } = self.active_slot {
-            let state = self.history.get(task_id).map(|(s, _)| s);
-            if matches!(state, Some(TaskState::InputRequired)) {
-                return Some(task_id.clone());
-            }
-        }
-        None
     }
 
     /// The cancel signal for `task_id`, minting one if nobody has asked yet.
@@ -930,18 +1460,14 @@ impl TaskRegistry {
     /// `response` artifact, each when it has one.
     pub(crate) fn get_task(&self, task_id: &str) -> Option<A2aTask> {
         self.history.get(task_id).map(|(state, context_id)| {
-            let artifact = |name: &str, text: &str| A2aArtifact {
-                name: name.to_string(),
-                parts: vec![ArtifactPart {
-                    text: text.to_string(),
-                }],
-            };
+            let artifact =
+                |name: &str, text: &str| A2aArtifact::named(name, vec![Part::text(text)]);
             let ending = self.endings.get(task_id).filter(|_| state.is_terminal());
             let artifacts = match state {
                 TaskState::InputRequired => self
                     .input_waiters
                     .get(task_id)
-                    .map(|(prompt, _)| vec![artifact("prompt", prompt)]),
+                    .map(|(prompt, _)| vec![artifact(PROMPT_ARTIFACT, prompt)]),
                 TaskState::Completed => ending
                     .and_then(|ending| ending.response.as_deref())
                     .filter(|response| !response.is_empty())
@@ -950,7 +1476,7 @@ impl TaskRegistry {
             };
             let message = ending
                 .filter(|ending| !ending.message.is_empty())
-                .map(|ending| StatusMessage::agent(task_id, &ending.message));
+                .map(|ending| StatusMessage::agent(task_id, context_id, &ending.message));
             A2aTask {
                 id: task_id.to_string(),
                 context_id: context_id.clone(),
@@ -962,6 +1488,51 @@ impl TaskRegistry {
                 metadata: ending.and_then(TaskEnding::metadata),
             }
         })
+    }
+
+    /// The block naming each task in `reference_task_ids` as it stands now, appended to a message
+    /// that references them, or `None` when it references none. `visible` says whether the sender
+    /// may see a task: one it may not reads exactly as one this registry never held.
+    ///
+    /// Each task is one line, `- <id>: <state>` in murmur's word. An ended task other than a
+    /// `completed` one appends what its final status said; a `completed` one with a response is
+    /// followed by the response in a code fence labelled `response`.
+    pub(crate) fn reference_block(
+        &self,
+        reference_task_ids: &[String],
+        visible: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        if reference_task_ids.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = reference_task_ids
+            .iter()
+            .map(|task_id| {
+                let Some((state, _)) = self.history.get(task_id).filter(|_| visible(task_id))
+                else {
+                    return format!("- {task_id}: not a task this capsule holds");
+                };
+                let mut line = format!("- {task_id}: {}", state.as_str());
+                let ending = self.endings.get(task_id).filter(|_| state.is_terminal());
+                match (state, ending) {
+                    (TaskState::Completed, Some(ending)) => {
+                        if let Some(response) =
+                            ending.response.as_deref().filter(|text| !text.is_empty())
+                        {
+                            line.push('\n');
+                            line.push_str(&code_fence(RESPONSE_ARTIFACT, response));
+                        }
+                    }
+                    (_, Some(ending)) if !ending.message.is_empty() => {
+                        line.push_str(": ");
+                        line.push_str(&ending.message.replace(['\r', '\n'], " "));
+                    }
+                    _ => {}
+                }
+                line
+            })
+            .collect();
+        Some(format!("Referenced tasks:\n{}", lines.join("\n")))
     }
 }
 
@@ -988,6 +1559,12 @@ pub(crate) struct IncomingTask {
     /// The formation member that called, when the door let this task in on a formation token.
     /// Recorded as `a2a_task_received.caller_member`; `None` for every other task.
     pub caller_member: Option<String>,
+    /// The message's `referenceTaskIds`, each once, recorded as `task_start.reference_task_ids`.
+    /// Empty for every task that did not arrive over the door.
+    pub reference_task_ids: Vec<String>,
+    /// The kind of each part of the message, recorded as `task_start.part_kinds`. Empty for every
+    /// task that did not arrive over the door.
+    pub part_kinds: Vec<&'static str>,
 }
 
 /// The `source` of a task that arrived over the A2A door.
@@ -1028,8 +1605,8 @@ mod tests {
         let task = r.get_task("tsk_001").unwrap();
         assert_eq!(task.status.state, TaskState::InputRequired);
         let artifacts = task.artifacts.unwrap();
-        assert_eq!(artifacts[0].name, "prompt");
-        assert_eq!(artifacts[0].parts[0].text, "which branch?");
+        assert_eq!(artifacts[0].artifact_id, "prompt");
+        assert_eq!(artifacts[0].first_text(), Some("which branch?"));
     }
 
     #[test]
@@ -1062,21 +1639,6 @@ mod tests {
     }
 
     #[test]
-    fn active_input_required_task_id_returns_correct() {
-        let mut r = running_registry("tsk_001");
-        assert_eq!(r.active_input_required_task_id(), None);
-        let (tx, _rx) = oneshot::channel();
-        r.set_input_required("tsk_001", "prompt".into(), tx)
-            .unwrap();
-        assert_eq!(
-            r.active_input_required_task_id(),
-            Some("tsk_001".to_string())
-        );
-        r.deliver_input("tsk_001", "answer".into()).unwrap();
-        assert_eq!(r.active_input_required_task_id(), None);
-    }
-
-    #[test]
     fn an_input_required_task_carries_its_prompt_and_nothing_else() {
         let mut r = running_registry("tsk_1");
         let (tx, _rx) = oneshot::channel();
@@ -1085,8 +1647,11 @@ mod tests {
         let task = r.get_task("tsk_1").unwrap();
         let artifacts = task.artifacts.unwrap();
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].name, "prompt");
-        assert_eq!(artifacts[0].parts[0].text, "Which file?");
+        assert_eq!(
+            serde_json::to_value(&artifacts[0]).unwrap(),
+            serde_json::json!({"artifactId": "prompt", "name": "prompt",
+                "parts": [{"text": "Which file?", "mediaType": "text/plain"}]})
+        );
         assert!(task.status.message.is_none());
     }
 
@@ -1097,7 +1662,7 @@ mod tests {
         let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
         assert_eq!(
             task,
-            serde_json::json!({"id": "tsk_1", "contextId": "ctx_001", "status": {"state": "working"}})
+            serde_json::json!({"id": "tsk_1", "contextId": "ctx_001", "status": {"state": "TASK_STATE_WORKING"}})
         );
     }
 
@@ -1115,14 +1680,20 @@ mod tests {
                 "id": "tsk_1",
                 "contextId": "ctx_001",
                 "status": {
-                    "state": "completed",
+                    "state": "TASK_STATE_COMPLETED",
                     "message": {
                         "messageId": "msg_tsk_1_status",
-                        "role": "agent",
-                        "parts": [{"text": "done"}],
+                        "contextId": "ctx_001",
+                        "taskId": "tsk_1",
+                        "role": "ROLE_AGENT",
+                        "parts": [{"text": "done", "mediaType": "text/plain"}],
                     },
                 },
-                "artifacts": [{"name": "response", "parts": [{"text": "the answer is 4"}]}],
+                "artifacts": [{
+                    "artifactId": "response",
+                    "name": "response",
+                    "parts": [{"text": "the answer is 4", "mediaType": "text/plain"}],
+                }],
             })
         );
     }
@@ -1138,7 +1709,7 @@ mod tests {
         r.finish_task(TaskState::Failed);
         r.record_ending("tsk_1", "q gave no answer", None, true, &below);
         let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
-        assert_eq!(task["status"]["state"], "failed");
+        assert_eq!(task["status"]["state"], "TASK_STATE_FAILED");
         assert_eq!(
             task["status"]["message"]["parts"][0]["text"],
             "q gave no answer"
@@ -1157,7 +1728,8 @@ mod tests {
         let task = serde_json::to_value(r.get_task("tsk_2").unwrap()).unwrap();
         assert_eq!(
             task["artifacts"],
-            serde_json::json!([{"name": "response", "parts": [{"text": "none came"}]}])
+            serde_json::json!([{"artifactId": "response", "name": "response",
+                "parts": [{"text": "none came", "mediaType": "text/plain"}]}])
         );
         assert_eq!(
             task["metadata"],
@@ -1187,8 +1759,8 @@ mod tests {
         let task = r.get_task("tsk_1").unwrap();
         assert!(task.artifacts.is_none());
         let message = task.status.message.unwrap();
-        assert_eq!(message.role, "agent");
-        assert_eq!(message.parts[0].text, "the driver failed");
+        assert_eq!(message.role, Role::Agent);
+        assert_eq!(message.text(), Some("the driver failed"));
     }
 
     /// A completed task with no response text, or no recorded ending, carries no artifact.
@@ -1200,7 +1772,7 @@ mod tests {
         r.record_ending("tsk_1", "ok", Some(""), false, &[]);
         let task = r.get_task("tsk_1").unwrap();
         assert!(task.artifacts.is_none());
-        assert_eq!(task.status.message.unwrap().parts[0].text, "ok");
+        assert_eq!(task.status.message.unwrap().text(), Some("ok"));
     }
 
     #[test]
@@ -1317,7 +1889,6 @@ mod tests {
             r.get_input_prompt("tsk_001").is_none(),
             "the waiter is gone"
         );
-        assert_eq!(r.active_input_required_task_id(), None);
         assert!(r.take_input_timeout("tsk_001"));
         assert!(
             !r.take_input_timeout("tsk_001"),
@@ -1429,32 +2000,81 @@ mod tests {
     }
 
     #[test]
-    fn as_str_is_the_serialized_spelling() {
-        for state in [
-            TaskState::Submitted,
-            TaskState::Working,
-            TaskState::InputRequired,
-            TaskState::Completed,
-            TaskState::Failed,
-            TaskState::Rejected,
-            TaskState::Canceled,
-        ] {
+    fn task_state_serializes_as_its_wire_name_and_reads_only_that() {
+        for state in TaskState::ALL {
+            let wire = serde_json::to_value(&state).unwrap();
+            assert_eq!(wire, serde_json::json!(state.wire_name()));
             assert_eq!(
-                serde_json::to_value(&state).unwrap(),
-                serde_json::json!(state.as_str())
+                serde_json::from_value::<TaskState>(wire).unwrap(),
+                state,
+                "{state:?}"
+            );
+            assert!(
+                serde_json::from_value::<TaskState>(serde_json::json!(state.as_str())).is_err(),
+                "{state:?}: murmur's word is not a wire state"
+            );
+        }
+        for refused in [
+            serde_json::json!("TASK_STATE_UNSPECIFIED"),
+            serde_json::json!("TASK_STATE_AUTH_REQUIRED"),
+            serde_json::json!("task_state_working"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                serde_json::from_value::<TaskState>(refused.clone()).is_err(),
+                "{refused}"
             );
         }
     }
 
     #[test]
-    fn canceled_serializes_with_the_protocol_spelling() {
-        let json = serde_json::to_string(&TaskState::Canceled).unwrap();
-        assert_eq!(json, "\"canceled\"");
-        // Every existing spelling is unchanged by the new variant.
+    fn task_state_as_str_is_murmurs_word() {
+        let words: Vec<&str> = TaskState::ALL.iter().map(TaskState::as_str).collect();
         assert_eq!(
-            serde_json::to_string(&TaskState::InputRequired).unwrap(),
-            "\"input-required\""
+            words,
+            [
+                "submitted",
+                "working",
+                "completed",
+                "failed",
+                "canceled",
+                "input-required",
+                "rejected"
+            ]
         );
+    }
+
+    #[test]
+    fn murmur_state_name_maps_the_eight_v1_states_and_nothing_else() {
+        for state in TaskState::ALL {
+            assert_eq!(murmur_state_name(state.wire_name()), Some(state.as_str()));
+        }
+        assert_eq!(
+            murmur_state_name("TASK_STATE_AUTH_REQUIRED"),
+            Some("auth-required")
+        );
+        for other in [
+            "TASK_STATE_UNSPECIFIED",
+            "working",
+            "",
+            "TASK_STATE_working",
+        ] {
+            assert_eq!(murmur_state_name(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn roles_serialize_as_their_proto_names() {
+        assert_eq!(
+            serde_json::to_value(Role::User).unwrap(),
+            serde_json::json!("ROLE_USER")
+        );
+        assert_eq!(
+            serde_json::to_value(Role::Agent).unwrap(),
+            serde_json::json!("ROLE_AGENT")
+        );
+        assert!(serde_json::from_value::<Role>(serde_json::json!("agent")).is_err());
     }
 
     #[test]
@@ -1705,5 +2325,348 @@ mod tests {
             answer["error"]["data"][0]["metadata"]["requestedVersion"],
             "1.0, 1.0"
         );
+    }
+
+    // ── Parts and incoming messages ──────────────────────────────────────────
+
+    #[test]
+    fn a_part_serializes_its_one_content_field_and_reads_back() {
+        for (part, wire) in [
+            (
+                Part::text("hi"),
+                serde_json::json!({"text": "hi", "mediaType": "text/plain"}),
+            ),
+            (
+                Part::data(serde_json::json!({"a": [1]})),
+                serde_json::json!({"data": {"a": [1]}, "mediaType": "application/json"}),
+            ),
+            (
+                Part::data(Value::Null),
+                serde_json::json!({"data": null, "mediaType": "application/json"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&part).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<Part>(wire).unwrap(), part);
+        }
+        for refused in [
+            serde_json::json!({}),
+            serde_json::json!({"text": "a", "data": 1}),
+            serde_json::json!({"kind": "file", "file": {"uri": "x"}}),
+            serde_json::json!({"text": 7}),
+            serde_json::json!("text"),
+        ] {
+            assert!(
+                serde_json::from_value::<Part>(refused.clone()).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    fn params(message: Value) -> Value {
+        serde_json::json!({ "message": message })
+    }
+
+    fn user(parts: Value) -> Value {
+        serde_json::json!({"messageId": "msg_1", "role": "ROLE_USER", "parts": parts})
+    }
+
+    fn invalid_params(params: &Value) -> String {
+        match read_send_params(params) {
+            Err(MessageRefusal::InvalidParams(message)) => message,
+            other => panic!("expected -32602 for {params}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_send_params_reads_a_v1_message_in_full() {
+        let message = read_send_params(&params(serde_json::json!({
+            "messageId": "msg_1",
+            "contextId": "ctx_1",
+            "taskId": "tsk_1",
+            "role": "ROLE_USER",
+            "referenceTaskIds": ["tsk_a", "tsk_b", "tsk_a"],
+            "parts": [{"text": "a"}, {"data": null, "filename": "f.json"}],
+            "metadata": {"ignored": true},
+            "extensions": ["https://example.com/x"],
+            "unknown": 1,
+        })))
+        .unwrap();
+        assert_eq!(message.message_id, "msg_1");
+        assert_eq!(message.context_id.as_deref(), Some("ctx_1"));
+        assert_eq!(message.task_id.as_deref(), Some("tsk_1"));
+        assert_eq!(message.reference_task_ids, ["tsk_a", "tsk_b"]);
+        assert_eq!(message.part_kinds(), ["text", "data"]);
+        assert_eq!(message.parts[1].filename.as_deref(), Some("f.json"));
+
+        let message = read_send_params(&params(serde_json::json!({
+            "messageId": "msg_1", "role": "ROLE_USER", "taskId": "", "parts": [{"text": "a"}],
+        })))
+        .unwrap();
+        assert_eq!(message.task_id, None, "an empty taskId names no task");
+    }
+
+    /// Each structural check refuses with `-32602` in the documented order, so a message wrong in
+    /// two ways learns about the earlier one.
+    #[test]
+    fn read_send_params_refuses_structure_in_order() {
+        let text = serde_json::json!([{"text": "a"}]);
+        for (params, expected) in [
+            (serde_json::json!({}), "params.message"),
+            (user(text.clone()), "params.message"),
+            (serde_json::json!({"message": "hi"}), "params.message"),
+            (
+                params(serde_json::json!({"role": "ROLE_USER", "parts": text})),
+                "messageId",
+            ),
+            (
+                params(serde_json::json!({"messageId": "", "role": "ROLE_USER", "parts": text})),
+                "messageId",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "user", "parts": []})),
+                "ROLE_USER",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "ROLE_AGENT", "parts": text})),
+                "ROLE_USER",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": 1, "parts": text})),
+                "ROLE_USER",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "parts": text})),
+                "ROLE_USER",
+            ),
+            (params(user(serde_json::json!([]))), "non-empty array"),
+            (
+                params(user(serde_json::json!({"text": "a"}))),
+                "non-empty array",
+            ),
+            (
+                params(user(serde_json::json!([{"text": "a"}, {}]))),
+                "message.parts[1] sets none",
+            ),
+            (
+                params(user(serde_json::json!([{"text": "a", "data": 1}]))),
+                "message.parts[0] sets text and data",
+            ),
+            (
+                params(user(
+                    serde_json::json!([{"kind": "file", "file": {"uri": "x"}}]),
+                )),
+                "message.parts[0] sets none",
+            ),
+            (
+                params(user(serde_json::json!([{"url": 7}, {}]))),
+                "message.parts[1] sets none",
+            ),
+            (
+                params(user(serde_json::json!([{"text": 7}]))),
+                "message.parts[0].text is not a string",
+            ),
+            (
+                params(user(serde_json::json!([{"data": 1, "mediaType": 2}]))),
+                "message.parts[0].mediaType",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                    "parts": [{"url": "u"}], "taskId": 7})),
+                "message.taskId",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                    "parts": text, "contextId": ["c"]})),
+                "message.contextId",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                    "parts": [{"raw": "aGk="}], "referenceTaskIds": [""]})),
+                "referenceTaskIds",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                    "parts": text, "referenceTaskIds": [7]})),
+                "referenceTaskIds",
+            ),
+            (
+                params(serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                    "parts": text, "referenceTaskIds": "tsk_a"})),
+                "referenceTaskIds",
+            ),
+        ] {
+            let message = invalid_params(&params);
+            assert!(message.contains(expected), "{params}: {message}");
+        }
+    }
+
+    #[test]
+    fn read_send_params_caps_distinct_references() {
+        let ids = |n: usize| -> Vec<String> { (0..n).map(|i| format!("tsk_{i}")).collect() };
+        let with = |ids: Vec<String>| {
+            params(serde_json::json!({"messageId": "m", "role": "ROLE_USER",
+                "parts": [{"text": "a"}], "referenceTaskIds": ids}))
+        };
+        let mut sixteen_twice = ids(MAX_REFERENCE_TASK_IDS);
+        sixteen_twice.extend(ids(MAX_REFERENCE_TASK_IDS));
+        assert_eq!(
+            read_send_params(&with(sixteen_twice))
+                .unwrap()
+                .reference_task_ids,
+            ids(MAX_REFERENCE_TASK_IDS)
+        );
+        let message = invalid_params(&with(ids(MAX_REFERENCE_TASK_IDS + 1)));
+        assert!(message.contains("names 17 tasks"), "{message}");
+    }
+
+    /// A file part is refused only once the message is otherwise well formed, naming the first.
+    #[test]
+    fn read_send_params_refuses_the_first_file_part_with_content_type_not_supported() {
+        assert_eq!(
+            read_send_params(&params(user(serde_json::json!([
+                {"text": "a"},
+                {"url": "https://example.com/x.pdf", "mediaType": "application/pdf"},
+                {"raw": "aGk="},
+            ])))),
+            Err(MessageRefusal::ContentTypeNotSupported {
+                part_index: 1,
+                kind: "url",
+                media_type: Some("application/pdf".to_string()),
+            })
+        );
+        let refusal =
+            read_send_params(&params(user(serde_json::json!([{"raw": "aGk="}])))).unwrap_err();
+        let answer = wire(&refusal.into_response(Value::from(3)));
+        assert_eq!(answer["error"]["code"], -32005);
+        let info = &answer["error"]["data"][0];
+        assert_eq!(info["reason"], "CONTENT_TYPE_NOT_SUPPORTED");
+        assert_eq!(info["metadata"], serde_json::json!({"partIndex": "0"}));
+        // Malformed beats unsupported.
+        invalid_params(&params(user(
+            serde_json::json!([{"raw": "aGk="}, {"text": 1}]),
+        )));
+    }
+
+    fn rendered(parts: Value) -> String {
+        read_send_params(&params(user(parts))).unwrap().agent_text()
+    }
+
+    #[test]
+    fn agent_text_of_text_parts_is_the_text_joined_by_newlines() {
+        assert_eq!(
+            rendered(
+                serde_json::json!([{"text": "one"}, {"text": "two", "mediaType": "text/markdown"}])
+            ),
+            "one\ntwo"
+        );
+    }
+
+    #[test]
+    fn agent_text_fences_a_data_part_beyond_its_longest_backtick_run() {
+        assert_eq!(
+            rendered(serde_json::json!([{"text": "summarise"}, {"data": {"rows": [1, 2]}}])),
+            "summarise\n```data\n{\n  \"rows\": [\n    1,\n    2\n  ]\n}\n```"
+        );
+        let three =
+            rendered(serde_json::json!([{"data": "a ``` b", "mediaType": "application/json"}]));
+        assert_eq!(
+            three,
+            "````data media-type=application/json\n\"a ``` b\"\n````"
+        );
+        let five = rendered(serde_json::json!([{"data": {"x": "`````"}}]));
+        assert!(five.starts_with("``````data\n"), "{five}");
+        assert!(five.ends_with("\n``````"), "{five}");
+        assert_eq!(
+            rendered(serde_json::json!([{"data": null}])),
+            "```data\nnull\n```"
+        );
+    }
+
+    #[test]
+    fn agent_text_sanitises_the_fence_label() {
+        assert_eq!(
+            rendered(serde_json::json!([{"data": 1, "mediaType": "a b=`c",
+                "filename": "my\tfile.json"}])),
+            "```data media-type=a_b__c filename=my_file.json\n1\n```"
+        );
+    }
+
+    #[test]
+    fn a_reference_block_names_each_task_as_it_stands() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        for id in ["tsk_a", "tsk_b", "tsk_c", "tsk_e"] {
+            r.enqueue(id, "ctx_001");
+        }
+        r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        r.finish_task(TaskState::Completed);
+        r.record_ending("tsk_a", "done", Some("four ```"), false, &[]);
+        r.start_task("tsk_b".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        r.finish_task(TaskState::Failed);
+        r.record_ending("tsk_b", "the driver\nfailed", None, false, &[]);
+        r.start_task("tsk_c".to_string(), "ctx_001".to_string(), TaskLane::Bg);
+        r.record_submitter("tsk_e", "reviewer");
+        let ids: Vec<String> = ["tsk_a", "tsk_b", "tsk_c", "tsk_d", "tsk_e"]
+            .map(str::to_string)
+            .to_vec();
+
+        assert_eq!(
+            r.reference_block(&ids, |_| true).unwrap(),
+            "Referenced tasks:\n\
+             - tsk_a: completed\n````response\nfour ```\n````\n\
+             - tsk_b: failed: the driver failed\n\
+             - tsk_c: working\n\
+             - tsk_d: not a task this capsule holds\n\
+             - tsk_e: submitted"
+        );
+        let member = |task_id: &str| r.submitter(task_id) == Some("planner");
+        let block = r.reference_block(&ids[4..], member).unwrap();
+        assert_eq!(
+            block,
+            "Referenced tasks:\n- tsk_e: not a task this capsule holds"
+        );
+        assert_eq!(r.reference_block(&[], |_| true), None);
+    }
+
+    #[test]
+    fn user_message_is_a_v1_message_from_the_user() {
+        assert_eq!(
+            user_message("msg_1", Some("ctx_1"), "hello"),
+            serde_json::json!({
+                "messageId": "msg_1",
+                "contextId": "ctx_1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello", "mediaType": "text/plain"}],
+            })
+        );
+        assert!(user_message("msg_1", None, "hello")
+            .get("contextId")
+            .is_none());
+        assert!(read_send_params(&params(user_message("msg_1", None, "hello"))).is_ok());
+    }
+
+    #[test]
+    fn send_message_result_is_exactly_one_member_of_the_oneof() {
+        let task = serde_json::json!({"id": "tsk_1", "contextId": "c",
+            "status": {"state": "TASK_STATE_SUBMITTED"}});
+        assert!(matches!(
+            SendMessageResult::from_result(&serde_json::json!({ "task": task })),
+            Ok(SendMessageResult::Task(task)) if task.id == "tsk_1"
+        ));
+        assert!(matches!(
+            SendMessageResult::from_result(&serde_json::json!({"message": {"messageId": "m"}})),
+            Ok(SendMessageResult::Message(_))
+        ));
+        for refused in [
+            serde_json::json!({}),
+            serde_json::json!({"task": task, "message": {}}),
+            task.clone(),
+            serde_json::json!({"task": {"id": "tsk_1", "contextId": "c",
+                "status": {"state": "submitted"}}}),
+        ] {
+            assert!(
+                SendMessageResult::from_result(&refused).is_err(),
+                "{refused}"
+            );
+        }
     }
 }

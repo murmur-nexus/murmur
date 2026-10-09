@@ -91,8 +91,9 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         vec![
             end_turn(1, "sent"),
             end_turn(2, "running"),
-            end_turn(3, "streamed"),
-            end_turn(4, "spare"),
+            end_turn(3, "data"),
+            end_turn(4, "streamed"),
+            end_turn(5, "spare"),
         ],
         Duration::from_millis(400),
     );
@@ -121,20 +122,16 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         message("m-census-send", "send"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"]
+    let task_id = sent.json()["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage answered no task: {sent:?}"))
         .to_string();
     wait_completed(&addr, token, &task_id);
 
-    // Without an `id`, the door answers its active task.
-    let active = rpc(&addr, token, "GetTask", json!({}));
-    assert_eq!(active.status, 200, "{active:?}");
-    assert_eq!(
-        active.json()["result"]["id"],
-        task_id.as_str(),
-        "{active:?}"
-    );
+    // `GetTask` names its task: without an `id` it is refused, and nothing is measured.
+    let unnamed = rpc(&addr, token, "GetTask", json!({}));
+    assert_eq!(unnamed.status, 200, "{unnamed:?}");
+    assert_eq!(unnamed.json()["error"]["code"], -32602, "{unnamed:?}");
 
     // A task that has ended is not cancelable, and is left as it ended.
     let ended = rpc(&addr, token, "CancelTask", json!({"id": task_id}));
@@ -142,7 +139,7 @@ fn the_door_fails_exactly_the_listed_exceptions() {
     assert_eq!(ended.json()["error"]["code"], -32002, "{ended:?}");
     assert_eq!(
         ended.json()["error"]["data"][0]["metadata"]["state"],
-        "completed",
+        "TASK_STATE_COMPLETED",
         "{ended:?}"
     );
 
@@ -153,7 +150,7 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         "SendMessage",
         message("m-census-running", "running"),
     );
-    let running_id = running.json()["result"]["id"]
+    let running_id = running.json()["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage answered no task: {running:?}"))
         .to_string();
@@ -163,7 +160,7 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         "SendMessage",
         message("m-census-queued", "queued"),
     );
-    let queued_id = queued.json()["result"]["id"]
+    let queued_id = queued.json()["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage answered no task: {queued:?}"))
         .to_string();
@@ -171,10 +168,37 @@ fn the_door_fails_exactly_the_listed_exceptions() {
     assert_eq!(canceled.status, 200, "{canceled:?}");
     assert_eq!(
         canceled.json()["result"]["status"]["state"],
-        "canceled",
+        "TASK_STATE_CANCELED",
         "{canceled:?}"
     );
     wait_completed(&addr, token, &running_id);
+
+    // A message with a text part and a data part is read in full and measured.
+    let data = rpc(
+        &addr,
+        token,
+        "SendMessage",
+        json!({"message": {"messageId": "m-census-data", "role": "ROLE_USER", "parts": [
+            {"text": "summarise", "mediaType": "text/plain"},
+            {"data": {"rows": [1, 2]}, "mediaType": "application/json"},
+        ]}}),
+    );
+    let data_id = data.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("SendMessage answered no task: {data:?}"))
+        .to_string();
+    wait_completed(&addr, token, &data_id);
+
+    // A file part is refused, and starts nothing.
+    let file = rpc(
+        &addr,
+        token,
+        "SendMessage",
+        json!({"message": {"messageId": "m-census-file", "role": "ROLE_USER",
+            "parts": [{"url": "https://example.com/x.pdf", "mediaType": "application/pdf"}]}}),
+    );
+    assert_eq!(file.status, 200, "{file:?}");
+    assert_eq!(file.json()["error"]["code"], -32005, "{file:?}");
 
     let streamed = rpc(
         &addr,

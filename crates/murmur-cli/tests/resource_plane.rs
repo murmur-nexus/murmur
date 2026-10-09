@@ -134,7 +134,11 @@ fn message_send_body(id: &str, text: &str) -> String {
         "id": 1,
         "method": "SendMessage",
         "params": {
-            "message": {"messageId": id, "role": "user", "parts": [{"text": text}]}
+            "message": {
+                "messageId": id,
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
+            }
         }
     })
     .to_string()
@@ -173,7 +177,7 @@ impl Capsule {
 
     fn submit_and_await(&self, id: &str, text: &str) {
         let response = http_post_json(&self.url, "/", &message_send_body(id, text));
-        let task_id = response["result"]["id"]
+        let task_id = response["result"]["task"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("expected a task id; got: {response}"))
             .to_string();
@@ -189,7 +193,7 @@ impl Capsule {
             .to_string();
             let response = http_post_json(&self.url, "/", &body);
             let state = response["result"]["status"]["state"].as_str().unwrap_or("");
-            if state == "completed" || state == "failed" {
+            if state == "TASK_STATE_COMPLETED" || state == "TASK_STATE_FAILED" {
                 return;
             }
             assert!(
@@ -655,7 +659,10 @@ fn concurrent_reads_leave_every_trace_line_parseable() {
     write_export_file(&capsule.project, "report.md", bytes);
 
     let response = http_post_json(&capsule.url, "/", &message_send_body("conc-1", "work"));
-    let task_id = response["result"]["id"].as_str().unwrap().to_string();
+    let task_id = response["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let readers: Vec<_> = (0..20)
         .map(|_| {

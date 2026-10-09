@@ -3738,6 +3738,8 @@ fn launch(
                                                 "task_md",
                                                 provenance,
                                                 bytes,
+                                                &[],
+                                                &[],
                                             )
                                             .await;
                                         let seed = hooks
@@ -3826,6 +3828,8 @@ fn launch(
                                                 "task_md",
                                                 provenance,
                                                 bytes,
+                                                &[],
+                                                &[],
                                             )
                                             .await;
                                         let seed = hooks
@@ -4155,6 +4159,8 @@ fn launch(
                                 incoming.source,
                                 incoming.provenance,
                                 incoming.message_text.len() as u64,
+                                &incoming.part_kinds,
+                                &incoming.reference_task_ids,
                             )
                             .await;
                         let seed = hooks
@@ -6843,11 +6849,7 @@ impl send::Host for CapsuleStoreState {
             traceparent,
             stamp_for_peer(sender_task).trust(),
         ));
-        Ok(send::TaskResult {
-            task_id: task.id,
-            context_id: task.context_id,
-            state: task.status.state.as_str().to_string(),
-        })
+        Ok(task.into())
     }
 }
 
@@ -11457,6 +11459,8 @@ async fn enqueue_detached_report(
                 // itself.
                 forget_session: false,
                 caller_member: None,
+                reference_task_ids: Vec::new(),
+                part_kinds: Vec::new(),
             };
             let _ = trace
                 .write_shell_completed(
@@ -11487,6 +11491,8 @@ async fn enqueue_detached_report(
             source: crate::a2a::SOURCE_DETACHED_LOST,
             forget_session: false,
             caller_member: None,
+            reference_task_ids: Vec::new(),
+            part_kinds: Vec::new(),
         },
     };
 
@@ -15025,6 +15031,8 @@ inference:
                     "task_md",
                     TaskProvenance::derive(TaskOrigin::User, None),
                     3,
+                    &[],
+                    &[],
                 )
                 .await
                 .unwrap();
@@ -18438,6 +18446,8 @@ inference:
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
                 8,
+                &[],
+                &[],
             )
             .await
             .unwrap();
@@ -18843,6 +18853,8 @@ inference:
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
                 8,
+                &[],
+                &[],
             )
             .await
             .unwrap();
@@ -20524,7 +20536,7 @@ inference:
                     seen.lock()
                         .unwrap()
                         .push(format!("{head}{}", String::from_utf8_lossy(&body)));
-                    let answer = r#"{"jsonrpc":"2.0","id":"x","result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"submitted"}}}"#;
+                    let answer = r#"{"jsonrpc":"2.0","id":"x","result":{"task":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_SUBMITTED"}}}}"#;
                     let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
@@ -21160,8 +21172,8 @@ mod member_call_tests {
             ),
             (
                 "200 OK",
-                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                    "id": "tsk_r", "contextId": "ctx", "status": {"state": "rejected"}}})
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+                    "id": "tsk_r", "contextId": "ctx", "status": {"state": "TASK_STATE_REJECTED"}}}})
                 .to_string(),
                 "\"output\":\"worker did not take the task\"",
                 "rejected",
@@ -21245,8 +21257,9 @@ mod member_call_tests {
             let sent: serde_json::Value = serde_json::from_str(&seen[0].body).unwrap();
             assert_eq!(sent["method"], "SendMessage");
             let message = &sent["params"]["message"];
-            assert_eq!(message["role"], "user");
+            assert_eq!(message["role"], "ROLE_USER");
             assert_eq!(message["parts"][0]["text"], "add 2 and 2");
+            assert_eq!(message["parts"][0]["mediaType"], "text/plain");
             assert!(message.get("contextId").is_none());
             assert_eq!(
                 message["messageId"],
@@ -21682,8 +21695,8 @@ mod member_call_tests {
     fn held(task_id: &str) -> (&'static str, String) {
         (
             "200 OK",
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                "id": task_id, "contextId": "ctx", "status": {"state": "submitted"}}})
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+                "id": task_id, "contextId": "ctx", "status": {"state": "TASK_STATE_SUBMITTED"}}}})
             .to_string(),
         )
     }
@@ -21692,9 +21705,10 @@ mod member_call_tests {
     fn rejected(message: &str) -> (&'static str, String) {
         (
             "200 OK",
-            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                "id": "tsk_refused", "contextId": "ctx", "status": {"state": "rejected",
-                "message": {"messageId": "m", "role": "agent", "parts": [{"text": message}]}}}})
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {
+                "id": "tsk_refused", "contextId": "ctx", "status": {"state": "TASK_STATE_REJECTED",
+                "message": {"messageId": "m", "contextId": "ctx", "taskId": "tsk_refused",
+                    "role": "ROLE_AGENT", "parts": [{"text": message}]}}}}})
             .to_string(),
         )
     }
@@ -21961,7 +21975,7 @@ mod member_call_tests {
         (
             "200 OK",
             serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                "id": task_id, "contextId": "ctx", "status": {"state": "canceled"}}})
+                "id": task_id, "contextId": "ctx", "status": {"state": "TASK_STATE_CANCELED"}}})
             .to_string(),
         )
     }
@@ -22177,8 +22191,9 @@ mod member_call_tests {
         (
             "200 OK",
             serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
-                "id": task_id, "contextId": "ctx", "status": {"state": "completed"},
-                "artifacts": [{"name": "response", "parts": [{"text": text}]}]}})
+                "id": task_id, "contextId": "ctx", "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [{"artifactId": "response", "name": "response",
+                    "parts": [{"text": text, "mediaType": "text/plain"}]}]}})
             .to_string(),
         )
     }
@@ -22682,14 +22697,16 @@ mod member_call_tests {
         response: Option<&str>,
         metadata: Option<serde_json::Value>,
     ) -> (&'static str, String) {
+        let state = format!("TASK_STATE_{}", state.to_uppercase().replace('-', "_"));
         let mut result = serde_json::json!({
             "id": task_id, "contextId": "ctx", "status": {"state": state}});
         if let Some(message) = message {
-            result["status"]["message"] = serde_json::json!({"messageId": "m", "role": "agent", "parts": [{"text": message}]});
+            result["status"]["message"] = serde_json::json!({"messageId": "m", "contextId": "ctx",
+                "taskId": task_id, "role": "ROLE_AGENT", "parts": [{"text": message}]});
         }
         if let Some(response) = response {
-            result["artifacts"] =
-                serde_json::json!([{"name": "response", "parts": [{"text": response}]}]);
+            result["artifacts"] = serde_json::json!([{"artifactId": "response", "name": "response",
+                "parts": [{"text": response}]}]);
         }
         if let Some(metadata) = metadata {
             result["metadata"] = metadata;

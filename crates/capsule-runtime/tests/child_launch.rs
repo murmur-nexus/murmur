@@ -382,8 +382,8 @@ fn a_parents_runtime_launches_an_approved_child_as_a_separate_process() {
                 "jsonrpc": "2.0",
                 "id": "child-launch-1",
                 "method": "SendMessage",
-                "params": {"message": {"messageId": "m-1", "role": "user",
-                                       "parts": [{"text": "hello"}]}}
+                "params": {"message": {"messageId": "m-1", "role": "ROLE_USER",
+                                       "parts": [{"text": "hello", "mediaType": "text/plain"}]}}
             })
             .to_string(),
         ),
@@ -394,7 +394,7 @@ fn a_parents_runtime_launches_an_approved_child_as_a_separate_process() {
     )
     .expect("the child answers SendMessage");
     assert!(
-        response["result"]["id"].as_str().is_some(),
+        response["result"]["task"]["id"].as_str().is_some(),
         "SendMessage returned {response}"
     );
 

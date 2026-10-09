@@ -783,14 +783,14 @@ fn json_launch_answers_its_door_after_the_supervisor_stops_reading() {
             "method": "SendMessage",
             "params": {"message": {
                 "messageId": "msg-1",
-                "role": "user",
-                "parts": [{"text": "door still answers"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "door still answers", "mediaType": "text/plain"}]
             }}
         })
         .to_string(),
     );
     assert!(
-        response["result"]["id"].as_str().is_some(),
+        response["result"]["task"]["id"].as_str().is_some(),
         "the door should accept a task; got: {response}"
     );
 
@@ -862,14 +862,14 @@ fn human_launch_runs_to_its_end_after_the_supervisor_stops_reading() {
             "method": "SendMessage",
             "params": {"message": {
                 "messageId": "msg-1",
-                "role": "user",
-                "parts": [{"text": "human launch door"}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "human launch door", "mediaType": "text/plain"}]
             }}
         })
         .to_string(),
     );
     assert!(
-        response["result"]["id"].as_str().is_some(),
+        response["result"]["task"]["id"].as_str().is_some(),
         "the door should accept a task; got: {response}"
     );
 
@@ -971,7 +971,10 @@ fn an_authenticated_capsule_readiness_line_says_auth_and_carries_no_token() {
         message("m-1", "hello"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_completed(&addr, Some(&operator), &task_id);
 
     let stderr = run.stderr();

@@ -43,7 +43,12 @@ fn tool_wasm_path() -> PathBuf {
 /// ScriptedServer that returns: first a tool_use call for request-input-tool,
 /// then (after tool result) an end_turn response.
 fn tool_then_end_turn_server(tool_input_data: &str, final_text: &str) -> common::ScriptedServer {
-    common::ScriptedServer::start(vec![
+    common::ScriptedServer::start(tool_then_end_turn_responses(tool_input_data, final_text))
+}
+
+/// The two answers [`tool_then_end_turn_server`] gives.
+fn tool_then_end_turn_responses(tool_input_data: &str, final_text: &str) -> Vec<String> {
+    vec![
         serde_json::json!({
             "id": "msg_1",
             "type": "message",
@@ -69,7 +74,7 @@ fn tool_then_end_turn_server(tool_input_data: &str, final_text: &str) -> common:
             "usage": {"input_tokens": 1, "output_tokens": 1}
         })
         .to_string(),
-    ])
+    ]
 }
 
 fn create_tool_artifact(dir: &Path) -> PathBuf {
@@ -240,21 +245,33 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
     serde_json::from_str(&body_str).unwrap_or_else(|_| serde_json::json!({"_raw": body_str}))
 }
 
-fn send_message(addr: &str, msg_id: &str, text: &str) -> Value {
+/// An A2A v1.0 message from the user carrying `text`.
+fn user_message(msg_id: &str, text: &str) -> Value {
+    serde_json::json!({"messageId": msg_id, "role": "ROLE_USER", "parts": [{"text": text}]})
+}
+
+/// `user_message` naming the task it continues.
+fn reply_to(task_id: &str, msg_id: &str, text: &str) -> Value {
+    let mut message = user_message(msg_id, text);
+    message["taskId"] = Value::from(task_id);
+    message
+}
+
+/// `SendMessage` carrying `message`.
+fn send(addr: &str, message: Value) -> Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendMessage",
-        "params": {
-            "message": {
-                "messageId": msg_id,
-                "role": "user",
-                "parts": [{"text": text}]
-            }
-        }
+        "params": { "message": message }
     })
     .to_string();
     http_post_json(addr, "/", &body)
+}
+
+/// `SendMessage` starting a new task with `text`.
+fn send_message(addr: &str, msg_id: &str, text: &str) -> Value {
+    send(addr, user_message(msg_id, text))
 }
 
 fn tasks_get(addr: &str, task_id: &str) -> Value {
@@ -268,28 +285,21 @@ fn tasks_get(addr: &str, task_id: &str) -> Value {
     http_post_json(addr, "/", &body)
 }
 
-/// Poll `GetTask` with no `id` param — which returns whichever task holds the active
-/// slot — until a task exists, and return its id.
+/// The id of the first task the session's trace records starting.
 ///
-/// Lets a caller that submitted a task over `SendStreamingMessage` learn the server-assigned
-/// task id, which that method never reports back over the wire.
-fn discover_active_task_id(addr: &str, timeout: Duration) -> String {
-    let deadline = std::time::Instant::now() + timeout;
+/// Lets a caller that submitted a task over `SendStreamingMessage` learn the task id before the
+/// stream's first frame reaches it, from a thread that is not reading the stream.
+fn started_task_id(trace_path: &Path, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
     loop {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "GetTask",
-            "params": {}
-        })
-        .to_string();
-        let resp = http_post_json(addr, "/", &body);
-        if let Some(task_id) = resp["result"]["id"].as_str() {
+        if let Some(task_id) = read_trace(trace_path)
+            .iter()
+            .find(|event| event["event_type"] == "task_start")
+            .and_then(|event| event["task_id"].as_str())
+        {
             return task_id.to_string();
         }
-        if std::time::Instant::now() >= deadline {
-            panic!("timed out discovering the active task id; last response: {resp}");
-        }
+        assert!(Instant::now() < deadline, "no task started");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -383,17 +393,20 @@ fn open_sse_stream(
     text: &str,
     deadline: Instant,
 ) -> Result<BufReader<TcpStream>, StreamEnd> {
+    open_sse_stream_with(addr, user_message(msg_id, text), deadline)
+}
+
+/// [`open_sse_stream`] for any `message`.
+fn open_sse_stream_with(
+    addr: &str,
+    message: Value,
+    deadline: Instant,
+) -> Result<BufReader<TcpStream>, StreamEnd> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendStreamingMessage",
-        "params": {
-            "message": {
-                "messageId": msg_id,
-                "role": "user",
-                "parts": [{"text": text}]
-            }
-        }
+        "params": { "message": message }
     })
     .to_string();
 
@@ -555,16 +568,16 @@ fn input_required_task_suspends_loop() {
 
     let resp = send_message(&capsule_url, "msg-1", "start the task");
     assert_eq!(
-        resp["result"]["status"]["state"], "submitted",
+        resp["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "initial response should be submitted; got: {resp}"
     );
-    let task_id = resp["result"]["id"].as_str().unwrap().to_string();
+    let task_id = resp["result"]["task"]["id"].as_str().unwrap().to_string();
 
     // Wait for the task to enter input-required state
     let ir_resp = poll_until_state(
         &capsule_url,
         &task_id,
-        "input-required",
+        "TASK_STATE_INPUT_REQUIRED",
         Duration::from_secs(30),
     );
 
@@ -573,6 +586,7 @@ fn input_required_task_suspends_loop() {
         artifacts.is_array(),
         "input-required task should have artifacts; got: {ir_resp}"
     );
+    assert_eq!(artifacts[0]["artifactId"], "prompt", "{ir_resp}");
     let prompt = artifacts[0]["parts"][0]["text"].as_str().unwrap_or("");
     assert!(
         prompt.contains("What branch"),
@@ -580,16 +594,171 @@ fn input_required_task_suspends_loop() {
     );
 
     // Unblock: deliver input to complete the task
-    let _ = send_message(&capsule_url, "msg-2", "use main branch");
+    let _ = send(&capsule_url, reply_to(&task_id, "msg-2", "use main branch"));
 
     handle.join().expect("launch thread should not panic");
 }
 
-/// Test 2: Delivering input via SendMessage resumes the suspended task and
-/// the task eventually reaches completed state.
+/// The `-32xxx` code of a JSON-RPC error answer, and its `ErrorInfo` metadata.
+fn error_of(answer: &Value) -> (i64, Value) {
+    (
+        answer["error"]["code"].as_i64().unwrap_or_default(),
+        answer["error"]["data"][0]["metadata"].clone(),
+    )
+}
+
+/// An input-required round trip names its task. A reply naming no task, an unknown one
+/// or the task in another context reaches nothing; the reply naming it continues it to
+/// `TASK_STATE_COMPLETED`, carrying the reply's text to the provider; and the ended task takes
+/// no further reply. While the task is working, a reply naming it is refused too.
 #[test]
-fn input_required_resumes_on_message_send() {
-    let server = tool_then_end_turn_server("Which option?", "task completed after input");
+fn input_required_round_trip_names_its_task() {
+    let server = common::ScriptedServer::start_with_delay(
+        tool_then_end_turn_responses("Which option?", "task completed after input"),
+        Duration::from_millis(1500),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
+    // A queue door with room for one waiting task, so it outlives the task and can be filled.
+    let lifecycle = LifecycleConfig {
+        task_acceptance: TaskAcceptance::Queue,
+        after_task: AfterTask::Sleep,
+        queue_depth: 1,
+        ..Default::default()
+    };
+    let staged = stage_agent(&home, &manifest_path, Some(lifecycle));
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(common::CAPSULE_URL_WAIT)
+        .expect("timed out waiting for capsule URL");
+
+    let resp = send(
+        &capsule_url,
+        serde_json::json!({"messageId": "msg-1", "contextId": "ctx-round-trip",
+            "role": "ROLE_USER", "parts": [{"text": "start task"}]}),
+    );
+    let task_id = resp["result"]["task"]["id"].as_str().unwrap().to_string();
+
+    // While the provider is still answering the first turn, the task is working.
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "TASK_STATE_WORKING",
+        Duration::from_secs(30),
+    );
+    let working = send(&capsule_url, reply_to(&task_id, "msg-early", "too soon"));
+    assert_eq!(
+        error_of(&working),
+        (
+            -32004,
+            serde_json::json!({"taskId": task_id, "state": "TASK_STATE_WORKING"})
+        ),
+        "{working}"
+    );
+
+    let waiting = poll_until_state(
+        &capsule_url,
+        &task_id,
+        "TASK_STATE_INPUT_REQUIRED",
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        waiting["result"]["artifacts"][0]["artifactId"], "prompt",
+        "{waiting}"
+    );
+
+    // 1. An unknown task id.
+    let unknown = send(&capsule_url, reply_to("tsk_made_up", "msg-2", "option A"));
+    assert_eq!(
+        error_of(&unknown),
+        (-32001, serde_json::json!({"taskId": "tsk_made_up"})),
+        "{unknown}"
+    );
+    // 2. No task id: a new task, which the door, its queue filled, rejects as busy.
+    let filler = send_message(&capsule_url, "msg-filler", "queued");
+    let filler_id = filler["result"]["task"]["id"].as_str().unwrap().to_string();
+    let unnamed = send_message(&capsule_url, "msg-3", "option A");
+    assert_eq!(
+        unnamed["result"]["task"]["status"]["state"], "TASK_STATE_REJECTED",
+        "{unnamed}"
+    );
+    assert_ne!(unnamed["result"]["task"]["id"], task_id.as_str());
+    let canceled = http_post_json(
+        &capsule_url,
+        "/",
+        &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "CancelTask",
+            "params": {"id": filler_id}})
+        .to_string(),
+    );
+    assert_eq!(
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
+        "{canceled}"
+    );
+    // 3. The task, in another context.
+    let mut elsewhere = reply_to(&task_id, "msg-4", "option A");
+    elsewhere["contextId"] = Value::from("ctx-other");
+    let elsewhere = send(&capsule_url, elsewhere);
+    assert_eq!(elsewhere["error"]["code"], -32602, "{elsewhere}");
+    assert_eq!(
+        tasks_get(&capsule_url, &task_id)["result"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED",
+        "nothing reached the waiting task"
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the provider was asked nothing further"
+    );
+
+    // 4. The task, by name and in its own context.
+    let mut named = reply_to(&task_id, "msg-5", "option A, by name");
+    named["contextId"] = Value::from("ctx-round-trip");
+    let resumed = send(&capsule_url, named);
+    assert_eq!(
+        resumed["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
+        "{resumed}"
+    );
+    assert_eq!(resumed["result"]["task"]["id"], task_id.as_str());
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(30),
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests[1].to_string().contains("option A, by name"),
+        "the tool result carries the reply: {}",
+        requests[1]
+    );
+
+    // 5. The ended task.
+    let ended = send(
+        &capsule_url,
+        reply_to(&task_id, "msg-6", "and another thing"),
+    );
+    assert_eq!(
+        error_of(&ended),
+        (
+            -32004,
+            serde_json::json!({"taskId": task_id, "state": "TASK_STATE_COMPLETED"})
+        ),
+        "{ended}"
+    );
+}
+
+/// `SendStreamingMessage` naming the waiting task continues it, and its stream ends on that
+/// task's final status.
+#[test]
+fn a_streaming_reply_continues_the_waiting_task_to_its_final_status() {
+    let server = tool_then_end_turn_server("Which option?", "streamed after input");
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
     let staged = stage_agent(&home, &manifest_path, None);
@@ -601,30 +770,40 @@ fn input_required_resumes_on_message_send() {
         })
         .expect("launch should succeed")
     });
-
     let capsule_url = url_rx
         .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start task");
-    let task_id = resp["result"]["id"].as_str().unwrap().to_string();
-
-    // Wait for input-required
+    let task_id = resp["result"]["task"]["id"].as_str().unwrap().to_string();
     poll_until_state(
         &capsule_url,
         &task_id,
-        "input-required",
+        "TASK_STATE_INPUT_REQUIRED",
         Duration::from_secs(30),
     );
 
-    // Deliver input: the second SendMessage should be routed to the waiting task
-    let resume_resp = send_message(&capsule_url, "msg-2", "option A");
-    let resume_state = resume_resp["result"]["status"]["state"]
-        .as_str()
-        .unwrap_or("");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut reader = open_sse_stream_with(
+        &capsule_url,
+        reply_to(&task_id, "msg-2", "option B, streamed"),
+        deadline,
+    )
+    .unwrap_or_else(|end| panic!("the stream ended ({end:?}) before its first event"));
+    let mut events = Vec::new();
+    assert_eq!(
+        collect_sse_events_until(&mut reader, deadline, &mut events),
+        StreamEnd::Final,
+        "{events:?}"
+    );
+    let last: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
+    assert_eq!(last["id"], task_id.as_str(), "{last}");
+    assert_eq!(last["status"]["state"], "completed", "{last}");
     assert!(
-        resume_state == "working" || resume_state == "completed",
-        "delivering input should return working or completed; got: '{resume_state}' in {resume_resp}"
+        server.requests()[1]
+            .to_string()
+            .contains("option B, streamed"),
+        "the tool result carries the reply"
     );
 
     handle.join().expect("launch thread should not panic");
@@ -664,14 +843,14 @@ fn input_required_working_state_rejects_message() {
     // First message starts the task
     let resp1 = send_message(&capsule_url, "msg-1", "first task");
     assert_eq!(
-        resp1["result"]["status"]["state"], "submitted",
+        resp1["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "first message should be submitted; got: {resp1}"
     );
 
     // Second message while working — must be rejected
     let resp2 = send_message(&capsule_url, "msg-2", "concurrent task attempt");
     assert_eq!(
-        resp2["result"]["status"]["state"], "rejected",
+        resp2["result"]["task"]["status"]["state"], "TASK_STATE_REJECTED",
         "second message to working task should be rejected; got: {resp2}"
     );
 
@@ -707,14 +886,19 @@ fn input_required_timeout_transitions_to_failed() {
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start timed task");
-    let task_id = resp["result"]["id"].as_str().unwrap().to_string();
+    let task_id = resp["result"]["task"]["id"].as_str().unwrap().to_string();
     poll_until_state(
         &capsule_url,
         &task_id,
-        "input-required",
+        "TASK_STATE_INPUT_REQUIRED",
         Duration::from_secs(30),
     );
-    poll_until_state(&capsule_url, &task_id, "failed", Duration::from_secs(30));
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "TASK_STATE_FAILED",
+        Duration::from_secs(30),
+    );
 
     let trace = wait_for_task_end(&trace_path, &task_id);
     assert_input_timeout_recorded(&trace, &task_id);
@@ -791,7 +975,7 @@ fn input_timeout_streams_one_failed_final_status() {
     let task_id = failed[0]["id"].as_str().unwrap();
     assert_eq!(
         tasks_get(&capsule_url, task_id)["result"]["status"]["state"],
-        "failed"
+        "TASK_STATE_FAILED"
     );
 }
 
@@ -823,7 +1007,7 @@ fn input_timeout_fails_the_launch() {
         .expect("timed out waiting for capsule URL");
 
     let resp = send_message(&capsule_url, "msg-1", "start timed task");
-    let task_id = resp["result"]["id"].as_str().unwrap().to_string();
+    let task_id = resp["result"]["task"]["id"].as_str().unwrap().to_string();
 
     match handle.join().expect("launch thread should not panic") {
         Err(RuntimeError::TaskDidNotComplete {
@@ -895,6 +1079,7 @@ fn input_required_sse_emits_state_event() {
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
     let staged = stage_agent(&home, &manifest_path, None);
+    let trace_path = staged.workdir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -919,26 +1104,26 @@ fn input_required_sse_emits_state_event() {
         )
     });
 
-    // SendStreamingMessage never reports the task id, so read it off the active slot.
-    let task_id = discover_active_task_id(&capsule_url, Duration::from_secs(30));
+    // The stream is read on the other thread, so the task id comes from the trace.
+    let task_id = started_task_id(&trace_path, Duration::from_secs(30));
 
-    // Input may only be delivered once the task has actually suspended: a SendMessage
-    // that lands while the task is still working is rejected as a concurrent task, and
-    // the suspended task then waits for input that never arrives.
+    // Input may only be delivered once the task has actually suspended: a reply that lands
+    // while the task is still working is refused, and the suspended task then waits for input
+    // that never arrives.
     poll_until_state(
         &capsule_url,
         &task_id,
-        "input-required",
+        "TASK_STATE_INPUT_REQUIRED",
         Duration::from_secs(30),
     );
 
-    let resume_resp = send_message(&capsule_url, "msg-sse-2", "use feature branch");
-    let resume_state = resume_resp["result"]["status"]["state"]
-        .as_str()
-        .unwrap_or("");
-    assert!(
-        resume_state == "working" || resume_state == "completed",
-        "delivering input should return working or completed; got: '{resume_state}' in {resume_resp}"
+    let resume_resp = send(
+        &capsule_url,
+        reply_to(&task_id, "msg-sse-2", "use feature branch"),
+    );
+    assert_eq!(
+        resume_resp["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
+        "delivering input answers the task working; got: {resume_resp}"
     );
 
     let events = sse_handle
@@ -1029,6 +1214,7 @@ fn sse_reader_returns_when_deadline_exceeded() {
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
     let staged = stage_agent(&home, &manifest_path, None);
+    let trace_path = staged.workdir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -1086,14 +1272,17 @@ fn sse_reader_returns_when_deadline_exceeded() {
     );
 
     // Release the suspended task so the capsule can shut down.
-    let task_id = discover_active_task_id(&capsule_url, Duration::from_secs(30));
+    let task_id = started_task_id(&trace_path, Duration::from_secs(30));
     poll_until_state(
         &capsule_url,
         &task_id,
-        "input-required",
+        "TASK_STATE_INPUT_REQUIRED",
         Duration::from_secs(30),
     );
-    let _ = send_message(&capsule_url, "msg-deadline-2", "use main branch");
+    let _ = send(
+        &capsule_url,
+        reply_to(&task_id, "msg-deadline-2", "use main branch"),
+    );
 
     handle.join().expect("launch thread should not panic");
 }

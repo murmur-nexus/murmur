@@ -1173,7 +1173,7 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 |---|---|---:|---|
 | `lifecycle.task_acceptance` | `none \| single \| queue` | no | Default: `single`. How the capsule accepts incoming A2A tasks — see [`lifecycle.task_acceptance`](#lifecycle-task-acceptance). |
 | `lifecycle.after_task` | `exit \| sleep` | no | Default: `exit`. What the capsule does after completing a task — see [`lifecycle.after_task`](#lifecycle-after-task). |
-| `lifecycle.queue_depth` | integer | no | Default: `1`. Maximum number of pending, not-yet-started tasks the capsule holds under `task_acceptance: queue`. Tasks beyond this limit receive `state: "rejected"`. For a [roster](roster.md) member, [`W-ROS-001`](diagnostics.md#w-ros-001) warns when more members may call it than it holds at once. |
+| `lifecycle.queue_depth` | integer | no | Default: `1`. Maximum number of pending, not-yet-started tasks the capsule holds under `task_acceptance: queue`. A task beyond this limit is answered in [`TASK_STATE_REJECTED`](agent-card.md#task-states). For a [roster](roster.md) member, [`W-ROS-001`](diagnostics.md#w-ros-001) warns when more members may call it than it holds at once. |
 | `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `SendMessage` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
@@ -2121,7 +2121,7 @@ lifecycle:
 | Value | Behaviour |
 |---|---|
 | `none` | Capsule runs from `task.md` if present, then exits. All incoming messages return JSON-RPC error `-32601`. |
-| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active returns `state: "rejected"`. A task accepted while a `task.md` task runs is never started: it ends `rejected` when the session ends — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
+| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active is answered with a task in [`TASK_STATE_REJECTED`](agent-card.md#task-states). A task accepted while a `task.md` task runs is never started: it ends `rejected` when the session ends — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 | `queue` | Capsule accepts up to `queue_depth` pending tasks simultaneously. Tasks are processed serially; new tasks are accepted as soon as the pending queue drops below `queue_depth`. Under `after_task: exit`, a task still queued when the session ends is never started: it ends `rejected` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 
 ### `lifecycle.after_task` { #lifecycle-after-task }
@@ -2139,7 +2139,7 @@ not run: running it would contradict `after_task: exit`.
 
 | Task | What it gets |
 |---|---|
-| Accepted, never started, when the session stops taking work | State `rejected` over [`GetTask`](agent-card.md#murmur-door-v1), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
+| Accepted, never started, when the session stops taking work | `TASK_STATE_REJECTED` over [`GetTask`](agent-card.md#tasks-get), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
 | Cancelled while still queued | Stays `canceled`, with its `task_canceled` trace line. Never `rejected` |
 | A message arriving after the session stops taking work | Answered `rejected` at the door. Nothing is recorded in the trace |
 

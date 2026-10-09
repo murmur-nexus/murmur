@@ -339,7 +339,8 @@ never sees the wire format.
 | Tracing | With OTel configured, the runtime injects a W3C `traceparent` header so the peer's session span nests under the sender's. |
 | Origin | The runtime stamps `x-murmur-task-origin: peer` and the sending task's own `x-murmur-task-trust` on every request, so the receiving capsule inherits the sender's trust class. The `message` record has no field for either, so a capsule cannot set them. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class). |
 | Refusal | A peer that answers with a non-`2xx` status fails the call with `Err("peer at <url> refused the message (<status> <error>): <message>")`, carrying the peer's own `error` code and `message` when its body has them. A peer that does not declare [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) answers `403 peer_not_accepted`. |
-| Result state | `task-result.state` is the peer's response to the send: `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, or `canceled`. Poll the peer's `GetTask` endpoint for the final state. |
+| Result state | `task-result.state` is the state the peer answered the send with, in murmur's word rather than the [`TASK_STATE_*` name](agent-card.md#task-states) on the wire: `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled`, or `auth-required`, which a peer that is not a murmur capsule may answer. Poll the peer's `GetTask` endpoint for the final state. |
+| Answers that fail | A peer answering `TASK_STATE_UNSPECIFIED`, a state that is not an A2A v1.0 task state, or a message rather than a task fails the call with `Err`, naming what the peer sent. |
 
 ---
 

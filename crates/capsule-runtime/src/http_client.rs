@@ -185,6 +185,14 @@ pub(crate) mod capture {
                 .collect()
         }
 
+        /// The body's `params.message`, or `null` when it carries none.
+        pub(crate) fn message(&self) -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&self.body)
+                .ok()
+                .and_then(|body| body.pointer("/params/message").cloned())
+                .unwrap_or_default()
+        }
+
         /// The body's JSON-RPC `method`.
         pub(crate) fn method(&self) -> String {
             serde_json::from_str::<serde_json::Value>(&self.body)

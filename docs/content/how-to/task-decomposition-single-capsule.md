@@ -208,11 +208,11 @@ Router rules:
 - Call only curl. Do not call any other tool under any circumstances.
 - The output files do not exist during dispatch — sub-tasks run after your session ends.
   Attempting to read them will produce errors. This is expected; do not react to it.
-- After all dispatches return {"state":"submitted"}, write "Done." and stop immediately.
+- After all dispatches return "state":"TASK_STATE_SUBMITTED", write "Done." and stop immediately.
 - If a dispatch returns an error, report it in text and stop. Do not retry.
 
 Dispatch shape:
--s -X POST http://localhost:52222 -H "Content-Type: application/json" -H "A2A-Version: 1.0" -d '{"jsonrpc":"2.0","method":"SendMessage","params":{"message":{"messageId":"task-N","role":"user","parts":[{"text":"[EXECUTE] ..."}]}},"id":N}'
+-s -X POST http://localhost:52222 -H "Content-Type: application/json" -H "A2A-Version: 1.0" -d '{"jsonrpc":"2.0","method":"SendMessage","params":{"message":{"messageId":"task-N","role":"ROLE_USER","parts":[{"text":"[EXECUTE] ..."}]}},"id":N}'
 ```
 
 The router completes in two turns: one to fire all dispatches in parallel, one to confirm submission and stop. It never calls any tool other than curl and never reads files — the task text arrives in the incoming message itself.

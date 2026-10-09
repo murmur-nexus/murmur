@@ -822,7 +822,10 @@ fn an_authenticated_door_names_mur_token_after_the_url_line() {
         message("m-1", "hello"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
-    let task_id = sent.json()["result"]["id"].as_str().unwrap().to_string();
+    let task_id = sent.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_completed(&addr, Some(&operator), &task_id);
 
     let stderr = run.stderr();

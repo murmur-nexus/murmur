@@ -230,7 +230,10 @@ impl Member {
     fn send(&self, message: Value) -> String {
         let sent = rpc(&self.url(), Some(&self.token()), "SendMessage", message);
         assert_eq!(sent.status, 200, "{sent:?}");
-        sent.json()["result"]["id"].as_str().unwrap().to_string()
+        sent.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// The session's `out/result.txt`, or `None` when nothing wrote it.
@@ -315,7 +318,7 @@ fn a_member_mid_task_cancels_it_when_its_lifeline_closes() {
                 json!({ "id": task_id }),
             );
             let state = got.json()["result"]["status"]["state"].clone();
-            if state == "canceled" {
+            if state == "TASK_STATE_CANCELED" {
                 break;
             }
             assert!(
@@ -450,7 +453,10 @@ fn a_cancelled_task_leaves_a_sleeping_members_ending_alone() {
         "CancelTask",
         json!({ "id": second }),
     );
-    assert_eq!(canceled.json()["result"]["status"]["state"], "canceled");
+    assert_eq!(
+        canceled.json()["result"]["status"]["state"],
+        "TASK_STATE_CANCELED"
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while !member
         .trace()

@@ -149,8 +149,8 @@ impl Running {
             "params": {
                 "message": {
                     "messageId": message_id,
-                    "role": "user",
-                    "parts": [{"text": text}]
+                    "role": "ROLE_USER",
+                    "parts": [{"text": text, "mediaType": "text/plain"}]
                 }
             }
         })
@@ -221,10 +221,10 @@ fn assert_refused_as_unwaited(response: &Value, delegation_id: &str) {
 
 fn submitted(response: &Value, label: &str) -> String {
     assert_eq!(
-        response["result"]["status"]["state"], "submitted",
+        response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "task {label} should be submitted; got: {response}"
     );
-    response["result"]["id"]
+    response["result"]["task"]["id"]
         .as_str()
         .expect("a submitted task carries its id")
         .to_string()

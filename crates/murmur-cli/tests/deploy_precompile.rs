@@ -240,8 +240,8 @@ fn post_task(address: &str) {
         "method": "SendMessage",
         "params": {"message": {
             "messageId": "msg-1",
-            "role": "user",
-            "parts": [{"text": "Say hello."}]
+            "role": "ROLE_USER",
+            "parts": [{"text": "Say hello.", "mediaType": "text/plain"}]
         }}
     })
     .to_string();

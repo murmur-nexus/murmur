@@ -893,8 +893,8 @@ impl Parent {
     }
 
     fn submit(&self, message_id: &str, text: &str) -> String {
-        let mut message = json!({"messageId": message_id, "role": "user",
-                                 "parts": [{"text": text}]});
+        let mut message = json!({"messageId": message_id, "role": "ROLE_USER",
+                                 "parts": [{"text": text, "mediaType": "text/plain"}]});
         if let Some(context_id) = &self.context_id {
             message["contextId"] = json!(context_id);
         }
@@ -904,7 +904,7 @@ impl Parent {
         })
         .to_string();
         let response = post_json(&self.url, &body);
-        response["result"]["id"]
+        response["result"]["task"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("expected a task id; got: {response}"))
             .to_string()
@@ -914,7 +914,7 @@ impl Parent {
         let deadline = Instant::now() + within;
         loop {
             let state = self.task_state(task_id);
-            if state == "completed" || state == "failed" {
+            if state == "TASK_STATE_COMPLETED" || state == "TASK_STATE_FAILED" {
                 return;
             }
             assert!(
@@ -1637,7 +1637,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     parent.server.push(end_turn_response("second task done"));
     let second = parent.submit("msg-second", "and another thing");
     parent.await_task(&second, Duration::from_secs(120));
-    assert_eq!(parent.task_state(&second), "completed");
+    assert_eq!(parent.task_state(&second), "TASK_STATE_COMPLETED");
 }
 
 /// A child that declares `network.authentication` is driven by its unauthenticated parent with the
@@ -1912,14 +1912,14 @@ fn a_wedged_started_child_is_ended_at_the_deadline() {
     thread::sleep(Duration::from_secs(2));
     assert_eq!(
         parent.task_state(&task_id),
-        "working",
+        "TASK_STATE_WORKING",
         "the task does not end while its delegation is outstanding"
     );
 
     // At the deadline the task continues, and then ends.
     parent.await_task(&task_id, Duration::from_secs(TIMEOUT_SECS + 240));
     let waited = started_at.elapsed();
-    assert_eq!(parent.task_state(&task_id), "completed");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_COMPLETED");
     assert!(
         waited >= Duration::from_secs(TIMEOUT_SECS),
         "the task ended after {waited:?}, before the {TIMEOUT_SECS}s deadline"
@@ -1978,7 +1978,7 @@ fn a_wedged_started_child_is_ended_at_the_deadline() {
     parent.server.push(end_turn_response("still here"));
     let task_id = parent.submit("msg-after-deadline", "are you there");
     parent.await_task(&task_id, Duration::from_secs(120));
-    assert_eq!(parent.task_state(&task_id), "completed");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_COMPLETED");
 }
 
 /// Three delegations in one turn, and the turn ends before any of them does.
@@ -2170,11 +2170,11 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(parent.task_state(&task_id), "working");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_WORKING");
 
     // This child answers nothing, ever, so the task ends only once the deadline has ended it.
     parent.await_task(&task_id, Duration::from_secs(TIMEOUT_SECS + 240));
-    assert_eq!(parent.task_state(&task_id), "completed");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_COMPLETED");
     let ended = parent.events("delegation");
     assert_eq!(ended.len(), 1, "{ended:?}");
     assert_eq!(ended[0]["outcome"], "terminated", "{}", ended[0]);
@@ -2205,7 +2205,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
     }
     // The turn has been answered; give the task a moment to reach its wait.
     thread::sleep(Duration::from_secs(1));
-    assert_eq!(parent.task_state(&task_id), "working");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_WORKING");
     let launch = only_event(&parent.trace_events(), "delegation_start").clone();
     let delegation_id = launch["delegation_id"]
         .as_str()
@@ -2226,7 +2226,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
     let took = started_at.elapsed();
 
     assert_eq!(
-        response["result"]["status"]["state"], "canceled",
+        response["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{response}"
     );
     assert!(
@@ -2242,7 +2242,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
         .filter(|artifact| artifact["name"] == "residue")
         .filter_map(|artifact| artifact["parts"].as_array())
         .flatten()
-        .filter_map(|part| serde_json::from_str::<Value>(part["text"].as_str()?).ok())
+        .filter_map(|part| part.get("data").cloned())
         .collect();
     let delegation = items
         .iter()
@@ -2320,7 +2320,7 @@ fn a_cancel_mid_delegation_names_the_child_and_ends_it() {
     parent.server.push(end_turn_response("after the cancel"));
     let next = parent.submit("msg-after-cancel", "carry on");
     parent.await_task(&next, Duration::from_secs(120));
-    assert_eq!(parent.task_state(&next), "completed");
+    assert_eq!(parent.task_state(&next), "TASK_STATE_COMPLETED");
 }
 
 /// A cancel that lands while a plan's `capsule` step is waiting on its sub-capsule ends that
@@ -2357,7 +2357,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
         assert!(Instant::now() < up, "the plan step's child never came up");
         thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(parent.task_state(&task_id), "working");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_WORKING");
 
     let started_at = Instant::now();
     let response = post_json(
@@ -2369,7 +2369,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
     );
     let took = started_at.elapsed();
     assert_eq!(
-        response["result"]["status"]["state"], "canceled",
+        response["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{response}"
     );
     assert!(
@@ -2383,7 +2383,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
         .filter(|artifact| artifact["name"] == "residue")
         .filter_map(|artifact| artifact["parts"].as_array())
         .flatten()
-        .filter_map(|part| serde_json::from_str::<Value>(part["text"].as_str()?).ok())
+        .filter_map(|part| part.get("data").cloned())
         .collect();
     let residue = items
         .iter()
@@ -2497,7 +2497,7 @@ fn a_cancel_mid_plan_ends_the_plan_steps_sub_capsule() {
     parent.server.push(end_turn_response("after the cancel"));
     let next = parent.submit("msg-after-plan-cancel", "carry on");
     parent.await_task(&next, Duration::from_secs(120));
-    assert_eq!(parent.task_state(&next), "completed");
+    assert_eq!(parent.task_state(&next), "TASK_STATE_COMPLETED");
 }
 
 /// A plan nobody cancels closes its own `capsule` step's delegation and leaves nothing in the
@@ -2522,7 +2522,7 @@ fn a_plan_step_that_completes_closes_its_own_delegation() {
     let started_at = Instant::now();
     let task_id = parent.submit("msg-plan-ok", "plan it");
     parent.await_task(&task_id, Duration::from_secs(240));
-    assert_eq!(parent.task_state(&task_id), "completed");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_COMPLETED");
     assert!(
         started_at.elapsed() < Duration::from_secs(TIMEOUT_SECS),
         "the task waited on a delegation its plan had already closed"
@@ -2625,7 +2625,7 @@ fn a_task_with_no_turn_left_ends_its_sub_capsules() {
     let task_id = parent.start_delegations("msg-last", &calls, 0);
     parent.await_task(&task_id, Duration::from_secs(240));
     let took = started_at.elapsed();
-    assert_eq!(parent.task_state(&task_id), "completed");
+    assert_eq!(parent.task_state(&task_id), "TASK_STATE_COMPLETED");
     assert!(
         took < Duration::from_secs(TIMEOUT_SECS),
         "the task waited {took:?} for an outcome it had no turn to read"

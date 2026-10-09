@@ -126,6 +126,8 @@ mod tests {
             source: crate::a2a::SOURCE_A2A,
             forget_session: false,
             caller_member: None,
+            reference_task_ids: Vec::new(),
+            part_kinds: Vec::new(),
         }
     }
 

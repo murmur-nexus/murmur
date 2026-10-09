@@ -278,7 +278,7 @@ curl -s -X POST http://localhost:$PORT \
       "message": {
         "messageId": "msg-001",
         "contextId": "ctx-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Acknowledge message from orchestrator capsule."}]
       }
     }
@@ -291,10 +291,10 @@ answered with error [`-32009`](../reference/agent-card.md#a2a-version) and start
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"contextId":"ctx-001","id":"tsk_019ed33d1f6873b09d25f0dc5ce387c4","status":{"state":"submitted"}}}
+{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"tsk_019ed33d1f6873b09d25f0dc5ce387c4","contextId":"ctx-001","status":{"state":"TASK_STATE_SUBMITTED"}}}}
 ```
 
-Save the returned `id` — that is the **task ID** you will use to poll status.
+Save the returned `result.task.id` — that is the **task ID** you will use to poll status.
 
 When the orchestrator capsule is itself a WASM capsule component, it sends messages via the host's message interface rather than raw HTTP. The host handles the JSON-RPC wire format transparently and enforces the network policy check before making any connection.
 
@@ -329,13 +329,13 @@ curl -s -X POST http://localhost:$PORT \
   -d '{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"<your-task-id>"}}'
 ```
 
-`state` progresses through: `submitted` → `working` → `completed` | `failed` | `canceled`.
+`status.state` progresses through `TASK_STATE_SUBMITTED` → `TASK_STATE_WORKING` → `TASK_STATE_COMPLETED` | `TASK_STATE_FAILED` | `TASK_STATE_CANCELED`. [Task states](../reference/agent-card.md#task-states) lists every state.
 
-| Final `state` | The task |
+| Final `status.state` | The task |
 |---|---|
-| `completed` | Finished its work. A reply cut off at `inference.max_tokens` still counts |
-| `failed` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
-| `canceled` | Was stopped with `CancelTask`, `session/stop` or `mur stop` |
+| `TASK_STATE_COMPLETED` | Finished its work. A reply cut off at `inference.max_tokens` still counts |
+| `TASK_STATE_FAILED` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
+| `TASK_STATE_CANCELED` | Was stopped with `CancelTask`, `session/stop` or `mur stop` |
 
 ```json
 {
@@ -343,17 +343,17 @@ curl -s -X POST http://localhost:$PORT \
     "id": 2,
     "result":
     {
-        "contextId": "ctx-001",
         "id": "tsk_019ed5211c827f63a8fe4be623277c55",
+        "contextId": "ctx-001",
         "status":
         {
-            "state": "completed"
+            "state": "TASK_STATE_COMPLETED"
         }
     }
 }
 ```
 
-Poll until `state` is `completed` or `failed`. The task registry on the worker capsule remembers completed tasks, so you can query a task ID after the task has already finished.
+Poll until `status.state` is `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED`. The task registry on the worker capsule remembers completed tasks, so you can query a task ID after the task has already finished.
 
 !!! note "The HTTP server shuts down with the session"
     Once the worker capsule exits (idle timeout, or after the last queued task), its HTTP server is released. Final status is always available in `trace.jsonl` in the worker capsule's workdir.
@@ -375,7 +375,7 @@ curl -s -X POST http://localhost:$PORT \
 
 The work in flight is stopped rather than waited out — the inference call is dropped, and under
 [`transport: process`](../reference/manifest.md#transport-process) the harness the capsule drives
-is interrupted — and the task reaches the terminal state `canceled`:
+is interrupted — and the task reaches the terminal state `TASK_STATE_CANCELED`:
 
 ```json
 {
@@ -383,11 +383,11 @@ is interrupted — and the task reaches the terminal state `canceled`:
     "id": 3,
     "result":
     {
-        "contextId": "ctx-001",
         "id": "tsk_019ed5211c827f63a8fe4be623277c55",
+        "contextId": "ctx-001",
         "status":
         {
-            "state": "canceled"
+            "state": "TASK_STATE_CANCELED"
         }
     }
 }
@@ -410,7 +410,8 @@ same `contextId` resumes the same harness session. When the harness had to be ki
 status says so — `task canceled; the harness was killed and its session may not resume cleanly` —
 because a harness cut off mid-turn may not be able to continue that session.
 
-Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` changes
+Cancelling a task that has already reached `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`,
+`TASK_STATE_REJECTED` or `TASK_STATE_CANCELED` changes
 nothing, and is answered with JSON-RPC error `-32002`, `TaskNotCancelableError`, whose `ErrorInfo`
 metadata names the task and the state it ended in:
 
@@ -421,14 +422,14 @@ metadata names the task and the state it ended in:
     "error":
     {
         "code": -32002,
-        "message": "Task cannot be canceled: it is already completed",
+        "message": "Task cannot be canceled: it is already TASK_STATE_COMPLETED",
         "data":
         [
             {
                 "@type": "type.googleapis.com/google.rpc.ErrorInfo",
                 "reason": "TASK_NOT_CANCELABLE",
                 "domain": "a2a-protocol.org",
-                "metadata": { "taskId": "tsk_019ed5211c827f63a8fe4be623277c55", "state": "completed" }
+                "metadata": { "taskId": "tsk_019ed5211c827f63a8fe4be623277c55", "state": "TASK_STATE_COMPLETED" }
             }
         ]
     }
@@ -445,19 +446,22 @@ A detached shell command keeps its own lifecycle. A sub-capsule the task delegat
 the cancelled task before its `task_end`, whether `delegate-task` started it or a
 [plan's `capsule` step](../reference/plans.md#when-the-task-is-cancelled) did; a plan stops with
 its task and runs none of its remaining steps. When either was in flight at the moment the cancel was
-answered, the response carries an artifact named `residue` with one part per item, each part's
-`text` a JSON object:
+answered, the response carries an artifact named `residue` with one data part per item, each part's
+`data` a JSON object:
 
 ```json
 {
     "artifacts":
     [
         {
+            "artifactId": "residue",
             "name": "residue",
             "parts":
             [
-                {"text": "{\"kind\":\"detached_shell\",\"work_id\":\"wrk_9f2a1c\",\"binary\":\"bash\",\"command\":\"sleep 30\",\"started_at_ms\":1757068800123}"},
-                {"text": "{\"kind\":\"delegation\",\"delegation_id\":\"dlg_7b31de\",\"capsule\":\"my-worker\",\"version\":\"0.1.0\",\"child_session_id\":\"ses_019ed…\",\"child_workdir\":\".murmur/children/my-worker-7b31de\"}"}
+                {"data": {"kind": "detached_shell", "work_id": "wrk_9f2a1c", "binary": "bash", "command": "sleep 30", "started_at_ms": 1757068800123},
+                 "mediaType": "application/json"},
+                {"data": {"kind": "delegation", "delegation_id": "dlg_7b31de", "capsule": "my-worker", "version": "0.1.0", "child_session_id": "ses_019ed…", "child_workdir": ".murmur/children/my-worker-7b31de"},
+                 "mediaType": "application/json"}
             ]
         }
     ]

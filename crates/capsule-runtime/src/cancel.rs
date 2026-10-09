@@ -22,7 +22,7 @@ use serde_json::json;
 use tokio::sync::watch;
 
 use crate::{
-    a2a::{A2aArtifact, ArtifactPart},
+    a2a::{A2aArtifact, Part},
     child_launch::LaunchedChild,
     delegation_plane::DelegationLaunch,
     detached::DetachedRegistry,
@@ -608,7 +608,8 @@ impl Residue {
         self.items.iter().map(ResidueItem::to_json).collect()
     }
 
-    /// The `residue` artifact for a cancel response, or `None` when nothing was running.
+    /// The `residue` artifact for a cancel response, one data part per item, or `None` when
+    /// nothing was running.
     ///
     /// `None` is what makes "nothing else is running" distinguishable from "these things are":
     /// `A2aTask::artifacts` omits the key entirely, so a caller never has to tell an empty list
@@ -617,16 +618,13 @@ impl Residue {
         if self.items.is_empty() {
             return None;
         }
-        Some(A2aArtifact {
-            name: RESIDUE_ARTIFACT.to_string(),
-            parts: self
-                .items
+        Some(A2aArtifact::named(
+            RESIDUE_ARTIFACT,
+            self.items
                 .iter()
-                .map(|item| ArtifactPart {
-                    text: item.to_json().to_string(),
-                })
+                .map(|item| Part::data(item.to_json()))
                 .collect(),
-        })
+        ))
     }
 }
 
@@ -852,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_residue_produces_one_json_part_per_item() {
+    fn a_residue_produces_one_data_part_per_item() {
         let (live, _scope) = scoped();
         live.register("dlg_one".to_string(), live_delegation("worker"));
         let residue = Residue {
@@ -870,17 +868,24 @@ mod tests {
         assert_eq!(residue.delegation_ids(), vec!["dlg_one".to_string()]);
 
         let artifact = residue.into_artifact().expect("two items is not empty");
+        assert_eq!(artifact.artifact_id, "residue");
         assert_eq!(artifact.name, "residue");
         assert_eq!(artifact.parts.len(), 2);
+        for part in &artifact.parts {
+            assert_eq!(part.media_type.as_deref(), Some("application/json"));
+        }
+        let wire = serde_json::to_value(&artifact).unwrap();
+        crate::a2a_conformance::check_message(&wire, "lf.a2a.v1.Artifact")
+            .unwrap_or_else(|errors| panic!("{wire}: {errors:?}"));
 
-        let shell: serde_json::Value = serde_json::from_str(&artifact.parts[0].text).unwrap();
+        let shell = artifact.parts[0].as_data().expect("a data part");
         assert_eq!(shell["kind"], "detached_shell");
         assert_eq!(shell["work_id"], "wrk_abc");
         assert_eq!(shell["command"], "sleep 30");
         assert_eq!(shell["binary"], "sleep");
         assert_eq!(shell["started_at_ms"], 17);
 
-        let delegation: serde_json::Value = serde_json::from_str(&artifact.parts[1].text).unwrap();
+        let delegation = artifact.parts[1].as_data().expect("a data part");
         assert_eq!(delegation["kind"], "delegation");
         assert_eq!(delegation["delegation_id"], "dlg_one");
         assert_eq!(delegation["capsule"], "worker");

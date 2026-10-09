@@ -201,8 +201,8 @@ fn message_send_body(message_id: &str, text: &str) -> String {
         "params": {
             "message": {
                 "messageId": message_id,
-                "role": "user",
-                "parts": [{"text": text}]
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }
         }
     })
@@ -293,7 +293,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
         &message_send_body("task-1", "first task"),
     );
     assert_eq!(
-        r1["result"]["status"]["state"], "submitted",
+        r1["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "first task should be submitted; got: {r1}"
     );
 
@@ -303,7 +303,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
         &message_send_body("task-2", "second task"),
     );
     assert_eq!(
-        r2["result"]["status"]["state"], "submitted",
+        r2["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "second task should be submitted; got: {r2}"
     );
 
@@ -451,10 +451,10 @@ fn lifecycle_queue_runs_the_peer_lane_before_the_background_lane() {
 
     let submitted = |response: &Value, label: &str| -> String {
         assert_eq!(
-            response["result"]["status"]["state"], "submitted",
+            response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
             "task {label} should be submitted; got: {response}"
         );
-        response["result"]["id"]
+        response["result"]["task"]["id"]
             .as_str()
             .expect("a submitted task carries its id")
             .to_string()
@@ -815,7 +815,7 @@ fn lifecycle_a_detached_command_completes_as_a_background_task() {
         "/",
         &message_send_body("task-build", "run the build"),
     );
-    let first_task_id = response["result"]["id"]
+    let first_task_id = response["result"]["task"]["id"]
         .as_str()
         .expect("a submitted task carries its id")
         .to_string();
@@ -908,7 +908,7 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
         "/",
         &message_send_body("task-first", "run the build"),
     );
-    let first_task_id = first["result"]["id"].as_str().unwrap().to_string();
+    let first_task_id = first["result"]["task"]["id"].as_str().unwrap().to_string();
 
     // The peer request is delivered while the first task is still in its opening turn, so it is
     // waiting in the channel before the completion is ever drained.
@@ -924,7 +924,7 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
             ("x-murmur-task-trust", "trusted"),
         ],
     );
-    let peer_task_id = peer["result"]["id"].as_str().unwrap().to_string();
+    let peer_task_id = peer["result"]["task"]["id"].as_str().unwrap().to_string();
 
     let events = wait_for_trace(&trace_path, 180, "all three tasks to start", |events| {
         events_named(events, "task_start").len() >= 3
@@ -1566,11 +1566,11 @@ fn queue_exit_lifecycle() -> LifecycleConfig {
 /// `SendMessage` of `text`, returning the task id and the state it was answered with.
 fn send_task(addr: &str, message_id: &str, text: &str) -> (String, String) {
     let response = http_post_json(addr, "/", &message_send_body(message_id, text));
-    let task_id = response["result"]["id"]
+    let task_id = response["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage returned no task id: {response}"))
         .to_string();
-    let state = response["result"]["status"]["state"]
+    let state = response["result"]["task"]["status"]["state"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage returned no state: {response}"))
         .to_string();
@@ -1589,7 +1589,11 @@ fn stream_until_closed(
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendStreamingMessage",
-        "params": {"message": {"messageId": "m-stream", "role": "user", "parts": [{"text": text}]}}
+        "params": {"message": {
+            "messageId": "m-stream",
+            "role": "ROLE_USER",
+            "parts": [{"text": text}]
+        }}
     })
     .to_string();
     std::thread::spawn(move || {
@@ -1693,7 +1697,7 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
         .expect("the task.md task reached the provider");
 
     let (task_b, state) = send_task(&capsule_url, "m-b", "queued behind the launch task");
-    assert_eq!(state, "submitted");
+    assert_eq!(state, "TASK_STATE_SUBMITTED");
     let (headers_tx, headers_rx) = std::sync::mpsc::channel();
     let stream_c = stream_until_closed(capsule_url.clone(), "streamed behind it", headers_tx);
     headers_rx
@@ -1755,8 +1759,9 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
     assert!(stdout.contains(&task_c), "{stdout}");
 }
 
-/// A refused task reads `rejected` over `GetTask` for as long as the door is up, a cancel of it
-/// is a cancel of any ended task, and the closed door refuses new work without recording it.
+/// A refused task reads `TASK_STATE_REJECTED` over `GetTask` for as long as the door is up, a
+/// cancel of it is a cancel of any ended task, and the closed door refuses new work without
+/// recording it.
 ///
 /// The `on-session-end` hook spins until its deadline, which holds teardown — and so the door —
 /// open after the refusal.
@@ -1790,7 +1795,7 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the task.md task reached the provider");
     let (task_b, state) = send_task(&capsule_url, "m-b", "queued behind the launch task");
-    assert_eq!(state, "submitted");
+    assert_eq!(state, "TASK_STATE_SUBMITTED");
     release.send(()).unwrap();
 
     let mut seen = Vec::new();
@@ -1806,26 +1811,29 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
             .as_str()
             .unwrap_or_else(|| panic!("GetTask answered no state: {got}"))
             .to_string();
-        let done = state == "rejected";
+        let done = state == "TASK_STATE_REJECTED";
         seen.push(state);
         if done {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "GetTask never read rejected: {seen:?}"
+            "GetTask never read TASK_STATE_REJECTED: {seen:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let (last, before) = seen.split_last().unwrap();
-    assert_eq!(last, "rejected");
+    assert_eq!(last, "TASK_STATE_REJECTED");
     assert!(
-        before.iter().all(|state| state == "submitted"),
+        before.iter().all(|state| state == "TASK_STATE_SUBMITTED"),
         "B read only submitted before rejected: {seen:?}"
     );
 
     let (late_task, late_state) = send_task(&capsule_url, "m-late", "after the close");
-    assert_eq!(late_state, "rejected", "a closed door refuses new work");
+    assert_eq!(
+        late_state, "TASK_STATE_REJECTED",
+        "a closed door refuses new work"
+    );
 
     let canceled = http_post_json(
         &capsule_url,
@@ -1839,7 +1847,7 @@ fn lifecycle_a_rejected_task_reads_rejected_over_tasks_get() {
     );
     assert_eq!(
         canceled["error"]["data"][0]["metadata"],
-        serde_json::json!({"taskId": task_b, "state": "rejected"}),
+        serde_json::json!({"taskId": task_b, "state": "TASK_STATE_REJECTED"}),
         "{canceled}"
     );
 
@@ -1870,9 +1878,12 @@ fn lifecycle_single_exit_rejects_the_task_it_accepted_during_its_task_md_task() 
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the task.md task reached the provider");
     let (task_b, state) = send_task(&capsule_url, "m-b", "taken while the launch task runs");
-    assert_eq!(state, "submitted");
+    assert_eq!(state, "TASK_STATE_SUBMITTED");
     let (busy_task, busy_state) = send_task(&capsule_url, "m-c", "one too many");
-    assert_eq!(busy_state, "rejected", "a single capsule holds one task");
+    assert_eq!(
+        busy_state, "TASK_STATE_REJECTED",
+        "a single capsule holds one task"
+    );
     release.send(()).unwrap();
 
     let result = handle.join().expect("launch thread should not panic");
@@ -1904,7 +1915,7 @@ fn lifecycle_a_failed_exit_task_still_rejects_what_queued_behind_it() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the task.md task reached the provider");
     let (task_b, state) = send_task(&capsule_url, "m-b", "queued behind a failing task");
-    assert_eq!(state, "submitted");
+    assert_eq!(state, "TASK_STATE_SUBMITTED");
     release.send(()).unwrap();
 
     let result = handle.join().expect("launch thread should not panic");

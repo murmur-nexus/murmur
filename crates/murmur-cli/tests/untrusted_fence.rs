@@ -500,15 +500,15 @@ fn event_origin_task_payload_is_fenced() {
         "params": {
             "message": {
                 "messageId": "fence-msg",
-                "role": "user",
-                "parts": [{"text": "Summarise this webhook body."}]
+                "role": "ROLE_USER",
+                "parts": [{"text": "Summarise this webhook body.", "mediaType": "text/plain"}]
             }
         }
     })
     .to_string();
     let response = http_post_json(&capsule_url, "/", &body);
     assert_eq!(
-        response["result"]["status"]["state"], "submitted",
+        response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "nothing is refused for being fenced; got: {response}"
     );
 

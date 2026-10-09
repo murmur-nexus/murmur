@@ -29,7 +29,7 @@ use wasip2::io::streams::StreamError;
 const FORMATION_PEERS: &str = "MURMUR_FORMATION_PEERS";
 const PEER_DOMAIN: &str = "formation.invalid";
 const A2A_VERSION: (&str, &[u8]) = ("a2a-version", b"1.0");
-const SEND_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"user","messageId":"formation-probe","parts":[{"kind":"text","text":"hello from a formation member"}]}}}"#;
+const SEND_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"formation-probe","parts":[{"text":"hello from a formation member","mediaType":"text/plain"}]}}}"#;
 
 struct FormationProbe;
 

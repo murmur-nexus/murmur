@@ -208,11 +208,11 @@ fn rpc(addr: &str, method: &str, params: Value) -> Value {
 fn submit(addr: &str, message_id: &str, text: &str) -> String {
     let params = json!({"message": {
         "messageId": message_id,
-        "role": "user",
-        "parts": [{"text": text}]
+        "role": "ROLE_USER",
+        "parts": [{"text": text, "mediaType": "text/plain"}]
     }});
     let response = rpc(addr, "SendMessage", params);
-    response["result"]["id"]
+    response["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the door did not accept the task: {response}"))
         .to_string()
@@ -607,7 +607,7 @@ fn flood(server: &common::ScriptedServer, addr: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let got = rpc(addr, "GetTask", json!({"id": last}));
-        if got["result"]["status"]["state"] == "completed" {
+        if got["result"]["status"]["state"] == "TASK_STATE_COMPLETED" {
             return last;
         }
         assert!(
@@ -746,8 +746,8 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
         "method": "SendStreamingMessage",
         "params": {"message": {
             "messageId": "block",
-            "role": "user",
-            "parts": [{"text": "reply at length"}]
+            "role": "ROLE_USER",
+            "parts": [{"text": "reply at length", "mediaType": "text/plain"}]
         }}
     })
     .to_string();
@@ -797,7 +797,7 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
     );
     assert_eq!(
         rpc(&addr, "GetTask", json!({"id": own_task}))["result"]["status"]["state"],
-        "completed",
+        "TASK_STATE_COMPLETED",
         "GetTask answers how the connection's own task ended"
     );
 

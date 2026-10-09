@@ -197,7 +197,7 @@ curl -s -X POST http://localhost:$PORT \
     "params": {
       "message": {
         "messageId": "msg-001",
-        "role": "user",
+        "role": "ROLE_USER",
         "parts": [{"text": "Summarise the README."}]
       }
     }

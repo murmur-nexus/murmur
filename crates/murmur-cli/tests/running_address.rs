@@ -409,13 +409,13 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
             "method": "SendMessage",
             "params": {"message": {
                 "messageId": message_id,
-                "role": "user",
-                "parts": [{"text": text}]
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }}
         })
         .to_string(),
     );
-    response["result"]["id"]
+    response["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the door did not accept the task: {response}"))
         .to_string()

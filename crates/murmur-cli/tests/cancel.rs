@@ -287,8 +287,8 @@ fn http_post_json(addr: &str, body: &str) -> Value {
 fn send_message(addr: &str, message_id: &str, text: &str, context_id: Option<&str>) -> Value {
     let mut message = json!({
         "messageId": message_id,
-        "role": "user",
-        "parts": [{"text": text}]
+        "role": "ROLE_USER",
+        "parts": [{"text": text, "mediaType": "text/plain"}]
     });
     if let Some(context_id) = context_id {
         message["contextId"] = json!(context_id);
@@ -441,7 +441,10 @@ fn cancel_stops_the_inference_call_in_flight() {
     let capsule = launch(stage_agent(&home, &manifest_path, queue_lifecycle()));
 
     let submitted = send_message(&capsule.url, "msg-1", "start something slow", None);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_requests(&server, 1, Duration::from_secs(30));
 
     let started = Instant::now();
@@ -449,7 +452,7 @@ fn cancel_stops_the_inference_call_in_flight() {
     let elapsed = started.elapsed();
 
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
     assert!(
@@ -467,7 +470,7 @@ fn cancel_stops_the_inference_call_in_flight() {
     );
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 }
 
@@ -497,7 +500,11 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "SendStreamingMessage",
-        "params": {"message": {"messageId": "msg-1", "role": "user", "parts": [{"text": "go"}]}}
+        "params": {"message": {
+            "messageId": "msg-1",
+            "role": "ROLE_USER",
+            "parts": [{"text": "go"}]
+        }}
     })
     .to_string();
     {
@@ -526,10 +533,10 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
     }
 
     wait_for_requests(&server, 1, Duration::from_secs(30));
-    let task_id = tasks_get_active_id(&capsule.url);
+    let task_id = first_status_task_id(&mut reader);
     let canceled = tasks_cancel(&capsule.url, &task_id);
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
 
@@ -561,26 +568,31 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
     assert_eq!(last_status["final"], json!(true), "{last_status}");
     assert_eq!(
         tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 }
 
-/// The id of whichever task holds the active slot — `SendStreamingMessage` never reports one.
-fn tasks_get_active_id(addr: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
+/// The task id the first `status` frame on a `SendStreamingMessage` stream carries: the agent
+/// loop's `working` frame before its first inference call. The stream answers no other way.
+fn first_status_task_id(reader: &mut impl BufRead) -> String {
+    let mut current_type = String::new();
     loop {
-        let response = http_post_json(
-            addr,
-            &json!({"jsonrpc": "2.0", "id": 3, "method": "GetTask", "params": {}}).to_string(),
-        );
-        if let Some(id) = response["result"]["id"].as_str() {
-            return id.to_string();
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .unwrap_or_else(|error| panic!("the stream errored before a status frame: {error}"));
+        assert!(read > 0, "the stream closed before a status frame");
+        let line = line.trim_end_matches(['\n', '\r']);
+        if let Some(rest) = line.strip_prefix("event: ") {
+            current_type = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("data: ") {
+            if current_type == "status" {
+                let frame: Value = serde_json::from_str(rest).unwrap();
+                if let Some(id) = frame["id"].as_str() {
+                    return id.to_string();
+                }
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out discovering the active task id; last response: {response}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -610,23 +622,31 @@ fn cancel_leaves_the_session_and_its_queue_running() {
 
     let context_id = "ctx_cancel_queue";
     let a = send_message(&capsule.url, "msg-a", "task A words", Some(context_id));
-    let task_a = a["result"]["id"].as_str().unwrap().to_string();
+    let task_a = a["result"]["task"]["id"].as_str().unwrap().to_string();
     wait_for_requests(&server, 1, Duration::from_secs(30));
 
     let b = send_message(&capsule.url, "msg-b", "task B words", Some(context_id));
-    let task_b = b["result"]["id"].as_str().unwrap().to_string();
-    assert_eq!(b["result"]["status"]["state"], "submitted", "{b}");
+    let task_b = b["result"]["task"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        b["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+        "{b}"
+    );
 
     assert_eq!(
         tasks_cancel(&capsule.url, &task_a)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 
-    let settled = poll_until_state(&capsule.url, &task_b, "completed", Duration::from_secs(60));
-    assert_eq!(settled["result"]["status"]["state"], "completed");
+    let settled = poll_until_state(
+        &capsule.url,
+        &task_b,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
+    assert_eq!(settled["result"]["status"]["state"], "TASK_STATE_COMPLETED");
     assert_eq!(
         tasks_get(&capsule.url, &task_a)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
     // Under a threaded conversation the cancelled task's own result file says it has no result,
     // and the one beside it is the next task's answer.
@@ -640,8 +660,13 @@ fn cancel_leaves_the_session_and_its_queue_running() {
     );
 
     let c = send_message(&capsule.url, "msg-c", "task C words", Some(context_id));
-    let task_c = c["result"]["id"].as_str().unwrap().to_string();
-    poll_until_state(&capsule.url, &task_c, "completed", Duration::from_secs(60));
+    let task_c = c["result"]["task"]["id"].as_str().unwrap().to_string();
+    poll_until_state(
+        &capsule.url,
+        &task_c,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
 
     let requests = server.requests();
     assert_eq!(requests.len(), 3, "three tasks, three turns: {requests:?}");
@@ -685,15 +710,20 @@ fn a_cancelled_task_leaves_no_earlier_answer_in_the_result_file() {
     let context_id = "ctx_cancel_result";
 
     let a = send_message(&capsule.url, "msg-a", "task A words", Some(context_id));
-    let task_a = a["result"]["id"].as_str().unwrap().to_string();
-    poll_until_state(&capsule.url, &task_a, "completed", Duration::from_secs(60));
+    let task_a = a["result"]["task"]["id"].as_str().unwrap().to_string();
+    poll_until_state(
+        &capsule.url,
+        &task_a,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
     assert_eq!(
         out_file(&capsule, "result.txt").as_deref(),
         Some("task A answer")
     );
 
     let b = send_message(&capsule.url, "msg-b", "task B words", Some(context_id));
-    let task_b = b["result"]["id"].as_str().unwrap().to_string();
+    let task_b = b["result"]["task"]["id"].as_str().unwrap().to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     while asked.load(Ordering::SeqCst) < 2 {
         assert!(Instant::now() < deadline, "task B never asked its model");
@@ -701,7 +731,7 @@ fn a_cancelled_task_leaves_no_earlier_answer_in_the_result_file() {
     }
     assert_eq!(
         tasks_cancel(&capsule.url, &task_b)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
     wait_for_trace(
         &capsule.trace_path,
@@ -727,8 +757,13 @@ fn a_cancelled_task_leaves_no_earlier_answer_in_the_result_file() {
     );
 
     let c = send_message(&capsule.url, "msg-c", "task C words", Some(context_id));
-    let task_c = c["result"]["id"].as_str().unwrap().to_string();
-    poll_until_state(&capsule.url, &task_c, "completed", Duration::from_secs(60));
+    let task_c = c["result"]["task"]["id"].as_str().unwrap().to_string();
+    poll_until_state(
+        &capsule.url,
+        &task_c,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
     assert_eq!(
         out_file(&capsule, "result.txt").as_deref(),
         Some("task C answer")
@@ -785,7 +820,10 @@ fn detached_scenario(name: &str) -> (common::ScriptedServer, TempDir, Capsule, S
     ));
 
     let submitted = send_message(&capsule.url, "msg-1", "start the long build", None);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_trace(
         &capsule.trace_path,
         Duration::from_secs(120),
@@ -814,7 +852,7 @@ fn cancel_names_a_detached_shell_still_running() {
 
     let canceled = tasks_cancel(&capsule.url, &task_id);
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
 
@@ -823,11 +861,12 @@ fn cancel_names_a_detached_shell_still_running() {
         .unwrap_or_else(|| panic!("a cancel with residue carries artifacts: {canceled}"));
     assert_eq!(artifacts.len(), 1, "{artifacts:?}");
     assert_eq!(artifacts[0]["name"], "residue");
+    assert_eq!(artifacts[0]["artifactId"], "residue");
     let parts = artifacts[0]["parts"].as_array().unwrap();
     assert_eq!(parts.len(), 1, "{parts:?}");
 
-    let item: Value = serde_json::from_str(parts[0]["text"].as_str().unwrap())
-        .expect("every residue part is JSON");
+    assert_eq!(parts[0]["mediaType"], "application/json", "{parts:?}");
+    let item = &parts[0]["data"];
     assert_eq!(item["kind"], "detached_shell", "{item}");
     assert_eq!(item["command"], "sleep 30", "{item}");
     let work_id = item["work_id"].as_str().unwrap();
@@ -887,12 +926,15 @@ fn a_cancel_with_no_residue_omits_the_artifacts_key() {
     let capsule = launch(stage_agent(&home, &manifest_path, queue_lifecycle()));
 
     let submitted = send_message(&capsule.url, "msg-1", "nothing else running", None);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_requests(&server, 1, Duration::from_secs(30));
 
     let canceled = tasks_cancel(&capsule.url, &task_id);
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
     assert!(
@@ -936,21 +978,29 @@ fn cancel_from_input_required_reaches_canceled() {
     ));
 
     let submitted = send_message(&capsule.url, "msg-1", "ask me something", None);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     poll_until_state(
         &capsule.url,
         &task_id,
-        "input-required",
+        "TASK_STATE_INPUT_REQUIRED",
         Duration::from_secs(60),
     );
 
     let canceled = tasks_cancel(&capsule.url, &task_id);
     assert_eq!(
-        canceled["result"]["status"]["state"], "canceled",
+        canceled["result"]["status"]["state"], "TASK_STATE_CANCELED",
         "{canceled}"
     );
-    let settled = poll_until_state(&capsule.url, &task_id, "canceled", Duration::from_secs(5));
-    assert_eq!(settled["result"]["status"]["state"], "canceled");
+    let settled = poll_until_state(
+        &capsule.url,
+        &task_id,
+        "TASK_STATE_CANCELED",
+        Duration::from_secs(5),
+    );
+    assert_eq!(settled["result"]["status"]["state"], "TASK_STATE_CANCELED");
 
     let events = wait_for_trace(
         &capsule.trace_path,
@@ -979,11 +1029,14 @@ fn cancelling_a_terminal_task_is_not_cancelable_and_changes_nothing() {
     let capsule = launch(stage_agent(&home, &manifest_path, queue_lifecycle()));
 
     let submitted = send_message(&capsule.url, "msg-1", "finish quickly", None);
-    let done_task = submitted["result"]["id"].as_str().unwrap().to_string();
+    let done_task = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     poll_until_state(
         &capsule.url,
         &done_task,
-        "completed",
+        "TASK_STATE_COMPLETED",
         Duration::from_secs(60),
     );
 
@@ -997,12 +1050,12 @@ fn cancelling_a_terminal_task_is_not_cancelable_and_changes_nothing() {
         assert_eq!(info["reason"], "TASK_NOT_CANCELABLE", "{response}");
         assert_eq!(
             info["metadata"],
-            json!({"taskId": done_task, "state": "completed"}),
+            json!({"taskId": done_task, "state": "TASK_STATE_COMPLETED"}),
             "{response}"
         );
         assert_eq!(
             tasks_get(&capsule.url, &done_task)["result"]["status"]["state"],
-            "completed"
+            "TASK_STATE_COMPLETED"
         );
     }
 
@@ -1019,16 +1072,19 @@ fn cancelling_a_terminal_task_is_not_cancelable_and_changes_nothing() {
         setup_project(&server_two.endpoint, "cancel-twice", &network(&server_two));
     let capsule_two = launch(stage_agent(&home_two, &manifest_two, queue_lifecycle()));
     let submitted = send_message(&capsule_two.url, "msg-1", "slow one", None);
-    let slow_task = submitted["result"]["id"].as_str().unwrap().to_string();
+    let slow_task = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_requests(&server_two, 1, Duration::from_secs(30));
     assert_eq!(
         tasks_cancel(&capsule_two.url, &slow_task)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
     let again = tasks_cancel(&capsule_two.url, &slow_task);
     assert_eq!(again["error"]["code"], -32002, "{again}");
     assert_eq!(
-        again["error"]["data"][0]["metadata"]["state"], "canceled",
+        again["error"]["data"][0]["metadata"]["state"], "TASK_STATE_CANCELED",
         "{again}"
     );
 }
@@ -1042,8 +1098,16 @@ fn mur_cancel_reports_unknown_and_completed_tasks() {
     let capsule = launch(stage_agent(&home, &manifest_path, queue_lifecycle()));
 
     let submitted = send_message(&capsule.url, "msg-1", "finish quickly", None);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
-    poll_until_state(&capsule.url, &task_id, "completed", Duration::from_secs(60));
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    poll_until_state(
+        &capsule.url,
+        &task_id,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
 
     let stdout = mur()
         .args(["cancel", "--url", &capsule.url, &task_id])
@@ -1091,19 +1155,27 @@ fn a_task_cancelled_while_queued_never_starts() {
     let capsule = launch(stage_agent(&home, &manifest_path, queue_lifecycle()));
 
     let a = send_message(&capsule.url, "msg-a", "task A holds the slot", None);
-    let task_a = a["result"]["id"].as_str().unwrap().to_string();
+    let task_a = a["result"]["task"]["id"].as_str().unwrap().to_string();
     wait_for_requests(&server, 1, Duration::from_secs(30));
 
     let b = send_message(&capsule.url, "msg-b", "task B is never run", None);
-    let task_b = b["result"]["id"].as_str().unwrap().to_string();
-    assert_eq!(b["result"]["status"]["state"], "submitted", "{b}");
+    let task_b = b["result"]["task"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        b["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+        "{b}"
+    );
 
     assert_eq!(
         tasks_cancel(&capsule.url, &task_b)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 
-    poll_until_state(&capsule.url, &task_a, "completed", Duration::from_secs(60));
+    poll_until_state(
+        &capsule.url,
+        &task_a,
+        "TASK_STATE_COMPLETED",
+        Duration::from_secs(60),
+    );
     let events = wait_for_trace(
         &capsule.trace_path,
         Duration::from_secs(60),
@@ -1113,7 +1185,7 @@ fn a_task_cancelled_while_queued_never_starts() {
 
     assert_eq!(
         tasks_get(&capsule.url, &task_b)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
     assert!(
         events_named(&events, "task_start")
@@ -1174,13 +1246,21 @@ fn the_record_shows_the_cancelled_turn() {
 
     let context_id = "ctx_cancel_record";
     let submitted = send_message(&capsule.url, "msg-1", "stop me", Some(context_id));
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_requests(&server, 1, Duration::from_secs(30));
     assert_eq!(
         tasks_cancel(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
-    poll_until_state(&capsule.url, &task_id, "canceled", Duration::from_secs(30));
+    poll_until_state(
+        &capsule.url,
+        &task_id,
+        "TASK_STATE_CANCELED",
+        Duration::from_secs(30),
+    );
 
     let record = scratch_home()
         .join(".murmur/conversations")
@@ -1206,11 +1286,11 @@ fn the_record_shows_the_cancelled_turn() {
 
     // The next task on the same context succeeds, and carries the content but not the marker.
     let next = send_message(&capsule.url, "msg-2", "carry on", Some(context_id));
-    let next_task = next["result"]["id"].as_str().unwrap().to_string();
+    let next_task = next["result"]["task"]["id"].as_str().unwrap().to_string();
     poll_until_state(
         &capsule.url,
         &next_task,
-        "completed",
+        "TASK_STATE_COMPLETED",
         Duration::from_secs(60),
     );
 
@@ -1275,11 +1355,14 @@ fn the_trace_distinguishes_cancelled_from_failed() {
     ));
 
     let submitted = send_message(&capsule.url, "msg-1", "stop me mid-inference", None);
-    let task_id = submitted["result"]["id"].as_str().unwrap().to_string();
+    let task_id = submitted["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     wait_for_requests(&server, 1, Duration::from_secs(30));
     assert_eq!(
         tasks_cancel(&capsule.url, &task_id)["result"]["status"]["state"],
-        "canceled"
+        "TASK_STATE_CANCELED"
     );
 
     let events = wait_for_trace(

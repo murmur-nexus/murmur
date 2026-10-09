@@ -362,18 +362,21 @@ pub fn submit_task(addr: &str, message_id: &str, text: &str) -> String {
         "params": {
             "message": {
                 "messageId": message_id,
-                "role": "user",
-                "parts": [{"text": text}]
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
             }
         }
     })
     .to_string();
     let response = http_post_json(addr, &body);
     assert_eq!(
-        response["result"]["status"]["state"], "submitted",
+        response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
         "task should be submitted; got: {response}"
     );
-    response["result"]["id"].as_str().unwrap().to_string()
+    response["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Wait until the session trace holds `expected` `task_end` records.

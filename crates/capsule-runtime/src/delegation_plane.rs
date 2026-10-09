@@ -40,7 +40,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::a2a::{A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
+use crate::a2a::{
+    user_message, A2aTask, SendMessageResult, TaskState, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER,
+    RESPONSE_ARTIFACT,
+};
 use crate::child_launch::{
     launch_child_capsule, workdir_relative_to, ChildLaunchRequest, LaunchedChild,
 };
@@ -860,7 +863,7 @@ impl DelegationPlane {
                 return canceled(&mut child);
             }
 
-            let task = match poll_task(&capsule_url, &headers, &delegation_id, &task_id) {
+            let answer = match poll_task(&capsule_url, &headers, &delegation_id, &task_id) {
                 Ok(task) => task,
                 Err(error) => {
                     return outcome(
@@ -870,18 +873,44 @@ impl DelegationPlane {
                     )
                 }
             };
-            match task.pointer("/result/status/state").and_then(Value::as_str) {
-                Some("submitted" | "working" | "input-required") => continue,
+            let task = match answer
+                .get("result")
+                .map(|result| serde_json::from_value::<A2aTask>(result.clone()))
+            {
+                Some(Ok(task)) => task,
+                Some(Err(error)) => {
+                    return outcome(
+                        DelegationStatus::Failed,
+                        &child.session_id,
+                        format!(
+                            "capsule '{}' answered GetTask with no task it could read: {error}",
+                            request.capsule
+                        ),
+                    )
+                }
+                None => {
+                    return outcome(
+                        DelegationStatus::Failed,
+                        &child.session_id,
+                        format!(
+                            "capsule '{}' answered GetTask with no task: {answer}",
+                            request.capsule
+                        ),
+                    )
+                }
+            };
+            match task.status.state {
+                TaskState::Submitted | TaskState::Working | TaskState::InputRequired => continue,
                 // Two places the answer can be, and both are read. A2A carries a completed task's
                 // output in its artifacts: a murmur door attaches a `response` artifact to a
                 // completed task that produced a response, and a capsule this runtime did not
                 // build puts its answer there too. A task that ended with no response text has no
                 // artifact, so the result file the child's runtime wrote into the directory this
                 // parent composed for it is read as well.
-                Some("completed") => {
+                TaskState::Completed => {
                     let carried = task
-                        .pointer("/result/artifacts/0/parts/0/text")
-                        .and_then(Value::as_str)
+                        .artifact(RESPONSE_ARTIFACT)
+                        .and_then(|artifact| artifact.first_text())
                         .filter(|text| !text.is_empty())
                         .map(str::to_string);
                     let found = read_child_result(&child.workdir, &child.session_id, &task_id);
@@ -899,23 +928,23 @@ impl DelegationPlane {
                     });
                     return result;
                 }
-                Some("failed" | "rejected") => {
+                TaskState::Failed | TaskState::Rejected => {
                     return outcome(
                         DelegationStatus::Failed,
                         &child.session_id,
-                        task.pointer("/result/status/message/parts/0/text")
-                            .and_then(Value::as_str)
+                        task.status_text()
                             .unwrap_or("the delegated capsule's task failed")
                             .to_string(),
                     )
                 }
-                other => {
+                ref other @ TaskState::Canceled => {
                     return outcome(
                         DelegationStatus::Failed,
                         &child.session_id,
                         format!(
-                            "capsule '{}' reported an unknown task state: {other:?}",
-                            request.capsule
+                            "capsule '{}' reported an unknown task state: {}",
+                            request.capsule,
+                            other.as_str()
                         ),
                     )
                 }
@@ -964,11 +993,7 @@ fn deliver_task(
         "id": delegation_id,
         "method": "SendMessage",
         "params": {
-            "message": {
-                "messageId": format!("msg_{delegation_id}"),
-                "role": "user",
-                "parts": [{"text": request.task}]
-            }
+            "message": user_message(&format!("msg_{delegation_id}"), None, &request.task)
         }
     })
     .to_string();
@@ -999,15 +1024,18 @@ fn deliver_task(
             }
         }
     };
-    sent.pointer("/result/id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            format!(
-                "capsule '{}' answered the delivered task with no task id",
-                request.capsule
-            )
-        })
+    match sent.get("result").map(SendMessageResult::from_result) {
+        Some(Ok(SendMessageResult::Task(task))) if !task.id.is_empty() => Ok(task.id),
+        Some(Ok(SendMessageResult::Message(message))) => Err(format!(
+            "capsule '{}' answered the delivered task with a message and started no task: \
+             {message}",
+            request.capsule
+        )),
+        _ => Err(format!(
+            "capsule '{}' answered the delivered task with no task id",
+            request.capsule
+        )),
+    }
 }
 
 /// End a child [`DelegationPlane::delegate`] holds because the task it was made for was
@@ -1243,8 +1271,8 @@ mod tests {
         use crate::http_client::capture::answer_one;
 
         let (addr, sent) = answer_one(
-            json!({"jsonrpc": "2.0", "id": 1, "result": {"id": "tsk_child", "contextId": "c",
-                "status": {"state": "submitted"}}})
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"task": {"id": "tsk_child",
+                "contextId": "c", "status": {"state": "TASK_STATE_SUBMITTED"}}}})
             .to_string(),
         );
         let token = crate::door_auth::DoorToken::new("tok".to_string());
@@ -1261,10 +1289,14 @@ mod tests {
         assert_eq!(sent.method(), "SendMessage");
         assert_eq!(sent.header("a2a-version"), ["1.0"]);
         assert_eq!(sent.header("authorization"), ["Bearer tok"]);
+        let message = sent.message();
+        assert_eq!(message["role"], "ROLE_USER");
+        assert_eq!(message["parts"][0]["text"], request().task);
+        assert_eq!(message["parts"][0]["mediaType"], "text/plain");
 
         let (addr, sent) = answer_one(
             json!({"jsonrpc": "2.0", "id": 1, "result": {"id": "tsk_child", "contextId": "c",
-                "status": {"state": "working"}}})
+                "status": {"state": "TASK_STATE_WORKING"}}})
             .to_string(),
         );
         let authorization = crate::door_auth::bearer_header(&token);

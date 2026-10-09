@@ -252,7 +252,8 @@ fn errors_under(violations: &[Violation], key: &str) -> Vec<String> {
         .clone()
 }
 
-/// The task the door answers `GetTask` with once a task completes.
+/// A completed task in A2A 0.3's shape: a kebab-case state, role `agent`, and an artifact with no
+/// `artifactId`.
 fn door_task() -> Value {
     json!({
         "id": "tsk_1",

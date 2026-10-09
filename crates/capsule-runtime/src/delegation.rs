@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::a2a::{A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
+use crate::a2a::{user_message, A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER};
 use crate::errors::RuntimeError;
 use crate::http_client::http_json;
 use crate::origin::{TaskOrigin, PEER_ORIGIN_HEADER};
@@ -473,12 +473,11 @@ pub fn deliver_completion(
         "id": format!("req_{}", uuid::Uuid::now_v7().simple()),
         "method": "SendMessage",
         "params": {
-            "message": {
-                "messageId": format!("msg_{}", uuid::Uuid::now_v7().simple()),
-                "contextId": handle.context_id,
-                "role": "user",
-                "parts": [{"text": outcome.message_text()}]
-            }
+            "message": user_message(
+                &format!("msg_{}", uuid::Uuid::now_v7().simple()),
+                Some(&handle.context_id),
+                &outcome.message_text(),
+            )
         }
     })
     .to_string();
@@ -806,8 +805,9 @@ mod tests {
     #[test]
     fn a_completion_is_an_a2a_1_0_send_message() {
         let (addr, sent) = crate::http_client::capture::answer_one(
-            serde_json::json!({"jsonrpc": "2.0", "id": 1,
-                "result": {"delegation_id": "dlg_0001", "received": true}})
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"message": {
+                "messageId": "msg_dlg_0001_received", "role": "ROLE_AGENT",
+                "parts": [{"data": {"delegation_id": "dlg_0001", "received": true}}]}}})
             .to_string(),
         );
         let to = CompletionAddress {
@@ -820,6 +820,11 @@ mod tests {
         assert_eq!(sent.header(PEER_ORIGIN_HEADER), ["completion"]);
         assert_eq!(sent.header(DELEGATION_ID_HEADER), ["dlg_0001"]);
         assert_eq!(sent.header(COMPLETION_SESSION_HEADER), ["ses_parent"]);
+        let message = sent.message();
+        assert_eq!(message["role"], "ROLE_USER");
+        assert_eq!(message["contextId"], handle().context_id);
+        assert_eq!(message["parts"][0]["mediaType"], "text/plain");
+        assert_eq!(message["parts"][0]["text"], outcome().message_text());
     }
 
     /// A completion the parent's door refuses is not delivered, and the door's message is the

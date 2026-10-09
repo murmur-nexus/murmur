@@ -263,8 +263,11 @@ fn raw_exchange(
 fn submitted_id(response: &Response) -> String {
     assert_eq!(response.status, 200, "{response:?}");
     let body = response.json();
-    assert_eq!(body["result"]["status"]["state"], "submitted", "{body}");
-    body["result"]["id"].as_str().unwrap().to_string()
+    assert_eq!(
+        body["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+        "{body}"
+    );
+    body["result"]["task"]["id"].as_str().unwrap().to_string()
 }
 
 fn assert_peer_refusal(response: &Response) {
@@ -431,7 +434,10 @@ fn the_refusal_is_the_same_bytes_for_every_method_path_and_body() {
     // The real task is untouched by the refused cancel.
     let task = rpc(&capsule.addr, None, "GetTask", json!({"id": real_id}));
     assert_eq!(task.status, 200, "{task:?}");
-    assert_ne!(task.json()["result"]["status"]["state"], "canceled");
+    assert_ne!(
+        task.json()["result"]["status"]["state"],
+        "TASK_STATE_CANCELED"
+    );
 }
 
 // ── S5: what the gate does not cover ──────────────────────────────────────────

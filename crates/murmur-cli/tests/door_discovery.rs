@@ -169,7 +169,11 @@ fn rpc(method: &str, params: Value) -> Value {
 }
 
 fn message_params(id: &str) -> Value {
-    json!({"message": {"messageId": id, "role": "user", "parts": [{"text": "hello"}]}})
+    json!({"message": {
+        "messageId": id,
+        "role": "ROLE_USER",
+        "parts": [{"text": "hello", "mediaType": "text/plain"}]
+    }})
 }
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -361,7 +365,7 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
 
     let sent = post_jsonrpc(&capsule.url, &rpc("SendMessage", message_params("m-send")));
     assert_ne!(sent["error"]["code"], -32601, "SendMessage: {sent}");
-    let task_id = sent["result"]["id"]
+    let task_id = sent["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage should start a task; got {sent}"))
         .to_string();

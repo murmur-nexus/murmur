@@ -313,11 +313,15 @@ impl Capsule {
     fn run_task(&self, id: &str, text: &str) {
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
-            "params": {"message": {"messageId": id, "role": "user", "parts": [{"text": text}]}}
+            "params": {"message": {
+                "messageId": id,
+                "role": "ROLE_USER",
+                "parts": [{"text": text, "mediaType": "text/plain"}]
+            }}
         })
         .to_string();
         let response = http_post_json(&self.url, &body);
-        let task_id = response["result"]["id"]
+        let task_id = response["result"]["task"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("expected a task id; got: {response}"))
             .to_string();
@@ -330,7 +334,7 @@ impl Capsule {
             .to_string();
             let response = http_post_json(&self.url, &body);
             let state = response["result"]["status"]["state"].as_str().unwrap_or("");
-            if state == "completed" || state == "failed" {
+            if state == "TASK_STATE_COMPLETED" || state == "TASK_STATE_FAILED" {
                 return;
             }
             assert!(
