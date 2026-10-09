@@ -607,7 +607,7 @@ fn error_of(answer: &Value) -> (i64, Value) {
     )
 }
 
-/// Test 2: an input-required round trip names its task. A reply naming no task, an unknown one
+/// An input-required round trip names its task. A reply naming no task, an unknown one
 /// or the task in another context reaches nothing; the reply naming it continues it to
 /// `TASK_STATE_COMPLETED`, carrying the reply's text to the provider; and the ended task takes
 /// no further reply. While the task is working, a reply naming it is refused too.

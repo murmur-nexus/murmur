@@ -874,6 +874,9 @@ mod tests {
         for part in &artifact.parts {
             assert_eq!(part.media_type.as_deref(), Some("application/json"));
         }
+        let wire = serde_json::to_value(&artifact).unwrap();
+        crate::a2a_conformance::check_message(&wire, "lf.a2a.v1.Artifact")
+            .unwrap_or_else(|errors| panic!("{wire}: {errors:?}"));
 
         let shell = artifact.parts[0].as_data().expect("a data part");
         assert_eq!(shell["kind"], "detached_shell");

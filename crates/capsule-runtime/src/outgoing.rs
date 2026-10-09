@@ -529,35 +529,11 @@ mod tests {
 
     /// A peer's answer as `send_a2a_message` reads it: `result`, served once on a local port.
     async fn answered(result: serde_json::Value) -> Result<PeerTask, String> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).await.unwrap();
-                if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = rest.trim().parse().unwrap();
-                }
-                if line.trim().is_empty() {
-                    break;
-                }
-            }
-            let mut body = vec![0u8; length];
-            reader.read_exact(&mut body).await.unwrap();
-            let answer =
-                serde_json::json!({"jsonrpc": "2.0", "id": "req_1", "result": result}).to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{answer}",
-                answer.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
+        let (addr, sent) = crate::http_client::capture::answer_one(
+            serde_json::json!({"jsonrpc": "2.0", "id": "req_1", "result": result}).to_string(),
+        );
         let task = send_a2a_message(&addr, hello(), None, None, None).await;
-        server.await.unwrap();
+        sent.join().unwrap();
         task
     }
 

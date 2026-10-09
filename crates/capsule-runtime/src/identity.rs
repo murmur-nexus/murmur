@@ -3454,8 +3454,7 @@ mod tests {
         );
     }
 
-    /// A message that names no task never reaches the one waiting for input, which is what the
-    /// door did before it read `taskId`.
+    /// A message that names no task starts a new one and never reaches the one waiting for input.
     #[test]
     fn a_message_naming_no_task_never_reaches_a_waiting_one() {
         let (registry, mut waiter) = routing_registry();
@@ -3601,6 +3600,9 @@ mod tests {
         assert!(completion_received(&serde_json::json!({}), "dlg_1")
             .get("contextId")
             .is_none());
+        let answer = serde_json::json!({ "message": completion_received(&params, "dlg_1") });
+        crate::a2a_conformance::check_message(&answer, "lf.a2a.v1.SendMessageResponse")
+            .unwrap_or_else(|errors| panic!("{answer}: {errors:?}"));
     }
 
     /// A `SendStreamingMessage` the door refuses because the session is closing is told so, in the
@@ -4692,7 +4694,7 @@ mod tests {
         ];
         sent.extend_from_slice(headers);
         let body = serde_json::json!({"jsonrpc": "2.0", "id": "c1", "method": "SendMessage",
-            "params": {"message": {"messageId": "m", "role": "user", "parts": [{"text": "done"}]}}})
+            "params": {"message": {"messageId": "m", "role": "ROLE_USER", "parts": [{"text": "done"}]}}})
         .to_string();
         tokio::task::spawn_blocking(move || {
             crate::http_client::http_json("POST", &url, Some(&body), &sent).unwrap()

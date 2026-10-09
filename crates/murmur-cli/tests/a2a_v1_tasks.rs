@@ -221,7 +221,7 @@ fn ask_for_input() -> String {
     .to_string()
 }
 
-/// S1: every task, message and artifact the door answers is v1.0 ProtoJSON.
+/// Every task, message and artifact the door answers is v1.0 ProtoJSON.
 #[test]
 fn shapes_on_the_wire_are_a2a_v1() {
     let door = Door::launch(
@@ -282,7 +282,7 @@ fn shapes_on_the_wire_are_a2a_v1() {
     }
 }
 
-/// S3: a data part reaches the agent as pretty-printed JSON in a fence one backtick longer than
+/// A data part reaches the agent as pretty-printed JSON in a fence one backtick longer than
 /// any run in it, and the trace names the part kinds.
 #[test]
 fn a_data_part_reaches_the_agent_as_fenced_json() {
@@ -325,7 +325,7 @@ fn a_data_part_reaches_the_agent_as_fenced_json() {
     assert_eq!(door.task_start(&null_id)["part_kinds"], json!(["data"]));
 }
 
-/// The four refused messages S4 sends, `naming` a task or none: each part list over each method.
+/// The four refused file-part messages, `naming` a task or none: each part list over each method.
 fn file_part_messages(naming: Option<&str>) -> Vec<(&'static str, Value, &'static str)> {
     let mut sent = Vec::new();
     for (parts, index) in [
@@ -372,7 +372,7 @@ fn assert_file_parts_refused(door: &Door, naming: Option<&str>) {
     }
 }
 
-/// S4: a file part is refused before anything happens: no task, no trace, no provider request,
+/// A file part is refused before anything happens: no task, no trace, no provider request,
 /// and nothing delivered to the task waiting for input.
 #[test]
 fn a_file_part_is_refused_and_starts_nothing() {
@@ -414,7 +414,7 @@ fn a_file_part_is_refused_and_starts_nothing() {
     door.completed(&task_id);
 }
 
-/// S5: `referenceTaskIds` is recorded once each on `task_start`, and reaches the agent as a
+/// `referenceTaskIds` is recorded once each on `task_start`, and reaches the agent as a
 /// block naming each task's state and outcome.
 #[test]
 fn reference_task_ids_are_recorded_and_reach_the_agent() {
@@ -456,7 +456,7 @@ fn reference_task_ids_are_recorded_and_reach_the_agent() {
     assert_eq!(door.provider.requests().len(), 2);
 }
 
-/// S6: a message that is not a v1.0 message is refused with `-32602` and starts nothing, and
+/// A message that is not a v1.0 message is refused with `-32602` and starts nothing, and
 /// `GetTask` names the task it reads.
 #[test]
 fn malformed_messages_and_an_unnamed_get_task_are_refused() {

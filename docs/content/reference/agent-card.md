@@ -614,8 +614,6 @@ A message from the agent — a task's `status.message`, a completion's acknowled
 Every artifact carries an `artifactId`, which is its name: `response`, `prompt` or `residue`. Each
 occurs at most once in a task, and its id is the same on every read.
 
-
-
 ## `skills` { #skills }
 
 A door that serves `SendMessage` advertises one skill: running a task. Under
