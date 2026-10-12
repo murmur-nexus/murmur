@@ -19,7 +19,7 @@ stream opens.
 
 | Method | Purpose | Params | Closes when |
 |---|---|---|---|
-| `SendStreamingMessage` | Send a message — a new task, or the reply to a task waiting for input — and stream that task | `params.message`, read as `SendMessage` reads it: see [Agent Card: Messages](agent-card.md#message) | After the task's terminal status, or after a live `TASK_STATE_INPUT_REQUIRED` status of the task |
+| `SendStreamingMessage` | Send a message — a new task, or the reply to a task waiting for input — and stream that task | `params.message`, read as `SendMessage` reads it: see [Agent Card: Messages](agent-card.md#message) | After the task's terminal status, or after a live `TASK_STATE_INPUT_REQUIRED` status of the task. Also when the client disconnects or the capsule exits. Closing the connection does not cancel the task: use `CancelTask` |
 | `stream/watch` | Observe every task the capsule runs, without sending anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A task's terminal status does not close it |
 
 On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), both
@@ -113,7 +113,7 @@ extension receives only `task`, `statusUpdate` and `artifactUpdate` events of it
 | `task` | First, on every `SendStreamingMessage` stream: the task as [`GetTask`](agent-card.md#tasks-get) would have answered when the message was taken. `TASK_STATE_SUBMITTED` for a new task, `TASK_STATE_WORKING` for one the message continued. Unnumbered | An A2A `Task` |
 | `statusUpdate` | Every change of a task's state, and every step the runtime reports while the task works | `taskId`, `contextId`, `status`, and `metadata` on an [annotated](#murmur-stream-v1) event |
 | `artifactUpdate` | Immediately before a `TASK_STATE_COMPLETED` status, when `GetTask` reports a `response` artifact for the task | `taskId`, `contextId`, `artifact` — the `response` artifact exactly as `GetTask` reports it — and `lastChunk: true` |
-| `message` | Only to an activated connection, carrying a [murmur frame](#murmur-stream-v1) that belongs to no task | An A2A `Message` from `ROLE_AGENT` |
+| `message` | Only on `stream/watch`, carrying a [murmur frame](#murmur-stream-v1) that belongs to no task | An A2A `Message` from `ROLE_AGENT` |
 
 A `status` holds `state` and, when the runtime had something to say, `message`: an A2A `Message`
 from `ROLE_AGENT` naming the task and its context, with one text part. A non-terminal status's
@@ -124,12 +124,29 @@ never written.
 | `status.state` | Murmur's word | `status.message` |
 |---|---|---|
 | `TASK_STATE_SUBMITTED` | `submitted` | On the opening `task` of a new task only. No message |
-| `TASK_STATE_WORKING` | `working` | `inference turn <n>`, counted from 1 across every attempt of the task, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task. `waiting on call-member: <n> call(s) outstanding` while [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered. `continuing with <n> member answer(s)` when the task continues with the answers that arrived. No message on the opening `task` of a continued task |
+| `TASK_STATE_WORKING` | `working` | One of the [working messages](#working-messages). No message on the opening `task` of a continued task |
 | `TASK_STATE_INPUT_REQUIRED` | `input-required` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
 | `TASK_STATE_COMPLETED` | `completed` | `session ended` |
 | `TASK_STATE_FAILED` | `failed` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: …` naming `inference.max_turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
 | `TASK_STATE_CANCELED` | `canceled` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed |
 | `TASK_STATE_REJECTED` | `rejected` | Refused at the door: `task rejected: capsule is busy` or `task rejected: the session is closing`, as the one unnumbered `task` event of its stream. Refused when the session ended: `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under [`mur stop`](cli.md#mur-stop), as a numbered `statusUpdate` |
+
+### Working status messages { #working-messages }
+
+A `TASK_STATE_WORKING` status says what the task is doing:
+
+| `status.message` | Written when |
+|---|---|
+| `inference turn <n>` | At the start of each inference turn, counted from 1 across every attempt of the task |
+| `resumed` | An `input-required` wait is answered |
+| `reopened by hook <hook>` | An `on-task-end` hook reopens the task |
+| `waiting on call-member: <n> call(s) outstanding` | [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered |
+| `waiting on delegate-task: <n> delegation(s) outstanding` | Delegations the task started have not reported back |
+| `continuing with <n> member answer(s)` | The task continues with the member answers that arrived |
+| `continuing with <n> delegation outcome(s)` | The task continues with the delegation outcomes that arrived |
+
+When both kinds are outstanding, or both kinds arrived, the two messages are joined with `; ` in
+one status.
 
 ### What `SendStreamingMessage` writes, in order { #stream-order }
 
@@ -142,10 +159,17 @@ never written.
 4. The task's live events, [`lagged`](#event-lagged) frames when activated, and heartbeats, until
    the task's terminal status or a live `TASK_STATE_INPUT_REQUIRED` status.
 
-Only events whose `taskId` is the connection's task are written. A stream that ends at
-`TASK_STATE_INPUT_REQUIRED` is answered by a `SendStreamingMessage` naming the task in
-`message.taskId`; that stream opens with the task in `TASK_STATE_WORKING`, and a `Last-Event-ID`
-set to the last id the first stream carried resumes exactly after it.
+Only events whose `taskId` is the connection's task are written.
+
+To answer a stream that ended at `TASK_STATE_INPUT_REQUIRED`:
+
+1. Read the prompt from that status's `status.message`.
+2. Send a `SendStreamingMessage` whose `message.taskId` is the task's id. A `message.contextId`, if
+   sent, must be the task's, or the request is answered `-32602`. Set `Last-Event-ID` to the last
+   id the first stream carried to receive anything of the task written since.
+3. The new stream opens with the task in `TASK_STATE_WORKING` and continues as above.
+
+A `SendMessage` naming the task delivers the same reply without a stream.
 
 ### What `stream/watch` writes, in order { #watch-order }
 
@@ -153,20 +177,16 @@ set to the last id the first stream carried resumes exactly after it.
 2. A [`connection-ack`](#event-connection-ack) frame.
 3. The [replay](#replay), from `Last-Event-ID`, or from `0` when the header is absent: a `gap`
    frame if one applies, then every buffered event.
-4. Every task's live events, `lagged` frames and heartbeats, until the capsule's stream ends. A
-   capsule process that exits closes the connection without a
+4. Every task's live events, murmur frames included, `lagged` frames and heartbeats, until the
+   capsule's stream ends. A capsule process that exits closes the connection without a
    [`capsule-closed`](#event-capsule-closed) frame.
-
-`stream/watch` always has the extension activated: it carries every murmur frame of every task.
 
 ### One final status { #one-final-status }
 
 Every task the capsule accepts ends in exactly one terminal `statusUpdate`, whether it ran or not,
 and it is the task's last event. It is written after [`GetTask`](agent-card.md#tasks-get) answers
-the same state, and its `status` is the one `GetTask` reports. For a task that ran, it is also
-written after every `on-task-end` hook has run and after `task_end` is in the trace. For a task the
-session refused, it follows the task's [`task_rejected`](observability-schemas.md#task-rejected)
-trace line.
+the same state, and its `status` is the one `GetTask` reports. For a task that ran, it is written
+after every `on-task-end` hook has run.
 
 | How the task ended | `status.state` | Before it |
 |---|---|---|
@@ -262,7 +282,7 @@ key naming the frame; the reopen annotation has none, which is how a client tell
 
 | The frame belongs to | Carrier |
 |---|---|
-| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on `SendStreamingMessage`) | A `statusUpdate` of the task repeating its state with no `status.message`. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`; a `gap` or `lagged` repeats the state of the last status the connection wrote |
+| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on `SendStreamingMessage`) | A `statusUpdate` of the task repeating its state with no `status.message`. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`. A `gap` repeats the opening `task`'s state; a `lagged` repeats the state of the last `task` or status the connection wrote |
 | No task (`connection-ack`, `capsule-closed`, and `gap` and `lagged` on `stream/watch`) | A `message` from `ROLE_AGENT`, `messageId` `msg_` and a UUIDv7, no `contextId`, and one text part holding the frame's name |
 
 ```json
@@ -273,8 +293,7 @@ key naming the frame; the reopen annotation has none, which is how a client tell
 {"message":{"messageId":"msg_0199c4e2f0a77e11a2b3c4d5e6f70819","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"connection-ack"}],"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}}}}
 ```
 
-A v1.0 client that does not know the extension reads a `statusUpdate` carrier as a status it
-already holds. The frame sections below show the object under `metadata[<URI>]`.
+The frame sections below show the object under `metadata[<URI>]`.
 
 ---
 
@@ -304,14 +323,15 @@ A process task ends in the same [one final status](#one-final-status) as an http
 path out of its last attempt, including the ones a runtime diagnostic ends: the status message is
 that diagnostic, under the code [`mur` reports it as](diagnostics.md).
 
-The two transports' streams differ in three things, each because the harness, not this runtime,
-ran the turn:
+On a process capsule the harness runs the turn, so its `artifact` frames differ in two keys:
 
-| Difference | Why |
-|---|---|
-| `fenceSource` is `null` on every `artifact` frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
-| `exitCode` is `null` and `truncated` is `false` on every `artifact` frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
-| A provider retry writes no event on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
+| Key | On a process capsule | Why |
+|---|---|---|
+| `fenceSource` | Always `null` | The harness receives tool output unfenced |
+| `exitCode`, `truncated` | Always `null` and `false` | A process driver reports no exit status or truncation flag |
+
+A provider retry writes no event on either transport; the driver reports it to the trace as
+`harness_retry`.
 
 ### Event order within a task { #task-frame-order }
 
@@ -564,16 +584,20 @@ Each connection reads live events from a queue of 128. A connection that falls m
 events behind loses the oldest of them; an activated connection is written a
 [`lagged`](#event-lagged) frame naming how many before the next event it receives. The connection
 stays open. The capsule also writes the count to its own stderr, as
-`SSE broadcast lagged by <n> events`; nothing about a lag is written to `trace.jsonl`.
+`SSE broadcast lagged by <n> events`.
 
-On `SendStreamingMessage`, a lost event may be its own task's terminal status. From the first
-loss on, the connection reads its task from the registry at each [heartbeat](#heartbeat): once the
-task has ended, or waits for input, it writes that status as `GetTask` reports it — after the
-`response` artifact when the task has one — unnumbered, and ends. A connection that never lost an
-event never reads the registry this way.
+On `SendStreamingMessage`, a lost event may be the status that ends the stream. From the first loss
+on, the connection checks its task's state at each [heartbeat](#heartbeat), and writes what it
+finds, unnumbered, then ends:
 
-A client that needs every event reconnects with the id of the last event it received and
-[replays](#replay) the rest, which recovers them while they are still in the replay buffer.
+| The task | Written |
+|---|---|
+| Has ended | Its ending as `GetTask` reports it: the `response` artifact when it has one, then the terminal status |
+| Waits for input | A `TASK_STATE_INPUT_REQUIRED` status carrying the prompt |
+
+A `stream/watch` client that needs every event reconnects with the id of the last event it
+received and [replays](#replay) the rest, which recovers them while they are still in the replay
+buffer.
 
 ---
 
@@ -590,8 +614,7 @@ from a closed connection by reading bytes.
 | Event id | None |
 | Replay buffer | Never entered, so no replay contains one |
 
-The heartbeat is written apart from the capsule's turns, so it
-keeps its cadence while a turn is running — through an inference call, a tool call, or a shell
+The heartbeat is written apart from the capsule's turns, so it keeps its cadence while a turn is running — through an inference call, a tool call, or a shell
 command the capsule is waiting on. Events wait on the call: a turn waiting on one call writes no
 event until the call returns, so heartbeats may be the only bytes on the connection for a while.
 
@@ -600,7 +623,7 @@ being given time to write it:
 
 - the process is suspended, for example by `SIGSTOP` or a debugger
 - the host is too loaded to schedule the process
-- every thread the capsule serves connections on is occupied
+- the capsule is too busy serving other connections
 
 A pause does not mean the capsule is gone. The connection closing is what ends the stream; what
 that tells a client is under [`capsule-closed`](#event-capsule-closed).
@@ -615,7 +638,7 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 | Every murmur frame of a task: `text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact` | yes |
 | The opening `task` of a `SendStreamingMessage` stream, and a `TASK_STATE_REJECTED` `task` refused at the door | no |
 | `gap`, `lagged`, `connection-ack`, `capsule-closed` | no |
-| The terminal status and `response` artifact a lagged connection writes from the registry | no |
+| The ending or `TASK_STATE_INPUT_REQUIRED` status a [lagged](#lagged) `SendStreamingMessage` connection writes in place of a lost one | no |
 | Heartbeat | no |
 
 A capsule session numbers its events from one sequence:
@@ -641,8 +664,8 @@ The heartbeat and every unnumbered event — the opening `task`, a `TASK_STATE_R
 
 | Endpoint | `Last-Event-ID` sent | `Last-Event-ID` absent | `Last-Event-ID` not a number |
 |---|---|---|---|
-| `SendStreamingMessage` | Replays this task's events from that id, after the opening `task` | No replay | No replay |
-| `stream/watch` | Replays every event from that id, after `connection-ack` | Replays from `0` | Replays from `0` |
+| `SendStreamingMessage` | Replays this task's events after that id, following the opening `task` | No replay | No replay |
+| `stream/watch` | Replays every event after that id, following `connection-ack` | Replays from `0` | Replays from `0` |
 
 The header name is case-insensitive. A replay from id `N`:
 
@@ -658,10 +681,14 @@ activated. A replay from `0` of a buffer that has evicted nothing is every event
 written, starting at id `1`. Live events follow the replay on the same connection, starting after
 the highest id the replay held.
 
-To reconnect, send the id of the last event received as `Last-Event-ID` — a browser `EventSource`
-does this on its own, from the `id:` lines. Without a `gap`, the replay is exactly the events
-written after that id. With one, the events between that id and `firstAvailableId` are gone, or the
-id came from an earlier capsule session, whose ids this session numbers again from `1`.
+To reconnect a `stream/watch`, send the id of the last event received as `Last-Event-ID`. Without
+a `gap`, the replay is exactly the events written after that id. With one, the events between that
+id and `firstAvailableId` are gone, or the id came from an earlier capsule session, whose ids this
+session numbers again from `1`.
+
+A `SendStreamingMessage` connection lost while its task works cannot be reopened: a message naming
+a working task is refused `-32004`. Follow the task on `stream/watch` from the last id received, or
+poll `GetTask`.
 
 ---
 

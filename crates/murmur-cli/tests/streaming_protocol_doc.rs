@@ -873,8 +873,8 @@ fn watch_prints_the_same_lines() {
     assert_eq!(transcript, WATCH_TRANSCRIPT);
 }
 
-/// What `mur watch` printed for [`watch_prints_the_same_lines`]'s task before stream events took
-/// the A2A v1.0 form, with every `<n>ms` written `Nms`.
+/// What `mur watch` prints for [`watch_prints_the_same_lines`]'s task, with every `<n>ms` written
+/// `Nms`. The stream's wire form must not change these lines.
 const WATCH_TRANSCRIPT: &str = "[working]  inference turn 1
 [artifact] tool: no-such-tool [error, Nms] | tool 'no-such-tool' is not declared in manifest allowlist
 [working]  inference turn 2

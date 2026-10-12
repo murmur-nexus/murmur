@@ -4,8 +4,6 @@
 //! `result` is an `lf.a2a.v1.StreamResponse`. A murmur frame rides in a `statusUpdate` or a
 //! `message` under `metadata[STREAM_EXTENSION_URI]`, and is read here by its `frame`.
 
-#![allow(dead_code)]
-
 use std::{
     io::{Read, Write},
     net::TcpStream,

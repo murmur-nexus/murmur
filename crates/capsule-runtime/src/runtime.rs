@@ -1557,13 +1557,13 @@ fn check_forget_launchable(inference: Option<&InferenceConfig>) -> Result<(), Ru
     })
 }
 
-/// What this session's inference transport can do, for the streaming boolean and the stream
-/// extension's frame list on the agent card.
+/// Which inference transport this session runs, for the stream extension's frame list on the
+/// agent card.
 ///
-/// A session is [`identity::TransportKind::Process`] exactly when it staged a process driver. It
-/// streams only what the harness its driver drives streams, which the driver's
-/// `describe().streams-text` answers. Every other transport runs inside this runtime, which
-/// streams. Cancellation is not here: a task is stopped the same way on every transport.
+/// A session is [`identity::TransportKind::Process`] exactly when it staged a process driver. The
+/// driver's `describe().streams-text` is not read: every transport writes the A2A task events,
+/// so `capabilities.streaming` depends only on whether the door serves `SendStreamingMessage`.
+/// Cancellation is not here: a task is stopped the same way on every transport.
 fn transport_capabilities(staged: &StagedSession) -> identity::TransportCapabilities {
     match staged.process_driver.as_ref() {
         Some(_) => identity::TransportCapabilities {

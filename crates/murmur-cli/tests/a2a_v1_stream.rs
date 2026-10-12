@@ -261,7 +261,7 @@ fn assert_one_task_stream(door: &Door, events: &[Event], opening_state: &str) ->
     task_id
 }
 
-/// S1: with no `A2A-Extensions`, the stream is pure v1.0 — the task, its statuses, the `response`
+/// With no `A2A-Extensions`, the stream is pure v1.0 — the task, its statuses, the `response`
 /// artifact and the terminal status — answering the request's id verbatim, string or integer.
 #[test]
 fn plain_stream_is_pure_v1_and_ends_after_the_terminal_status() {
@@ -330,7 +330,7 @@ fn plain_stream_is_pure_v1_and_ends_after_the_terminal_status() {
     }
 }
 
-/// S2: an activated stream carries the same standard events as a plain one for the same work,
+/// An activated stream carries the same standard events as a plain one for the same work,
 /// plus murmur's frames as `WORKING` carriers of the task, and echoes the extension.
 #[test]
 fn activated_stream_adds_murmur_frames_and_echoes_the_extension() {
@@ -421,7 +421,7 @@ fn activated_stream_adds_murmur_frames_and_echoes_the_extension() {
     );
 }
 
-/// S2: `A2A-Extensions` activates the stream extension when one comma-separated entry of any line
+/// `A2A-Extensions` activates the stream extension when one comma-separated entry of any line
 /// equals its URI exactly, and the response echoes only that URI. Unary methods ignore it.
 #[test]
 fn activated_by_an_exact_entry_on_any_a2a_extensions_line() {
@@ -480,7 +480,7 @@ fn activated_by_an_exact_entry_on_any_a2a_extensions_line() {
     }
 }
 
-/// S3: a stream ends once its task stops for input, carrying the prompt; the reply naming the task
+/// A stream ends once its task stops for input, carrying the prompt; the reply naming the task
 /// continues it on a new stream that opens with the task working, resumes after the client's
 /// cursor and ends after `COMPLETED`. Resuming from `0` replays the task's earlier events after
 /// the opening task without ending on the replayed `INPUT_REQUIRED`.
@@ -572,7 +572,7 @@ fn input_required_ends_the_stream_and_the_reply_continues_it() {
     );
 }
 
-/// S5: a `SendStreamingMessage` stream carries only its own task, even activated and with another
+/// A `SendStreamingMessage` stream carries only its own task, even activated and with another
 /// task running, while a `stream/watch` opened first sees both and ends on neither.
 #[test]
 fn own_task_only_on_a_message_stream_and_every_task_on_watch() {
@@ -627,7 +627,7 @@ fn own_task_only_on_a_message_stream_and_every_task_on_watch() {
     );
 }
 
-/// S6: a busy door answers a `SendStreamingMessage` with one unnumbered `TASK_STATE_REJECTED` task
+/// A busy door answers a `SendStreamingMessage` with one unnumbered `TASK_STATE_REJECTED` task
 /// event, the answer `SendMessage` gives the same refusal; a malformed message is a `-32602`
 /// JSON body before any stream.
 #[test]
@@ -677,7 +677,7 @@ fn refusal_busy_rejects_in_one_task_event_and_malformed_is_json() {
     assert_eq!(response.json()["error"]["code"], -32602, "{response:?}");
 }
 
-/// S6 and S7: a door that starts no task does not stream: its card says so, and it answers
+/// A door that starts no task does not stream: its card says so, and it answers
 /// `SendStreamingMessage` `-32004` `UnsupportedOperationError`.
 #[test]
 fn refusal_a_door_that_starts_no_task_answers_unsupported_operation() {
@@ -712,7 +712,7 @@ fn refusal_a_door_that_starts_no_task_answers_unsupported_operation() {
     assert_eq!(error["data"][0]["reason"], "UNSUPPORTED_OPERATION");
 }
 
-/// S7: the card of a door that streams says so, and its stream extension lists every murmur frame
+/// The card of a door that streams says so, and its stream extension lists every murmur frame
 /// with the description of what activation does.
 #[test]
 fn card_says_what_the_stream_extension_adds() {

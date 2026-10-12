@@ -73,10 +73,9 @@ anywhere inside a block — including one drawn inside an image — is a forgery
 | [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `skill_call` | Not recorded: the event carries no output | `trust` — `"untrusted"` exactly when the skill's result was fenced under `skill:<skill_name>` |
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | In the message's `content` | Unlabelled. The `message` record has no `fence` field; read the markers |
 
-The two labelled surfaces differ on purpose. A stream consumer may be talking to any runtime
-version, so `fenceSource` is present on every frame and `null` distinguishes "this frame is
-unfenced" from "this runtime does not label frames". A record line follows the other envelope
-keys in the file, which are all absent when unset.
+The two labelled surfaces differ: `fenceSource` is on every frame, `null` when `content` is
+unfenced, while a record line's `fence` is absent when unset, like the other envelope keys in the
+file.
 
 ### The `artifact` frame
 
@@ -85,9 +84,8 @@ keys in the file, which are all absent when unset.
 ```
 
 `content` is the bytes the model received, markers included. `fenceSource` is the source
-`content` is fenced under, or `null` when `content` carries no fence. A frame with no
-`fenceSource` key came from a runtime that does not label frames: read the markers. Every field
-on the frame is listed in [Streaming Protocol](streaming-protocol.md#event-artifact).
+`content` is fenced under, or `null` when `content` carries no fence. Every field on the frame is
+listed in [Streaming Protocol](streaming-protocol.md#event-artifact).
 
 ### The record line
 
