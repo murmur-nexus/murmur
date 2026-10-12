@@ -1,9 +1,10 @@
 //! Integration tests for what a streaming client sees of a task its `on-task-end` hooks reopen.
 //!
-//! Every task that runs ends in exactly one `status` frame with `"final":true`, written after the
-//! hooks have had their say and agreeing with `GetTask` and the trace's `task_end`. Between two
-//! attempts the stream carries one non-final `working` frame naming the hook, with `status.reopen`
-//! set to the reopen's ordinal. `SendStreamingMessage` closes on its own task's final status only.
+//! Every task that runs ends in exactly one terminal `statusUpdate`, written after the hooks have
+//! had their say and agreeing with `GetTask` and the trace's `task_end`. Between two attempts the
+//! stream carries one `working` status naming the hook, which an activated connection reads with
+//! the reopen's ordinal under the stream extension. `SendStreamingMessage` carries only its own
+//! task and closes on its terminal status.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -22,8 +23,9 @@ use std::{
 
 use common::idle_capsule::{
     end_turn, end_turns, http_post_json, launch_idle_capsule,
-    launch_idle_capsule_with_input_timeout, open_watch, IdleCapsule,
+    launch_idle_capsule_with_input_timeout, IdleCapsule,
 };
+use common::stream::{parse, Event, Watch, STREAM_EXTENSION_URI};
 use serde_json::Value;
 
 const REOPEN_ONCE_HOOK: &str = "reopen-once";
@@ -117,96 +119,85 @@ fn request_input_call(n: usize) -> String {
 
 // ── the stream ─────────────────────────────────────────────────────────────────
 
-/// One SSE frame as written: its `id:` (if any), its event type and its parsed data.
-#[derive(Debug, Clone, PartialEq)]
-struct Frame {
-    id: Option<u64>,
-    event: String,
-    data: Value,
+/// Whether `event` is the reopen boundary: the `working` status an activated connection reads with
+/// `metadata[STREAM_EXTENSION_URI].reopen`.
+fn is_boundary(event: &Event) -> bool {
+    event.result()["statusUpdate"]["metadata"][STREAM_EXTENSION_URI]
+        .get("reopen")
+        .is_some()
 }
 
-impl Frame {
-    fn is_status(&self) -> bool {
-        self.event == "status"
-    }
-
-    fn is_final_status(&self) -> bool {
-        self.is_status() && self.data["final"] == true
-    }
-
-    fn is_boundary(&self) -> bool {
-        self.is_status() && self.data["status"].get("reopen").is_some()
-    }
-
-    fn state(&self) -> &str {
-        self.data["status"]["state"].as_str().unwrap_or_default()
-    }
-
-    fn message(&self) -> &str {
-        self.data["status"]["message"].as_str().unwrap_or_default()
-    }
-
-    fn task_id(&self) -> &str {
-        self.data["id"].as_str().unwrap_or_default()
-    }
+fn is_status(event: &Event) -> bool {
+    event.kind() == "status-update"
 }
 
-/// What one `SendStreamingMessage` connection received.
+/// What one activated `SendStreamingMessage` connection received.
 struct Stream {
-    frames: Vec<Frame>,
+    events: Vec<Event>,
     /// Whether the capsule closed the connection before the deadline.
     closed: bool,
 }
 
 impl Stream {
-    fn finals(&self) -> Vec<&Frame> {
-        self.frames.iter().filter(|f| f.is_final_status()).collect()
+    fn finals(&self) -> Vec<&Event> {
+        self.events
+            .iter()
+            .filter(|f| f.is_terminal_status())
+            .collect()
     }
 
-    fn boundaries(&self) -> Vec<&Frame> {
-        self.frames.iter().filter(|f| f.is_boundary()).collect()
+    fn boundaries(&self) -> Vec<&Event> {
+        self.events.iter().filter(|f| is_boundary(f)).collect()
     }
 
-    /// The connection's own task's final status, asserted to be the last frame on the connection
-    /// and the only final status that task has.
-    fn the_final(&self) -> &Frame {
+    /// The connection's own task's terminal status, asserted to be the last event on the
+    /// connection and the only terminal status that task has.
+    fn the_final(&self) -> &Event {
         assert!(
             self.closed,
             "the capsule closed the stream: {:#?}",
-            self.frames
+            self.events
         );
-        let last = self.frames.last().expect("the stream carried frames");
+        let last = self.events.last().expect("the stream carried events");
         assert!(
-            last.is_final_status(),
-            "the final status is the last frame: {:#?}",
-            self.frames
+            last.is_terminal_status(),
+            "the final status is the last event: {:#?}",
+            self.events
         );
         let own = self
             .finals()
             .into_iter()
             .filter(|f| f.task_id() == last.task_id())
             .count();
-        assert_eq!(own, 1, "exactly one final status: {:#?}", self.frames);
+        assert_eq!(own, 1, "exactly one final status: {:#?}", self.events);
         last
     }
 
-    /// The id of the task this connection submitted: the task its final status names.
-    fn own_task_id(&self) -> String {
-        self.the_final().task_id().to_string()
+    /// The task's answer: the `response` artifact delivered just before its `completed` status.
+    fn response(&self) -> Option<&str> {
+        let answer = &self.events[self.events.len().checked_sub(2)?];
+        (answer.artifact()?["artifactId"] == "response")
+            .then(|| answer.artifact_text())
+            .flatten()
     }
 
-    /// Index of the first frame at or after `from` that `matches`.
-    fn index(&self, from: usize, matches: impl Fn(&Frame) -> bool) -> usize {
-        from + self.frames[from..]
+    /// The id of the task this connection submitted: the task its opening event names.
+    fn own_task_id(&self) -> String {
+        self.events[0].task_id().unwrap().to_string()
+    }
+
+    /// Index of the first event at or after `from` that `matches`.
+    fn index(&self, from: usize, matches: impl Fn(&Event) -> bool) -> usize {
+        from + self.events[from..]
             .iter()
             .position(matches)
-            .unwrap_or_else(|| panic!("no matching frame after {from}: {:#?}", self.frames))
+            .unwrap_or_else(|| panic!("no matching event after {from}: {:#?}", self.events))
     }
 
-    /// Every numbered frame's id, asserted strictly ascending.
+    /// Every numbered event's id, asserted strictly ascending.
     fn assert_ids_ascend(&self) {
-        let ids: Vec<u64> = self.frames.iter().filter_map(|f| f.id).collect();
-        assert!(!ids.is_empty(), "{:#?}", self.frames);
+        let ids: Vec<u64> = self.events.iter().filter_map(|f| f.id).collect();
+        assert!(!ids.is_empty(), "{:#?}", self.events);
         assert!(
             ids.windows(2).all(|pair| pair[0] < pair[1]),
             "numbered ids ascend strictly: {ids:?}"
@@ -214,8 +205,8 @@ impl Stream {
     }
 }
 
-/// Send `SendStreamingMessage` for a new task and return the connection, positioned at the first byte
-/// of the HTTP response.
+/// Send an activated `SendStreamingMessage` for a new task and return the connection, positioned
+/// at the first byte of the HTTP response.
 fn open_message_stream(addr: &str, message_id: &str, text: &str) -> TcpStream {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -230,8 +221,9 @@ fn open_message_stream(addr: &str, message_id: &str, text: &str) -> TcpStream {
         }
     })
     .to_string();
+    let (extensions, uri) = common::stream::extensions_header();
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n{extensions}: {uri}\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
         body.len()
     );
     let stream = TcpStream::connect(addr).expect("should connect to capsule");
@@ -271,30 +263,9 @@ fn read_until_closed(conn: TcpStream) -> Stream {
     let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
     let body = text.split_once("\n\n").map(|(_, body)| body).unwrap_or("");
     Stream {
-        frames: parse_frames(body),
+        events: parse(body),
         closed,
     }
-}
-
-/// Parse an SSE body into frames, dropping comments such as the heartbeat.
-fn parse_frames(body: &str) -> Vec<Frame> {
-    let mut out = Vec::new();
-    for block in body.split("\n\n") {
-        let (mut id, mut event, mut data) = (None, None, None);
-        for line in block.lines() {
-            if let Some(rest) = line.strip_prefix("id: ") {
-                id = rest.parse().ok();
-            } else if let Some(rest) = line.strip_prefix("event: ") {
-                event = Some(rest.to_string());
-            } else if let Some(rest) = line.strip_prefix("data: ") {
-                data = serde_json::from_str::<Value>(rest).ok();
-            }
-        }
-        if let (Some(event), Some(data)) = (event, data) {
-            out.push(Frame { id, event, data });
-        }
-    }
-    out
 }
 
 /// Stream one task from submission to the capsule closing the connection.
@@ -302,38 +273,36 @@ fn stream_task(capsule: &IdleCapsule, message_id: &str, text: &str) -> Stream {
     read_until_closed(open_message_stream(&capsule.url, message_id, text))
 }
 
-/// Every frame a `stream/watch` connection replays from `Last-Event-ID: 0`, read until `task_id`'s
-/// final status arrives or [`STREAM_DEADLINE`] passes. The observer's `connection-ack` is dropped.
-fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Frame> {
-    let conn = open_watch(&capsule.url, 0);
-    let deadline = Instant::now() + STREAM_DEADLINE;
-    let mut bytes = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut source = &conn;
-    loop {
-        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-        let body = text.split_once("\n\n").map(|(_, body)| body).unwrap_or("");
-        let frames: Vec<Frame> = parse_frames(body)
-            .into_iter()
-            .filter(|f| f.event != "connection-ack")
-            .collect();
-        if Instant::now() >= deadline
-            || frames
-                .iter()
-                .any(|f| f.is_final_status() && f.task_id() == task_id)
-        {
-            return frames;
-        }
-        match source.read(&mut buf) {
-            Ok(0) => return frames,
-            Ok(n) => bytes.extend_from_slice(&buf[..n]),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => return frames,
-        }
+/// Every event a `stream/watch` connection replays from `Last-Event-ID: 0`, read until
+/// `task_id`'s terminal status arrives or [`STREAM_DEADLINE`] passes. The observer's
+/// `connection-ack` is dropped.
+fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Event> {
+    let mut watch = Watch::open(&capsule.url, 0);
+    watch.read_until(STREAM_DEADLINE, |event| {
+        event.is_terminal_status() && event.task_id() == Some(task_id)
+    });
+    watch
+        .events
+        .into_iter()
+        .filter(|f| f.kind() != "connection-ack")
+        .collect()
+}
+
+/// The whole of a task whose stream ended when it stopped for input: the stream is asserted to
+/// end there, and the task's events, through its terminal status, are read from a `stream/watch`
+/// replay.
+fn after_input_wait(capsule: &IdleCapsule, streamed: &Stream) -> Stream {
+    assert!(streamed.closed, "{:#?}", streamed.events);
+    let last = streamed.events.last().expect("the stream carried events");
+    assert_eq!(
+        last.murmur_state(),
+        Some("input-required"),
+        "the stream ends once its task waits for input: {:#?}",
+        streamed.events
+    );
+    Stream {
+        events: replay(capsule, &streamed.own_task_id()),
+        closed: true,
     }
 }
 
@@ -377,16 +346,20 @@ fn assert_first_boundary(stream: &Stream, task_id: &str, hook: &str) {
         boundaries.len(),
         1,
         "one boundary frame: {:#?}",
-        stream.frames
+        stream.events
     );
     let boundary = boundaries[0];
     assert!(boundary.id.is_some(), "the boundary frame is numbered");
-    assert_eq!(boundary.data["id"], task_id);
-    assert_eq!(boundary.data["final"], false);
-    assert_eq!(boundary.state(), "working");
-    assert_eq!(boundary.message(), format!("reopened by hook {hook}"));
-    assert_eq!(boundary.data["status"]["reopen"], 1);
-    assert!(boundary.data["status"].get("response").is_none());
+    assert_eq!(boundary.task_id(), Some(task_id));
+    assert_eq!(boundary.murmur_state(), Some("working"));
+    assert_eq!(
+        boundary.status_text(),
+        Some(format!("reopened by hook {hook}").as_str())
+    );
+    assert_eq!(
+        boundary.result()["statusUpdate"]["metadata"][STREAM_EXTENSION_URI],
+        serde_json::json!({"reopen": 1})
+    );
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -407,45 +380,49 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
     let stream = stream_task(&capsule, "reopen-stream-s1", "take a note");
 
     let last = stream.the_final();
-    assert_eq!(last.state(), "completed");
-    assert_eq!(last.data["status"]["response"], "Noted, second attempt.");
+    assert_eq!(last.murmur_state(), Some("completed"));
+    assert_eq!(stream.response(), Some("Noted, second attempt."));
     assert!(
-        !stream.frames.iter().any(|f| f.is_status()
-            && f.state() == "completed"
-            && f.data["status"]["response"] == "Noted, first attempt."),
-        "the rejected answer is never reported completed: {:#?}",
-        stream.frames
+        !stream
+            .events
+            .iter()
+            .any(|f| f.artifact_text() == Some("Noted, first attempt.")),
+        "the rejected answer is never delivered as the task's answer: {:#?}",
+        stream.events
     );
     let task_id = stream.own_task_id();
     assert_first_boundary(&stream, &task_id, REOPEN_ONCE_HOOK);
 
-    let first_text = stream.index(0, |f| {
-        f.event == "text" && f.data["text"] == "Noted, first attempt."
-    });
-    let boundary = stream.index(0, Frame::is_boundary);
+    let first_text = stream.index(0, |f| f.frame()["text"] == "Noted, first attempt.");
+    let boundary = stream.index(0, is_boundary);
     // The second attempt's first turn numbers on from the first attempt's one turn.
-    let is_turn_status = |f: &Frame| f.is_status() && f.message().starts_with("inference turn ");
+    let is_turn_status = |f: &Event| {
+        is_status(f)
+            && f.status_text()
+                .is_some_and(|text| text.starts_with("inference turn "))
+    };
     let first_turn = stream.index(0, is_turn_status);
     let second_turn = stream.index(boundary, is_turn_status);
     assert_eq!(
         (
-            stream.frames[first_turn].message(),
-            stream.frames[second_turn].message()
+            stream.events[first_turn].status_text(),
+            stream.events[second_turn].status_text()
         ),
-        ("inference turn 1", "inference turn 2"),
+        (Some("inference turn 1"), Some("inference turn 2")),
         "{:#?}",
-        stream.frames
+        stream.events
     );
     assert!(
         first_text < boundary && boundary < second_turn,
         "{:#?}",
-        stream.frames
+        stream.events
     );
     stream.assert_ids_ascend();
     assert_eq!(
         replay(&capsule, &task_id),
-        stream.frames,
-        "a stream/watch replay shows the live stream's frames, boundary and final status included"
+        stream.events[1..],
+        "a stream/watch replay shows the live stream's events after its opening task, boundary \
+         and final status included"
     );
 
     assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");
@@ -471,19 +448,16 @@ fn a_task_refused_a_reopen_is_told_it_failed_once() {
     let stream = stream_task(&capsule, "reopen-stream-s2", "try it");
 
     let last = stream.the_final();
-    assert_eq!(last.state(), "failed");
-    assert!(
-        last.message().contains("lifecycle.max_task_reopens"),
-        "{}",
-        last.message()
-    );
+    assert_eq!(last.murmur_state(), Some("failed"));
+    let message = last.status_text().unwrap();
+    assert!(message.contains("lifecycle.max_task_reopens"), "{message}");
     assert!(
         !stream
-            .frames
+            .events
             .iter()
-            .any(|f| f.is_status() && f.state() == "completed"),
+            .any(|f| is_status(f) && f.murmur_state() == Some("completed")),
         "{:#?}",
-        stream.frames
+        stream.events
     );
     let task_id = stream.own_task_id();
     assert_first_boundary(&stream, &task_id, REOPEN_ALWAYS_HOOK);
@@ -509,15 +483,15 @@ fn a_failed_attempt_that_is_reopened_is_not_reported_failed() {
     let stream = stream_task(&capsule, "reopen-stream-s3", "recover");
 
     let last = stream.the_final();
-    assert_eq!(last.state(), "completed");
-    assert_eq!(last.data["status"]["response"], "Recovered.");
+    assert_eq!(last.murmur_state(), Some("completed"));
+    assert_eq!(stream.response(), Some("Recovered."));
     assert!(
         !stream
-            .frames
+            .events
             .iter()
-            .any(|f| f.is_status() && f.state() == "failed"),
+            .any(|f| is_status(f) && f.murmur_state() == Some("failed")),
         "{:#?}",
-        stream.frames
+        stream.events
     );
     let task_id = stream.own_task_id();
     assert_first_boundary(&stream, &task_id, REOPEN_ONCE_HOOK);
@@ -542,24 +516,25 @@ fn an_input_timeout_ends_the_task_with_one_failed_status() {
         common::ScriptedServer::start(vec![request_input_call(1), end_turn(2, "Too late.")]),
         false,
     );
-    let stream = stream_task(&capsule, "reopen-stream-s5a", "ask me something");
+    let streamed = stream_task(&capsule, "reopen-stream-s5a", "ask me something");
+    let stream = after_input_wait(&capsule, &streamed);
 
-    let asked = stream.index(0, |f| f.is_status() && f.state() == "input-required");
+    let asked = stream.index(0, |f| f.murmur_state() == Some("input-required"));
     let last = stream.the_final();
-    assert_eq!(last.state(), "failed");
-    assert_eq!(last.message(), "input-timeout");
+    assert_eq!(last.murmur_state(), Some("failed"));
+    assert_eq!(last.status_text(), Some("input-timeout"));
     assert_eq!(
         stream
-            .frames
+            .events
             .iter()
-            .filter(|f| f.is_status() && f.state() == "failed")
+            .filter(|f| is_status(f) && f.murmur_state() == Some("failed"))
             .count(),
         1,
         "{:#?}",
-        stream.frames
+        stream.events
     );
-    assert!(asked < stream.frames.len() - 1);
-    assert!(stream.boundaries().is_empty(), "{:#?}", stream.frames);
+    assert!(asked < stream.events.len() - 1);
+    assert!(stream.boundaries().is_empty(), "{:#?}", stream.events);
     assert_eq!(
         task_state(&capsule.url, &stream.own_task_id()),
         "TASK_STATE_FAILED"
@@ -577,7 +552,7 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     );
 
     // Every state `GetTask` answers for the streamed task while the stream is open, from the
-    // moment the trace names it: the stream itself reports no id until it closes.
+    // moment the trace names it.
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let poller = {
@@ -597,20 +572,21 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
             }
         })
     };
-    let stream = stream_task(&capsule, "reopen-stream-s5b", "ask me something");
+    let streamed = stream_task(&capsule, "reopen-stream-s5b", "ask me something");
+    let stream = after_input_wait(&capsule, &streamed);
     stop.store(true, Ordering::Relaxed);
     poller.join().unwrap();
 
     let last = stream.the_final();
-    assert_eq!(last.state(), "completed");
-    assert_eq!(last.data["status"]["response"], "Answered anyway.");
+    assert_eq!(last.murmur_state(), Some("completed"));
+    assert_eq!(stream.response(), Some("Answered anyway."));
     assert!(
         !stream
-            .frames
+            .events
             .iter()
-            .any(|f| f.is_status() && f.state() == "failed"),
+            .any(|f| is_status(f) && f.murmur_state() == Some("failed")),
         "{:#?}",
-        stream.frames
+        stream.events
     );
     let task_id = stream.own_task_id();
     assert_first_boundary(&stream, &task_id, REOPEN_ONCE_HOOK);
@@ -632,8 +608,8 @@ fn an_input_timeout_a_hook_reopens_is_not_reported_failed() {
     );
 }
 
-/// `SendStreamingMessage` forwards other tasks' frames but closes on its own task's final status.
-/// B, opened while A runs, receives A's final status and stays open until its own.
+/// `SendStreamingMessage` carries only its own task and closes on its terminal status. B, opened
+/// while A runs, never receives A's events and stays open until its own end.
 #[test]
 fn message_stream_closes_on_its_own_tasks_final_status() {
     let capsule = launch_idle_capsule(common::ScriptedServer::start_with_delay(
@@ -653,24 +629,22 @@ fn message_stream_closes_on_its_own_tasks_final_status() {
     let b = b_reader.join().unwrap();
 
     let a_final = a.the_final();
-    assert_eq!(a_final.state(), "completed");
-    assert_eq!(a_final.data["status"]["response"], "A done.");
+    assert_eq!(a_final.murmur_state(), Some("completed"));
+    assert_eq!(a.response(), Some("A done."));
 
     let b_final = b.the_final();
-    assert_eq!(b_final.state(), "completed");
-    assert_eq!(b_final.data["status"]["response"], "B done.");
+    assert_eq!(b_final.murmur_state(), Some("completed"));
+    assert_eq!(b.response(), Some("B done."));
     assert_ne!(b_final.task_id(), a_final.task_id());
     assert!(
-        b.frames.iter().any(|f| f.is_final_status()
-            && f.task_id() == a_final.task_id()
-            && f.data["status"]["response"] == "A done."),
-        "B received A's final status and stayed open: {:#?}",
-        b.frames
+        !b.events.iter().any(|f| f.task_id() == a_final.task_id()),
+        "B received none of A's events: {:#?}",
+        b.events
     );
     assert!(
-        !a.frames.iter().any(|f| f.task_id() == b_final.task_id()),
-        "A closed before B ran: {:#?}",
-        a.frames
+        !a.events.iter().any(|f| f.task_id() == b_final.task_id()),
+        "A received none of B's events: {:#?}",
+        a.events
     );
 }
 

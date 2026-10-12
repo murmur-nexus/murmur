@@ -1,7 +1,7 @@
-//! The A2A half of a `transport: process` attempt: the frames its harness's events write.
+//! The A2A half of a `transport: process` attempt: the events its harness's events write.
 //!
-//! The same frame builders the http path uses, fed from the process driver contract's generic
-//! events, so the same fact produces the same frame on both transports. Nothing here names a
+//! The same event constructors the http path uses, fed from the process driver contract's generic
+//! events, so the same fact produces the same event on both transports. Nothing here names a
 //! harness, a driver or a vendor: every value on the wire comes from an [`Event`] field or from
 //! the runtime's own measurement.
 //!
@@ -29,11 +29,10 @@
 //!
 //! # The attempt's ending
 //!
-//! Every frame this module writes is non-final. Every way an attempt can end records one
-//! [`AttemptEnding`] — [`ending`] reads it off the attempt's own result on every path out of the
-//! attempt — and the task's one `final:true` `status` frame is `run_task_with_reopens`'s, written
-//! from the last attempt's ending once the `on-task-end` hooks have decided not to reopen the
-//! task.
+//! Every event this module writes leaves the task working. Every way an attempt can end records
+//! one [`AttemptEnding`] — [`ending`] reads it off the attempt's own result on every path out of
+//! the attempt — and the task's one terminal status is `run_task_with_reopens`'s, written from the
+//! last attempt's ending once the `on-task-end` hooks have decided not to reopen the task.
 //!
 //! [`ending`]: A2aStream::ending
 //!
@@ -43,7 +42,7 @@
 //! arrives with `"final":true`. So a segment that streamed fragments closes with an empty
 //! `final:true` frame — the cursor removal — and the client keeps what it was streamed, rather
 //! than being sent the same words twice. The authoritative answer reaches it anyway, as the
-//! `response` of the task's final `completed` status and as `out/result.txt`. The same rule governs
+//! task's `response` artifact and as `out/result.txt`. The same rule governs
 //! `thinking`, whose frames are always `"final":false`.
 //!
 //! # Hook artifacts
@@ -57,7 +56,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::Instant,
 };
@@ -71,9 +70,8 @@ use crate::{
     errors::RuntimeError,
     hooks::HookArtifact,
     streaming::{
-        emit_chunk_sse, emit_chunk_sse_final, emit_sse, emit_thinking_chunk_sse, SseBroadcast,
-        SseEventBuffer, StreamArtifact, StreamFrame, StreamStatus, TaskArtifactUpdateEvent,
-        TaskStatusUpdateEvent, TaskToolCallProgressEvent, TaskToolCallStartedEvent,
+        emit_frame, emit_status, emit_text, emit_thinking, MurmurFrame, StreamArtifact, StreamSink,
+        StreamTask,
     },
     tool_call_progress::ToolCallProgress,
 };
@@ -81,9 +79,8 @@ use crate::{
 /// Where one attempt's frames go. Absent for a run with no A2A task — `mur run`, a `task.md`
 /// launch — which writes nothing.
 struct A2aTarget {
-    sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    task_id: String,
-    context_id: Option<String>,
+    sse: StreamSink,
+    task: StreamTask,
 }
 
 /// What the current segment has already sent, which is what decides the frames the rest of it
@@ -103,13 +100,6 @@ struct Segment {
     /// Whether this segment streamed a `thinking-delta`, which makes a complete `thinking` a
     /// repeat of what the client already has.
     streamed_thinking: bool,
-}
-
-/// The broadcast, buffer and task id the synchronous chunk emitters take.
-struct Wire<'a> {
-    tx: &'a SseBroadcast,
-    buf: &'a Arc<Mutex<SseEventBuffer>>,
-    task_id: &'a str,
 }
 
 /// One attempt's A2A stream.
@@ -138,20 +128,17 @@ pub(super) struct A2aStream {
 }
 
 impl A2aStream {
-    /// The stream for one attempt. `task_id` is `None` for a run that serves no A2A task, which
-    /// makes every method here a no-op.
+    /// The stream for one attempt. `task_id` and `context_id` are `None` for a run that serves
+    /// no A2A task, which makes every method here a no-op.
     pub(super) fn new(
-        sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+        sse: StreamSink,
         task_id: Option<String>,
         context_id: Option<String>,
         chunks_emitted: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            target: task_id.map(|task_id| A2aTarget {
-                sse,
-                task_id,
-                context_id,
-            }),
+            target: StreamTask::of(task_id.as_deref(), context_id.as_deref())
+                .map(|task| A2aTarget { sse, task }),
             chunks_emitted,
             segment: Segment::default(),
             result: String::new(),
@@ -192,8 +179,15 @@ impl A2aStream {
             ..Segment::default()
         };
         self.chunks_emitted.store(false, Ordering::Relaxed);
-        self.status("working", &format!("inference turn {turn}"))
-            .await;
+        if let Some(target) = &self.target {
+            emit_status(
+                &target.sse,
+                &target.task,
+                TaskState::Working,
+                &format!("inference turn {turn}"),
+                None,
+            );
+        }
     }
 
     /// One streamed text fragment.
@@ -201,8 +195,8 @@ impl A2aStream {
         self.segment.streamed_text = true;
         self.segment.cursor_removal_owed = true;
         self.chunks_emitted.store(true, Ordering::Relaxed);
-        if let Some(wire) = self.wire() {
-            emit_chunk_sse(wire.tx, wire.buf, wire.task_id, text);
+        if let Some(target) = &self.target {
+            emit_text(&target.sse, &target.task, text, false);
         }
     }
 
@@ -215,8 +209,8 @@ impl A2aStream {
     /// One streamed thinking fragment.
     pub(super) fn thinking_delta(&mut self, text: &str) {
         self.segment.streamed_thinking = true;
-        if let Some(wire) = self.wire() {
-            emit_thinking_chunk_sse(wire.tx, wire.buf, wire.task_id, text);
+        if let Some(target) = &self.target {
+            emit_thinking(&target.sse, &target.task, text);
         }
     }
 
@@ -226,8 +220,8 @@ impl A2aStream {
         if self.segment.streamed_thinking {
             return;
         }
-        if let Some(wire) = self.wire() {
-            emit_thinking_chunk_sse(wire.tx, wire.buf, wire.task_id, text);
+        if let Some(target) = &self.target {
+            emit_thinking(&target.sse, &target.task, text);
         }
     }
 
@@ -241,19 +235,10 @@ impl A2aStream {
             return;
         }
         self.open_segment(turn).await;
-        let Some(target) = self.target.as_ref() else {
-            return;
-        };
-        emit_sse(
-            &target.sse,
-            StreamFrame::ToolCallStarted,
-            &TaskToolCallStartedEvent {
-                id: target.task_id.clone(),
-                tool_call_id: id.to_string(),
-                tool_name: name.to_string(),
-            },
-        )
-        .await;
+        self.frame(MurmurFrame::ToolCallStarted {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+        });
     }
 
     /// The model has written `input_bytes` of started call `id`'s input, as of `now`. Writes a
@@ -262,7 +247,7 @@ impl A2aStream {
         let Some(size) = self.calls.report(id, input_bytes, now) else {
             return;
         };
-        self.progress(id, size).await;
+        self.progress(id, size);
     }
 
     /// Call `id`'s complete `tool-call` arrived at `now`. Writes the size still held for it, if
@@ -270,7 +255,7 @@ impl A2aStream {
     pub(super) async fn tool_call_complete(&mut self, id: &str, now: Instant) -> Option<String> {
         let call = self.calls.complete(id, now)?;
         if let Some(size) = call.held {
-            self.progress(id, size).await;
+            self.progress(id, size);
         }
         Some(call.name)
     }
@@ -282,7 +267,7 @@ impl A2aStream {
         }
         self.pay_cursor_removal();
         self.segment.open = false;
-        self.artifact(artifact).await;
+        self.frame(MurmurFrame::Artifact(artifact));
     }
 
     /// The harness ended the turn. Holds the result for the attempt's ending, forwards what the
@@ -299,17 +284,16 @@ impl A2aStream {
         }
         for hook_artifact in hook_artifacts {
             // The operator's own declared hook speaking, so the frame carries no fence.
-            self.artifact(StreamArtifact::hook(
+            self.frame(MurmurFrame::Artifact(StreamArtifact::hook(
                 hook_artifact.hook_name,
                 hook_artifact.payload,
-            ))
-            .await;
+            )));
         }
         if self.segment.streamed_text || result.is_empty() {
             return;
         }
-        if let Some(wire) = self.wire() {
-            emit_chunk_sse_final(wire.tx, wire.buf, wire.task_id, result);
+        if let Some(target) = &self.target {
+            emit_text(&target.sse, &target.task, result, true);
         }
     }
 
@@ -357,73 +341,23 @@ impl A2aStream {
             return;
         }
         self.segment.cursor_removal_owed = false;
-        if let Some(wire) = self.wire() {
-            emit_chunk_sse_final(wire.tx, wire.buf, wire.task_id, "");
+        if let Some(target) = &self.target {
+            emit_text(&target.sse, &target.task, "", true);
         }
     }
 
-    async fn artifact(&self, artifact: StreamArtifact) {
-        let Some(target) = self.target.as_ref() else {
-            return;
-        };
-        emit_sse(
-            &target.sse,
-            StreamFrame::Artifact,
-            &TaskArtifactUpdateEvent {
-                id: target.task_id.clone(),
-                artifact,
-            },
-        )
-        .await;
+    /// One murmur frame of the task, when the attempt serves one.
+    fn frame(&self, frame: MurmurFrame) {
+        if let Some(target) = &self.target {
+            emit_frame(&target.sse, &target.task, frame);
+        }
     }
 
-    async fn progress(&self, tool_call_id: &str, input_bytes: u64) {
-        let Some(target) = self.target.as_ref() else {
-            return;
-        };
-        emit_sse(
-            &target.sse,
-            StreamFrame::ToolCallProgress,
-            &TaskToolCallProgressEvent {
-                id: target.task_id.clone(),
-                tool_call_id: tool_call_id.to_string(),
-                input_bytes,
-            },
-        )
-        .await;
-    }
-
-    async fn status(&self, state: &str, message: &str) {
-        let Some(target) = self.target.as_ref() else {
-            return;
-        };
-        emit_sse(
-            &target.sse,
-            StreamFrame::Status,
-            &TaskStatusUpdateEvent {
-                id: target.task_id.clone(),
-                context_id: target.context_id.clone(),
-                status: StreamStatus {
-                    state: state.to_string(),
-                    message: message.to_string(),
-                    response: None,
-                    reopen: None,
-                },
-                r#final: false,
-            },
-        )
-        .await;
-    }
-
-    /// What the chunk emitters take, for a task whose stream has somewhere to go.
-    fn wire(&self) -> Option<Wire<'_>> {
-        let target = self.target.as_ref()?;
-        let (tx, buf) = target.sse.as_ref()?;
-        Some(Wire {
-            tx,
-            buf,
-            task_id: &target.task_id,
-        })
+    fn progress(&self, tool_call_id: &str, input_bytes: u64) {
+        self.frame(MurmurFrame::ToolCallProgress {
+            tool_call_id: tool_call_id.to_string(),
+            input_bytes,
+        });
     }
 }
 
@@ -448,8 +382,10 @@ const CANCELED_KILLED_STATUS_MESSAGE: &str =
 mod tests {
     use std::time::Duration;
 
+    use std::sync::Mutex;
+
     use super::*;
-    use crate::streaming::ReplayResult;
+    use crate::streaming::{buffered, event_kind, SseEventBuffer};
 
     /// `ms` milliseconds after `base`.
     fn at(base: Instant, ms: u64) -> Instant {
@@ -463,27 +399,15 @@ mod tests {
         let stream = A2aStream::new(
             Some((tx, Arc::clone(&frames))),
             Some("tsk_test".to_string()),
-            None,
+            Some("ctx_test".to_string()),
             Arc::new(AtomicBool::new(false)),
         );
         (stream, frames)
     }
 
-    /// The `event:` value of every frame the buffer holds, in order.
+    /// The kind of every event the buffer holds, in order.
     fn event_types(frames: &Arc<Mutex<SseEventBuffer>>) -> Vec<String> {
-        let ReplayResult::Complete(frames) = frames.lock().unwrap().replay_from(0) else {
-            panic!("a gap in a test buffer");
-        };
-        frames
-            .iter()
-            .map(|frame| {
-                frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("event: "))
-                    .unwrap()
-                    .to_string()
-            })
-            .collect()
+        buffered(frames).iter().map(event_kind).collect()
     }
 
     #[tokio::test]
@@ -499,7 +423,7 @@ mod tests {
         stream.tool_call_progress("c1", 40, at(now, 1_000)).await;
         assert_eq!(
             event_types(&frames),
-            ["status", "tool-call-started", "tool-call-progress"]
+            ["status-update", "tool-call-started", "tool-call-progress"]
         );
     }
 

@@ -381,9 +381,8 @@ A formation token carries exactly these scopes:
 | `GetTask` | Read the state of a task the calling member started; any other id is `-32001 Task not found`, as [Agent Card: `GetTask`](agent-card.md#tasks-get) describes |
 | `CancelTask` | Cancel a task the calling member started; any other id is `-32001 Task not found`, and nothing is cancelled. The runtime sends it only for a task a member took just after the calling task ended — see [A busy member](runtime-provided-tools.md#call-member-busy) |
 
-A formation token does not reach `SendStreamingMessage`: a `SendStreamingMessage` connection
-carries the frames of every task the door runs, other members' included, as
-[Streaming Protocol: Endpoints](streaming-protocol.md#endpoints) describes.
+A formation token does not reach `SendStreamingMessage`: a member reads a task it started with
+`GetTask`.
 
 The operator token and declared credentials work as they do outside a formation. A peer task is
 still refused with `403 peer_not_accepted` by a member that does not declare

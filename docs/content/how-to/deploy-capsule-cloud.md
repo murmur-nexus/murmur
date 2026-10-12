@@ -213,10 +213,10 @@ A 200 response confirms the capsule is running:
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "Every server-sent event type this capsule's SendStreamingMessage and stream/watch connections can write. Only status and artifact correspond to A2A events; the others are murmur frames.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
-          "frames": ["status", "artifact", "text", "thinking", "tool-call-started", "tool-call-progress", "gap", "lagged", "connection-ack", "capsule-closed", "error"]
+          "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
         }
       }
     ]

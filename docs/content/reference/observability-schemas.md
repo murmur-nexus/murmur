@@ -627,7 +627,7 @@ stopped taking work while the task was still queued, as described under
 | `context_id` | string | The task's context id |
 | `source` | string | Where the task came from: `"a2a"` \| `"detached_shell"` \| `"detached_lost"`, as on `task_start` |
 | `cause` | string | Why the session stopped taking work, from the table below |
-| `reason` | string | The `status.message` of the task's final `rejected` [status frame](streaming-protocol.md#one-final-status) |
+| `reason` | string | The text of the `status.message` of the task's terminal `TASK_STATE_REJECTED` [status](streaming-protocol.md#one-final-status) |
 
 | `cause` | Written when |
 |---|---|

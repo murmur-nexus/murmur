@@ -1,7 +1,8 @@
 # Streaming Protocol
 
-The server-sent event stream a capsule serves on its A2A address: the two endpoints, every frame
-they write, event ids, replay and the heartbeat.
+The server-sent event streams a capsule serves on its A2A address: the two endpoints, the A2A
+v1.0 events they write, the murmur frames the stream extension adds, event ids, replay and the
+heartbeat.
 
 [`mur watch`](cli.md#mur-watch) is a client for one of the endpoints. What it implements is listed
 under [What `mur watch` implements](#mur-watch).
@@ -18,14 +19,23 @@ stream opens.
 
 | Method | Purpose | Params | Closes when |
 |---|---|---|---|
-| `SendStreamingMessage` | Submit a task and stream the capsule's frames while it runs | An A2A message, under `params.message` or as `params` itself: `messageId` (string, required), `role` (string, required), `parts` (array of `{"text": …}`, required), `contextId` (string, optional) | The first live `status` frame with `"final":true` whose `id` is the task this connection submitted is written. Also after an `error` frame and after a `rejected` status |
-| `stream/watch` | Observe every frame the capsule writes, without submitting anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A `final` status does not close it |
+| `SendStreamingMessage` | Send a message — a new task, or the reply to a task waiting for input — and stream that task | `params.message`, read as `SendMessage` reads it: see [Agent Card: Messages](agent-card.md#message) | After the task's terminal status, or after a live `TASK_STATE_INPUT_REQUIRED` status of the task |
+| `stream/watch` | Observe every task the capsule runs, without sending anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A task's terminal status does not close it |
 
 On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), both
 methods require `Authorization: Bearer <token>` with a token holding the method's scope. A request
-without one is refused with `401` or `403` and a JSON body before the stream opens: no
-`text/event-stream` headers are written and no frame is sent. See
+without one is refused with `401` or `403` and a JSON body before the stream opens. See
 [Agent Card: What the door answers](agent-card.md#door-authentication).
+
+Request a `SendStreamingMessage`, with the stream extension activated:
+
+```bash
+curl -N -X POST http://localhost:52222/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H 'A2A-Extensions: https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1' \
+  -d '{"jsonrpc":"2.0","id":"r1","method":"SendStreamingMessage","params":{"message":{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"Summarise README.md"}]}}}'
+```
 
 Request a `stream/watch`:
 
@@ -37,208 +47,278 @@ curl -N -X POST http://localhost:52222/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}'
 ```
 
-Request a `SendStreamingMessage`:
-
-```bash
-curl -N -X POST http://localhost:52222/ \
-  -H 'Content-Type: application/json' \
-  -H 'A2A-Version: 1.0' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"Summarise README.md"}]}}}'
-```
-
 Both answer with these response headers, then the event stream. There is no `content-length`: the
-body ends when the connection closes.
+body ends when the connection closes. The `A2A-Extensions` line is written on `stream/watch`
+always, and on `SendStreamingMessage` only when the request [activated](#murmur-stream-v1) the
+stream extension.
 
 ```text
 HTTP/1.1 200 OK
 content-type: text/event-stream
 cache-control: no-cache
 connection: keep-alive
+A2A-Extensions: https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1
 ```
 
-A `SendStreamingMessage` sent to a capsule with
-[`lifecycle.task_acceptance: none`](manifest.md#lifecycle-task-acceptance) is answered with a plain
-JSON-RPC error instead — `HTTP/1.1 200 OK`, `content-type: application/json`, and
-`{"jsonrpc":"2.0","id":…,"error":{"code":-32601,"message":"Method not found"}}`. `stream/watch`
-is served whatever `task_acceptance` says.
+Everything that can refuse a `SendStreamingMessage` is answered as one JSON-RPC body,
+`content-type: application/json`, before any stream opens:
 
-Which frames each endpoint can deliver:
+| Refusal | Answer |
+|---|---|
+| The capsule's [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) is `none`, so its card says `capabilities.streaming: false` | `-32004` `UnsupportedOperationError` |
+| The message is malformed, carries a file part, or names a task it cannot go to | The error [`SendMessage`](agent-card.md#message) answers the same message with |
+| The task could not be handed to the capsule's queue | `-32603`, and the task is not kept |
 
-| Frame | `SendStreamingMessage` | `stream/watch` |
+A new task the capsule has no room for, or refuses because its session is closing, is answered
+as a stream of exactly one unnumbered event: the [`task`](#standard-events) in
+`TASK_STATE_REJECTED`, whose `status.message` is `task rejected: capsule is busy` or
+`task rejected: the session is closing` — the task `SendMessage` answers the same refusal with.
+The stream then ends.
+
+`stream/watch` is served whatever `task_acceptance` says.
+
+---
+
+## Event form { #event-form }
+
+Every event either endpoint writes is an optional `id:` line, one `data:` line, then a blank line.
+Lines end with `\n`. No event carries an `event:` line.
+
+| Line | Form | On |
 |---|---|---|
-| [`status`](#event-status) | yes | yes |
-| [`status`](#event-status) with state `rejected`, refused at the door | yes, only to the connection that submitted the task | no |
-| [`status`](#event-status) with state `rejected`, refused when the session ended | yes | yes |
-| [`artifact`](#event-artifact) | yes | yes |
-| [`text`](#event-text) | yes | yes |
-| [`thinking`](#event-thinking) | yes | yes |
-| [`gap`](#event-gap) | yes, only when the request sent `Last-Event-ID` | yes |
-| [`lagged`](#event-lagged) | yes | yes |
-| [`connection-ack`](#event-connection-ack) | no | yes, first frame |
-| [`capsule-closed`](#event-capsule-closed) | no | yes, as the last frame when it is written |
-| [`error`](#event-error) | yes | no |
-| [Heartbeat](#heartbeat) | yes | yes |
+| Id | `id: <unsigned 64-bit integer>` | Every event in the session's sequence — see [Event ids](#event-ids) |
+| Data | `data: <JSON-RPC response>` | Every event. Always exactly one line |
+| Comment | `:<text>` | The [heartbeat](#heartbeat). Stands alone between blank lines and is not an event |
 
-Neither endpoint filters by task. Every `status`, `artifact`, `text` and `thinking` frame the
-capsule writes reaches every open connection on either endpoint, so a `SendStreamingMessage` connection
-carries the frames of other tasks running or queued on the same capsule, their final statuses
-included. Read the `id` key in each frame's `data` to tell tasks apart. A `SendStreamingMessage`
-connection closes on the final status of its own task only.
+The `data:` line is a JSON-RPC 2.0 response to the request: its `id` is the request's `id`,
+verbatim, string or integer, and its `result` is one A2A v1.0 `StreamResponse`, in ProtoJSON
+camelCase.
 
-The task id is minted when the task is accepted and appears only in the frames, so a client does
-not know it when the request is made, and cannot tell its own task's frames from another's until
-its final status arrives. To pick out its own frames while the task runs, a client sends a
-`contextId` of its own in the message — the capsule uses it verbatim and mints one only when it is
-absent — and matches each frame on `context_id` in its `data`.
+```text
+id: 3
+data: {"jsonrpc":"2.0","id":"r1","result":{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f1b87a01b2c3d4e5f6071829","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"inference turn 2"}]}}}}}
 
-### What `SendStreamingMessage` writes, in order
+```
+
+---
+
+## Standard events { #standard-events }
+
+A `StreamResponse` sets exactly one member. A connection that did not activate the stream
+extension receives only `task`, `statusUpdate` and `artifactUpdate` events of its own task, and no
+`metadata` keyed by the extension's URI.
+
+| Member | Written | Shape |
+|---|---|---|
+| `task` | First, on every `SendStreamingMessage` stream: the task as [`GetTask`](agent-card.md#tasks-get) would have answered when the message was taken. `TASK_STATE_SUBMITTED` for a new task, `TASK_STATE_WORKING` for one the message continued. Unnumbered | An A2A `Task` |
+| `statusUpdate` | Every change of a task's state, and every step the runtime reports while the task works | `taskId`, `contextId`, `status`, and `metadata` on an [annotated](#murmur-stream-v1) event |
+| `artifactUpdate` | Immediately before a `TASK_STATE_COMPLETED` status, when `GetTask` reports a `response` artifact for the task | `taskId`, `contextId`, `artifact` — the `response` artifact exactly as `GetTask` reports it — and `lastChunk: true` |
+| `message` | Only to an activated connection, carrying a [murmur frame](#murmur-stream-v1) that belongs to no task | An A2A `Message` from `ROLE_AGENT` |
+
+A `status` holds `state` and, when the runtime had something to say, `message`: an A2A `Message`
+from `ROLE_AGENT` naming the task and its context, with one text part. A non-terminal status's
+`messageId` is `msg_` and a UUIDv7, unique within the session. A terminal status is exactly the
+`status` `GetTask` reports for the task afterwards. `TaskStatus.timestamp` and `Task.history` are
+never written.
+
+| `status.state` | Murmur's word | `status.message` |
+|---|---|---|
+| `TASK_STATE_SUBMITTED` | `submitted` | On the opening `task` of a new task only. No message |
+| `TASK_STATE_WORKING` | `working` | `inference turn <n>`, counted from 1 across every attempt of the task, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task. `waiting on call-member: <n> call(s) outstanding` while [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered. `continuing with <n> member answer(s)` when the task continues with the answers that arrived. No message on the opening `task` of a continued task |
+| `TASK_STATE_INPUT_REQUIRED` | `input-required` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
+| `TASK_STATE_COMPLETED` | `completed` | `session ended` |
+| `TASK_STATE_FAILED` | `failed` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: …` naming `inference.max_turns`; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
+| `TASK_STATE_CANCELED` | `canceled` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed |
+| `TASK_STATE_REJECTED` | `rejected` | Refused at the door: `task rejected: capsule is busy` or `task rejected: the session is closing`, as the one unnumbered `task` event of its stream. Refused when the session ended: `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under [`mur stop`](cli.md#mur-stop), as a numbered `statusUpdate` |
+
+### What `SendStreamingMessage` writes, in order { #stream-order }
 
 1. The response headers.
-2. When the request carried `Last-Event-ID`, the [replay](#replay): a `gap` frame if one applies,
-   then the buffered frames. A replayed `final` status does not close the connection.
-3. When the params do not parse as a message, an [`error`](#event-error) frame, and the
-   connection closes.
-4. When the capsule cannot accept another task, a `rejected` [`status`](#event-status), and the
-   connection closes. Its message is `task rejected: capsule is busy` when the capsule has no room
-   for the task, and `task rejected: the session is closing` once the session has stopped taking
-   work.
-5. When the task cannot be handed to the capsule's queue, an [`error`](#event-error) frame, and
-   the connection closes.
-6. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the first delivered
-   `status` frame with `"final":true` for the task this connection submitted.
+2. The `task`, unnumbered.
+3. When the request carried `Last-Event-ID`: a [`gap`](#event-gap) when one applies and the
+   connection activated the extension, then every buffered event of this task with an id above
+   the cursor — see [Replay](#replay). A replayed terminal status ends the stream; a replayed
+   `TASK_STATE_INPUT_REQUIRED` does not, since the task has left that state.
+4. The task's live events, [`lagged`](#event-lagged) frames when activated, and heartbeats, until
+   the task's terminal status or a live `TASK_STATE_INPUT_REQUIRED` status.
 
-The task id and context id minted for the task appear only in the frames' `data`: `tsk_` and a
-UUIDv7 for the task, and the message's `contextId` or `ctx_` and a UUIDv7 for the context.
+Only events whose `taskId` is the connection's task are written. A stream that ends at
+`TASK_STATE_INPUT_REQUIRED` is answered by a `SendStreamingMessage` naming the task in
+`message.taskId`; that stream opens with the task in `TASK_STATE_WORKING`, and a `Last-Event-ID`
+set to the last id the first stream carried resumes exactly after it.
 
-### What `stream/watch` writes, in order
+### What `stream/watch` writes, in order { #watch-order }
 
 1. The response headers.
 2. A [`connection-ack`](#event-connection-ack) frame.
 3. The [replay](#replay), from `Last-Event-ID`, or from `0` when the header is absent: a `gap`
-   frame if one applies, then the buffered frames.
-4. Live frames, [`lagged`](#event-lagged) frames and heartbeats, until the capsule's stream ends.
-   A capsule process that exits closes the connection without a
+   frame if one applies, then every buffered event.
+4. Every task's live events, `lagged` frames and heartbeats, until the capsule's stream ends. A
+   capsule process that exits closes the connection without a
    [`capsule-closed`](#event-capsule-closed) frame.
 
-### Frames a connection misses { #lagged }
+`stream/watch` always has the extension activated: it carries every murmur frame of every task.
 
-Each connection reads live frames from a queue of 128. A connection that falls more than 128
-frames behind loses the oldest of them, and a [`lagged`](#event-lagged) frame naming how many is
-written before the next frame the connection receives. The connection stays open. The capsule also
-writes the count to its own stderr, as `SSE broadcast lagged by <n> events`; nothing about a lag is
-written to `trace.jsonl`.
+### One final status { #one-final-status }
 
-On `SendStreamingMessage`, a lost frame may be the `final` status of the connection's own task, and the
-connection then stays open until the capsule's stream ends. A client that receives a `lagged` frame
-can learn how its task ended by either of these:
+Every task the capsule accepts ends in exactly one terminal `statusUpdate`, whether it ran or not,
+and it is the task's last event. It is written after [`GetTask`](agent-card.md#tasks-get) answers
+the same state, and its `status` is the one `GetTask` reports. For a task that ran, it is also
+written after every `on-task-end` hook has run and after `task_end` is in the trace. For a task the
+session refused, it follows the task's [`task_rejected`](observability-schemas.md#task-rejected)
+trace line.
 
-- Call `GetTask` with the task id, read from one of its own frames.
-- Open a `stream/watch` with `Last-Event-ID` set to the last id it received, and read the replay
-  for the task's final status.
+| How the task ended | `status.state` | Before it |
+|---|---|---|
+| An attempt completed and no hook reopened it | `TASK_STATE_COMPLETED` | The `response` `artifactUpdate`, when the answer is not empty |
+| A hook still wanted a reopen that `lifecycle.max_task_reopens` or `inference.max_turns` did not allow | `TASK_STATE_FAILED` | — |
+| The last attempt failed | `TASK_STATE_FAILED` | — |
+| The task was cancelled | `TASK_STATE_CANCELED` | — |
+| The session ended before the task started | `TASK_STATE_REJECTED` | — |
 
-A client that needs every frame reconnects with the id of the last frame it received and
-[replays](#replay) the rest, which recovers them while they are still in the replay buffer.
+A `request-input` wait that times out ends the attempt, not the task: the tool that asked fails,
+and the task's terminal status — `TASK_STATE_FAILED` with message `input-timeout` — follows once
+the hooks have run, unless a hook reopens the task.
+
+### Reopened tasks { #reopened-tasks }
+
+An `on-task-end` hook that [reopens a task](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
+starts a new attempt of the same task id. Between the two attempts the stream carries one
+`TASK_STATE_WORKING` status with message `reopened by hook <hook>`. An activated connection reads
+the reopen's ordinal, counted from 1, as `metadata[<URI>].reopen` on that status — the only
+annotation the extension makes on a standard event:
+
+```json
+{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f2117c0aa1b2c3d4e5f60718","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"reopened by hook review-gate"}]}},"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"reopen":1}}}}
+```
+
+| What a client sees | Reading |
+|---|---|
+| `text`, `thinking` and `artifact` frames of a rejected attempt | Written live and never withdrawn |
+| The boundary status | The rejected attempt is over; the next attempt starts with `inference turn <n>`, numbered on from the rejected attempt's last turn |
+| The `response` artifact | The task's answer |
+
+Never join `text` frames across a boundary: the joined text mixes a rejected answer with the
+accepted one.
 
 ---
 
-## Frame vocabulary { #murmur-stream-v1 }
+## The stream extension { #murmur-stream-v1 }
 
-The agent card's stream extension lists every frame type a capsule's `SendStreamingMessage` and
-`stream/watch` connections can write. It is an A2A `AgentExtension` with URI
-`https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1` and `required: false`,
-in `capabilities.extensions` after the door and capsule extensions — see
-[Agent Card: Extensions](agent-card.md#extensions). On the public card of a door that declares
-`network.authentication` it follows the door extension, and the extended card carries it too.
+The murmur frames — streamed text and reasoning, tool calls being written, tool results, and the
+connection-level frames — are an A2A extension with URI
+`https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1`. It is listed in the
+agent card's `capabilities.extensions` after the door and capsule extensions, with
+`required: false` — see [Agent Card: Extensions](agent-card.md#extensions). On the public card of a
+door that declares `network.authentication` it follows the door extension, and the extended card
+carries it too.
+
+```json
+{
+  "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
+  "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+  "required": false,
+  "params": {"frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]}
+}
+```
 
 | Key | Type | Notes |
 |---|---|---|
-| `params.frames` | array of strings | The event types this capsule's `SendStreamingMessage` and `stream/watch` connections can write, in the order below |
+| `params.frames` | array of strings | The frames a connection to this door can receive, in the order of the table below |
 
-| Frame | Listed when | A2A counterpart |
+| Frame | `SendStreamingMessage`, activated | `stream/watch` |
 |---|---|---|
-| [`status`](#event-status) | Always, on both transports | A2A `TaskStatusUpdateEvent` |
-| [`artifact`](#event-artifact) | Always, on both transports | A2A `TaskArtifactUpdateEvent` |
-| [`text`](#event-text) | Always, on both transports | None — a murmur frame |
-| [`thinking`](#event-thinking) | Always, on both transports | None — a murmur frame |
-| [`tool-call-started`](#event-tool-call-started) | Always, on both transports | None — a murmur frame |
-| [`tool-call-progress`](#event-tool-call-progress) | Always, on both transports | None — a murmur frame |
-| [`gap`](#event-gap) | Always, on both transports | None — a murmur frame |
-| [`lagged`](#event-lagged) | Always, on both transports | None — a murmur frame |
-| [`connection-ack`](#event-connection-ack) | Always, on both transports | None — a murmur frame |
-| [`capsule-closed`](#event-capsule-closed) | Always, on both transports | None — a murmur frame |
-| [`error`](#event-error) | Only when the door extension lists `SendStreamingMessage` | None — a murmur frame |
+| [`text`](#event-text) | yes | yes |
+| [`thinking`](#event-thinking) | yes | yes |
+| [`tool-call-started`](#event-tool-call-started) | yes | yes |
+| [`tool-call-progress`](#event-tool-call-progress) | yes | yes |
+| [`artifact`](#event-artifact) | yes | yes |
+| [`gap`](#event-gap) | yes, when the request sent `Last-Event-ID` | yes |
+| [`lagged`](#event-lagged) | yes | yes |
+| [`connection-ack`](#event-connection-ack) | no | yes, first event |
+| [`capsule-closed`](#event-capsule-closed) | no | yes, as the last event when it is written |
 
-Each capsule computes its own list from the methods its door serves and its
-[`inference.transport`](manifest.md#inference-config). Read the list from the capsule's card rather
-than from this table. The extension declares what the stream sends and changes nothing about it: a
-client that never reads it follows [Unknown frames and keys](#unknown-events).
+Read the list from the capsule's card rather than from this table.
 
----
+### Activation { #activation }
 
-## Frame format { #frame-format }
+| Request | Connection |
+|---|---|
+| `SendStreamingMessage` whose `A2A-Extensions` headers name the URI | Activated. The response head carries `A2A-Extensions: <URI>` |
+| `SendStreamingMessage` without it | Plain: the [standard events](#standard-events) of its task and nothing else. No `A2A-Extensions` response header |
+| `stream/watch` | Always activated, whatever the request says. The response head carries `A2A-Extensions: <URI>` |
+| `SendMessage`, `GetTask`, `CancelTask`, `session/stop`, `GetExtendedAgentCard` | The header is ignored and never echoed |
 
-A frame is a group of lines ending with a blank line (`\n\n`). Lines end with `\n`, never `\r\n`.
+The door reads every `A2A-Extensions` request line, header name case-insensitive, splits each
+value on `,`, trims each entry and drops empty ones. The connection is activated when one entry
+equals the URI exactly. Any other URI is ignored, the door's and capsule's own extension URIs
+included. No method refuses a request for not activating the extension.
 
-| Line | Form | On |
-|---|---|---|
-| Id | `id: <unsigned 64-bit integer>` | `status` except `rejected`, `artifact`, `text`, `thinking`, `tool-call-started`, `tool-call-progress` — see [Event ids](#event-ids) |
-| Event type | `event: <type>` | Every frame |
-| Data | `data: <JSON object>` | Every frame. Always exactly one line |
-| Comment | `:<text>` | The [heartbeat](#heartbeat). Stands alone between blank lines and is not a frame |
+### Carriers { #carriers }
 
-A frame with an id writes its lines in the order `id`, `event`, `data`. A frame without one writes
-`event`, `data`.
+An activated connection receives each murmur frame inside an event that still parses as an A2A
+v1.0 `StreamResponse`, under `metadata` keyed by the URI. The object there always has a `frame`
+key naming the frame; the reopen annotation has none, which is how a client tells them apart.
 
-```text
-id: 3
-event: status
-data: {"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"working","message":"inference turn 2"},"final":false}
+| The frame belongs to | Carrier |
+|---|---|
+| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on `SendStreamingMessage`) | A `statusUpdate` of the task repeating its state with no `status.message`. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`; a `gap` or `lagged` repeats the state of the last status the connection wrote |
+| No task (`connection-ack`, `capsule-closed`, and `gap` and `lagged` on `stream/watch`) | A `message` from `ROLE_AGENT`, `messageId` `msg_` and a UUIDv7, no `contextId`, and one text part holding the frame's name |
 
+```json
+{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING"},"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"text","text":"README.md describes","final":false}}}}
 ```
+
+```json
+{"message":{"messageId":"msg_0199c4e2f0a77e11a2b3c4d5e6f70819","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"connection-ack"}],"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}}}}
+```
+
+A v1.0 client that does not know the extension reads a `statusUpdate` carrier as a status it
+already holds. The frame sections below show the object under `metadata[<URI>]`.
 
 ---
 
 ## Transports { #transports }
 
-A task writes the same frames whatever the capsule's [`inference.transport`](manifest.md#inference-config):
-the same types, the same keys and the same order for the same work, apart from the differences
+A task writes the same events whatever the capsule's [`inference.transport`](manifest.md#inference-config):
+the same kinds, the same keys and the same order for the same work, apart from the differences
 listed below. On a `transport: http` capsule, the `text`, `thinking`, `tool-call-started` and
 `tool-call-progress` frames come from the driver's
 [`murmur:stream/events`](wit-interfaces.md#stream-events) calls. On a `transport: process`
-capsule the frames come from the events its [process driver](manifest.md#process-driver) reads out
-of the harness:
+capsule they come from the events its [process driver](manifest.md#process-driver) reads out of the
+harness:
 
-| The harness | Frames |
+| The harness | Events |
 |---|---|
-| Starts text, reasoning or a tool call | `status` `working`, message `inference turn <n>` |
+| Starts text, reasoning or a tool call | A `TASK_STATE_WORKING` status, message `inference turn <n>` |
 | Streams a fragment of text | [`text`](#event-text), `"final":false` |
 | Reports the complete text of what it streamed | [`text`](#event-text), `"final":true`, empty — the client keeps the fragments it was sent |
 | Streams a fragment of reasoning, or reports reasoning nothing streamed | [`thinking`](#event-thinking) |
 | Begins writing a tool call | [`tool-call-started`](#event-tool-call-started) |
 | Reports how much of it is written | [`tool-call-progress`](#event-tool-call-progress) |
 | Answers a tool call | [`artifact`](#event-artifact) |
-| Ends the turn | One [`artifact`](#event-artifact) frame for each artifact an `on-inference` hook returned for that turn, then the whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the task's final `status` `completed` |
-| Fails the turn | The task's final `status` `failed` |
+| Ends the turn | One [`artifact`](#event-artifact) frame for each artifact an `on-inference` hook returned for that turn, then the whole result as one `"final":true` [`text`](#event-text) frame when the last turn streamed nothing, then the `response` artifact and the task's `TASK_STATE_COMPLETED` status |
+| Fails the turn | The task's `TASK_STATE_FAILED` status |
 
 A process task ends in the same [one final status](#one-final-status) as an http task, on every
-path out of its last attempt, including the ones a runtime diagnostic ends: the frame's
-`status.message` is that diagnostic, under the code [`mur` reports it as](diagnostics.md).
+path out of its last attempt, including the ones a runtime diagnostic ends: the status message is
+that diagnostic, under the code [`mur` reports it as](diagnostics.md).
 
 The two transports' streams differ in three things, each because the harness, not this runtime,
 ran the turn:
 
 | Difference | Why |
 |---|---|
-| `artifact.fence_source` is `null` on every frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
-| `artifact.exit_code` is `null` and `artifact.truncated` is `false` on every frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
-| A provider retry writes no frame on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
+| `fenceSource` is `null` on every `artifact` frame a process capsule writes | The tool bridge returns tool output to the harness unfenced, so the content carries no fence |
+| `exitCode` is `null` and `truncated` is `false` on every `artifact` frame a process capsule writes | The driver contract's tool result carries neither an exit status nor a truncation flag |
+| A provider retry writes no event on either transport | A retry happens inside the driver, which reports it to the trace as `harness_retry` and to the stream not at all |
 
-### Frame order within a task { #task-frame-order }
+### Event order within a task { #task-frame-order }
 
-One attempt of a task writes its frames in this order:
+One attempt of a task writes its events in this order:
 
-1. [`status`](#event-status) `working`, message `inference turn <n>`, at the start of each
-   inference turn, before the driver is called.
+1. A `TASK_STATE_WORKING` status, message `inference turn <n>`, at the start of each inference
+   turn, before the driver is called.
 2. While the turn runs, [`thinking`](#event-thinking) and [`text`](#event-text) `"final":false`
    frames, in the order they are produced. A
    [`tool-call-started`](#event-tool-call-started) frame for each tool call the model begins
@@ -248,142 +328,16 @@ One attempt of a task writes its frames in this order:
 3. When the turn streamed text, one `text` `"final":true` frame with empty text once the driver
    returns.
 4. One [`artifact`](#event-artifact) per tool call, written when the call returns, in dispatch
-   order. A tool's own streamed `text` and `thinking` frames, and the `input-required` and
-   `working` `resumed` pair of its `request-input` wait, come before its `artifact`.
+   order. A tool's own streamed `text` and `thinking` frames, and the `TASK_STATE_INPUT_REQUIRED`
+   and `working` `resumed` statuses of its `request-input` wait, come before its `artifact`.
 5. The next turn repeats from step 1.
 6. When the attempt completes, one `artifact` per hook artifact, then the whole reply as one
    `text` `"final":true` frame when the last turn streamed no text.
 7. A reopen writes the [reopen boundary](#reopened-tasks), and the next attempt starts at step 1.
-8. The task's [one final status](#one-final-status) is its last frame.
+8. The task's [one final status](#one-final-status) is its last event, after its `response`
+   artifact when it completed with one.
 
-A `transport: process` capsule writes the same order from its harness's events, through the table
-under [Transports](#transports).
-
----
-
-## `status` { #event-status }
-
-A task's state. Written at the start of every inference turn, when a task waits for input and
-resumes, when an `on-task-end` hook reopens a task, and once when a task ends.
-
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `id` | string | Never | The task id, `tsk_…` |
-| `context_id` | string | On the `input-required` frame and the `working` frame with message `resumed` | The task's context id. Present on every final frame |
-| `status` | object | Never | |
-| `status.state` | string | Never | One of the states below |
-| `status.message` | string | Never | See the states below |
-| `status.response` | string | On every state except `completed` | The task's result text, as written to `out/result.txt` |
-| `status.reopen` | integer | On every frame except the [reopen boundary](#reopened-tasks) | The reopen's ordinal, counted from 1 |
-| `final` | bool | Never | `true` on the states that end a task |
-
-| `status.state` | `final` | `status.message` |
-|---|---|---|
-| `working` | `false` | `inference turn <n>`, counted from 1 across every attempt of the task, at the start of each inference turn. `resumed` when an `input-required` wait is answered. `reopened by hook <hook>` when an `on-task-end` hook reopens the task. `waiting on call-member: <n> call(s) outstanding` when the model ends a turn, with a turn left, while [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered and none has answered yet. `continuing with <n> member answer(s)` when the task continues with the answers that arrived |
-| `input-required` | `false` | The prompt a tool passed to [`request-input`](wit-interfaces.md#murmurtasktask) |
-| `completed` | `true` | `session ended` |
-| `failed` | `true` | `session ended` when the driver or its response failed, or compaction failed; `driver invocation failed: <error>` when the driver could not be called; `max_turns exceeded: the task used all <n> inference turns inference.max_turns allows (turn 0 to turn <last>)` — `<n>` is `inference.max_turns`, the turn numbers are the ones [`mur trace show`](cli.md#mur-trace-show) prints, and `, and <h> hook run-inference calls` follows the last turn when a hook's [`run-inference`](wit-interfaces.md#murmurruntimeinference) calls counted toward the same limit; the spend refusal when a spend ceiling stopped the task; `input-timeout` when a `request-input` wait timed out; the refusal naming [`lifecycle.max_task_reopens`](manifest.md#field-lifecycle) or `inference.max_turns` when an `on-task-end` hook still wanted a reopen that limit did not allow; the error, as `error[<code>]: <message>` or its text, when the task ended in a runtime error |
-| `canceled` | `true` | `task canceled` for a running task; `task canceled before it started` for a queued one; `task canceled; the harness was killed and its session may not resume cleanly` when a [`transport: process`](#transports) harness had to be killed rather than stopping when it was asked |
-| `rejected` | `true` | Refused at the door: `task rejected: capsule is busy` when the capsule has no room for the task, `task rejected: the session is closing` once the session has stopped taking work. Written only to the `SendStreamingMessage` connection that submitted the task, with no `id:` line, and never buffered. Refused when the session ended: `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under [`mur stop`](cli.md#mur-stop). Written to every connection and buffered with an `id:` like any other `status` |
-
-### One final status { #one-final-status }
-
-Every task the capsule accepts ends in exactly one `status` frame with `"final":true`, whether it
-ran or not. It is the task's last frame, and it is written after
-[`GetTask`](agent-card.md#tasks-get) answers the same state. For a task that ran, it is
-also written after every `on-task-end` hook has run and after `task_end` is in the trace. For a
-task the session refused, it follows the task's
-[`task_rejected`](observability-schemas.md#task-rejected) trace line.
-
-| How the task ended | `status.state` | `status.message` | `status.response` |
-|---|---|---|---|
-| An attempt completed and no hook reopened it | `completed` | `session ended` | That attempt's result |
-| A hook still wanted a reopen that `lifecycle.max_task_reopens` or `inference.max_turns` did not allow | `failed` | The refusal, naming the limit | Absent |
-| The last attempt failed | `failed` | The reason, from the `failed` row above | Absent |
-| The task was cancelled | `canceled` | From the `canceled` row above | Absent |
-| The session ended before the task started | `rejected` | `task rejected: the session ended before this task started`, or `task rejected: the session was stopped before this task started` under `mur stop` | Absent |
-
-A `request-input` wait that times out ends the attempt, not the task: the tool that asked fails,
-and the task's final status — `failed` with message `input-timeout` — follows once the hooks have
-run, unless a hook reopens the task.
-
-```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"completed","message":"session ended","response":"README.md describes the build."},"final":true}
-```
-
-### Reopened tasks { #reopened-tasks }
-
-An `on-task-end` hook that [reopens a task](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
-starts a new attempt of the same task id. Between the two attempts the stream carries one
-boundary frame:
-
-```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","context_id":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"working","message":"reopened by hook review-gate","reopen":1},"final":false}
-```
-
-| What a client sees | Reading |
-|---|---|
-| `text`, `thinking` and `artifact` frames of a rejected attempt | Written live and never withdrawn |
-| The boundary frame | The rejected attempt is over; the next attempt starts with `working` `inference turn <n>`, numbered on from the rejected attempt's last turn |
-| The final status's `status.response` | The task's answer |
-
-Never join `text` frames across a boundary frame: the joined text mixes a rejected answer with the
-accepted one. The answer is the final status's `response`.
-
----
-
-## `artifact` { #event-artifact }
-
-One tool call's result, or one hook artifact. The runtime writes one frame for each tool call it
-dispatches, in dispatch order.
-
-A hook artifact is what an `on-inference` hook returned as
-[`artifact`](wit-interfaces.md#what-each-handler-can-commit) for the attempt's last inference
-turn. The runtime writes one frame for each, in hook-registration order, only when the attempt
-completes: after that turn's streamed text, before its whole-result [`text`](#event-text) frame,
-and ahead of the task's final status or the [reopen boundary](#reopened-tasks). A turn that called
-a tool forwards none, and neither does an attempt that is canceled, fails or stops at a spend
-ceiling.
-
-What a refused call writes depends on what refused it and on the transport:
-
-| Refused by | [`transport: http`](manifest.md#transport-http) | [`transport: process`](manifest.md#transport-process) |
-|---|---|---|
-| A policy hook or `capabilities.filesystem.read_only` | No frame | One frame with `artifact.is_error` `true`: the harness reports the refusal it was handed as its own failed tool call |
-| A missing [required field](manifest.md#input-schema) | One frame with `artifact.is_error` `true` and the refusal text as `content`, the same frame as for a call that never reached a tool | One frame with `artifact.is_error` `true`, from the harness's report |
-
-Every key is present on every frame, in this order. A key that does not apply to the frame is
-`null`, never absent.
-
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `id` | string | Never | The task id |
-| `artifact` | object | Never | |
-| `artifact.tool_name` | string | Never | The tool, skill or hook the frame reports |
-| `artifact.content` | string | Never | Exactly the bytes the model received, never truncated. Fenced when `fence_source` is a string, unfenced when it is `null`. The fence grammar is in [Untrusted Fence](untrusted-fence.md#grammar) |
-| `artifact.fence_source` | string \| null | Never | `tool:<name>` for an ordinary tool result. `null` for a skill result, a call that never reached a tool, and a hook artifact |
-| `artifact.tool_call_id` | string \| null | Never | The provider's id for the call. `null` on a hook artifact, and on a call the provider gave no id or an empty one |
-| `artifact.is_error` | bool | Never | `true` when the tool returned a status other than `passed`, or the call never reached a tool. Matches `"status":"error"` on the call's `tool_call` or `skill_call` [trace event](observability-schemas.md#session-trace-tracejsonl). `false` on a hook artifact |
-| `artifact.duration_ms` | u64 \| null | Never | Time the dispatch took, equal to the `duration_ms` on the call's trace event. `null` on a hook artifact |
-| `artifact.exit_code` | i32 \| null | Never | The exit status of the subprocess the call ran to completion. `null` for a WASM tool, a skill, a command moved to the background, a call that never reached a tool, and a hook artifact |
-| `artifact.truncated` | bool | Never | The tool result's own `truncated` flag, unchanged. `false` on a call that never reached a tool and on a hook artifact |
-
-There is no `summary` key.
-
-`is_error` and `exit_code` are separate facts. A shell command that runs to completion is a
-successful call whatever its exit status, so `bash` reports `"is_error":false` beside
-`"exit_code":3`. Branch on `exit_code` to act on the command's own outcome.
-
-| Frame | Example `artifact` |
-|---|---|
-| A successful tool call | `{"tool_name":"bash","content":"<untrusted-content source=tool:bash>\n$ echo hello\nExit code: 0\nStdout:\nhello\n\nStderr:\n\n</untrusted-content>","fence_source":"tool:bash","tool_call_id":"toolu_01","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}` |
-| A failed tool call | `{"tool_name":"jsonl-line-count","content":"<untrusted-content source=tool:jsonl-line-count>\nfailed to read '{\"data\":\"missing.jsonl\"}': No such file or directory (os error 44)\n</untrusted-content>","fence_source":"tool:jsonl-line-count","tool_call_id":"toolu_02","is_error":true,"duration_ms":5,"exit_code":null,"truncated":false}` |
-| A call that never reached a tool | `{"tool_name":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fence_source":null,"tool_call_id":"toolu_03","is_error":true,"duration_ms":0,"exit_code":null,"truncated":false}` |
-| A hook artifact | `{"tool_name":"my-hook","content":"{\"reviewed\":true}","fence_source":null,"tool_call_id":null,"is_error":false,"duration_ms":null,"exit_code":null,"truncated":false}` |
-
-```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","artifact":{"tool_name":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fence_source":null,"tool_call_id":"toolu_03","is_error":true,"duration_ms":0,"exit_code":null,"truncated":false}}
-```
+A plain connection receives steps 1, 4's statuses, 7 and 8 only.
 
 ---
 
@@ -391,11 +345,11 @@ successful call whatever its exit status, so `bash` reports `"is_error":false` b
 
 A piece of the model's reply.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `id` | string | Never | The task id |
-| `text` | string | Never | The piece of reply text |
-| `final` | bool | Never | See below |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `text` |
+| `text` | string | The piece of reply text |
+| `final` | bool | See below |
 
 | `final` | `text` | Written when |
 |---|---|---|
@@ -403,10 +357,10 @@ A piece of the model's reply.
 | `true` | `""` | A streaming driver's inference call returned, or a [`transport: process`](#transports) harness reported the complete text of fragments it streamed. Marks the end of that turn's chunks |
 | `true` | The whole reply | An attempt completed with a non-empty reply and no chunk was emitted during its last inference turn |
 
-`final` on a `text` frame ends nothing: the task goes on to its `status` frames.
+`final` on a `text` frame ends nothing: the task goes on to its statuses.
 
 ```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","text":"README.md describes","final":false}
+{"frame":"text","text":"README.md describes","final":false}
 ```
 
 ---
@@ -416,14 +370,14 @@ A piece of the model's reply.
 A piece of the model's reasoning, emitted by a streaming driver or a tool through
 [`murmur:stream/events`](wit-interfaces.md#stream-events).
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `id` | string | Never | The task id |
-| `text` | string | Never | The piece of reasoning |
-| `final` | bool | Never | Always `false` |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `thinking` |
+| `text` | string | The piece of reasoning |
+| `final` | bool | Always `false` |
 
 ```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","text":"The file names two targets","final":false}
+{"frame":"thinking","text":"The file names two targets","final":false}
 ```
 
 ---
@@ -438,22 +392,22 @@ Written when the capsule's driver reports calls as they are written:
 | `http` | The inference driver calls [`tool-call-started`](wit-interfaces.md#stream-events) |
 | `process` | The [process driver](wit-interfaces.md#process-tool-call-progress) sends the `tool-call-started` event |
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `id` | string | Never | The task id |
-| `tool_call_id` | string | Never | The call's id: the `artifact.tool_call_id` of the [`artifact`](#event-artifact) that answers it |
-| `tool_name` | string | Never | The capsule's tool name, with no harness prefix: the `artifact.tool_name` of the answering `artifact` |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `tool-call-started` |
+| `toolCallId` | string | The call's id: the `toolCallId` of the [`artifact`](#event-artifact) that answers it |
+| `toolName` | string | The capsule's tool name, with no harness prefix: the `toolName` of the answering `artifact` |
 
 | Property | Value |
 |---|---|
-| Once per call | At most one frame per `tool_call_id`, before any `tool-call-progress` for the call and before its `artifact` |
-| End of the call | The `artifact` with the same `tool_call_id` ends the call. A call no `artifact` answers ends with the task's final `status` |
+| Once per call | At most one frame per `toolCallId`, before any `tool-call-progress` for the call and before its `artifact` |
+| End of the call | The `artifact` with the same `toolCallId` ends the call. A call no `artifact` answers ends with the task's terminal status |
 | Input | The frame carries none of the call's input |
 | Turns | Opens no inference turn and does not count toward `inference.max_turns` |
 | Optional | A call's `artifact` may arrive with no `tool-call-started` before it. A client treats the start as a hint, never as a prerequisite |
 
 ```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","tool_call_id":"toolu_01","tool_name":"write_file"}
+{"frame":"tool-call-started","toolCallId":"toolu_01","toolName":"write_file"}
 ```
 
 ---
@@ -466,11 +420,11 @@ driver's [`tool-call-input-bytes`](wit-interfaces.md#stream-events) calls; on `t
 from the process driver's [`tool-call-progress`](wit-interfaces.md#process-tool-call-progress)
 events.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `id` | string | Never | The task id |
-| `tool_call_id` | string | Never | The call's id, as on its `tool-call-started` frame |
-| `input_bytes` | u64 | Never | Bytes of the call's input JSON written so far, cumulative for the call. Never smaller than an earlier frame's for the same `tool_call_id` |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `tool-call-progress` |
+| `toolCallId` | string | The call's id, as on its `tool-call-started` frame |
+| `inputBytes` | u64 | Bytes of the call's input JSON written so far, cumulative for the call. Never smaller than an earlier frame's for the same `toolCallId` |
 
 | Property | Value |
 |---|---|
@@ -480,69 +434,121 @@ events.
 | Turns | Opens no inference turn and does not count toward `inference.max_turns` |
 
 ```json
-{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394","tool_call_id":"toolu_01","input_bytes":3172}
+{"frame":"tool-call-progress","toolCallId":"toolu_01","inputBytes":3172}
 ```
+
+---
+
+## `artifact` { #event-artifact }
+
+One tool call's result, or one hook artifact, as the model received it. It is a murmur frame, never
+an A2A artifact: `GetTask` reports none of them. The runtime writes one frame for each tool call it
+dispatches, in dispatch order.
+
+A hook artifact is what an `on-inference` hook returned as
+[`artifact`](wit-interfaces.md#what-each-handler-can-commit) for the attempt's last inference
+turn. The runtime writes one frame for each, in hook-registration order, only when the attempt
+completes: after that turn's streamed text, before its whole-result [`text`](#event-text) frame,
+and ahead of the task's terminal status or the [reopen boundary](#reopened-tasks). A turn that
+called a tool forwards none, and neither does an attempt that is canceled, fails or stops at a
+spend ceiling.
+
+What a refused call writes depends on what refused it and on the transport:
+
+| Refused by | [`transport: http`](manifest.md#transport-http) | [`transport: process`](manifest.md#transport-process) |
+|---|---|---|
+| A policy hook or `capabilities.filesystem.read_only` | No frame | One frame with `isError` `true`: the harness reports the refusal it was handed as its own failed tool call |
+| A missing [required field](manifest.md#input-schema) | One frame with `isError` `true` and the refusal text as `content`, the same frame as for a call that never reached a tool | One frame with `isError` `true`, from the harness's report |
+
+Every key is present on every frame, in this order. A key that does not apply to the frame is
+`null`, never absent.
+
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `artifact` |
+| `toolName` | string | The tool, skill or hook the frame reports |
+| `content` | string | Exactly the bytes the model received, never truncated. Fenced when `fenceSource` is a string, unfenced when it is `null`. The fence grammar is in [Untrusted Fence](untrusted-fence.md#grammar) |
+| `fenceSource` | string \| null | `tool:<name>` for an ordinary tool result. `null` for a skill result, a call that never reached a tool, and a hook artifact |
+| `toolCallId` | string \| null | The provider's id for the call. `null` on a hook artifact, and on a call the provider gave no id or an empty one |
+| `isError` | bool | `true` when the tool returned a status other than `passed`, or the call never reached a tool. Matches `"status":"error"` on the call's `tool_call` or `skill_call` [trace event](observability-schemas.md#session-trace-tracejsonl). `false` on a hook artifact |
+| `durationMs` | u64 \| null | Time the dispatch took, equal to the `duration_ms` on the call's trace event. `null` on a hook artifact |
+| `exitCode` | i32 \| null | The exit status of the subprocess the call ran to completion. `null` for a WASM tool, a skill, a command moved to the background, a call that never reached a tool, and a hook artifact |
+| `truncated` | bool | The tool result's own `truncated` flag, unchanged. `false` on a call that never reached a tool and on a hook artifact |
+
+`isError` and `exitCode` are separate facts. A shell command that runs to completion is a
+successful call whatever its exit status, so `bash` reports `"isError":false` beside
+`"exitCode":3`. Branch on `exitCode` to act on the command's own outcome.
+
+| Frame | Example |
+|---|---|
+| A successful tool call | `{"frame":"artifact","toolName":"bash","content":"<untrusted-content source=tool:bash>\n$ echo hello\nExit code: 0\nStdout:\nhello\n\nStderr:\n\n</untrusted-content>","fenceSource":"tool:bash","toolCallId":"toolu_01","isError":false,"durationMs":12,"exitCode":0,"truncated":false}` |
+| A call that never reached a tool | `{"frame":"artifact","toolName":"no-such-tool","content":"tool 'no-such-tool' is not declared in manifest allowlist","fenceSource":null,"toolCallId":"toolu_03","isError":true,"durationMs":0,"exitCode":null,"truncated":false}` |
+| A hook artifact | `{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false}` |
 
 ---
 
 ## `gap` { #event-gap }
 
-Written before a [replay](#replay) when frames written after the client's `Last-Event-ID` are no
-longer in the replay buffer, or when that id was never issued by this capsule session. The replay
-that follows is the whole buffer.
+Written before a [replay](#replay) when events written after the client's `Last-Event-ID` are no
+longer in the replay buffer, or when that id was never issued by this capsule session. Unnumbered.
+On `SendStreamingMessage` it is written only to an activated connection.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `first_available_id` | u64 | Never | The id of the oldest frame in the replay buffer |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `gap` |
+| `firstAvailableId` | u64 | The id of the oldest event in the replay buffer |
 
 ```json
-{"first_available_id":37}
+{"frame":"gap","firstAvailableId":37}
 ```
 
 ---
 
 ## `lagged` { #event-lagged }
 
-Written to a connection that fell more than 128 frames behind and [lost live frames](#lagged),
-before the next frame it receives. Only that connection receives it, once per loss. The count is
-not cumulative: a client that wants a total adds them up.
+Written to a connection that fell more than 128 events behind and [lost live events](#lagged),
+before the next event it receives. Unnumbered, and only that connection receives it, once per loss.
+The count is not cumulative: a client that wants a total adds them up. On `SendStreamingMessage`
+it is written only to an activated connection.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `missed` | u64 | Never | The frames this connection lost since the last frame it received. At least `1` |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `lagged` |
+| `missed` | u64 | The events this connection lost since the last event it received. At least `1` |
 
 ```json
-{"missed":40}
+{"frame":"lagged","missed":40}
 ```
 
 ---
 
 ## `connection-ack` { #event-connection-ack }
 
-The first frame on every `stream/watch` connection.
+The first event on every `stream/watch` connection. Unnumbered.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `role` | string | Never | Always `observer` |
-| `conversation_mode` | string | Never | `stateless` or `threaded` — the capsule's [`lifecycle.conversation`](manifest.md#lifecycle-conversation) |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `connection-ack` |
+| `role` | string | Always `observer` |
+| `conversationMode` | string | `stateless` or `threaded` — the capsule's [`lifecycle.conversation`](manifest.md#lifecycle-conversation) |
 
 ```json
-{"role":"observer","conversation_mode":"stateless"}
+{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}
 ```
 
 ---
 
 ## `capsule-closed` { #event-capsule-closed }
 
-The last frame on a `stream/watch` connection whose capsule closed its frame stream while still
-serving the connection. Its data is an empty object.
+The last event on a `stream/watch` connection whose capsule closed its event stream while still
+serving the connection. Unnumbered.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| — | — | — | No keys |
+| Key | Type | Notes |
+|---|---|---|
+| `frame` | string | `capsule-closed`. No other key |
 
 ```json
-{}
+{"frame":"capsule-closed"}
 ```
 
 A capsule process that exits closes the connection without writing this frame, whether it was
@@ -552,21 +558,22 @@ be running, and only a new connection tells the two apart.
 
 ---
 
-## `error` { #event-error }
+## Events a connection misses { #lagged }
 
-Written on `SendStreamingMessage` when a request cannot become a task. The connection closes after it.
+Each connection reads live events from a queue of 128. A connection that falls more than 128
+events behind loses the oldest of them; an activated connection is written a
+[`lagged`](#event-lagged) frame naming how many before the next event it receives. The connection
+stays open. The capsule also writes the count to its own stderr, as
+`SSE broadcast lagged by <n> events`; nothing about a lag is written to `trace.jsonl`.
 
-| Key | Type | Absent when | Notes |
-|---|---|---|---|
-| `error` | string | Never | `Invalid params: <parse error>` when the params are not a message; `internal error: queue send failed` when the task could not be queued |
+On `SendStreamingMessage`, a lost event may be its own task's terminal status. From the first
+loss on, the connection reads its task from the registry at each [heartbeat](#heartbeat): once the
+task has ended, or waits for input, it writes that status as `GetTask` reports it — after the
+`response` artifact when the task has one — unnumbered, and ends. A connection that never lost an
+event never reads the registry this way.
 
-The parse error is written into the string without escaping. A parse error that quotes the
-offending value, such as `invalid type: string "x", expected a sequence`, makes `data` invalid
-JSON; a client that fails to parse an `error` frame's data still has an `error` frame.
-
-```json
-{"error":"Invalid params: missing field `messageId`"}
-```
+A client that needs every event reconnects with the id of the last event it received and
+[replays](#replay) the rest, which recovers them while they are still in the replay buffer.
 
 ---
 
@@ -579,14 +586,14 @@ from a closed connection by reading bytes.
 |---|---|
 | Wire form | `:heartbeat\n\n` — the comment line `:heartbeat`, then a blank line |
 | Interval | 15 seconds, measured from when the connection was opened. The first one arrives about 15 seconds after connecting |
-| Reset by frames | No. A heartbeat comes due every 15 seconds whether or not frames were written in between |
+| Reset by events | No. A heartbeat comes due every 15 seconds whether or not events were written in between |
 | Event id | None |
 | Replay buffer | Never entered, so no replay contains one |
 
 The heartbeat is written apart from the capsule's turns, so it
 keeps its cadence while a turn is running — through an inference call, a tool call, or a shell
-command the capsule is waiting on. Frames wait on the call: a turn waiting on one call writes no
-frame until the call returns, so heartbeats may be the only bytes on the connection for a while.
+command the capsule is waiting on. Events wait on the call: a turn waiting on one call writes no
+event until the call returns, so heartbeats may be the only bytes on the connection for a while.
 
 A pause in the heartbeat longer than 15 seconds means the capsule's process is alive but not
 being given time to write it:
@@ -602,67 +609,59 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 
 ## Event ids { #event-ids }
 
-| Frame | Carries `id:` | Id source |
-|---|---|---|
-| `status` `working` per turn, the reopen boundary, and each task's final status (`completed`, `failed`, `canceled`) | yes | The session's sequence |
-| `artifact` | yes | The session's sequence |
-| `text`, `thinking` | yes | The session's sequence |
-| `tool-call-started`, `tool-call-progress` | yes | The session's sequence |
-| `status` `input-required`, `working` `resumed` | yes | The session's sequence |
-| `status` `canceled` with message `task canceled before it started` | yes | The session's sequence |
-| `status` `rejected`, refused at the door | no | — |
-| `status` `rejected`, refused when the session ended | yes | The session's sequence |
-| `gap` | no | — |
-| `lagged` | no | — |
-| `connection-ack` | no | — |
-| `capsule-closed` | no | — |
-| `error` | no | — |
-| Heartbeat | no | — |
+| Event | Carries `id:` |
+|---|---|
+| Every `statusUpdate` and `artifactUpdate` of a task | yes |
+| Every murmur frame of a task: `text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact` | yes |
+| The opening `task` of a `SendStreamingMessage` stream, and a `TASK_STATE_REJECTED` `task` refused at the door | no |
+| `gap`, `lagged`, `connection-ack`, `capsule-closed` | no |
+| The terminal status and `response` artifact a lagged connection writes from the registry | no |
+| Heartbeat | no |
 
-A capsule session numbers its frames from one sequence:
+A capsule session numbers its events from one sequence:
 
 | Property | Value |
 |---|---|
 | First id | `1` |
-| Next id | Exactly one higher than the previous frame's, across every task, every reopened attempt and every frame kind, in the order frames are written |
+| Next id | Exactly one higher than the previous numbered event's, across every task, every reopened attempt and every event kind, in the order events are written |
 | Uniqueness | Unique within a capsule session. A new session, including one started with `mur run --resume`, starts again at `1` |
-| On one connection | Strictly ascending. A connection never receives the same id twice |
+| On one connection | Strictly ascending, never repeated, and not contiguous: a `SendStreamingMessage` connection skips other tasks' ids, and a plain one skips its own task's murmur frames |
 
-Frames without an id never take a number, so they leave no hole in the sequence. A
-[`lagged`](#event-lagged) frame is what reports live frames a connection lost.
+An event without an id never takes a number, so it leaves no hole in the sequence. A
+[`lagged`](#event-lagged) frame is what reports live events a connection lost.
 
 ---
 
 ## Replay { #replay }
 
-Each session keeps its most recent 512 frames with ids in one replay buffer shared by both
-endpoints, in the order they were written. When the buffer is full, a new frame evicts the oldest.
-The heartbeat, `connection-ack`, `gap`, `lagged`, `capsule-closed`, `error` and a `rejected`
-status refused at the door never enter it.
+Each session keeps its most recent 512 events with ids in one replay buffer shared by both
+endpoints, in the order they were written. When the buffer is full, a new event evicts the oldest.
+The heartbeat and every unnumbered event — the opening `task`, a `TASK_STATE_REJECTED` `task`,
+`connection-ack`, `gap`, `lagged` and `capsule-closed` — never enter it.
 
 | Endpoint | `Last-Event-ID` sent | `Last-Event-ID` absent | `Last-Event-ID` not a number |
 |---|---|---|---|
-| `SendStreamingMessage` | Replays from that id, before the task is submitted | No replay | No replay |
-| `stream/watch` | Replays from that id, after `connection-ack` | Replays from `0` | Replays from `0` |
+| `SendStreamingMessage` | Replays this task's events from that id, after the opening `task` | No replay | No replay |
+| `stream/watch` | Replays every event from that id, after `connection-ack` | Replays from `0` | Replays from `0` |
 
 The header name is case-insensitive. A replay from id `N`:
 
 | Buffer | Written |
 |---|---|
 | Empty | Nothing |
-| `N` was never issued by this session: it is the id the next frame will take, or higher | A `gap` frame naming the oldest id, then every frame in the buffer |
-| The oldest frame's id is greater than `N + 1`: frames after `N` were evicted | A `gap` frame naming the oldest id, then every frame in the buffer |
-| Otherwise | Every frame in the buffer whose id is greater than `N`, in order |
+| `N` was never issued by this session: it is the id the next event will take, or higher | A `gap` naming the oldest id, then every event in the buffer |
+| The oldest event's id is greater than `N + 1`: events after `N` were evicted | A `gap` naming the oldest id, then every event in the buffer |
+| Otherwise | Every event in the buffer whose id is greater than `N`, in order |
 
-A replay from `0` of a buffer that has evicted nothing is every frame the session has written,
-starting at id `1`. Live frames follow the replay on the same connection, starting after the
-highest id the replay wrote.
+`SendStreamingMessage` writes the replay's events of its own task only, and its `gap` only when
+activated. A replay from `0` of a buffer that has evicted nothing is every event the session has
+written, starting at id `1`. Live events follow the replay on the same connection, starting after
+the highest id the replay held.
 
-To reconnect, send the id of the last frame received as `Last-Event-ID` — a browser `EventSource`
-does this on its own, from the `id:` lines. Without a `gap`, the replay is exactly the frames
-written after that id, whichever task they belong to. With one, the frames between that id and
-`first_available_id` are gone, or the id came from an earlier capsule session, whose ids this
-session numbers again from `1`.
+To reconnect, send the id of the last event received as `Last-Event-ID` — a browser `EventSource`
+does this on its own, from the `id:` lines. Without a `gap`, the replay is exactly the events
+written after that id. With one, the events between that id and `firstAvailableId` are gone, or the
+id came from an earlier capsule session, whose ids this session numbers again from `1`.
 
 ---
 
@@ -670,12 +669,13 @@ session numbers again from `1`.
 
 | On receiving | A client |
 |---|---|
-| An event type it does not know | Ignores the frame |
+| A `StreamResponse` member it does not know | Ignores the event |
+| A `frame` it does not know | Ignores the event |
 | A JSON key it does not know, at any depth | Ignores the key |
 | A line beginning with `:` | Skips the line |
 
-These three rules are what let the capsule add frame types, keys and comments without breaking a
-client that follows them.
+These rules are what let the capsule add frames, keys and comments without breaking a client that
+follows them.
 
 ---
 
@@ -689,14 +689,16 @@ client that follows them.
 | `Last-Event-ID` | Sends `Last-Event-ID: 0`, so it replays the buffer on attach |
 | `id:` lines | Read, only to report where a lost connection stopped |
 | Reconnecting | Does not reconnect |
-| `status`, `artifact`, `text` | Printed to stdout, including a `rejected` status refused when the session ended |
+| `statusUpdate` | Printed to stdout as `[<state>]  <message>`, the state in murmur's word; a task's terminal status as `[<state>]` alone |
+| `artifactUpdate` `response` | Held, and printed wrapped under its task's `[completed]` line |
+| `task` | Ignored |
+| `text`, `artifact` | Printed to stdout |
 | `thinking` | Not shown |
 | `tool-call-started`, `tool-call-progress` | Not shown |
-| `connection-ack` | Read for `conversation_mode`, which sets how `status` lines are labelled |
+| `connection-ack` | Read for `conversationMode`, which sets how status lines are labelled |
 | Heartbeat | Read and discarded |
-| `error`, a `rejected` status refused at the door | Never delivered to this endpoint |
-| `gap` | A warning on stderr naming `first_available_id` |
+| `gap` | A warning on stderr naming `firstAvailableId` |
 | `lagged` | A warning on stderr naming `missed` |
-| Unknown event types and keys | Ignored |
+| Unknown members, frames and keys | Ignored |
 | `capsule-closed` | Prints `[murmur] capsule closed` to stderr and exits `0` |
 | Connection lost | Exits `1` with `E-IO-003`: `connection to <session id or address> lost after event id <n>`, or `lost before any event`, followed by `the capsule may still be running; run mur watch again to reattach` |

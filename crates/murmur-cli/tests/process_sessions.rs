@@ -469,9 +469,9 @@ impl LiveCapsule {
             .to_string()
     }
 
-    /// One A2A `SendStreamingMessage` under `context`, read to its terminal frame. Returns every
-    /// `(event, data)` pair the connection carried.
-    fn stream(&self, message_id: &str, context: &str, text: &str) -> Vec<(String, Value)> {
+    /// One A2A `SendStreamingMessage` under `context`, read to its terminal status. Returns every
+    /// event the connection carried.
+    fn stream(&self, message_id: &str, context: &str, text: &str) -> Vec<common::stream::Event> {
         let stream = TcpStream::connect(&self.url).expect("should connect for SSE");
         let body =
             send_body(message_id, context, text).replace("SendMessage", "SendStreamingMessage");
@@ -498,24 +498,9 @@ impl LiveCapsule {
                 break;
             }
         }
-        let mut frames = Vec::new();
-        let mut current = String::new();
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let line = line.trim_end_matches(['\n', '\r']).to_string();
-            if let Some(rest) = line.strip_prefix("event: ") {
-                current = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("data: ") {
-                if let Ok(data) = serde_json::from_str::<Value>(rest) {
-                    frames.push((current.clone(), data));
-                }
-            }
-        }
-        frames
+        let mut body = String::new();
+        let _ = reader.read_to_string(&mut body);
+        common::stream::parse(&body)
     }
 
     fn cancel(&self, task_id: &str) -> Value {
@@ -1246,12 +1231,10 @@ fn forget_session_recovers_a_bricked_context_over_the_door() {
     let frames = live.stream("m2", "ctx_door", RECALL_TASK);
     let terminal = frames
         .iter()
-        .filter(|(event, data)| event == "status" && data["final"] == serde_json::json!(true))
-        .map(|(_, data)| data.clone())
-        .next()
+        .find(|event| event.is_terminal_status())
         .unwrap_or_else(|| panic!("the stream must end on a terminal status: {frames:#?}"));
-    assert_eq!(terminal["status"]["state"], "failed", "{terminal:#?}");
-    let message = terminal["status"]["message"].as_str().unwrap_or_default();
+    assert_eq!(terminal.murmur_state(), Some("failed"), "{terminal:#?}");
+    let message = terminal.status_text().unwrap_or_default();
     assert!(message.contains("error[E-RUN-036]"), "{message}");
     assert_eq!(live.capsule.stored_session("ctx_door"), lost);
 

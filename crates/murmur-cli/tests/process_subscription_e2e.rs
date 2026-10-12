@@ -55,6 +55,7 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, launch_session, stage_session, AfterTask,
     ArtifactRequest, LifecycleConfig, StageRequest, TaskAcceptance,
 };
+use common::stream::Event;
 use murmur_artifact::{
     load_runtime_manifest, ArtifactRuntime, ContainmentClass, ConversationMode, LocalRegistry,
     W_SEC_031,
@@ -843,12 +844,12 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     serde_json::from_str(response.trim()).unwrap_or_else(|_| json!({"_raw": response}))
 }
 
-/// An open `stream/watch` connection, read frame by frame.
+/// An open `stream/watch` connection, read event by event.
 struct Watch {
     stream: TcpStream,
     pending: Vec<u8>,
-    event: String,
-    frames: Vec<(String, Value)>,
+    block: Vec<String>,
+    frames: Vec<Event>,
 }
 
 impl Watch {
@@ -857,13 +858,13 @@ impl Watch {
         Self {
             stream,
             pending: Vec::new(),
-            event: String::new(),
+            block: Vec::new(),
             frames: Vec::new(),
         }
     }
 
     /// Read whatever has arrived, appending to [`Self::frames`], and return them all.
-    fn pump(&mut self) -> &[(String, Value)] {
+    fn pump(&mut self) -> &[Event] {
         let mut buf = [0u8; 4096];
         let mut source: &TcpStream = &self.stream;
         loop {
@@ -873,28 +874,30 @@ impl Watch {
                 Err(_) => break,
             }
         }
+        let mut in_head = self.frames.is_empty() && self.block.is_empty();
         while let Some(pos) = self.pending.iter().position(|byte| *byte == b'\n') {
             let raw: Vec<u8> = self.pending.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&raw[..raw.len() - 1])
                 .trim_end_matches('\r')
                 .to_string();
-            if let Some(rest) = line.strip_prefix("event: ") {
-                self.event = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("data: ") {
-                if let Ok(data) = serde_json::from_str::<Value>(rest) {
-                    self.frames.push((self.event.clone(), data));
-                }
+            if in_head {
+                // The response head ends at its blank line; only `data:` lines matter here.
+                in_head = !line.is_empty();
+                continue;
             }
+            if !line.is_empty() {
+                self.block.push(line);
+                continue;
+            }
+            let block = std::mem::take(&mut self.block);
+            self.frames
+                .extend(common::stream::parse(&format!("{}\n\n", block.join("\n"))));
         }
         &self.frames
     }
 
-    /// Pump until `predicate` holds over the frames read so far, or `timeout` passes.
-    fn wait_for(
-        &mut self,
-        timeout: Duration,
-        predicate: impl Fn(&[(String, Value)]) -> bool,
-    ) -> bool {
+    /// Pump until `predicate` holds over the events read so far, or `timeout` passes.
+    fn wait_for(&mut self, timeout: Duration, predicate: impl Fn(&[Event]) -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             if predicate(self.pump()) {
@@ -907,45 +910,54 @@ impl Watch {
         }
     }
 
-    /// The `status` object of the terminal frame for `task_id`, once it has arrived.
-    ///
-    /// The answer a turn produced and the reason one failed are carried here and nowhere else:
-    /// `GetTask` reports a task's state but none of its text, so a case that wants either has
-    /// to be watching the feed while the turn runs.
+    /// How `task_id` ended on the feed, once its terminal status has arrived: `state` in murmur's
+    /// word, the status `message`'s text, and the `response` artifact delivered before it.
     fn terminal_status(&mut self, task_id: &str, timeout: Duration) -> Value {
-        let is_terminal = |frames: &[(String, Value)]| {
-            frames.iter().any(|(event, data)| {
-                event == "status" && data["id"] == json!(task_id) && data["final"] == json!(true)
-            })
+        let is_terminal = |frames: &[Event]| {
+            frames
+                .iter()
+                .any(|event| event.is_terminal_status() && event.task_id() == Some(task_id))
         };
         assert!(
             self.wait_for(timeout, is_terminal),
-            "no terminal status frame arrived for {task_id}; frames: {:#?}",
+            "no terminal status arrived for {task_id}; events: {:#?}",
             self.frames
         );
-        self.frames
+        let of_task: Vec<&Event> = self
+            .frames
             .iter()
-            .find(|(event, data)| {
-                event == "status" && data["id"] == json!(task_id) && data["final"] == json!(true)
-            })
-            .map(|(_, data)| data["status"].clone())
-            .expect("just waited for it")
+            .filter(|event| event.task_id() == Some(task_id))
+            .collect();
+        let terminal = of_task
+            .iter()
+            .position(|event| event.is_terminal_status())
+            .expect("just waited for it");
+        let response = terminal
+            .checked_sub(1)
+            .and_then(|index| of_task[index].artifact_text())
+            .unwrap_or_default();
+        json!({
+            "state": of_task[terminal].murmur_state(),
+            "message": of_task[terminal].status_text(),
+            "response": response,
+        })
     }
 
-    fn of_type(&self, event_type: &str) -> Vec<&Value> {
+    /// The payload of every murmur frame named `frame` read so far.
+    fn of_type(&self, frame: &str) -> Vec<&Value> {
         self.frames
             .iter()
-            .filter(|(event, _)| event == event_type)
-            .map(|(_, data)| data)
+            .filter(|event| event.kind() == frame)
+            .map(Event::frame)
             .collect()
     }
 }
 
-/// Whether any frame read so far is a non-final text frame — the proof that text streamed.
-fn has_streamed_text(frames: &[(String, Value)]) -> bool {
+/// Whether any event read so far is a non-final text frame — the proof that text streamed.
+fn has_streamed_text(frames: &[Event]) -> bool {
     frames
         .iter()
-        .any(|(event, data)| event == "text" && data["final"] != json!(true))
+        .any(|event| event.kind() == "text" && event.frame()["final"] != json!(true))
 }
 
 /// How long one scripted turn is given to finish. Generous, because it spans a real harness
@@ -978,9 +990,7 @@ fn a_coding_task_edits_a_file_through_the_bridge_and_completes() {
         "the task should have completed: {response}"
     );
     watch.wait_for(Duration::from_secs(10), |frames| {
-        frames
-            .iter()
-            .any(|(event, data)| event == "status" && data["final"] == json!(true))
+        frames.iter().any(Event::is_terminal_status)
     });
 
     // The file changed on disk, inside the capsule's filesystem scope.
@@ -1003,15 +1013,15 @@ fn a_coding_task_edits_a_file_through_the_bridge_and_completes() {
     let artifacts = watch.of_type("artifact");
     let editor_calls: Vec<&&Value> = artifacts
         .iter()
-        .filter(|frame| frame["artifact"]["tool_name"] == json!(EDITOR_NAME))
+        .filter(|frame| frame["toolName"] == json!(EDITOR_NAME))
         .collect();
     assert!(
         !editor_calls.is_empty(),
         "no artifact frame named the bare tool '{EDITOR_NAME}'; frames: {artifacts:#?}"
     );
-    let call = &editor_calls[0]["artifact"];
+    let call = &editor_calls[0];
     assert_eq!(
-        call["is_error"],
+        call["isError"],
         json!(false),
         "the tool call failed: {call}"
     );
@@ -1173,14 +1183,12 @@ fn a_cancel_mid_turn_ends_canceled_and_the_next_task_still_resumes() {
     );
 
     watch.wait_for(Duration::from_secs(15), |frames| {
-        frames
-            .iter()
-            .any(|(event, data)| event == "status" && data["final"] == json!(true))
+        frames.iter().any(Event::is_terminal_status)
     });
-    let terminal: Vec<&Value> = watch
-        .of_type("status")
-        .into_iter()
-        .filter(|frame| frame["final"] == json!(true))
+    let terminal: Vec<&Event> = watch
+        .frames
+        .iter()
+        .filter(|event| event.is_terminal_status())
         .collect();
     assert_eq!(
         terminal.len(),

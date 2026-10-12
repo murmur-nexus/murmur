@@ -16,7 +16,7 @@ mod common;
 use std::{
     collections::HashSet,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{mpsc, OnceLock},
@@ -665,7 +665,7 @@ fn poll_until_state(addr: &str, task_id: &str, expected: &str) -> Value {
 }
 
 /// Send `text` over `SendStreamingMessage` and read the connection to its end. Returns the task id and
-/// the last status event the stream carried.
+/// the `statusUpdate` the stream ended on, its task's terminal status.
 fn stream_to_end(addr: &str, text: &str) -> (String, Value) {
     let stream = TcpStream::connect(addr).expect("should connect for SSE");
     let body = json!({
@@ -701,33 +701,21 @@ fn stream_to_end(addr: &str, text: &str) -> (String, Value) {
         }
     }
 
-    let mut last_status: Option<Value> = None;
-    let mut current_type = String::new();
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Err(error) => panic!("the SSE connection errored instead of closing: {error}"),
-            Ok(_) => {}
-        }
-        let line = line.trim_end_matches(['\n', '\r']).to_string();
-        if let Some(rest) = line.strip_prefix("event: ") {
-            current_type = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            if current_type == "status" {
-                last_status = serde_json::from_str(rest).ok();
-            }
-            if last_status
-                .as_ref()
-                .is_some_and(|status| status["final"] == json!(true))
-            {
-                break;
-            }
-        }
+    let mut body = String::new();
+    if let Err(error) = reader.read_to_string(&mut body) {
+        panic!("the SSE connection errored instead of closing: {error}");
     }
-    let last_status = last_status.expect("the stream carried at least one status event");
-    let task_id = last_status["id"].as_str().unwrap().to_string();
-    (task_id, last_status)
+    let events = common::stream::parse(&body);
+    let last = events
+        .iter()
+        .rfind(|event| event.kind() == "status-update")
+        .expect("the stream carried at least one status event");
+    assert!(
+        last.is_terminal_status(),
+        "the stream ends on its task's terminal status: {events:?}"
+    );
+    let task_id = last.task_id().unwrap().to_string();
+    (task_id, last.result()["statusUpdate"].clone())
 }
 
 fn assert_did_not_complete(result: Result<(), RuntimeError>, expected: &str) -> String {
@@ -758,8 +746,10 @@ fn s4_a_failed_a2a_task_fails_the_launch_and_its_stream() {
     let capsule = Capsule::launch(staged);
 
     let (task_id, last_status) = stream_to_end(&capsule.url, TASK);
-    assert_eq!(last_status["status"]["state"], "failed", "{last_status}");
-    assert_eq!(last_status["final"], json!(true), "{last_status}");
+    assert_eq!(
+        last_status["status"]["state"], "TASK_STATE_FAILED",
+        "{last_status}"
+    );
 
     let reason = assert_did_not_complete(capsule.launch_result(), "failed");
     let trace = capsule.trace();

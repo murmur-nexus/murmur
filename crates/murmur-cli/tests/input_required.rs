@@ -285,25 +285,6 @@ fn tasks_get(addr: &str, task_id: &str) -> Value {
     http_post_json(addr, "/", &body)
 }
 
-/// The id of the first task the session's trace records starting.
-///
-/// Lets a caller that submitted a task over `SendStreamingMessage` learn the task id before the
-/// stream's first frame reaches it, from a thread that is not reading the stream.
-fn started_task_id(trace_path: &Path, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(task_id) = read_trace(trace_path)
-            .iter()
-            .find(|event| event["event_type"] == "task_start")
-            .and_then(|event| event["task_id"].as_str())
-        {
-            return task_id.to_string();
-        }
-        assert!(Instant::now() < deadline, "no task started");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// Poll GetTask until the task reaches the expected state, or timeout.
 fn poll_until_state(addr: &str, task_id: &str, expected_state: &str, timeout: Duration) -> Value {
     let deadline = std::time::Instant::now() + timeout;
@@ -325,17 +306,12 @@ fn poll_until_state(addr: &str, task_id: &str, expected_state: &str, timeout: Du
 
 // ── SSE client helper ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct SseEvent {
-    id: Option<u64>,
-    event_type: String,
-    data: String,
-}
+use common::stream::Event as SseEvent;
 
 /// Why an SSE collection stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamEnd {
-    /// A terminal `status` event — one whose data carries `"final":true` — arrived.
+    /// A terminal status of a task arrived.
     Final,
     /// The collection deadline passed while the stream was still open.
     Deadline,
@@ -433,42 +409,29 @@ fn next_sse_event(
     reader: &mut BufReader<TcpStream>,
     deadline: Instant,
 ) -> Result<SseEvent, StreamEnd> {
-    let mut cur_id = None;
-    let mut cur_type = String::new();
-    let mut cur_data = String::new();
-
+    let mut block = Vec::new();
     loop {
         let line = read_line_before(reader, deadline)?;
         let line = line.trim_end_matches('\n').trim_end_matches('\r');
-
-        if line.is_empty() {
-            if !cur_type.is_empty() && !cur_data.is_empty() {
-                return Ok(SseEvent {
-                    id: cur_id,
-                    event_type: cur_type,
-                    data: cur_data,
-                });
-            }
-            cur_id = None;
-            cur_type.clear();
-            cur_data.clear();
-        } else if let Some(rest) = line.strip_prefix("id: ") {
-            cur_id = rest.parse().ok();
-        } else if let Some(rest) = line.strip_prefix("event: ") {
-            cur_type = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            cur_data = rest.to_string();
+        if !line.is_empty() {
+            block.push(line.to_string());
+            continue;
+        }
+        let events = common::stream::parse(&format!("{}\n\n", block.join("\n")));
+        block.clear();
+        if let Some(event) = events.into_iter().next() {
+            return Ok(event);
         }
     }
 }
 
-/// Whether `event` is the terminal `status` event that closes a task's stream.
+/// Whether `event` is a terminal status, which closes its task's stream.
 fn is_final(event: &SseEvent) -> bool {
-    event.event_type == "status" && event.data.contains("\"final\":true")
+    event.is_terminal_status()
 }
 
-/// Read events into `events` until a terminal `status` event arrives, the peer closes the
-/// stream, or `deadline` passes, and report which.
+/// Read events into `events` until a terminal status arrives, the peer closes the stream, or
+/// `deadline` passes, and report which.
 fn collect_sse_events_until(
     reader: &mut BufReader<TcpStream>,
     deadline: Instant,
@@ -489,7 +452,7 @@ fn collect_sse_events_until(
 }
 
 /// Subscribe to `SendStreamingMessage` for a new task and collect SSE events until a terminal
-/// `status` event arrives, the peer closes the stream, or `timeout` elapses, reporting which.
+/// status arrives, the peer closes the stream, or `timeout` elapses, reporting which.
 /// `timeout` bounds the whole collection, not each read, and starts before the connect.
 fn collect_sse_stream(
     addr: &str,
@@ -504,17 +467,6 @@ fn collect_sse_stream(
         Err(end) => end,
     };
     (events, end)
-}
-
-/// [`collect_sse_stream`] without the stop reason. On expiry the events gathered so far are
-/// returned rather than panicking.
-fn collect_sse_events_for_message(
-    addr: &str,
-    msg_id: &str,
-    text: &str,
-    timeout: Duration,
-) -> Vec<SseEvent> {
-    collect_sse_stream(addr, msg_id, text, timeout).0
 }
 
 /// Run `read` on its own thread and wait for it under `READER_LIVENESS_GUARD`.
@@ -796,9 +748,11 @@ fn a_streaming_reply_continues_the_waiting_task_to_its_final_status() {
         StreamEnd::Final,
         "{events:?}"
     );
-    let last: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
-    assert_eq!(last["id"], task_id.as_str(), "{last}");
-    assert_eq!(last["status"]["state"], "completed", "{last}");
+    assert_eq!(events[0].kind(), "task", "{events:?}");
+    assert_eq!(events[0].state(), Some("TASK_STATE_WORKING"), "{events:?}");
+    let last = events.last().unwrap();
+    assert_eq!(last.task_id(), Some(task_id.as_str()), "{last:?}");
+    assert_eq!(last.state(), Some("TASK_STATE_COMPLETED"), "{last:?}");
     assert!(
         server.requests()[1]
             .to_string()
@@ -909,9 +863,9 @@ fn input_required_timeout_transitions_to_failed() {
     );
 }
 
-/// A streaming client of a task whose `request-input` wait times out is told once that the task
-/// failed: after `input-required`, one final `failed` status with message `input-timeout`, the
-/// last frame the connection carries, with no earlier `failed` frame.
+/// A streaming client of a task whose `request-input` wait times out is told the task waits for
+/// input, and its stream ends there. The task then fails once: a watcher reads one terminal
+/// `failed` status with message `input-timeout`, the task's last status, with no earlier `failed`.
 #[test]
 fn input_timeout_streams_one_failed_final_status() {
     let server = tool_then_end_turn_server("Quick question", "would have completed");
@@ -936,46 +890,58 @@ fn input_timeout_streams_one_failed_final_status() {
         .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
-    let events = collect_sse_events_for_message(
+    let (events, end) = collect_sse_stream(
         &capsule_url,
         "msg-stream-timeout",
         "start timed task",
         Duration::from_secs(60),
     );
-    let statuses: Vec<Value> = events
-        .iter()
-        .filter(|e| e.event_type == "status")
-        .map(|e| serde_json::from_str(&e.data).expect("status data is JSON"))
-        .collect();
-    assert!(
-        statuses
-            .iter()
-            .any(|s| s["status"]["state"] == "input-required"),
-        "{events:?}"
-    );
-    let failed: Vec<&Value> = statuses
-        .iter()
-        .filter(|s| s["status"]["state"] == "failed")
-        .collect();
-    assert_eq!(failed.len(), 1, "one failed status: {events:?}");
-    assert_eq!(failed[0]["final"], true);
-    assert_eq!(failed[0]["status"]["message"], "input-timeout");
-    assert!(failed[0]["context_id"].is_string(), "{}", failed[0]);
+    assert_eq!(end, StreamEnd::Closed, "{events:?}");
+    let asked = events.last().unwrap();
     assert_eq!(
-        statuses.last(),
-        Some(failed[0]),
-        "the final status is the last status: {events:?}"
+        asked.state(),
+        Some("TASK_STATE_INPUT_REQUIRED"),
+        "the stream ends once the task waits for input: {events:?}"
     );
-    assert_eq!(
-        events.last().map(|e| e.event_type.as_str()),
-        Some("status"),
-        "{events:?}"
+    assert!(!events.iter().any(is_final), "{events:?}");
+    let task_id = asked.task_id().unwrap().to_string();
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "TASK_STATE_FAILED",
+        Duration::from_secs(30),
     );
 
-    let task_id = failed[0]["id"].as_str().unwrap();
+    // A watcher reads how the wait ended: one terminal `failed` status, `input-timeout`.
+    let mut watch = common::stream::Watch::open(&capsule_url, 0);
+    assert!(
+        watch.read_until(Duration::from_secs(30), |event| is_final(event)
+            && event.task_id() == Some(task_id.as_str()))
+    );
+    let statuses: Vec<&SseEvent> = watch
+        .events
+        .iter()
+        .filter(|e| e.kind() == "status-update" && e.task_id() == Some(task_id.as_str()))
+        .collect();
+    let failed: Vec<&&SseEvent> = statuses
+        .iter()
+        .filter(|s| s.murmur_state() == Some("failed"))
+        .collect();
+    assert_eq!(failed.len(), 1, "one failed status: {statuses:?}");
+    assert_eq!(failed[0].status_text(), Some("input-timeout"));
+    assert!(
+        failed[0].result()["statusUpdate"]["contextId"].is_string(),
+        "{:?}",
+        failed[0]
+    );
     assert_eq!(
-        tasks_get(&capsule_url, task_id)["result"]["status"]["state"],
-        "TASK_STATE_FAILED"
+        statuses.last().map(|s| s.id),
+        Some(failed[0].id),
+        "the final status is the last status: {statuses:?}"
+    );
+    assert_eq!(
+        tasks_get(&capsule_url, &task_id)["result"]["status"],
+        failed[0].result()["statusUpdate"]["status"]
     );
 }
 
@@ -1070,16 +1036,15 @@ fn assert_input_timeout_recorded(trace: &[Value], task_id: &str) {
     assert_eq!(trace[position("task_end")]["exit_status"], "failed");
 }
 
-/// Test 5: SendStreamingMessage SSE stream receives an input-required status event
-/// (with final:false), and after delivering input via SendMessage the stream
-/// eventually sees a completed final event.
+/// Test 5: a `SendStreamingMessage` stream ends once its task waits for input, on an
+/// `input-required` status carrying the prompt; the reply, sent as a `SendStreamingMessage` naming
+/// the task, continues it on a new stream that carries the `resumed` status and ends `completed`.
 #[test]
 fn input_required_sse_emits_state_event() {
     let server = tool_then_end_turn_server("SSE branch?", "stream completed");
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
     let staged = stage_agent(&home, &manifest_path, None);
-    let trace_path = staged.workdir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
     let handle = std::thread::spawn(move || {
@@ -1093,135 +1058,92 @@ fn input_required_sse_emits_state_event() {
         .recv_timeout(common::CAPSULE_URL_WAIT)
         .expect("timed out waiting for capsule URL");
 
-    // Spawn SSE collection in background — it will block until final event or timeout
-    let addr_clone = capsule_url.clone();
-    let sse_handle = std::thread::spawn(move || {
-        collect_sse_events_for_message(
-            &addr_clone,
-            "msg-sse-1",
-            "stream task start",
-            Duration::from_secs(60),
-        )
-    });
-
-    // The stream is read on the other thread, so the task id comes from the trace.
-    let task_id = started_task_id(&trace_path, Duration::from_secs(30));
-
-    // Input may only be delivered once the task has actually suspended: a reply that lands
-    // while the task is still working is refused, and the suspended task then waits for input
-    // that never arrives.
-    poll_until_state(
+    let (asked, end) = collect_sse_stream(
         &capsule_url,
-        &task_id,
-        "TASK_STATE_INPUT_REQUIRED",
-        Duration::from_secs(30),
+        "msg-sse-1",
+        "stream task start",
+        Duration::from_secs(60),
     );
+    assert_eq!(end, StreamEnd::Closed, "{asked:?}");
+    let last = asked.last().expect("the stream carried events");
+    assert_eq!(last.state(), Some("TASK_STATE_INPUT_REQUIRED"), "{asked:?}");
+    // The fixture tool asks with its whole input as the prompt.
+    assert_eq!(
+        last.status_text(),
+        Some(
+            serde_json::json!({"data": "SSE branch?"})
+                .to_string()
+                .as_str()
+        )
+    );
+    assert!(!asked.iter().any(is_final), "{asked:?}");
+    let task_id = last.task_id().unwrap().to_string();
 
-    let resume_resp = send(
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut reader = open_sse_stream_with(
         &capsule_url,
         reply_to(&task_id, "msg-sse-2", "use feature branch"),
-    );
+        deadline,
+    )
+    .unwrap_or_else(|end| panic!("the stream ended ({end:?}) before its first event"));
+    let mut resumed = Vec::new();
     assert_eq!(
-        resume_resp["result"]["task"]["status"]["state"], "TASK_STATE_WORKING",
-        "delivering input answers the task working; got: {resume_resp}"
+        collect_sse_events_until(&mut reader, deadline, &mut resumed),
+        StreamEnd::Final,
+        "{resumed:?}"
     );
-
-    let events = sse_handle
-        .join()
-        .expect("SSE collection thread should not panic");
-    for event in &events {
-        eprintln!("event: {}\ndata: {}\n", event.event_type, event.data);
-    }
-
+    assert_eq!(resumed[0].state(), Some("TASK_STATE_WORKING"));
+    let final_event = resumed.last().unwrap();
+    assert_eq!(final_event.state(), Some("TASK_STATE_COMPLETED"));
     assert!(
-        !events.is_empty(),
-        "should have received SSE events; got none"
+        resumed.iter().any(|e| e.status_text() == Some("resumed")),
+        "the stream should carry the resumed status; got events: {resumed:?}"
     );
 
-    let input_required_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "status" && e.data.contains("input-required"))
-        .collect();
-    assert!(
-        !input_required_events.is_empty(),
-        "should have an input-required status SSE event; got events: {events:?}"
-    );
-
-    // The input-required event must have final:false
-    let ir_event = &input_required_events[0];
-    assert!(
-        !ir_event.data.contains("\"final\":true"),
-        "input-required SSE event should have final:false; got: {}",
-        ir_event.data
-    );
-
-    let final_event = events
-        .iter()
-        .find(|e| e.event_type == "status" && e.data.contains("\"final\":true"));
-    assert!(
-        final_event.is_some(),
-        "should have a final SSE event; got events: {events:?}"
-    );
-    assert!(
-        final_event.unwrap().data.contains("\"completed\""),
-        "final SSE event should be completed; got: {}",
-        final_event.unwrap().data
-    );
-
-    // Every frame on the stream — the agent loop's, the `request-input` wait's `input-required`
-    // and `resumed`, the chunks and the final status — is numbered from the session's one
-    // sequence, which starts at 1 and rises by one per frame.
-    let ids: Vec<u64> = events
-        .iter()
-        .map(|e| {
-            e.id.unwrap_or_else(|| panic!("frame without an id on the stream: {e:?}"))
-        })
-        .collect();
+    // Every numbered event on the two streams — the agent loop's, the `request-input` wait's
+    // `input-required` and `resumed`, and the ending — is numbered from the session's one
+    // sequence, which starts at 1 and rises with every event.
+    let ids: Vec<u64> = asked.iter().chain(&resumed).filter_map(|e| e.id).collect();
     assert!(
         ids.windows(2).all(|pair| pair[0] < pair[1]),
-        "event ids should strictly ascend across every frame kind; got {ids:?}"
+        "event ids should strictly ascend across every event kind; got {ids:?}"
     );
     assert!(
         ids.iter().all(|id| *id < 1 << 32),
         "event ids should come from one sequence starting at 1; got {ids:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|e| e.event_type == "status" && e.data.contains("\"resumed\"")),
-        "the stream should carry the resumed status; got events: {events:?}"
     );
 
     handle.join().expect("launch thread should not panic");
 }
 
 /// Test 6: the SSE reader returns at its deadline while the capsule's stream is still open. A
-/// task suspended on request-input with no input delivered emits no terminal event and keeps its
-/// stream open, so once the input-required event has arrived the collection can only end on its
-/// deadline. The deadline starts at that event, so how long the capsule takes to suspend is
-/// bounded only by `INPUT_REQUIRED_WAIT`.
+/// task whose provider holds its reply writes nothing after its turn's `working` status and keeps
+/// its stream open, so once that status has arrived the collection can only end on its deadline.
+/// The deadline starts at that status, so how long the capsule takes to reach it is bounded only
+/// by `WORKING_WAIT`.
 ///
 /// The budget is shorter than the capsule's `SSE_HEARTBEAT_INTERVAL`, so a heartbeat need not
 /// fall inside it; `sse_reader_returns_at_its_deadline_through_a_heartbeating_stream` covers a
 /// stream that never goes quiet.
 #[test]
 fn sse_reader_returns_when_deadline_exceeded() {
-    /// How long the stream may take to deliver the input-required event. A liveness bound sized
-    /// for a loaded host; it and the budget together sit well inside `READER_LIVENESS_GUARD`.
-    const INPUT_REQUIRED_WAIT: Duration = Duration::from_secs(60);
+    /// How long the stream may take to deliver the `working` status. A liveness bound sized for
+    /// a loaded host; it and the budget together sit well inside `READER_LIVENESS_GUARD`.
+    const WORKING_WAIT: Duration = Duration::from_secs(60);
 
-    let server = tool_then_end_turn_server("Deadline branch?", "would have completed");
+    let server = common::ScriptedServer::start_with_delay(
+        tool_then_end_turn_responses("Deadline branch?", "would have completed"),
+        Duration::from_secs(20),
+    );
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
     let staged = stage_agent(&home, &manifest_path, None);
-    let trace_path = staged.workdir.join("trace.jsonl");
 
     let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
-    let handle = std::thread::spawn(move || {
-        launch_session(staged, move |url| {
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
             let _ = url_tx.send(url.to_string());
-        })
-        .expect("launch should succeed")
+        });
     });
 
     let capsule_url = url_rx
@@ -1231,24 +1153,23 @@ fn sse_reader_returns_when_deadline_exceeded() {
     let budget = Duration::from_secs(5);
     let addr = capsule_url.clone();
     let (events, end, elapsed) = within_reader_liveness_guard(budget, move || {
-        let suspended_by = Instant::now() + INPUT_REQUIRED_WAIT;
-        let mut reader =
-            open_sse_stream(&addr, "msg-deadline-1", "stream task start", suspended_by)
-                .unwrap_or_else(|end| panic!("the stream ended ({end:?}) before its first event"));
+        let working_by = Instant::now() + WORKING_WAIT;
+        let mut reader = open_sse_stream(&addr, "msg-deadline-1", "stream task start", working_by)
+            .unwrap_or_else(|end| panic!("the stream ended ({end:?}) before its first event"));
         let mut events = Vec::new();
         loop {
-            match next_sse_event(&mut reader, suspended_by) {
+            match next_sse_event(&mut reader, working_by) {
                 Ok(event) => {
-                    let suspended =
-                        event.event_type == "status" && event.data.contains("input-required");
+                    let working =
+                        event.murmur_state() == Some("working") && event.kind() == "status-update";
                     events.push(event);
-                    if suspended {
+                    if working {
                         break;
                     }
                 }
                 Err(end) => panic!(
-                    "the stream ended ({end:?}) before delivering the input-required event; \
-                     got events: {events:?}"
+                    "the stream ended ({end:?}) before delivering the working status; got \
+                     events: {events:?}"
                 ),
             }
         }
@@ -1268,23 +1189,8 @@ fn sse_reader_returns_when_deadline_exceeded() {
     );
     assert!(
         !events.iter().any(is_final),
-        "no terminal event is emitted while the task waits for input; got events: {events:?}"
+        "no terminal event is emitted while the provider holds its reply; got events: {events:?}"
     );
-
-    // Release the suspended task so the capsule can shut down.
-    let task_id = started_task_id(&trace_path, Duration::from_secs(30));
-    poll_until_state(
-        &capsule_url,
-        &task_id,
-        "TASK_STATE_INPUT_REQUIRED",
-        Duration::from_secs(30),
-    );
-    let _ = send(
-        &capsule_url,
-        reply_to(&task_id, "msg-deadline-2", "use main branch"),
-    );
-
-    handle.join().expect("launch thread should not panic");
 }
 
 /// Test 7: the SSE reader returns at its deadline through a stream whose traffic never pauses.

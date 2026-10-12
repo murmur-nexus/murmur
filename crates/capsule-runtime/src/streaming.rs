@@ -1,10 +1,37 @@
-use std::collections::VecDeque;
+//! The capsule's stream: the A2A v1.0 events `SendStreamingMessage` and `stream/watch` write,
+//! and the murmur frames the stream extension adds to them.
+//!
+//! Every event is numbered, buffered and broadcast once, here, as a [`StreamEvent`] holding the
+//! `StreamResponse` it renders to with and without the extension. Each connection renders it with
+//! its own JSON-RPC request id ([`sse_event`]), so one buffer serves connections that differ in
+//! both. The writers both transports call are [`emit_status`], [`emit_input_required`],
+//! [`emit_task_ending`] and [`emit_frame`].
+//!
+//! A murmur frame rides in a `statusUpdate` of its task that repeats `TASK_STATE_WORKING` with no
+//! message, under `metadata` keyed by [`STREAM_EXTENSION_URI`], so a v1.0 client that does not
+//! know the extension reads a status it already holds. A frame that belongs to no task rides in a
+//! `message`.
+
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-pub(crate) type SseBroadcast = broadcast::Sender<Arc<String>>;
+use crate::a2a::{A2aArtifact, A2aTask, Part, Role, StatusMessage, TaskState, TaskStatus};
+
+/// URI of the agent-card extension that lists the murmur frames the capsule's stream can write,
+/// and the `A2A-Extensions` value a client sends to receive them. It is the address of that
+/// extension's section in the reference docs, on the streaming protocol page beside the frames it
+/// names. Every murmur frame on the wire sits under `metadata` keyed by this URI.
+pub const STREAM_EXTENSION_URI: &str =
+    murmur_artifact::docs_reference_url!("streaming-protocol/#murmur-stream-v1");
+
+pub(crate) type SseBroadcast = broadcast::Sender<Arc<StreamEvent>>;
+
+/// Where a task's events go: the session's broadcast and its replay buffer, or `None` for a run
+/// no client can watch.
+pub(crate) type StreamSink = Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>;
 
 /// Cadence at which an idle SSE connection writes [`SSE_HEARTBEAT_COMMENT`].
 ///
@@ -14,69 +41,88 @@ pub(crate) const SSE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Durati
 
 /// The liveness signal written to an idle SSE connection.
 ///
-/// An SSE comment, not a frame: it carries no `id:` line, is written straight to the
-/// socket rather than through [`emit_frame`], and so consumes
-/// no event id and never enters the replay buffer. A client that counts events sees
-/// none of these.
+/// An SSE comment, not an event: it carries no `id:` line, is written straight to the socket
+/// rather than through the buffer, and so consumes no event id and never enters the replay
+/// buffer. A client that counts events sees none of these.
 pub(crate) const SSE_HEARTBEAT_COMMENT: &[u8] = b":heartbeat\n\n";
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TaskStatusUpdateEvent {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_id: Option<String>,
-    pub status: StreamStatus,
-    pub r#final: bool,
+/// The task an event belongs to: every task-bound event names both ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamTask {
+    pub task_id: String,
+    pub context_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct StreamStatus {
-    pub state: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
-    /// The 1-based ordinal of the reopen this frame announces, on the `working` frame the reopen
-    /// loop writes between two attempts of one task; `None`, and absent from the wire, on every
-    /// other status.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reopen: Option<u32>,
+impl StreamTask {
+    pub(crate) fn new(task_id: impl Into<String>, context_id: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            context_id: context_id.into(),
+        }
+    }
+
+    /// The task of a run that serves an A2A task, which carries both ids, or `None` for one that
+    /// serves none.
+    pub(crate) fn of(task_id: Option<&str>, context_id: Option<&str>) -> Option<Self> {
+        Some(Self::new(task_id?, context_id?))
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TaskArtifactUpdateEvent {
-    pub id: String,
-    pub artifact: StreamArtifact,
+/// How a status event ends a `SendStreamingMessage` connection on its task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamEnd {
+    /// The task's terminal status: the stream ends whether it was replayed or live.
+    Terminal,
+    /// The task stopped for input: a live one ends the stream, a replayed one does not, since the
+    /// task has left that state by the time a continuation replays it.
+    Interrupted,
 }
 
-/// A tool call the model has begun writing. Carries the call's id and name and nothing of its
-/// input, which a hook or the call gate has not yet seen.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TaskToolCallStartedEvent {
-    pub id: String,
-    /// The id the call's answering `artifact` frame carries as its `tool_call_id`.
-    pub tool_call_id: String,
-    /// The capsule's tool name, the one the answering `artifact` frame carries.
-    pub tool_name: String,
+/// One event in the session's sequence, rendered once for every connection.
+#[derive(Debug)]
+pub(crate) struct StreamEvent {
+    /// Its place in the session's sequence: `1` for the first event, one higher for each after.
+    pub id: u64,
+    pub task_id: String,
+    /// The `StreamResponse` a connection that did not activate the stream extension receives, or
+    /// `None` for a murmur frame, which it does not.
+    pub plain: Option<String>,
+    /// The `StreamResponse` an activated connection receives.
+    pub extended: String,
+    /// The state of a standard `statusUpdate`, which a connection's later carriers repeat. `None`
+    /// for an `artifactUpdate` and a murmur frame.
+    pub state: Option<TaskState>,
+    pub ends: Option<StreamEnd>,
 }
 
-/// How much of a started call's input the model has written: a byte count, never the bytes.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct TaskToolCallProgressEvent {
-    pub id: String,
-    pub tool_call_id: String,
-    /// Bytes of the call's input JSON written so far. Never smaller than an earlier frame's for
-    /// the same call.
-    pub input_bytes: u64,
+impl StreamEvent {
+    /// The `result` a connection receives for this event, or `None` when it receives nothing.
+    pub(crate) fn result(&self, activated: bool) -> Option<&str> {
+        if activated {
+            Some(&self.extended)
+        } else {
+            self.plain.as_deref()
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// One SSE event: an `id:` line for an event in the session's sequence, then one `data:` line
+/// holding a JSON-RPC response to `request_id` (already JSON) whose `result` is `result`. No
+/// event has an `event:` line: a v1.0 client reads every `data:` line as a JSON-RPC response.
+pub(crate) fn sse_event(id: Option<u64>, request_id: &str, result: &str) -> String {
+    let id_line = id.map(|id| format!("id: {id}\n")).unwrap_or_default();
+    format!("{id_line}data: {{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{result}}}\n\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct StreamArtifact {
     pub tool_name: String,
     pub content: String,
     /// The fence source naming what produced `content` — `tool:<name>` — or `None` when
     /// `content` carries no fence. It tells apart the frame shapes that are otherwise
     /// identical on the wire: an ordinary tool result, a skill result, a dispatch failure and
-    /// a hook artifact all arrive as a `tool_name` and a `content`.
+    /// a hook artifact all arrive as a `toolName` and a `content`.
     ///
     /// Serialized on every frame, `null` included, without `skip_serializing_if`: a consumer
     /// that sees the key knows it is talking to a runtime that labels its frames, and one that
@@ -154,137 +200,265 @@ impl StreamArtifact {
     }
 }
 
-/// An SSE event type the capsule's stream writes: the `event:` line of every frame on
-/// `SendStreamingMessage` and `stream/watch`. Every writer takes one, so this is the whole vocabulary
-/// the agent card's stream extension is derived from.
+/// A murmur frame: the name every frame carries under `frame`, first, and the vocabulary the
+/// stream extension's `params.frames` lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamFrame {
-    Status,
-    Artifact,
     Text,
     Thinking,
     ToolCallStarted,
     ToolCallProgress,
+    Artifact,
     Gap,
     Lagged,
     ConnectionAck,
     CapsuleClosed,
-    Error,
 }
 
 impl StreamFrame {
     /// Every frame, in the order the stream extension's `params.frames` lists them.
-    pub(crate) const ALL: [StreamFrame; 11] = [
-        StreamFrame::Status,
-        StreamFrame::Artifact,
+    pub(crate) const ALL: [StreamFrame; 9] = [
         StreamFrame::Text,
         StreamFrame::Thinking,
         StreamFrame::ToolCallStarted,
         StreamFrame::ToolCallProgress,
+        StreamFrame::Artifact,
         StreamFrame::Gap,
         StreamFrame::Lagged,
         StreamFrame::ConnectionAck,
         StreamFrame::CapsuleClosed,
-        StreamFrame::Error,
     ];
 
-    /// The `event:` line's value, and the frame's name in `params.frames`.
+    /// The frame's `frame` value, and its name in `params.frames`.
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
-            StreamFrame::Status => "status",
-            StreamFrame::Artifact => "artifact",
             StreamFrame::Text => "text",
             StreamFrame::Thinking => "thinking",
             StreamFrame::ToolCallStarted => "tool-call-started",
             StreamFrame::ToolCallProgress => "tool-call-progress",
+            StreamFrame::Artifact => "artifact",
             StreamFrame::Gap => "gap",
             StreamFrame::Lagged => "lagged",
             StreamFrame::ConnectionAck => "connection-ack",
             StreamFrame::CapsuleClosed => "capsule-closed",
-            StreamFrame::Error => "error",
         }
     }
 }
 
-/// Format a single SSE event frame:
-///   id: <event_id>\n
-///   event: <event_type>\n
-///   data: <json>\n\n
-pub(crate) fn format_sse_event(event_id: u64, frame: StreamFrame, data: &str) -> String {
-    let event_type = frame.wire_name();
-    format!("id: {event_id}\nevent: {event_type}\ndata: {data}\n\n")
+/// One murmur frame and what it says: the object under `metadata[STREAM_EXTENSION_URI]`, `frame`
+/// first and the rest in declaration order, camelCase.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "frame", rename_all = "kebab-case")]
+pub(crate) enum MurmurFrame {
+    /// Streamed text. `final` marks the cursor removal (empty) and the whole answer a
+    /// non-streaming driver sends at once.
+    Text { text: String, r#final: bool },
+    /// Streamed reasoning. Always `final: false`.
+    Thinking { text: String, r#final: bool },
+    /// A tool call the model has begun writing: its id and name, nothing of its input, which a
+    /// hook or the call gate has not yet seen.
+    #[serde(rename_all = "camelCase")]
+    ToolCallStarted {
+        /// The id the call's answering `artifact` frame carries as its `toolCallId`.
+        tool_call_id: String,
+        /// The capsule's tool name, the one the answering `artifact` frame carries.
+        tool_name: String,
+    },
+    /// How much of a started call's input the model has written: a byte count, never the bytes.
+    #[serde(rename_all = "camelCase")]
+    ToolCallProgress {
+        tool_call_id: String,
+        /// Bytes of the call's input JSON written so far. Never smaller than an earlier frame's
+        /// for the same call.
+        input_bytes: u64,
+    },
+    /// One tool call's result or one hook artifact, as the model received it.
+    Artifact(StreamArtifact),
+    /// The replay this connection asked for starts later than its cursor.
+    #[serde(rename_all = "camelCase")]
+    Gap { first_available_id: u64 },
+    /// This connection lost `missed` live events, always at least 1.
+    Lagged { missed: u64 },
+    /// The first event of a `stream/watch` connection.
+    #[serde(rename_all = "camelCase")]
+    ConnectionAck {
+        role: &'static str,
+        conversation_mode: String,
+    },
+    /// The session's event stream closed while the door still serves the connection.
+    CapsuleClosed,
 }
 
-/// Format an SSE event frame with no `id:` line, for a frame that is written straight to one
-/// connection and never takes a place in the session's sequence.
-pub(crate) fn format_unnumbered_sse_event(frame: StreamFrame, data: &str) -> String {
-    let event_type = frame.wire_name();
-    format!("event: {event_type}\ndata: {data}\n\n")
-}
-
-/// The id of a frame formatted by [`format_sse_event`], read from its leading `id:` line, or
-/// `None` for a frame that carries no id.
-pub(crate) fn frame_id(frame: &str) -> Option<u64> {
-    frame.strip_prefix("id: ")?.split('\n').next()?.parse().ok()
-}
-
-/// Decide whether a live frame is written to a connection that has already written every id up
-/// to `last_written`, and advance `last_written` when it is.
-///
-/// A frame whose id is at or below `last_written` was already written by the replay (a frame
-/// emitted between subscribing and reading the buffer arrives both ways), so it is dropped. A
-/// frame with no id is always written and leaves `last_written` unchanged.
-pub(crate) fn admit_live_frame(last_written: &mut Option<u64>, frame: &str) -> bool {
-    let Some(id) = frame_id(frame) else {
-        return true;
-    };
-    if last_written.is_some_and(|written| id <= written) {
-        return false;
+impl MurmurFrame {
+    pub(crate) fn kind(&self) -> StreamFrame {
+        match self {
+            MurmurFrame::Text { .. } => StreamFrame::Text,
+            MurmurFrame::Thinking { .. } => StreamFrame::Thinking,
+            MurmurFrame::ToolCallStarted { .. } => StreamFrame::ToolCallStarted,
+            MurmurFrame::ToolCallProgress { .. } => StreamFrame::ToolCallProgress,
+            MurmurFrame::Artifact(_) => StreamFrame::Artifact,
+            MurmurFrame::Gap { .. } => StreamFrame::Gap,
+            MurmurFrame::Lagged { .. } => StreamFrame::Lagged,
+            MurmurFrame::ConnectionAck { .. } => StreamFrame::ConnectionAck,
+            MurmurFrame::CapsuleClosed => StreamFrame::CapsuleClosed,
+        }
     }
-    *last_written = Some(id);
-    true
+}
+
+/// What the stream extension says on one event: a frame, or the reopen boundary's annotation.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Extension<'a> {
+    Frame(&'a MurmurFrame),
+    Reopen { reopen: u32 },
+}
+
+/// `metadata` holding one extension payload under [`STREAM_EXTENSION_URI`].
+fn extension_metadata(extension: Extension<'_>) -> BTreeMap<&'static str, Extension<'_>> {
+    BTreeMap::from([(STREAM_EXTENSION_URI, extension)])
+}
+
+/// The one member of a `StreamResponse`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum StreamResponse<'a> {
+    Task(&'a A2aTask),
+    Message(CarrierMessage<'a>),
+    StatusUpdate(StatusUpdate<'a>),
+    ArtifactUpdate(ArtifactUpdate<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusUpdate<'a> {
+    task_id: &'a str,
+    context_id: &'a str,
+    status: &'a TaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<BTreeMap<&'static str, Extension<'a>>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactUpdate<'a> {
+    task_id: &'a str,
+    context_id: &'a str,
+    artifact: &'a A2aArtifact,
+    last_chunk: bool,
+}
+
+/// A frame that belongs to no task, carried as an agent `message` with no `contextId`: the proto
+/// requires one part, so its one text part is the frame's name.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CarrierMessage<'a> {
+    message_id: String,
+    role: Role,
+    parts: Vec<Part>,
+    metadata: BTreeMap<&'static str, Extension<'a>>,
+}
+
+fn render(response: StreamResponse<'_>) -> String {
+    serde_json::to_string(&response).expect("a StreamResponse always serializes")
+}
+
+/// A fresh `messageId`, unique within the session.
+fn message_id() -> String {
+    format!("msg_{}", uuid::Uuid::now_v7().simple())
+}
+
+/// The `task` member: how a `SendStreamingMessage` stream opens, and the whole of a refused one.
+pub(crate) fn task_result(task: &A2aTask) -> String {
+    render(StreamResponse::Task(task))
+}
+
+/// `frame` carried by a `message`, for a frame that belongs to no task.
+pub(crate) fn message_carrier(frame: &MurmurFrame) -> String {
+    render(StreamResponse::Message(CarrierMessage {
+        message_id: message_id(),
+        role: Role::Agent,
+        parts: vec![Part::text(frame.kind().wire_name())],
+        metadata: extension_metadata(Extension::Frame(frame)),
+    }))
+}
+
+/// `frame` carried by a `statusUpdate` of `task` repeating `state` with no message.
+pub(crate) fn status_carrier(task: &StreamTask, state: TaskState, frame: &MurmurFrame) -> String {
+    render(StreamResponse::StatusUpdate(StatusUpdate {
+        task_id: &task.task_id,
+        context_id: &task.context_id,
+        status: &TaskStatus::of(state),
+        metadata: Some(extension_metadata(Extension::Frame(frame))),
+    }))
+}
+
+fn status_update(task: &StreamTask, status: &TaskStatus, reopen: Option<u32>) -> String {
+    render(StreamResponse::StatusUpdate(StatusUpdate {
+        task_id: &task.task_id,
+        context_id: &task.context_id,
+        status,
+        metadata: reopen.map(|reopen| extension_metadata(Extension::Reopen { reopen })),
+    }))
+}
+
+/// A `statusUpdate` reporting `status`, and the stream end it is.
+fn status_event(task: &StreamTask, status: TaskStatus, reopen: Option<u32>) -> Draft {
+    let ends = if status.state.is_terminal() {
+        Some(StreamEnd::Terminal)
+    } else if status.state == TaskState::InputRequired {
+        Some(StreamEnd::Interrupted)
+    } else {
+        None
+    };
+    Draft {
+        task_id: task.task_id.clone(),
+        plain: Some(status_update(task, &status, None)),
+        extended: status_update(task, &status, reopen),
+        state: Some(status.state),
+        ends,
+    }
+}
+
+/// The `artifactUpdate` delivering `artifact` whole.
+pub(crate) fn artifact_update(task: &StreamTask, artifact: &A2aArtifact) -> String {
+    render(StreamResponse::ArtifactUpdate(ArtifactUpdate {
+        task_id: &task.task_id,
+        context_id: &task.context_id,
+        artifact,
+        last_chunk: true,
+    }))
+}
+
+/// An event before the buffer gives it its id.
+struct Draft {
+    task_id: String,
+    plain: Option<String>,
+    extended: String,
+    state: Option<TaskState>,
+    ends: Option<StreamEnd>,
 }
 
 /// Result of a replay request from `SseEventBuffer::replay_from`.
 pub(crate) enum ReplayResult {
-    Complete(Vec<Arc<String>>),
-    /// Frames after the cursor are no longer buffered, or the cursor was never issued by this
-    /// session. `events` is the whole buffer; callers write a gap event before it.
+    Complete(Vec<Arc<StreamEvent>>),
+    /// Events after the cursor are no longer buffered, or the cursor was never issued by this
+    /// session. `events` is the whole buffer; callers write a gap before it.
     WithGap {
         first_available_id: u64,
-        events: Vec<Arc<String>>,
+        events: Vec<Arc<StreamEvent>>,
     },
 }
 
-/// Format a gap SSE event indicating that buffered history starts at `first_available_id`.
-pub(crate) fn format_gap_event(first_available_id: u64) -> String {
-    format_unnumbered_sse_event(
-        StreamFrame::Gap,
-        &format!("{{\"first_available_id\":{first_available_id}}}"),
-    )
-}
-
-/// Format the frame telling one SSE connection it lost `missed` live frames.
-///
-/// Written straight to that connection's socket, immediately before the next live frame
-/// it receives: it carries no `id:` line, never passes through [`emit_frame`], and so
-/// consumes no event id, never appears in a replay and never reaches any other connection.
-/// `missed` is the count carried by the broadcast receiver's `RecvError::Lagged`, always at
-/// least 1.
-pub(crate) fn format_lagged_event(missed: u64) -> String {
-    format_unnumbered_sse_event(StreamFrame::Lagged, &format!("{{\"missed\":{missed}}}"))
-}
-
-/// The session's event-id sequence and a bounded ring-buffer of the most recent frames for
+/// The session's event-id sequence and a bounded ring-buffer of the most recent events for
 /// reconnect replay.
 ///
-/// One buffer serves a whole capsule session, so every numbered frame of every task takes its
-/// id from `next_id`: the first frame is `1` and each later one is exactly one higher.
+/// One buffer serves a whole capsule session, so every numbered event of every task takes its id
+/// from `next_id`: the first event is `1` and each later one is exactly one higher.
 pub(crate) struct SseEventBuffer {
-    events: VecDeque<(u64, Arc<String>)>,
+    events: VecDeque<Arc<StreamEvent>>,
     capacity: usize,
-    /// Starts at `1`, not `0`: replay writes frames with an id strictly greater than the
-    /// client's `Last-Event-ID`, and `0` is the cursor for "from the start", so a frame numbered
+    /// Starts at `1`, not `0`: replay writes events with an id strictly greater than the
+    /// client's `Last-Event-ID`, and `0` is the cursor for "from the start", so an event numbered
     /// `0` could never be replayed.
     next_id: u64,
 }
@@ -298,28 +472,35 @@ impl SseEventBuffer {
         }
     }
 
-    /// Number, format and store one frame, returning its id and the formatted text.
-    fn append(&mut self, frame: StreamFrame, data: &str) -> (u64, Arc<String>) {
+    /// Number and store one event.
+    fn append(&mut self, draft: Draft) -> Arc<StreamEvent> {
         let id = self.next_id;
         self.next_id += 1;
-        let event = Arc::new(format_sse_event(id, frame, data));
+        let event = Arc::new(StreamEvent {
+            id,
+            task_id: draft.task_id,
+            plain: draft.plain,
+            extended: draft.extended,
+            state: draft.state,
+            ends: draft.ends,
+        });
         if self.events.len() >= self.capacity {
             self.events.pop_front();
         }
-        self.events.push_back((id, Arc::clone(&event)));
-        (id, event)
+        self.events.push_back(Arc::clone(&event));
+        event
     }
 
-    /// Return the frames written after `last_id`, distinguishing a clean replay from one that
-    /// cannot be: frames after `last_id` were evicted, or `last_id` was never issued by this
+    /// Return the events written after `last_id`, distinguishing a clean replay from one that
+    /// cannot be: events after `last_id` were evicted, or `last_id` was never issued by this
     /// session. Either of those returns the whole buffer as [`ReplayResult::WithGap`].
     pub fn replay_from(&self, last_id: u64) -> ReplayResult {
-        let Some(oldest_id) = self.events.front().map(|(id, _)| *id) else {
+        let Some(oldest_id) = self.events.front().map(|event| event.id) else {
             return ReplayResult::Complete(vec![]);
         };
 
         if last_id >= self.next_id || last_id < oldest_id - 1 {
-            let events = self.events.iter().map(|(_, s)| Arc::clone(s)).collect();
+            let events = self.events.iter().cloned().collect();
             return ReplayResult::WithGap {
                 first_available_id: oldest_id,
                 events,
@@ -329,149 +510,279 @@ impl SseEventBuffer {
         let events = self
             .events
             .iter()
-            .filter(|(id, _)| *id > last_id)
-            .map(|(_, s)| Arc::clone(s))
+            .filter(|event| event.id > last_id)
+            .cloned()
             .collect();
         ReplayResult::Complete(events)
     }
 }
 
-/// Give one frame the session's next id, buffer it and broadcast it, returning the id.
+/// Give each draft the session's next id, buffer it and broadcast it, in order.
 ///
-/// The buffer lock is held across the broadcast send, so frames emitted concurrently — by the
+/// The buffer lock is held across the broadcast send, so events emitted concurrently — by the
 /// agent loop, a tool's chunk host function and a `request-input` wait — enter the buffer and
-/// reach every live receiver in id order. A send with no receivers is not an error.
-pub(crate) fn emit_frame(
-    tx: &SseBroadcast,
-    buf: &Arc<Mutex<SseEventBuffer>>,
-    frame: StreamFrame,
-    data: &str,
-) -> u64 {
-    let mut buf = buf.lock().unwrap();
-    let (id, event) = buf.append(frame, data);
-    let _ = tx.send(event);
-    id
-}
-
-/// Serialize and emit one SSE event through [`emit_frame`]. No-op when sse is None.
-pub(crate) async fn emit_sse(
-    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    frame: StreamFrame,
-    data: &impl Serialize,
-) {
-    let Some((sse_tx, sse_buffer)) = sse else {
+/// reach every live receiver in id order, and the drafts of one call take consecutive ids. A send
+/// with no receivers is not an error.
+fn publish(sink: &StreamSink, drafts: impl IntoIterator<Item = Draft>) {
+    let Some((tx, buf)) = sink else {
         return;
     };
-    let data_str = match serde_json::to_string(data) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    emit_frame(sse_tx, sse_buffer, frame, &data_str);
-}
-
-/// Whether a pre-formatted SSE event string is `task_id`'s final status: an `event: status`
-/// frame whose data carries `"final": true` and `"id"` equal to `task_id`. A `text` frame with
-/// `"final":true` (a cursor removal or the non-streaming fallback) is not, and neither is
-/// another task's final status.
-pub(crate) fn is_final_status_for(event: &str, task_id: &str) -> bool {
-    let mut is_status = false;
-    let mut data = None;
-    for line in event.lines() {
-        if line.split_once(": ") == Some(("event", StreamFrame::Status.wire_name())) {
-            is_status = true;
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            data = Some(rest);
-        }
+    let mut buf = buf
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for draft in drafts {
+        let event = buf.append(draft);
+        let _ = tx.send(event);
     }
-    if !is_status {
-        return false;
+}
+
+/// A non-terminal status of `task`: `working` with what the runtime is doing, or
+/// `input-required` with the prompt. `reopen` is the 1-based ordinal of the reopen the status
+/// announces, on the `working` status written between two attempts of one task; an activated
+/// connection reads it as `metadata[STREAM_EXTENSION_URI].reopen`.
+pub(crate) fn emit_status(
+    sink: &StreamSink,
+    task: &StreamTask,
+    state: TaskState,
+    message: &str,
+    reopen: Option<u32>,
+) {
+    publish(
+        sink,
+        [status_event(
+            task,
+            agent_status(task, state, message),
+            reopen,
+        )],
+    );
+}
+
+/// `task` stopped for input: an `input-required` status carrying `prompt`.
+pub(crate) fn emit_input_required(sink: &StreamSink, task: &StreamTask, prompt: &str) {
+    emit_status(sink, task, TaskState::InputRequired, prompt, None);
+}
+
+/// The status [`emit_input_required`] writes, as a connection writes it outside the session's
+/// sequence.
+pub(crate) fn input_required_result(task: &StreamTask, prompt: &str) -> String {
+    status_update(
+        task,
+        &agent_status(task, TaskState::InputRequired, prompt),
+        None,
+    )
+}
+
+/// A status in `state` whose message, from the agent, is `text`.
+fn agent_status(task: &StreamTask, state: TaskState, text: &str) -> TaskStatus {
+    TaskStatus {
+        state,
+        message: Some(StatusMessage {
+            message_id: message_id(),
+            context_id: task.context_id.clone(),
+            task_id: task.task_id.clone(),
+            role: Role::Agent,
+            parts: vec![Part::text(text)],
+        }),
     }
-    let Some(parsed) = data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-    else {
-        return false;
+}
+
+/// How `task` ended, exactly as `GetTask` reports it: the `response` artifact, when it has one,
+/// as an `artifactUpdate`, then its terminal status. The two take consecutive ids.
+pub(crate) fn emit_task_ending(sink: &StreamSink, task: &A2aTask) {
+    publish(sink, ending_drafts(task));
+}
+
+fn ending_drafts(task: &A2aTask) -> Vec<Draft> {
+    let stream_task = StreamTask::new(&task.id, &task.context_id);
+    let mut drafts = Vec::new();
+    if let Some(response) = task
+        .artifact(crate::a2a::RESPONSE_ARTIFACT)
+        .filter(|_| task.status.state == TaskState::Completed)
+    {
+        let update = artifact_update(&stream_task, response);
+        drafts.push(Draft {
+            task_id: task.id.clone(),
+            plain: Some(update.clone()),
+            extended: update,
+            state: None,
+            ends: None,
+        });
+    }
+    drafts.push(status_event(&stream_task, task.status.clone(), None));
+    drafts
+}
+
+/// The events a connection that lost `task`'s ending writes in its place, outside the session's
+/// sequence: what [`emit_task_ending`] writes for the same task, rendered for a connection that
+/// did not activate the extension (the two renderings are equal).
+pub(crate) fn ending_results(task: &A2aTask) -> Vec<String> {
+    ending_drafts(task)
+        .into_iter()
+        .map(|draft| draft.extended)
+        .collect()
+}
+
+/// One murmur frame of `task`, which is working: a carrier only an activated connection receives.
+pub(crate) fn emit_frame(sink: &StreamSink, task: &StreamTask, frame: MurmurFrame) {
+    publish(
+        sink,
+        [Draft {
+            task_id: task.task_id.clone(),
+            plain: None,
+            extended: status_carrier(task, TaskState::Working, &frame),
+            state: None,
+            ends: None,
+        }],
+    );
+}
+
+/// One streamed text fragment of `task`.
+pub(crate) fn emit_text(sink: &StreamSink, task: &StreamTask, text: &str, r#final: bool) {
+    emit_frame(
+        sink,
+        task,
+        MurmurFrame::Text {
+            text: text.to_string(),
+            r#final,
+        },
+    );
+}
+
+/// One streamed reasoning fragment of `task`.
+pub(crate) fn emit_thinking(sink: &StreamSink, task: &StreamTask, text: &str) {
+    emit_frame(
+        sink,
+        task,
+        MurmurFrame::Thinking {
+            text: text.to_string(),
+            r#final: false,
+        },
+    );
+}
+
+/// The extended `result` of every event the buffer holds, in order, for tests reading what a task
+/// wrote.
+#[cfg(test)]
+pub(crate) fn buffered(buffer: &Mutex<SseEventBuffer>) -> Vec<serde_json::Value> {
+    let events = match buffer.lock().unwrap().replay_from(0) {
+        ReplayResult::Complete(events) | ReplayResult::WithGap { events, .. } => events,
     };
-    parsed.get("final") == Some(&serde_json::Value::Bool(true))
-        && parsed.get("id").and_then(serde_json::Value::as_str) == Some(task_id)
+    events
+        .iter()
+        .map(|event| serde_json::from_str(&event.extended).unwrap())
+        .collect()
 }
 
-/// Emit one text chunk SSE event (synchronous, for use in `func_wrap` callbacks).
-///
-/// Wire format:
-///   event: text
-///   data: {"id":"<task_id>","text":"<chunk>","final":false}
-pub(crate) fn emit_chunk_sse(
-    tx: &SseBroadcast,
-    buf: &Arc<Mutex<SseEventBuffer>>,
-    task_id: &str,
-    chunk: &str,
-) {
-    emit_frame(
-        tx,
-        buf,
-        StreamFrame::Text,
-        &format_text_sse_data(task_id, chunk, false),
-    );
+/// What a `StreamResponse` is: its murmur frame's name, or its member's (`task`, `message`,
+/// `status-update`, `artifact-update`).
+#[cfg(test)]
+pub(crate) fn event_kind(result: &serde_json::Value) -> String {
+    let (member, body) = result
+        .as_object()
+        .and_then(|object| object.iter().next())
+        .expect("a StreamResponse has one member");
+    if let Some(frame) = body["metadata"][STREAM_EXTENSION_URI]["frame"].as_str() {
+        return frame.to_string();
+    }
+    match member.as_str() {
+        "statusUpdate" => "status-update".to_string(),
+        "artifactUpdate" => "artifact-update".to_string(),
+        other => other.to_string(),
+    }
 }
 
-/// Emit one thinking chunk SSE event (synchronous).
-///
-/// Wire format:
-///   event: thinking
-///   data: {"id":"<task_id>","text":"<chunk>","final":false}
-pub(crate) fn emit_thinking_chunk_sse(
-    tx: &SseBroadcast,
-    buf: &Arc<Mutex<SseEventBuffer>>,
-    task_id: &str,
-    chunk: &str,
-) {
-    emit_frame(
-        tx,
-        buf,
-        StreamFrame::Thinking,
-        &format_text_sse_data(task_id, chunk, false),
-    );
-}
-
-/// Emit a final text SSE event (synchronous) — either cursor-removal (empty text) or
-/// full-text fallback for non-streaming drivers.
-///
-/// Wire format:
-///   event: text
-///   data: {"id":"<task_id>","text":"<text>","final":true}
-pub(crate) fn emit_chunk_sse_final(
-    tx: &SseBroadcast,
-    buf: &Arc<Mutex<SseEventBuffer>>,
-    task_id: &str,
-    text: &str,
-) {
-    emit_frame(
-        tx,
-        buf,
-        StreamFrame::Text,
-        &format_text_sse_data(task_id, text, true),
-    );
-}
-
-fn format_text_sse_data(task_id: &str, text: &str, is_final: bool) -> String {
-    let text_json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
-    format!(r#"{{"id":"{task_id}","text":{text_json},"final":{is_final}}}"#)
+/// The murmur frame `result` carries, or `null`.
+#[cfg(test)]
+pub(crate) fn frame_of(result: &serde_json::Value) -> serde_json::Value {
+    let body = result.as_object().and_then(|object| object.values().next());
+    body.map(|body| body["metadata"][STREAM_EXTENSION_URI].clone())
+        .filter(|frame| frame.get("frame").is_some())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
     use super::*;
 
-    fn frame_json(artifact: StreamArtifact) -> String {
-        serde_json::to_string(&TaskArtifactUpdateEvent {
-            id: "task_1".into(),
-            artifact,
-        })
-        .unwrap()
+    fn task() -> StreamTask {
+        StreamTask::new("tsk_1", "ctx_1")
+    }
+
+    fn payload(frame: &MurmurFrame) -> String {
+        serde_json::to_string(frame).unwrap()
+    }
+
+    fn sink(capacity: usize) -> (StreamSink, broadcast::Receiver<Arc<StreamEvent>>) {
+        let (tx, rx) = broadcast::channel(capacity);
+        let buf = Arc::new(Mutex::new(SseEventBuffer::new(capacity)));
+        (Some((tx, buf)), rx)
+    }
+
+    fn buffer_of(sink: &StreamSink) -> &Arc<Mutex<SseEventBuffer>> {
+        &sink.as_ref().unwrap().1
+    }
+
+    #[test]
+    fn every_frame_payload_puts_frame_first_then_its_keys_in_order() {
+        let cases = [
+            (
+                MurmurFrame::Text {
+                    text: "Hel".into(),
+                    r#final: false,
+                },
+                r#"{"frame":"text","text":"Hel","final":false}"#,
+            ),
+            (
+                MurmurFrame::Thinking {
+                    text: "hmm".into(),
+                    r#final: false,
+                },
+                r#"{"frame":"thinking","text":"hmm","final":false}"#,
+            ),
+            (
+                MurmurFrame::ToolCallStarted {
+                    tool_call_id: "call_1".into(),
+                    tool_name: "write_file".into(),
+                },
+                r#"{"frame":"tool-call-started","toolCallId":"call_1","toolName":"write_file"}"#,
+            ),
+            (
+                MurmurFrame::ToolCallProgress {
+                    tool_call_id: "call_1".into(),
+                    input_bytes: 3172,
+                },
+                r#"{"frame":"tool-call-progress","toolCallId":"call_1","inputBytes":3172}"#,
+            ),
+            (
+                MurmurFrame::Gap {
+                    first_available_id: 42,
+                },
+                r#"{"frame":"gap","firstAvailableId":42}"#,
+            ),
+            (
+                MurmurFrame::Lagged { missed: 7 },
+                r#"{"frame":"lagged","missed":7}"#,
+            ),
+            (
+                MurmurFrame::ConnectionAck {
+                    role: "observer",
+                    conversation_mode: "stateless".into(),
+                },
+                r#"{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}"#,
+            ),
+            (MurmurFrame::CapsuleClosed, r#"{"frame":"capsule-closed"}"#),
+        ];
+        for (frame, expected) in cases {
+            assert_eq!(payload(&frame), expected);
+            assert!(expected.contains(&format!("\"frame\":\"{}\"", frame.kind().wire_name())));
+        }
     }
 
     #[test]
     fn tool_call_frame_serializes_every_key_in_declaration_order() {
-        let json = frame_json(StreamArtifact::tool_call(
+        let json = payload(&MurmurFrame::Artifact(StreamArtifact::tool_call(
             "bash".into(),
             "hello".into(),
             Some("tool:bash".into()),
@@ -480,52 +791,20 @@ mod tests {
             12,
             Some(0),
             false,
-        ));
+        )));
         assert_eq!(
             json,
-            r#"{"id":"task_1","artifact":{"tool_name":"bash","content":"hello","fence_source":"tool:bash","tool_call_id":"call_1","is_error":false,"duration_ms":12,"exit_code":0,"truncated":false}}"#
+            r#"{"frame":"artifact","toolName":"bash","content":"hello","fenceSource":"tool:bash","toolCallId":"call_1","isError":false,"durationMs":12,"exitCode":0,"truncated":false}"#
         );
     }
 
-    #[test]
-    fn tool_call_started_frame_serializes_every_key_in_declaration_order() {
-        let json = serde_json::to_string(&TaskToolCallStartedEvent {
-            id: "task_1".into(),
-            tool_call_id: "call_1".into(),
-            tool_name: "write_file".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            json,
-            r#"{"id":"task_1","tool_call_id":"call_1","tool_name":"write_file"}"#
-        );
-        assert_eq!(
-            format_sse_event(7, StreamFrame::ToolCallStarted, &json),
-            "id: 7\nevent: tool-call-started\ndata: {\"id\":\"task_1\",\"tool_call_id\":\"call_1\",\"tool_name\":\"write_file\"}\n\n"
-        );
-    }
-
-    #[test]
-    fn tool_call_progress_frame_serializes_every_key_in_declaration_order() {
-        let json = serde_json::to_string(&TaskToolCallProgressEvent {
-            id: "task_1".into(),
-            tool_call_id: "call_1".into(),
-            input_bytes: 3172,
-        })
-        .unwrap();
-        assert_eq!(
-            json,
-            r#"{"id":"task_1","tool_call_id":"call_1","input_bytes":3172}"#
-        );
-        assert_eq!(
-            format_sse_event(8, StreamFrame::ToolCallProgress, &json),
-            "id: 8\nevent: tool-call-progress\ndata: {\"id\":\"task_1\",\"tool_call_id\":\"call_1\",\"input_bytes\":3172}\n\n"
-        );
+    fn artifact_json(artifact: StreamArtifact) -> String {
+        payload(&MurmurFrame::Artifact(artifact))
     }
 
     #[test]
     fn tool_call_frame_passes_truncated_through() {
-        let json = frame_json(StreamArtifact::tool_call(
+        let json = artifact_json(StreamArtifact::tool_call(
             "read".into(),
             "partial".into(),
             None,
@@ -540,7 +819,7 @@ mod tests {
 
     #[test]
     fn tool_call_frame_keeps_the_exit_code_key_with_or_without_a_subprocess() {
-        let ran = frame_json(StreamArtifact::tool_call(
+        let ran = artifact_json(StreamArtifact::tool_call(
             "bash".into(),
             String::new(),
             None,
@@ -550,10 +829,10 @@ mod tests {
             Some(2),
             false,
         ));
-        assert!(ran.contains(r#""exit_code":2"#), "{ran}");
-        assert!(ran.contains(r#""is_error":true"#), "{ran}");
+        assert!(ran.contains(r#""exitCode":2"#), "{ran}");
+        assert!(ran.contains(r#""isError":true"#), "{ran}");
 
-        let none = frame_json(StreamArtifact::tool_call(
+        let none = artifact_json(StreamArtifact::tool_call(
             "write-file".into(),
             String::new(),
             None,
@@ -563,12 +842,12 @@ mod tests {
             None,
             false,
         ));
-        assert!(none.contains(r#""exit_code":null"#), "{none}");
+        assert!(none.contains(r#""exitCode":null"#), "{none}");
     }
 
     #[test]
     fn tool_call_frame_records_an_empty_provider_id_as_null() {
-        let empty = frame_json(StreamArtifact::tool_call(
+        let empty = artifact_json(StreamArtifact::tool_call(
             "bash".into(),
             String::new(),
             None,
@@ -578,9 +857,9 @@ mod tests {
             None,
             false,
         ));
-        assert!(empty.contains(r#""tool_call_id":null"#), "{empty}");
+        assert!(empty.contains(r#""toolCallId":null"#), "{empty}");
 
-        let issued = frame_json(StreamArtifact::tool_call(
+        let issued = artifact_json(StreamArtifact::tool_call(
             "bash".into(),
             String::new(),
             None,
@@ -590,38 +869,239 @@ mod tests {
             None,
             false,
         ));
-        assert!(issued.contains(r#""tool_call_id":"toolu_01""#), "{issued}");
+        assert!(issued.contains(r#""toolCallId":"toolu_01""#), "{issued}");
     }
 
     #[test]
     fn hook_frame_reports_no_call_behind_it() {
-        let json = frame_json(StreamArtifact::hook(
-            "my-hook".into(),
-            r#"{"reviewed":true}"#.into(),
-        ));
         assert_eq!(
-            json,
-            r#"{"id":"task_1","artifact":{"tool_name":"my-hook","content":"{\"reviewed\":true}","fence_source":null,"tool_call_id":null,"is_error":false,"duration_ms":null,"exit_code":null,"truncated":false}}"#
+            artifact_json(StreamArtifact::hook(
+                "my-hook".into(),
+                r#"{"reviewed":true}"#.into(),
+            )),
+            r#"{"frame":"artifact","toolName":"my-hook","content":"{\"reviewed\":true}","fenceSource":null,"toolCallId":null,"isError":false,"durationMs":null,"exitCode":null,"truncated":false}"#
         );
     }
 
     #[test]
-    fn format_sse_event_produces_correct_frame() {
-        let out = format_sse_event(3, StreamFrame::Status, r#"{"id":"x"}"#);
-        assert_eq!(out, "id: 3\nevent: status\ndata: {\"id\":\"x\"}\n\n");
+    fn a_task_frame_is_a_working_status_update_carrying_it_under_the_uri() {
+        let carrier: Value = serde_json::from_str(&status_carrier(
+            &task(),
+            TaskState::Working,
+            &MurmurFrame::Text {
+                text: "Hel".into(),
+                r#final: false,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            carrier,
+            json!({"statusUpdate": {
+                "taskId": "tsk_1",
+                "contextId": "ctx_1",
+                "status": {"state": "TASK_STATE_WORKING"},
+                "metadata": {STREAM_EXTENSION_URI: {"frame": "text", "text": "Hel", "final": false}},
+            }})
+        );
     }
 
-    /// A buffer of `capacity` holding `count` frames, ids `1..=count`, each frame's data its id.
+    #[test]
+    fn a_frame_of_no_task_is_an_agent_message_named_after_it() {
+        let carrier: Value =
+            serde_json::from_str(&message_carrier(&MurmurFrame::CapsuleClosed)).unwrap();
+        let message = &carrier["message"];
+        let id = message["messageId"].as_str().unwrap();
+        assert!(id.starts_with("msg_") && id.len() == 36, "{id}");
+        assert_eq!(message["role"], "ROLE_AGENT");
+        assert_eq!(
+            message["parts"],
+            json!([{"text": "capsule-closed", "mediaType": "text/plain"}])
+        );
+        assert_eq!(
+            message["metadata"],
+            json!({STREAM_EXTENSION_URI: {"frame": "capsule-closed"}})
+        );
+        assert!(message.get("contextId").is_none());
+    }
+
+    #[test]
+    fn sse_event_is_a_json_rpc_response_with_no_event_line() {
+        assert_eq!(
+            sse_event(Some(3), "\"req-7\"", "{\"task\":{}}"),
+            "id: 3\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"req-7\",\"result\":{\"task\":{}}}\n\n"
+        );
+        assert_eq!(
+            sse_event(None, "9", "{}"),
+            "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n\n"
+        );
+    }
+
+    #[test]
+    fn a_status_message_names_its_task_and_a_fresh_message_id() {
+        let (sink, _rx) = sink(8);
+        emit_status(&sink, &task(), TaskState::Working, "inference turn 1", None);
+        emit_status(&sink, &task(), TaskState::Working, "inference turn 2", None);
+        let events = buffered(buffer_of(&sink));
+        let status = &events[0]["statusUpdate"]["status"];
+        assert_eq!(status["state"], "TASK_STATE_WORKING");
+        let message = &status["message"];
+        assert_eq!(message["taskId"], "tsk_1");
+        assert_eq!(message["contextId"], "ctx_1");
+        assert_eq!(message["role"], "ROLE_AGENT");
+        assert_eq!(
+            message["parts"],
+            json!([{"text": "inference turn 1", "mediaType": "text/plain"}])
+        );
+        assert_ne!(
+            message["messageId"],
+            events[1]["statusUpdate"]["status"]["message"]["messageId"]
+        );
+        assert!(events[0]["statusUpdate"].get("metadata").is_none());
+    }
+
+    #[test]
+    fn only_the_reopen_boundary_is_annotated_and_only_for_an_activated_connection() {
+        let (sink, _rx) = sink(8);
+        emit_status(
+            &sink,
+            &task(),
+            TaskState::Working,
+            "reopened by hook h",
+            Some(2),
+        );
+        let buffer = buffer_of(&sink).lock().unwrap();
+        let ReplayResult::Complete(events) = buffer.replay_from(0) else {
+            panic!("gap");
+        };
+        let plain: Value = serde_json::from_str(events[0].result(false).unwrap()).unwrap();
+        let extended: Value = serde_json::from_str(events[0].result(true).unwrap()).unwrap();
+        assert!(plain["statusUpdate"].get("metadata").is_none());
+        assert_eq!(
+            extended["statusUpdate"]["metadata"],
+            json!({STREAM_EXTENSION_URI: {"reopen": 2}})
+        );
+        assert_eq!(
+            plain["statusUpdate"]["status"],
+            extended["statusUpdate"]["status"]
+        );
+    }
+
+    #[test]
+    fn a_murmur_frame_reaches_only_an_activated_connection() {
+        let (sink, _rx) = sink(8);
+        emit_text(&sink, &task(), "hi", false);
+        let buffer = buffer_of(&sink).lock().unwrap();
+        let ReplayResult::Complete(events) = buffer.replay_from(0) else {
+            panic!("gap");
+        };
+        assert_eq!(events[0].result(false), None);
+        assert!(events[0].result(true).is_some());
+        assert_eq!(events[0].ends, None);
+        assert_eq!(events[0].state, None);
+    }
+
+    fn ended(state: TaskState, response: Option<&str>) -> A2aTask {
+        A2aTask {
+            id: "tsk_1".into(),
+            context_id: "ctx_1".into(),
+            status: TaskStatus {
+                state,
+                message: Some(StatusMessage::agent("tsk_1", "ctx_1", "session ended")),
+            },
+            artifacts: response.map(|response| {
+                vec![A2aArtifact::named(
+                    crate::a2a::RESPONSE_ARTIFACT,
+                    vec![Part::text(response)],
+                )]
+            }),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn a_completed_ending_is_its_response_then_its_status_with_consecutive_ids() {
+        let (sink, _rx) = sink(8);
+        emit_status(&sink, &task(), TaskState::Working, "inference turn 1", None);
+        emit_task_ending(&sink, &ended(TaskState::Completed, Some("four")));
+        let buffer = buffer_of(&sink).lock().unwrap();
+        let ReplayResult::Complete(events) = buffer.replay_from(0) else {
+            panic!("gap");
+        };
+        assert_eq!(
+            events.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let artifact: Value = serde_json::from_str(events[1].result(false).unwrap()).unwrap();
+        assert_eq!(
+            artifact,
+            json!({"artifactUpdate": {
+                "taskId": "tsk_1",
+                "contextId": "ctx_1",
+                "artifact": {
+                    "artifactId": "response",
+                    "name": "response",
+                    "parts": [{"text": "four", "mediaType": "text/plain"}],
+                },
+                "lastChunk": true,
+            }})
+        );
+        assert_eq!(events[1].ends, None);
+        let status: Value = serde_json::from_str(events[2].result(false).unwrap()).unwrap();
+        assert_eq!(
+            status["statusUpdate"]["status"],
+            serde_json::to_value(&ended(TaskState::Completed, Some("four")).status).unwrap()
+        );
+        assert_eq!(events[2].ends, Some(StreamEnd::Terminal));
+        assert_eq!(events[2].state, Some(TaskState::Completed));
+    }
+
+    #[test]
+    fn an_ending_without_a_response_is_its_status_alone() {
+        for state in [TaskState::Failed, TaskState::Canceled, TaskState::Rejected] {
+            let results = ending_results(&ended(state.clone(), None));
+            assert_eq!(results.len(), 1, "{state:?}");
+            assert!(results[0].starts_with("{\"statusUpdate\""));
+        }
+        assert_eq!(ending_results(&ended(TaskState::Completed, None)).len(), 1);
+    }
+
+    #[test]
+    fn input_required_interrupts_with_the_prompt_as_its_message() {
+        let (sink, _rx) = sink(8);
+        emit_input_required(&sink, &task(), "Which file?");
+        let buffer = buffer_of(&sink).lock().unwrap();
+        let ReplayResult::Complete(events) = buffer.replay_from(0) else {
+            panic!("gap");
+        };
+        assert_eq!(events[0].ends, Some(StreamEnd::Interrupted));
+        let status: Value = serde_json::from_str(events[0].result(false).unwrap()).unwrap();
+        assert_eq!(
+            status["statusUpdate"]["status"]["state"],
+            "TASK_STATE_INPUT_REQUIRED"
+        );
+        assert_eq!(
+            status["statusUpdate"]["status"]["message"]["parts"][0]["text"],
+            "Which file?"
+        );
+    }
+
+    /// A buffer of `capacity` holding `count` events, ids `1..=count`.
     fn buffer_with(capacity: usize, count: u64) -> SseEventBuffer {
         let mut buf = SseEventBuffer::new(capacity);
         for n in 1..=count {
-            buf.append(StreamFrame::Status, &n.to_string());
+            buf.append(Draft {
+                task_id: "t".into(),
+                plain: None,
+                extended: n.to_string(),
+                state: None,
+                ends: None,
+            });
         }
         buf
     }
 
-    fn ids(events: &[Arc<String>]) -> Vec<u64> {
-        events.iter().map(|e| frame_id(e).unwrap()).collect()
+    fn ids(events: &[Arc<StreamEvent>]) -> Vec<u64> {
+        events.iter().map(|e| e.id).collect()
     }
 
     fn complete(result: ReplayResult) -> Vec<u64> {
@@ -643,15 +1123,14 @@ mod tests {
 
     #[test]
     fn ids_start_at_one_and_rise_by_one() {
-        let (tx, mut rx) = broadcast::channel(8);
-        let buf = Arc::new(Mutex::new(SseEventBuffer::new(8)));
-        assert_eq!(emit_frame(&tx, &buf, StreamFrame::Status, "{}"), 1);
-        emit_chunk_sse(&tx, &buf, "t", "a");
-        emit_thinking_chunk_sse(&tx, &buf, "t", "b");
-        emit_chunk_sse_final(&tx, &buf, "t", "");
-        assert_eq!(emit_frame(&tx, &buf, StreamFrame::Artifact, "{}"), 5);
+        let (sink, mut rx) = sink(8);
+        emit_status(&sink, &task(), TaskState::Working, "inference turn 1", None);
+        emit_text(&sink, &task(), "a", false);
+        emit_thinking(&sink, &task(), "b");
+        emit_text(&sink, &task(), "", true);
+        emit_task_ending(&sink, &ended(TaskState::Failed, None));
         let received: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|e| frame_id(&e).unwrap())
+            .map(|e| e.id)
             .collect();
         assert_eq!(received, vec![1, 2, 3, 4, 5]);
     }
@@ -665,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_from_zero_without_eviction_is_every_frame() {
+    fn replay_from_zero_without_eviction_is_every_event() {
         let buf = buffer_with(8, 5);
         assert_eq!(complete(buf.replay_from(0)), vec![1, 2, 3, 4, 5]);
         assert_eq!(complete(buf.replay_from(3)), vec![4, 5]);
@@ -696,26 +1175,25 @@ mod tests {
         const THREADS: u64 = 8;
         const PER_THREAD: u64 = 200;
         let total = THREADS * PER_THREAD;
-        let (tx, mut rx) = broadcast::channel(total as usize);
-        let buf = Arc::new(Mutex::new(SseEventBuffer::new(total as usize)));
+        let (sink, mut rx) = sink(total as usize);
         std::thread::scope(|scope| {
             for t in 0..THREADS {
-                let (tx, buf) = (tx.clone(), Arc::clone(&buf));
+                let sink = sink.clone();
                 scope.spawn(move || {
                     for _ in 0..PER_THREAD {
                         if t % 2 == 0 {
-                            emit_chunk_sse(&tx, &buf, "t", "x");
+                            emit_text(&sink, &task(), "x", false);
                         } else {
-                            emit_frame(&tx, &buf, StreamFrame::Status, "{}");
+                            emit_status(&sink, &task(), TaskState::Working, "w", None);
                         }
                     }
                 });
             }
         });
 
-        let buffered = complete(buf.lock().unwrap().replay_from(0));
+        let buffered = complete(buffer_of(&sink).lock().unwrap().replay_from(0));
         let received: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|e| frame_id(&e).unwrap())
+            .map(|e| e.id)
             .collect();
         let expected: Vec<u64> = (1..=total).collect();
         assert_eq!(buffered, expected, "buffer order is id order");
@@ -723,57 +1201,21 @@ mod tests {
     }
 
     #[test]
-    fn frame_id_reads_the_leading_id_line() {
-        assert_eq!(frame_id("id: 42\nevent: status\ndata: {}\n\n"), Some(42));
-        assert_eq!(frame_id("event: gap\ndata: {}\n\n"), None);
-        assert_eq!(frame_id(":heartbeat\n\n"), None);
-    }
-
-    #[test]
-    fn live_frames_already_replayed_are_dropped() {
-        let frame = |id| format_sse_event(id, StreamFrame::Status, "{}");
-        let mut last = Some(3);
-        assert!(!admit_live_frame(&mut last, &frame(2)));
-        assert!(!admit_live_frame(&mut last, &frame(3)));
-        assert!(admit_live_frame(&mut last, &frame(4)));
-        assert_eq!(last, Some(4));
-        assert!(
-            !admit_live_frame(&mut last, &frame(4)),
-            "an id is written once"
+    fn event_kind_names_the_frame_or_the_member() {
+        let text = status_carrier(
+            &task(),
+            TaskState::Working,
+            &MurmurFrame::Text {
+                text: String::new(),
+                r#final: true,
+            },
         );
-        assert!(admit_live_frame(&mut last, &format_gap_event(1)));
-        assert_eq!(last, Some(4), "a frame without an id leaves the cursor");
-
-        let mut fresh = None;
-        assert!(admit_live_frame(&mut fresh, &frame(1)));
-        assert_eq!(fresh, Some(1));
-    }
-
-    #[test]
-    fn unnumbered_frame_has_no_id_line() {
-        let out = format_unnumbered_sse_event(StreamFrame::Status, r#"{"id":"x"}"#);
-        assert_eq!(out, "event: status\ndata: {\"id\":\"x\"}\n\n");
-        assert_eq!(frame_id(&out), None);
-    }
-
-    #[test]
-    fn format_gap_event_has_correct_shape() {
-        let s = format_gap_event(42);
-        assert!(s.contains("event: gap\n"), "missing event field");
-        assert!(s.contains("\"first_available_id\":42"), "missing id field");
-        assert!(s.ends_with("\n\n"), "missing double newline terminator");
-    }
-
-    #[test]
-    fn format_lagged_event_has_exact_wire_form() {
-        let s = format_lagged_event(7);
-        assert_eq!(s, "event: lagged\ndata: {\"missed\":7}\n\n");
-        let data = s
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .expect("data line");
-        let parsed: serde_json::Value = serde_json::from_str(data).expect("data is JSON");
-        assert_eq!(parsed, serde_json::json!({"missed": 7}));
+        assert_eq!(event_kind(&serde_json::from_str(&text).unwrap()), "text");
+        let status = status_update(&task(), &TaskStatus::of(TaskState::Working), None);
+        assert_eq!(
+            event_kind(&serde_json::from_str(&status).unwrap()),
+            "status-update"
+        );
     }
 
     /// One non-comment production line of a file under `src/`, other than a `*_tests.rs` file.
@@ -817,41 +1259,20 @@ mod tests {
         out
     }
 
-    /// Whether a source line writes an `event:` line itself: a string literal that opens with one,
-    /// or one that carries one after a newline escape.
-    fn writes_event_line(line: &str) -> bool {
-        line.contains("\"event: ") || line.contains("\\nevent: ")
-    }
-
+    /// No event a connection writes has an `event:` line: a v1.0 client reads every `data:` line
+    /// as a JSON-RPC response, and a browser `EventSource` delivers only unnamed events to
+    /// `onmessage`.
     #[test]
-    fn stream_frame_writers_all_go_through_the_enum() {
-        let mut bypasses = Vec::new();
-        let mut formatters = Vec::new();
-        for line in production_code() {
-            if !writes_event_line(&line.code) {
-                continue;
-            }
-            let is_formatter = line.file == "streaming.rs"
-                && matches!(
-                    line.item.as_str(),
-                    "format_sse_event" | "format_unnumbered_sse_event"
-                );
-            if is_formatter {
-                formatters.push(format!("{}:{}", line.file, line.number));
-            } else {
-                bypasses.push(format!("{}:{}: {}", line.file, line.number, line.code));
-            }
-        }
+    fn stream_frame_no_writer_names_an_event() {
+        let named: Vec<String> = production_code()
+            .into_iter()
+            .filter(|line| line.code.contains("\"event: ") || line.code.contains("\\nevent: "))
+            .map(|line| format!("{}:{}: {}", line.file, line.number, line.code))
+            .collect();
         assert!(
-            bypasses.is_empty(),
-            "frames written without StreamFrame, outside format_sse_event and \
-             format_unnumbered_sse_event:\n{}",
-            bypasses.join("\n")
-        );
-        assert_eq!(
-            formatters.len(),
-            2,
-            "one event: line in each formatter: {formatters:?}"
+            named.is_empty(),
+            "lines writing an event: line:\n{}",
+            named.join("\n")
         );
     }
 
@@ -864,15 +1285,12 @@ mod tests {
         let mut uncarried = Vec::new();
         for line in production_code() {
             let methods: &[DoorMethod] = match (line.file.as_str(), line.item.as_str()) {
-                ("streaming.rs", "impl StreamFrame" | "wire_name")
-                | ("identity.rs", "writes_frame") => continue,
-                ("identity.rs", "handle_message_stream" | "format_rejected_event") => {
-                    &[DoorMethod::SendStreamingMessage]
-                }
+                ("streaming.rs", _) | ("identity.rs", "writes_frame") => continue,
+                ("identity.rs", "handle_message_stream") => &[DoorMethod::SendStreamingMessage],
                 ("identity.rs", "handle_stream_watch") => &[DoorMethod::StreamWatch],
                 _ => &[DoorMethod::SendStreamingMessage, DoorMethod::StreamWatch],
             };
-            let named = line.code.split("StreamFrame::").skip(1).map(|rest| {
+            let named = line.code.split("MurmurFrame::").skip(1).map(|rest| {
                 rest.split(|c: char| !c.is_alphanumeric())
                     .next()
                     .unwrap_or("")
@@ -909,35 +1327,5 @@ mod tests {
         let names: std::collections::BTreeSet<&str> =
             StreamFrame::ALL.iter().map(|f| f.wire_name()).collect();
         assert_eq!(names.len(), StreamFrame::ALL.len());
-    }
-
-    #[test]
-    fn is_final_status_for_matches_only_this_tasks_final_status() {
-        let status_final = "id: 5\nevent: status\ndata: {\"id\":\"x\",\"final\":true}\n\n";
-        let other_final = "id: 6\nevent: status\ndata: {\"id\":\"xy\",\"final\":true}\n\n";
-        let text_final =
-            "id: 3\nevent: text\ndata: {\"id\":\"x\",\"text\":\"\",\"final\":true}\n\n";
-        let status_nonfinal = "id: 1\nevent: status\ndata: {\"id\":\"x\",\"final\":false}\n\n";
-
-        assert!(
-            is_final_status_for(status_final, "x"),
-            "this task's final status is terminal"
-        );
-        assert!(
-            !is_final_status_for(other_final, "x"),
-            "another task's final status is not this task's end, even when its id contains this one"
-        );
-        assert!(
-            !is_final_status_for(status_final, "xy"),
-            "an id that only contains the frame's id does not match it"
-        );
-        assert!(
-            !is_final_status_for(text_final, "x"),
-            "text:final:true is not terminal"
-        );
-        assert!(
-            !is_final_status_for(status_nonfinal, "x"),
-            "status:final:false is not terminal"
-        );
     }
 }

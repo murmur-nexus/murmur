@@ -15,7 +15,7 @@ mod common;
 use std::{
     collections::HashSet,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -475,43 +475,28 @@ impl Stream {
         Self { reader }
     }
 
-    /// Every `(event, data)` pair the connection carried, read until it closed.
-    fn frames(&mut self) -> Vec<(String, Value)> {
-        let mut frames = Vec::new();
-        let mut current = String::new();
-        loop {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => break,
-                Err(error) => panic!("the SSE connection errored instead of closing: {error}"),
-                Ok(_) => {}
-            }
-            let line = line.trim_end_matches(['\n', '\r']).to_string();
-            if let Some(rest) = line.strip_prefix("event: ") {
-                current = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("data: ") {
-                if let Ok(data) = serde_json::from_str::<Value>(rest) {
-                    frames.push((current.clone(), data));
-                }
-            }
+    /// Every event the connection carried, read until it closed.
+    fn frames(&mut self) -> Vec<common::stream::Event> {
+        let mut body = String::new();
+        if let Err(error) = self.reader.read_to_string(&mut body) {
+            panic!("the SSE connection errored instead of closing: {error}");
         }
-        frames
+        common::stream::parse(&body)
     }
 }
 
-/// The one `"final":true` status frame a stream carried, asserting it is the only one.
-fn only_terminal_status(frames: &[(String, Value)]) -> Value {
-    let terminal: Vec<&Value> = frames
+/// The body of the one terminal `statusUpdate` a stream carried, asserting it is the only one.
+fn only_terminal_status(frames: &[common::stream::Event]) -> Value {
+    let terminal: Vec<&common::stream::Event> = frames
         .iter()
-        .filter(|(event, data)| event == "status" && data["final"] == json!(true))
-        .map(|(_, data)| data)
+        .filter(|event| event.is_terminal_status())
         .collect();
     assert_eq!(
         terminal.len(),
         1,
         "exactly one terminal status per attempt; got {frames:#?}"
     );
-    terminal[0].clone()
+    terminal[0].result()["statusUpdate"].clone()
 }
 
 // ── Reading the trace and the harness ─────────────────────────────────────────
@@ -558,7 +543,7 @@ impl Capsule {
     }
 
     /// The id of the task the trace's first `task_start` names: the task a `SendStreamingMessage`
-    /// started, whose stream reports no id until its first frame.
+    /// started, read here off the trace by a test that is not reading the stream.
     fn active_task_id(&self) -> String {
         let events = self.wait_for_trace("a task to start", |events| {
             events.iter().any(|e| e["event_type"] == "task_start")
@@ -734,8 +719,10 @@ fn s2_a_harness_that_ignores_the_interrupt_is_killed_after_the_grace() {
         "the harness was killed without being given its grace: {took:?}"
     );
     common::assert_dead_within(pid, REAPED_WITHIN);
-    assert_eq!(status["status"]["state"], "canceled", "{status}");
-    let message = status["status"]["message"].as_str().unwrap();
+    assert_eq!(status["status"]["state"], "TASK_STATE_CANCELED", "{status}");
+    let message = status["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
     assert!(message.contains("the harness was killed"), "{message}");
 
     capsule.wait_for_trace("the cancelled task's records", |events| {
@@ -807,9 +794,9 @@ fn s3_a_harness_interrupted_by_sigint_stops() {
         "the signal was waited out rather than honoured: {took:?}"
     );
     common::assert_dead_within(pid, REAPED_WITHIN);
-    assert_eq!(status["status"]["state"], "canceled", "{status}");
+    assert_eq!(status["status"]["state"], "TASK_STATE_CANCELED", "{status}");
     assert_eq!(
-        status["status"]["message"], "task canceled",
+        status["status"]["message"]["parts"][0]["text"], "task canceled",
         "a harness that stopped when it was asked leaves the http path's message: {status}"
     );
 
@@ -847,8 +834,10 @@ fn s4_a_driver_declaring_unsupported_has_its_harness_killed_at_once() {
         "a driver with no graceful interrupt spends no grace: {took:?}"
     );
     common::assert_dead_within(pid, REAPED_WITHIN);
-    assert_eq!(status["status"]["state"], "canceled", "{status}");
-    let message = status["status"]["message"].as_str().unwrap();
+    assert_eq!(status["status"]["state"], "TASK_STATE_CANCELED", "{status}");
+    let message = status["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
     assert!(
         message.contains("the harness was killed and its session may not resume cleanly"),
         "{message}"
@@ -883,16 +872,14 @@ fn s5_a_cancelled_task_writes_exactly_one_terminal_status() {
 
     let frames = stream.frames();
     let status = only_terminal_status(&frames);
-    assert_eq!(status["status"]["state"], "canceled", "{status}");
-    assert_eq!(status["context_id"], context, "{status}");
-    for (event, data) in &frames {
-        if event == "status" {
-            let state = data["status"]["state"].as_str().unwrap_or_default();
-            assert!(
-                state != "completed" && state != "failed",
-                "a stopped task is neither completed nor failed: {data}"
-            );
-        }
+    assert_eq!(status["status"]["state"], "TASK_STATE_CANCELED", "{status}");
+    assert_eq!(status["contextId"], context, "{status}");
+    for event in &frames {
+        let state = event.murmur_state().unwrap_or_default();
+        assert!(
+            state != "completed" && state != "failed",
+            "a stopped task is neither completed nor failed: {event:?}"
+        );
     }
 }
 
@@ -972,8 +959,10 @@ fn s9_an_interrupted_run_hands_the_driver_interrupted_true() {
 
     let status = only_terminal_status(&stream.frames());
     common::assert_dead_within(pid, REAPED_WITHIN);
-    assert_eq!(status["status"]["state"], "canceled", "{status}");
-    let message = status["status"]["message"].as_str().unwrap();
+    assert_eq!(status["status"]["state"], "TASK_STATE_CANCELED", "{status}");
+    let message = status["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
     assert!(
         !message.contains("E-RUN-033"),
         "a stopped task reports no turn failure: {message}"

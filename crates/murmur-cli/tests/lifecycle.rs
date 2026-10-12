@@ -4,7 +4,7 @@ mod common;
 use std::{
     collections::HashSet,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
 };
@@ -1578,13 +1578,13 @@ fn send_task(addr: &str, message_id: &str, text: &str) -> (String, String) {
 }
 
 /// Open a `SendStreamingMessage` for `text` and read it until the server closes it, returning every
-/// `status` frame's data in order. `headers_tx` fires once the response headers have arrived,
-/// which the door writes directly before it enqueues the task.
+/// event in order. `headers_tx` fires once the response headers have arrived, which the door
+/// writes once it has enqueued the task.
 fn stream_until_closed(
     addr: String,
     text: &str,
     headers_tx: std::sync::mpsc::Sender<()>,
-) -> std::thread::JoinHandle<Vec<Value>> {
+) -> std::thread::JoinHandle<Vec<common::stream::Event>> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1618,25 +1618,11 @@ fn stream_until_closed(
             }
         }
         let _ = headers_tx.send(());
-        let mut statuses = Vec::new();
-        let mut current_type = String::new();
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Err(error) => panic!("the SSE connection errored instead of closing: {error}"),
-                Ok(_) => {}
-            }
-            let line = line.trim_end_matches(['\n', '\r']);
-            if let Some(rest) = line.strip_prefix("event: ") {
-                current_type = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("data: ") {
-                if current_type == "status" {
-                    statuses.push(serde_json::from_str(rest).expect("a status frame is JSON"));
-                }
-            }
+        let mut body = String::new();
+        if let Err(error) = reader.read_to_string(&mut body) {
+            panic!("the SSE connection errored instead of closing: {error}");
         }
-        statuses
+        common::stream::parse(&body)
     })
 }
 
@@ -1703,8 +1689,6 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
     headers_rx
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("the stream was answered");
-    // The door enqueues directly after writing the headers, with no await in between.
-    std::thread::sleep(std::time::Duration::from_millis(300));
     release.send(()).unwrap();
 
     let result = handle.join().expect("launch thread should not panic");
@@ -1735,11 +1719,11 @@ fn lifecycle_a_task_queued_behind_an_exit_task_is_rejected_when_the_session_clos
 
     let final_c = statuses
         .iter()
-        .rfind(|status| status["final"] == true)
+        .rfind(|event| event.is_terminal_status())
         .unwrap_or_else(|| panic!("the stream carried no final status: {statuses:?}"));
-    assert_eq!(final_c["id"], task_c.as_str(), "{statuses:?}");
-    assert_eq!(final_c["status"]["state"], "rejected");
-    assert_eq!(final_c["status"]["message"], REJECTED_SESSION_ENDED_MESSAGE);
+    assert_eq!(final_c.task_id(), Some(task_c.as_str()), "{statuses:?}");
+    assert_eq!(final_c.state(), Some("TASK_STATE_REJECTED"));
+    assert_eq!(final_c.status_text(), Some(REJECTED_SESSION_ENDED_MESSAGE));
 
     let shown = assert_cmd::Command::cargo_bin("mur")
         .unwrap()

@@ -571,60 +571,18 @@ fn send_message(addr: &str, message_id: &str, text: &str) -> Value {
     )
 }
 
-/// Send `text` over `SendStreamingMessage` and read the connection to its end, returning the last
-/// `status` event.
+/// Send `text` over `SendStreamingMessage` and read the connection to its end, returning the
+/// `statusUpdate` it ended on: its task's terminal status.
 fn stream_message(addr: &str, message_id: &str, text: &str) -> Value {
-    let stream = TcpStream::connect(addr).expect("should connect for SSE");
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "SendStreamingMessage",
-        "params": {"message": {
-            "messageId": message_id,
-            "role": "ROLE_USER",
-            "parts": [{"text": text, "mediaType": "text/plain"}]
-        }}
-    })
-    .to_string();
-    {
-        let mut writer = &stream;
-        writer
-            .write_all(
-                format!(
-                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        let _ = writer.flush();
-    }
-    stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    let mut reader = BufReader::new(&stream);
-    let mut last_status = None;
-    let mut current_type = String::new();
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Err(error) => panic!("the SSE connection errored instead of closing: {error}"),
-            Ok(_) => {}
-        }
-        let line = line.trim_end_matches(['\n', '\r']).to_string();
-        if let Some(rest) = line.strip_prefix("event: ") {
-            current_type = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            if current_type == "status" {
-                let status: Value = serde_json::from_str(rest).unwrap();
-                let is_final = status["final"] == json!(true);
-                last_status = Some(status);
-                if is_final {
-                    break;
-                }
-            }
-        }
-    }
-    last_status.expect("the stream carried a status event")
+    let params = json!({"message": {
+        "messageId": message_id,
+        "role": "ROLE_USER",
+        "parts": [{"text": text, "mediaType": "text/plain"}]
+    }});
+    let (_, events) = common::stream::stream_message(addr, None, params, false);
+    let last = events.last().expect("the stream carried events");
+    assert!(last.is_terminal_status(), "{events:?}");
+    last.result()["statusUpdate"].clone()
 }
 
 fn wait_for_trace(path: &Path, what: &str, predicate: impl Fn(&[Value]) -> bool) -> Vec<Value> {
@@ -689,15 +647,14 @@ fn latched_session_refuses_the_next_task() {
 
     let status = stream_message(&url, "msg-2", "go again");
     println!("second task terminal status: {status}");
-    assert_eq!(status["status"]["state"], "failed", "{status}");
+    assert_eq!(status["status"]["state"], "TASK_STATE_FAILED", "{status}");
     assert!(
-        status["status"]["message"]
+        status["status"]["message"]["parts"][0]["text"]
             .as_str()
             .unwrap()
             .starts_with("spend ceiling reached:"),
         "{status}"
     );
-    assert_eq!(status["final"], json!(true));
 
     let trace = wait_for_trace(&trace_path, "the second task_end", |trace| {
         events(trace, "task_end").len() == 2

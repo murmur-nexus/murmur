@@ -16,6 +16,7 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
     StageRequest,
 };
+use common::stream::Event;
 use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, LocalRegistry};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -201,16 +202,9 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
 
 // ── SSE client helpers ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct SseEvent {
-    id: Option<u64>,
-    event_type: String,
-    data: String,
-}
-
-/// Open a SendStreamingMessage connection, optionally with Last-Event-ID, and collect all
-/// SSE events until a final=true event or timeout. Returns the collected events.
-fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration) -> Vec<SseEvent> {
+/// Open an activated `SendStreamingMessage` connection for a new task, optionally with
+/// `Last-Event-ID`, and read it to its end: the task's terminal status.
+fn collect_sse_events(addr: &str, last_event_id: Option<u64>, _timeout: Duration) -> Vec<Event> {
     let msg_id = format!(
         "stream_{}",
         std::time::SystemTime::now()
@@ -218,116 +212,29 @@ fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration)
             .map(|d| d.as_millis())
             .unwrap_or(0)
     );
-
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "SendStreamingMessage",
-        "params": {
-            "message": {
-                "messageId": msg_id,
-                "role": "ROLE_USER",
-                "parts": [{"text": "streaming test task", "mediaType": "text/plain"}]
-            }
+    let params = serde_json::json!({
+        "message": {
+            "messageId": msg_id,
+            "role": "ROLE_USER",
+            "parts": [{"text": "streaming test task", "mediaType": "text/plain"}]
         }
-    })
-    .to_string();
-
-    let mut extra_headers = String::new();
-    if let Some(last_id) = last_event_id {
-        extra_headers = format!("Last-Event-ID: {last_id}\r\n");
+    });
+    let cursor = last_event_id.map(|id| id.to_string());
+    let mut headers = vec![common::stream::extensions_header()];
+    if let Some(cursor) = cursor.as_deref() {
+        headers.push(("Last-Event-ID", cursor));
     }
+    common::stream::stream_message_with(addr, None, serde_json::json!(1), params, &headers).1
+}
 
-    let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{extra_headers}\r\n{}",
-        body.len(),
-        body
-    );
+/// Whether `event` is a `working` status.
+fn is_working(event: &Event) -> bool {
+    event.kind() == "status-update" && event.murmur_state() == Some("working")
+}
 
-    let stream = match TcpStream::connect(addr) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[streaming test] failed to connect: {e}");
-            return vec![];
-        }
-    };
-    stream.set_read_timeout(Some(timeout)).ok();
-
-    {
-        let mut writer = &stream;
-        if writer.write_all(request.as_bytes()).is_err() {
-            return vec![];
-        }
-        let _ = writer.flush();
-    }
-
-    let mut reader = BufReader::new(&stream);
-
-    // Read status line
-    let mut status_line = String::new();
-    if reader.read_line(&mut status_line).is_err() {
-        return vec![];
-    }
-
-    // Discard remaining headers
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut events = Vec::new();
-    let mut current_id: Option<u64> = None;
-    let mut current_event_type = String::new();
-    let mut current_data = String::new();
-
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Err(_) => break,
-            Ok(_) => {}
-        }
-
-        let line = line
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string();
-
-        if line.is_empty() {
-            if !current_event_type.is_empty() && !current_data.is_empty() {
-                // Only stop on status events with final:true — text events with final:true
-                // (cursor-removal / non-streaming fallback) are NOT terminal.
-                let is_terminal =
-                    current_event_type == "status" && current_data.contains("\"final\":true");
-                events.push(SseEvent {
-                    id: current_id,
-                    event_type: current_event_type.clone(),
-                    data: current_data.clone(),
-                });
-                if is_terminal {
-                    break;
-                }
-            }
-            current_id = None;
-            current_event_type.clear();
-            current_data.clear();
-        } else if let Some(rest) = line.strip_prefix("event: ") {
-            current_event_type = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            current_data = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("id: ") {
-            current_id = rest.trim().parse().ok();
-        }
-        // heartbeat comments and unknown fields are silently skipped
-    }
-
-    events
+/// Whether `event` is a `text` frame whose `final` is `last`.
+fn is_text(event: &Event, last: bool) -> bool {
+    event.kind() == "text" && event.frame()["final"] == last
 }
 
 /// Make a blocking HTTP GET request and return the response body.
@@ -389,26 +296,21 @@ fn streaming_basic_events_received() {
         "should have received SSE events; got none"
     );
 
-    let working_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "status" && e.data.contains("\"working\""))
-        .collect();
+    let working_events: Vec<_> = events.iter().filter(|e| is_working(e)).collect();
     assert!(
         !working_events.is_empty(),
         "should have at least one working status event; got events: {events:?}"
     );
 
-    let final_event = events
-        .iter()
-        .find(|e| e.event_type == "status" && e.data.contains("\"final\":true"));
+    let final_event = events.iter().find(|e| e.is_terminal_status());
     assert!(
         final_event.is_some(),
         "should have a final status event; got events: {events:?}"
     );
     assert!(
-        final_event.unwrap().data.contains("\"completed\""),
+        final_event.unwrap().murmur_state() == Some("completed"),
         "final event should have completed state; got: {:?}",
-        final_event.unwrap().data
+        final_event.unwrap()
     );
 }
 
@@ -437,36 +339,28 @@ fn streaming_tool_artifact_event() {
 
     handle.join().expect("launch thread should not panic");
 
-    let final_event = events
-        .iter()
-        .find(|e| e.event_type == "status" && e.data.contains("\"final\":true"));
+    let final_event = events.iter().find(|e| e.is_terminal_status());
     assert!(
         final_event.is_some(),
         "should have received a final status event; got events: {events:?}"
     );
     assert!(
-        final_event.unwrap().data.contains("\"completed\""),
-        "final status event should be 'completed' not 'failed'; got: {}",
-        final_event.unwrap().data
+        final_event.unwrap().murmur_state() == Some("completed"),
+        "final status event should be 'completed' not 'failed'; got: {:?}",
+        final_event.unwrap()
     );
 
-    let artifact_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "artifact")
-        .collect();
+    let artifact_events: Vec<_> = events.iter().filter(|e| e.kind() == "artifact").collect();
     assert!(
         !artifact_events.is_empty(),
         "should have at least one artifact event; got events: {events:?}"
     );
 
     let first_artifact = &artifact_events[0];
-    let parsed: Value = serde_json::from_str(&first_artifact.data)
-        .expect("artifact event data should be valid JSON");
-    let tool_name = parsed["artifact"]["tool_name"].as_str().unwrap_or("");
+    let tool_name = first_artifact.frame()["toolName"].as_str().unwrap_or("");
     assert!(
         !tool_name.is_empty(),
-        "artifact event should have non-empty tool_name; got: {}",
-        first_artifact.data
+        "artifact event should have non-empty toolName; got: {first_artifact:?}"
     );
 }
 
@@ -503,9 +397,7 @@ fn streaming_reconnect_replays_missed_events() {
     let first_event_id = first_events.iter().find_map(|e| e.id).unwrap_or(0);
 
     // Check if the final event is among first_events (session may already be complete)
-    let session_complete = first_events
-        .iter()
-        .any(|e| e.data.contains("\"final\":true"));
+    let session_complete = first_events.iter().any(Event::is_terminal_status);
 
     if !session_complete {
         // Session still running — reconnect and collect remaining events
@@ -518,18 +410,13 @@ fn streaming_reconnect_replays_missed_events() {
 
     // The primary assertion: the full event stream (first connection) received
     // at least one working event and one final event.
-    let working_count = first_events
-        .iter()
-        .filter(|e| e.event_type == "status" && e.data.contains("\"working\""))
-        .count();
+    let working_count = first_events.iter().filter(|e| is_working(e)).count();
     assert!(
         working_count >= 1,
         "should have at least one working event; got: {first_events:?}"
     );
 
-    let final_event = first_events
-        .iter()
-        .find(|e| e.event_type == "status" && e.data.contains("\"final\":true"));
+    let final_event = first_events.iter().find(|e| e.is_terminal_status());
     assert!(
         final_event.is_some(),
         "should have received final event; got: {first_events:?}"
@@ -726,10 +613,7 @@ fn streaming_text_chunks_received() {
     handle.join().expect("launch thread should not panic");
 
     // Three chunk events (final:false)
-    let chunk_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "text" && e.data.contains("\"final\":false"))
-        .collect();
+    let chunk_events: Vec<_> = events.iter().filter(|e| is_text(e, false)).collect();
     assert_eq!(
         chunk_events.len(),
         3,
@@ -737,15 +621,12 @@ fn streaming_text_chunks_received() {
     );
 
     // One cursor-removal event (final:true, empty text)
-    let text_final = events
-        .iter()
-        .find(|e| e.event_type == "text" && e.data.contains("\"final\":true"));
+    let text_final = events.iter().find(|e| is_text(e, true));
     assert!(
         text_final.is_some(),
         "expected cursor-removal text event; got events: {events:?}"
     );
-    let text_final_data: Value =
-        serde_json::from_str(&text_final.unwrap().data).expect("text event data should be JSON");
+    let text_final_data = text_final.unwrap().frame();
     assert_eq!(
         text_final_data["text"], "",
         "cursor-removal event should have empty text; got: {:?}",
@@ -753,13 +634,10 @@ fn streaming_text_chunks_received() {
     );
 
     // status:completed arrives after the final text event
-    let text_final_pos = events
-        .iter()
-        .position(|e| e.event_type == "text" && e.data.contains("\"final\":true"))
-        .unwrap();
+    let text_final_pos = events.iter().position(|e| is_text(e, true)).unwrap();
     let completed_pos = events
         .iter()
-        .position(|e| e.event_type == "status" && e.data.contains("\"completed\""))
+        .position(|e| e.is_terminal_status() && e.murmur_state() == Some("completed"))
         .expect("expected status:completed event");
     assert!(
         text_final_pos < completed_pos,
@@ -794,17 +672,14 @@ fn streaming_non_streaming_driver_fallback() {
     handle.join().expect("launch thread should not panic");
 
     // No chunk events (final:false text events)
-    let chunk_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.event_type == "text" && e.data.contains("\"final\":false"))
-        .collect();
+    let chunk_events: Vec<_> = events.iter().filter(|e| is_text(e, false)).collect();
     assert!(
         chunk_events.is_empty(),
         "non-streaming driver should not emit chunk events; got: {chunk_events:?}"
     );
 
     // Exactly one text event with final:true containing the full response text
-    let text_events: Vec<_> = events.iter().filter(|e| e.event_type == "text").collect();
+    let text_events: Vec<_> = events.iter().filter(|e| e.kind() == "text").collect();
     assert_eq!(
         text_events.len(),
         1,
@@ -812,20 +687,19 @@ fn streaming_non_streaming_driver_fallback() {
     );
     let text_event = text_events[0];
     assert!(
-        text_event.data.contains("\"final\":true"),
-        "single text event should have final:true; got: {}",
-        text_event.data
+        is_text(text_event, true),
+        "single text event should have final:true; got: {text_event:?}"
     );
-    assert!(
-        text_event.data.contains("the full response text"),
-        "text event should contain the full driver response; got: {}",
-        text_event.data
+    assert_eq!(
+        text_event.frame()["text"],
+        "the full response text",
+        "text event should contain the full driver response; got: {text_event:?}"
     );
 
     // status:completed event present
     let completed = events
         .iter()
-        .find(|e| e.event_type == "status" && e.data.contains("\"completed\""));
+        .find(|e| e.is_terminal_status() && e.murmur_state() == Some("completed"));
     assert!(
         completed.is_some(),
         "should have received status:completed event; got events: {events:?}"
@@ -863,8 +737,8 @@ fn streamed_artifact_frames(
 
     let frames: Vec<Value> = events
         .iter()
-        .filter(|e| e.event_type == "artifact")
-        .map(|e| serde_json::from_str(&e.data).expect("artifact frame data is JSON"))
+        .filter(|e| e.kind() == "artifact")
+        .map(|e| serde_json::json!({ "artifact": e.frame() }))
         .collect();
     assert!(
         !frames.is_empty(),
@@ -884,9 +758,9 @@ fn artifact_frame_names_the_fence_source_of_a_tool_result() {
     let (frames, _launched) = artifact_frames(setup_agent_project(&server.endpoint));
 
     let artifact = &frames[0]["artifact"];
-    assert_eq!(artifact["tool_name"], "bash");
+    assert_eq!(artifact["toolName"], "bash");
     assert_eq!(
-        artifact["fence_source"], "tool:bash",
+        artifact["fenceSource"], "tool:bash",
         "the frame must name the fence source; got: {artifact}"
     );
 
@@ -919,11 +793,11 @@ fn artifact_frame_of_a_dispatch_failure_carries_no_fence() {
 
     let artifact = &frames[0]["artifact"];
     assert!(
-        artifact.get("fence_source").is_some(),
+        artifact.get("fenceSource").is_some(),
         "the key is present on every frame: {artifact}"
     );
     assert!(
-        artifact["fence_source"].is_null(),
+        artifact["fenceSource"].is_null(),
         "a dispatch failure carries no fence: {artifact}"
     );
 
@@ -949,13 +823,13 @@ fn artifact_frame_of_a_skill_result_carries_no_fence() {
     ));
 
     let artifact = &frames[0]["artifact"];
-    assert_eq!(artifact["tool_name"], SKILL_NAME);
+    assert_eq!(artifact["toolName"], SKILL_NAME);
     assert!(
-        artifact.get("fence_source").is_some(),
+        artifact.get("fenceSource").is_some(),
         "the key is present on every frame: {artifact}"
     );
     assert!(
-        artifact["fence_source"].is_null(),
+        artifact["fenceSource"].is_null(),
         "a skill result carries no fence: {artifact}"
     );
     assert_eq!(
@@ -1113,10 +987,10 @@ fn tool_call_record<'a>(events: &'a [Value], tool_call_id: &str) -> &'a Value {
 /// "this runtime does not report it".
 fn assert_outcome_keys_present(artifact: &Value) {
     for key in [
-        "tool_call_id",
-        "is_error",
-        "duration_ms",
-        "exit_code",
+        "toolCallId",
+        "isError",
+        "durationMs",
+        "exitCode",
         "truncated",
     ] {
         assert!(
@@ -1137,13 +1011,13 @@ fn streaming_artifact_reports_a_successful_call() {
     assert_eq!(frames.len(), 1, "one call, one frame: {frames:?}");
     let artifact = &frames[0]["artifact"];
     assert_outcome_keys_present(artifact);
-    assert_eq!(artifact["tool_name"], SKILL_NAME);
+    assert_eq!(artifact["toolName"], SKILL_NAME);
     assert_eq!(artifact["content"], SKILL_GUIDANCE, "{artifact}");
-    assert_eq!(artifact["is_error"], false, "{artifact}");
-    assert_eq!(artifact["tool_call_id"], "toolu_ok", "{artifact}");
-    assert!(artifact["duration_ms"].is_u64(), "{artifact}");
+    assert_eq!(artifact["isError"], false, "{artifact}");
+    assert_eq!(artifact["toolCallId"], "toolu_ok", "{artifact}");
+    assert!(artifact["durationMs"].is_u64(), "{artifact}");
     assert!(
-        artifact["exit_code"].is_null(),
+        artifact["exitCode"].is_null(),
         "a skill runs no subprocess: {artifact}"
     );
     assert_eq!(artifact["truncated"], false, "{artifact}");
@@ -1151,7 +1025,7 @@ fn streaming_artifact_reports_a_successful_call() {
     let events = trace_events(&launched);
     let record = skill_call_record(&events);
     assert_eq!(record["status"], "ok", "{record}");
-    assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+    assert_eq!(record["duration_ms"], artifact["durationMs"]);
 }
 
 #[test]
@@ -1169,17 +1043,17 @@ fn streaming_artifact_reports_a_failed_call() {
     assert_eq!(frames.len(), 1, "one call, one frame: {frames:?}");
     let artifact = &frames[0]["artifact"];
     assert_outcome_keys_present(artifact);
-    assert_eq!(artifact["is_error"], true, "{artifact}");
-    assert_eq!(artifact["tool_call_id"], "toolu_missing", "{artifact}");
-    assert!(artifact["duration_ms"].is_u64(), "{artifact}");
-    assert!(artifact["exit_code"].is_null(), "{artifact}");
+    assert_eq!(artifact["isError"], true, "{artifact}");
+    assert_eq!(artifact["toolCallId"], "toolu_missing", "{artifact}");
+    assert!(artifact["durationMs"].is_u64(), "{artifact}");
+    assert!(artifact["exitCode"].is_null(), "{artifact}");
     assert_eq!(artifact["truncated"], false, "{artifact}");
 
     let events = trace_events(&launched);
     let record = tool_call_record(&events, "toolu_missing");
     assert_eq!(record["status"], "error", "{record}");
     assert_eq!(
-        record["duration_ms"], artifact["duration_ms"],
+        record["duration_ms"], artifact["durationMs"],
         "the frame and the trace carry one measurement"
     );
 }
@@ -1195,20 +1069,20 @@ fn streaming_artifact_reports_a_failed_dispatch() {
     assert_eq!(frames.len(), 1, "one call, one frame: {frames:?}");
     let artifact = &frames[0]["artifact"];
     assert_outcome_keys_present(artifact);
-    assert_eq!(artifact["tool_name"], "no-such-tool");
-    assert_eq!(artifact["is_error"], true, "{artifact}");
+    assert_eq!(artifact["toolName"], "no-such-tool");
+    assert_eq!(artifact["isError"], true, "{artifact}");
     assert_eq!(
-        artifact["tool_call_id"], "toolu_undeclared",
+        artifact["toolCallId"], "toolu_undeclared",
         "the call was made even though no tool ran: {artifact}"
     );
-    assert!(artifact["exit_code"].is_null(), "nothing ran: {artifact}");
+    assert!(artifact["exitCode"].is_null(), "nothing ran: {artifact}");
     assert_eq!(artifact["truncated"], false, "{artifact}");
-    assert!(artifact["duration_ms"].is_u64(), "{artifact}");
+    assert!(artifact["durationMs"].is_u64(), "{artifact}");
 
     let events = trace_events(&launched);
     let record = tool_call_record(&events, "toolu_undeclared");
     assert_eq!(record["status"], "error", "{record}");
-    assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+    assert_eq!(record["duration_ms"], artifact["durationMs"]);
 }
 
 #[test]
@@ -1230,7 +1104,7 @@ fn streaming_artifact_frames_carry_their_own_call_id() {
     let ids: Vec<&str> = frames
         .iter()
         .map(|frame| {
-            frame["artifact"]["tool_call_id"]
+            frame["artifact"]["toolCallId"]
                 .as_str()
                 .unwrap_or_else(|| panic!("every call frame carries an id: {frame}"))
         })
@@ -1244,9 +1118,9 @@ fn streaming_artifact_frames_carry_their_own_call_id() {
     let events = trace_events(&launched);
     for frame in &frames {
         let artifact = &frame["artifact"];
-        let id = artifact["tool_call_id"].as_str().unwrap();
+        let id = artifact["toolCallId"].as_str().unwrap();
         assert_eq!(
-            artifact["is_error"],
+            artifact["isError"],
             id == "toolu_b",
             "only the failing call's frame reports an error: {artifact}"
         );
@@ -1258,10 +1132,10 @@ fn streaming_artifact_frames_carry_their_own_call_id() {
         };
         assert_eq!(
             record["status"] == "error",
-            artifact["is_error"] == true,
+            artifact["isError"] == true,
             "one fact, two spellings: {record} vs {artifact}"
         );
-        assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+        assert_eq!(record["duration_ms"], artifact["durationMs"]);
     }
 }
 
@@ -1304,7 +1178,7 @@ fn streaming_artifact_carries_the_subprocess_exit_code() {
         .map(|frame| {
             let artifact = &frame["artifact"];
             assert_outcome_keys_present(artifact);
-            artifact["exit_code"]
+            artifact["exitCode"]
                 .as_i64()
                 .unwrap_or_else(|| panic!("a completed subprocess reports its exit: {artifact}"))
         })
@@ -1314,23 +1188,23 @@ fn streaming_artifact_carries_the_subprocess_exit_code() {
     // Calls dispatch one after another, so the n-th shell record belongs to the n-th frame.
     for (frame, shell) in frames.iter().zip(&shell_records) {
         assert_eq!(
-            frame["artifact"]["exit_code"], shell["exit_code"],
+            frame["artifact"]["exitCode"], shell["exit_code"],
             "the frame and the shell record carry one exit code: {frame} vs {shell}"
         );
     }
-    assert_eq!(frames[0]["artifact"]["tool_call_id"], "toolu_zero");
-    assert_eq!(frames[1]["artifact"]["tool_call_id"], "toolu_three");
+    assert_eq!(frames[0]["artifact"]["toolCallId"], "toolu_zero");
+    assert_eq!(frames[1]["artifact"]["toolCallId"], "toolu_three");
 
     // A command that ran to completion is a successful call whatever its exit status, so
     // `is_error` and `exit_code` are separate facts; `is_error` still agrees with the trace.
     for frame in &frames {
         let artifact = &frame["artifact"];
-        let record = tool_call_record(&events, artifact["tool_call_id"].as_str().unwrap());
+        let record = tool_call_record(&events, artifact["toolCallId"].as_str().unwrap());
         assert_eq!(
             record["status"] == "error",
-            artifact["is_error"] == true,
+            artifact["isError"] == true,
             "one fact, two spellings: {record} vs {artifact}"
         );
-        assert_eq!(record["duration_ms"], artifact["duration_ms"]);
+        assert_eq!(record["duration_ms"], artifact["durationMs"]);
     }
 }

@@ -313,8 +313,9 @@ mur watch @1
 last four characters of its session id, or reach a capsule directly with `mur watch --url localhost:$PORT`.
 
 To consume the same events from your own client, send `stream/watch` or `SendStreamingMessage` to the
-capsule's address. [Streaming Protocol](../reference/streaming-protocol.md) lists both endpoints and
-every frame they write.
+capsule's address. [Streaming Protocol](../reference/streaming-protocol.md) lists both endpoints, the
+A2A events they write, and the `A2A-Extensions` header that adds murmur's text and tool frames to a
+`SendStreamingMessage` stream.
 
 ---
 

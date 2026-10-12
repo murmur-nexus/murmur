@@ -34,7 +34,7 @@ use wasmtime_wasi_http::{
 };
 
 use crate::{
-    a2a::{IncomingTask, TaskRegistry, TaskState},
+    a2a::{A2aTask, IncomingTask, TaskRegistry, TaskState},
     agent::{self, AgentLoopExit},
     artifact::{
         check_root_wasm, extract_manifest_yaml, extract_native_binary, extract_root_wasm,
@@ -93,7 +93,8 @@ use crate::{
     state_store::STATE_PREOPEN_NAME,
     stream_events::{self, StreamEventsTarget},
     streaming::{
-        emit_sse, SseBroadcast, SseEventBuffer, StreamFrame, StreamStatus, TaskStatusUpdateEvent,
+        emit_input_required, emit_status, emit_task_ending, SseBroadcast, SseEventBuffer,
+        StreamTask,
     },
     tool_annotations::ToolAnnotationMap,
     tool_call_progress::ToolCallProgress,
@@ -195,13 +196,14 @@ fn resolve_versioned_iface<T>(
 /// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
 /// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
 ///
-/// When `agent_task_id` is `Some`, this function is the one writer of the task's `final:true`
-/// `status` frame, and writes exactly one, after the last `on-task-end` dispatch, after
-/// `task_end` is in the trace and after the registry slot records the terminal state — so the
-/// frame, `GetTask` and `task_end` agree. Its state, message and response are the last
-/// attempt's [`agent::AttemptEnding`], or the reopen refusal when the budget ran out. An attempt
-/// writes no final frame of its own; between two attempts the stream gets one non-final
-/// `working` frame naming the hook and carrying `status.reopen`, the reopen's 1-based ordinal.
+/// When `agent_task_id` is `Some`, this function is the one writer of the task's terminal status,
+/// and writes exactly one, after the last `on-task-end` dispatch, after `task_end` is in the
+/// trace and after the registry slot records the terminal state — so the stream, `GetTask` and
+/// `task_end` agree. Its state, message and response are the last attempt's
+/// [`agent::AttemptEnding`], or the reopen refusal when the budget ran out. An attempt writes no
+/// terminal status of its own; between two attempts the stream gets one `working` status naming
+/// the hook, annotated with the reopen's 1-based ordinal for a client that activated the stream
+/// extension.
 ///
 /// `seed` is whatever the task's single `on-task-start` dispatch proposed. The hook is
 /// dispatched once, at task start, and is not asked again.
@@ -448,8 +450,7 @@ async fn run_task_with_reopens(
                             agent_task_id.as_deref(),
                             context_id.as_ref(),
                             said.join("; "),
-                        )
-                        .await;
+                        );
                         // Original + reopen feedback + every outcome so far: what a restarted
                         // attempt reads as its task, and what `as-given` reports.
                         let rewritten = build_continued_task_md(
@@ -579,23 +580,16 @@ async fn run_task_with_reopens(
                         .await;
                     // The attempt boundary, so a client watching the task does not read the
                     // rejected attempt's frames as its end.
-                    if let Some(task_id) = &agent_task_id {
-                        emit_sse(
+                    if let Some(task) =
+                        StreamTask::of(agent_task_id.as_deref(), context_id.as_deref())
+                    {
+                        emit_status(
                             &sse,
-                            StreamFrame::Status,
-                            &TaskStatusUpdateEvent {
-                                id: task_id.clone(),
-                                context_id: context_id.clone(),
-                                status: StreamStatus {
-                                    state: "working".into(),
-                                    message: format!("reopened by hook {hook_name}"),
-                                    response: None,
-                                    reopen: Some(reopens_used),
-                                },
-                                r#final: false,
-                            },
-                        )
-                        .await;
+                            &task,
+                            TaskState::Working,
+                            &format!("reopened by hook {hook_name}"),
+                            Some(reopens_used),
+                        );
                     }
                     continuation = Some(agent::Continuation::ReopenFeedback(
                         reopen_feedback_message(reopens_used as usize, &hook_name, &reason),
@@ -675,11 +669,11 @@ async fn run_task_with_reopens(
 
 /// End a task [`run_task_with_reopens`] ran, in the order its readers rely on: `task_end` with
 /// `exit_status`, the hooks' task scope closed, the trace flushed, then — for an A2A task, when
-/// `agent_task_id` is `Some` — the registry slot finished and the task's one `final:true` status
-/// written from `ending`.
+/// `agent_task_id` is `Some` — the registry slot finished and the task's one terminal status
+/// written from `GetTask`'s view of it, after its `response` artifact when it has one.
 ///
 /// An accepted `CancelTask` the loop did not observe has already recorded `canceled`, which
-/// [`TaskRegistry::finish_task`] keeps; the frame then says `canceled` too, so it never disagrees
+/// [`TaskRegistry::finish_task`] keeps; the stream then says `canceled` too, so it never disagrees
 /// with `GetTask`.
 ///
 /// A task that ends `canceled`, after that override, gets [`write_canceled_result`] in `workdir`
@@ -721,9 +715,10 @@ async fn end_task(
         .map(|(member, status)| (member, status.as_str().to_string()))
         .collect();
     // The ending `GetTask` reports is recorded under the lock the terminal state is, after the
-    // cancel override, so it is the one the final frame below says.
-    let ending = match state.a2a_task_registry.as_ref() {
-        None => ending,
+    // cancel override, and the stream's ending is read back from `GetTask`'s view under the same
+    // lock, so the two cannot disagree.
+    let (ending, reported) = match state.a2a_task_registry.as_ref() {
+        None => (ending, None),
         Some(registry) => {
             let mut reg = registry.lock().unwrap();
             let recorded = reg.finish_task(ending.state.clone());
@@ -750,28 +745,41 @@ async fn end_task(
                     &no_answer_below,
                 );
             }
-            ending
+            let reported = reg.get_task(task_id);
+            (ending, reported)
         }
     };
     if ending.state == TaskState::Canceled {
         write_canceled_result(workdir, mode, Some(task_id));
     }
-    emit_sse(
-        sse,
-        StreamFrame::Status,
-        &TaskStatusUpdateEvent {
-            id: task_id.to_string(),
-            context_id,
-            status: StreamStatus {
-                state: ending.state.as_str().to_string(),
-                message: ending.message,
-                response: ending.response,
-                reopen: None,
-            },
-            r#final: true,
-        },
-    )
-    .await;
+    let reported = reported.or_else(|| {
+        let context_id = context_id?;
+        Some(unregistered_ending(task_id, &context_id, &ending))
+    });
+    if let Some(task) = reported {
+        emit_task_ending(sse, &task);
+    }
+}
+
+/// `GetTask`'s view of a task that ended as `ending` in a session with no task registry, built by
+/// the rules [`TaskRegistry::get_task`] reads an ending by.
+fn unregistered_ending(task_id: &str, context_id: &str, ending: &agent::AttemptEnding) -> A2aTask {
+    let mut registry = TaskRegistry::new(1, murmur_artifact::TaskAcceptance::Single);
+    registry.enqueue(task_id, context_id);
+    registry.history.insert(
+        task_id.to_string(),
+        (ending.state.clone(), context_id.to_string()),
+    );
+    registry.record_ending(
+        task_id,
+        &ending.message,
+        ending.response.as_deref(),
+        ending.no_answer,
+        &[],
+    );
+    registry
+        .get_task(task_id)
+        .expect("the task was just recorded")
 }
 
 /// Write [`crate::cancel::CANCELED_RESULT_TEXT`] to the session's `out/result.txt`, and, under
@@ -895,33 +903,18 @@ fn build_continued_task_md(
     out
 }
 
-/// A non-final `working` frame on an A2A task's stream saying `message`. Nothing for a task with
-/// no A2A id, whose stream no client watches.
-async fn emit_task_working(
+/// A `working` status on an A2A task's stream saying `message`. Nothing for a task with no A2A
+/// id, whose stream no client watches.
+fn emit_task_working(
     sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
     agent_task_id: Option<&str>,
     context_id: Option<&String>,
     message: String,
 ) {
-    let Some(task_id) = agent_task_id else {
+    let Some(task) = StreamTask::of(agent_task_id, context_id.map(String::as_str)) else {
         return;
     };
-    emit_sse(
-        sse,
-        StreamFrame::Status,
-        &TaskStatusUpdateEvent {
-            id: task_id.to_string(),
-            context_id: context_id.cloned(),
-            status: StreamStatus {
-                state: "working".into(),
-                message,
-                response: None,
-                reopen: None,
-            },
-            r#final: false,
-        },
-    )
-    .await;
+    emit_status(sse, &task, TaskState::Working, &message, None);
 }
 
 /// How long a delegated child whose outcome has arrived is given to finish exiting before its
@@ -1022,7 +1015,7 @@ async fn wait_for_handed_off_work(
         let outstanding = calls_outstanding + delegations_outstanding;
         if announced != Some(outstanding) {
             announced = Some(outstanding);
-            emit_task_working(sse, agent_task_id, context_id, waiting).await;
+            emit_task_working(sse, agent_task_id, context_id, waiting);
         }
         let overdue_at = backstop.and_then(|bound| delegations.next_overdue(bound));
         tokio::select! {
@@ -1573,12 +1566,10 @@ fn check_forget_launchable(inference: Option<&InferenceConfig>) -> Result<(), Ru
 /// streams. Cancellation is not here: a task is stopped the same way on every transport.
 fn transport_capabilities(staged: &StagedSession) -> identity::TransportCapabilities {
     match staged.process_driver.as_ref() {
-        Some(driver) => identity::TransportCapabilities {
-            streams_text: driver.description.streams_text,
+        Some(_) => identity::TransportCapabilities {
             kind: identity::TransportKind::Process,
         },
         None => identity::TransportCapabilities {
-            streams_text: true,
             kind: identity::TransportKind::Http,
         },
     }
@@ -3109,8 +3100,9 @@ fn launch(
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // SSE broadcast channel and replay buffer for SSE clients
-        let (sse_tx, _) =
-            tokio::sync::broadcast::channel::<std::sync::Arc<String>>(SSE_BROADCAST_CAPACITY);
+        let (sse_tx, _) = tokio::sync::broadcast::channel::<
+            std::sync::Arc<crate::streaming::StreamEvent>,
+        >(SSE_BROADCAST_CAPACITY);
         let sse_buffer = std::sync::Arc::new(Mutex::new(SseEventBuffer::new(SSE_REPLAY_CAPACITY)));
 
         let capsule_name = staged.capsule_name.clone();
@@ -3492,7 +3484,7 @@ fn launch(
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
                         a2a_sse: Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
-                        a2a_task_id: None,
+                        a2a_task: None,
                         input_timeout_secs: effective_lifecycle.input_timeout_secs,
                         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
                         a2a_tool_calls: Arc::default(),
@@ -4123,6 +4115,7 @@ fn launch(
                         let Some(cancel_signal) = cancel_signal else {
                             record_canceled_before_start(
                                 &incoming,
+                                &task_registry,
                                 &mut trace,
                                 &detached,
                                 &live_delegations,
@@ -4189,7 +4182,10 @@ fn launch(
                         state.current_forget_harness_session = incoming
                             .forget_session
                             .then_some(crate::harness_session::FORGET_BY_A2A);
-                        state.a2a_task_id = Some(incoming.task_id.clone());
+                        state.a2a_task = Some(StreamTask::new(
+                            &incoming.task_id,
+                            &incoming.context_id,
+                        ));
                         let failures_before = trace.task_failures_written();
                         let loop_result = run_task_with_reopens(
                             &mut state,
@@ -4215,7 +4211,7 @@ fn launch(
                         .await;
 
                         // task_end (with reopen_count), the terminal on-task-end dispatch, the
-                        // registry slot's terminal state and the task's final status frame all
+                        // registry slot's terminal state and the task's terminal status all
                         // happened inside run_task_with_reopens; an exhausted reopen budget
                         // surfaces here as loop_result.is_err(), i.e. a failed task.
 
@@ -4551,7 +4547,7 @@ fn launch(
         shell_grace_secs: 0,
         a2a_task_registry: None,
         a2a_sse: None,
-        a2a_task_id: None,
+        a2a_task: None,
         input_timeout_secs: None,
         a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
         a2a_tool_calls: Arc::default(),
@@ -6153,7 +6149,7 @@ fn driver_choice_env(
 /// Called from the `murmur:task/task#request-input` host function registered in the tool linker.
 /// Emits SSE events for the state transitions. Returns `Err` on timeout (traps the WASM guest).
 pub(crate) async fn request_input_impl(
-    task_id: String,
+    task: StreamTask,
     prompt: String,
     task_registry: Arc<Mutex<TaskRegistry>>,
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
@@ -6165,27 +6161,12 @@ pub(crate) async fn request_input_impl(
     let (tx, rx) = oneshot::channel::<String>();
     let cancel = {
         let mut reg = task_registry.lock().unwrap();
-        reg.set_input_required(&task_id, prompt.clone(), tx)
+        reg.set_input_required(&task.task_id, prompt.clone(), tx)
             .map_err(|e| wasmtime::Error::msg(format!("request-input: {e}")))?;
-        reg.cancel_watch(&task_id)
+        reg.cancel_watch(&task.task_id)
     };
 
-    emit_sse(
-        &sse,
-        StreamFrame::Status,
-        &TaskStatusUpdateEvent {
-            id: task_id.clone(),
-            context_id: None,
-            status: StreamStatus {
-                state: "input-required".into(),
-                message: prompt.clone(),
-                response: None,
-                reopen: None,
-            },
-            r#final: false,
-        },
-    )
-    .await;
+    emit_input_required(&sse, &task, &prompt);
 
     // `input-required` is a wait like any other, so a cancel ends it rather than leaving the task
     // parked until the input timeout. The guest is unwound by the error either way; what differs
@@ -6210,22 +6191,7 @@ pub(crate) async fn request_input_impl(
 
     match result {
         Ok(text) => {
-            emit_sse(
-                &sse,
-                StreamFrame::Status,
-                &TaskStatusUpdateEvent {
-                    id: task_id.clone(),
-                    context_id: None,
-                    status: StreamStatus {
-                        state: "working".into(),
-                        message: "resumed".into(),
-                        response: None,
-                        reopen: None,
-                    },
-                    r#final: false,
-                },
-            )
-            .await;
+            emit_status(&sse, &task, TaskState::Working, "resumed", None);
             Ok(text)
         }
         // The agent loop takes the cancel at its next boundary and ends the attempt there, with
@@ -6236,7 +6202,10 @@ pub(crate) async fn request_input_impl(
         // ends the attempt, and the reopen loop writes the task's one final status — or reopens
         // it — once the `on-task-end` hooks have run.
         Err(InputWaitEnd::TimedOut) => {
-            task_registry.lock().unwrap().record_input_timeout(&task_id);
+            task_registry
+                .lock()
+                .unwrap()
+                .record_input_timeout(&task.task_id);
             Err(wasmtime::Error::msg("input-timeout"))
         }
     }
@@ -6603,8 +6572,8 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) a2a_task_registry: Option<Arc<Mutex<TaskRegistry>>>,
     /// SSE broadcast channel — Some in A2A mode, None for script capsules.
     pub(crate) a2a_sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    /// Active A2A task ID — set per-task before run_agent_loop, None outside A2A context.
-    pub(crate) a2a_task_id: Option<String>,
+    /// The active A2A task — set per-task before run_agent_loop, None outside A2A context.
+    pub(crate) a2a_task: Option<StreamTask>,
     /// Optional input timeout from lifecycle config.
     pub(crate) input_timeout_secs: Option<u64>,
     // ── A2A streaming text chunk support ─────────────────────────────────────────
@@ -6653,8 +6622,8 @@ impl CapsuleStoreState {
     /// The script-capsule path has neither and can cancel nothing.
     pub(crate) fn task_cancel_signal(&self) -> Option<crate::cancel::CancelSignal> {
         let registry = self.a2a_task_registry.as_ref()?;
-        let task_id = self.a2a_task_id.as_deref()?;
-        Some(registry.lock().unwrap().cancel_watch(task_id))
+        let task = self.a2a_task.as_ref()?;
+        Some(registry.lock().unwrap().cancel_watch(&task.task_id))
     }
 
     /// Whether `task_id`'s `request-input` wait timed out since this was last asked. Taking the
@@ -7479,7 +7448,7 @@ pub(crate) struct ToolInvokeEnv<'a> {
 /// user for input).
 pub(crate) struct ToolA2aWiring {
     sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
-    task_id: Option<String>,
+    task: Option<StreamTask>,
     chunks_emitted: Arc<AtomicBool>,
     /// The calls the session's driver has started, present only on the agent loop's driver
     /// turn: `murmur:stream/events`' tool-call functions do nothing without it.
@@ -7492,7 +7461,7 @@ impl ToolA2aWiring {
     pub(crate) fn silent() -> Self {
         Self {
             sse: None,
-            task_id: None,
+            task: None,
             chunks_emitted: Arc::new(AtomicBool::new(false)),
             tool_calls: None,
             task_registry: None,
@@ -7529,7 +7498,7 @@ pub(crate) async fn invoke_tool_component(
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
-        task_id: a2a_task_id,
+        task: a2a_task,
         chunks_emitted: a2a_chunks_emitted,
         tool_calls: a2a_tool_calls,
         task_registry: a2a_task_registry,
@@ -7551,7 +7520,7 @@ pub(crate) async fn invoke_tool_component(
         let events_iface = WIT_STREAM_EVENTS_IFACE;
         let target = StreamEventsTarget {
             sse: a2a_sse.clone(),
-            task_id: a2a_task_id.clone(),
+            task: a2a_task.clone(),
             chunks_emitted: a2a_chunks_emitted,
             tool_calls: a2a_tool_calls,
         };
@@ -7612,7 +7581,7 @@ pub(crate) async fn invoke_tool_component(
         let task_iface = WIT_TASK_IFACE;
         let ri_task_registry = a2a_task_registry.clone();
         let ri_sse = a2a_sse.clone();
-        let ri_task_id = a2a_task_id.clone();
+        let ri_task = a2a_task.clone();
         let ri_timeout = input_timeout_secs;
         linker
             .instance(task_iface)
@@ -7623,13 +7592,13 @@ pub(crate) async fn invoke_tool_component(
                       (prompt,): (String,)| {
                     let reg = ri_task_registry.clone();
                     let sse = ri_sse.clone();
-                    let tid = ri_task_id.clone();
+                    let task = ri_task.clone();
                     let fut: std::pin::Pin<
                         Box<dyn std::future::Future<Output = wasmtime::Result<(String,)>> + Send>,
                     > = Box::pin(async move {
-                        let result = match (reg, tid) {
-                            (Some(reg), Some(tid)) => {
-                                request_input_impl(tid, prompt, reg, sse, ri_timeout).await
+                        let result = match (reg, task) {
+                            (Some(reg), Some(task)) => {
+                                request_input_impl(task, prompt, reg, sse, ri_timeout).await
                             }
                             _ => Err(wasmtime::Error::msg(
                                 "request-input is not available outside an A2A task context",
@@ -7883,7 +7852,7 @@ impl CapsuleStoreState {
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
-                task_id: self.a2a_task_id.clone(),
+                task: self.a2a_task.clone(),
                 chunks_emitted: Arc::clone(&self.a2a_chunks_emitted),
                 tool_calls,
                 task_registry: self.a2a_task_registry.clone(),
@@ -11098,10 +11067,12 @@ enum Woke {
 /// `task_start`, no `on-task-start`, no request to the provider, and no `task_end`, because it
 /// never ran. The `PHASE_QUEUED` record is its ending.
 ///
-/// The final status event is the only thing that closes a `SendStreamingMessage` connection on this
-/// task: it never reaches an agent loop, so nothing else would.
+/// The ending is recorded for `GetTask`, and the task's terminal status written from it, which is
+/// the only thing that closes a `SendStreamingMessage` connection on this task: it never reaches
+/// an agent loop, so nothing else would.
 async fn record_canceled_before_start(
     task: &IncomingTask,
+    task_registry: &Mutex<TaskRegistry>,
     trace: &mut TraceWriter,
     detached: &Arc<DetachedRegistry>,
     live_delegations: &crate::cancel::LiveDelegations,
@@ -11118,23 +11089,24 @@ async fn record_canceled_before_start(
         )
         .await;
     let _ = trace.flush().await;
-    emit_sse(
-        sse,
-        StreamFrame::Status,
-        &crate::streaming::TaskStatusUpdateEvent {
-            id: task.task_id.clone(),
-            context_id: Some(task.context_id.clone()),
-            status: crate::streaming::StreamStatus {
-                state: "canceled".into(),
-                message: "task canceled before it started".into(),
-                response: None,
-                reopen: None,
-            },
-            r#final: true,
-        },
-    )
-    .await;
+    let reported = {
+        let mut reg = task_registry.lock().unwrap();
+        reg.record_ending(
+            &task.task_id,
+            CANCELED_BEFORE_START_MESSAGE,
+            None,
+            false,
+            &[],
+        );
+        reg.get_task(&task.task_id)
+    };
+    if let Some(reported) = reported {
+        emit_task_ending(sse, &reported);
+    }
 }
+
+/// The status message of a task cancelled while it was still `submitted`.
+const CANCELED_BEFORE_START_MESSAGE: &str = "task canceled before it started";
 
 /// What a session says, on standard error, when its spawner lifeline reads EOF. An agent session
 /// adds that it is winding down, a script capsule that its run is ending.
@@ -11338,7 +11310,15 @@ async fn close_lanes_on_termination(
     // `None` for the active lane is safe only because nothing taken here is started.
     while let Some((_, task)) = lanes.next(None) {
         if task_registry.lock().unwrap().is_canceled(&task.task_id) {
-            record_canceled_before_start(&task, trace, detached, live_delegations, sse).await;
+            record_canceled_before_start(
+                &task,
+                task_registry,
+                trace,
+                detached,
+                live_delegations,
+                sse,
+            )
+            .await;
         }
     }
 }
@@ -11346,8 +11326,8 @@ async fn close_lanes_on_termination(
 /// Close the registry to new work and end every task it still holds as `submitted` in
 /// `Rejected`, starting nothing. Runs once, after the task loop has ended.
 ///
-/// A refused task gets one `task_rejected` record and one buffered final `rejected` status
-/// frame, which is what closes a `SendStreamingMessage` connection on it. It gets no `task_start`,
+/// A refused task gets one `task_rejected` record and one buffered `TASK_STATE_REJECTED` status,
+/// which is what closes a `SendStreamingMessage` connection on it. It gets no `task_start`,
 /// `task_end`, hook dispatch or provider request, and it is not folded into the launch outcome.
 ///
 /// The registry is closed before the channel is drained, under the lock the door enqueues under,
@@ -11377,7 +11357,15 @@ async fn refuse_undelivered_tasks(
     // `None` for the active lane is safe only because nothing taken here is started.
     while let Some((_, task)) = lanes.next(None) {
         if task_registry.lock().unwrap().is_canceled(&task.task_id) {
-            record_canceled_before_start(&task, trace, detached, live_delegations, sse).await;
+            record_canceled_before_start(
+                &task,
+                task_registry,
+                trace,
+                detached,
+                live_delegations,
+                sse,
+            )
+            .await;
         } else {
             sources.insert(task.task_id, task.source);
         }
@@ -11388,10 +11376,11 @@ async fn refuse_undelivered_tasks(
         crate::a2a::REJECTED_SESSION_ENDED_MESSAGE
     };
     for (task_id, context_id) in refused {
-        task_registry
-            .lock()
-            .unwrap()
-            .record_ending(&task_id, reason, None, false, &[]);
+        let reported = {
+            let mut reg = task_registry.lock().unwrap();
+            reg.record_ending(&task_id, reason, None, false, &[]);
+            reg.get_task(&task_id)
+        };
         let source = sources
             .get(&task_id)
             .copied()
@@ -11399,22 +11388,9 @@ async fn refuse_undelivered_tasks(
         let _ = trace
             .write_task_rejected(&task_id, &context_id, source, cause, reason)
             .await;
-        emit_sse(
-            sse,
-            StreamFrame::Status,
-            &crate::streaming::TaskStatusUpdateEvent {
-                id: task_id,
-                context_id: Some(context_id),
-                status: crate::streaming::StreamStatus {
-                    state: "rejected".into(),
-                    message: reason.into(),
-                    response: None,
-                    reopen: None,
-                },
-                r#final: true,
-            },
-        )
-        .await;
+        if let Some(reported) = reported {
+            emit_task_ending(sse, &reported);
+        }
     }
     let _ = trace.flush().await;
 }
@@ -14267,7 +14243,7 @@ inference:
             shell_grace_secs: 0,
             a2a_task_registry: None,
             a2a_sse: None,
-            a2a_task_id: None,
+            a2a_task: None,
             input_timeout_secs: None,
             a2a_chunks_emitted: Arc::new(AtomicBool::new(false)),
             a2a_tool_calls: Arc::default(),
@@ -18261,57 +18237,56 @@ inference:
         record: Vec<serde_json::Value>,
         /// `task.md` as the last attempt left it.
         task_md: String,
-        /// Every frame the task's stream carried, in order, as `{"event": <type>, "data": <data>}`;
-        /// empty for a scenario that is not streamed.
+        /// Every event the task's stream carried, in order, as the `StreamResponse` an activated
+        /// connection reads; empty for a scenario that is not streamed.
         frames: Vec<serde_json::Value>,
         /// `out/result.txt` as the last attempt left it, empty when none was written.
         result_txt: String,
     }
 
     impl ReopenRun {
-        /// The data of every `status` frame with `"final":true`.
+        /// Every terminal `statusUpdate`.
         fn final_statuses(&self) -> Vec<&serde_json::Value> {
             self.frames
                 .iter()
-                .filter(|frame| frame["event"] == "status" && frame["data"]["final"] == true)
-                .map(|frame| &frame["data"])
+                .map(|frame| &frame["statusUpdate"])
+                .filter(|status| {
+                    status["status"]["state"]
+                        .as_str()
+                        .and_then(crate::a2a::murmur_state_name)
+                        .is_some_and(|state| {
+                            ["completed", "failed", "canceled", "rejected"].contains(&state)
+                        })
+                })
                 .collect()
         }
 
-        /// The data of every `status` frame that marks a reopen boundary.
+        /// Every `statusUpdate` that marks a reopen boundary.
         fn boundary_statuses(&self) -> Vec<&serde_json::Value> {
             self.frames
                 .iter()
-                .filter(|frame| {
-                    frame["event"] == "status" && frame["data"]["status"].get("reopen").is_some()
+                .map(|frame| &frame["statusUpdate"])
+                .filter(|status| {
+                    status["metadata"][crate::streaming::STREAM_EXTENSION_URI]
+                        .get("reopen")
+                        .is_some()
                 })
-                .map(|frame| &frame["data"])
                 .collect()
+        }
+
+        /// The text of the `response` artifact the stream delivered, if it delivered one.
+        fn response(&self) -> Option<&str> {
+            self.frames
+                .iter()
+                .map(|frame| &frame["artifactUpdate"]["artifact"])
+                .find(|artifact| artifact["artifactId"] == "response")
+                .and_then(|artifact| artifact["parts"][0]["text"].as_str())
         }
     }
 
-    /// Every frame in `buffer`, in order, as `{"event": <type>, "data": <data>}`.
+    /// Every event in `buffer`, in order, as the `StreamResponse` an activated connection reads.
     pub(super) fn buffered_frames(buffer: &Mutex<SseEventBuffer>) -> Vec<serde_json::Value> {
-        let frames = match buffer.lock().unwrap().replay_from(0) {
-            crate::streaming::ReplayResult::Complete(frames)
-            | crate::streaming::ReplayResult::WithGap { events: frames, .. } => frames,
-        };
-        frames
-            .iter()
-            .map(|frame| {
-                let field = |name: &str| {
-                    frame
-                        .lines()
-                        .find_map(|line| line.strip_prefix(name))
-                        .expect("every frame names its type and carries data")
-                        .to_string()
-                };
-                serde_json::json!({
-                    "event": field("event: "),
-                    "data": serde_json::from_str::<serde_json::Value>(&field("data: ")).unwrap(),
-                })
-            })
-            .collect()
+        crate::streaming::buffered(buffer)
     }
 
     /// The task text every reopen scenario starts from.
@@ -19781,19 +19756,19 @@ inference:
         assert!(!message.contains("reopen budget"), "{message}");
     }
 
-    /// The task's one final status: exactly one `final:true` `status` frame, the last frame on
-    /// the stream, naming the task and its context.
+    /// The task's one terminal status: exactly one, the last event on the stream, naming the task
+    /// and its context.
     fn the_one_final_status(run: &ReopenRun) -> &serde_json::Value {
         let finals = run.final_statuses();
         assert_eq!(finals.len(), 1, "{:#?}", run.frames);
         assert_eq!(
-            run.frames.last().map(|frame| &frame["data"]),
+            run.frames.last().map(|frame| &frame["statusUpdate"]),
             Some(finals[0]),
-            "the final status is the task's last frame: {:#?}",
+            "the final status is the task's last event: {:#?}",
             run.frames
         );
-        assert_eq!(finals[0]["id"], "tsk_1");
-        assert_eq!(finals[0]["context_id"], "ctx_1");
+        assert_eq!(finals[0]["taskId"], "tsk_1");
+        assert_eq!(finals[0]["contextId"], "ctx_1");
         finals[0]
     }
 
@@ -19809,19 +19784,31 @@ inference:
             .unwrap_or_else(|| panic!("no matching frame after {from}: {:#?}", run.frames))
     }
 
-    /// The reopen boundary frame, checked for its exact shape.
+    /// The reopen boundary status, checked for its exact shape, its fresh `messageId` aside.
     fn assert_boundary_frame(frame: &serde_json::Value, reopen: u32) {
+        let mut frame = frame.clone();
+        let message_id = frame["status"]["message"]
+            .as_object_mut()
+            .and_then(|message| message.remove("messageId"));
+        assert!(
+            message_id.is_some_and(|id| id.as_str().is_some_and(|id| id.starts_with("msg_"))),
+            "{frame}"
+        );
         assert_eq!(
             frame,
-            &serde_json::json!({
-                "id": "tsk_1",
-                "context_id": "ctx_1",
+            serde_json::json!({
+                "taskId": "tsk_1",
+                "contextId": "ctx_1",
                 "status": {
-                    "state": "working",
-                    "message": "reopened by hook gatekeeper",
-                    "reopen": reopen,
+                    "state": "TASK_STATE_WORKING",
+                    "message": {
+                        "contextId": "ctx_1",
+                        "taskId": "tsk_1",
+                        "role": "ROLE_AGENT",
+                        "parts": [{"text": "reopened by hook gatekeeper", "mediaType": "text/plain"}],
+                    },
                 },
-                "final": false,
+                "metadata": {crate::streaming::STREAM_EXTENSION_URI: {"reopen": reopen}},
             })
         );
     }
@@ -19839,13 +19826,15 @@ inference:
         .await;
         assert!(run.result.is_err(), "{:?}", run.result);
         let last = the_one_final_status(&run);
-        assert_eq!(last["status"]["state"], "failed");
-        let message = last["status"]["message"].as_str().unwrap();
+        assert_eq!(last["status"]["state"], "TASK_STATE_FAILED");
+        let message = last["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(
             message.contains("failed to parse driver response"),
             "{message}"
         );
-        assert!(last["status"].get("response").is_none(), "{last}");
+        assert!(run.response().is_none(), "{last}");
 
         // A driver named in the manifest but absent from `tools/`.
         let run = run_http_reopen(HttpReopen {
@@ -19858,8 +19847,11 @@ inference:
         let error = run.result.as_ref().unwrap_err().to_string();
         assert!(error.contains("is not installed"), "{error}");
         let last = the_one_final_status(&run);
-        assert_eq!(last["status"]["state"], "failed");
-        assert_eq!(last["status"]["message"], error.as_str());
+        assert_eq!(last["status"]["state"], "TASK_STATE_FAILED");
+        assert_eq!(
+            last["status"]["message"]["parts"][0]["text"],
+            error.as_str()
+        );
     }
 
     /// The `inference` records of a run that are failed calls.
@@ -20018,8 +20010,8 @@ inference:
         assert!(run.result.is_ok(), "{:?}", run.result);
 
         let last = the_one_final_status(&run);
-        assert_eq!(last["status"]["state"], "completed");
-        assert_eq!(last["status"]["response"], "RESULT-2");
+        assert_eq!(last["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(run.response(), Some("RESULT-2"));
 
         let boundaries = run.boundary_statuses();
         assert_eq!(boundaries.len(), 1, "{:#?}", run.frames);
@@ -20028,13 +20020,15 @@ inference:
         // The boundary sits after the first attempt's answer and before the second's first turn,
         // which numbers on from the first attempt's one turn.
         let first_answer = frame_index(&run, 0, |frame| {
-            frame["event"] == "text" && frame["data"]["text"] == "RESULT-1"
+            crate::streaming::frame_of(frame)["text"] == "RESULT-1"
         });
         let boundary = frame_index(&run, 0, |frame| {
-            frame["data"]["status"].get("reopen").is_some()
+            frame["statusUpdate"]["metadata"][crate::streaming::STREAM_EXTENSION_URI]
+                .get("reopen")
+                .is_some()
         });
         let second_turn = frame_index(&run, boundary, |frame| {
-            frame["data"]["status"]["message"] == "inference turn 2"
+            frame["statusUpdate"]["status"]["message"]["parts"][0]["text"] == "inference turn 2"
         });
         assert!(first_answer < boundary && boundary < second_turn);
         let turns: Vec<&serde_json::Value> = of_type(&run.events, "inference")
@@ -20062,13 +20056,15 @@ inference:
         assert!(run.result.is_err(), "{:?}", run.result);
 
         let last = the_one_final_status(&run);
-        assert_eq!(last["status"]["state"], "failed");
-        let message = last["status"]["message"].as_str().unwrap();
+        assert_eq!(last["status"]["state"], "TASK_STATE_FAILED");
+        let message = last["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(message.contains("lifecycle.max_task_reopens"), "{message}");
         assert!(
             !run.frames
                 .iter()
-                .any(|frame| frame["data"]["status"]["state"] == "completed"),
+                .any(|frame| frame["statusUpdate"]["status"]["state"] == "TASK_STATE_COMPLETED"),
             "{:#?}",
             run.frames
         );
@@ -20089,8 +20085,8 @@ inference:
         assert!(run.result.is_ok(), "{:?}", run.result);
 
         let last = the_one_final_status(&run);
-        assert_eq!(last["status"]["state"], "completed");
-        assert_eq!(last["status"]["response"], "RESULT-1");
+        assert_eq!(last["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(run.response(), Some("RESULT-1"));
         let boundaries = run.boundary_statuses();
         assert_eq!(boundaries.len(), 1, "{:#?}", run.frames);
         assert_boundary_frame(boundaries[0], 1);
@@ -20109,13 +20105,15 @@ inference:
         assert!(run.result.is_err(), "{:?}", run.result);
 
         let last = the_one_final_status(&run);
-        assert_eq!(last["status"]["state"], "failed");
-        let message = last["status"]["message"].as_str().unwrap();
+        assert_eq!(last["status"]["state"], "TASK_STATE_FAILED");
+        let message = last["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(message.contains("lifecycle.max_task_reopens"), "{message}");
         assert!(
             !run.frames
                 .iter()
-                .any(|frame| frame["data"]["status"]["state"] == "completed"),
+                .any(|frame| frame["statusUpdate"]["status"]["state"] == "TASK_STATE_COMPLETED"),
             "{:#?}",
             run.frames
         );
@@ -21528,18 +21526,18 @@ mod member_call_tests {
         (state, scope, sse)
     }
 
+    /// The context the waiting task runs in: every event of a task names its context.
+    const CONTEXT: &str = "ctx_1";
+
     /// The message of every `working` frame on `sse`, in order.
     fn working_messages(sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>) -> Vec<String> {
         let (_, buffer) = sse.as_ref().unwrap();
         super::tests::buffered_frames(buffer)
             .iter()
-            .filter(|frame| frame["event"] == "status")
-            .map(|frame| {
-                frame["data"]["status"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
+            .filter_map(|frame| {
+                frame["statusUpdate"]["status"]["message"]["parts"][0]["text"].as_str()
             })
+            .map(str::to_string)
             .collect()
     }
 
@@ -21584,7 +21582,14 @@ mod member_call_tests {
         };
         let round = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            wait_for_handed_off_work(&state, None, None, &sse, Some("tsk_1"), None),
+            wait_for_handed_off_work(
+                &state,
+                None,
+                None,
+                &sse,
+                Some("tsk_1"),
+                Some(&CONTEXT.to_string()),
+            ),
         )
         .await
         .expect("the wait ends once every call has")
@@ -21614,7 +21619,14 @@ mod member_call_tests {
         }
         let round = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            wait_for_handed_off_work(&state, None, None, &sse, Some("tsk_1"), None),
+            wait_for_handed_off_work(
+                &state,
+                None,
+                None,
+                &sse,
+                Some("tsk_1"),
+                Some(&CONTEXT.to_string()),
+            ),
         )
         .await
         .expect("nothing outstanding: the wait returns at once")
@@ -21667,7 +21679,14 @@ mod member_call_tests {
         });
         let round = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            wait_for_handed_off_work(&state, Some(backstop), None, &sse, Some("tsk_1"), None),
+            wait_for_handed_off_work(
+                &state,
+                Some(backstop),
+                None,
+                &sse,
+                Some("tsk_1"),
+                Some(&CONTEXT.to_string()),
+            ),
         )
         .await
         .expect("the wait ends once neither kind has anything outstanding")

@@ -954,7 +954,7 @@ token.
 | Scope | Reaches |
 |---|---|
 | `SendMessage` | Starting a task with `SendMessage` |
-| `SendStreamingMessage` | Starting a task with `SendStreamingMessage`; the connection carries [every task's frames](streaming-protocol.md#endpoints) while it is open |
+| `SendStreamingMessage` | Starting or continuing a task with `SendStreamingMessage`; the connection carries [that task's events](streaming-protocol.md#endpoints) while it is open |
 | `stream/watch` | Watching every task on the session |
 | `GetTask` | Reading any task on the session |
 | `CancelTask` | Cancelling any task on the session |
@@ -2139,7 +2139,7 @@ not run: running it would contradict `after_task: exit`.
 
 | Task | What it gets |
 |---|---|
-| Accepted, never started, when the session stops taking work | `TASK_STATE_REJECTED` over [`GetTask`](agent-card.md#tasks-get), a final `rejected` [status frame](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
+| Accepted, never started, when the session stops taking work | `TASK_STATE_REJECTED` over [`GetTask`](agent-card.md#tasks-get), a terminal `TASK_STATE_REJECTED` [status on the stream](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
 | Cancelled while still queued | Stays `canceled`, with its `task_canceled` trace line. Never `rejected` |
 | A message arriving after the session stops taking work | Answered `rejected` at the door. Nothing is recorded in the trace |
 

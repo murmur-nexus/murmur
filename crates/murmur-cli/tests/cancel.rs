@@ -10,7 +10,7 @@ mod common;
 use std::{
     collections::HashSet,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{
@@ -540,58 +540,41 @@ fn cancel_closes_the_stream_with_a_final_canceled_status() {
         "{canceled}"
     );
 
-    // Read the connection to EOF and keep the last status event seen. The socket carries a read
-    // timeout, so a server that neither sends nor closes surfaces as an error here rather than as
-    // a test that hangs.
-    let mut last_status: Option<Value> = None;
-    let mut current_type = String::new();
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            // The clean end: the server closed the connection after its final event.
-            Ok(0) => break,
-            Err(error) => panic!("the SSE connection errored instead of closing: {error}"),
-            Ok(_) => {}
-        }
-        let line = line.trim_end_matches(['\n', '\r']).to_string();
-        if let Some(rest) = line.strip_prefix("event: ") {
-            current_type = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            if current_type == "status" {
-                last_status = serde_json::from_str(rest).ok();
-            }
-        }
+    // Read the connection to EOF. The socket carries a read timeout, so a server that neither
+    // sends nor closes surfaces as an error here rather than as a test that hangs.
+    let mut body = String::new();
+    if let Err(error) = reader.read_to_string(&mut body) {
+        panic!("the SSE connection errored instead of closing: {error}");
     }
-
-    let last_status = last_status.expect("the stream carried at least one status event");
-    assert_eq!(last_status["status"]["state"], "canceled", "{last_status}");
-    assert_eq!(last_status["final"], json!(true), "{last_status}");
+    let events = common::stream::parse(&body);
+    let last_status = events.last().expect("the stream carried a status event");
+    assert!(last_status.is_terminal_status(), "{events:?}");
     assert_eq!(
-        tasks_get(&capsule.url, &task_id)["result"]["status"]["state"],
-        "TASK_STATE_CANCELED"
+        last_status.state(),
+        Some("TASK_STATE_CANCELED"),
+        "{events:?}"
+    );
+    assert_eq!(
+        last_status.status(),
+        &tasks_get(&capsule.url, &task_id)["result"]["status"]
     );
 }
 
-/// The task id the first `status` frame on a `SendStreamingMessage` stream carries: the agent
-/// loop's `working` frame before its first inference call. The stream answers no other way.
+/// The task id the event a `SendStreamingMessage` stream opens with carries: its task.
 fn first_status_task_id(reader: &mut impl BufRead) -> String {
-    let mut current_type = String::new();
     loop {
         let mut line = String::new();
         let read = reader
             .read_line(&mut line)
-            .unwrap_or_else(|error| panic!("the stream errored before a status frame: {error}"));
-        assert!(read > 0, "the stream closed before a status frame");
+            .unwrap_or_else(|error| panic!("the stream errored before its first event: {error}"));
+        assert!(read > 0, "the stream closed before its first event");
         let line = line.trim_end_matches(['\n', '\r']);
-        if let Some(rest) = line.strip_prefix("event: ") {
-            current_type = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            if current_type == "status" {
-                let frame: Value = serde_json::from_str(rest).unwrap();
-                if let Some(id) = frame["id"].as_str() {
-                    return id.to_string();
-                }
-            }
+        if let Some(rest) = line.strip_prefix("data: ") {
+            let event: Value = serde_json::from_str(rest).unwrap();
+            return event["result"]["task"]["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the stream did not open with its task: {event}"))
+                .to_string();
         }
     }
 }

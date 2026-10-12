@@ -17,6 +17,7 @@ pub mod loopback_target;
 #[path = "../../../capsule-runtime/src/pinned_port.rs"]
 pub mod pinned_port;
 pub mod recording_upstream;
+pub mod stream;
 pub mod wire_recorder;
 
 use std::{
@@ -1094,7 +1095,7 @@ pub const DOOR_EXTENSION_URI: &str =
 pub const CAPSULE_EXTENSION_URI: &str =
     "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1";
 
-/// URI of the agent card's stream extension: every SSE event type the capsule's stream can write.
+/// URI of the agent card's stream extension: the murmur frames the capsule's stream can write.
 pub const STREAM_EXTENSION_URI: &str =
     "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
 

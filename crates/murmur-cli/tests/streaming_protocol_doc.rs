@@ -1,6 +1,7 @@
 //! The streaming protocol reference page, held against the wire a launched capsule writes: the
-//! frames a task writes, the `lagged` frame a connection that falls behind is sent, and
-//! `mur watch`'s report of a connection that ends without `capsule-closed`.
+//! events and frames a task writes, the `lagged` frames a connection that falls behind is sent,
+//! `mur watch`'s report of a connection that ends without `capsule-closed`, and the lines it
+//! prints.
 //!
 //! Every capsule here is its own `mur run` process: `mur watch` is attached to it from outside,
 //! and the lost-connection case needs a process to kill.
@@ -9,7 +10,7 @@
 mod common;
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
@@ -21,6 +22,7 @@ use std::{
 };
 
 use assert_cmd::Command;
+use common::stream::{self, Event};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -220,51 +222,32 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
 
 // ── Raw SSE reading ───────────────────────────────────────────────────────────
 
-/// One blank-line-delimited block of the SSE body, every line kept.
-#[derive(Debug)]
-struct Block {
-    lines: Vec<String>,
-}
-
-impl Block {
-    fn field(&self, name: &str) -> Option<&str> {
-        let prefix = format!("{name}: ");
-        self.lines
-            .iter()
-            .find_map(|line| line.strip_prefix(&prefix))
-    }
-
-    fn is_comment(&self) -> bool {
-        self.lines.iter().all(|line| line.starts_with(':'))
-    }
-}
-
-/// Opens `stream/watch` with no `Last-Event-ID` and reads blocks until `done` accepts one or
-/// `timeout` passes. Comment lines are kept, as their own blocks.
-fn watch_until(addr: &str, timeout: Duration, done: impl Fn(&Block) -> bool) -> Vec<Block> {
+/// Opens `stream/watch` with no `Last-Event-ID` and reads events until `done` accepts one or
+/// `timeout` passes.
+fn watch_until(addr: &str, timeout: Duration, done: impl Fn(&Event) -> bool) -> Vec<Event> {
     let stream = TcpStream::connect(addr).expect("should connect to capsule");
-    let mut reader = SseReader::open(stream, addr, WATCH_BODY);
-    let (blocks, end) = reader.read_until(timeout, done);
+    let mut reader = SseReader::open(stream, addr, WATCH_BODY, &[]);
+    let (events, end) = reader.read_until(timeout, done);
     assert_eq!(
         end,
         ReadEnd::Accepted,
-        "the watched stream did not reach the expected frame in {timeout:?}; blocks were: {blocks:?}"
+        "the watched stream did not reach the expected event in {timeout:?}; events were: {events:#?}"
     );
-    blocks
+    events
 }
 
 const WATCH_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}"#;
 
 #[derive(Debug, PartialEq)]
 enum ReadEnd {
-    /// The `done` predicate accepted a block.
+    /// The `done` predicate accepted an event.
     Accepted,
     /// The server closed the connection.
     Closed,
     TimedOut,
 }
 
-/// An SSE response read block by block, across as many `read_until` calls as the test needs.
+/// An SSE response read event by event, across as many `read_until` calls as the test needs.
 struct SseReader {
     stream: TcpStream,
     pending: Vec<u8>,
@@ -275,10 +258,15 @@ struct SseReader {
 }
 
 impl SseReader {
-    /// Sends `body` as a JSON-RPC POST on `stream`, reading nothing yet.
-    fn open(mut stream: TcpStream, addr: &str, body: &str) -> Self {
+    /// Sends `body` as a JSON-RPC POST on `stream` with `headers` besides the usual ones, reading
+    /// nothing yet.
+    fn open(mut stream: TcpStream, addr: &str, body: &str, headers: &[(&str, &str)]) -> Self {
+        let extra: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n{extra}Content-Length: {}\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).unwrap();
@@ -294,14 +282,14 @@ impl SseReader {
     fn read_until(
         &mut self,
         timeout: Duration,
-        done: impl Fn(&Block) -> bool,
-    ) -> (Vec<Block>, ReadEnd) {
+        done: impl Fn(&Event) -> bool,
+    ) -> (Vec<Event>, ReadEnd) {
         self.stream
             .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
         let deadline = Instant::now() + timeout;
         let mut buf = vec![0u8; 64 * 1024];
-        let mut blocks = Vec::new();
+        let mut events = Vec::new();
 
         loop {
             while let Some(offset) = self.pending[self.scanned..]
@@ -325,29 +313,30 @@ impl SseReader {
                 if self.current.is_empty() {
                     continue;
                 }
-                let block = Block {
-                    lines: std::mem::take(&mut self.current),
-                };
-                let finished = done(&block);
-                blocks.push(block);
-                if finished {
-                    return (blocks, ReadEnd::Accepted);
+                let block = std::mem::take(&mut self.current);
+                // A heartbeat block parses to no event.
+                for event in stream::parse(&format!("{}\n\n", block.join("\n"))) {
+                    let finished = done(&event);
+                    events.push(event);
+                    if finished {
+                        return (events, ReadEnd::Accepted);
+                    }
                 }
             }
             self.scanned = self.pending.len();
 
             if Instant::now() >= deadline {
-                return (blocks, ReadEnd::TimedOut);
+                return (events, ReadEnd::TimedOut);
             }
             match self.stream.read(&mut buf) {
-                Ok(0) => return (blocks, ReadEnd::Closed),
+                Ok(0) => return (events, ReadEnd::Closed),
                 Ok(n) => self.pending.extend_from_slice(&buf[..n]),
                 Err(e)
                     if matches!(
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
-                Err(_) => return (blocks, ReadEnd::Closed),
+                Err(_) => return (events, ReadEnd::Closed),
             }
         }
     }
@@ -360,128 +349,134 @@ fn object_keys(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The section of the page under the heading carrying `{ #anchor }`, up to the next `---` line.
+fn section<'a>(page: &'a str, anchor: &str) -> &'a str {
+    let marker = format!("{{ #{anchor} }}");
+    let at = page
+        .find(&marker)
+        .unwrap_or_else(|| panic!("the page has no heading {marker}"));
+    let rest = &page[at..];
+    &rest[..rest.find("\n---\n").unwrap_or(rest.len())]
+}
+
+/// Whether `event` is `task_id`'s terminal status.
+fn is_final_status_of(event: &Event, task_id: &str) -> bool {
+    event.is_terminal_status() && event.task_id() == Some(task_id)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Every frame type, key and id rule a real task produces is on the page.
+/// Every `StreamResponse` member, murmur frame and frame key a real task writes is on the page,
+/// on an activated `SendStreamingMessage` and on `stream/watch`, and the page's `params.frames`
+/// example is a live card's.
 #[test]
 fn the_page_covers_every_frame_a_task_writes() {
     let server = undeclared_tool_then_end_turn();
     let capsule = start_capsule(&server, "streaming-protocol-doc");
     let addr = capsule.url();
 
-    let task_id = Arc::new(Mutex::new(None::<String>));
-    let submitter = {
-        let addr = addr.clone();
-        let task_id = Arc::clone(&task_id);
-        thread::spawn(move || {
-            // Submitted once the watch is attached, so the task's frames arrive live as well as
-            // through the replay.
-            thread::sleep(Duration::from_millis(500));
-            *task_id.lock().unwrap() = Some(submit(&addr, "msg-1", "call a tool"));
-        })
-    };
-
-    let blocks = watch_until(&addr, Duration::from_secs(120), |block| {
-        block.field("event") == Some("status")
-            && block
-                .field("data")
-                .and_then(|data| serde_json::from_str::<Value>(data).ok())
-                .is_some_and(|data| data["final"] == json!(true))
+    let (response, streamed) = stream::stream_message(
+        &addr,
+        None,
+        json!({"message": {"messageId": "msg-1", "role": "ROLE_USER",
+            "parts": [{"text": "call a tool", "mediaType": "text/plain"}]}}),
+        true,
+    );
+    assert_eq!(
+        response.header("a2a-extensions"),
+        Some(stream::STREAM_EXTENSION_URI)
+    );
+    let task_id = streamed[0].task_id().unwrap().to_string();
+    let watched = watch_until(&addr, Duration::from_secs(60), |event| {
+        is_final_status_of(event, &task_id)
     });
-    submitter.join().unwrap();
-    let task_id = task_id.lock().unwrap().clone().expect("task was submitted");
 
     let page = page();
-    let frames: Vec<&Block> = blocks.iter().filter(|block| !block.is_comment()).collect();
-
-    // A heartbeat is a comment standing alone, never part of a frame.
-    for block in &blocks {
-        if block.lines.iter().any(|line| line.starts_with(':')) {
-            assert_eq!(block.lines, vec![":heartbeat".to_string()], "{block:?}");
+    let members = section(&page, "standard-events");
+    let mut frames = BTreeSet::new();
+    for event in streamed.iter().chain(&watched) {
+        let member = event
+            .result()
+            .as_object()
+            .and_then(|object| object.keys().next())
+            .unwrap()
+            .clone();
+        assert!(
+            members.contains(&format!("`{member}`")),
+            "the StreamResponse member `{member}` is not in the Standard events section"
+        );
+        if !event.is_frame() {
+            continue;
         }
-    }
-
-    let mut types = BTreeSet::new();
-    let mut id_less = BTreeSet::new();
-    for frame in &frames {
-        let event = frame
-            .field("event")
-            .unwrap_or_else(|| panic!("frame without an event line: {frame:?}"));
-        types.insert(event.to_string());
-        if frame.field("id").is_none() {
-            id_less.insert(event.to_string());
-        }
-
-        let data: Value = serde_json::from_str(frame.field("data").unwrap_or("null"))
-            .unwrap_or_else(|e| panic!("data is not JSON ({e}): {frame:?}"));
-        for key in object_keys(&data) {
+        let name = event.frame()["frame"].as_str().unwrap().to_string();
+        let documented = section(&page, &format!("event-{name}"));
+        for key in object_keys(event.frame()) {
             assert!(
-                page.contains(&format!("`{key}`")),
-                "`{event}` key `{key}` is not on the page"
+                documented.contains(&format!("`{key}`")),
+                "`{name}` key `{key}` is not in its section"
             );
         }
-        for (object, key) in [("status", "status"), ("artifact", "artifact")] {
-            for nested in object_keys(&data[key]) {
-                assert!(
-                    page.contains(&format!("`{object}.{nested}`"))
-                        || page.contains(&format!("`{nested}`")),
-                    "`{object}` key `{nested}` is not on the page"
-                );
-            }
-        }
+        frames.insert(name);
     }
-
-    for event in &types {
+    for expected in ["connection-ack", "artifact", "text"] {
         assert!(
-            page.contains(&format!("| [`{event}`](#event-{event}) |")),
-            "event type `{event}` is not in the page's endpoint table"
+            frames.contains(expected),
+            "no `{expected}` frame seen: {frames:?}"
         );
     }
-    for expected in ["connection-ack", "status", "artifact"] {
-        assert!(
-            types.contains(expected),
-            "no `{expected}` frame seen: {types:?}"
-        );
-    }
-
-    let allowed: HashSet<&str> = ["connection-ack", "gap", "lagged"].into_iter().collect();
-    assert!(
-        id_less.contains("connection-ack")
-            && id_less.iter().all(|event| allowed.contains(event.as_str())),
-        "frames without an id line were {id_less:?}"
-    );
-    for event in &id_less {
-        assert!(
-            page.contains(&format!("| `{event}` | no |")),
-            "the page does not list `{event}` as a frame without an id"
-        );
-    }
-
-    let artifact = frames
+    let artifact = streamed
         .iter()
-        .filter(|frame| frame.field("event") == Some("artifact"))
-        .filter_map(|frame| serde_json::from_str::<Value>(frame.field("data")?).ok())
-        .find(|data| data["id"] == json!(task_id))
-        .expect("the task wrote an artifact frame");
-    assert_eq!(artifact["artifact"]["tool_name"], UNDECLARED_TOOL);
-    assert_eq!(artifact["artifact"]["is_error"], true);
-    assert_eq!(artifact["artifact"]["fence_source"], Value::Null);
+        .find(|event| event.kind() == "artifact")
+        .expect("the task wrote an artifact frame")
+        .frame();
+    assert_eq!(artifact["toolName"], UNDECLARED_TOOL);
+    assert_eq!(artifact["isError"], true);
+    assert_eq!(artifact["fenceSource"], Value::Null);
+
+    let card: Value = {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        write!(
+            stream,
+            "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    let live = card["capabilities"]["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|extension| extension["uri"] == stream::STREAM_EXTENSION_URI)
+        .unwrap()["params"]["frames"]
+        .clone();
+    let example = section(&page, "murmur-stream-v1")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("\"params\": "))
+        .map(|params| serde_json::from_str::<Value>(params.trim_end_matches(',')).unwrap())
+        .expect("the stream extension section shows its params");
+    assert_eq!(
+        example["frames"], live,
+        "the page's params.frames is not a live card's"
+    );
 }
 
 #[test]
 fn the_page_names_every_state_and_mode() {
     let page = page();
-    for state in [
-        "working",
-        "input-required",
-        "completed",
-        "failed",
-        "canceled",
-        "rejected",
+    for (wire, word) in [
+        ("TASK_STATE_SUBMITTED", "submitted"),
+        ("TASK_STATE_WORKING", "working"),
+        ("TASK_STATE_INPUT_REQUIRED", "input-required"),
+        ("TASK_STATE_COMPLETED", "completed"),
+        ("TASK_STATE_FAILED", "failed"),
+        ("TASK_STATE_CANCELED", "canceled"),
+        ("TASK_STATE_REJECTED", "rejected"),
     ] {
         assert!(
-            page.contains(&format!("| `{state}` |")),
-            "state `{state}` has no row"
+            page.contains(&format!("| `{wire}` | `{word}` |")),
+            "state `{wire}` has no row"
         );
     }
     for mode in ["`stateless`", "`threaded`"] {
@@ -618,20 +613,19 @@ fn flood(server: &common::ScriptedServer, addr: &str) -> String {
     }
 }
 
-/// The `missed` count of every `lagged` frame in `blocks`, asserting each is id-less.
-fn lagged_counts(blocks: &[Block]) -> Vec<u64> {
-    blocks
+/// The `missed` count of every `lagged` frame in `events`, asserting each is unnumbered.
+fn lagged_counts(events: &[Event]) -> Vec<u64> {
+    events
         .iter()
-        .filter(|block| block.field("event") == Some("lagged"))
-        .map(|block| {
+        .filter(|event| event.kind() == "lagged")
+        .map(|event| {
+            assert_eq!(event.id, None, "a lagged frame carries an id: {event:?}");
             assert_eq!(
-                block.field("id"),
-                None,
-                "a lagged frame carries an id: {block:?}"
+                object_keys(event.frame()),
+                vec!["frame", "missed"],
+                "{event:?}"
             );
-            let data: Value = serde_json::from_str(block.field("data").unwrap()).unwrap();
-            assert_eq!(object_keys(&data), vec!["missed"], "{block:?}");
-            data["missed"].as_u64().expect("missed is a u64")
+            event.frame()["missed"].as_u64().expect("missed is a u64")
         })
         .collect()
 }
@@ -660,30 +654,20 @@ fn reported_lags(capsule: &Capsule, prefix: &str, expected_total: u64) -> Vec<u6
     }
 }
 
-fn is_final_status_of(block: &Block, task_id: &str) -> bool {
-    block.field("event") == Some("status")
-        && block
-            .field("data")
-            .and_then(|data| serde_json::from_str::<Value>(data).ok())
-            .is_some_and(|data| data["final"] == json!(true) && data["id"] == json!(task_id))
-}
-
-/// A fresh `stream/watch` replays the session's buffer through `last_task`'s final status without a
-/// `lagged` frame in it.
+/// A fresh `stream/watch` replays the session's buffer through `last_task`'s terminal status
+/// without a `lagged` frame in it.
 fn assert_replay_has_no_lagged_frame(addr: &str, last_task: &str) {
-    let replay = watch_until(addr, Duration::from_secs(120), |block| {
-        is_final_status_of(block, last_task)
+    let replay = watch_until(addr, Duration::from_secs(120), |event| {
+        is_final_status_of(event, last_task)
     });
     assert!(
-        replay
-            .iter()
-            .all(|block| block.field("event") != Some("lagged")),
+        replay.iter().all(|event| event.kind() != "lagged"),
         "a lagged frame was replayed"
     );
 }
 
-/// A `stream/watch` client that stops reading while a capsule writes more than 128 frames is sent
-/// one id-less `lagged` frame per loss, carrying the count the runtime reported, and keeps
+/// A `stream/watch` client that stops reading while a capsule writes more than 128 events is sent
+/// one unnumbered `lagged` frame per loss, carrying the count the runtime reported, and keeps
 /// receiving on the same connection.
 #[test]
 fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
@@ -691,17 +675,17 @@ fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
     let capsule = start_capsule(&server, "lagged-watch");
     let addr = capsule.url();
 
-    let mut slow = SseReader::open(connect_slow_reader(&addr), &addr, WATCH_BODY);
-    let (_, end) = slow.read_until(Duration::from_secs(30), |block| {
-        block.field("event") == Some("connection-ack")
+    let mut slow = SseReader::open(connect_slow_reader(&addr), &addr, WATCH_BODY, &[]);
+    let (_, end) = slow.read_until(Duration::from_secs(30), |event| {
+        event.kind() == "connection-ack"
     });
     assert_eq!(end, ReadEnd::Accepted, "no connection-ack");
 
     let blocking_task = submit(&addr, "block", "reply at length");
     let last_task = flood(&server, &addr);
 
-    let (blocks, end) = slow.read_until(Duration::from_secs(120), |block| {
-        is_final_status_of(block, &last_task)
+    let (events, end) = slow.read_until(Duration::from_secs(120), |event| {
+        is_final_status_of(event, &last_task)
     });
     assert_eq!(
         end,
@@ -709,8 +693,11 @@ fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
         "the watch did not reach the last task's final status"
     );
 
-    let sent = lagged_counts(&blocks);
+    let sent = lagged_counts(&events);
     assert!(!sent.is_empty(), "no lagged frame reached the connection");
+    for event in events.iter().filter(|event| event.kind() == "lagged") {
+        assert_eq!(event.result()["message"]["role"], "ROLE_AGENT", "{event:?}");
+    }
     let reported = reported_lags(
         &capsule,
         "[capsule-runtime] stream/watch: SSE broadcast lagged by ",
@@ -721,19 +708,20 @@ fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
         "the lagged frames' counts are not the counts the runtime reported"
     );
     assert!(
-        !blocks
+        !events
             .iter()
-            .any(|block| is_final_status_of(block, &blocking_task)),
+            .any(|event| is_final_status_of(event, &blocking_task)),
         "the blocking task's final status was delivered, so nothing was lost before it"
     );
 
     assert_replay_has_no_lagged_frame(&addr, &last_task);
 }
 
-/// A `SendStreamingMessage` client that stops reading while a capsule writes more than 128 frames is sent
-/// a `lagged` frame carrying the count the runtime reported. Its own task's final status was among
-/// the frames lost, and the connection closes on no other task's: it stays open past the last
-/// task's final status, and `GetTask` answers how its own task ended.
+/// A `SendStreamingMessage` client that activated the stream extension and stops reading while a
+/// capsule writes more than 128 events is sent `lagged` frames carrying the counts the runtime
+/// reported, as carriers of its own task. Its task's ending was among the events lost, so once
+/// the task has ended the connection writes it from the registry, unnumbered, and closes, having
+/// written no other task's event.
 #[test]
 fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
     let server = blocking_reply_then_flood();
@@ -751,26 +739,36 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
         }}
     })
     .to_string();
-    let mut slow = SseReader::open(connect_slow_reader(&addr), &addr, &body);
+    let mut slow = SseReader::open(
+        connect_slow_reader(&addr),
+        &addr,
+        &body,
+        &[stream::extensions_header()],
+    );
     let last_task = flood(&server, &addr);
 
-    let (mut blocks, end) = slow.read_until(Duration::from_secs(120), |block| {
-        is_final_status_of(block, &last_task)
-    });
+    let (events, end) = slow.read_until(Duration::from_secs(120), |_| false);
     assert_eq!(
         end,
-        ReadEnd::Accepted,
-        "the connection did not stay open to the last task's final status"
+        ReadEnd::Closed,
+        "the connection did not end: {events:#?}"
     );
-    let (more, end) = slow.read_until(Duration::from_secs(1), |_| false);
-    assert_eq!(
-        end,
-        ReadEnd::TimedOut,
-        "the connection closed on another task's final status"
-    );
-    blocks.extend(more);
 
-    let sent = lagged_counts(&blocks);
+    let own_task = events[0]
+        .task_id()
+        .expect("the stream opens with its task")
+        .to_string();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.task_id() == Some(own_task.as_str())),
+        "another task's event reached the connection"
+    );
+    assert!(!events
+        .iter()
+        .any(|event| event.task_id() == Some(last_task.as_str())));
+
+    let sent = lagged_counts(&events);
     assert!(!sent.is_empty(), "no lagged frame reached the connection");
     let reported = reported_lags(
         &capsule,
@@ -782,24 +780,104 @@ fn a_lagging_message_stream_connection_is_told_how_many_frames_it_lost() {
         "the lagged frames' counts are not the counts the runtime reported"
     );
 
-    let own_task = blocks
-        .iter()
-        .find_map(|block| {
-            let data: Value = serde_json::from_str(block.field("data")?).ok()?;
-            data["id"].as_str().map(str::to_string)
-        })
-        .expect("the connection delivered a frame of its own task before blocking");
-    assert!(
-        !blocks
-            .iter()
-            .any(|block| is_final_status_of(block, &own_task)),
-        "the connection's own final status was delivered, so nothing was lost before it"
+    let last = events.last().unwrap();
+    assert!(is_final_status_of(last, &own_task), "{last:?}");
+    assert_eq!(last.state(), Some("TASK_STATE_COMPLETED"));
+    let got = rpc(&addr, "GetTask", json!({"id": own_task}));
+    assert_eq!(
+        last.status(),
+        &got["result"]["status"],
+        "the stream ends on the status GetTask reports"
     );
     assert_eq!(
-        rpc(&addr, "GetTask", json!({"id": own_task}))["result"]["status"]["state"],
-        "TASK_STATE_COMPLETED",
-        "GetTask answers how the connection's own task ended"
+        last.id, None,
+        "the lost ending is written from the registry, outside the sequence"
     );
 
     assert_replay_has_no_lagged_frame(&addr, &last_task);
 }
+
+/// `mur watch` attached to a capsule that ran one task prints the task's lines: its statuses, the
+/// failed call's artifact and the answer. Durations are normalised, since they are measured.
+#[test]
+fn watch_prints_the_same_lines() {
+    let server = undeclared_tool_then_end_turn();
+    let capsule = start_capsule(&server, "watch-prints-lines");
+    let addr = capsule.url();
+
+    let task_id = submit(&addr, "msg-1", "call a tool");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while rpc(&addr, "GetTask", json!({"id": task_id}))["result"]["status"]["state"]
+        != "TASK_STATE_COMPLETED"
+    {
+        assert!(Instant::now() < deadline, "the task never completed");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut watch = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["watch", "--url", &addr])
+        .env_remove("NEXUS_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("mur watch should start");
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let stdout = watch.stdout.take().unwrap();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = line_tx.send(line);
+        }
+    });
+    let mut lines = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while lines.last().map(String::as_str) != Some("  done") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match line_rx.recv_timeout(left) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    while let Ok(line) = line_rx.recv_timeout(Duration::from_secs(1)) {
+        lines.push(line);
+    }
+    let _ = watch.kill();
+    let _ = watch.wait();
+
+    let normalised: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            let mut out = String::new();
+            let mut digits = String::new();
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    digits.push(c);
+                    continue;
+                }
+                if !digits.is_empty() {
+                    if c == 'm' && chars.peek() == Some(&'s') {
+                        out.push('N');
+                    } else {
+                        out.push_str(&digits);
+                    }
+                    digits.clear();
+                }
+                out.push(c);
+            }
+            out.push_str(&digits);
+            out
+        })
+        .collect();
+    let transcript = normalised.join("\n");
+    eprintln!("mur watch printed:\n{transcript}");
+    assert_eq!(transcript, WATCH_TRANSCRIPT);
+}
+
+/// What `mur watch` printed for [`watch_prints_the_same_lines`]'s task before stream events took
+/// the A2A v1.0 form, with every `<n>ms` written `Nms`.
+const WATCH_TRANSCRIPT: &str = "[working]  inference turn 1
+[artifact] tool: no-such-tool [error, Nms] | tool 'no-such-tool' is not declared in manifest allowlist
+[working]  inference turn 2
+done[completed]
+  done
+";

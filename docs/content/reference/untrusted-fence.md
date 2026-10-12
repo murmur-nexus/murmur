@@ -67,26 +67,26 @@ anywhere inside a block — including one drawn inside an image — is a forgery
 
 | Surface | Fence present | How it is labelled |
 |---|---|---|
-| A2A [`artifact` SSE frame](streaming-protocol.md#event-artifact) | In `artifact.content` | `artifact.fence_source` — the source name, or `null`. Present on every frame |
+| The stream's [`artifact` frame](streaming-protocol.md#event-artifact) | In `content` | `fenceSource` — the source name, or `null`. Present on every frame |
 | [`conversation.jsonl`](workdir.md#the-conversation-record) message line | In `content` | `fence` — the source name. Absent on an unfenced line |
 | [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `tool_call` | In `output`, and counted in `output_bytes` | Unlabelled |
 | [`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl) `skill_call` | Not recorded: the event carries no output | `trust` — `"untrusted"` exactly when the skill's result was fenced under `skill:<skill_name>` |
 | [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) | In the message's `content` | Unlabelled. The `message` record has no `fence` field; read the markers |
 
-The two labelled surfaces differ on purpose. An SSE consumer may be talking to any runtime
-version, so `fence_source` is present on every frame and `null` distinguishes "this frame is
+The two labelled surfaces differ on purpose. A stream consumer may be talking to any runtime
+version, so `fenceSource` is present on every frame and `null` distinguishes "this frame is
 unfenced" from "this runtime does not label frames". A record line follows the other envelope
 keys in the file, which are all absent when unset.
 
 ### The `artifact` frame
 
 ```json
-{"id":"tsk_01a0…","artifact":{"tool_name":"web-fetch","content":"<untrusted-content source=tool:web-fetch>\n{\"status\":200}\n</untrusted-content>","fence_source":"tool:web-fetch"}}
+{"frame":"artifact","toolName":"web-fetch","content":"<untrusted-content source=tool:web-fetch>\n{\"status\":200}\n</untrusted-content>","fenceSource":"tool:web-fetch","toolCallId":"toolu_1","isError":false,"durationMs":41,"exitCode":null,"truncated":false}
 ```
 
-`content` is the bytes the model received, markers included. `fence_source` is the source
+`content` is the bytes the model received, markers included. `fenceSource` is the source
 `content` is fenced under, or `null` when `content` carries no fence. A frame with no
-`fence_source` key came from a runtime that does not label frames: read the markers. Every field
+`fenceSource` key came from a runtime that does not label frames: read the markers. Every field
 on the frame is listed in [Streaming Protocol](streaming-protocol.md#event-artifact).
 
 ### The record line
