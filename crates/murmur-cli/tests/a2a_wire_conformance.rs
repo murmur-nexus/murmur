@@ -1,89 +1,33 @@
-//! The A2A v1.0 wire census: one authenticated door driven through every method it serves, with
-//! the set of failing checks compared against `tests/fixtures/a2a/wire-exceptions.txt` in both
-//! directions.
+//! A2A v1.0 conformance with nothing excused: the wire recorder's own behaviour, one
+//! authenticated door driven through every method it serves, and the docs held to the v1.0 wire.
 //!
-//! Every other test that goes through the common door helpers enforces the list one way only: a
-//! failing check that is not listed fails it. Only here does a listed exception that no longer
-//! occurs fail, because nextest runs each test in its own process and no other process sees every
-//! method served.
+//! Every test that goes through the common door helpers fails on any exchange the recorder finds
+//! non-conformant. [`every_served_method_conforms`] makes sure each served method is judged at
+//! least once, including methods no other test calls. The docs tests read every page under
+//! `docs/content`: a retired 0.3 or murmur name must sit beside its replacement, and every
+//! JSON-RPC request example must pass the same request check the recorder applies.
 
 #[path = "common/mod.rs"]
 mod common;
 
 use std::{
-    collections::BTreeSet,
+    panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use common::{
-    a2a_conformance::WirePart,
+    a2a_conformance::check_request,
     door_capsule::{
         agent_project, driver_home, end_turn, launch_door, message, push_config_requests, rpc,
         stage_door, wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
     },
-    wire_recorder::{
-        begin_census, exceptions, exceptions_file, observed, parse_exceptions, EXCEPTIONS_PATH,
-        PART5_CARDS, VERSION_HEADER,
-    },
+    wire_recorder::{record_post, VERSION_HEADER},
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[test]
-fn wire_exceptions_list_is_well_formed() {
-    let mut problems = Vec::new();
-    let mut keys = BTreeSet::new();
-    for (line_no, line) in parse_exceptions(exceptions_file()) {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                problems.push(format!("line {line_no}: {error}"));
-                continue;
-            }
-        };
-        let Some(part) = WirePart::parse(&line.part) else {
-            problems.push(format!(
-                "line {line_no}: part `{}` is not one of method, header, envelope, params, result, event",
-                line.part
-            ));
-            continue;
-        };
-        let subject_fits = match part {
-            WirePart::Method | WirePart::Envelope => line.subject == "-",
-            WirePart::Header => line.subject == VERSION_HEADER,
-            WirePart::Params | WirePart::Result | WirePart::Event => {
-                line.subject.starts_with("lf.a2a.v1.") && line.subject.len() > "lf.a2a.v1.".len()
-            }
-        };
-        if !subject_fits {
-            problems.push(format!(
-                "line {line_no}: subject `{}` does not fit part `{}`: `-` for method and envelope, \
-                 the header name for header, an lf.a2a.v1 message for params, result and event",
-                line.subject, line.part
-            ));
-        }
-        if !PART5_CARDS.contains(&line.card.as_str()) {
-            problems.push(format!(
-                "line {line_no}: card `{}` is not one of {PART5_CARDS:?}",
-                line.card
-            ));
-        }
-        if line.why.is_empty() {
-            problems.push(format!("line {line_no}: no reason given"));
-        }
-        if !keys.insert(line.key()) {
-            problems.push(format!("line {line_no}: `{}` is listed twice", line.key()));
-        }
-    }
-    assert!(
-        problems.is_empty(),
-        "{EXCEPTIONS_PATH} is malformed:\n{}",
-        problems.join("\n")
-    );
-}
-
-#[test]
-fn the_door_fails_exactly_the_listed_exceptions() {
-    begin_census();
+fn every_served_method_conforms() {
     // Every provider answer takes a moment, so a task queued behind a running one is still
     // `submitted` when it is cancelled. Short enough that a stream never goes the second quiet
     // `request` reads it until.
@@ -320,36 +264,431 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         "census: every served method driven in {:.1}s",
         started.elapsed().as_secs_f64()
     );
+    drop(server);
+}
 
-    let observed = observed();
-    let listed: BTreeSet<String> = exceptions().iter().map(|line| line.key()).collect();
-    let mut differences = Vec::new();
-    for (key, violation) in &observed {
-        if !listed.contains(key) {
-            let errors: Vec<String> = violation
-                .errors
-                .iter()
-                .map(|error| format!("    - {error}"))
-                .collect();
-            differences.push(format!(
-                "observed but not listed: {key}\n{}",
-                errors.join("\n")
-            ));
+// ── The recorder fails what is not v1.0 ───────────────────────────────────────
+
+const GET_TASK: &str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"tsk_1"}}"#;
+
+const STREAM_MESSAGE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"hello"}]}}}"#;
+
+const V1_TASK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING"}}}"#;
+
+const V1_STATUS_EVENT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+
+const VERSIONED: [(&str, &str); 2] = [
+    ("Content-Type", "application/json"),
+    (VERSION_HEADER, "1.0"),
+];
+
+fn json_headers() -> Vec<(String, String)> {
+    vec![("content-type".to_string(), "application/json".to_string())]
+}
+
+fn event_stream_headers() -> Vec<(String, String)> {
+    vec![("content-type".to_string(), "text/event-stream".to_string())]
+}
+
+/// The message [`record_post`] panics with for this 200 exchange, or `None` when it passes.
+fn recorder_failure(
+    request_headers: &[(&str, &str)],
+    request_body: &str,
+    response_headers: &[(String, String)],
+    response_body: &str,
+) -> Option<String> {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        record_post(
+            request_headers,
+            request_body,
+            200,
+            response_headers,
+            response_body,
+        )
+    }));
+    outcome.err().map(|payload| {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_else(|| "a panic with no message".to_string())
+    })
+}
+
+#[test]
+fn recorder_fails_a_nonconformant_result() {
+    let failure = recorder_failure(
+        &VERSIONED,
+        GET_TASK,
+        &json_headers(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"working"}}}"#,
+    )
+    .expect("a 0.3 task state in a GetTask result fails the recorder");
+    assert!(
+        failure.starts_with("A2A v1.0 wire check failed: GetTask result lf.a2a.v1.Task"),
+        "{failure}"
+    );
+    assert!(failure.contains("result.status.state"), "{failure}");
+}
+
+#[test]
+fn recorder_fails_a_nonconformant_stream_event() {
+    let body = concat!(
+        "id: 1\n",
+        r#"data: {"jsonrpc":"2.0","id":1,"result":{"kind":"status-update","taskId":"tsk_1","contextId":"ctx_1","status":{"state":"working"},"final":false}}"#,
+        "\n\n",
+    );
+    let failure = recorder_failure(&VERSIONED, STREAM_MESSAGE, &event_stream_headers(), body)
+        .expect("a 0.3 status-update event fails the recorder");
+    assert!(
+        failure.starts_with("A2A v1.0 wire check failed: SendStreamingMessage event"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn recorder_fails_an_unversioned_request() {
+    let failure = recorder_failure(
+        &[("Content-Type", "application/json")],
+        GET_TASK,
+        &json_headers(),
+        V1_TASK,
+    )
+    .expect("an accepted request without A2A-Version fails the recorder");
+    assert!(
+        failure.starts_with("A2A v1.0 wire check failed: GetTask header A2A-Version"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn recorder_passes_a_conformant_exchange() {
+    let stream_body = format!("id: 1\ndata: {V1_STATUS_EVENT}\n\n");
+    let exchanges = [
+        ("result", GET_TASK, json_headers(), V1_TASK.to_string()),
+        (
+            "stream event",
+            STREAM_MESSAGE,
+            event_stream_headers(),
+            stream_body,
+        ),
+    ];
+    for (what, request, response_headers, response) in exchanges {
+        assert_eq!(
+            recorder_failure(&VERSIONED, request, &response_headers, &response),
+            None,
+            "a v1.0 {what} fails the recorder"
+        );
+    }
+}
+
+// ── The docs describe the v1.0 wire ───────────────────────────────────────────
+
+/// Each retired wire name the docs may mention only beside its replacement.
+const RETIRED_NAMES: [(&str, &str); 9] = [
+    ("message/send", "SendMessage"),
+    ("message/stream", "SendStreamingMessage"),
+    ("tasks/get", "GetTask"),
+    ("tasks/cancel", "CancelTask"),
+    ("getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
+    ("input-required", "TASK_STATE_INPUT_REQUIRED"),
+    ("stream/watch", "murmur.WatchSession"),
+    ("session/stop", "murmur.StopSession"),
+    ("x-murmur-forget-session", "forgetSession"),
+];
+
+/// The fewest JSON-RPC request examples the docs hold; fewer means the extractor lost them.
+const MIN_REQUEST_EXAMPLES: usize = 15;
+
+fn docs_content() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/content")
+}
+
+/// Every `.md` file under `docs/content`, as (path relative to it, text), sorted by path.
+fn docs_pages() -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, pages: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, root, pages);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+                let relative = path.strip_prefix(root).expect("under docs/content");
+                pages.push((relative.to_string_lossy().replace('\\', "/"), text));
+            }
         }
     }
-    for line in exceptions() {
-        if !observed.contains_key(&line.key()) {
-            differences.push(format!(
-                "listed but not observed: {} ({}): the door no longer fails it, so remove this line",
-                line.key(),
-                line.card
-            ));
+    let root = docs_content();
+    let mut pages = Vec::new();
+    walk(&root, &root, &mut pages);
+    pages.sort();
+    assert!(!pages.is_empty(), "no pages under {}", root.display());
+    pages
+}
+
+/// One fenced code block: the 0-based lines of its opening and closing fences (the closing one
+/// is the page's end for an unclosed block), and its info string's first word.
+struct Fence {
+    open: usize,
+    close: usize,
+    info: String,
+}
+
+/// The fenced blocks of a page. A fence is a run of three or more backticks or tildes, indented
+/// or not, so blocks inside admonitions count.
+fn fences(lines: &[&str]) -> Vec<Fence> {
+    let mut fences = Vec::new();
+    let mut open: Option<(usize, char, usize, String)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+        let Some(marker) = marker else { continue };
+        let run = trimmed.chars().take_while(|c| *c == marker).count();
+        if run < 3 {
+            continue;
+        }
+        match &open {
+            None => {
+                let info = trimmed[run..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                open = Some((index, marker, run, info));
+            }
+            Some((start, open_marker, open_run, info)) => {
+                if marker == *open_marker && run >= *open_run && trimmed[run..].trim().is_empty() {
+                    fences.push(Fence {
+                        open: *start,
+                        close: index,
+                        info: info.clone(),
+                    });
+                    open = None;
+                }
+            }
+        }
+    }
+    if let Some((start, _, _, info)) = open {
+        fences.push(Fence {
+            open: start,
+            close: lines.len(),
+            info,
+        });
+    }
+    fences
+}
+
+fn is_fence_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// The blank-line-delimited paragraph around `line`, stopping at a fence line, as a line range.
+fn paragraph(lines: &[&str], line: usize) -> (usize, usize) {
+    let stops = |index: usize| lines[index].trim().is_empty() || is_fence_line(lines[index]);
+    let mut start = line;
+    while start > 0 && !stops(start - 1) {
+        start -= 1;
+    }
+    let mut end = line + 1;
+    while end < lines.len() && !stops(end) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The text a mention on `line` is judged with:
+/// - a table row is its own unit;
+/// - a line inside a fenced block takes the whole block, plus the nearest non-blank paragraph
+///   before the opening fence;
+/// - any other line takes its blank-line-delimited paragraph.
+fn unit(lines: &[&str], fences: &[Fence], line: usize) -> String {
+    if lines[line].trim_start().starts_with('|') {
+        return lines[line].to_string();
+    }
+    if let Some(fence) = fences
+        .iter()
+        .find(|fence| fence.open <= line && line <= fence.close)
+    {
+        let mut before = fence.open;
+        while before > 0 && lines[before - 1].trim().is_empty() {
+            before -= 1;
+        }
+        let start = if before == 0 {
+            fence.open
+        } else {
+            paragraph(lines, before - 1).0
+        };
+        let end = (fence.close + 1).min(lines.len());
+        return lines[start..end].join("\n");
+    }
+    let (start, end) = paragraph(lines, line);
+    lines[start..end].join("\n")
+}
+
+/// Where `term` occurs in `line`, as byte offsets. `message/send` right after `:` or `/` is the
+/// WIT interface `murmur:message/send` or its file path, not the 0.3 method.
+fn mentions(line: &str, term: &str) -> Vec<usize> {
+    line.match_indices(term)
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            term != "message/send" || !matches!(line[..at].chars().last(), Some(':' | '/'))
+        })
+        .collect()
+}
+
+#[test]
+fn the_docs_describe_no_a2a_0_3_wire() {
+    let mut misses = Vec::new();
+    for (path, text) in docs_pages() {
+        let lines: Vec<&str> = text.lines().collect();
+        let fences = fences(&lines);
+        for (index, line) in lines.iter().enumerate() {
+            for (term, replacement) in RETIRED_NAMES {
+                if mentions(line, term).is_empty() {
+                    continue;
+                }
+                if !unit(&lines, &fences, index).contains(replacement) {
+                    misses.push(format!(
+                        "{path}:{}: {term} without {replacement}",
+                        index + 1
+                    ));
+                }
+            }
         }
     }
     assert!(
-        differences.is_empty(),
-        "the door's A2A v1.0 violations differ from {EXCEPTIONS_PATH}:\n{}",
-        differences.join("\n")
+        misses.is_empty(),
+        "these docs lines name a retired wire name with no replacement in the same table row, \
+         paragraph or code block (with the paragraph before it):\n{}",
+        misses.join("\n")
     );
-    drop(server);
+}
+
+/// A JSON-RPC request example in the docs: the page and 1-based line it starts on, its text, and
+/// the fenced block it sits in.
+struct RequestExample {
+    path: String,
+    line: usize,
+    text: String,
+    fence: usize,
+}
+
+/// Every candidate request in a page's fenced blocks:
+/// - the text between `-d '` (or `--data '`) and the next `'`;
+/// - the whole of a block whose info string is `json`, when it is a JSON-RPC request.
+fn request_candidates(path: &str, lines: &[&str], fences: &[Fence]) -> Vec<RequestExample> {
+    let mut candidates = Vec::new();
+    for (index, fence) in fences.iter().enumerate() {
+        let body_start = fence.open + 1;
+        let body_end = fence.close.min(lines.len()).max(body_start);
+        let body = lines[body_start..body_end].join("\n");
+        if fence.info == "json" && is_json_rpc_request(&body) {
+            candidates.push(RequestExample {
+                path: path.to_string(),
+                line: body_start + 1,
+                text: body.clone(),
+                fence: index,
+            });
+        }
+        for flag in ["-d '", "--data '"] {
+            for (at, _) in body.match_indices(flag) {
+                let start = at + flag.len();
+                let Some(length) = body[start..].find('\'') else {
+                    continue;
+                };
+                candidates.push(RequestExample {
+                    path: path.to_string(),
+                    line: body_start + 1 + body[..at].matches('\n').count(),
+                    text: body[start..start + length].to_string(),
+                    fence: index,
+                });
+            }
+        }
+    }
+    candidates
+}
+
+/// `text` is a JSON object carrying `jsonrpc` and `method`.
+fn is_json_rpc_request(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .is_ok_and(|value| value.get("jsonrpc").is_some() && value.get("method").is_some())
+}
+
+/// The unit shows a refusal: a JSON-RPC error code `-32xxx`, or an HTTP `401` or `403`, each as a
+/// word of its own. A bare substring would skip any example whose ids or ports hold `401`.
+fn shows_refusal(unit: &str) -> bool {
+    unit.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .any(|word| {
+            let is_error_code = word.strip_prefix("-32").is_some_and(|digits| {
+                digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit())
+            });
+            is_error_code || word == "401" || word == "403"
+        })
+}
+
+#[test]
+fn the_docs_request_examples_are_v1_requests() {
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for (path, text) in docs_pages() {
+        let lines: Vec<&str> = text.lines().collect();
+        let fences = fences(&lines);
+        let mut unversioned_curls = Vec::new();
+        for example in request_candidates(&path, &lines, &fences) {
+            let at = format!("{}:{}", example.path, example.line);
+            let request = match serde_json::from_str::<Value>(&example.text) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("skipped {at}: not JSON ({error})");
+                    continue;
+                }
+            };
+            if request.get("jsonrpc").is_none() || request.get("method").is_none() {
+                eprintln!("skipped {at}: not a JSON-RPC request (no jsonrpc and method)");
+                continue;
+            }
+            let fence = &fences[example.fence];
+            let block = lines[fence.open..fence.close.min(lines.len())].join("\n");
+            if block.contains("curl")
+                && !block.contains(&format!("{VERSION_HEADER}: 1.0"))
+                && !unversioned_curls.contains(&example.fence)
+            {
+                unversioned_curls.push(example.fence);
+                failures.push(format!(
+                    "{at}: a curl request without `-H \"{VERSION_HEADER}: 1.0\"`"
+                ));
+            }
+            if shows_refusal(&unit(&lines, &fences, example.line - 1)) {
+                eprintln!("skipped {at}: shown being refused");
+                continue;
+            }
+            checked += 1;
+            for violation in check_request(&request) {
+                failures.push(format!(
+                    "{at}: {}\n{}",
+                    violation.key(),
+                    violation
+                        .errors
+                        .iter()
+                        .map(|error| format!("  - {error}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+    }
+    eprintln!("checked {checked} JSON-RPC request examples");
+    assert!(
+        failures.is_empty(),
+        "these docs request examples are not A2A v1.0 requests:\n{}",
+        failures.join("\n")
+    );
+    assert!(
+        checked >= MIN_REQUEST_EXAMPLES,
+        "checked only {checked} request examples, fewer than {MIN_REQUEST_EXAMPLES}"
+    );
 }

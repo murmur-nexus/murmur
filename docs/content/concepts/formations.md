@@ -96,7 +96,8 @@ Every capsule with an agent session serves a door: a small HTTP endpoint exposin
 [Agent Card](../reference/agent-card.md) (`/.well-known/agent-card.json`) and a JSON-RPC 2.0 task
 interface, so other capsules and standard A2A clients can discover the capsule and hand it a task.
 Whether an incoming message is accepted depends on the capsule's `lifecycle.task_acceptance`
-setting (see [Capsule lifecycle](session-loop.md#capsule-lifecycle)).
+setting (see [Capsule lifecycle](session-loop.md#capsule-lifecycle)). What the door serves of
+A2A v1.0 is in [A2A v1.0 conformance](../reference/agent-card.md#conformance).
 
 A formation member is reached at its door like any capsule: `call-member` sends the task there. To
 wire two capsules together by hand, with a pinned port and `curl`, see

@@ -7,6 +7,9 @@ heartbeat.
 [`mur watch`](cli.md#mur-watch) is a client for one of the endpoints. What it implements is listed
 under [What `mur watch` implements](#mur-watch).
 
+What the door serves and refuses, and every extension, is listed under
+[A2A v1.0 conformance](agent-card.md#conformance).
+
 ---
 
 ## Endpoints { #endpoints }
@@ -154,7 +157,7 @@ A `TASK_STATE_WORKING` status says what the task is doing:
 | `status.message` | Written when |
 |---|---|
 | `inference turn <n>` | At the start of each inference turn, counted from 1 across every attempt of the task |
-| `resumed` | An `input-required` wait is answered |
+| `resumed` | A `TASK_STATE_INPUT_REQUIRED` wait is answered |
 | `reopened by hook <hook>` | An `on-task-end` hook reopens the task |
 | `waiting on call-member: <n> call(s) outstanding` | [`call-member`](runtime-provided-tools.md#call-member) calls are unanswered |
 | `waiting on delegate-task: <n> delegation(s) outstanding` | Delegations the task started have not reported back |
@@ -380,13 +383,14 @@ One attempt of a task writes its events in this order:
    frames, in the order they are produced. A
    [`tool-call-started`](#event-tool-call-started) frame for each tool call the model begins
    writing, and that call's [`tool-call-progress`](#event-tool-call-progress) frames, come after
-   the turn's `working` status and before the call's `artifact`. On a `transport: http` capsule
-   they come before the turn's `"final":true` `text` frame of step 3.
+   the turn's `TASK_STATE_WORKING` status and before the call's `artifact`. On a
+   `transport: http` capsule they come before the turn's `"final":true` `text` frame of step 3.
 3. When the turn streamed text, one `text` `"final":true` frame with empty text once the driver
    returns.
 4. One [`artifact`](#event-artifact) per tool call, written when the call returns, in dispatch
    order. A tool's own streamed `text` and `thinking` frames, and the `TASK_STATE_INPUT_REQUIRED`
-   and `working` `resumed` statuses of its `request-input` wait, come before its `artifact`.
+   and `TASK_STATE_WORKING` `resumed` statuses of its `request-input` wait, come before its
+   `artifact`.
 5. The next turn repeats from step 1.
 6. When the attempt completes, one `artifact` per hook artifact, then the whole reply as one
    `text` `"final":true` frame when the last turn streamed no text.

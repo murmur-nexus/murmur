@@ -145,7 +145,8 @@ pub(crate) struct Violation {
 }
 
 impl Violation {
-    /// `<method> <part> <subject>`: one line's key in the wire exceptions list.
+    /// `<method> <part> <subject>`, `GetTask result lf.a2a.v1.Task`: what names the violation in
+    /// the wire recorder's failure message, ahead of its errors.
     pub(crate) fn key(&self) -> String {
         format!("{} {} {}", self.method, self.part.as_str(), self.subject)
     }

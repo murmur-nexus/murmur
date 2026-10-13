@@ -92,7 +92,7 @@ already holds it and is never seeded again. A [`--forget-session`](../reference/
 [`forgetSession`](../reference/agent-card.md#forget-session) request applies to the task's first attempt only, so a reopened attempt
 resumes the session that attempt established.
 
-A client streaming the task sees a `working` status marking each reopen and one terminal status,
+A client streaming the task sees a `TASK_STATE_WORKING` status marking each reopen and one terminal status,
 written after the hooks accept the task or the reopen limit runs out. The `response` artifact
 before it is the accepted answer; frames from a rejected attempt stay on the stream. The events
 are described under [Reopened tasks](../reference/streaming-protocol.md#reopened-tasks) in the
@@ -120,8 +120,8 @@ turn budget just because a hook keeps asking for another try.
 
 If the reopen limit or the turn limit is used up while a hook still wants to reopen, the task
 ends with its own exit status — `exit_status: "reopen_budget_exhausted"` rather than an
-ordinary `"ok"`/`"failed"` — and the task registry / A2A task state records it like any other
-failed task. The task's error message names the limit that refused the reopen:
+ordinary `"ok"`/`"failed"` — and its A2A state is `TASK_STATE_FAILED`, like any other failed
+task. The task's error message names the limit that refused the reopen:
 
 | Limit used up | Error message contains | Raise |
 |---|---|---|
@@ -204,7 +204,7 @@ it accepts over its lifetime:
 
 | `task_acceptance` | `after_task` | Behaviour |
 |---|---|---|
-| `none` | `exit` | Runs from `task.md` if present, then exits. All incoming messages are rejected. |
+| `none` | `exit` | Runs from `task.md` if present, then exits. The door starts no task — see [`lifecycle.task_acceptance`](../reference/manifest.md#lifecycle-task-acceptance). |
 | `single` (default) | `exit` (default) | Accepts one [A2A task](formations.md), runs it, exits. Classic ephemeral capsule. |
 | `queue` | `sleep` | Accepts a queue of tasks, processes them serially, sleeps between tasks; the host decides when to shut it down on idle. |
 

@@ -978,7 +978,7 @@ A scope that is a retired name of a door method is refused with
 | `message/stream` | `SendStreamingMessage` |
 | `tasks/get` | `GetTask` |
 | `tasks/cancel` | `CancelTask` |
-| `agent/getAuthenticatedExtendedCard` | Nothing: remove it |
+| `agent/getAuthenticatedExtendedCard` | Nothing: remove it. Every valid token may call `GetExtendedAgentCard` |
 | `stream/watch` | `murmur.WatchSession` |
 | `session/stop` | `murmur.StopSession` |
 
@@ -1479,7 +1479,7 @@ A call that does not fit is never sent. The refusal appears as:
 |---|---|
 | `trace.jsonl` | A [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line naming the limit, the ceiling, what was used and what the call needed |
 | `out/result.txt` | `stopped: spend ceiling reached: …`, ending with `retrying will not get past it` |
-| A2A terminal status | `failed`, with the same `spend ceiling reached: …` text as its message |
+| A2A terminal status | `TASK_STATE_FAILED`, with the same `spend ceiling reached: …` text as its message |
 | A hook's `run-inference` | `err` with the same text |
 | `task_end`, `session_end` | `exit_status: "spend_ceiling_reached"` |
 | [`mur run`](cli.md#mur-run-status) | `status:  spend_ceiling_reached`, [`E-RUN-040`](diagnostics.md#e-run-040), exit code `1` |
@@ -1605,7 +1605,7 @@ inference:
 | Turn limit | One model action — a message or a tool call — is one turn, bounded by `inference.max_turns`. A turn past the limit ends the run with [`E-RUN-033`](diagnostics.md#e-run-033). |
 | Inactivity limit | A run with neither a line of harness output nor a tool call for 600 seconds is killed with [`E-RUN-035`](diagnostics.md#e-run-035). A harness that is working is never interrupted for taking a long time. |
 | Interrupt grace | A harness sent a graceful interrupt has 10 seconds to end on its own before it is killed. Both this and the inactivity limit are fixed, not manifest settings. |
-| Cancellation | [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) interrupts the harness the way the driver's `describe()` declares: `stdin-message` writes the launch plan's interrupt bytes to its stdin, `signal-int` sends it `SIGINT`, and `unsupported` kills it outright. A graceful interrupt gets the interrupt grace above. The task is `canceled` either way, and the capsule, its queue and its conversation keep going. |
+| Cancellation | [`CancelTask`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) interrupts the harness the way the driver's `describe()` declares: `stdin-message` writes the launch plan's interrupt bytes to its stdin, `signal-int` sends it `SIGINT`, and `unsupported` kills it outright. A graceful interrupt gets the interrupt grace above. The task is `TASK_STATE_CANCELED` either way, and the capsule, its queue and its conversation keep going. |
 | Result | The harness's final result text is written to `out/result.txt`. A turn the harness reports as failed is [`E-RUN-033`](diagnostics.md#e-run-033), naming why. |
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. |
 | Token counts | The harness's own, as its driver reports them, in the `inference` line's `input_tokens` and `output_tokens` — this transport has no runtime estimate, so `input_tokens_actual` and `output_tokens_actual` stay absent. A driver that reports no usage leaves both counts absent, which is not the same as zero. |
@@ -2126,15 +2126,15 @@ lifecycle:
 
 | Value | Behaviour |
 |---|---|
-| `none` | Capsule runs from `task.md` if present, then exits. All incoming messages return JSON-RPC error `-32601`. |
-| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active is answered with a task in [`TASK_STATE_REJECTED`](agent-card.md#task-states). A task accepted while a `task.md` task runs is never started: it ends `rejected` when the session ends — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
-| `queue` | Capsule accepts up to `queue_depth` pending tasks simultaneously. Tasks are processed serially; new tasks are accepted as soon as the pending queue drops below `queue_depth`. Under `after_task: exit`, a task still queued when the session ends is never started: it ends `rejected` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
+| `none` | Capsule runs from `task.md` if present, then exits. The door answers `SendMessage` with JSON-RPC error `-32601`, and `SendStreamingMessage` and `SubscribeToTask` with `-32004` — see [Agent Card: Errors](agent-card.md#errors). |
+| `single` (default) | Capsule accepts one A2A task, runs it, then exits. A second message while a task is active is answered with a task in [`TASK_STATE_REJECTED`](agent-card.md#task-states). A task accepted while a `task.md` task runs is never started: it ends `TASK_STATE_REJECTED` when the session ends — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
+| `queue` | Capsule accepts up to `queue_depth` pending tasks simultaneously. Tasks are processed serially; new tasks are accepted as soon as the pending queue drops below `queue_depth`. Under `after_task: exit`, a task still queued when the session ends is never started: it ends `TASK_STATE_REJECTED` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 
 ### `lifecycle.after_task` { #lifecycle-after-task }
 
 | Value | Behaviour |
 |---|---|
-| `exit` (default) | The session ends as soon as the task finishes, whether the task came from `--task` or over A2A. A launch that receives no task ends when the [idle timeout](#idle-timeout) fires. A task the door accepted that the session never started ends `rejected` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
+| `exit` (default) | The session ends as soon as the task finishes, whether the task came from `--task` or over A2A. A launch that receives no task ends when the [idle timeout](#idle-timeout) fires. A task the door accepted that the session never started ends `TASK_STATE_REJECTED` — see [Tasks queued when the session ends](#queued-tasks-at-session-end). |
 | `sleep` | The capsule loops back to wait for the next task. Only useful with `task_acceptance: queue`; with `single` it behaves like `exit`. |
 
 ### Tasks queued when the session ends { #queued-tasks-at-session-end }
@@ -2146,8 +2146,8 @@ not run: running it would contradict `after_task: exit`.
 | Task | What it gets |
 |---|---|
 | Accepted, never started, when the session stops taking work | `TASK_STATE_REJECTED` over [`GetTask`](agent-card.md#tasks-get), a terminal `TASK_STATE_REJECTED` [status on the stream](streaming-protocol.md#one-final-status), and one [`task_rejected`](observability-schemas.md#task-rejected) trace line. No `task_start`, `task_end`, hook dispatch or model request |
-| Cancelled while still queued | Stays `canceled`, with its `task_canceled` trace line. Never `rejected` |
-| A message arriving after the session stops taking work | Answered `rejected` at the door. Nothing is recorded in the trace |
+| Cancelled while still queued | Stays `TASK_STATE_CANCELED`, with its `task_canceled` trace line. Never `TASK_STATE_REJECTED` |
+| A message arriving after the session stops taking work | Answered with a task in `TASK_STATE_REJECTED` at the door. Nothing is recorded in the trace |
 
 A refused task does not change the session's own outcome: `session_end.exit_status`, the
 `on-session-end` hook's `exit_status` and the `mur run` exit code are what the tasks that ran make
@@ -2160,8 +2160,8 @@ Controls how long the capsule waits for a `SendMessage` reply after a WASM tool 
 
 | Value | Behaviour |
 |---|---|
-| absent (default) | Wait indefinitely — the task stays in `input-required` state until a reply arrives or the process is killed. |
-| `N` (positive integer) | If no `SendMessage` arrives within `N` seconds, the tool call fails and the attempt ends. The task ends `failed`, and its [final status](streaming-protocol.md#one-final-status) carries message `input-timeout`, unless an `on-task-end` hook reopens it. |
+| absent (default) | Wait indefinitely — the task stays in [`TASK_STATE_INPUT_REQUIRED`](agent-card.md#task-states) until a reply arrives, the task is cancelled, or the process is killed. |
+| `N` (positive integer) | If no `SendMessage` arrives within `N` seconds, the tool call fails and the attempt ends. The task ends `TASK_STATE_FAILED`, and its [final status](streaming-protocol.md#one-final-status) carries message `input-timeout`, unless an `on-task-end` hook reopens it. |
 
 Example — require a reply within 5 minutes:
 

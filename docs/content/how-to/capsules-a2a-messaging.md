@@ -161,7 +161,7 @@ mur install
 mur run --manifest worker/murmur.yaml
 ```
 
-The worker capsule starts and prints its URL to stderr:
+The worker capsule starts and prints its URL:
 
 ```
 mur run --manifest worker/murmur.yaml
@@ -348,13 +348,29 @@ curl -s -X POST http://localhost:$PORT \
         "contextId": "ctx-001",
         "status":
         {
-            "state": "TASK_STATE_COMPLETED"
-        }
+            "state": "TASK_STATE_COMPLETED",
+            "message":
+            {
+                "messageId": "msg_tsk_019ed5211c827f63a8fe4be623277c55_status",
+                "contextId": "ctx-001",
+                "taskId": "tsk_019ed5211c827f63a8fe4be623277c55",
+                "role": "ROLE_AGENT",
+                "parts": [{"text": "session ended", "mediaType": "text/plain"}]
+            }
+        },
+        "artifacts":
+        [
+            {
+                "artifactId": "response",
+                "name": "response",
+                "parts": [{"text": "Acknowledged.", "mediaType": "text/plain"}]
+            }
+        ]
     }
 }
 ```
 
-Poll until `status.state` is `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED`. The task registry on the worker capsule remembers completed tasks, so you can query a task ID after the task has already finished.
+The worker's answer is the `response` artifact. Poll until `status.state` is `TASK_STATE_COMPLETED` or `TASK_STATE_FAILED`. The task registry on the worker capsule remembers completed tasks, so you can query a task ID after the task has already finished.
 
 !!! note "The HTTP server shuts down with the session"
     Once the worker capsule exits (idle timeout, or after the last queued task), its HTTP server is released. Final status is always available in `trace.jsonl` in the worker capsule's workdir.
@@ -405,8 +421,9 @@ declares — writing the driver's interrupt bytes to the harness's stdin, or sen
 gives it 10 seconds to end on its own, and kills it if it does not. A driver that declares no
 graceful interrupt has its harness killed at once: a person can always stop the task.
 
-The task is `canceled` either way, whatever the harness says on its way out, and the capsule keeps
-its session, its queue and the conversation this context was holding: the next message under the
+The task ends `TASK_STATE_CANCELED` either way, whatever the harness says on its way out, and the
+capsule keeps its session, its queue and the conversation this context was holding: the next
+message under the
 same `contextId` resumes the same harness session. When the harness had to be killed, the terminal
 status says so — `task canceled; the harness was killed and its session may not resume cleanly` —
 because a harness cut off mid-turn may not be able to continue that session.
@@ -516,7 +533,7 @@ curl -s -X POST http://localhost:$PORT \
 | Key | Carries |
 |---|---|
 | `session_id` | The session this door answers for |
-| `canceled` | The task ids this call moved to `canceled`, sorted. Empty when nothing was still running |
+| `canceled` | The task ids this call moved to `TASK_STATE_CANCELED`, sorted. Empty when nothing was still running |
 | `residue` | One object per thing the session leaves running, the [residue items](../reference/agent-card.md#residue-items) `CancelTask` names. Empty when nothing is |
 
 All three keys are always present. `residue` is `[]` rather than absent when nothing is running,

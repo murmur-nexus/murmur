@@ -107,8 +107,8 @@ A call ends its tool call in one of four ways:
 | Result | When | `data` |
 |---|---|---|
 | `passed`, summary `Called <member>: started` | The member's door answered with a task id and a state that is not terminal | `{"call_id": "mcl_…", "member": "<name>", "status": "started", "task_id": "<the member's task id>"}` |
-| `passed`, summary `Called <member>: busy` | The member's door answered `rejected` with the status message `task rejected: capsule is busy`. The runtime keeps offering the task — see [A busy member](#call-member-busy) | `{"call_id": "mcl_…", "member": "<name>", "status": "busy", "output": "<member> is busy with other work and did not take the task"}` |
-| `failed`, summary `Called <member>: rejected` | The member's door answered `rejected` for any other reason, such as its session closing | `{"call_id": "mcl_…", "member": "<name>", "status": "rejected", "output": "<member> did not take the task: <reason>"}` |
+| `passed`, summary `Called <member>: busy` | The member's door answered [`TASK_STATE_REJECTED`](agent-card.md#task-states) with the status message `task rejected: capsule is busy`. The runtime keeps offering the task — see [A busy member](#call-member-busy) | `{"call_id": "mcl_…", "member": "<name>", "status": "busy", "output": "<member> is busy with other work and did not take the task"}` |
+| `failed`, summary `Called <member>: rejected` | The member's door answered `TASK_STATE_REJECTED` for any other reason, such as its session closing, which `call-member` reports as `rejected` | `{"call_id": "mcl_…", "member": "<name>", "status": "rejected", "output": "<member> did not take the task: <reason>"}` |
 | `failed`, summary `Called <member>: failed` | The call was refused, the door could not be reached, the door answered an error status or a JSON-RPC error, or the member answered with another terminal state | `{"call_id": "mcl_…", "member": "<name>", "status": "failed", "output": "<why>"}` |
 
 `data` reaches the model [fenced](untrusted-fence.md) under `tool:call-member`. Each result
@@ -127,7 +127,7 @@ adds the runtime's own note on the line after the closing marker, outside the fe
 | `busy` | `[call-member] <member> is busy with other work and has not taken call <call_id> yet. The runtime keeps offering it the task for up to <N>s and adds <member>'s answer, or word that it stayed busy, to this conversation after you end your turn. Unless you still have work to hand to a different member, end your turn now by replying without calling a tool. Calling <member> again before then is refused.` `<N>` is the call's deadline in seconds |
 | `rejected`, `failed` | `[call-member] Call <call_id> to <member> ended <status>, with no answer from <member>. Do not present an answer of your own as <member>'s.` For a task another formation member sent, followed by ` If you have no answer to give without <member>, call end-without-answer with the reason: the runtime then tells <caller> plainly that you gave none.` |
 
-A door's `rejected` answer reads as one sentence:
+A door's `TASK_STATE_REJECTED` answer reads as one sentence:
 
 | The door's status message | `output` |
 |---|---|
@@ -151,7 +151,7 @@ The call then ends in one of these ways:
 | What happens | The call |
 |---|---|
 | The member takes the task | Writes [`member_call_start`](observability-schemas.md#member-call-start) and runs as a started call does, against the same deadline |
-| The member answers `rejected` for another reason, or another terminal state | Ends with that status and sentence |
+| The member answers `TASK_STATE_REJECTED` for another reason, or another terminal state | Ends `rejected` or `failed` respectively, with the sentence [What a call returns](#call-member-result) gives |
 | Two offers in a row get no answer | Ends `unreachable` |
 | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) passes while the member is still busy | Ends `rejected`, never held: `<member> stayed busy with other work for the whole <N>s this call may wait and never took the task; it was offered the task <k> times. Nothing was done on it.` |
 | The calling task ends between offers | Ends `abandoned`, never held: `the calling task ended before <member> took the task; <member> was busy and was never handed it` |
@@ -186,7 +186,7 @@ different members in one turn never refuse each other.
 
 1. The model ends its turn with a turn still left.
 2. The task waits until every call it made has ended. While any call is outstanding, the task's
-   stream shows a `working` status `waiting on call-member: <n> call(s) outstanding`: once when
+   stream shows a `TASK_STATE_WORKING` status `waiting on call-member: <n> call(s) outstanding`: once when
    the wait starts, and again with the new count each time an answer arrives while others are
    still out. When every answer arrived during the turn, the task does not wait and shows no
    such status.
@@ -225,7 +225,7 @@ critic did not answer within 600s. …
 | Any other | `[call-member] call <call_id> to <member> ended <status>, with no answer from <member>:` |
 
 A call ends `no_answer` when the member ended its task with
-[`end-without-answer`](#end-without-answer): its task is `failed` and its `GetTask` result
+[`end-without-answer`](#end-without-answer): its task is `TASK_STATE_FAILED` and its `GetTask` result
 carries [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata). A member's
 `GetTask` result may also name, in `metadata.murmur.noAnswerBelow`, the members further down
 that gave it no answer. The runtime reads those names only for a `completed` or `no_answer` call,
@@ -291,7 +291,7 @@ the task ends as its attempt ended:
 | The model ends its last allowed turn | Not waited for: each is recorded `abandoned` | Recorded `delivered: false` |
 | Fails, runs out of turns, is cancelled, or is stopped by `SIGTERM` or its formation ending | Each is recorded `abandoned` | Recorded `delivered: false` |
 
-A task cancelled while it waits ends `canceled`. A task with `delegate-task` delegations
+A task cancelled while it waits ends `TASK_STATE_CANCELED`. A task with `delegate-task` delegations
 outstanding as well waits for both kinds together and continues once neither has anything
 outstanding, with every answer and every delegation outcome in one message, answers first — see
 [How the outcome arrives](roost-api.md#how-the-outcome-arrives).
@@ -341,7 +341,7 @@ the call and finished ends the same way.
 
 | Surface | What it shows |
 |---|---|
-| A2A state | `failed`, with the reason as its status message |
+| A2A state | `TASK_STATE_FAILED`, with the reason as its status message |
 | `GetTask` | [`metadata.murmur.noAnswer: true`](agent-card.md#no-answer-metadata), and `metadata.murmur.noAnswerBelow` naming each member further down this task had no answer from |
 | `out/result.txt` | `no answer: <reason>` |
 | [`task_end.exit_status`](observability-schemas.md#task-end) and the `on-task-end` exit status | `no_answer` |
@@ -350,7 +350,7 @@ the call and finished ends the same way.
 | The launch | A `no_answer` task never decides `session_end.exit_status` or the launch's exit code |
 
 An `on-task-end` hook may reopen the task; the reopened attempt may answer, or end without an
-answer again. A caller that is not a formation member reads an ordinary `failed` task with a
+answer again. A caller that is not a formation member reads an ordinary `TASK_STATE_FAILED` task with a
 status message.
 
 A task that answers in text while a member it called gave no answer completes as usual. Its
