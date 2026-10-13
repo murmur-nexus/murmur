@@ -60,12 +60,12 @@ pub(crate) fn run_stop(address: &str, timeout_secs: u64) -> Result<(), CliError>
 }
 
 /// What stopping one session did, for [`print_session_stop`].
-struct SessionStop {
+struct StoppedSession {
     session_id: String,
     capsule: String,
     /// What actually ended the process.
     signal: &'static str,
-    /// The door's `session/stop` answer, or why it could not be had.
+    /// The door's `murmur.StopSession` answer, or why it could not be had.
     door: Result<Value, String>,
     /// Cancelled tasks whose ending the final trace does not record.
     unended: Vec<String>,
@@ -73,15 +73,15 @@ struct SessionStop {
 
 /// End one running capsule: ask its door, then signal, then escalate, then remove its record.
 ///
-/// The order is the point. `session/stop` goes first because it is the only moment anything can
-/// ask the capsule what it leaves running — a detached shell command keeps its own lifecycle and
-/// a delegated child is still going, and the registries that know about either die with the
+/// The order is the point. `murmur.StopSession` goes first because it is the only moment anything
+/// can ask the capsule what it leaves running — a detached shell command keeps its own lifecycle
+/// and a delegated child is still going, and the registries that know about either die with the
 /// process. Reaching for `kill` first would throw that account away.
 ///
 /// A door that does not answer stops nothing: the two signalling steps still run, and the missing
 /// account is reported as missing. The session was ended either way; only the accounting is
 /// incomplete. The `Err` is `E-RUN-024`, the process still running, with its record kept.
-fn stop_session(record: &RunningRecord, grace: Duration) -> Result<SessionStop, CliError> {
+fn stop_session(record: &RunningRecord, grace: Duration) -> Result<StoppedSession, CliError> {
     let door = ask_the_door(record);
     if let Ok(result) = &door {
         wait_for_endings(record, result);
@@ -111,7 +111,7 @@ fn stop_session(record: &RunningRecord, grace: Duration) -> Result<SessionStop, 
     // it, and nothing but this will.
     running::prune(record);
 
-    Ok(SessionStop {
+    Ok(StoppedSession {
         session_id: record.session_id.clone(),
         capsule: format!("{}@{}", record.capsule_name, record.capsule_version),
         signal,
@@ -122,7 +122,7 @@ fn stop_session(record: &RunningRecord, grace: Duration) -> Result<SessionStop, 
 
 /// The block `mur stop <session>` prints, and `mur stop <formation id>` prints once per member
 /// started by hand.
-fn print_session_stop(stopped: &SessionStop) {
+fn print_session_stop(stopped: &StoppedSession) {
     capsule_runtime::report_println!("stopped: {}", stopped.session_id);
     capsule_runtime::report_println!("capsule: {}", stopped.capsule);
     capsule_runtime::report_println!("signal:  {}", stopped.signal);
@@ -240,7 +240,7 @@ fn stop_formation(address: &str, grace: Duration) -> Result<(), CliError> {
 
     // One at a time, in member order, each exactly as `mur stop <session>` stops it. A member
     // that could not be ended is reported and counted as still running; the rest still go.
-    let by_hand: Vec<Result<SessionStop, CliError>> = members
+    let by_hand: Vec<Result<StoppedSession, CliError>> = members
         .iter()
         .filter(|member| started_by_hand(member))
         .map(|member| stop_session(member, grace))
@@ -485,7 +485,8 @@ fn wait_for_exit(identity: &ProcessIdentity, grace: Duration) -> bool {
     }
 }
 
-/// `session/stop` through the door: cancel what the session still holds, and read the residue.
+/// `murmur.StopSession` through the door: cancel what the session still holds, and read the
+/// residue.
 ///
 /// The `Err` is why the door could not answer, which is printed rather than returned — a capsule
 /// that has stopped listening still has a process to end.
@@ -497,7 +498,7 @@ fn ask_the_door(record: &RunningRecord) -> Result<Value, String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "session/stop",
+        "method": "murmur.StopSession",
         "params": {}
     })
     .to_string();
@@ -508,7 +509,7 @@ fn ask_the_door(record: &RunningRecord) -> Result<Value, String> {
         let message = error
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("the capsule refused session/stop");
+            .unwrap_or("the capsule refused murmur.StopSession");
         return Err(format!("the capsule at {addr} refused the stop: {message}"));
     }
     response
@@ -517,7 +518,8 @@ fn ask_the_door(record: &RunningRecord) -> Result<Value, String> {
         .ok_or_else(|| format!("the capsule at {addr} answered with neither a result nor an error"))
 }
 
-/// The task ids the door's `session/stop` answer says it cancelled, in the order it gave them.
+/// The task ids the door's `murmur.StopSession` answer says it cancelled, in the order it gave
+/// them.
 fn canceled_ids(result: &Value) -> Vec<&str> {
     result
         .get("canceled")

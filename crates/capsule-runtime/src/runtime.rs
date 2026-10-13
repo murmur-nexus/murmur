@@ -3022,8 +3022,8 @@ fn launch(
             transport_capabilities(&staged),
             staged.door_authentication.as_ref(),
         );
-        // Read here, where the staged transport is still in hand, for the door to answer the
-        // forget header with.
+        // Read here, where the staged transport is still in hand, for the door to answer a
+        // message's `forgetSession` with.
         let forgettable_session = keeps_a_harness_session(staged.inference.as_ref());
         let accepts_peer_tasks = staged.accepts_peer_tasks;
         let agent_card_json = agent_cards.public.to_string();
@@ -19259,7 +19259,7 @@ inference:
             LaunchEnding::FormationEnded
         );
 
-        // `SIGTERM`, `session/stop` or the spawner's end: still a cancel.
+        // `SIGTERM`, `murmur.StopSession` or the spawner's end: still a cancel.
         let canceled = terminated(None, AgentLoopExit::Canceled, false);
         assert_eq!(canceled.exit_status(), "canceled");
         assert!(matches!(

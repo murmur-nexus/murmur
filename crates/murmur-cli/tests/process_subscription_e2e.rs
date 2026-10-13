@@ -844,7 +844,7 @@ fn http_post_json(addr: &str, body: &str) -> Value {
     serde_json::from_str(response.trim()).unwrap_or_else(|_| json!({"_raw": response}))
 }
 
-/// An open `stream/watch` connection, read event by event.
+/// An open `murmur.WatchSession` connection, read event by event.
 struct Watch {
     stream: TcpStream,
     pending: Vec<u8>,

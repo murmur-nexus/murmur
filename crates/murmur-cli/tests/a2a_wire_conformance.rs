@@ -223,11 +223,11 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         assert_eq!(events.iter().any(|event| event.is_frame()), activated);
     }
 
-    let watched = rpc(&addr, token, "stream/watch", json!({}));
+    let watched = rpc(&addr, token, "murmur.WatchSession", json!({}));
     assert_eq!(watched.status, 200, "{watched:?}");
     assert!(
         watched.body.contains("data:"),
-        "stream/watch wrote no events: {watched:?}"
+        "murmur.WatchSession wrote no events: {watched:?}"
     );
 
     let card = rpc(&addr, token, "GetExtendedAgentCard", json!({}));
@@ -238,7 +238,7 @@ fn the_door_fails_exactly_the_listed_exceptions() {
     assert_eq!(unknown.status, 200, "{unknown:?}");
     assert_eq!(unknown.json()["error"]["code"], -32001, "{unknown:?}");
 
-    let stopped = rpc(&addr, token, "session/stop", json!({}));
+    let stopped = rpc(&addr, token, "murmur.StopSession", json!({}));
     assert_eq!(stopped.status, 200, "{stopped:?}");
     assert!(stopped.json().get("result").is_some(), "{stopped:?}");
     eprintln!(

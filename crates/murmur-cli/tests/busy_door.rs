@@ -361,9 +361,9 @@ fn post_json(addr: &str, body: &str, budget: Duration) -> Result<Value, String> 
     serde_json::from_str(body).map_err(|e| format!("unparseable answer ({e}): {response:?}"))
 }
 
-/// Opens `stream/watch` and returns the socket and the moment it was opened.
+/// Opens `murmur.WatchSession` and returns the socket and the moment it was opened.
 fn open_watch(addr: &str) -> (TcpStream, Instant) {
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"murmur.WatchSession","params":{}}"#;
     let opened = Instant::now();
     let stream = TcpStream::connect(addr).expect("should connect");
     (&stream)
@@ -529,8 +529,11 @@ fn every_door_path_answers_while_the_turn_is_busy() {
 
     let (watch, opened) = open_watch(&capsule.url());
     read_until_line(&watch, CONNECTION_ACK, opened, PROBE_BUDGET)
-        .unwrap_or_else(|e| panic!("stream/watch went unanswered mid-turn: {e}"));
-    eprintln!("[busy-door] stream/watch acked in {:?}", opened.elapsed());
+        .unwrap_or_else(|e| panic!("murmur.WatchSession went unanswered mid-turn: {e}"));
+    eprintln!(
+        "[busy-door] murmur.WatchSession acked in {:?}",
+        opened.elapsed()
+    );
     let last_answer_ms = now_ms();
 
     assert!(
@@ -579,7 +582,7 @@ fn an_open_observer_does_not_outlive_the_session() {
 
     let (watch, opened) = open_watch(&url);
     read_until_line(&watch, CONNECTION_ACK, opened, Duration::from_secs(10))
-        .unwrap_or_else(|e| panic!("stream/watch did not open: {e}"));
+        .unwrap_or_else(|e| panic!("murmur.WatchSession did not open: {e}"));
 
     capsule.mur().args(["stop", "@1"]).assert().success();
 

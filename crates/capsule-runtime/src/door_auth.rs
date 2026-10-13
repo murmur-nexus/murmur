@@ -537,7 +537,7 @@ mod tests {
                 },
                 DoorCredential {
                     name: "watcher".to_string(),
-                    scopes: vec!["GetTask".to_string(), "stream/watch".to_string()],
+                    scopes: vec!["GetTask".to_string(), "murmur.WatchSession".to_string()],
                 },
             ],
         }
@@ -573,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             payload(&auth.tokens()[2].1),
-            json!({"credential": "watcher", "scopes": ["GetTask", "stream/watch"]})
+            json!({"credential": "watcher", "scopes": ["GetTask", "murmur.WatchSession"]})
         );
         let raw = mac_token::payload_segment(DOOR_TOKEN_TAG, auth.tokens()[1].1.expose()).unwrap();
         assert_eq!(
@@ -608,7 +608,8 @@ mod tests {
         let watcher = auth.verify(&[&header(&auth.tokens()[2].1)]).unwrap();
         assert_eq!(watcher.credential(), "watcher");
         assert!(watcher.allows("GetTask"));
-        assert!(watcher.allows("stream/watch"));
+        assert!(watcher.allows("murmur.WatchSession"));
+        assert!(!watcher.allows("murmur.StopSession"));
         assert!(!watcher.allows("SendMessage"));
         assert_eq!(
             watcher.require("SendMessage"),
@@ -761,10 +762,10 @@ mod tests {
             );
         }
         assert_eq!(
-            grant.require("session/stop"),
+            grant.require("murmur.StopSession"),
             Err(AuthRefusal::InsufficientScope {
                 credential: "member:planner".to_string(),
-                scope: "session/stop".to_string(),
+                scope: "murmur.StopSession".to_string(),
             })
         );
         assert!(!grant.allows("SendStreamingMessage"));
@@ -932,8 +933,8 @@ mod tests {
             format!(
                 "warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is \
                  not declared — any caller that reaches it can call SendMessage, \
-                 SendStreamingMessage, stream/watch, GetTask, CancelTask, session/stop, and the \
-                 agent card publishes to any A2A client the session id, tools [bash], shell: \
+                 SendStreamingMessage, murmur.WatchSession, GetTask, CancelTask, \
+                 murmur.StopSession, and the agent card publishes to any A2A client the session id, tools [bash], shell: \
                  true, network: true and planes [files] ({})",
                 security_warning_link(W_SEC_032)
             )
@@ -948,7 +949,8 @@ mod tests {
             "{published}"
         );
         assert!(
-            published.contains("can call stream/watch, GetTask, CancelTask, session/stop,"),
+            published
+                .contains("can call murmur.WatchSession, GetTask, CancelTask, murmur.StopSession,"),
             "{published}"
         );
     }
@@ -973,11 +975,13 @@ mod tests {
         );
         let authenticated = manifest(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-             watcher: {scopes: [GetTask, stream/watch]}\n      reader: {scopes: [resources/files]}\n",
+             watcher: {scopes: [GetTask, murmur.WatchSession]}\n      \
+             reader: {scopes: [resources/files]}\n",
         );
         assert_eq!(
             door_posture(&authenticated),
-            "door: bearer — operator, reader (resources/files), watcher (GetTask, stream/watch)"
+            "door: bearer — operator, reader (resources/files), watcher (GetTask, \
+             murmur.WatchSession)"
         );
     }
 }

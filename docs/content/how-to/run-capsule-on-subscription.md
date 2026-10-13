@@ -187,11 +187,10 @@ If the harness has lost a conversation Murmur is still naming, the next task in 
     curl -s localhost:41234 \
       -H 'content-type: application/json' \
       -H 'A2A-Version: 1.0' \
-      -H 'x-murmur-forget-session: true' \
-      -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m1","contextId":"ctx_0193f2","role":"ROLE_USER","parts":[{"text":"carry on"}]}}}'
+      -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m1","contextId":"ctx_0193f2","role":"ROLE_USER","parts":[{"text":"carry on"}],"extensions":["https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1"],"metadata":{"https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1":{"forgetSession":true}}}}}'
     ```
 
-Either way the entry is deleted, the turn runs as a new conversation under the same context id, and the trace records a `harness_session_forgotten` event naming the context, the id that was dropped and who asked. The flag applies to the launch's first task, and the header to the message that carried it. Only this transport has a harness session, so a forget asked of any other capsule is refused with [`E-RUN-039`](../reference/diagnostics.md#e-run-039).
+Either way the entry is deleted, the turn runs as a new conversation under the same context id, and the trace records a `harness_session_forgotten` event naming the context, the id that was dropped and who asked. The flag applies to the launch's first task, and the [`forgetSession`](../reference/agent-card.md#forget-session) field to the task its message starts; it goes on a message without a `taskId`. Only this transport has a harness session, so a forget asked of any other capsule is refused: [`E-RUN-039`](../reference/diagnostics.md#e-run-039) from the CLI, `-32602` from the door.
 
 Because the harness holds the history, `--resume-mode compact` has nothing to compact and refuses with [`E-RUN-037`](../reference/diagnostics.md#e-run-037). `context.max_tokens` and `inference.compaction` parse but do nothing: the harness manages its own context.
 

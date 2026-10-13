@@ -148,7 +148,7 @@ fn two_tasks_replayed() -> (IdleCapsule, Vec<Event>) {
     (capsule, replay)
 }
 
-/// The events a `stream/watch` attached with `last_event_id` receives within 3 s after its
+/// The events a `murmur.WatchSession` attached with `last_event_id` receives within 3 s after its
 /// `connection-ack`, which is asserted to come first.
 fn watch_frames(addr: &str, last_event_id: u64) -> Vec<Event> {
     let mut watch = Watch::open(addr, last_event_id);
@@ -157,7 +157,7 @@ fn watch_frames(addr: &str, last_event_id: u64) -> Vec<Event> {
     assert_eq!(
         all.first().map(Event::kind).as_deref(),
         Some("connection-ack"),
-        "stream/watch should open with connection-ack; events were {all:#?}"
+        "murmur.WatchSession should open with connection-ack; events were {all:#?}"
     );
     all.into_iter().skip(1).collect()
 }

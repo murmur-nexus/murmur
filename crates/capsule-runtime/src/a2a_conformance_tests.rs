@@ -28,7 +28,7 @@ fn conformant_card() -> Value {
                     "description": "Every JSON-RPC method this door answers.",
                     "required": false,
                     "params": {
-                        "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"]
+                        "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "CancelTask", "murmur.StopSession"]
                     }
                 },
                 {
@@ -91,7 +91,7 @@ fn a2a_card_conformance_rejects_the_previous_card_shape() {
             "cancellation": true
         },
         "serves": {
-            "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
+            "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "CancelTask", "murmur.StopSession"],
             "planes": ["files"]
         }
     });
@@ -730,6 +730,10 @@ fn a2a_wire_conformance_resolves_v1_and_extension_names() {
         assert_eq!((resolved.kind, resolved.name), (MethodKind::V1, v1));
         assert_eq!(resolved.spec.unwrap().name, v1);
     }
+    assert_eq!(
+        EXTENSION_METHODS,
+        [("murmur.WatchSession", true), ("murmur.StopSession", false)]
+    );
     for (name, streaming) in EXTENSION_METHODS {
         let resolved = resolve_method(name).unwrap();
         assert_eq!(
@@ -744,6 +748,9 @@ fn a2a_wire_conformance_resolves_v1_and_extension_names() {
     }
     assert!(resolve_method("tasks/list").is_none());
     assert!(resolve_method("sendmessage").is_none());
+    // The retired names of murmur's two methods are unknown methods, not aliases.
+    assert!(resolve_method("stream/watch").is_none());
+    assert!(resolve_method("session/stop").is_none());
 }
 
 #[test]
@@ -805,16 +812,17 @@ fn a2a_wire_conformance_absent_params_are_checked_as_empty() {
 #[test]
 fn a2a_wire_conformance_extension_methods_are_envelope_checked_only() {
     assert_eq!(
-        check_request(&request("stream/watch", json!({"anything": 1}))),
+        check_request(&request("murmur.WatchSession", json!({"anything": 1}))),
         []
     );
     assert_eq!(
-        check_request(&request("session/stop", json!({"reason": "x"}))),
+        check_request(&request("murmur.StopSession", json!({"reason": "x"}))),
         []
     );
-    let violations = check_request(&json!({"jsonrpc": "1.0", "id": 1, "method": "session/stop"}));
-    assert_eq!(keys(&violations), ["session/stop envelope -"]);
-    let stop = request("session/stop", json!({}));
+    let violations =
+        check_request(&json!({"jsonrpc": "1.0", "id": 1, "method": "murmur.StopSession"}));
+    assert_eq!(keys(&violations), ["murmur.StopSession envelope -"]);
+    let stop = request("murmur.StopSession", json!({}));
     let answer = json!({"jsonrpc": "2.0", "id": 1, "result": {"session_id": "ses_1", "canceled": [], "residue": null}});
     assert_eq!(check_response(&stop, &answer), []);
 }
@@ -971,7 +979,7 @@ fn a2a_wire_conformance_response_results_are_checked_as_the_method_result() {
 
 #[test]
 fn a2a_wire_conformance_a_streaming_method_answers_with_events_not_a_result() {
-    for method in ["SendStreamingMessage", "stream/watch"] {
+    for method in ["SendStreamingMessage", "murmur.WatchSession"] {
         let answer = json!({"jsonrpc": "2.0", "id": 1, "result": {}});
         let violations = check_response(&request(method, json!({})), &answer);
         assert_eq!(keys(&violations), [format!("{method} envelope -")]);
@@ -1032,16 +1040,19 @@ fn a2a_wire_conformance_stream_events() {
             .contains(&"`result` sets no member of oneof `payload`".to_string())
     );
 
-    let watch = request("stream/watch", json!({}));
+    let watch = request("murmur.WatchSession", json!({}));
     let ack = check_stream_event(
         &watch,
         r#"{"role":"observer","conversation_mode":"stateless"}"#,
     );
-    assert_eq!(keys(&ack), ["stream/watch event lf.a2a.v1.StreamResponse"]);
+    assert_eq!(
+        keys(&ack),
+        ["murmur.WatchSession event lf.a2a.v1.StreamResponse"]
+    );
     let garbage = check_stream_event(&watch, "not json");
     assert_eq!(
         keys(&garbage),
-        ["stream/watch event lf.a2a.v1.StreamResponse"]
+        ["murmur.WatchSession event lf.a2a.v1.StreamResponse"]
     );
     assert!(
         garbage[0].errors[0].starts_with("the event data is not JSON: "),

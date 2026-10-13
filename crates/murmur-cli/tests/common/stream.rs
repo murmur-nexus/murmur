@@ -1,4 +1,4 @@
-//! Reading the A2A v1.0 streams a door writes: `SendStreamingMessage` and `stream/watch`.
+//! Reading the A2A v1.0 streams a door writes: `SendStreamingMessage` and `murmur.WatchSession`.
 //!
 //! Every event is an optional `id:` line and one `data:` line holding a JSON-RPC response whose
 //! `result` is an `lf.a2a.v1.StreamResponse`. A murmur frame rides in a `statusUpdate` or a
@@ -279,8 +279,8 @@ fn read_to_end(addr: &str, headers: &[(&str, &str)], request_body: &str) -> Resp
     }
 }
 
-/// A `stream/watch` connection read event by event, across as many reads as a test needs. Every
-/// line it reads is checked against A2A v1.0 by the wire recorder.
+/// A `murmur.WatchSession` connection read event by event, across as many reads as a test needs.
+/// Every line it reads is checked against A2A v1.0 by the wire recorder.
 pub struct Watch {
     stream: TcpStream,
     pending: Vec<u8>,
@@ -296,7 +296,7 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// Opens `stream/watch` resuming after `last_event_id`.
+    /// Opens `murmur.WatchSession` resuming after `last_event_id`.
     pub fn open(addr: &str, last_event_id: u64) -> Self {
         Self {
             stream: super::idle_capsule::open_watch(addr, last_event_id),

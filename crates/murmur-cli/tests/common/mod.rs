@@ -1099,14 +1099,20 @@ pub const CAPSULE_EXTENSION_URI: &str =
 pub const STREAM_EXTENSION_URI: &str =
     "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1";
 
-/// The `params` of the extension in `card.capabilities.extensions` whose `uri` is `uri`; fails the
-/// test when the card has no such extension.
-pub fn card_extension_params<'a>(card: &'a Value, uri: &str) -> &'a serde_json::Map<String, Value> {
+/// The extension in `card.capabilities.extensions` whose `uri` is `uri`; fails the test when the
+/// card has no such extension.
+pub fn card_extension<'a>(card: &'a Value, uri: &str) -> &'a Value {
     card["capabilities"]["extensions"]
         .as_array()
         .and_then(|extensions| extensions.iter().find(|extension| extension["uri"] == uri))
-        .and_then(|extension| extension["params"].as_object())
-        .unwrap_or_else(|| panic!("the card has no extension {uri} with params: {card}"))
+        .unwrap_or_else(|| panic!("the card has no extension {uri}: {card}"))
+}
+
+/// The `params` of [`card_extension`]; fails the test when it has none.
+pub fn card_extension_params<'a>(card: &'a Value, uri: &str) -> &'a serde_json::Map<String, Value> {
+    card_extension(card, uri)["params"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the card's extension {uri} has no params: {card}"))
 }
 
 /// The methods the card's door extension lists, in order.

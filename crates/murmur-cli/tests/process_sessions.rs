@@ -436,7 +436,7 @@ impl LiveCapsule {
         self.send_with(message_id, context, text, task_number, &[]);
     }
 
-    /// [`Self::send`] with request headers, which is how a forget is asked for over the door.
+    /// [`Self::send`] with request headers.
     fn send_with(
         &self,
         message_id: &str,
@@ -447,6 +447,25 @@ impl LiveCapsule {
     ) {
         self.send_only(message_id, context, text, headers);
         self.wait_for_task_ends(task_number);
+    }
+
+    /// [`Self::send`] with `forgetSession: true` under the door extension's key in the message's
+    /// metadata, which is how a forget is asked for over the door. Returns the response head.
+    fn send_forgetting(
+        &self,
+        message_id: &str,
+        context: &str,
+        text: &str,
+        task_number: usize,
+    ) -> String {
+        let (head, response) =
+            exchange(&self.url, &forgetting_body(message_id, context, text), &[]);
+        assert_eq!(
+            response["result"]["task"]["status"]["state"], "TASK_STATE_SUBMITTED",
+            "the task should be accepted; got: {response}"
+        );
+        self.wait_for_task_ends(task_number);
+        head
     }
 
     /// One A2A `SendMessage` under `context`, returning the id of the task it started without
@@ -597,7 +616,23 @@ fn send_body(message_id: &str, context: &str, text: &str) -> String {
     .to_string()
 }
 
+/// [`send_body`] whose message asks for a forget: `forgetSession: true` under the door
+/// extension's key in its metadata, and the extension's URI in its `extensions`.
+fn forgetting_body(message_id: &str, context: &str, text: &str) -> String {
+    let mut body: Value = serde_json::from_str(&send_body(message_id, context, text)).unwrap();
+    let message = &mut body["params"]["message"];
+    message["extensions"] = serde_json::json!([common::DOOR_EXTENSION_URI]);
+    message["metadata"] =
+        serde_json::json!({ common::DOOR_EXTENSION_URI: { "forgetSession": true } });
+    body.to_string()
+}
+
 fn post(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
+    exchange(addr, body, headers).1
+}
+
+/// One `POST /` of `body` with `headers`: the response head, and the body as JSON.
+fn exchange(addr: &str, body: &str, headers: &[(&str, &str)]) -> (String, Value) {
     let mut stream = TcpStream::connect(addr).expect("should connect to the capsule");
     let extra: String = headers
         .iter()
@@ -612,16 +647,20 @@ fn post(addr: &str, body: &str, headers: &[(&str, &str)]) -> Value {
     stream.flush().unwrap();
 
     let mut reader = BufReader::new(&stream);
+    let mut head = String::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         if line.trim().is_empty() {
             break;
         }
+        head.push_str(&line);
     }
     let mut response = String::new();
     reader.read_to_string(&mut response).ok();
-    serde_json::from_str(&response).unwrap_or_else(|_| serde_json::json!({"_raw": response}))
+    let json =
+        serde_json::from_str(&response).unwrap_or_else(|_| serde_json::json!({"_raw": response}));
+    (head, json)
 }
 
 fn assert_mode(path: &Path, expected: u32) {
@@ -1172,13 +1211,22 @@ fn forget_session_recovers_a_bricked_context_from_the_cli() {
     // The dead end, and the way out the diagnostic now names.
     let failed = capsule.task("memory", "ctx_forget", RECALL_TASK).failed();
     assert!(failed.text.contains("error[E-RUN-036]"), "{}", failed.text);
-    for expected in ["--forget-session", "x-murmur-forget-session"] {
+    for expected in [
+        "--forget-session",
+        "forgetSession",
+        "reference/agent-card/#forget-session",
+    ] {
         assert!(
             failed.text.contains(expected),
             "the hint must name {expected}:\n{}",
             failed.text
         );
     }
+    assert!(
+        !failed.text.contains("x-murmur-forget-session"),
+        "the hint must not name the header the door no longer reads:\n{}",
+        failed.text
+    );
     assert!(
         !failed.text.contains("delete that file"),
         "the hint must not send the reader to delete a file by hand:\n{}",
@@ -1238,13 +1286,14 @@ fn forget_session_recovers_a_bricked_context_over_the_door() {
     assert!(message.contains("error[E-RUN-036]"), "{message}");
     assert_eq!(live.capsule.stored_session("ctx_door"), lost);
 
-    // The same message, asking for the session to be dropped, answers.
-    live.send_with(
-        "m3",
-        "ctx_door",
-        SECRET_TASK,
-        3,
-        &[("x-murmur-forget-session", "true")],
+    // The same message, asking for the session to be dropped, answers, and the answer lists the
+    // extension the message used.
+    let head = live.send_forgetting("m3", "ctx_door", SECRET_TASK, 3);
+    assert!(
+        head.lines().any(
+            |line| line.trim_end() == format!("A2A-Extensions: {}", common::DOOR_EXTENSION_URI)
+        ),
+        "{head}"
     );
 
     let launches = live.launches();
@@ -1272,13 +1321,7 @@ fn forget_session_recovers_a_bricked_context_over_the_door() {
 fn a_forget_over_the_door_applies_to_one_task_only() {
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
 
-    live.send_with(
-        "m1",
-        "ctx_once",
-        SECRET_TASK,
-        1,
-        &[("x-murmur-forget-session", "true")],
-    );
+    live.send_forgetting("m1", "ctx_once", SECRET_TASK, 1);
     live.send("m2", "ctx_once", RECALL_TASK, 2);
 
     let launches = live.launches();
@@ -1286,6 +1329,33 @@ fn a_forget_over_the_door_applies_to_one_task_only() {
     assert_eq!(launches[1]["session_mode"], "resume");
     assert!(live.result().contains(SECRET), "{}", live.result());
     // The first context had nothing to drop, so nothing was recorded as dropped.
+    assert!(live
+        .events()
+        .iter()
+        .all(|event| event["event_type"] != "harness_session_forgotten"));
+}
+
+/// `x-murmur-forget-session` is read as any unknown header is: not at all. The message it rides
+/// on resumes the session its context established.
+#[test]
+fn the_forget_header_is_no_longer_read() {
+    let live = LiveCapsule::start(Built::new().queueing().build(), "memory");
+
+    live.send("m1", "ctx_header", SECRET_TASK, 1);
+    let established = live.capsule.stored_session("ctx_header");
+    live.send_with(
+        "m2",
+        "ctx_header",
+        RECALL_TASK,
+        2,
+        &[("x-murmur-forget-session", "true")],
+    );
+
+    let launches = live.launches();
+    assert_eq!(launches.len(), 2, "{launches:#?}");
+    assert_eq!(launches[1]["session_mode"], "resume");
+    assert_eq!(launches[1]["harness_session_id"], established.as_str());
+    assert!(live.result().contains(SECRET), "{}", live.result());
     assert!(live
         .events()
         .iter()
@@ -1365,16 +1435,16 @@ fn a_forget_asked_of_a_capsule_with_no_harness_session_is_refused() {
         "a refusal at staging leaves no session behind"
     );
 
-    // And the door refuses the header the same way, without starting a task.
+    // And the door refuses the field the same way, without starting a task.
     let live = LiveCapsule::start(capsule, "happy");
-    let response = post(
-        &live.url,
-        &send_body("m1", "ctx_x", "hello"),
-        &[("x-murmur-forget-session", "true")],
-    );
+    let (head, response) = exchange(&live.url, &forgetting_body("m1", "ctx_x", "hello"), &[]);
     assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert!(
+        !head.to_ascii_lowercase().contains("a2a-extensions"),
+        "{head}"
+    );
     let message = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("x-murmur-forget-session"), "{message}");
+    assert!(message.contains("forgetSession"), "{message}");
     assert!(
         message.contains("inference.transport: process"),
         "{message}"

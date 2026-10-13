@@ -222,7 +222,7 @@ fn submit(addr: &str, message_id: &str, text: &str) -> String {
 
 // ── Raw SSE reading ───────────────────────────────────────────────────────────
 
-/// Opens `stream/watch` with no `Last-Event-ID` and reads events until `done` accepts one or
+/// Opens `murmur.WatchSession` with no `Last-Event-ID` and reads events until `done` accepts one or
 /// `timeout` passes.
 fn watch_until(addr: &str, timeout: Duration, done: impl Fn(&Event) -> bool) -> Vec<Event> {
     let stream = TcpStream::connect(addr).expect("should connect to capsule");
@@ -236,7 +236,7 @@ fn watch_until(addr: &str, timeout: Duration, done: impl Fn(&Event) -> bool) -> 
     events
 }
 
-const WATCH_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}"#;
+const WATCH_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"murmur.WatchSession","params":{}}"#;
 
 #[derive(Debug, PartialEq)]
 enum ReadEnd {
@@ -367,8 +367,8 @@ fn is_final_status_of(event: &Event, task_id: &str) -> bool {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// Every `StreamResponse` member, murmur frame and frame key a real task writes is on the page,
-/// on an activated `SendStreamingMessage` and on `stream/watch`, and the page's `params.frames`
-/// example is a live card's.
+/// on an activated `SendStreamingMessage` and on `murmur.WatchSession`, and the page's
+/// `params.frames` example is a live card's.
 #[test]
 fn the_page_covers_every_frame_a_task_writes() {
     let server = undeclared_tool_then_end_turn();
@@ -654,7 +654,7 @@ fn reported_lags(capsule: &Capsule, prefix: &str, expected_total: u64) -> Vec<u6
     }
 }
 
-/// A fresh `stream/watch` replays the session's buffer through `last_task`'s terminal status
+/// A fresh `murmur.WatchSession` replays the session's buffer through `last_task`'s terminal status
 /// without a `lagged` frame in it.
 fn assert_replay_has_no_lagged_frame(addr: &str, last_task: &str) {
     let replay = watch_until(addr, Duration::from_secs(120), |event| {
@@ -666,8 +666,8 @@ fn assert_replay_has_no_lagged_frame(addr: &str, last_task: &str) {
     );
 }
 
-/// A `stream/watch` client that stops reading while a capsule writes more than 128 events is sent
-/// one unnumbered `lagged` frame per loss, carrying the count the runtime reported, and keeps
+/// A `murmur.WatchSession` client that stops reading while a capsule writes more than 128 events is
+/// sent one unnumbered `lagged` frame per loss, carrying the count the runtime reported, and keeps
 /// receiving on the same connection.
 #[test]
 fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
@@ -700,7 +700,7 @@ fn a_lagging_watch_connection_is_told_how_many_frames_it_lost() {
     }
     let reported = reported_lags(
         &capsule,
-        "[capsule-runtime] stream/watch: SSE broadcast lagged by ",
+        "[capsule-runtime] murmur.WatchSession: SSE broadcast lagged by ",
         sent.iter().sum(),
     );
     assert_eq!(

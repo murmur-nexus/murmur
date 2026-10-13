@@ -14,9 +14,9 @@ use serde_json::Value;
 /// delegation is printed `ended:`, because the cancelled task that started it ends its child once
 /// the residue has named it.
 ///
-/// A part is either the residue item itself — the shape `session/stop` returns — or an A2A data
-/// part holding it, which is how `CancelTask` carries it. Both spellings describe the same item,
-/// so both are read here rather than at each caller.
+/// A part is either the residue item itself — the shape `murmur.StopSession` returns — or an A2A
+/// data part holding it, which is how `CancelTask` carries it. Both spellings describe the same
+/// item, so both are read here rather than at each caller.
 pub(crate) fn print_residue(parts: &[Value]) {
     for line in residue_lines(parts) {
         capsule_runtime::report_println!("{line}");

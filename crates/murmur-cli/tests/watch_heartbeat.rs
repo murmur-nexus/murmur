@@ -1,4 +1,4 @@
-//! Integration tests for the `stream/watch` liveness signal against a real launched capsule.
+//! Integration tests for the `murmur.WatchSession` liveness signal against a real launched capsule.
 //!
 //! These read raw bytes rather than parsed events: the heartbeat is an SSE comment, and the
 //! SSE clients elsewhere in the tree (and `mur watch` itself) discard comment lines by design,
@@ -14,7 +14,7 @@ use common::idle_capsule::{
     wait_for_task_ends,
 };
 
-/// The interval `handle_stream_watch` writes `:heartbeat` at. Mirrored from
+/// The interval `handle_watch_session` writes `:heartbeat` at. Mirrored from
 /// `capsule_runtime::streaming::SSE_HEARTBEAT_INTERVAL`, which is crate-private.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -44,7 +44,7 @@ fn watch_idle_observer_receives_heartbeat() {
 
     assert!(
         body.iter().any(|(_, line)| line.contains(CONNECTION_ACK)),
-        "stream/watch should open with a connection-ack; body was: {:?}",
+        "murmur.WatchSession should open with a connection-ack; body was: {:?}",
         body.iter().map(|(_, l)| l).collect::<Vec<_>>()
     );
 
