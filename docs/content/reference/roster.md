@@ -385,8 +385,8 @@ A formation token carries exactly these scopes:
 
 Each reaches only the tasks the calling member started, by the rule
 [Agent Card: Who sees a task](agent-card.md#task-access) states. A formation token does not reach
-`SendStreamingMessage`, `stream/watch`, `session/stop` or `resources/files`: a member follows a task
-it started with `SubscribeToTask` or `GetTask`.
+`SendStreamingMessage`, `murmur.WatchSession`, `murmur.StopSession` or `resources/files`: a member
+follows a task it started with `SubscribeToTask` or `GetTask`.
 
 The operator token and declared credentials work as they do outside a formation. A peer task is
 still refused with `403 peer_not_accepted` by a member that does not declare

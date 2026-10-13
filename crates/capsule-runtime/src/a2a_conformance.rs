@@ -39,7 +39,7 @@ const STREAM_RESPONSE_MESSAGE: &str = "lf.a2a.v1.StreamResponse";
 /// streams. Their envelopes and stream events are checked; their params and unary results are
 /// murmur's own and are not.
 pub(crate) const EXTENSION_METHODS: [(&str, bool); 2] =
-    [("stream/watch", true), ("session/stop", false)];
+    [("murmur.WatchSession", true), ("murmur.StopSession", false)];
 
 /// Every error a strict protobuf JSON parse of `card` as `lf.a2a.v1.AgentCard` would raise.
 pub(crate) fn check_agent_card(card: &Value) -> Result<(), Vec<String>> {

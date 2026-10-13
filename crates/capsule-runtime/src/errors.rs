@@ -800,7 +800,8 @@ pub enum RuntimeError {
     /// `path` is the map file that still holds the id, or `None` on a launch that kept none. The
     /// entry is deliberately left as it is — the next task in this context fails the same way
     /// rather than quietly starting a new conversation, until somebody asks for it to be dropped
-    /// with `mur run --forget-session` or the door's forget header.
+    /// with `mur run --forget-session` or a message whose metadata carries `forgetSession: true`
+    /// under the door extension's key.
     #[error(
         "the harness '{harness}' could not continue session {session_id}, which context \
          '{context_id}' names: {detail}{}",

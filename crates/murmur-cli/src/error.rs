@@ -693,10 +693,10 @@ impl From<RuntimeError> for CliError {
                     "the harness no longer holds that conversation. murmur left the id where it \
                      is, so the next task in this context fails the same way rather than answering \
                      from nothing. Ask for it to be dropped and this context starts a new \
-                     conversation: `mur run --context <id> --forget-session`, or the header \
-                     `x-murmur-forget-session: true` on the next SendMessage or \
-                     SendStreamingMessage — see ",
-                    murmur_artifact::docs_reference_url!("cli/")
+                     conversation: `mur run --context <id> --forget-session`, or \
+                     `\"forgetSession\": true` under the murmur door extension's key in the next \
+                     SendMessage or SendStreamingMessage message's metadata — see ",
+                    murmur_artifact::docs_reference_url!("agent-card/#forget-session")
                 ),
             ),
             error @ RuntimeError::ForgetSessionUnsupportedTransport { .. } => CliError::with_hint(

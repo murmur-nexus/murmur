@@ -573,7 +573,7 @@ fn input_required_ends_the_stream_and_the_reply_continues_it() {
 }
 
 /// A `SendStreamingMessage` stream carries only its own task, even activated and with another
-/// task running, while a `stream/watch` opened first sees both and ends on neither.
+/// task running, while a `murmur.WatchSession` opened first sees both and ends on neither.
 #[test]
 fn own_task_only_on_a_message_stream_and_every_task_on_watch() {
     let door = Door::anthropic(
@@ -589,7 +589,10 @@ fn own_task_only_on_a_message_stream_and_every_task_on_watch() {
         watch.read_until(Duration::from_secs(30), |event| event.kind()
             == "connection-ack")
     );
-    assert_eq!(watch.header("a2a-extensions"), Some(STREAM_EXTENSION_URI));
+    assert_eq!(
+        watch.header("a2a-extensions"),
+        Some(format!("{}, {STREAM_EXTENSION_URI}", common::DOOR_EXTENSION_URI).as_str())
+    );
 
     let first = door.rpc("SendMessage", message("m-a", "a"))["result"]["task"]["id"]
         .as_str()
@@ -748,7 +751,7 @@ fn card_says_what_the_stream_extension_adds() {
         stream["description"],
         "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on \
          SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names \
-         this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata \
+         this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata \
          keyed by this URI."
     );
 }

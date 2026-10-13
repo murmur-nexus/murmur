@@ -406,10 +406,11 @@ fn tasks_get(addr: &str, task_id: &str) -> Value {
     )
 }
 
-fn session_stop(addr: &str) -> Value {
+fn stop_session(addr: &str) -> Value {
     http_post_json(
         addr,
-        &json!({"jsonrpc": "2.0", "id": 1, "method": "session/stop", "params": {}}).to_string(),
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "murmur.StopSession", "params": {}})
+            .to_string(),
     )
 }
 
@@ -1674,11 +1675,11 @@ fn watch_names_the_session_and_what_ctrl_c_does() {
     );
 }
 
-// ── 15. `session/stop` on the wire ────────────────────────────────────────────
+// ── 15. `murmur.StopSession` on the wire ───────────────────────────────────────
 
 /// The method cancels and reports; it does not shut the door down. A second call is not a failure.
 #[test]
-fn session_stop_answers_and_leaves_the_door_up() {
+fn stop_session_answers_and_leaves_the_door_up() {
     let server = common::ScriptedServer::start_with_delay(
         vec![
             tool_call_response("msg_1", "toolu_1", "no-such-tool", json!({})),
@@ -1693,7 +1694,7 @@ fn session_stop_answers_and_leaves_the_door_up() {
     let task_id = submit(&door, "msg-1", "start something slow");
     wait_for_requests(&server, 1, Duration::from_secs(60));
 
-    let response = session_stop(&door);
+    let response = stop_session(&door);
     let result = &response["result"];
     assert_eq!(
         result["session_id"],
@@ -1713,11 +1714,11 @@ fn session_stop_answers_and_leaves_the_door_up() {
     );
     assert!(
         record_for(home.path(), &capsule.session_id()).exists(),
-        "session/stop ends no process, so the record stands"
+        "murmur.StopSession ends no process, so the record stands"
     );
 
     // Issued again: nothing left to cancel, and that is an answer rather than an error.
-    let again = session_stop(&door);
+    let again = stop_session(&door);
     assert!(again.get("error").is_none(), "{again}");
     assert_eq!(
         again["result"]["canceled"].as_array().map(Vec::len),
@@ -1731,12 +1732,12 @@ fn session_stop_answers_and_leaves_the_door_up() {
 /// differs from `CancelTask`, which omits the key. A session stop has to be able to say
 /// "nothing" as a positive fact.
 #[test]
-fn session_stop_always_emits_the_residue_key() {
+fn stop_session_always_emits_the_residue_key() {
     let server = common::ScriptedServer::start(vec![end_turn_response("msg_1", "an answer")]);
     let home = driver_home();
     let capsule = start_agent(&home, &server, "session-stop-empty");
 
-    let response = session_stop(&capsule.url());
+    let response = stop_session(&capsule.url());
     assert_eq!(
         response["result"]["residue"],
         json!([]),

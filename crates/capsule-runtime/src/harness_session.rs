@@ -36,8 +36,8 @@ pub(crate) const HARNESS_SESSION_TYPE: &str = "murmur.harness-session";
 /// from `mur run --forget-session`.
 pub(crate) const FORGET_BY_CLI: &str = "cli";
 
-/// What that record names as the asker when the forget arrived on an A2A request, under
-/// [`crate::identity::FORGET_SESSION_HEADER`].
+/// What that record names as the asker when the forget arrived on an A2A message, as
+/// [`crate::a2a::IncomingMessage::forget_session`].
 pub(crate) const FORGET_BY_A2A: &str = "a2a";
 
 /// One context's harness session, as the file holds it.

@@ -172,8 +172,8 @@ pub fn record_post(
     enforce(violations, &request, &context);
 }
 
-/// Registers a `stream/watch` connection whose response [`stream_lines`] will read, keyed by the
-/// socket's local address.
+/// Registers a `murmur.WatchSession` connection whose response [`stream_lines`] will read, keyed by
+/// the socket's local address.
 pub fn watch_opened(stream: &TcpStream, request_body: &str, request_headers: &[(&str, &str)]) {
     let (Some(request), Ok(local)) = (json_rpc_request(request_body), stream.local_addr()) else {
         return;

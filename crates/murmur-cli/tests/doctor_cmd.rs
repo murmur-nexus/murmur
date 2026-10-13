@@ -2206,8 +2206,8 @@ fn door_posture_names_every_credential() {
     let doctor = doctor_stdout(home.path(), project.path(), &["--bind", "0.0.0.0"]);
     assert!(
         doctor.lines().any(|line| {
-            line
-            == "door: bearer — operator, reader (resources/files), watcher (GetTask, stream/watch)"
+            line == "door: bearer — operator, reader (resources/files), watcher (GetTask, \
+                murmur.WatchSession)"
         }),
         "{doctor}"
     );

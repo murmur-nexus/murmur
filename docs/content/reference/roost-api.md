@@ -388,7 +388,7 @@ and usually well under a second per level. With the default [`--max-depth`](#the
 | Ending | Effect on a `delegate-task` child |
 |---|---|
 | The parent's process is killed | The child winds down |
-| The delegating task is cancelled — `CancelTask`, `session/stop`, or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task ends the child before it ends, and records it `terminated` |
+| The delegating task is cancelled — `CancelTask`, [`murmur.StopSession`](agent-card.md#stop-session), or the parent's own wind-down on `SIGTERM` or lifeline EOF | The task ends the child before it ends, and records it `terminated` |
 | The delegating task ends any other way while the child is still running | The task ends the child, and records it `terminated` |
 | The [delegation deadline](#bounds) passes | The child is ended, and the task continues with a `terminated` outcome |
 

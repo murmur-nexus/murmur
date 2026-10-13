@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::error::{CliError, E_IO_003};
 use crate::live_address::Target;
 
-/// Connect to a capsule's SSE observer endpoint (`stream/watch`) and print events to stdout.
+/// Connect to a capsule's SSE observer endpoint (`murmur.WatchSession`) and print events to
+/// stdout.
 ///
 /// Unlike `SendStreamingMessage`, this does not submit a task. It passively observes the capsule's
 /// SSE stream, including any events buffered since the capsule started. The process stays
@@ -29,7 +30,7 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "stream/watch",
+        "method": "murmur.WatchSession",
         "params": {}
     })
     .to_string();
@@ -117,7 +118,7 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
     }
 }
 
-/// How a `stream/watch` connection ended.
+/// How a `murmur.WatchSession` connection ended.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StreamEnd {
     /// The capsule wrote `capsule-closed`.
@@ -125,7 +126,7 @@ pub(crate) enum StreamEnd {
     /// The stream reached EOF or a read error with no `capsule-closed`. `last_event_id` is the
     /// `id:` of the last complete frame that carried one, or `None` when no such frame arrived.
     /// Ids are unique and ascending within a capsule session, so it is the `Last-Event-ID` a new
-    /// `stream/watch` connection resumes after.
+    /// `murmur.WatchSession` connection resumes after.
     ConnectionLost { last_event_id: Option<u64> },
     /// Standard output was closed by its reader.
     ReaderClosed,
@@ -136,8 +137,8 @@ fn lagged_warning(missed: u64) -> String {
     format!("[murmur] warning: this connection missed {missed} events")
 }
 
-/// Read a `stream/watch` SSE body to its end, rendering task statuses, answers, tool results and
-/// text to `out` and warnings to stderr.
+/// Read a `murmur.WatchSession` SSE body to its end, rendering task statuses, answers, tool
+/// results and text to `out` and warnings to stderr.
 ///
 /// Every event's `data:` is a JSON-RPC response whose `result` is an A2A v1.0 `StreamResponse`.
 /// One carrying a murmur frame under `metadata[STREAM_EXTENSION_URI]` is read by its `frame`;
@@ -522,7 +523,8 @@ mod tests {
         message_frame(json!({"frame": "capsule-closed"}))
     }
 
-    /// Read `body` as a `stream/watch` SSE body, returning how it ended and what was rendered.
+    /// Read `body` as a `murmur.WatchSession` SSE body, returning how it ended and what was
+    /// rendered.
     fn read(body: &str) -> (StreamEnd, String) {
         let mut out = Vec::new();
         let end = read_stream(body.as_bytes(), &mut out).unwrap();

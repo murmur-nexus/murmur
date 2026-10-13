@@ -176,12 +176,17 @@ message names the field and the value; the cases are listed in the [index](#inde
 `gateway.api_key: ${NAME}` that nothing holds is explained under
 [Where `${NAME}` is read from](config.md#credentials-precedence).
 
-A credential scope that is an A2A 0.3 method name is refused, and the hint names the scope to write
-in its place:
+A credential scope that is a retired name of a door method — an A2A 0.3 method name, or an older
+name of a murmur method — is refused, and the hint names the scope to write in its place:
 
 ```text
-error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authentication.credentials.watcher.scopes': 'tasks/get' is the A2A 0.3 name of a door method, and the door answers A2A 1.0 names only
+error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authentication.credentials.watcher.scopes': 'tasks/get' is a retired name of a door method, and the door answers only the names its card lists
   hint: write 'GetTask' in place of 'tasks/get'
+```
+
+```text
+error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authentication.credentials.watcher.scopes': 'stream/watch' is a retired name of a door method, and the door answers only the names its card lists
+  hint: write 'murmur.WatchSession' in place of 'stream/watch'
 ```
 
 `agent/getAuthenticatedExtendedCard` has no replacement scope:
@@ -778,14 +783,14 @@ store:
 
 ```text
 error[E-RUN-036]: the harness 'claude-code' could not continue session 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55, which context 'ctx_0193f2…' names: no conversation found with session id 0199c7d4-1f60-7c31-9a6e-0f2b9c1d4e55 (that id is recorded in /home/you/.murmur/conversations/shey/ctx_0193f2…/harness-session.json)
-  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or the header `x-murmur-forget-session: true` on the next SendMessage or SendStreamingMessage — see https://docs.murmur.nexus/reference/cli/
+  hint: the harness no longer holds that conversation. murmur left the id where it is, so the next task in this context fails the same way rather than answering from nothing. Ask for it to be dropped and this context starts a new conversation: `mur run --context <id> --forget-session`, or `"forgetSession": true` under the murmur door extension's key in the next SendMessage or SendStreamingMessage message's metadata — see https://docs.murmur.nexus/reference/agent-card/#forget-session
 ```
 
 The map entry is left exactly as it was. Starting a new conversation instead would be silent memory
 loss: the next message would be answered as if nothing had been said. Dropping the entry is a
 person's decision, asked for on the request that starts the next turn — with
-[`mur run --forget-session`](cli.md#run-forget-session) or the
-[`x-murmur-forget-session`](agent-card.md#request-headers) header, both described under
+[`mur run --forget-session`](cli.md#run-forget-session) or the door's
+[`forgetSession`](agent-card.md#forget-session) message field, both described under
 [what removes an entry](workdir.md#what-removes-an-entry). A forget asked of a capsule on any other
 transport is [`E-RUN-039`](#e-run-039).
 
@@ -829,9 +834,10 @@ driver, and its turns simply carry no token counts.
 
 ### E-RUN-039 — nothing to forget on this transport { #e-run-039 }
 
-`--forget-session` and the `x-murmur-forget-session` header drop the harness session a context
-names. Only [`transport: process`](manifest.md#transport-process) has one — on every other
-transport the runtime holds the conversation itself, in a
+`--forget-session` and the door's [`forgetSession`](agent-card.md#forget-session) message field
+drop the harness session a context names. Only
+[`transport: process`](manifest.md#transport-process) has one — on every other transport the
+runtime holds the conversation itself, in a
 [conversation record](workdir.md#the-conversation-record). The CLI refuses at staging, before the
 launch creates anything:
 
@@ -840,8 +846,8 @@ error[E-RUN-039]: --forget-session forgets the harness session a context names, 
   hint: a harness owns the conversation only under inference.transport: process, so that is the only transport with a session to forget; every other one keeps its conversation record here, which `mur conversation rm` removes — see https://docs.murmur.nexus/reference/cli/
 ```
 
-The door refuses the header on `SendMessage` and `SendStreamingMessage` with JSON-RPC `-32602`, and
-starts no task.
+The door refuses `forgetSession: true` on `SendMessage` and `SendStreamingMessage` with JSON-RPC
+`-32602`, and starts no task — see [`forgetSession`](agent-card.md#forget-session).
 
 ### E-RUN-040 — the task did not complete { #e-run-040 }
 
@@ -859,7 +865,7 @@ error[E-RUN-040]: the task ended failed: {"error":"driver: failed to parse Anthr
 | `failed` | The `reason` of the run's [`task_failed`](observability-schemas.md#task-failed) line, whose `cause` names the kind of failure |
 | `max_turns_reached` | That the task used every turn `inference.max_turns` allows |
 | `spend_ceiling_reached` | That a spend ceiling refused the next inference call. The [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line names which ceiling and the numbers |
-| `canceled` | That the task was canceled, by `CancelTask`, `session/stop`, `mur stop`, `SIGTERM` or the end of the session that delegated it. A task canceled by its formation's end is no error: the member ends [`formation_ended`](cli.md#mur-run-status) |
+| `canceled` | That the task was canceled, by `CancelTask`, [`murmur.StopSession`](agent-card.md#stop-session), `mur stop`, `SIGTERM` or the end of the session that delegated it. A task canceled by its formation's end is no error: the member ends [`formation_ended`](cli.md#mur-run-status) |
 
 For `canceled` the hint says there is no result to read:
 
@@ -3109,13 +3115,14 @@ address or hostname are off it. A capsule with no `inference:` block serves no d
 warns. `mur run` and `mur doctor` print the same bytes for the same manifest and address.
 
 ```text
-warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call SendMessage, SendStreamingMessage, stream/watch, GetTask, ListTasks, CancelTask, SubscribeToTask, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
+warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call SendMessage, SendStreamingMessage, murmur.WatchSession, GetTask, ListTasks, CancelTask, SubscribeToTask, murmur.StopSession, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
 ```
 
 **Why it matters:** a public door answers every caller that reaches the port. Anyone on the network
-can start tasks, read and watch every task, and cancel every task at once with `session/stop`, and
-the [agent card](agent-card.md) tells them the session id, the tools, and whether the capsule holds
-shell and network grants. The methods and the disclosure in the line are read from the manifest.
+can start tasks, read and watch every task, and cancel every task at once with
+[`murmur.StopSession`](agent-card.md#stop-session), and the [agent card](agent-card.md) tells them
+the session id, the tools, and whether the capsule holds shell and network grants. The methods and
+the disclosure in the line are read from the manifest.
 
 **What the runtime does about it:** nothing is refused. The capsule binds and serves as it would on
 loopback.

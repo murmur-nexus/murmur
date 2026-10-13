@@ -131,8 +131,8 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     assert!(got.json()["result"]["id"].is_string(), "{got:?}");
     // Every other method is the ordinary scope refusal, naming the member credential.
     for (method, path, scope) in [
-        ("session/stop", "/", "session/stop"),
-        ("stream/watch", "/", "stream/watch"),
+        ("murmur.StopSession", "/", "murmur.StopSession"),
+        ("murmur.WatchSession", "/", "murmur.WatchSession"),
         ("", "/resources/files/x", "resources/files"),
     ] {
         let refused = if method.is_empty() {

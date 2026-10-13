@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::{cancel::CancelSignal, lanes::TaskLane, origin::TaskProvenance};
+use crate::{
+    cancel::CancelSignal, identity::DOOR_EXTENSION_URI, lanes::TaskLane, origin::TaskProvenance,
+};
 
 // ── A2A protocol version ──────────────────────────────────────────────────────
 
@@ -80,6 +82,15 @@ pub(crate) fn activates_extension(values: &[String], uri: &str) -> bool {
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .any(|entry| entry == uri)
+}
+
+/// The [`A2A_EXTENSIONS_HEADER`] line of a response that used `uris`, in that order, ending in
+/// `\r\n`; empty when it used none.
+pub(crate) fn extensions_echo(uris: &[&str]) -> String {
+    if uris.is_empty() {
+        return String::new();
+    }
+    format!("{A2A_EXTENSIONS_HEADER}: {}\r\n", uris.join(", "))
 }
 
 // ── JSON-RPC 2.0 envelope types ───────────────────────────────────────────────
@@ -214,9 +225,20 @@ impl JsonRpcResponse {
     }
 
     pub(crate) fn into_http_response(self) -> String {
+        self.into_http_response_echoing(&[])
+    }
+
+    /// [`Self::into_http_response`], listing `extensions` in [`A2A_EXTENSIONS_HEADER`] when the
+    /// response is a `result`. An error echoes nothing: a refused request used no extension.
+    pub(crate) fn into_http_response_echoing(self, extensions: &[&str]) -> String {
+        let echo = if self.error.is_none() {
+            extensions_echo(extensions)
+        } else {
+            String::new()
+        };
         let body = serde_json::to_string(&self).unwrap_or_else(|_| "{}".to_string());
         format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{echo}\r\n{}",
             body.len(),
             body,
         )
@@ -822,6 +844,14 @@ pub(crate) struct IncomingMessage {
     pub reference_task_ids: Vec<String>,
     /// Text and data parts only: a message carrying any other part is refused.
     pub parts: Vec<Part>,
+    /// Whether `metadata` carries the door extension's key, [`DOOR_EXTENSION_URI`]: the message
+    /// used that extension, so a response that serves it lists the URI in
+    /// [`A2A_EXTENSIONS_HEADER`].
+    pub door_extension: bool,
+    /// `metadata[DOOR_EXTENSION_URI].forgetSession`: the task this message starts drops the
+    /// harness session its context names before its first attempt. Never `true` on a message
+    /// that names a `taskId`.
+    pub forget_session: bool,
 }
 
 /// Why the door refused a message, and so answered no task.
@@ -891,10 +921,13 @@ pub(crate) fn push_notification_not_supported(id: Value) -> JsonRpcResponse {
 /// is a non-empty array; every part sets exactly one of `text`, `raw`, `url` and `data`; `text`,
 /// `raw`, `url`, `mediaType` and `filename` are strings where present; `taskId` and `contextId`
 /// are strings where present; `referenceTaskIds` is an array of non-empty strings naming at most
-/// [`MAX_REFERENCE_TASK_IDS`] distinct tasks. Then the first `raw` or `url` part is
-/// [`MessageRefusal::ContentTypeNotSupported`], and a `configuration.taskPushNotificationConfig`
-/// that is present and not `null` is [`MessageRefusal::PushNotificationNotSupported`]. The rest of
-/// `configuration` and every unknown field are ignored.
+/// [`MAX_REFERENCE_TASK_IDS`] distinct tasks; `metadata[DOOR_EXTENSION_URI]` is an object where
+/// present; its `forgetSession` is a boolean where present; `forgetSession: true` names no
+/// `taskId`. Then the first `raw` or `url` part is [`MessageRefusal::ContentTypeNotSupported`],
+/// and a `configuration.taskPushNotificationConfig` that is present and not `null` is
+/// [`MessageRefusal::PushNotificationNotSupported`]. The rest of `configuration` and unknown
+/// fields are ignored, a `metadata` that is not an object and every other key of it and of the
+/// door extension's object among them.
 pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, MessageRefusal> {
     let invalid = |message: String| Err(MessageRefusal::InvalidParams(message));
     let Some(message) = params.get("message").and_then(Value::as_object) else {
@@ -966,6 +999,33 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
         }
         Some(_) => return invalid("message.referenceTaskIds must be an array".to_string()),
     };
+    let door_metadata = message
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(DOOR_EXTENSION_URI));
+    let forget_session = match door_metadata {
+        None => false,
+        Some(Value::Object(door)) => match door.get("forgetSession") {
+            None => false,
+            Some(Value::Bool(forget)) => *forget,
+            Some(_) => {
+                return invalid(format!(
+                    "message.metadata[\"{DOOR_EXTENSION_URI}\"].forgetSession must be a boolean"
+                ))
+            }
+        },
+        Some(_) => {
+            return invalid(format!(
+                "message.metadata[\"{DOOR_EXTENSION_URI}\"] must be an object"
+            ))
+        }
+    };
+    if let (true, Some(task_id)) = (forget_session, &task_id) {
+        return invalid(format!(
+            "forgetSession starts a new conversation, so it goes on a message that starts a task, \
+             not on one that continues task {task_id}"
+        ));
+    }
     if let Some((part_index, part)) = parts
         .iter()
         .enumerate()
@@ -990,6 +1050,8 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
         task_id,
         reference_task_ids,
         parts,
+        door_extension: door_metadata.is_some(),
+        forget_session,
     })
 }
 
@@ -1767,9 +1829,9 @@ pub(crate) struct IncomingTask {
     /// that arrived over the peer door, `"detached_shell"` for a completion the runtime produced
     /// locally. The `a2a_task_received` record is written only for the former.
     pub source: &'static str,
-    /// Whether this request asked the capsule to drop the harness session its context names
-    /// before the turn, under [`crate::identity::FORGET_SESSION_HEADER`]. `false` for every task
-    /// that did not carry the header, and for every task the runtime enqueued for itself.
+    /// Whether the message that started this task asked the capsule to drop the harness session
+    /// its context names before the turn: [`IncomingMessage::forget_session`]. `false` for every
+    /// task whose message did not ask, and for every task the runtime enqueued for itself.
     pub forget_session: bool,
     /// The formation member that called, when the door let this task in on a formation token.
     /// Recorded as `a2a_task_received.caller_member`; `None` for every other task.
@@ -2967,6 +3029,162 @@ mod tests {
             let params = serde_json::json!({"message": message, "configuration": configuration});
             assert!(read_send_params(&params).is_ok(), "{params}");
         }
+    }
+
+    /// A message whose `metadata` is `metadata`, naming `task_id` when given.
+    fn with_metadata(metadata: Value, task_id: Option<&str>) -> Value {
+        let mut message = user(serde_json::json!([{"text": "a"}]));
+        message["metadata"] = metadata;
+        if let Some(task_id) = task_id {
+            message["taskId"] = Value::from(task_id);
+        }
+        params(message)
+    }
+
+    /// `metadata` keyed by the door extension's URI, holding `door`.
+    fn door(door: Value) -> Value {
+        serde_json::json!({ DOOR_EXTENSION_URI: door })
+    }
+
+    #[test]
+    fn read_send_params_reads_forget_session_true() {
+        let message = read_send_params(&with_metadata(
+            door(serde_json::json!({"forgetSession": true})),
+            None,
+        ))
+        .unwrap();
+        assert!(message.forget_session);
+        assert!(message.door_extension);
+    }
+
+    #[test]
+    fn read_send_params_reads_every_other_metadata_as_no_forget() {
+        for (metadata, door_extension) in [
+            (door(serde_json::json!({"forgetSession": false})), true),
+            (door(serde_json::json!({})), true),
+            (
+                door(serde_json::json!({"other": 1, "forgetSession": false})),
+                true,
+            ),
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({"https://example.com/x": {"forgetSession": true}}),
+                false,
+            ),
+            (serde_json::json!({"forgetSession": true}), false),
+            (serde_json::json!("not an object"), false),
+            (
+                serde_json::json!([door(serde_json::json!({"forgetSession": true}))]),
+                false,
+            ),
+            (Value::Null, false),
+        ] {
+            let message = read_send_params(&with_metadata(metadata.clone(), None)).unwrap();
+            assert!(!message.forget_session, "{metadata}");
+            assert_eq!(message.door_extension, door_extension, "{metadata}");
+        }
+        let message = read_send_params(&params(user(serde_json::json!([{"text": "a"}])))).unwrap();
+        assert!(
+            !message.forget_session && !message.door_extension,
+            "no metadata at all"
+        );
+    }
+
+    #[test]
+    fn read_send_params_ignores_other_keys_beside_forget_session() {
+        let message = read_send_params(&with_metadata(
+            door(serde_json::json!({"forgetSession": true, "later": {"x": 1}})),
+            None,
+        ))
+        .unwrap();
+        assert!(message.forget_session);
+    }
+
+    #[test]
+    fn read_send_params_refuses_a_door_extension_value_that_is_not_an_object() {
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!("forget"),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(
+                invalid_params(&with_metadata(door(value), None)),
+                format!("message.metadata[\"{DOOR_EXTENSION_URI}\"] must be an object")
+            );
+        }
+    }
+
+    #[test]
+    fn read_send_params_refuses_a_forget_session_that_is_not_a_boolean() {
+        for value in [serde_json::json!("true"), serde_json::json!(1), Value::Null] {
+            assert_eq!(
+                invalid_params(&with_metadata(
+                    door(serde_json::json!({"forgetSession": value})),
+                    None
+                )),
+                format!(
+                    "message.metadata[\"{DOOR_EXTENSION_URI}\"].forgetSession must be a boolean"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn read_send_params_refuses_a_forget_on_a_message_that_continues_a_task() {
+        assert_eq!(
+            invalid_params(&with_metadata(
+                door(serde_json::json!({"forgetSession": true})),
+                Some("tsk_1")
+            )),
+            "forgetSession starts a new conversation, so it goes on a message that starts a task, \
+             not on one that continues task tsk_1"
+        );
+        // `false` asks for nothing, so it may ride on a continuation.
+        let message = read_send_params(&with_metadata(
+            door(serde_json::json!({"forgetSession": false})),
+            Some("tsk_1"),
+        ))
+        .unwrap();
+        assert_eq!(message.task_id.as_deref(), Some("tsk_1"));
+        assert!(!message.forget_session);
+    }
+
+    /// The door extension's checks come after every structural check and before the file-part
+    /// refusal, each refused with `-32602` in order.
+    #[test]
+    fn read_send_params_checks_the_forget_field_in_order() {
+        // A structural fault earlier in the message is reported first.
+        let mut message = with_metadata(door(Value::from(1)), None);
+        message["message"]["referenceTaskIds"] = Value::from("tsk_a");
+        assert!(invalid_params(&message).contains("referenceTaskIds"));
+        // Not an object beats the boolean and continuation checks (they cannot be reached).
+        let message = with_metadata(door(Value::from(1)), Some("tsk_1"));
+        assert!(invalid_params(&message).ends_with("must be an object"));
+        // Not a boolean beats the continuation check.
+        let message = with_metadata(
+            door(serde_json::json!({"forgetSession": "yes"})),
+            Some("tsk_1"),
+        );
+        assert!(invalid_params(&message).ends_with("must be a boolean"));
+        // A malformed forget beats a file part.
+        let mut message = with_metadata(door(serde_json::json!({"forgetSession": 1})), None);
+        message["message"]["parts"] = serde_json::json!([{"raw": "aGk="}]);
+        assert!(invalid_params(&message).ends_with("must be a boolean"));
+        // A well-formed forget on a message with a file part is refused for the part.
+        let mut message = with_metadata(door(serde_json::json!({"forgetSession": true})), None);
+        message["message"]["parts"] = serde_json::json!([{"raw": "aGk="}]);
+        assert!(matches!(
+            read_send_params(&message),
+            Err(MessageRefusal::ContentTypeNotSupported { .. })
+        ));
+        // Each renders as `Invalid params: …`.
+        let refusal = read_send_params(&with_metadata(door(Value::from(1)), None)).unwrap_err();
+        let answer = wire(&refusal.into_response(Value::from(3)));
+        assert_eq!(answer["error"]["code"], -32602);
+        assert_eq!(
+            answer["error"]["message"],
+            format!("Invalid params: message.metadata[\"{DOOR_EXTENSION_URI}\"] must be an object")
+        );
     }
 
     /// A file part is refused only once the message is otherwise well formed, naming the first.

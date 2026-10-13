@@ -78,12 +78,12 @@ pub(crate) async fn bind_local_port(
 pub(crate) enum DoorMethod {
     SendMessage,
     SendStreamingMessage,
-    StreamWatch,
+    WatchSession,
     GetTask,
     ListTasks,
     CancelTask,
     SubscribeToTask,
-    SessionStop,
+    StopSession,
     GetExtendedAgentCard,
 }
 
@@ -93,27 +93,28 @@ impl DoorMethod {
     pub(crate) const ALL: [DoorMethod; 9] = [
         DoorMethod::SendMessage,
         DoorMethod::SendStreamingMessage,
-        DoorMethod::StreamWatch,
+        DoorMethod::WatchSession,
         DoorMethod::GetTask,
         DoorMethod::ListTasks,
         DoorMethod::CancelTask,
         DoorMethod::SubscribeToTask,
-        DoorMethod::SessionStop,
+        DoorMethod::StopSession,
         DoorMethod::GetExtendedAgentCard,
     ];
 
-    /// The method's name on the wire: the A2A v1.0 name of an A2A method, and murmur's own name of
-    /// `stream/watch` and `session/stop`.
+    /// The method's name on the wire: the A2A v1.0 name of an A2A method, which is an rpc of
+    /// `A2AService`, and `murmur.` followed by a PascalCase verb and object for murmur's own. No
+    /// A2A rpc name holds a `.`, so a murmur name cannot collide with a method A2A adds.
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             DoorMethod::SendMessage => "SendMessage",
             DoorMethod::SendStreamingMessage => "SendStreamingMessage",
-            DoorMethod::StreamWatch => "stream/watch",
+            DoorMethod::WatchSession => "murmur.WatchSession",
             DoorMethod::GetTask => "GetTask",
             DoorMethod::ListTasks => "ListTasks",
             DoorMethod::CancelTask => "CancelTask",
             DoorMethod::SubscribeToTask => "SubscribeToTask",
-            DoorMethod::SessionStop => "session/stop",
+            DoorMethod::StopSession => "murmur.StopSession",
             DoorMethod::GetExtendedAgentCard => "GetExtendedAgentCard",
         }
     }
@@ -218,14 +219,14 @@ pub(crate) struct TransportCapabilities {
 ///
 /// Each frame's arm states which streaming methods carry it and which transports write it. Only
 /// the two task streams, `SendStreamingMessage` and `SubscribeToTask`, on a connection that
-/// activated the stream extension, and `stream/watch` write frames; `stream/watch` alone writes the
+/// activated the stream extension, and `murmur.WatchSession` write frames; `murmur.WatchSession` alone writes the
 /// observer's `connection-ack` and `capsule-closed`.
 pub(crate) fn writes_frame(
     method: DoorMethod,
     frame: StreamFrame,
     transport: TransportKind,
 ) -> bool {
-    let (on_task_stream, on_stream_watch, transports): (bool, bool, &[TransportKind]) = match frame
+    let (on_task_stream, on_watch_session, transports): (bool, bool, &[TransportKind]) = match frame
     {
         StreamFrame::Text
         | StreamFrame::Thinking
@@ -240,12 +241,12 @@ pub(crate) fn writes_frame(
     };
     let carried = match method {
         DoorMethod::SendStreamingMessage | DoorMethod::SubscribeToTask => on_task_stream,
-        DoorMethod::StreamWatch => on_stream_watch,
+        DoorMethod::WatchSession => on_watch_session,
         DoorMethod::SendMessage
         | DoorMethod::GetTask
         | DoorMethod::ListTasks
         | DoorMethod::CancelTask
-        | DoorMethod::SessionStop
+        | DoorMethod::StopSession
         | DoorMethod::GetExtendedAgentCard => false,
     };
     carried && transports.contains(&transport)
@@ -276,18 +277,6 @@ pub(crate) fn served_frames(
         .collect()
 }
 
-/// Asks the capsule to drop the harness session the request's context names before the turn it
-/// starts, so that turn opens a new conversation under the same context id.
-///
-/// Carried on the request that starts a turn rather than served as a method of its own, because
-/// that is where the context, the trace and the session plan already are: the door itself writes
-/// no trace and holds no map. Only the value `true` asks for it — every other value, and the
-/// header's absence, are the same request.
-///
-/// Refused with `-32602` by a capsule that keeps no harness session, which is every transport but
-/// `inference.transport: process`.
-pub(crate) const FORGET_SESSION_HEADER: &str = "x-murmur-forget-session";
-
 /// What a door declaring `network.authentication` holds: the session's key and tokens, the realm
 /// its challenges name, and the extended card an authenticated caller may read.
 pub(crate) struct DoorGate {
@@ -309,10 +298,10 @@ pub(crate) const CAPSULE_EXTENSION_URI: &str =
     murmur_artifact::docs_reference_url!("agent-card/#murmur-capsule-v1");
 
 /// What the door extension says about itself.
-const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.";
+const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, A2A methods and murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from peer capsules; and the forgetSession field a message's metadata may carry under this URI.";
 
 /// What the stream extension says about itself.
-const STREAM_EXTENSION_DESCRIPTION: &str = "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.";
+const STREAM_EXTENSION_DESCRIPTION: &str = "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.";
 
 /// The id of the one skill a door that starts tasks advertises: running a task.
 pub(crate) const TASK_SKILL_ID: &str = "task";
@@ -636,8 +625,8 @@ pub(crate) async fn serve_http(
     // delegation set is also where every completion is handed.
     detached: Option<Arc<DetachedRegistry>>,
     live_delegations: Arc<LiveDelegations>,
-    // Whether this capsule has a harness session to forget, which is the one thing
-    // `FORGET_SESSION_HEADER` needs to know about the transport behind the door.
+    // Whether this capsule has a harness session to forget, which is the one thing a message's
+    // `forgetSession` field needs to know about the transport behind the door.
     forgettable_session: bool,
     // The manifest's own `exports.peer_tasks.accept`. `false` refuses every peer-origin request
     // past the token check with `peer_tasks::refusal`.
@@ -691,8 +680,8 @@ pub(crate) async fn serve_http(
     if accept_failed {
         let _ = shutdown_rx.await;
     }
-    // A `stream/watch` or `SendStreamingMessage` connection otherwise outlives the session: its
-    // handler holds a broadcast sender, so it never sees the channel close.
+    // A `murmur.WatchSession` or `SendStreamingMessage` connection otherwise outlives the session:
+    // its handler holds a broadcast sender, so it never sees the channel close.
     let _ = closing_tx.send(true);
     let drained = async { while connections.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(CONNECTION_DRAIN_GRACE, drained).await;
@@ -836,7 +825,6 @@ async fn handle_connection(
     let mut task_trust: Option<String> = None;
     let mut delegation_id: Option<String> = None;
     let mut completion_session: Option<String> = None;
-    let mut forget_session = false;
     let mut authorization: Option<String> = None;
     // Every `authorization` header, in order: a door token is refused when more than one is sent.
     let mut authorizations: Vec<String> = Vec::new();
@@ -902,11 +890,6 @@ async fn handle_connection(
             delegation_id = Some(rest.trim().to_string());
         } else if let Some(rest) = lower.strip_prefix(&format!("{COMPLETION_SESSION_HEADER}:")) {
             completion_session = Some(rest.trim().to_string());
-        } else if let Some(rest) = lower.strip_prefix(&format!("{FORGET_SESSION_HEADER}:")) {
-            // One value asks for a forget. Anything else reads as the header not being there:
-            // dropping a conversation on a value nobody meant as `true` is the failure this
-            // header exists to recover from.
-            forget_session = rest.trim() == "true";
         }
     }
 
@@ -1124,29 +1107,6 @@ async fn handle_connection(
             return;
         }
 
-        // A forget writes to this capsule's harness session map, and only a `transport: process`
-        // capsule has one. Refused here, on the request that carried it, rather than dropped into
-        // a task that would ignore it: a caller that asked for a conversation to be dropped and
-        // was answered `completed` would read that as the drop having happened.
-        let starts_a_turn = matches!(
-            resolved,
-            DoorMethod::SendMessage | DoorMethod::SendStreamingMessage
-        );
-        if forget_session && starts_a_turn && !forgettable_session {
-            let response = JsonRpcResponse::err(
-                req.id,
-                INVALID_PARAMS,
-                &format!(
-                    "{FORGET_SESSION_HEADER} asks this capsule to forget the harness session \
-                     this context names, and only a capsule on inference.transport: process has \
-                     one"
-                ),
-            )
-            .into_http_response();
-            let _ = writer_half.write_all(response.as_bytes()).await;
-            return;
-        }
-
         // Every method the door serves takes its parameters as one object.
         if !req.params.is_object() {
             let response = JsonRpcResponse::err(
@@ -1179,10 +1139,10 @@ async fn handle_connection(
                     MessageSender {
                         traceparent,
                         provenance,
-                        forget_session,
                         caller_member,
                         caller,
                     },
+                    forgettable_session,
                     StreamRequest {
                         last_event_id,
                         activated: crate::a2a::activates_extension(
@@ -1217,8 +1177,8 @@ async fn handle_connection(
                 .await;
                 return;
             }
-            DoorMethod::StreamWatch => {
-                handle_stream_watch(
+            DoorMethod::WatchSession => {
+                handle_watch_session(
                     writer_half,
                     &req.id,
                     last_event_id,
@@ -1243,9 +1203,9 @@ async fn handle_connection(
                 &task_tx,
                 traceparent,
                 provenance,
-                forget_session,
                 caller_member,
                 caller,
+                forgettable_session,
                 detached.as_ref(),
                 &live_delegations,
                 &session_id,
@@ -1338,23 +1298,18 @@ struct StreamConnection {
 }
 
 impl StreamConnection {
-    /// Writes the SSE response head, which lists the stream extension in `A2A-Extensions` when the
-    /// connection activated it. `Err` means the client is gone.
+    /// Writes the SSE response head, which lists `extensions` in `A2A-Extensions`: the extensions
+    /// the request used, the stream extension last when the connection is `activated`. `Err`
+    /// means the client is gone.
     async fn open(
         mut writer: tokio::net::tcp::OwnedWriteHalf,
         request_id: &Value,
+        extensions: &[&str],
         activated: bool,
     ) -> Result<Self, ()> {
         use tokio::io::AsyncWriteExt;
 
-        let echo = if activated {
-            format!(
-                "{}: {STREAM_EXTENSION_URI}\r\n",
-                crate::a2a::A2A_EXTENSIONS_HEADER
-            )
-        } else {
-            String::new()
-        };
+        let echo = crate::a2a::extensions_echo(extensions);
         let head = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n{echo}\r\n"
         );
@@ -1415,10 +1370,13 @@ fn replay(
 
 /// `SendStreamingMessage`: route the message as [`route_message`] does, then stream its task.
 ///
-/// Every refusal [`read_send_params`] or the router answers with is one JSON-RPC body, written
+/// Every refusal [`read_message`] or the router answers with is one JSON-RPC body, written
 /// before any SSE head. A new task the registry has no room for is answered as a stream of exactly
 /// one unnumbered event, the `TASK_STATE_REJECTED` task `SendMessage` answers the same refusal
 /// with.
+///
+/// The response head lists the door extension in `A2A-Extensions` when the message's metadata used
+/// it, then the stream extension when the request activated it.
 ///
 /// Otherwise the stream opens with the task as the registry held it when the message was taken,
 /// unnumbered, and goes on as [`serve_task_stream`] serves it, ending after the task's terminal
@@ -1430,6 +1388,7 @@ async fn handle_message_stream(
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
     sender: MessageSender,
+    forgettable_session: bool,
     request: StreamRequest,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
@@ -1443,10 +1402,19 @@ async fn handle_message_stream(
     let rx = sse_tx.subscribe();
     drop(sse_tx);
 
-    let routed = match read_send_params(&req.params) {
-        Ok(message) => route_message(&req.id, message, task_registry, task_tx, sender),
-        Err(refusal) => MessageRoute::Refused(refusal.into_response(req.id.clone())),
+    let mut extensions = Vec::new();
+    let routed = match read_message(&req.id, &req.params, forgettable_session) {
+        Ok(message) => {
+            if message.door_extension {
+                extensions.push(DOOR_EXTENSION_URI);
+            }
+            route_message(&req.id, message, task_registry, task_tx, sender)
+        }
+        Err(response) => MessageRoute::Refused(response),
     };
+    if request.activated {
+        extensions.push(STREAM_EXTENSION_URI);
+    }
     let (opening, rejected) = match routed {
         MessageRoute::Refused(response) => {
             let _ = writer
@@ -1458,7 +1426,8 @@ async fn handle_message_stream(
         MessageRoute::Rejected(task) => (task, true),
     };
 
-    let Ok(mut connection) = StreamConnection::open(writer, &req.id, request.activated).await
+    let Ok(mut connection) =
+        StreamConnection::open(writer, &req.id, &extensions, request.activated).await
     else {
         return;
     };
@@ -1522,7 +1491,13 @@ async fn handle_task_subscribe(
             return;
         }
     };
-    let Ok(mut connection) = StreamConnection::open(writer, &req.id, request.activated).await
+    let extensions: &[&str] = if request.activated {
+        &[STREAM_EXTENSION_URI]
+    } else {
+        &[]
+    };
+    let Ok(mut connection) =
+        StreamConnection::open(writer, &req.id, extensions, request.activated).await
     else {
         return;
     };
@@ -1750,10 +1725,11 @@ fn lost_stream_end(
     Some(vec![crate::streaming::input_required_result(task, prompt)])
 }
 
-/// Passive observer handler for `stream/watch`.
+/// `murmur.WatchSession`: the passive observer of every task of this session.
 ///
-/// Does not submit a task or call `can_accept()`. The extension is always active: the response
-/// head lists it, and the murmur frames of every task are written. The stream opens with an
+/// Does not submit a task or call `can_accept()`. Calling it uses the door extension and the
+/// stream extension, so the response head lists both, in that order; the stream extension is
+/// always active, and the murmur frames of every task are written. The stream opens with an
 /// unnumbered `connection-ack`, then replays the buffer after `Last-Event-ID` (from the start when
 /// absent), preceded by a `gap` when the buffer cannot supply all of it, then forwards live events
 /// until the capsule shuts down or the client disconnects. A task's terminal status does NOT
@@ -1764,7 +1740,7 @@ fn lost_stream_end(
 /// flowed in between, so an observer can tell an idle capsule from a dead socket. The handler
 /// runs on the runtime's worker pool, off the thread running the agent loop, so synchronous work
 /// inside a turn does not delay it.
-async fn handle_stream_watch(
+async fn handle_watch_session(
     writer: tokio::net::tcp::OwnedWriteHalf,
     request_id: &Value,
     last_event_id: Option<u64>,
@@ -1778,7 +1754,14 @@ async fn handle_stream_watch(
     let mut rx = sse_tx.subscribe();
     drop(sse_tx);
 
-    let Ok(mut connection) = StreamConnection::open(writer, request_id, true).await else {
+    let Ok(mut connection) = StreamConnection::open(
+        writer,
+        request_id,
+        &[DOOR_EXTENSION_URI, STREAM_EXTENSION_URI],
+        true,
+    )
+    .await
+    else {
         return;
     };
 
@@ -1846,7 +1829,7 @@ async fn handle_stream_watch(
                         return;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        crate::runtime_err!("[capsule-runtime] stream/watch: SSE broadcast lagged by {n} events");
+                        crate::runtime_err!("[capsule-runtime] murmur.WatchSession: SSE broadcast lagged by {n} events");
                         let frame = MurmurFrame::Lagged { missed: n };
                         if connection.write(None, &message_carrier(&frame)).await.is_err() {
                             return;
@@ -1948,9 +1931,9 @@ fn handle_jsonrpc(
     task_tx: &mpsc::Sender<IncomingTask>,
     traceparent: Option<String>,
     provenance: TaskProvenance,
-    forget_session: bool,
     caller_member: Option<String>,
     caller: TaskCaller,
+    forgettable_session: bool,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
     session_id: &str,
@@ -1965,10 +1948,10 @@ fn handle_jsonrpc(
             MessageSender {
                 traceparent,
                 provenance,
-                forget_session,
                 caller_member,
                 caller,
             },
+            forgettable_session,
         ),
         DoorMethod::GetTask => handle_tasks_get(id, &req.params, task_registry, &caller),
         DoorMethod::ListTasks => handle_tasks_list(id, &req.params, task_registry, &caller),
@@ -1980,12 +1963,12 @@ fn handle_jsonrpc(
             detached,
             live_delegations,
         ),
-        DoorMethod::SessionStop => {
-            handle_session_stop(id, task_registry, detached, live_delegations, session_id)
+        DoorMethod::StopSession => {
+            handle_stop_session(id, task_registry, detached, live_delegations, session_id)
         }
         DoorMethod::SendStreamingMessage
         | DoorMethod::SubscribeToTask
-        | DoorMethod::StreamWatch
+        | DoorMethod::WatchSession
         | DoorMethod::GetExtendedAgentCard => {
             unreachable!("handle_connection answers the streaming methods and the extended card")
         }
@@ -1997,7 +1980,6 @@ fn handle_jsonrpc(
 pub(crate) struct MessageSender {
     pub traceparent: Option<String>,
     pub provenance: TaskProvenance,
-    pub forget_session: bool,
     /// The formation member that sent it, when the door let it in on a formation token. Recorded
     /// on the task it starts for the trace, and decides nothing.
     pub caller_member: Option<String>,
@@ -2015,8 +1997,8 @@ pub(crate) struct MessageSender {
 /// | a declared credential's token | the tasks a request carrying that credential started |
 /// | a formation token, credential `member:<from>` | the tasks that member started |
 ///
-/// The session's own methods, `stream/watch` and `session/stop`, are not task methods: whoever
-/// holds their scope reaches every task through them.
+/// The session's own methods, `murmur.WatchSession` and `murmur.StopSession`, are not task
+/// methods: whoever holds their scope reaches every task through them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TaskCaller {
     /// A caller of a public door, or the holder of the operator token.
@@ -2190,7 +2172,7 @@ fn start_task(
         traceparent: sender.traceparent,
         provenance: sender.provenance,
         source: crate::a2a::SOURCE_A2A,
-        forget_session: sender.forget_session,
+        forget_session: message.forget_session,
         caller_member: sender.caller_member,
         reference_task_ids: message.reference_task_ids,
         part_kinds,
@@ -2215,18 +2197,50 @@ fn start_task(
     })
 }
 
+/// The message a `SendMessage` or `SendStreamingMessage` request's `params` carries, as
+/// [`read_send_params`] reads it, or the error answering request `id`.
+///
+/// A message asking for a forget is refused `-32602` by a capsule that keeps no harness session,
+/// which is every transport but `inference.transport: process`: on the request that carried it,
+/// before it is routed, rather than dropped into a task that would ignore it. A caller that asked
+/// for a conversation to be dropped and was answered `completed` would read that as the drop
+/// having happened.
+fn read_message(
+    id: &Value,
+    params: &Value,
+    forgettable_session: bool,
+) -> Result<IncomingMessage, JsonRpcResponse> {
+    let message = read_send_params(params).map_err(|refusal| refusal.into_response(id.clone()))?;
+    if message.forget_session && !forgettable_session {
+        return Err(JsonRpcResponse::err(
+            id.clone(),
+            INVALID_PARAMS,
+            "forgetSession asks this capsule to forget the harness session this context names, \
+             and only a capsule on inference.transport: process has one",
+        ));
+    }
+    Ok(message)
+}
+
 /// `SendMessage`: the message routed as [`route_message`] routes it, answered as a
-/// `SendMessageResponse` holding the task, or as the error refusing it.
+/// `SendMessageResponse` holding the task, or as the error refusing it. The answer lists the door
+/// extension in `A2A-Extensions` when the message's metadata used it.
 fn handle_message_send(
     id: Value,
     params: &Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
     sender: MessageSender,
+    forgettable_session: bool,
 ) -> String {
-    let message = match read_send_params(params) {
+    let message = match read_message(&id, params, forgettable_session) {
         Ok(message) => message,
-        Err(refusal) => return refusal.into_response(id).into_http_response(),
+        Err(response) => return response.into_http_response(),
+    };
+    let extensions: &[&str] = if message.door_extension {
+        &[DOOR_EXTENSION_URI]
+    } else {
+        &[]
     };
     let task = match route_message(&id, message, task_registry, task_tx, sender) {
         MessageRoute::Started(task)
@@ -2234,7 +2248,8 @@ fn handle_message_send(
         | MessageRoute::Rejected(task) => task,
         MessageRoute::Refused(response) => return response.into_http_response(),
     };
-    JsonRpcResponse::ok(id, serde_json::json!({ "task": task })).into_http_response()
+    JsonRpcResponse::ok(id, serde_json::json!({ "task": task }))
+        .into_http_response_echoing(extensions)
 }
 
 /// Whether `caller` reaches `task_id`, by the rule [`TaskCaller`] states: a session caller every
@@ -2516,7 +2531,9 @@ fn handle_tasks_cancel(
     }
 }
 
-/// `session/stop`: cancel everything this session still holds and report what it leaves running.
+/// `murmur.StopSession`: cancel everything this session still holds and report what it leaves
+/// running. The answer lists the door extension in `A2A-Extensions`: calling a murmur method is
+/// the use of it.
 ///
 /// The one moment anything can ask a capsule for that account. A detached shell command keeps its
 /// own lifecycle, and a delegated child runs until the cancelled task that started it ends it;
@@ -2530,7 +2547,7 @@ fn handle_tasks_cancel(
 /// `canceled`, so a second stop answers `[]` rather than an error. `residue` is `[]` when nothing
 /// is running — unlike `CancelTask`, which omits the key: a session stop has to be able to say
 /// "nothing" as a positive fact, because that is the whole answer the operator asked for.
-fn handle_session_stop(
+fn handle_stop_session(
     id: Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     detached: Option<&Arc<DetachedRegistry>>,
@@ -2551,7 +2568,7 @@ fn handle_session_stop(
             "residue": residue,
         }),
     )
-    .into_http_response()
+    .into_http_response_echoing(&[DOOR_EXTENSION_URI])
 }
 
 #[cfg(test)]
@@ -2589,8 +2606,8 @@ mod tests {
         );
     }
 
-    /// Every murmur frame: what `stream/watch` carries, and so the stream extension's
-    /// `params.frames` under every acceptance, since `stream/watch` is served under each.
+    /// Every murmur frame: what `murmur.WatchSession` carries, and so the stream extension's
+    /// `params.frames` under every acceptance, since `murmur.WatchSession` is served under each.
     const ALL_FRAMES: &[&str] = &[
         "text",
         "thinking",
@@ -2635,7 +2652,7 @@ mod tests {
             }
             let watched: Vec<&str> = StreamFrame::ALL
                 .into_iter()
-                .filter(|&frame| writes_frame(DoorMethod::StreamWatch, frame, transport))
+                .filter(|&frame| writes_frame(DoorMethod::WatchSession, frame, transport))
                 .map(StreamFrame::wire_name)
                 .collect();
             assert_eq!(watched, ALL_FRAMES, "{transport:?}");
@@ -2655,7 +2672,7 @@ mod tests {
             stream["description"],
             "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on \
              SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header \
-             names this URI, and always on stream/watch. Each is carried in a StreamResponse under \
+             names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under \
              metadata keyed by this URI."
         );
         assert_eq!(stream["required"], false);
@@ -2820,10 +2837,10 @@ mod tests {
                     "extensions": [
                         {
                             "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
+                            "description": "Every JSON-RPC method this door answers, A2A methods and murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from peer capsules; and the forgetSession field a message's metadata may carry under this URI.",
                             "required": false,
                             "params": {
-                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop"],
+                                "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "murmur.StopSession"],
                                 "peerTasks": false
                             }
                         },
@@ -2841,7 +2858,7 @@ mod tests {
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.",
                             "required": false,
                             "params": {
                                 "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -3272,7 +3289,7 @@ mod tests {
             scheme: murmur_artifact::AuthenticationScheme::Bearer,
             credentials: vec![murmur_artifact::DoorCredential {
                 name: "watcher".to_string(),
-                scopes: vec!["GetTask".to_string(), "stream/watch".to_string()],
+                scopes: vec!["GetTask".to_string(), "murmur.WatchSession".to_string()],
             }],
         }
     }
@@ -3393,16 +3410,16 @@ mod tests {
                     "extensions": [
                         {
                             "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-                            "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
+                            "description": "Every JSON-RPC method this door answers, A2A methods and murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from peer capsules; and the forgetSession field a message's metadata may carry under this URI.",
                             "required": false,
                             "params": {
-                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop", "GetExtendedAgentCard"],
+                                "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "murmur.StopSession", "GetExtendedAgentCard"],
                                 "peerTasks": false
                             }
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.",
                             "required": false,
                             "params": {
                                 "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -3458,11 +3475,11 @@ mod tests {
                     "pushNotifications": false,
                     "extendedAgentCard": true,
                     "extensions": [
-                        { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.", "required": false,
-                          "params": { "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop", "GetExtendedAgentCard"], "peerTasks": false } },
+                        { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, A2A methods and murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from peer capsules; and the forgetSession field a message's metadata may carry under this URI.", "required": false,
+                          "params": { "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "murmur.StopSession", "GetExtendedAgentCard"], "peerTasks": false } },
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
                           "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
-                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.", "required": false,
+                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.", "required": false,
                           "params": { "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"] } }
                     ]
                 },
@@ -3522,11 +3539,11 @@ mod tests {
         assert_eq!(
             door_methods(&cards.public),
             [
-                "stream/watch",
+                "murmur.WatchSession",
                 "GetTask",
                 "ListTasks",
                 "CancelTask",
-                "session/stop",
+                "murmur.StopSession",
                 "GetExtendedAgentCard"
             ]
         );
@@ -3656,7 +3673,6 @@ mod tests {
         MessageSender {
             traceparent: None,
             provenance: TaskProvenance::derive(TaskOrigin::User, None),
-            forget_session: false,
             caller_member: caller.map(str::to_string),
             caller: caller.map_or(TaskCaller::Session, |member| {
                 TaskCaller::Credential(format!("member:{member}"))
@@ -3674,6 +3690,109 @@ mod tests {
         serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
     }
 
+    /// `message_send_params` whose message carries `forgetSession: forget` under the door
+    /// extension's key.
+    fn forget_params(message_id: &str, forget: bool) -> Value {
+        let mut params = message_send_params(message_id);
+        params["message"]["metadata"] =
+            serde_json::json!({ DOOR_EXTENSION_URI: { "forgetSession": forget } });
+        params
+    }
+
+    /// A capsule with no harness session refuses a forget before the message is routed: no task
+    /// is registered or handed to the loop, and the refusal echoes no extension.
+    #[test]
+    fn a_forget_asked_of_a_capsule_with_no_harness_session_is_refused_before_routing() {
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+
+        let raw = handle_message_send(
+            serde_json::json!(1),
+            &forget_params("msg_forget", true),
+            &task_registry,
+            &task_tx,
+            operator(),
+            false,
+        );
+
+        let response = response_json(&raw);
+        assert_eq!(response["error"]["code"], INVALID_PARAMS, "{response}");
+        assert_eq!(
+            response["error"]["message"],
+            "forgetSession asks this capsule to forget the harness session this context names, \
+             and only a capsule on inference.transport: process has one"
+        );
+        assert!(response["error"].get("data").is_none(), "{response}");
+        assert!(!split_response(&raw).0.contains("A2A-Extensions"), "{raw}");
+        assert!(
+            task_rx.try_recv().is_err(),
+            "nothing was handed to the loop"
+        );
+        assert!(task_registry.lock().unwrap().history.is_empty());
+
+        // `false` asks for nothing, so the same capsule serves it and echoes the extension the
+        // message used.
+        let raw = handle_message_send(
+            serde_json::json!(2),
+            &forget_params("msg_keep", false),
+            &task_registry,
+            &task_tx,
+            operator(),
+            false,
+        );
+        assert_eq!(
+            response_json(&raw)["result"]["task"]["status"]["state"],
+            "TASK_STATE_SUBMITTED"
+        );
+        assert!(
+            split_response(&raw)
+                .0
+                .contains(&format!("\r\nA2A-Extensions: {DOOR_EXTENSION_URI}")),
+            "{raw}"
+        );
+        assert!(!task_rx.try_recv().unwrap().forget_session);
+    }
+
+    /// A capsule that keeps a harness session carries the forget to the task the message starts,
+    /// and the answer echoes the door extension. A message that does not use the extension is
+    /// answered with no echo.
+    #[test]
+    fn a_forget_reaches_the_task_its_message_starts_and_echoes_the_door_extension() {
+        let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+
+        let raw = handle_message_send(
+            serde_json::json!(1),
+            &forget_params("msg_forget", true),
+            &task_registry,
+            &task_tx,
+            operator(),
+            true,
+        );
+        assert_eq!(
+            response_json(&raw)["result"]["task"]["status"]["state"],
+            "TASK_STATE_SUBMITTED"
+        );
+        assert!(
+            split_response(&raw)
+                .0
+                .contains(&format!("\r\nA2A-Extensions: {DOOR_EXTENSION_URI}")),
+            "{raw}"
+        );
+        assert!(task_rx.try_recv().unwrap().forget_session);
+
+        let raw = handle_message_send(
+            serde_json::json!(2),
+            &message_send_params("msg_plain"),
+            &task_registry,
+            &task_tx,
+            operator(),
+            true,
+        );
+        assert!(!split_response(&raw).0.contains("A2A-Extensions"), "{raw}");
+        assert!(!task_rx.try_recv().unwrap().forget_session);
+    }
+
     /// A closed registry refuses `SendMessage` whatever room its queue has, and the refused
     /// message never reaches the task loop or the registry.
     #[test]
@@ -3688,6 +3807,7 @@ mod tests {
             &task_registry,
             &task_tx,
             operator(),
+            false,
         ));
 
         assert_eq!(
@@ -3802,6 +3922,7 @@ mod tests {
             registry,
             task_tx,
             member(caller),
+            false,
         ))
     }
 
@@ -4367,11 +4488,11 @@ mod tests {
         assert_eq!(
             served_methods(&TaskAcceptance::None, false),
             [
-                "stream/watch",
+                "murmur.WatchSession",
                 "GetTask",
                 "ListTasks",
                 "CancelTask",
-                "session/stop"
+                "murmur.StopSession"
             ]
         );
         for acceptance in [TaskAcceptance::Single, TaskAcceptance::Queue] {
@@ -4380,12 +4501,12 @@ mod tests {
                 [
                     "SendMessage",
                     "SendStreamingMessage",
-                    "stream/watch",
+                    "murmur.WatchSession",
                     "GetTask",
                     "ListTasks",
                     "CancelTask",
                     "SubscribeToTask",
-                    "session/stop"
+                    "murmur.StopSession"
                 ]
             );
         }
@@ -4445,6 +4566,30 @@ mod tests {
         }
     }
 
+    /// A murmur method is named `murmur.` and a PascalCase word, which no A2A rpc can be, and an
+    /// A2A method is named as its rpc, which holds no `.`. A new murmur method under a bare name
+    /// fails here before it can collide with a method A2A adds.
+    #[test]
+    fn door_method_murmur_methods_are_namespaced() {
+        let rpcs = crate::a2a_conformance::v1_methods().expect("the vendored a2a.proto reads");
+        for method in DoorMethod::ALL {
+            let name = method.wire_name();
+            if rpcs.iter().any(|rpc| rpc.name == name) {
+                assert!(!name.contains('.'), "{name} is an A2A rpc");
+                continue;
+            }
+            let word = name.strip_prefix("murmur.").unwrap_or_else(|| {
+                panic!("{name} is not an A2A rpc, so it is named murmur.<Method>")
+            });
+            let mut chars = word.chars();
+            assert!(
+                chars.next().is_some_and(|c| c.is_ascii_uppercase())
+                    && chars.all(|c| c.is_ascii_alphanumeric()),
+                "{name}: murmur.<Method> takes an ASCII PascalCase word"
+            );
+        }
+    }
+
     #[test]
     fn door_method_resolve_matches_names_exactly() {
         for acceptance in &ACCEPTANCES {
@@ -4464,7 +4609,14 @@ mod tests {
                 " GetTask",
                 "GetTask ",
                 "GetTask\n",
-                "session/stop/",
+                "stream/watch",
+                "session/stop",
+                "murmur.watchsession",
+                " murmur.StopSession",
+                "murmur.StopSession/",
+                "WatchSession",
+                "StopSession",
+                "murmur/StopSession",
             ] {
                 for authenticated in [false, true] {
                     assert_eq!(
@@ -4541,7 +4693,7 @@ mod tests {
     }
 
     /// The door runs on the runtime's worker pool while the agent loop holds its own thread. This
-    /// reproduces that shape — `handle_stream_watch` spawned onto the pool, as `serve_http` spawns
+    /// reproduces that shape — `handle_watch_session` spawned onto the pool, as `serve_http` spawns
     /// every connection, beside a `LocalSet` task that holds the calling thread with
     /// `std::thread::sleep` across a due tick — and asserts what a client actually reads: a
     /// heartbeat while the thread is still held.
@@ -4549,7 +4701,7 @@ mod tests {
     /// `protocol_page_says_the_heartbeat_keeps_its_cadence_during_a_turn` holds the protocol page to
     /// this behaviour and must change with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stream_watch_heartbeat_continues_while_session_thread_is_blocked() {
+    async fn watch_session_heartbeat_continues_while_session_thread_is_blocked() {
         use std::time::{Duration, Instant};
 
         // Longer than one heartbeat interval, so a tick falls due inside the blocked stretch.
@@ -4577,7 +4729,7 @@ mod tests {
                 let buffer = Arc::clone(&sse_buffer);
                 let watcher = tokio::spawn(async move {
                     let _read_half = read_half;
-                    handle_stream_watch(
+                    handle_watch_session(
                         write_half,
                         &serde_json::json!(1),
                         Some(0),
@@ -4825,6 +4977,7 @@ mod tests {
                 &task_registry,
                 &task_tx,
                 operator(),
+                false,
                 request,
                 sse,
                 buffer,
@@ -5020,14 +5173,14 @@ mod tests {
     /// Events beyond [`LAG_QUEUE`] in the burst, and so the count the `lagged` frame must carry.
     const LAG_MISSED: usize = 3;
 
-    /// A `stream/watch` connection that falls behind is told how many live events it lost, in one
-    /// unnumbered `lagged` message carrier written before the oldest retained event, and stays
-    /// open.
+    /// A `murmur.WatchSession` connection that falls behind is told how many live events it lost,
+    /// in one unnumbered `lagged` message carrier written before the oldest retained event, and
+    /// stays open.
     ///
     /// Current-thread flavour: the burst is sent with no await between sends, so the handler cannot
     /// drain its queue part-way through and the lost count is exact.
     #[tokio::test]
-    async fn stream_watch_writes_lagged_frame() {
+    async fn watch_session_writes_lagged_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, lines) = spawn_sse_line_reader(
             listener.local_addr().unwrap(),
@@ -5045,7 +5198,7 @@ mod tests {
         let (_closing_tx, closing) = watch::channel(false);
         let watcher = tokio::spawn(async move {
             let _read_half = read_half;
-            handle_stream_watch(
+            handle_watch_session(
                 write_half,
                 &serde_json::json!(1),
                 Some(0),
@@ -5075,8 +5228,10 @@ mod tests {
 
         let (head, body) = split_response(&received);
         assert!(
-            head.contains(&format!("A2A-Extensions: {STREAM_EXTENSION_URI}\r\n")),
-            "stream/watch always echoes the stream extension: {head}"
+            head.contains(&format!(
+                "A2A-Extensions: {DOOR_EXTENSION_URI}, {STREAM_EXTENSION_URI}\r\n"
+            )),
+            "murmur.WatchSession always echoes both extensions: {head}"
         );
         let events = events_of(body);
         let frames: Vec<Value> = events
@@ -5113,7 +5268,7 @@ mod tests {
     /// events it lost, in a `lagged` carrier of its task repeating the state it last wrote, keeps
     /// receiving, and closes on its own task's terminal status, not another task's.
     ///
-    /// Current-thread flavour for the same reason as `stream_watch_writes_lagged_frame`.
+    /// Current-thread flavour for the same reason as `watch_session_writes_lagged_frame`.
     #[tokio::test]
     async fn message_stream_writes_lagged_frame() {
         let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(LAG_QUEUE);
@@ -5373,11 +5528,11 @@ mod tests {
         assert_eq!(ns(&events), [1]);
     }
 
-    /// A `stream/watch` observer is written every event it was sent before the door closed, rather
-    /// than having its socket dropped mid-queue, and the stream then ends without
+    /// A `murmur.WatchSession` observer is written every event it was sent before the door closed,
+    /// rather than having its socket dropped mid-queue, and the stream then ends without
     /// `capsule-closed`, as it does for any capsule that exits.
     #[tokio::test]
-    async fn stream_watch_writes_queued_frames_before_the_door_closes() {
+    async fn watch_session_writes_queued_frames_before_the_door_closes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, lines) = spawn_sse_line_reader(
             listener.local_addr().unwrap(),
@@ -5395,7 +5550,7 @@ mod tests {
         let (closing_tx, closing) = watch::channel(false);
         let watcher = tokio::spawn(async move {
             let _read_half = read_half;
-            handle_stream_watch(
+            handle_watch_session(
                 write_half,
                 &serde_json::json!("watch-1"),
                 Some(0),
@@ -5439,10 +5594,10 @@ mod tests {
         assert!(!received.contains("capsule-closed"), "{received}");
     }
 
-    /// A `stream/watch` connection whose session's broadcast closes is told so in a
+    /// A `murmur.WatchSession` connection whose session's broadcast closes is told so in a
     /// `capsule-closed` message carrier, and ends.
     #[tokio::test]
-    async fn stream_watch_writes_capsule_closed_when_the_broadcast_closes() {
+    async fn watch_session_writes_capsule_closed_when_the_broadcast_closes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (client, lines) = spawn_sse_line_reader(
             listener.local_addr().unwrap(),
@@ -5457,7 +5612,7 @@ mod tests {
         let (_closing_tx, closing) = watch::channel(false);
         let watcher = tokio::spawn(async move {
             let _read_half = read_half;
-            handle_stream_watch(
+            handle_watch_session(
                 write_half,
                 &serde_json::json!(1),
                 None,
@@ -5838,7 +5993,7 @@ mod tests {
         }
     }
 
-    /// The page documents the frame `stream_watch_writes_lagged_frame` and
+    /// The page documents the frame `watch_session_writes_lagged_frame` and
     /// `message_stream_writes_lagged_frame` hold the handlers to: its key, its place in the
     /// endpoint and event-id tables, and its absence from replay.
     #[test]
@@ -5921,7 +6076,7 @@ mod tests {
     }
 
     /// The Heartbeat section's liveness claim is held against
-    /// `stream_watch_heartbeat_continues_while_session_thread_is_blocked`: the heartbeat keeps its
+    /// `watch_session_heartbeat_continues_while_session_thread_is_blocked`: the heartbeat keeps its
     /// cadence while the thread running the agent loop is held.
     #[test]
     fn protocol_page_says_the_heartbeat_keeps_its_cadence_during_a_turn() {

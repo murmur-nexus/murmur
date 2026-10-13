@@ -601,9 +601,9 @@ impl Residue {
 
     /// Every item in this snapshot as its own JSON object, in the order [`Self::snapshot`] fixed.
     ///
-    /// The shape a `session/stop` result carries under `residue`, where an empty array is the
-    /// answer "nothing" rather than an absence: a session stop has to be able to say that as a
-    /// positive fact, which is the one place this differs from [`Self::into_artifact`].
+    /// The shape a `murmur.StopSession` result carries under `residue`, where an empty array is
+    /// the answer "nothing" rather than an absence: a session stop has to be able to say that as
+    /// a positive fact, which is the one place this differs from [`Self::into_artifact`].
     pub(crate) fn into_json_items(self) -> Vec<serde_json::Value> {
         self.items.iter().map(ResidueItem::to_json).collect()
     }

@@ -21,7 +21,7 @@ pub const DRIVER_VERSION: &str = "0.1.4";
 /// `network.authentication` with a `watcher` that may read tasks and watch, and a `reader` that
 /// may read the operator resource plane.
 pub const AUTHENTICATION_YAML: &str = "network:\n  authentication:\n    scheme: bearer\n    \
-     credentials:\n      watcher:\n        scopes: [GetTask, stream/watch]\n      \
+     credentials:\n      watcher:\n        scopes: [GetTask, murmur.WatchSession]\n      \
      reader:\n        scopes: [resources/files]\n";
 
 /// `network.authentication` with two credentials, `alice` and `bob`, that may each start, read,

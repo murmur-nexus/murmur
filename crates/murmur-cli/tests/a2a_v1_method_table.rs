@@ -862,8 +862,8 @@ fn tenant_is_refused_on_every_served_method() {
         ("CancelTask", json!({"id": running})),
         ("SubscribeToTask", json!({"id": running})),
         ("GetExtendedAgentCard", json!({})),
-        ("stream/watch", json!({})),
-        ("session/stop", json!({})),
+        ("murmur.WatchSession", json!({})),
+        ("murmur.StopSession", json!({})),
     ];
     for (method, params) in served.clone() {
         for tenant in [json!("acme"), json!(7)] {

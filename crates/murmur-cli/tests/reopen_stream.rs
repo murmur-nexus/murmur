@@ -273,7 +273,7 @@ fn stream_task(capsule: &IdleCapsule, message_id: &str, text: &str) -> Stream {
     read_until_closed(open_message_stream(&capsule.url, message_id, text))
 }
 
-/// Every event a `stream/watch` connection replays from `Last-Event-ID: 0`, read until
+/// Every event a `murmur.WatchSession` connection replays from `Last-Event-ID: 0`, read until
 /// `task_id`'s terminal status arrives or [`STREAM_DEADLINE`] passes. The observer's
 /// `connection-ack` is dropped.
 fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Event> {
@@ -289,8 +289,8 @@ fn replay(capsule: &IdleCapsule, task_id: &str) -> Vec<Event> {
 }
 
 /// The whole of a task whose stream ended when it stopped for input: the stream is asserted to
-/// end there, and the task's events, through its terminal status, are read from a `stream/watch`
-/// replay.
+/// end there, and the task's events, through its terminal status, are read from a
+/// `murmur.WatchSession` replay.
 fn after_input_wait(capsule: &IdleCapsule, streamed: &Stream) -> Stream {
     assert!(streamed.closed, "{:#?}", streamed.events);
     let last = streamed.events.last().expect("the stream carried events");
@@ -366,7 +366,8 @@ fn assert_first_boundary(stream: &Stream, task_id: &str, hook: &str) {
 
 /// A task a hook reopens once and then accepts ends in one final `completed` status carrying the
 /// second attempt's answer. The first attempt's text still went out, followed by one boundary
-/// frame before the second attempt's first turn, and a `stream/watch` replay shows the same frames.
+/// frame before the second attempt's first turn, and a `murmur.WatchSession` replay shows the same
+/// frames.
 #[test]
 fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
     let capsule = launch_with_hook(
@@ -421,8 +422,8 @@ fn a_reopened_task_is_told_it_finished_once_with_the_accepted_answer() {
     assert_eq!(
         replay(&capsule, &task_id),
         stream.events[1..],
-        "a stream/watch replay shows the live stream's events after its opening task, boundary \
-         and final status included"
+        "a murmur.WatchSession replay shows the live stream's events after its opening task, \
+         boundary and final status included"
     );
 
     assert_eq!(task_state(&capsule.url, &task_id), "TASK_STATE_COMPLETED");

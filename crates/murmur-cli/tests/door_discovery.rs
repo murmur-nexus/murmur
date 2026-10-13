@@ -32,12 +32,12 @@ const DRIVER_VERSION: &str = "0.1.4";
 const ALL_METHODS: [&str; 8] = [
     "SendMessage",
     "SendStreamingMessage",
-    "stream/watch",
+    "murmur.WatchSession",
     "GetTask",
     "ListTasks",
     "CancelTask",
     "SubscribeToTask",
-    "session/stop",
+    "murmur.StopSession",
 ];
 
 const EXPORTS_FILES: &str = "exports:\n  files:\n    root: out/\n    mode: read-only\n";
@@ -372,7 +372,7 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
         .unwrap_or_else(|| panic!("SendMessage should start a task; got {sent}"))
         .to_string();
 
-    for method in ["SendStreamingMessage", "stream/watch"] {
+    for method in ["SendStreamingMessage", "murmur.WatchSession"] {
         let params = if method == "SendStreamingMessage" {
             message_params("m-stream")
         } else {
@@ -397,13 +397,16 @@ fn every_method_the_card_lists_is_answered_and_an_unlisted_one_is_not() {
         "CancelTask: {cancelled}"
     );
 
-    // Asked before `session/stop`, while the session is certainly still answering.
+    // Asked before `murmur.StopSession`, while the session is certainly still answering.
     let unlisted = post_jsonrpc(&capsule.url, &rpc("tasks/list", json!({})));
     assert_eq!(unlisted["error"]["code"], -32601, "tasks/list: {unlisted}");
     assert_eq!(unlisted["error"]["message"], "Method not found");
 
-    let stopped = post_jsonrpc(&capsule.url, &rpc("session/stop", json!({})));
-    assert_ne!(stopped["error"]["code"], -32601, "session/stop: {stopped}");
+    let stopped = post_jsonrpc(&capsule.url, &rpc("murmur.StopSession", json!({})));
+    assert_ne!(
+        stopped["error"]["code"], -32601,
+        "murmur.StopSession: {stopped}"
+    );
     assert_eq!(stopped["result"]["session_id"], capsule.session_id.as_str());
 }
 
@@ -422,11 +425,11 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
     assert_eq!(
         common::card_door_methods(&card),
         [
-            "stream/watch",
+            "murmur.WatchSession",
             "GetTask",
             "ListTasks",
             "CancelTask",
-            "session/stop"
+            "murmur.StopSession"
         ]
     );
     assert_eq!(
@@ -442,7 +445,7 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
             "connection-ack",
             "capsule-closed"
         ],
-        "stream/watch alone carries every frame: {card}"
+        "murmur.WatchSession alone carries every frame: {card}"
     );
     assert_eq!(card["capabilities"]["streaming"], false);
     assert_eq!(card["skills"], json!([]), "no task can be started: {card}");

@@ -273,7 +273,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     );
 
     // The streaming methods are refused before any stream opens.
-    for method in ["SendStreamingMessage", "stream/watch"] {
+    for method in ["SendStreamingMessage", "murmur.WatchSession"] {
         let refused = rpc(&addr, None, method, message("m-s", "hello"));
         assert_refused(&refused, 401, "unauthenticated", &realm);
         assert_ne!(refused.header("content-type"), Some("text/event-stream"));
@@ -416,8 +416,8 @@ fn public_door_warning_names_what_a_stranger_reaches() {
         "{line}"
     );
     for named in [
-        "SendMessage, SendStreamingMessage, stream/watch, GetTask, ListTasks, CancelTask, \
-         SubscribeToTask, session/stop",
+        "SendMessage, SendStreamingMessage, murmur.WatchSession, GetTask, ListTasks, CancelTask, \
+         SubscribeToTask, murmur.StopSession",
         "the session id",
         "tools []",
         "shell: false",
@@ -592,6 +592,14 @@ fn a_retired_scope_is_refused_naming_its_replacement() {
             "every authenticated caller may call GetExtendedAgentCard, so a credential lists no \
              scope for it",
         ),
+        (
+            "stream/watch",
+            "write 'murmur.WatchSession' in place of 'stream/watch'",
+        ),
+        (
+            "session/stop",
+            "write 'murmur.StopSession' in place of 'session/stop'",
+        ),
     ] {
         let project = agent_project(
             "http://127.0.0.1:1",
@@ -599,7 +607,7 @@ fn a_retired_scope_is_refused_naming_its_replacement() {
             "",
             &format!(
                 "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-                 watcher:\n        scopes: [{retired}]\n"
+                 watcher:\n        scopes: [GetTask, {retired}]\n"
             ),
         );
         for args in [
@@ -613,13 +621,26 @@ fn a_retired_scope_is_refused_naming_its_replacement() {
                 .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success(), "{retired} {args:?}: {stderr}");
-            assert!(stderr.contains("E-MAN-003"), "{retired} {args:?}: {stderr}");
-            assert!(stderr.contains(retired), "{retired} {args:?}: {stderr}");
+            assert!(
+                stderr.contains("error[E-MAN-003]"),
+                "{retired} {args:?}: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "'{retired}' is a retired name of a door method, and the door answers only \
+                     the names its card lists"
+                )),
+                "{retired} {args:?}: {stderr}"
+            );
             let hint_line = stderr
                 .lines()
                 .find(|line| line.trim_start().starts_with("hint:"))
                 .unwrap_or_else(|| panic!("no hint line for {retired} {args:?}: {stderr}"));
-            assert!(hint_line.contains(hint), "{retired} {args:?}: {hint_line}");
+            assert!(
+                hint_line.contains(&format!("hint: {hint}"))
+                    || hint_line.contains(&format!("hint: remove '{retired}': {hint}")),
+                "{retired} {args:?}: {hint_line}"
+            );
         }
     }
 }

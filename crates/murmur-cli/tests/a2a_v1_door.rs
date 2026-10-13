@@ -11,6 +11,7 @@ use common::door_capsule::{
     agent_project, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
     wait_completed, Response, A2A_VERSION, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
+use common::{DOOR_EXTENSION_URI, STREAM_EXTENSION_URI};
 use serde_json::{json, Value};
 
 const ERROR_INFO: &str = "type.googleapis.com/google.rpc.ErrorInfo";
@@ -25,8 +26,8 @@ fn served_methods(task_id: &str) -> Vec<(&'static str, Value)> {
         ("CancelTask", json!({"id": task_id})),
         ("SubscribeToTask", json!({"id": task_id})),
         ("GetExtendedAgentCard", json!({})),
-        ("stream/watch", json!({})),
-        ("session/stop", json!({})),
+        ("murmur.WatchSession", json!({})),
+        ("murmur.StopSession", json!({})),
     ]
 }
 
@@ -241,8 +242,8 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
     );
     assert_eq!(error_of(&retired).0["code"], -32009, "{retired:?}");
 
-    // The served round: every method under every accepted spelling, `session/stop` last. Every
-    // task it starts is recorded, so the stop can be held to cancelling only those.
+    // The served round: every method under every accepted spelling, `murmur.StopSession` last.
+    // Every task it starts is recorded, so the stop can be held to cancelling only those.
     let mut started: Vec<String> = Vec::new();
     let accepted: [(&str, &str); 4] = [
         ("A2A-Version", "1.0"),
@@ -290,7 +291,7 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
             "SubscribeToTask",
             "SendStreamingMessage",
             "GetExtendedAgentCard",
-            "stream/watch",
+            "murmur.WatchSession",
         ] {
             let named = if method == "SubscribeToTask" {
                 &queued_id
@@ -309,12 +310,20 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
         }
     }
     for (name, version) in accepted {
-        let stopped = versioned(&addr, token, name, &[version], 1, "session/stop", json!({}));
-        assert_served("session/stop", &stopped);
+        let stopped = versioned(
+            &addr,
+            token,
+            name,
+            &[version],
+            1,
+            "murmur.StopSession",
+            json!({}),
+        );
+        assert_served("murmur.StopSession", &stopped);
         for canceled in stopped.json()["result"]["canceled"].as_array().unwrap() {
             assert!(
                 started.iter().any(|task| canceled == task.as_str()),
-                "session/stop canceled {canceled}, which the served round did not start: \
+                "murmur.StopSession canceled {canceled}, which the served round did not start: \
                  {started:?}"
             );
         }
@@ -374,12 +383,12 @@ fn a2a_v1_door_names_are_the_v1_names_alone() {
     let all = [
         "SendMessage",
         "SendStreamingMessage",
-        "stream/watch",
+        "murmur.WatchSession",
         "GetTask",
         "ListTasks",
         "CancelTask",
         "SubscribeToTask",
-        "session/stop",
+        "murmur.StopSession",
         "GetExtendedAgentCard",
     ];
     assert_eq!(common::card_door_methods(&authenticated_card), all);
@@ -504,4 +513,266 @@ fn a2a_v1_door_errors_are_the_a2a_table_with_error_info() {
     let listed = raw(r#"{"jsonrpc":"2.0","id":5,"method":"GetTask","params":[1]}"#);
     assert_eq!(listed["error"]["code"], -32602, "{listed}");
     assert_eq!(listed["id"], 5);
+}
+
+/// What the door extension says about itself on every card.
+const DOOR_EXTENSION_DESCRIPTION: &str =
+    "Every JSON-RPC method this door answers, A2A methods and \
+     murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from \
+     peer capsules; and the forgetSession field a message's metadata may carry under this URI.";
+
+/// The card at `addr`, read without a token.
+fn public_card(addr: &str) -> Value {
+    let card = request(addr, "GET", "/.well-known/agent-card.json", &[], "");
+    assert_eq!(card.status, 200, "{card:?}");
+    card.json()
+}
+
+/// murmur's own methods are `murmur.WatchSession` and `murmur.StopSession`: listed on every card,
+/// served under `A2A-Version: 1.0` alone, gated by their own scopes, and answered with the
+/// extensions their use activates. Their retired names, and every other spelling, are methods
+/// the door does not have.
+#[test]
+fn murmur_methods_are_listed_served_and_negotiated() {
+    if common::skip_without_host_support("murmur_methods_are_listed_served_and_negotiated") {
+        return;
+    }
+    let door = Door::launch(
+        "murmur-methods-agent",
+        &format!("{QUEUE_SLEEP_YAML}{AUTHENTICATION_YAML}"),
+        common::ScriptedServer::start(vec![end_turn(1, "spare")]),
+    );
+    let public_door = Door::launch(
+        "murmur-methods-public",
+        QUEUE_SLEEP_YAML,
+        common::ScriptedServer::start(vec![end_turn(1, "spare")]),
+    );
+    let addr = door.addr.clone();
+    let (operator, watcher) = (door.token("operator"), door.token("watcher"));
+    let token = Some(operator.as_str());
+
+    // The cards. `door_discovery` holds the card of a door that starts no task.
+    let public_methods = [
+        "SendMessage",
+        "SendStreamingMessage",
+        "murmur.WatchSession",
+        "GetTask",
+        "ListTasks",
+        "CancelTask",
+        "SubscribeToTask",
+        "murmur.StopSession",
+    ];
+    let mut authenticated_methods = public_methods.to_vec();
+    authenticated_methods.push("GetExtendedAgentCard");
+    let extended = rpc(&addr, token, "GetExtendedAgentCard", json!({})).json()["result"].clone();
+    for (card, methods) in [
+        (public_card(&public_door.addr), &public_methods[..]),
+        (public_card(&addr), &authenticated_methods[..]),
+        (extended, &authenticated_methods[..]),
+    ] {
+        assert_eq!(common::card_door_methods(&card), methods, "{card:#}");
+        let extension = common::card_extension(&card, DOOR_EXTENSION_URI);
+        assert_eq!(extension["description"], DOOR_EXTENSION_DESCRIPTION);
+        assert_eq!(extension["required"], false);
+    }
+
+    // `murmur.StopSession`: murmur's own result, echoing the door extension.
+    let stopped = rpc(&addr, token, "murmur.StopSession", json!({}));
+    assert_eq!(stopped.status, 200, "{stopped:?}");
+    assert_eq!(stopped.header("content-type"), Some("application/json"));
+    assert_eq!(stopped.header("a2a-extensions"), Some(DOOR_EXTENSION_URI));
+    let result = stopped.json()["result"].clone();
+    let mut keys: Vec<&str> = result
+        .as_object()
+        .unwrap_or_else(|| panic!("{stopped:?}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["canceled", "residue", "session_id"], "{result}");
+    assert!(result["session_id"]
+        .as_str()
+        .is_some_and(|session| session.starts_with("ses_")));
+
+    // `murmur.WatchSession`: the session's stream, echoing both extensions, door first. The
+    // watcher's token holds exactly `GetTask` and `murmur.WatchSession`.
+    for watching in [operator.as_str(), watcher.as_str()] {
+        let watched = rpc(&addr, Some(watching), "murmur.WatchSession", json!({}));
+        assert_eq!(watched.status, 200, "{watched:?}");
+        assert_eq!(watched.header("content-type"), Some("text/event-stream"));
+        assert_eq!(
+            watched.header("a2a-extensions"),
+            Some(format!("{DOOR_EXTENSION_URI}, {STREAM_EXTENSION_URI}").as_str()),
+            "{watched:?}"
+        );
+        let events = common::stream::parse(&watched.body);
+        assert_eq!(
+            events.first().map(|event| event.kind()).as_deref(),
+            Some("connection-ack"),
+            "{events:#?}"
+        );
+    }
+    let unscoped = rpc(&addr, Some(&watcher), "murmur.StopSession", json!({}));
+    assert_eq!(unscoped.status, 403, "{unscoped:?}");
+    assert!(
+        unscoped
+            .header("www-authenticate")
+            .is_some_and(|challenge| challenge.contains("insufficient_scope")),
+        "{unscoped:?}"
+    );
+    assert_eq!(unscoped.header("a2a-extensions"), None, "{unscoped:?}");
+
+    // Both need `A2A-Version: 1.0`, and a refusal echoes nothing.
+    for method in ["murmur.WatchSession", "murmur.StopSession"] {
+        for versions in [&[][..], &["0.3"][..]] {
+            let refused = versioned(&addr, token, "A2A-Version", versions, 7, method, json!({}));
+            let (error, info) = error_of(&refused);
+            assert_eq!(error["code"], -32009, "{method} {versions:?}: {refused:?}");
+            assert_eq!(info["reason"], "VERSION_NOT_SUPPORTED");
+            assert_eq!(refused.header("a2a-extensions"), None, "{refused:?}");
+        }
+    }
+
+    // No other name reaches either method.
+    for (door_addr, door_token) in [(addr.as_str(), token), (public_door.addr.as_str(), None)] {
+        for name in [
+            "stream/watch",
+            "session/stop",
+            "murmur.watchsession",
+            " murmur.StopSession",
+            "WatchSession",
+            "StopSession",
+        ] {
+            let response = rpc(door_addr, door_token, name, json!({}));
+            assert_eq!(response.status, 200, "{name}: {response:?}");
+            let body = response.json();
+            assert_eq!(body["error"]["code"], -32601, "{name}: {body}");
+            assert_eq!(
+                body["error"]["message"], "Method not found",
+                "{name}: {body}"
+            );
+            assert!(body["error"].get("data").is_none(), "{name}: {body}");
+            assert_eq!(response.header("a2a-extensions"), None, "{name}");
+        }
+    }
+}
+
+/// A message's `forgetSession` asks a capsule to forget a harness session, which only a
+/// `transport: process` capsule keeps: this http capsule refuses it as invalid params, on
+/// `SendStreamingMessage` as one JSON body before any event stream, and starts nothing. A
+/// message that uses the door extension without asking for a forget is served, and the stream's
+/// head lists the door extension ahead of the stream extension.
+#[test]
+fn forget_session_is_refused_by_an_http_capsule_before_any_stream() {
+    if common::skip_without_host_support(
+        "forget_session_is_refused_by_an_http_capsule_before_any_stream",
+    ) {
+        return;
+    }
+    let door = Door::launch(
+        "forget-refusing-agent",
+        QUEUE_SLEEP_YAML,
+        common::ScriptedServer::start(vec![end_turn(1, "kept"), end_turn(2, "kept")]),
+    );
+    let addr = door.addr.clone();
+    let with_forget = |message_id: &str, forget: Value| {
+        let mut params = message(message_id, "hello");
+        params["message"]["extensions"] = json!([DOOR_EXTENSION_URI]);
+        params["message"]["metadata"] = json!({ DOOR_EXTENSION_URI: { "forgetSession": forget } });
+        params
+    };
+
+    for activated in [false, true] {
+        let extra: &[(&str, &str)] = if activated {
+            &[common::stream::extensions_header()]
+        } else {
+            &[]
+        };
+        let (response, events) = common::stream::stream_message_with(
+            &addr,
+            None,
+            json!("forget"),
+            with_forget("m-forget", json!(true)),
+            extra,
+        );
+        assert_eq!(response.status, 200, "{response:?}");
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/json"),
+            "{response:?}"
+        );
+        assert!(events.is_empty(), "{response:?}");
+        assert_eq!(response.header("a2a-extensions"), None, "{response:?}");
+        let body = response.json();
+        assert_eq!(body["id"], "forget");
+        assert_eq!(body["error"]["code"], -32602, "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "forgetSession asks this capsule to forget the harness session this context names, \
+             and only a capsule on inference.transport: process has one"
+        );
+    }
+    let sent = rpc(
+        &addr,
+        None,
+        "SendMessage",
+        with_forget("m-forget-send", json!(true)),
+    );
+    assert_eq!(sent.json()["error"]["code"], -32602, "{sent:?}");
+    assert_eq!(sent.header("a2a-extensions"), None, "{sent:?}");
+    // A malformed field is refused the same way, before anything else is looked at.
+    let malformed = rpc(
+        &addr,
+        None,
+        "SendMessage",
+        with_forget("m-bad", json!("yes")),
+    );
+    assert_eq!(
+        malformed.json()["error"]["message"],
+        format!(
+            "Invalid params: message.metadata[\"{DOOR_EXTENSION_URI}\"].forgetSession must be a \
+             boolean"
+        ),
+        "{malformed:?}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        door.provider.requests().is_empty(),
+        "a refused forget started a task: {:?}",
+        door.provider.requests()
+    );
+
+    // `forgetSession: false` asks for nothing, so the message is served, and both extensions it
+    // used are listed, the door's first.
+    let (response, events) = common::stream::stream_message_with(
+        &addr,
+        None,
+        json!("kept"),
+        with_forget("m-kept", json!(false)),
+        &[common::stream::extensions_header()],
+    );
+    assert_eq!(response.header("content-type"), Some("text/event-stream"));
+    assert_eq!(
+        response.header("a2a-extensions"),
+        Some(format!("{DOOR_EXTENSION_URI}, {STREAM_EXTENSION_URI}").as_str()),
+        "{response:?}"
+    );
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.is_terminal_status()),
+        "{events:#?}"
+    );
+    let (response, _) = common::stream::stream_message_with(
+        &addr,
+        None,
+        json!("plain"),
+        with_forget("m-door-only", json!(false)),
+        &[],
+    );
+    assert_eq!(
+        response.header("a2a-extensions"),
+        Some(DOOR_EXTENSION_URI),
+        "{response:?}"
+    );
 }

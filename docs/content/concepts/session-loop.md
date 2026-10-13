@@ -89,7 +89,7 @@ context its own task built.
 
 A seed from an `on-task-start` hook is applied to a fresh context only; a continued attempt
 already holds it and is never seeded again. A [`--forget-session`](../reference/cli.md#run-forget-session) or
-`x-murmur-forget-session` request applies to the task's first attempt only, so a reopened attempt
+[`forgetSession`](../reference/agent-card.md#forget-session) request applies to the task's first attempt only, so a reopened attempt
 resumes the session that attempt established.
 
 A client streaming the task sees a `working` status marking each reopen and one terminal status,

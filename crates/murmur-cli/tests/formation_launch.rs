@@ -2652,3 +2652,114 @@ fn mur_stop_with_no_grace_kills_the_launcher_and_every_member_still_winds_down()
     }
     project.assert_no_member_was_sent_sigterm(&launcher);
 }
+
+/// `mur watch <member session>` attaches to one member of a running formation as it does to any
+/// capsule, and `mur stop <formation id>` ends the watch along with the member, within the stop's
+/// grace.
+///
+/// An exiting capsule closes its door, which ends an observer's stream without `capsule-closed`,
+/// so the watch reports the connection lost, as it does for a single capsule that stops.
+#[test]
+fn mur_watch_attaches_to_a_formation_member() {
+    use std::io::{BufRead, Read};
+
+    let _lock = launch_lock();
+    let project = Project::with_probes(
+        &[CODER, PLANNER],
+        "reachability:\n  - from: planner\n    to: [coder]\n",
+        &[("planner", json!({"names": []}))],
+    );
+    let mut launcher = project.launch(&[], &[]);
+    let (_, formation) = launcher.next_json();
+    let (_, planner) = launcher.next_json();
+    project.await_entry_mid_task();
+    let id = formation["formation_id"].as_str().unwrap();
+    let coder = formation["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|peer| peer["name"] == "coder")
+        .unwrap()
+        .clone();
+    let coder_session = coder["session_id"].as_str().unwrap();
+
+    let mut watch = project
+        .command(&["watch", coder_session])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mur watch should start");
+    let mut stdout = watch.stdout.take().unwrap();
+    let stdout_reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let stderr = watch.stderr.take().unwrap();
+    thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = line_tx.send(line);
+        }
+    });
+    let mut stderr_lines = Vec::new();
+    let banner = line_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("mur watch printed no banner");
+    assert!(
+        banner.contains("watching") && banner.contains(coder_session),
+        "{banner}"
+    );
+    stderr_lines.push(banner);
+
+    const GRACE_SECS: u64 = 10;
+    let stopped = project.run(&["stop", id, "--timeout", &GRACE_SECS.to_string()], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}\n{}",
+        stopped.stdout,
+        stopped.stderr
+    );
+    let deadline = Instant::now() + Duration::from_secs(GRACE_SECS + 10);
+    let status = loop {
+        if let Some(status) = watch.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = watch.kill();
+            panic!("mur watch was still running {GRACE_SECS} s + 10 s after the formation stopped");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    while let Ok(line) = line_rx.recv_timeout(Duration::from_secs(2)) {
+        stderr_lines.push(line);
+    }
+    let stderr = stderr_lines.join("\n");
+    let watched = stdout_reader.join().unwrap();
+    eprintln!("[mur watch] {status}\nstdout:\n{watched}\nstderr:\n{stderr}");
+
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    let errors: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("error["))
+        .collect();
+    assert_eq!(
+        errors,
+        [format!(
+            "error[E-IO-003]: connection to {coder_session} lost before any event — the capsule \
+             may still be running; run mur watch again to reattach"
+        )],
+        "{stderr}"
+    );
+    assert!(watched.is_empty(), "the member ran no task: {watched}");
+
+    launcher.wait();
+    let _ = project.release.send(());
+    project.assert_no_member_remains(
+        &reported_pids(&formation, Some(&planner)),
+        Duration::from_secs(30),
+    );
+}
