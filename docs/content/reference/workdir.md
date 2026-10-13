@@ -359,7 +359,7 @@ One action, asked for on the request that starts the next turn:
 | Surface | How it is asked for |
 |---|---|
 | CLI | [`mur run --forget-session`](cli.md#run-forget-session), with `--context <id>` |
-| A2A door | [`x-murmur-forget-session: true`](agent-card.md#request-headers) on `SendMessage` or `SendStreamingMessage` |
+| A2A door | [`forgetSession: true`](agent-card.md#forget-session) in the metadata of a `SendMessage` or `SendStreamingMessage` message that starts a task |
 
 The entry is deleted from the file and from the running capsule's memory, the run's trace records a
 [`harness_session_forgotten`](observability-schemas.md#harness-session-forgotten) event naming the

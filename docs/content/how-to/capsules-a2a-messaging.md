@@ -312,7 +312,7 @@ mur watch @1
 [running-capsule records](../reference/cli.md#running-capsule-records). Name an older one by the
 last four characters of its session id, or reach a capsule directly with `mur watch --url localhost:$PORT`.
 
-To consume the same events from your own client, send `stream/watch` or `SendStreamingMessage` to the
+To consume the same events from your own client, send `murmur.WatchSession` or `SendStreamingMessage` to the
 capsule's address. [Streaming Protocol](../reference/streaming-protocol.md) lists both endpoints, the
 A2A events they write, and the `A2A-Extensions` header that adds murmur's text and tool frames to a
 `SendStreamingMessage` stream.
@@ -336,7 +336,7 @@ curl -s -X POST http://localhost:$PORT \
 |---|---|
 | `TASK_STATE_COMPLETED` | Finished its work. A reply cut off at `inference.max_tokens` still counts |
 | `TASK_STATE_FAILED` | Did not finish: an inference call failed, a `request-input` wait timed out, it used every turn `inference.max_turns` allows, or a spend ceiling stopped it. The worker's `trace.jsonl` says which — its `task_end` status, and a `task_failed` line naming the cause |
-| `TASK_STATE_CANCELED` | Was stopped with `CancelTask`, `session/stop` or `mur stop` |
+| `TASK_STATE_CANCELED` | Was stopped with `CancelTask`, `murmur.StopSession` or `mur stop` |
 
 ```json
 {
@@ -485,15 +485,16 @@ that went out and a `harness_exit` with `cause: "canceled"`, which `mur trace sh
 
 ## Ending the session
 
-`session/stop` cancels every task the session still holds and reports what it leaves running, in
+`murmur.StopSession` cancels every task the session still holds and reports what it leaves running, in
 one answer. The capsule keeps running and keeps answering afterwards — the method cancels and
-reports, and ends nothing.
+reports, and ends nothing. It is one of murmur's own door methods, listed in the agent card's
+[door extension](../reference/agent-card.md#stop-session).
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
   -H "Content-Type: application/json" \
   -H "A2A-Version: 1.0" \
-  -d '{"jsonrpc":"2.0","id":4,"method":"session/stop","params":{}}'
+  -d '{"jsonrpc":"2.0","id":4,"method":"murmur.StopSession","params":{}}'
 ```
 
 ```json
@@ -516,7 +517,7 @@ curl -s -X POST http://localhost:$PORT \
 |---|---|
 | `session_id` | The session this door answers for |
 | `canceled` | The task ids this call moved to `canceled`, sorted. Empty when nothing was still running |
-| `residue` | One object per thing the session leaves running, in the same vocabulary `CancelTask` uses. Empty when nothing is |
+| `residue` | One object per thing the session leaves running, the [residue items](../reference/agent-card.md#residue-items) `CancelTask` names. Empty when nothing is |
 
 All three keys are always present. `residue` is `[]` rather than absent when nothing is running,
 which is the one place this differs from `CancelTask`: a session stop has to be able to say
@@ -574,5 +575,5 @@ When OTel tracing is configured, the `traceparent` header links the worker capsu
 | Network policy enforcement | Any peer URL not in `network.allow` is rejected before TCP connection |
 | Task ID | Returned by the message call; use it with `GetTask` to poll status and `CancelTask` to stop it |
 | Stopping one task | `CancelTask`, or `mur cancel <session> <task-id>`; the session, its conversation and its queue keep running |
-| Ending the session | `mur stop <session>`, which calls `session/stop` for the account of what is still running and then signals the process. `session/stop` on its own cancels and reports without ending anything |
+| Ending the session | `mur stop <session>`, which calls `murmur.StopSession` for the account of what is still running and then signals the process. `murmur.StopSession` on its own cancels and reports without ending anything |
 | Trace | Both capsules write independent `trace.jsonl` files; `a2a_task_received` appears on the worker capsule side, `a2a_send` on the orchestrator capsule side |

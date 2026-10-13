@@ -1,5 +1,5 @@
-//! The capsule's stream: the A2A v1.0 events `SendStreamingMessage` and `stream/watch` write,
-//! and the murmur frames the stream extension adds to them.
+//! The capsule's stream: the A2A v1.0 events `SendStreamingMessage` and `murmur.WatchSession`
+//! write, and the murmur frames the stream extension adds to them.
 //!
 //! Every event is numbered, buffered and broadcast once, here, as a [`StreamEvent`] holding the
 //! `StreamResponse` it renders to with and without the extension. Each connection renders it with
@@ -35,7 +35,7 @@ pub(crate) type StreamSink = Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>;
 
 /// Cadence at which an idle SSE connection writes [`SSE_HEARTBEAT_COMMENT`].
 ///
-/// Shared by `SendStreamingMessage` and `stream/watch` so the two endpoints present one
+/// Shared by `SendStreamingMessage` and `murmur.WatchSession` so the two endpoints present one
 /// liveness contract. Not configurable.
 pub(crate) const SSE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -279,7 +279,7 @@ pub(crate) enum MurmurFrame {
     Gap { first_available_id: u64 },
     /// This connection lost `missed` live events, always at least 1.
     Lagged { missed: u64 },
-    /// The first event of a `stream/watch` connection.
+    /// The first event of a `murmur.WatchSession` connection.
     #[serde(rename_all = "camelCase")]
     ConnectionAck {
         role: &'static str,
@@ -1287,8 +1287,8 @@ mod tests {
             let methods: &[DoorMethod] = match (line.file.as_str(), line.item.as_str()) {
                 ("streaming.rs", _) | ("identity.rs", "writes_frame") => continue,
                 ("identity.rs", "handle_message_stream") => &[DoorMethod::SendStreamingMessage],
-                ("identity.rs", "handle_stream_watch") => &[DoorMethod::StreamWatch],
-                _ => &[DoorMethod::SendStreamingMessage, DoorMethod::StreamWatch],
+                ("identity.rs", "handle_watch_session") => &[DoorMethod::WatchSession],
+                _ => &[DoorMethod::SendStreamingMessage, DoorMethod::WatchSession],
             };
             let named = line.code.split("MurmurFrame::").skip(1).map(|rest| {
                 rest.split(|c: char| !c.is_alphanumeric())

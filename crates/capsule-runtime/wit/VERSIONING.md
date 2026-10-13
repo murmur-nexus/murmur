@@ -237,11 +237,11 @@ is a breaking change under the rule below. Its instance name is now
 `murmur:driver/process@0.3.0`.
 
 The progress case carries a byte count, not a fragment of the input, on
-purpose. The runtime turns both cases into stream frames, and `stream/watch`
-may be held by a watch-only credential or be public. Input streamed while the
-model writes it would reach that stream before a hook or the call gate had seen
-the complete call and had the chance to deny it, and would put on the ephemeral
-stream what the durable trace does not hold. Carrying only a count across the
+purpose. The runtime turns both cases into stream frames, and
+`murmur.WatchSession` may be held by a watch-only credential or be public.
+Input streamed while the model writes it would reach that stream before a hook
+or the call gate had seen the complete call and had the chance to deny it, and
+would put on the ephemeral stream what the durable trace does not hold. Carrying only a count across the
 interface means the runtime never holds a call's input before the gate does.
 
 The cost was paid knowingly. Every installed `@0.2.0` driver is refused at

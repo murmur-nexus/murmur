@@ -947,7 +947,7 @@ capsule to drop the harness session a context names, and there was one to drop. 
 |---|---|---|
 | `context_id` | string | The context whose entry was dropped |
 | `harness_session_id` | string | The id that was dropped, which the harness is no longer asked to continue |
-| `requested_by` | string | `"cli"` for `mur run --forget-session`, `"a2a"` for the door header |
+| `requested_by` | string | `"cli"` for `mur run --forget-session`, `"a2a"` for the door's [`forgetSession`](agent-card.md#forget-session) message field |
 
 **`harness_warning`** — written beside each warning the run printed to stderr
 

@@ -147,7 +147,7 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
     }
 }
 
-/// The hint under a credential scope that names an A2A 0.3 method: the scope to write instead, or,
+/// The hint under a credential scope that names a retired door method: the scope to write instead, or,
 /// for a method no scope gates, that the credential lists nothing for it.
 fn retired_door_scope_hint(scope: &str, replacement: &str) -> String {
     if murmur_artifact::DOOR_SCOPES.contains(&replacement) {

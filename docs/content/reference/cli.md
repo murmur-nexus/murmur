@@ -1279,7 +1279,7 @@ When the session ends, `mur run` prints one `status:` line and exits:
 | `failed` | 1 | Ran a task that failed — a failed driver call, a response it could not act on, a compaction hook error, a `request-input` wait past `lifecycle.input_timeout_secs` — and prints [`E-RUN-040`](diagnostics.md#e-run-040) with the reason. Also the status of a launch that could not run at all, with that error's own code |
 | `max_turns_reached` | 1 | Ran a task that used every turn `inference.max_turns` allows, and prints `E-RUN-040` |
 | `spend_ceiling_reached` | 1 | Ran a task a [spend ceiling](manifest.md#inference-max-session-tokens) stopped, and prints `E-RUN-040` |
-| `canceled` | 1 | Ran a task that was canceled — by `CancelTask`, `session/stop`, [`mur stop`](#mur-stop), `SIGTERM`, or the end of the session that [delegated](roost-api.md#spawner-lifeline) it — and prints `E-RUN-040` |
+| `canceled` | 1 | Ran a task that was canceled — by `CancelTask`, [`murmur.StopSession`](agent-card.md#stop-session), [`mur stop`](#mur-stop), `SIGTERM`, or the end of the session that [delegated](roost-api.md#spawner-lifeline) it — and prints `E-RUN-040` |
 | `formation_ended` | 0 | Was a formation member running a task when its formation ended, and the [wind-down](roster.md#launch-stop) canceled that task. Prints no error. The task itself still ends `canceled` |
 | `trapped` | 1 | Ran a script capsule that stopped with an error |
 
@@ -1320,7 +1320,7 @@ ends its output instead, as [Piped output](#piped-output) describes.
 An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur stop`](#mur-stop),
 `kill`, or a service manager — ends its session the way a clean exit does:
 
-1. Every live task is cancelled, as [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) cancels them, and no new task is started.
+1. Every live task is cancelled, as [`murmur.StopSession`](agent-card.md#stop-session) cancels them, and no new task is started.
 2. Each cancelled task's `task_end` is written, after its `on-task-end` hooks.
 3. The session teardown runs: `on-session-end`, waiting for asynchronous hooks to finish, `shell_abandoned` records for detached commands, `session_end`, and removal of the [running-capsule record](#running-capsule-records).
 
@@ -1585,7 +1585,7 @@ Three steps, in this order:
 
 | Step | What it does |
 |---|---|
-| 1. [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) through the A2A door | Cancels every task the session still holds and reads what it leaves running, then waits up to 5 seconds for the trace to record how each cancelled task ended |
+| 1. [`murmur.StopSession`](agent-card.md#stop-session) through the A2A door | Cancels every task the session still holds and reads what it leaves running, then waits up to 5 seconds for the trace to record how each cancelled task ended |
 | 2. `SIGTERM` to the recorded process | Ends the capsule. An agent capsule records its remaining endings and runs its teardown first — see [`SIGTERM`](#mur-run-sigterm) |
 | 3. `SIGKILL` after `--timeout` seconds | Only if the process is still there |
 
@@ -1778,7 +1778,7 @@ MURMUR_DOOR_TOKEN=$(mur token) mur watch --url localhost:41873
 ## `mur watch`
 
 Stream live SSE events from a running capsule's output to stdout. The command opens a
-`stream/watch` connection to the capsule and prints each event in a human-readable
+[`murmur.WatchSession`](agent-card.md#watch-session) connection to the capsule and prints each event in a human-readable
 format until the capsule closes or Ctrl+C is pressed.
 
 ```bash

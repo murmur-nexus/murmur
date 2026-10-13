@@ -702,16 +702,17 @@ pub struct NetworkConfig {
 pub const DOOR_SCOPES: &[&str] = &[
     "SendMessage",
     "SendStreamingMessage",
-    "stream/watch",
+    "murmur.WatchSession",
     "GetTask",
     "CancelTask",
-    "session/stop",
+    "murmur.StopSession",
     "resources/files",
 ];
 
-/// The A2A 0.3 method names a credential's `scopes` may not list, each with the A2A 1.0 method
-/// that replaces it. A manifest naming one is refused with [`RuntimeManifestError::RetiredDoorScope`]:
-/// the door serves no 0.3 name, and no token carries one.
+/// The retired door method names a credential's `scopes` may not list, each with the method that
+/// replaces it: the A2A 0.3 names of the A2A methods, and the 0.3-style names murmur's own methods
+/// had. A manifest naming one is refused with [`RuntimeManifestError::RetiredDoorScope`]: the door
+/// serves no retired name, and no token carries one.
 ///
 /// A replacement outside [`DOOR_SCOPES`] is a method every authenticated caller may call, which a
 /// credential lists nothing for. A test holds every replacement to the runtime's method table and
@@ -722,6 +723,8 @@ pub const RETIRED_DOOR_SCOPES: &[(&str, &str)] = &[
     ("tasks/get", "GetTask"),
     ("tasks/cancel", "CancelTask"),
     ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
+    ("stream/watch", "murmur.WatchSession"),
+    ("session/stop", "murmur.StopSession"),
 ];
 
 /// The credential the runtime always mints for an authenticated door, holding every scope in
@@ -1784,11 +1787,11 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidNetworkConfig { field: String, message: String },
-    /// A credential's `scopes` lists an A2A 0.3 method name, one of [`RETIRED_DOOR_SCOPES`].
-    /// `replacement` is the A2A 1.0 method that replaces it.
+    /// A credential's `scopes` lists a retired door method name, one of [`RETIRED_DOOR_SCOPES`].
+    /// `replacement` is the method name that replaces it.
     #[error(
-        "{}: invalid network config for '{field}': '{scope}' is the A2A 0.3 name of a door \
-         method, and the door answers A2A 1.0 names only",
+        "{}: invalid network config for '{field}': '{scope}' is a retired name of a door \
+         method, and the door answers only the names its card lists",
         MANIFEST_FILENAME
     )]
     RetiredDoorScope {
@@ -12883,7 +12886,7 @@ mod network_authentication_tests {
     fn network_authentication_with_credentials_parses_sorted_by_name() {
         let auth = network_authentication_of(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-             watcher:\n        scopes: [GetTask, stream/watch]\n      \
+             watcher:\n        scopes: [GetTask, murmur.WatchSession]\n      \
              reader:\n        scopes: [resources/files]\n",
         )
         .unwrap()
@@ -12899,7 +12902,7 @@ mod network_authentication_tests {
                 DoorCredential {
                     name: "watcher".to_string(),
                     // Declared order, not sorted.
-                    scopes: vec!["GetTask".to_string(), "stream/watch".to_string()],
+                    scopes: vec!["GetTask".to_string(), "murmur.WatchSession".to_string()],
                 },
             ]
         );
@@ -13014,7 +13017,7 @@ mod network_authentication_tests {
         assert!(message.contains("GetExtendedAgentCard"), "{message}");
 
         let (got, message) = network_authentication_refusal(&credential(
-            "        scopes: [GetTask, stream/watch, GetTask]\n",
+            "        scopes: [GetTask, murmur.WatchSession, GetTask]\n",
         ));
         assert_eq!(got, field);
         assert!(message.contains("more than once"), "{message}");
@@ -13029,10 +13032,12 @@ mod network_authentication_tests {
             ("tasks/get", "GetTask"),
             ("tasks/cancel", "CancelTask"),
             ("agent/getAuthenticatedExtendedCard", "GetExtendedAgentCard"),
+            ("stream/watch", "murmur.WatchSession"),
+            ("session/stop", "murmur.StopSession"),
         ] {
             let error = network_authentication_of(&format!(
                 "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-                 watcher:\n        scopes: [stream/watch, {retired}]\n"
+                 watcher:\n        scopes: [murmur.WatchSession, {retired}]\n"
             ))
             .unwrap_err();
             let rendered = error.to_string();
@@ -13048,7 +13053,13 @@ mod network_authentication_tests {
                 }
                 other => panic!("expected RetiredDoorScope for {retired}, got {other:?}"),
             }
-            assert!(rendered.contains(retired), "{rendered}");
+            assert!(
+                rendered.contains(&format!(
+                    "'{retired}' is a retired name of a door method, and the door answers only \
+                     the names its card lists"
+                )),
+                "{rendered}"
+            );
             assert!(rendered.contains(field), "{rendered}");
         }
     }
@@ -13057,11 +13068,14 @@ mod network_authentication_tests {
     fn network_authentication_accepts_the_v1_scopes() {
         let auth = network_authentication_of(
             "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
-             watcher:\n        scopes: [GetTask, stream/watch]\n",
+             watcher:\n        scopes: [GetTask, murmur.WatchSession, murmur.StopSession]\n",
         )
         .unwrap()
         .unwrap();
-        assert_eq!(auth.credentials[0].scopes, ["GetTask", "stream/watch"]);
+        assert_eq!(
+            auth.credentials[0].scopes,
+            ["GetTask", "murmur.WatchSession", "murmur.StopSession"]
+        );
     }
 
     #[test]

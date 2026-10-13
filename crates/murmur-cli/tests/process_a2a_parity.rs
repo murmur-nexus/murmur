@@ -1134,7 +1134,7 @@ fn inference_records(capsule: &Capsule) -> Vec<Value> {
         .collect()
 }
 
-/// Open `stream/watch` with `Last-Event-ID: last_event_id` and read it until a task's final
+/// Open `murmur.WatchSession` with `Last-Event-ID: last_event_id` and read it until a task's final
 /// status, returning every frame after the connection's `connection-ack`. Every test that calls it
 /// runs one task.
 fn watch_until_final(addr: &str, last_event_id: u64) -> Vec<SseEvent> {
@@ -1144,7 +1144,7 @@ fn watch_until_final(addr: &str, last_event_id: u64) -> Vec<SseEvent> {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => panic!("stream/watch closed before its headers ended"),
+            Ok(0) | Err(_) => panic!("murmur.WatchSession closed before its headers ended"),
             Ok(_) if line.trim().is_empty() => break,
             Ok(_) => {}
         }

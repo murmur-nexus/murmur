@@ -191,7 +191,7 @@ network:
     scheme: bearer      # required in the block; the only scheme
     credentials:        # optional; tokens narrower than the operator token
       watcher:
-        scopes: [GetTask, stream/watch]
+        scopes: [GetTask, murmur.WatchSession]
 
 context:
   max_tokens: 200000   # enables context compaction; omit to disable
@@ -955,18 +955,18 @@ token.
 |---|---|
 | `SendMessage` | Starting a task with `SendMessage` |
 | `SendStreamingMessage` | Starting or continuing a task with `SendStreamingMessage`; the connection carries [that task's events](streaming-protocol.md#endpoints) while it is open |
-| `stream/watch` | Watching every task on the session |
+| `murmur.WatchSession` | [Watching every task](agent-card.md#watch-session) on the session |
 | `GetTask` | Reading any task on the session |
 | `CancelTask` | Cancelling any task on the session |
-| `session/stop` | Cancelling every task and reporting the residue |
+| `murmur.StopSession` | [Cancelling every task](agent-card.md#stop-session) and reporting the residue |
 | `resources/files` | The [operator resource plane](resource-plane.md#operator-plane) under `/resources/files` |
 
 A scope names a method, not a task: every authenticated caller shares the session's tasks.
 `GetExtendedAgentCard` takes no scope: every valid token reaches it. What the door answers each
 caller, and the public and extended cards, are in [Agent Card: Security](agent-card.md#security).
 
-A scope that is an A2A 0.3 method name is refused with `E-MAN-003`, and the hint names the scope to
-write in its place:
+A scope that is a retired name of a door method is refused with
+[`E-MAN-003`](diagnostics.md#e-man-003), and the hint names the scope to write in its place:
 
 | Retired scope | Write instead |
 |---|---|
@@ -975,6 +975,8 @@ write in its place:
 | `tasks/get` | `GetTask` |
 | `tasks/cancel` | `CancelTask` |
 | `agent/getAuthenticatedExtendedCard` | Nothing: remove it |
+| `stream/watch` | `murmur.WatchSession` |
+| `session/stop` | `murmur.StopSession` |
 
 See [Agent Card: Migrating from A2A 0.3](agent-card.md#migrating-a2a-0-3).
 

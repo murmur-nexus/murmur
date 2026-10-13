@@ -1,5 +1,6 @@
 //! A launched, idle `queue` + `sleep` agent capsule and the raw-socket helpers that drive it:
-//! submitting tasks, waiting on the trace, and reading a `stream/watch` connection byte for byte.
+//! submitting tasks, waiting on the trace, and reading a `murmur.WatchSession` connection byte for
+//! byte.
 //!
 //! The readers keep SSE comment lines, which `mur watch` and the parsed SSE clients elsewhere in
 //! the suite drop, so a test can observe the heartbeat.
@@ -208,10 +209,10 @@ fn stage_agent(
 
 // ── raw SSE reading ────────────────────────────────────────────────────────────
 
-/// Open a `stream/watch` connection and return the socket, positioned at the first byte
+/// Open a `murmur.WatchSession` connection and return the socket, positioned at the first byte
 /// of the HTTP response. [`LineReader`] checks the response it reads against A2A v1.0.
 pub fn open_watch(addr: &str, last_event_id: u64) -> TcpStream {
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"stream/watch","params":{}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"murmur.WatchSession","params":{}}"#;
     let last_event_id = last_event_id.to_string();
     let headers = [
         ("Content-Type", "application/json"),

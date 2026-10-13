@@ -25,10 +25,10 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
     "extensions": [
       {
         "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
+        "description": "Every JSON-RPC method this door answers, A2A methods and murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from peer capsules; and the forgetSession field a message's metadata may carry under this URI.",
         "required": false,
         "params": {
-          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
+          "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "CancelTask", "murmur.StopSession"],
           "peerTasks": false
         }
       },
@@ -46,7 +46,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
           "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -157,17 +157,17 @@ A scope is a door method's name, or `resources/files` for the
 |---|---|
 | `SendMessage` | [`SendMessage`](#murmur-door-v1) |
 | `SendStreamingMessage` | `SendStreamingMessage` |
-| `stream/watch` | `stream/watch` |
+| `murmur.WatchSession` | [`murmur.WatchSession`](#watch-session) |
 | `GetTask` | [`GetTask`](#tasks-get) |
 | `CancelTask` | `CancelTask` |
-| `session/stop` | `session/stop` |
+| `murmur.StopSession` | [`murmur.StopSession`](#stop-session) |
 | `resources/files` | The [operator plane](resource-plane.md#operator-plane) |
 
 `GetExtendedAgentCard` needs no scope: every valid token may read the extended card.
 
 Every authenticated caller shares the session's one task and context space. A scope limits which
 methods a token reaches, not which tasks: a credential holding `SendStreamingMessage`, `GetTask` or
-`stream/watch` sees every task on the session. The one exception is a
+`murmur.WatchSession` sees every task on the session. The one exception is a
 [formation token](roster.md#formation-token): it reaches [`GetTask`](#tasks-get) and
 `CancelTask` only for the tasks its member submitted, and does not reach `SendStreamingMessage`.
 
@@ -190,16 +190,16 @@ methods a token reaches, not which tasks: a credential holding `SendStreamingMes
     "extensions": [
       {
         "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1",
-        "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
+        "description": "Every JSON-RPC method this door answers, A2A methods and murmur's own alike, the murmur ones named murmur.<Method>; whether it accepts tasks from peer capsules; and the forgetSession field a message's metadata may carry under this URI.",
         "required": false,
         "params": {
-          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"],
+          "methods": ["SendMessage", "SendStreamingMessage", "murmur.WatchSession", "GetTask", "CancelTask", "murmur.StopSession", "GetExtendedAgentCard"],
           "peerTasks": false
         }
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
           "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -313,10 +313,10 @@ The door checks, in this order, on every request:
     [door extension](#murmur-door-v1) does not list. A public door answers `GetExtendedAgentCard`
     with `-32004` instead.
 11. The scope of the method, on a door declaring `network.authentication`.
-12. On `SendMessage` and `SendStreamingMessage`, an
-    [`x-murmur-forget-session: true`](#request-headers) the capsule cannot act on: `-32602`.
-13. `params` that is present and is not an object: `-32602`.
-14. The method itself, whose errors are listed under [Errors](#errors).
+12. `params` that is present and is not an object: `-32602`.
+13. The method itself, whose errors are listed under [Errors](#errors). On `SendMessage` and
+    `SendStreamingMessage` that starts with reading the [message](#message), its
+    [`forgetSession`](#forget-session) field included.
 
 A refusal at steps 2, 3, 4 and 11 is an HTTP status and a JSON body, never a JSON-RPC envelope:
 
@@ -365,8 +365,9 @@ speaks `1.0`.
 The header name matches in any case, and surrounding whitespace in the value is ignored. A query
 parameter does not set the version.
 
-Every method is negotiated: the A2A methods, `stream/watch`, `session/stop` and completions alike.
-The refusal is one JSON body, also on `SendStreamingMessage` and `stream/watch`, and nothing is
+Every method is negotiated: the A2A methods, `murmur.WatchSession`, `murmur.StopSession` and
+completions alike. The refusal is one JSON body, also on `SendStreamingMessage` and
+`murmur.WatchSession`, and nothing is
 started or stopped:
 
 ```json
@@ -396,7 +397,7 @@ The standard JSON-RPC errors carry no `data`:
 | `-32700` | `Invalid JSON payload` | A body that is not JSON. `id` is `null` |
 | `-32600` | `Request payload validation error` | A body that is not a [JSON-RPC 2.0 request](#jsonrpc-request) |
 | `-32601` | `Method not found` | A method the door extension does not list |
-| `-32602` | Names the parameter | `params` that is not an object, a message the door cannot [read in full](#message), a message naming a waiting task in another `contextId`, a `GetTask` or `CancelTask` with no `id`, or an `x-murmur-forget-session` the capsule cannot act on |
+| `-32602` | Names the parameter | `params` that is not an object, a message the door cannot [read in full](#message), a message naming a waiting task in another `contextId`, a `GetTask` or `CancelTask` with no `id`, or a [`forgetSession`](#forget-session) that is malformed, names a `taskId`, or reaches a capsule not on `inference.transport: process` |
 | `-32603` | Names the failure | A request the door accepted and could not hand to the session |
 
 Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo`:
@@ -458,7 +459,7 @@ names and enum value names. The door reads field names and enum values in that s
 | `TASK_STATE_COMPLETED` | Ended with an answer | `completed` |
 | `TASK_STATE_FAILED` | Ended without one | `failed` |
 | `TASK_STATE_REJECTED` | Refused, busy or closing, and never run | `rejected` |
-| `TASK_STATE_CANCELED` | Stopped by `CancelTask` or `session/stop` | `canceled` |
+| `TASK_STATE_CANCELED` | Stopped by `CancelTask` or [`murmur.StopSession`](#stop-session) | `canceled` |
 
 The door never produces `TASK_STATE_AUTH_REQUIRED`: it authenticates a request before any task
 exists, so no task waits for authentication.
@@ -480,7 +481,8 @@ in full or refuses it; no part is skipped.
 | `taskId` | no | A string naming the task this message continues — see [Continuing a task](#task-id). `""` names none |
 | `contextId` | no | A string. A new task without one is given a fresh `ctx_…` |
 | `referenceTaskIds` | no | An array of non-empty strings naming at most 16 distinct tasks — see [Referenced tasks](#reference-task-ids) |
-| `metadata`, `extensions` | no | Ignored |
+| `metadata` | no | An object. The door reads one key, the [door extension](#murmur-door-v1)'s URI, which holds [`forgetSession`](#forget-session). Every other key, and a `metadata` that is not an object, is ignored |
+| `extensions` | no | Ignored |
 
 The checks run in this order, and the first failure answers:
 
@@ -489,9 +491,12 @@ The checks run in this order, and the first failure answers:
 3. Every part sets exactly one of `text`, `raw`, `url` and `data`.
 4. `text`, `raw`, `url`, `mediaType` and `filename` are strings where present.
 5. `taskId` and `contextId`, then `referenceTaskIds`, as in the table.
-6. The first `raw` or `url` part: [`-32005`](#errors).
+6. The door extension's key in `metadata`, then its `forgetSession` — see
+   [`forgetSession`](#forget-session).
+7. The first `raw` or `url` part: [`-32005`](#errors).
+8. A `forgetSession: true` to a capsule not on `inference.transport: process`: `-32602`.
 
-Steps 1 to 5 answer `-32602`. Every refusal comes before the door looks up a task or starts one: a
+Steps 1 to 6 and 8 answer `-32602`. Every refusal comes before the door looks up a task or starts one: a
 refused message starts no task, writes no trace record, reaches no model and delivers nothing to a
 waiting task. Unknown fields are ignored.
 
@@ -629,8 +634,8 @@ Installed tools are not skills: a caller cannot invoke a tool directly. They are
 ## Extensions { #extensions }
 
 All three extensions are A2A `AgentExtension` objects with `required: false`: a standard A2A client
-can call the capsule without understanding any of them. The door and capsule extensions need no
-activation. The stream extension is activated per request; see
+can call the capsule without understanding any of them. No client activates the door or capsule
+extension. The stream extension is activated per request; see
 [Streaming Protocol: Activation](streaming-protocol.md#activation).
 
 | Key | Value |
@@ -646,21 +651,25 @@ URI: `https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1`
 
 | Key | Type | Value |
 |---|---|---|
-| `params.methods` | array of strings | The JSON-RPC methods `POST /` answers, standard and murmur alike |
+| `params.methods` | array of strings | The JSON-RPC methods `POST /` answers, A2A and murmur alike |
 | `params.peerTasks` | boolean | Whether the door serves a request another capsule's runtime sends, stamped `x-murmur-task-origin: peer`: the capsule's [`exports.peer_tasks.accept`](manifest.md#field-exports-peer-tasks), `false` when the block is absent. Always present, on the public and the extended card. When `false`, every such request is answered `403` [`peer_not_accepted`](#door-authentication) |
 
+The extension also carries [`forgetSession`](#forget-session), a field a message's `metadata` may
+hold under the extension's URI.
+
 A method is listed exactly when `POST /` answers it with something other than `-32601 Method not
-found`. Method names match exactly: case and surrounding whitespace are significant. `stream/watch`
-and `session/stop` are murmur methods, not A2A methods. Methods appear in this order:
+found`. Method names match exactly: case and surrounding whitespace are significant. Murmur's own
+methods are the ones named `murmur.<Method>`; every other name is an A2A v1.0 method. Methods
+appear in this order:
 
 | Method | Answers | Listed when |
 |---|---|---|
 | `SendMessage` | Starts a task, or delivers input to a task waiting for it, and returns the task | `lifecycle.task_acceptance` is `single` or `queue` |
 | `SendStreamingMessage` | Starts a task and streams its events as `text/event-stream` | `lifecycle.task_acceptance` is `single` or `queue` |
-| `stream/watch` | Streams this session's events as an observer, without starting a task | Always |
+| [`murmur.WatchSession`](#watch-session) | Streams every task of this session as an observer, without starting a task | Always |
 | `GetTask` | Returns the task named by `params.id` | Always |
 | `CancelTask` | Cancels the task named by `params.id`. A task that had already ended is left unchanged and answered [`-32002`](#errors) | Always |
-| `session/stop` | Cancels every live task and reports what the session leaves running | Always |
+| [`murmur.StopSession`](#stop-session) | Cancels every live task and reports what the session leaves running | Always |
 | `GetExtendedAgentCard` | Returns the [extended card](#extended-card) | The capsule declares [`network.authentication`](manifest.md#field-network-authentication) |
 
 See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
@@ -669,28 +678,212 @@ answers `SendMessage` and `SendStreamingMessage` with `-32601`, so neither is li
 
 | Door | `params.methods` |
 |---|---|
-| Public | `SendMessage`, `SendStreamingMessage`, `stream/watch`, `GetTask`, `CancelTask`, `session/stop` |
+| Public | `SendMessage`, `SendStreamingMessage`, `murmur.WatchSession`, `GetTask`, `CancelTask`, `murmur.StopSession` |
 | Authenticated | The public door's six, then `GetExtendedAgentCard` |
-| Public, `task_acceptance: none` | `stream/watch`, `GetTask`, `CancelTask`, `session/stop` |
-| Authenticated, `task_acceptance: none` | `stream/watch`, `GetTask`, `CancelTask`, `session/stop`, `GetExtendedAgentCard` |
+| Public, `task_acceptance: none` | `murmur.WatchSession`, `GetTask`, `CancelTask`, `murmur.StopSession` |
+| Authenticated, `task_acceptance: none` | `murmur.WatchSession`, `GetTask`, `CancelTask`, `murmur.StopSession`, `GetExtendedAgentCard` |
 
 The card endpoint itself is not listed.
 
-#### Request headers { #request-headers }
+Calling a murmur method, or sending a message whose `metadata` holds the extension's URI, uses the
+extension. A served answer names what it used in its `A2A-Extensions` response header; a refusal
+carries none:
 
-The door reads `x-murmur-*` request headers alongside the JSON-RPC body and the
-[`A2A-Version`](#a2a-version) header. One of them changes what the methods that start a turn do:
+| Request | `A2A-Extensions` on the answer |
+|---|---|
+| `murmur.WatchSession` | The door URI, then the [stream extension](#stream-extension)'s URI |
+| `murmur.StopSession` | The door URI |
+| `SendMessage` whose `message.metadata` holds the door URI | The door URI |
+| `SendStreamingMessage` whose `message.metadata` holds the door URI | The door URI, then the stream extension's URI when the request [activated](streaming-protocol.md#activation) it |
+| A refusal: `-32009`, `-32601`, `403`, `-32602` and every other error | None |
 
-| Header | Read on | Effect |
+#### `murmur.WatchSession` { #watch-session }
+
+The observer stream of this session: every task's events, across turns and tasks, without sending
+anything. `SendStreamingMessage` follows the one task its message starts or continues;
+`murmur.WatchSession` follows them all, and stays open when a task ends. `params` is `{}`, and is
+not read.
+
+```bash
+curl -N -X POST http://localhost:41873/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H 'Last-Event-ID: 41' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"murmur.WatchSession","params":{}}'
+```
+
+The answer is a `text/event-stream` with no `content-length`; the body ends when the connection
+closes:
+
+```text
+HTTP/1.1 200 OK
+content-type: text/event-stream
+cache-control: no-cache
+connection: keep-alive
+A2A-Extensions: https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1, https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1
+```
+
+It writes, in order:
+
+1. A [`connection-ack`](streaming-protocol.md#event-connection-ack) frame in an unnumbered
+   `message` event.
+2. The [replay](streaming-protocol.md#replay) from `Last-Event-ID`, or from the start of the replay
+   buffer when the header is absent: a [`gap`](streaming-protocol.md#event-gap) frame when the
+   buffer cannot supply every event after that id, then the buffered events.
+3. Every task's live events, murmur frames included, until the capsule's stream ends or the client
+   disconnects.
+
+The [stream extension](streaming-protocol.md#murmur-stream-v1) is always active on this stream,
+whatever the request's `A2A-Extensions` says. The first two events of a reconnect from id `41`:
+
+```text
+data: {"jsonrpc":"2.0","id":1,"result":{"message":{"messageId":"msg_01a131fc15437521b334719530864c4f","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"connection-ack"}],"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}}}}}
+
+id: 42
+data: {"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f1b87a01b2c3d4e5f6071829","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"inference turn 2"}]}}}}}
+
+```
+
+Every event and frame it can write, and the heartbeat, are under
+[What `murmur.WatchSession` writes](streaming-protocol.md#watch-order).
+[`mur watch`](cli.md#mur-watch) is a client of this method.
+
+#### `murmur.StopSession` { #stop-session }
+
+Cancels every task the session still holds, and reports what the session leaves running, in one
+answer. `params` is `{}`, and is not read.
+
+```bash
+curl -s -X POST http://localhost:41873/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"murmur.StopSession","params":{}}'
+```
+
+```text
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 267
+connection: close
+A2A-Extensions: https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1
+
+{"jsonrpc":"2.0","id":1,"result":{"canceled":["tsk_019ed5211c827f63a8fe4be623277c55"],"residue":[{"binary":"bash","command":"sleep 30","kind":"detached_shell","started_at_ms":1757068800123,"work_id":"wrk_9f2a1c"}],"session_id":"ses_019f01a940ce7761854e768ecbe3d399"}}
+```
+
+| Key | Type | Value |
 |---|---|---|
-| `x-murmur-forget-session` | `SendMessage`, `SendStreamingMessage` | `true` drops the harness session this request's context names before the turn, so the turn starts a new conversation under the same context id |
+| `session_id` | string | The session this door answers for |
+| `canceled` | array of strings | The tasks this call moved to `TASK_STATE_CANCELED`, sorted. `[]` when none was live, so a second call answers `[]` |
+| `residue` | array of objects | One [residue item](#residue-items) per thing the session leaves running. `[]` when nothing is |
 
-Only the value `true` asks for it; every other value, and the header's absence, are the same
-request. A capsule on any transport but
-[`inference.transport: process`](manifest.md#transport-process) keeps no harness session, and
-answers the header with `-32602` without starting a task — see
-[`E-RUN-039`](diagnostics.md#e-run-039). What the forget does, and what it records, is
-[what removes an entry](workdir.md#what-removes-an-entry).
+All three keys are always present. `CancelTask` omits its `residue` artifact when nothing is
+running; `murmur.StopSession` answers `"residue": []`.
+
+`murmur.StopSession` ends no process and does not shut the door: the capsule keeps running and
+answering. [`mur stop`](cli.md#mur-stop) calls it, then signals the process.
+
+##### Residue items { #residue-items }
+
+The items a `murmur.StopSession` answer lists, and the data parts of a `CancelTask` answer's
+`residue` artifact. [`mur cancel`](cli.md#mur-cancel) and [`mur stop`](cli.md#mur-stop) print a
+`detached_shell` item as `running:` and a `delegation` item as `ended:`.
+
+| `kind` | Names | Keys |
+|---|---|---|
+| `detached_shell` | A [demoted shell command](manifest.md#lifecycle-shell-grace-secs), which keeps running | `work_id` (`wrk_…`), `binary`, `command`, `started_at_ms` |
+| `delegation` | A sub-capsule the cancelled task delegated to, which that task ends | `delegation_id` (`dlg_…`), `capsule`, `version`, `child_session_id`, `child_workdir` |
+
+```json
+{"kind": "delegation", "delegation_id": "dlg_7b31de", "capsule": "my-worker", "version": "0.1.0",
+ "child_session_id": "ses_019ed2af76b57c42912b612f07dd4d51", "child_workdir": ".murmur/children/my-worker-7b31de"}
+```
+
+#### `forgetSession` { #forget-session }
+
+A field of a `SendMessage` or `SendStreamingMessage` message that starts a task: it asks the
+capsule to drop the harness session the message's context names, so the task starts a new
+conversation under the same context id. It lives in the message's `metadata`, under the door
+extension's URI:
+
+| Path | Type | Value |
+|---|---|---|
+| `params.message.metadata["https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1"].forgetSession` | boolean | `true` asks for the forget. `false`, an absent field and an absent URI key ask for nothing |
+
+Other keys in the URI's object, and other `metadata` keys, are ignored. List the door URI in
+`message.extensions` too; the door does not read `extensions`.
+
+```bash
+curl -s -X POST http://localhost:41873/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "messageId": "msg-1",
+        "role": "ROLE_USER",
+        "contextId": "ctx_0193f2a1c4d87e01b2c3d4e5f6a7b8c9",
+        "parts": [{"text": "carry on"}],
+        "extensions": ["https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1"],
+        "metadata": {
+          "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1": {"forgetSession": true}
+        }
+      }
+    }
+  }'
+```
+
+```text
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 181
+connection: close
+A2A-Extensions: https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1
+
+{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"tsk_019ed5211c827f63a8fe4be623277c55","contextId":"ctx_0193f2a1c4d87e01b2c3d4e5f6a7b8c9","status":{"state":"TASK_STATE_SUBMITTED"}}}}
+```
+
+The door refuses the message with `-32602`, starting no task, in this order. The first three come
+after the other [message checks](#message) and before the `-32005` file-part check:
+
+| Refusal | `error.message` |
+|---|---|
+| The URI's value is not an object | `Invalid params: message.metadata["https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1"] must be an object` |
+| `forgetSession` is not a boolean | `Invalid params: message.metadata["https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1"].forgetSession must be a boolean` |
+| `forgetSession: true` on a message that names a `taskId` | `Invalid params: forgetSession starts a new conversation, so it goes on a message that starts a task, not on one that continues task <id>` |
+| `forgetSession: true` to a capsule not on [`inference.transport: process`](manifest.md#transport-process). Checked once the message is read, before it is routed | `forgetSession asks this capsule to forget the harness session this context names, and only a capsule on inference.transport: process has one` |
+
+On `SendStreamingMessage` each refusal is one JSON body, before any stream opens.
+
+On a `transport: process` capsule, the forget:
+
+1. Drops the harness session the context names before the task's first attempt. The
+   [`harness_session_forgotten`](observability-schemas.md#harness-session-forgotten) trace record
+   names the context, the dropped id and `requested_by: "a2a"` — see
+   [what removes an entry](workdir.md#what-removes-an-entry).
+2. Starts the harness on a new session: the run's `harness_start` says `session_mode: "new"`.
+3. Applies to that one task. The next message in the context resumes the new session.
+
+A context that names no harness session has nothing to drop, and the task starts a new
+conversation as it would have without the field. `mur run --context <id> --forget-session` asks for
+the same forget from the CLI — see [`--forget-session`](cli.md#run-forget-session). Both are the
+answer to [`E-RUN-036`](diagnostics.md#e-run-036).
+
+#### Runtime headers { #runtime-headers }
+
+Murmur's runtimes send each other these headers. Each is read before or outside any JSON-RPC
+message body, so it is a header rather than a field:
+
+| Header | Sent by | Read | Why it is a header |
+|---|---|---|---|
+| `x-murmur-task-origin` | A capsule's outbound A2A send, and a sub-capsule's [completion](roost-api.md#how-it-travels) | By the door, before the body | Peer consent, `403` [`peer_not_accepted`](#door-authentication), is decided on it before the body is read, on every method |
+| `x-murmur-task-trust` | A capsule's outbound A2A send, beside `x-murmur-task-origin` | By the door, before the body | Read with `x-murmur-task-origin`, for the same reason |
+| `x-murmur-delegation-id` | A sub-capsule's completion | On the completion path, before `params` is read | It addresses the completion: one naming no delegation a task here awaits is refused [`-31002`](#murmur-errors) before its `params` is read |
+| `x-murmur-completion-session` | A sub-capsule's completion | On the completion path, before the method is resolved | A misaddressed completion is refused [`-31001`](#murmur-errors) before its method or `params` is read |
+| `x-murmur-audience` | A capsule redeeming a peer handle | By the [peer plane](resource-plane.md#redeem) at `/resources/peer/<handle>` | The peer plane is not JSON-RPC, and a redeem has no message to carry metadata |
+| `x-murmur-handle-id` | The peer plane, on its answer to a redeem | By the redeeming client | A response header of the peer plane, whose body is the file's bytes |
 
 #### Completion errors { #murmur-errors }
 
@@ -752,7 +945,8 @@ is required: a `GetTask` without one, or with `""`, is answered `-32602` `GetTas
 ```
 
 `CancelTask` on a live task answers the task in `TASK_STATE_CANCELED`, with a `residue` artifact
-naming what the session still runs, one data part per item, when anything is:
+naming what the session still runs, one data part per [residue item](#residue-items), when anything
+is:
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
@@ -890,6 +1084,10 @@ changes these:
 | A part with `kind`, and a file or data part skipped | A part sets one of `text`, `raw`, `url` or `data`. A data part is [read](#parts); a file part is refused with `-32005` |
 | Artifacts without an id | Every artifact carries an [`artifactId`](#send-message-response) |
 | `tasks/get` without an `id` answering the active task | `GetTask` requires an [`id`](#tasks-get) |
+| `stream/watch` | [`murmur.WatchSession`](#watch-session) |
+| `session/stop` | [`murmur.StopSession`](#stop-session) |
+| Credential scopes `stream/watch`, `session/stop` | `murmur.WatchSession`, `murmur.StopSession`. A manifest listing an old name is refused |
+| Header `x-murmur-forget-session: true` | [`forgetSession: true`](#forget-session) in the message's `metadata`, under the door extension's URI. The header is not read |
 
-The 0.3 method names are answered `-32601` `Method not found`. `stream/watch`, `session/stop` and
-the `x-murmur-*` headers keep their names.
+Every old method name in the table is answered `-32601` `Method not found`: the door serves no alias.
+The other `x-murmur-*` headers are unchanged — see [Runtime headers](#runtime-headers).
