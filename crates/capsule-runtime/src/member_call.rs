@@ -362,7 +362,7 @@ fn offer_task(
         )));
     }
     let task = match answer.get("result").map(SendMessageResult::from_result) {
-        Some(Ok(SendMessageResult::Task(task))) => task,
+        Some(Ok(SendMessageResult::Task(task))) => *task,
         Some(Ok(SendMessageResult::Message(message))) => {
             return Err(StartFailure::failed(format!(
                 "{member} answered with a message and started no task: {message}"

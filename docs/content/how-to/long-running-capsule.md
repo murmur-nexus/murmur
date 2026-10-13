@@ -177,7 +177,7 @@ Response:
     "task": {
       "id": "tsk_019e23bd122f77e291a065f9481325cb",
       "contextId": "ctx-001",
-      "status": { "state": "TASK_STATE_SUBMITTED" }
+      "status": { "state": "TASK_STATE_SUBMITTED", "timestamp": "2026-10-13T09:00:00.123Z" }
     }
   }
 }
@@ -240,7 +240,7 @@ curl -s -X POST http://localhost:$PORT \
   "result": {
     "id": "tsk_019e23bd122f77e291a065f9481325cb",
     "contextId": "ctx-001",
-    "status": { "state": "TASK_STATE_WORKING" }
+    "status": { "state": "TASK_STATE_WORKING", "timestamp": "2026-10-13T09:00:01.276Z" }
   }
 }
 ```

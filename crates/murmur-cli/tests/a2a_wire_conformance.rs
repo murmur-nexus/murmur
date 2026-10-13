@@ -22,7 +22,7 @@ use common::{
         agent_project, driver_home, end_turn, launch_door, message, push_config_requests, rpc,
         stage_door, wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
     },
-    wire_recorder::{record_post, VERSION_HEADER},
+    wire_recorder::{record_post, UNTIMED_STATUS, VERSION_HEADER},
 };
 use serde_json::{json, Value};
 
@@ -187,6 +187,20 @@ fn every_served_method_conforms() {
     );
     assert_eq!(second.status, 200, "{second:?}");
     assert!(second.json().get("result").is_some(), "{second:?}");
+    // And filtered by status time, from the timestamp of the newest task the first page held.
+    let newest = first.json()["result"]["tasks"][0]["status"]["timestamp"].clone();
+    assert!(newest.is_string(), "{first:?}");
+    let since = rpc(
+        &addr,
+        token,
+        "ListTasks",
+        json!({"statusTimestampAfter": newest}),
+    );
+    assert_eq!(since.status, 200, "{since:?}");
+    assert!(
+        since.json()["result"]["totalSize"].as_u64() >= Some(1),
+        "{since:?}"
+    );
 
     // A subscription is measured plain and activated, each on a task queued behind another, so it
     // is still live when subscribed to.
@@ -273,9 +287,14 @@ const GET_TASK: &str = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"
 
 const STREAM_MESSAGE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"SendStreamingMessage","params":{"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"hello"}]}}}"#;
 
-const V1_TASK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING"}}}"#;
+const V1_TASK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING","timestamp":"2026-10-13T09:00:00.123Z"}}}"#;
 
-const V1_STATUS_EVENT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
+const V1_STATUS_EVENT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING","timestamp":"2026-10-13T09:00:00.123Z"}}}}"#;
+
+/// [`V1_TASK`] and [`V1_STATUS_EVENT`] with no `timestamp`: v1.0, but not what murmur writes.
+const UNTIMED_TASK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"id":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING"}}}"#;
+
+const UNTIMED_STATUS_EVENT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_1","contextId":"ctx_1","status":{"state":"TASK_STATE_WORKING"}}}}"#;
 
 const VERSIONED: [(&str, &str); 2] = [
     ("Content-Type", "application/json"),
@@ -344,6 +363,32 @@ fn recorder_fails_a_nonconformant_stream_event() {
         failure.starts_with("A2A v1.0 wire check failed: SendStreamingMessage event"),
         "{failure}"
     );
+}
+
+/// The proto leaves `TaskStatus.timestamp` optional, so these pass the proto checks; the recorder
+/// still fails them, since every status murmur writes carries one.
+#[test]
+fn recorder_fails_a_status_without_a_timestamp() {
+    let failure = recorder_failure(&VERSIONED, GET_TASK, &json_headers(), UNTIMED_TASK)
+        .expect("a GetTask status without a timestamp fails the recorder");
+    assert!(
+        failure.starts_with(&format!(
+            "A2A v1.0 wire check failed: GetTask result {UNTIMED_STATUS}"
+        )),
+        "{failure}"
+    );
+    assert!(failure.contains("result.status:"), "{failure}");
+
+    let body = format!("id: 1\ndata: {UNTIMED_STATUS_EVENT}\n\n");
+    let failure = recorder_failure(&VERSIONED, STREAM_MESSAGE, &event_stream_headers(), &body)
+        .expect("a statusUpdate without a timestamp fails the recorder");
+    assert!(
+        failure.starts_with(&format!(
+            "A2A v1.0 wire check failed: SendStreamingMessage event {UNTIMED_STATUS}"
+        )),
+        "{failure}"
+    );
+    assert!(failure.contains("result.statusUpdate.status:"), "{failure}");
 }
 
 #[test]

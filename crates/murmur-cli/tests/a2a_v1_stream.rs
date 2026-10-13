@@ -384,9 +384,15 @@ fn activated_stream_adds_murmur_frames_and_echoes_the_extension() {
             "a carrier precedes WORKING: {event:?}"
         );
         assert_eq!(event.kind(), event.frame()["frame"].as_str().unwrap());
+        let status = &event.result()["statusUpdate"]["status"];
+        let timestamp = status["timestamp"].as_str().unwrap_or_default();
+        assert!(
+            timestamp.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(timestamp).is_ok(),
+            "a carrier is stamped as it is written: {event:?}"
+        );
         assert_eq!(
-            event.result()["statusUpdate"]["status"],
-            json!({"state": "TASK_STATE_WORKING"}),
+            *status,
+            json!({"state": "TASK_STATE_WORKING", "timestamp": timestamp}),
             "{event:?}"
         );
         assert!(event.id.is_some(), "a task's frame is numbered: {event:?}");

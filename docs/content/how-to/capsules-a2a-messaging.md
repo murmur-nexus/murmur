@@ -291,7 +291,7 @@ answered with error [`-32009`](../reference/agent-card.md#a2a-version) and start
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"tsk_019ed33d1f6873b09d25f0dc5ce387c4","contextId":"ctx-001","status":{"state":"TASK_STATE_SUBMITTED"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"tsk_019ed33d1f6873b09d25f0dc5ce387c4","contextId":"ctx-001","status":{"state":"TASK_STATE_SUBMITTED","timestamp":"2026-10-13T09:00:00.123Z"}}}}
 ```
 
 Save the returned `result.task.id` — that is the **task ID** you will use to poll status.
@@ -356,7 +356,8 @@ curl -s -X POST http://localhost:$PORT \
                 "taskId": "tsk_019ed5211c827f63a8fe4be623277c55",
                 "role": "ROLE_AGENT",
                 "parts": [{"text": "session ended", "mediaType": "text/plain"}]
-            }
+            },
+            "timestamp": "2026-10-13T09:00:04.512Z"
         },
         "artifacts":
         [
@@ -404,7 +405,8 @@ is interrupted — and the task reaches the terminal state `TASK_STATE_CANCELED`
         "contextId": "ctx-001",
         "status":
         {
-            "state": "TASK_STATE_CANCELED"
+            "state": "TASK_STATE_CANCELED",
+            "timestamp": "2026-10-13T09:00:04.512Z"
         }
     }
 }

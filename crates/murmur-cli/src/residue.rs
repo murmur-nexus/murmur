@@ -51,11 +51,12 @@ fn residue_line(item: &Value) -> String {
     }
 }
 
-/// The item a data part holds, or the part itself when it already is one.
+/// The item a data part holds, or the part itself when it already is one: a bare object is an
+/// item only when it carries `kind`, so a text part or any other part is no item.
 fn unwrap_item(part: &Value) -> Option<Value> {
     match part.get("data") {
         Some(item) => item.is_object().then(|| item.clone()),
-        None => part.is_object().then(|| part.clone()),
+        None => (part.is_object() && part.get("kind").is_some()).then(|| part.clone()),
     }
 }
 
@@ -95,9 +96,14 @@ mod tests {
         assert_eq!(unwrap_item(&item).unwrap(), item);
         assert_eq!(
             unwrap_item(&json!({"text": item.to_string()})),
-            Some(json!({"text": item.to_string()})),
-            "JSON is not parsed out of a text part"
+            None,
+            "a text part is no item, and JSON is not parsed out of it"
         );
+    }
+
+    #[test]
+    fn a_text_part_prints_no_residue_line() {
+        assert!(residue_lines(&[json!({"text": "nothing is running"})]).is_empty());
     }
 
     /// A detached shell command outlives the cancel and reads `running:`; a delegation is ended

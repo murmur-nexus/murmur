@@ -1925,3 +1925,132 @@ fn lifecycle_a_failed_exit_task_still_rejects_what_queued_behind_it() {
     assert_sole_rejection(&events, &task_b, "session_ended");
     assert_eq!(events_named(&events, "task_rejected").len(), 1);
 }
+
+// ── queue_depth: 0 under queue ────────────────────────────────────────────────
+
+/// `setup_agent_project`'s capsule with `lifecycle_yaml` appended as its `lifecycle:` block.
+fn setup_agent_project_with_lifecycle(endpoint: &str, lifecycle_yaml: &str) -> (TempDir, PathBuf) {
+    let (home, manifest_path) = setup_agent_project(endpoint);
+    let mut manifest = fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str(&format!("lifecycle:\n{lifecycle_yaml}"));
+    fs::write(&manifest_path, manifest).unwrap();
+    (home, manifest_path)
+}
+
+/// Every `trace.jsonl` under `root`, at any depth.
+fn traces_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A refusal of a queue with no room: `E-MAN-003` naming `lifecycle.queue_depth`, with a hint,
+/// and nothing launched — no panic and no session trace.
+fn assert_refused_before_launch(
+    output: &std::process::Output,
+    home: &TempDir,
+    manifest_path: &Path,
+) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "mur run must refuse:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("error[E-MAN-003]"), "{stderr}");
+    assert!(stderr.contains("lifecycle.queue_depth"), "{stderr}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("bounded channel"),
+        "{stderr}"
+    );
+    for root in [home.path(), manifest_path.parent().unwrap()] {
+        let traces = traces_under(root);
+        assert!(traces.is_empty(), "nothing launched, yet: {traces:?}");
+    }
+    stderr
+}
+
+#[test]
+fn lifecycle_queue_depth_zero_under_queue_is_refused_before_launch() {
+    let server = end_turn_server("done");
+    let (home, manifest_path) = setup_agent_project_with_lifecycle(
+        &server.endpoint,
+        "  task_acceptance: queue\n  after_task: sleep\n  queue_depth: 0\n",
+    );
+
+    let output = mur_run(&home, &manifest_path, &["--task", "Say done."], &[]);
+    let stderr = assert_refused_before_launch(&output, &home, &manifest_path);
+    let hint = stderr
+        .lines()
+        .find(|line| line.trim_start().starts_with("hint:"))
+        .unwrap_or_else(|| panic!("no hint line:\n{stderr}"));
+    assert!(
+        hint.contains("lifecycle.queue_depth to 1 or more"),
+        "{hint}"
+    );
+    assert!(hint.contains("task_acceptance: single"), "{hint}");
+    assert!(server.requests().is_empty(), "no inference was made");
+}
+
+#[test]
+fn lifecycle_queue_depth_zero_under_an_override_to_queue_is_refused() {
+    let server = end_turn_server("done");
+    let (home, manifest_path) = setup_agent_project_with_lifecycle(
+        &server.endpoint,
+        "  task_acceptance: single\n  queue_depth: 0\n",
+    );
+
+    let output = mur_run(
+        &home,
+        &manifest_path,
+        &[
+            "--task",
+            "Say done.",
+            "--lifecycle-task-acceptance",
+            "queue",
+        ],
+        &[],
+    );
+    let stderr = assert_refused_before_launch(&output, &home, &manifest_path);
+    assert!(
+        stderr.contains("--lifecycle-task-acceptance queue"),
+        "{stderr}"
+    );
+    assert!(server.requests().is_empty(), "no inference was made");
+}
+
+/// `queue_depth` means nothing under `single`, so `0` there launches as it always has.
+#[test]
+fn lifecycle_queue_depth_zero_under_single_still_runs() {
+    let server = end_turn_server("done");
+    let (home, manifest_path) = setup_agent_project_with_lifecycle(
+        &server.endpoint,
+        "  task_acceptance: single\n  queue_depth: 0\n",
+    );
+
+    let output = mur_run(&home, &manifest_path, &["--task", "Say done."], &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "mur run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let workdir = common::parse_workdir_from_stdout(&stdout);
+    let events = read_trace(&workdir.join("trace.jsonl"));
+    assert_eq!(events_named(&events, "task_end").len(), 1);
+    assert_eq!(events_named(&events, "session_end")[0]["exit_status"], "ok");
+    assert_eq!(server.requests().len(), 1);
+}

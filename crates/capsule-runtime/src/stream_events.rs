@@ -165,9 +165,9 @@ mod tests {
         buffered(frames)
             .iter()
             .map(|result| {
-                assert_eq!(
-                    result["statusUpdate"]["status"],
-                    serde_json::json!({"state": "TASK_STATE_WORKING"})
+                crate::a2a::assert_bare_status(
+                    &result["statusUpdate"]["status"],
+                    "TASK_STATE_WORKING",
                 );
                 assert_eq!(result["statusUpdate"]["taskId"], "tsk_test");
                 (event_kind(result), frame_of(result))

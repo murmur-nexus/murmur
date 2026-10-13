@@ -279,18 +279,13 @@ pub fn caller_overflow_warning(overflow: &CallerOverflow) -> String {
     let noun = if count == 1 { "member" } else { "members" };
     let depth = overflow.sufficient_queue_depth;
     let (holding, rejection, remedy) = match overflow.task_acceptance {
-        TaskAcceptance::Queue if overflow.queue_depth > 0 => (
+        TaskAcceptance::Queue => (
             format!(
                 "{} tasks at once — one running and lifecycle.queue_depth: {} waiting —",
                 overflow.holds, overflow.queue_depth
             ),
             "a call that arrives while it is full waits and is offered again, and is rejected only \
              if it stays full until the call's deadline",
-            format!("lifecycle.queue_depth: {depth}"),
-        ),
-        TaskAcceptance::Queue => (
-            "no task — lifecycle.queue_depth: 0 —".to_string(),
-            NEVER_TAKEN,
             format!("lifecycle.queue_depth: {depth}"),
         ),
         TaskAcceptance::Single => (
@@ -1383,22 +1378,34 @@ mod tests {
         );
     }
 
+    /// A member whose packed manifest declares `queue` at `queue_depth: 0` does not parse, so it
+    /// never reaches W-ROS-001's arithmetic.
     #[test]
-    fn a_queue_member_at_depth_zero_holds_no_task() {
-        let (_dir, admitted) = admit_with(
-            &[("lead", ""), ("shut", &queue_at(0))],
-            RosterReachability::Rules(vec![rule("lead", &["shut"])]),
-        );
-        let overflows = admitted.caller_overflows();
-        assert_eq!(overflows.len(), 1);
-        assert_eq!(
-            caller_overflow_warning(&overflows[0]),
-            "warning[W-ROS-001]: roster.yaml lets 1 member call 'shut' (lead), but it holds no \
-             task — lifecycle.queue_depth: 0 — so no call is ever taken: each is offered again \
-             until its deadline and then rejected; \
-             lifecycle.queue_depth: 1 would hold them all \
-             (https://docs.murmur.nexus/reference/diagnostics/#w-ros-001)"
-        );
+    fn a_queue_member_at_depth_zero_is_refused_at_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalRegistry::new(dir.path());
+        for (name, lifecycle) in [("lead", String::new()), ("shut", queue_at(0))] {
+            install(
+                &store,
+                name,
+                "1.0.0",
+                &manifest_with_lifecycle(name, &lifecycle),
+            );
+        }
+        let roster = Roster {
+            members: vec![
+                member("lead", "1.0.0", true),
+                member("shut", "1.0.0", false),
+            ],
+            reachability: RosterReachability::Rules(vec![rule("lead", &["shut"])]),
+        };
+        match admit_roster(&roster, &store, None) {
+            Err(RosterRefusal::MemberUnresolvable { member, reason, .. }) => {
+                assert_eq!(member, "shut");
+                assert!(reason.contains("lifecycle.queue_depth"), "{reason}");
+            }
+            other => panic!("expected MemberUnresolvable for shut, got {other:?}"),
+        }
     }
 
     /// The entry member holds no task of its own here, yet nothing may call it, so it is never

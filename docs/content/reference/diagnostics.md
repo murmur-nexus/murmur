@@ -47,7 +47,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure), including a write to standard output that failed for a reason other than its reader going away | [Piped output](cli.md#piped-output) |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [E-MAN-003](#e-man-003) |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), a removed `inference.endpoint` or `inference.api_key`, a [`gateway.endpoint`](manifest.md#gateway-endpoint-validation) with userinfo, `${` or another rejected shape, a `gateway:` that writes both `api_key` and `keyless: true`, a malformed [`network.authentication`](manifest.md#field-network-authentication), a credential scope that names a retired door method, a `network.authentication` declared beside a non-empty `capabilities.spawn.allow`, a `lifecycle.queue_depth: 0` under `task_acceptance: queue`, or a `gateway.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [E-MAN-003](#e-man-003) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new-task) |
 | `E-NEW-002` | The name given to `mur new --roster`, or a capsule name derived from it, is not an artifact name | [`mur new --roster`](cli.md#mur-new-roster) |
 | `E-NEW-003` | The directory `mur new --roster` would write already exists | [`mur new --roster`](cli.md#mur-new-roster-writing) |
@@ -198,6 +198,25 @@ error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authenticatio
 
 The scopes are listed under
 [`network.authentication`](manifest.md#field-network-authentication).
+
+A `lifecycle.queue_depth` of `0` under `task_acceptance: queue` leaves the queue no room for a
+waiting task, and is refused before anything launches:
+
+```text
+error[E-MAN-003]: murmur.yaml: invalid lifecycle config for 'lifecycle.queue_depth': 0 leaves task_acceptance: queue no room for a waiting task
+  hint: set lifecycle.queue_depth to 1 or more, or use lifecycle.task_acceptance: single to take one task at a time
+```
+
+`mur run --lifecycle-task-acceptance queue` over a manifest that declares `queue_depth: 0` under
+another acceptance is refused the same way:
+
+```text
+error[E-MAN-003]: the launch sets lifecycle.task_acceptance to queue, and murmur.yaml declares lifecycle.queue_depth: 0, which leaves the queue no room for a waiting task
+  hint: set lifecycle.queue_depth to 1 or more in murmur.yaml, or launch without --lifecycle-task-acceptance queue
+```
+
+Under `single` and `none`, `queue_depth` has no effect, and any value is accepted. See
+[`lifecycle.queue_depth`](manifest.md#field-lifecycle).
 
 ## Capability errors
 
@@ -1924,8 +1943,7 @@ to it ends `rejected` at its deadline. See [A busy member](runtime-provided-tool
 
 | `lifecycle.task_acceptance` | Tasks held at once |
 |---|---|
-| `queue`, `queue_depth` 1 or more | `queue_depth` + 1: one running and `queue_depth` waiting |
-| `queue`, `queue_depth: 0` | 0 |
+| `queue` | `queue_depth` + 1: one running and `queue_depth` waiting |
 | `single` | 1 |
 | `none` | 0 |
 

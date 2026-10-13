@@ -89,18 +89,29 @@ impl LifecycleConfig {
         self.task_acceptance == TaskAcceptance::Queue && self.after_task == AfterTask::Sleep
     }
 
+    /// Whether this lifecycle's queue has room for a waiting task: `false` exactly for
+    /// `task_acceptance: queue` at `queue_depth: 0`, which the A2A door would turn into a door
+    /// refusing every task, with nowhere for background completions to wait.
+    ///
+    /// The manifest refuses such a lifecycle at load
+    /// ([`RuntimeManifestError::QueueWithoutRoom`]) and staging refuses one a
+    /// `--lifecycle-task-acceptance queue` override produces; both ask this. `queue_depth` means
+    /// nothing under `single` or `none`, so any value passes there.
+    pub fn queue_has_room(&self) -> bool {
+        !(self.task_acceptance == TaskAcceptance::Queue && self.queue_depth == 0)
+    }
+
     /// How many tasks a capsule under this lifecycle holds at once: one running task plus
     /// `queue_depth` waiting ones under `queue`, a single task under `single`, none under `none`.
     ///
-    /// A `queue` lifecycle with `queue_depth: 0` holds nothing, because the A2A door admits a
-    /// task under `queue` only while fewer than `queue_depth` tasks are waiting. That door is the
-    /// authority this mirrors: the task registry in `capsule-runtime` (`TaskRegistry::can_accept`)
-    /// decides what is rejected, and a test there fails if the two drift apart.
+    /// A `queue` lifecycle at `queue_depth: 0` is refused at load and at staging
+    /// ([`Self::queue_has_room`]), so no running capsule has one. The A2A door is the authority
+    /// this mirrors: the task registry in `capsule-runtime` (`TaskRegistry::can_accept`) decides
+    /// what is rejected, and a test there fails if the two drift apart.
     pub fn tasks_held_at_once(&self) -> usize {
         match self.task_acceptance {
             TaskAcceptance::None => 0,
             TaskAcceptance::Single => 1,
-            TaskAcceptance::Queue if self.queue_depth == 0 => 0,
             TaskAcceptance::Queue => self.queue_depth + 1,
         }
     }
@@ -1801,6 +1812,14 @@ pub enum RuntimeManifestError {
         scope: String,
         replacement: &'static str,
     },
+    /// `lifecycle.task_acceptance: queue` with `lifecycle.queue_depth: 0`; see
+    /// [`LifecycleConfig::queue_has_room`].
+    #[error(
+        "{}: invalid lifecycle config for 'lifecycle.queue_depth': 0 leaves task_acceptance: \
+         queue no room for a waiting task",
+        MANIFEST_FILENAME
+    )]
+    QueueWithoutRoom,
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
     /// A `gateway:` names an upstream but neither binds a non-blank `api_key` nor declares
@@ -3530,21 +3549,29 @@ impl RuntimeManifest {
             })
             .transpose()?;
         refuse_authenticated_delegating_parent(network.as_ref(), capabilities.as_ref())?;
-        let lifecycle = raw.lifecycle.map(|raw_lc| {
-            let defaults = LifecycleConfig::default();
-            LifecycleConfig {
-                task_acceptance: raw_lc.task_acceptance.unwrap_or(defaults.task_acceptance),
-                after_task: raw_lc.after_task.unwrap_or(defaults.after_task),
-                queue_depth: raw_lc.queue_depth.unwrap_or(defaults.queue_depth),
-                input_timeout_secs: raw_lc.input_timeout_secs,
-                conversation_mode: raw_lc.conversation.unwrap_or(defaults.conversation_mode),
-                max_task_reopens: raw_lc.max_task_reopens.unwrap_or(defaults.max_task_reopens),
-                shell_grace_secs: raw_lc.shell_grace_secs.unwrap_or(defaults.shell_grace_secs),
-                delegation_deadline_secs: raw_lc
-                    .delegation_deadline_secs
-                    .unwrap_or(defaults.delegation_deadline_secs),
-            }
-        });
+        let lifecycle = raw
+            .lifecycle
+            .map(|raw_lc| {
+                let defaults = LifecycleConfig::default();
+                let lifecycle = LifecycleConfig {
+                    task_acceptance: raw_lc.task_acceptance.unwrap_or(defaults.task_acceptance),
+                    after_task: raw_lc.after_task.unwrap_or(defaults.after_task),
+                    queue_depth: raw_lc.queue_depth.unwrap_or(defaults.queue_depth),
+                    input_timeout_secs: raw_lc.input_timeout_secs,
+                    conversation_mode: raw_lc.conversation.unwrap_or(defaults.conversation_mode),
+                    max_task_reopens: raw_lc.max_task_reopens.unwrap_or(defaults.max_task_reopens),
+                    shell_grace_secs: raw_lc.shell_grace_secs.unwrap_or(defaults.shell_grace_secs),
+                    delegation_deadline_secs: raw_lc
+                        .delegation_deadline_secs
+                        .unwrap_or(defaults.delegation_deadline_secs),
+                };
+                if lifecycle.queue_has_room() {
+                    Ok(lifecycle)
+                } else {
+                    Err(RuntimeManifestError::QueueWithoutRoom)
+                }
+            })
+            .transpose()?;
 
         let exports = parse_exports(raw.exports)?;
         let control = parse_control(raw.control, &gateway_references, inference.as_ref())?;
@@ -5846,8 +5873,52 @@ mod tests {
     }
 
     #[test]
-    fn tasks_held_at_once_under_queue_with_depth_zero_is_zero() {
-        assert_eq!(lifecycle(TaskAcceptance::Queue, 0).tasks_held_at_once(), 0);
+    fn queue_has_room_is_false_only_for_a_queue_at_depth_zero() {
+        assert!(!lifecycle(TaskAcceptance::Queue, 0).queue_has_room());
+        assert!(lifecycle(TaskAcceptance::Queue, 1).queue_has_room());
+        assert!(lifecycle(TaskAcceptance::Single, 0).queue_has_room());
+        assert!(lifecycle(TaskAcceptance::None, 0).queue_has_room());
+        assert!(lifecycle(TaskAcceptance::Single, 3).queue_has_room());
+    }
+
+    fn parse_lifecycle(block: &str) -> Result<RuntimeManifest, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n{block}"
+        ))
+    }
+
+    #[test]
+    fn queue_depth_zero_under_queue_is_refused_at_load() {
+        let error = parse_lifecycle("  task_acceptance: queue\n  queue_depth: 0\n").unwrap_err();
+        assert!(
+            matches!(error, RuntimeManifestError::QueueWithoutRoom),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "murmur.yaml: invalid lifecycle config for 'lifecycle.queue_depth': 0 leaves \
+             task_acceptance: queue no room for a waiting task"
+        );
+    }
+
+    /// `queue_depth` means nothing outside `queue`, so `0` there parses as it always has.
+    #[test]
+    fn queue_depth_zero_outside_queue_still_parses() {
+        for block in [
+            "  task_acceptance: single\n  queue_depth: 0\n",
+            "  task_acceptance: none\n  queue_depth: 0\n",
+            "  queue_depth: 0\n",
+        ] {
+            let lifecycle = parse_lifecycle(block)
+                .unwrap_or_else(|error| panic!("{block:?}: {error}"))
+                .effective_lifecycle();
+            assert_eq!(lifecycle.queue_depth, 0, "{block:?}");
+        }
+        let queue = parse_lifecycle("  task_acceptance: queue\n  queue_depth: 1\n")
+            .unwrap()
+            .effective_lifecycle();
+        assert_eq!(queue.task_acceptance, TaskAcceptance::Queue);
+        assert_eq!(queue.queue_depth, 1);
     }
 
     #[test]
