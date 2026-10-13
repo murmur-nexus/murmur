@@ -240,8 +240,8 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
     );
     assert_eq!(error_of(&retired).0["code"], -32009, "{retired:?}");
 
-    // The served round: every method under every accepted spelling, `murmur.StopSession` last. Every
-    // task it starts is recorded, so the stop can be held to cancelling only those.
+    // The served round: every method under every accepted spelling, `murmur.StopSession` last.
+    // Every task it starts is recorded, so the stop can be held to cancelling only those.
     let mut started: Vec<String> = Vec::new();
     let accepted: [(&str, &str); 4] = [
         ("A2A-Version", "1.0"),
@@ -501,21 +501,10 @@ fn public_card(addr: &str) -> Value {
     card.json()
 }
 
-/// The door extension's entry on `card`.
-fn door_extension(card: &Value) -> Value {
-    card["capabilities"]["extensions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|extension| extension["uri"] == DOOR_EXTENSION_URI)
-        .cloned()
-        .unwrap_or_else(|| panic!("no door extension: {card:#}"))
-}
-
-/// murmur's own methods are `murmur.WatchSession` and `murmur.StopSession`: listed on every card
-/// in the old names' places, served under `A2A-Version: 1.0` alone, gated by their own scopes,
-/// and answered with the extensions their use activates. The old names, and every other
-/// spelling, are methods the door does not have.
+/// murmur's own methods are `murmur.WatchSession` and `murmur.StopSession`: listed on every card,
+/// served under `A2A-Version: 1.0` alone, gated by their own scopes, and answered with the
+/// extensions their use activates. Their retired names, and every other spelling, are methods
+/// the door does not have.
 #[test]
 fn murmur_methods_are_listed_served_and_negotiated() {
     if common::skip_without_host_support("murmur_methods_are_listed_served_and_negotiated") {
@@ -553,7 +542,7 @@ fn murmur_methods_are_listed_served_and_negotiated() {
         (extended, &authenticated_methods[..]),
     ] {
         assert_eq!(common::card_door_methods(&card), methods, "{card:#}");
-        let extension = door_extension(&card);
+        let extension = common::card_extension(&card, DOOR_EXTENSION_URI);
         assert_eq!(extension["description"], DOOR_EXTENSION_DESCRIPTION);
         assert_eq!(extension["required"], false);
     }

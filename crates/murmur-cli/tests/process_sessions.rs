@@ -1335,8 +1335,8 @@ fn a_forget_over_the_door_applies_to_one_task_only() {
         .all(|event| event["event_type"] != "harness_session_forgotten"));
 }
 
-/// The header a forget was once asked for with is read as any unknown header is: not at all. The
-/// message it rides on resumes the session its context established.
+/// `x-murmur-forget-session` is read as any unknown header is: not at all. The message it rides
+/// on resumes the session its context established.
 #[test]
 fn the_forget_header_is_no_longer_read() {
     let live = LiveCapsule::start(Built::new().queueing().build(), "memory");

@@ -657,8 +657,8 @@ pub(crate) async fn serve_http(
     if accept_failed {
         let _ = shutdown_rx.await;
     }
-    // A `murmur.WatchSession` or `SendStreamingMessage` connection otherwise outlives the session: its
-    // handler holds a broadcast sender, so it never sees the channel close.
+    // A `murmur.WatchSession` or `SendStreamingMessage` connection otherwise outlives the session:
+    // its handler holds a broadcast sender, so it never sees the channel close.
     let _ = closing_tx.send(true);
     let drained = async { while connections.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(CONNECTION_DRAIN_GRACE, drained).await;
@@ -3273,10 +3273,6 @@ mod tests {
         params
     }
 
-    fn head_of(response: &str) -> &str {
-        &response[..response.find("\r\n\r\n").expect("header terminator")]
-    }
-
     /// A capsule with no harness session refuses a forget before the message is routed: no task
     /// is registered or handed to the loop, and the refusal echoes no extension.
     #[test]
@@ -3301,7 +3297,7 @@ mod tests {
              and only a capsule on inference.transport: process has one"
         );
         assert!(response["error"].get("data").is_none(), "{response}");
-        assert!(!head_of(&raw).contains("A2A-Extensions"), "{raw}");
+        assert!(!split_response(&raw).0.contains("A2A-Extensions"), "{raw}");
         assert!(
             task_rx.try_recv().is_err(),
             "nothing was handed to the loop"
@@ -3323,7 +3319,9 @@ mod tests {
             "TASK_STATE_SUBMITTED"
         );
         assert!(
-            head_of(&raw).contains(&format!("\r\nA2A-Extensions: {DOOR_EXTENSION_URI}")),
+            split_response(&raw)
+                .0
+                .contains(&format!("\r\nA2A-Extensions: {DOOR_EXTENSION_URI}")),
             "{raw}"
         );
         assert!(!task_rx.try_recv().unwrap().forget_session);
@@ -3350,7 +3348,9 @@ mod tests {
             "TASK_STATE_SUBMITTED"
         );
         assert!(
-            head_of(&raw).contains(&format!("\r\nA2A-Extensions: {DOOR_EXTENSION_URI}")),
+            split_response(&raw)
+                .0
+                .contains(&format!("\r\nA2A-Extensions: {DOOR_EXTENSION_URI}")),
             "{raw}"
         );
         assert!(task_rx.try_recv().unwrap().forget_session);
@@ -3363,7 +3363,7 @@ mod tests {
             operator(),
             true,
         );
-        assert!(!head_of(&raw).contains("A2A-Extensions"), "{raw}");
+        assert!(!split_response(&raw).0.contains("A2A-Extensions"), "{raw}");
         assert!(!task_rx.try_recv().unwrap().forget_session);
     }
 
@@ -4482,9 +4482,9 @@ mod tests {
     /// Events beyond [`LAG_QUEUE`] in the burst, and so the count the `lagged` frame must carry.
     const LAG_MISSED: usize = 3;
 
-    /// A `murmur.WatchSession` connection that falls behind is told how many live events it lost, in one
-    /// unnumbered `lagged` message carrier written before the oldest retained event, and stays
-    /// open.
+    /// A `murmur.WatchSession` connection that falls behind is told how many live events it lost,
+    /// in one unnumbered `lagged` message carrier written before the oldest retained event, and
+    /// stays open.
     ///
     /// Current-thread flavour: the burst is sent with no await between sends, so the handler cannot
     /// drain its queue part-way through and the lost count is exact.
@@ -4837,8 +4837,8 @@ mod tests {
         assert_eq!(ns(&events), [1]);
     }
 
-    /// A `murmur.WatchSession` observer is written every event it was sent before the door closed, rather
-    /// than having its socket dropped mid-queue, and the stream then ends without
+    /// A `murmur.WatchSession` observer is written every event it was sent before the door closed,
+    /// rather than having its socket dropped mid-queue, and the stream then ends without
     /// `capsule-closed`, as it does for any capsule that exits.
     #[tokio::test]
     async fn watch_session_writes_queued_frames_before_the_door_closes() {

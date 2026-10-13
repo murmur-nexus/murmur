@@ -842,7 +842,7 @@ content-length: 181
 connection: close
 A2A-Extensions: https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1
 
-{"jsonrpc":"2.0","id":1,"result":{"task":{"id":"tsk_019ed5211c827f63a8fe4be623277c55","contextId":"ctx_0193f2a1c4d87e01b2c3d4e5f6a7b8c9","status":{"state":"TASK_STATE_SUBMITTED"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"task":{"contextId":"ctx_0193f2a1c4d87e01b2c3d4e5f6a7b8c9","id":"tsk_019ed5211c827f63a8fe4be623277c55","status":{"state":"TASK_STATE_SUBMITTED"}}}}
 ```
 
 The door refuses the message with `-32602`, starting no task, in this order. The first three come
@@ -873,17 +873,17 @@ answer to [`E-RUN-036`](diagnostics.md#e-run-036).
 
 #### Runtime headers { #runtime-headers }
 
-Murmur's runtimes send each other these headers. Each is read before or outside any JSON-RPC
-message body, so it is a header rather than a field:
+Murmur's runtimes send each other these headers, and a capsule's runtime stamps them itself. A
+client calling the door sends none of them:
 
-| Header | Sent by | Read | Why it is a header |
+| Header | Sent by | Read by | Effect |
 |---|---|---|---|
-| `x-murmur-task-origin` | A capsule's outbound A2A send, and a sub-capsule's [completion](roost-api.md#how-it-travels) | By the door, before the body | Peer consent, `403` [`peer_not_accepted`](#door-authentication), is decided on it before the body is read, on every method |
-| `x-murmur-task-trust` | A capsule's outbound A2A send, beside `x-murmur-task-origin` | By the door, before the body | Read with `x-murmur-task-origin`, for the same reason |
-| `x-murmur-delegation-id` | A sub-capsule's completion | On the completion path, before `params` is read | It addresses the completion: one naming no delegation a task here awaits is refused [`-31002`](#murmur-errors) before its `params` is read |
-| `x-murmur-completion-session` | A sub-capsule's completion | On the completion path, before the method is resolved | A misaddressed completion is refused [`-31001`](#murmur-errors) before its method or `params` is read |
-| `x-murmur-audience` | A capsule redeeming a peer handle | By the [peer plane](resource-plane.md#redeem) at `/resources/peer/<handle>` | The peer plane is not JSON-RPC, and a redeem has no message to carry metadata |
-| `x-murmur-handle-id` | The peer plane, on its answer to a redeem | By the redeeming client | A response header of the peer plane, whose body is the file's bytes |
+| `x-murmur-task-origin` | A capsule's outbound A2A send, and a sub-capsule's [completion](roost-api.md#how-it-travels) | The door, before the body | The task's [origin](../concepts/access-control.md#task-origin-and-trust-class). On a door whose `peerTasks` is `false`, `peer` is refused `403` [`peer_not_accepted`](#door-authentication) on every method |
+| `x-murmur-task-trust` | A capsule's outbound A2A send, beside `x-murmur-task-origin` | The door, before the body | The task's [trust class](../concepts/access-control.md#task-origin-and-trust-class) |
+| `x-murmur-delegation-id` | A sub-capsule's completion | The door's completion path | Names the delegation the completion answers. One no task here awaits is refused [`-31002`](#murmur-errors) before its `params` is read |
+| `x-murmur-completion-session` | A sub-capsule's completion | The door's completion path | Names the session the completion is for. A misaddressed one is refused [`-31001`](#murmur-errors) before its method or `params` is read |
+| `x-murmur-audience` | A capsule redeeming a peer handle | The [peer plane](resource-plane.md#redeem) at `/resources/peer/<handle>` | Names the redeeming capsule, which the handle must have been issued to |
+| `x-murmur-handle-id` | The peer plane, on its answer to a redeem | The redeeming client | Names the handle the bytes were served for |
 
 #### Completion errors { #murmur-errors }
 
