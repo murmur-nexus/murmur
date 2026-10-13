@@ -195,7 +195,7 @@ A 200 response confirms the capsule is running:
         "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
+          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop"],
           "peerTasks": false
         }
       },
@@ -213,7 +213,7 @@ A 200 response confirms the capsule is running:
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
           "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]

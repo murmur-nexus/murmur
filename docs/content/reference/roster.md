@@ -370,7 +370,7 @@ A member's door checks the `Authorization` header before anything else, in this 
 | No `Authorization` header | `401` | `unauthenticated` |
 | A formation token that does not verify: forged, altered, another formation's, or any formation token at a door in no formation | `401` | `invalid_token` — the same body as any other invalid token |
 | A valid formation token issued for another member's door | `403` | `not_permitted` — the message names only the member that presented it |
-| A valid formation token issued for this door, calling a method outside its three scopes | `403` | `insufficient_scope`, naming the credential `member:<caller>` |
+| A valid formation token issued for this door, calling a method outside its five scopes | `403` | `insufficient_scope`, naming the credential `member:<caller>` |
 | A valid formation token issued for this door, within its scopes | Served, as the credential `member:<caller>` | — |
 
 A formation token carries exactly these scopes:
@@ -380,9 +380,13 @@ A formation token carries exactly these scopes:
 | `SendMessage` | Start a task |
 | `GetTask` | Read the state of a task the calling member started; any other id is `-32001 Task not found`, as [Agent Card: `GetTask`](agent-card.md#tasks-get) describes |
 | `CancelTask` | Cancel a task the calling member started; any other id is `-32001 Task not found`, and nothing is cancelled. The runtime sends it only for a task a member took just after the calling task ended — see [A busy member](runtime-provided-tools.md#call-member-busy) |
+| `ListTasks` | List the tasks the calling member started, as [Agent Card: `ListTasks`](agent-card.md#list-tasks) describes |
+| `SubscribeToTask` | Stream the rest of a live task the calling member started; any other id is `-32001 Task not found`, as [Agent Card: `SubscribeToTask`](agent-card.md#subscribe-to-task) describes |
 
-A formation token does not reach `SendStreamingMessage`: a member reads a task it started with
-`GetTask`.
+Each reaches only the tasks the calling member started, by the rule
+[Agent Card: Who sees a task](agent-card.md#task-access) states. A formation token does not reach
+`SendStreamingMessage`, `stream/watch`, `session/stop` or `resources/files`: a member follows a task
+it started with `SubscribeToTask` or `GetTask`.
 
 The operator token and declared credentials work as they do outside a formation. A peer task is
 still refused with `403 peer_not_accepted` by a member that does not declare
@@ -489,7 +493,7 @@ A member the roster lets call others, whose grant reaches no such door, prints
 [`W-RUN-008`](diagnostics.md#w-run-008) at launch, and every call it makes fails.
 
 The caller's runtime reads the answer from the member's [`GetTask`](agent-card.md#tasks-get).
-On a formation token, `GetTask` answers only the tasks the calling member submitted.
+On a formation token, `GetTask` answers only the tasks the calling member started.
 
 ### What each member learns { #enforcement-learns }
 

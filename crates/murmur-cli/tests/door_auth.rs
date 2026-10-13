@@ -200,7 +200,8 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
     assert_eq!(unknown.status, 200, "{unknown:?}");
     assert_eq!(unknown.json()["error"]["code"], -32601, "{unknown:?}");
 
-    // The operator runs a task exactly as a public door would, and the watcher can read it.
+    // The operator runs a task exactly as a public door would. A declared credential reaches only
+    // the tasks it started, so the watcher reads the operator's task as one the session never held.
     let sent = rpc(
         &addr,
         Some(&operator),
@@ -214,10 +215,17 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         .to_string();
     wait_completed(&addr, Some(&operator), &task_id);
     let seen = rpc(&addr, Some(&watcher), "GetTask", json!({"id": task_id}));
+    assert_eq!(seen.json()["error"]["code"], -32001, "{seen:?}");
     assert_eq!(
-        seen.json()["result"]["status"]["state"],
-        "TASK_STATE_COMPLETED",
+        seen.json()["error"]["data"][0]["metadata"],
+        json!({"taskId": task_id}),
         "{seen:?}"
+    );
+    let read = rpc(&addr, Some(&operator), "GetTask", json!({"id": task_id}));
+    assert_eq!(
+        read.json()["result"]["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "{read:?}"
     );
 
     // The extended card: any valid token, the v1.0 card with the capsule extension.
@@ -408,7 +416,8 @@ fn public_door_warning_names_what_a_stranger_reaches() {
         "{line}"
     );
     for named in [
-        "SendMessage, SendStreamingMessage, stream/watch, GetTask, CancelTask, session/stop",
+        "SendMessage, SendStreamingMessage, stream/watch, GetTask, ListTasks, CancelTask, \
+         SubscribeToTask, session/stop",
         "the session id",
         "tools []",
         "shell: false",
@@ -492,7 +501,7 @@ fn tokens_stay_out_of_the_session() {
         .as_str()
         .unwrap()
         .to_string();
-    wait_completed(&addr, Some(&tokens[1]), &task_id);
+    wait_completed(&addr, Some(&tokens[0]), &task_id);
 
     // A refusal on the way: its body carries no token either.
     let refused = rpc(

@@ -21,8 +21,13 @@
 //! another member's door is `403 not_permitted`; any other token of that family is the same `401`
 //! as any other invalid token. A door with no verifier refuses every formation token as invalid.
 //!
-//! **A scope limits methods, not tasks.** Every authenticated caller shares the session's one task
-//! and context space, as every caller shares it on a public door.
+//! **A scope limits methods; the credential limits tasks.** The operator token reaches every task
+//! of the session, as every caller of a public door does. Any other token reaches only the tasks a
+//! request carrying its credential started, through every method that names or lists a task:
+//! `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, a message's `taskId` and its
+//! `referenceTaskIds`. A task it does not reach is answered as one the session never held.
+//! `stream/watch` and `session/stop` are the session's own methods, and reach every task whatever
+//! the credential holding them started. [`crate::identity::TaskCaller`] states the rule.
 //!
 //! A token reaches no guest, no trace, no log, no error body and no `Debug` output. [`DoorToken`]
 //! implements neither `Display` nor `Serialize`, and [`DoorToken::expose`] is the one way to read
@@ -740,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn door_auth_formation_tokens_reach_their_audience_with_three_scopes() {
+    fn door_auth_formation_tokens_reach_their_audience_with_five_scopes() {
         let authority = crate::formation_credentials::FormationAuthority::for_test();
         let coder = formation_door(&authority, "coder");
         let token = authority.mint("planner", "coder");
@@ -751,7 +756,13 @@ mod tests {
         assert_eq!(grant.formation_caller(), Some("planner"));
         assert_eq!(
             FORMATION_CALL_SCOPES,
-            ["SendMessage", "GetTask", "CancelTask"]
+            [
+                "SendMessage",
+                "GetTask",
+                "CancelTask",
+                "ListTasks",
+                "SubscribeToTask"
+            ]
         );
         for scope in DOOR_SCOPES {
             assert_eq!(
@@ -932,8 +943,8 @@ mod tests {
             format!(
                 "warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is \
                  not declared — any caller that reaches it can call SendMessage, \
-                 SendStreamingMessage, stream/watch, GetTask, CancelTask, session/stop, and the \
-                 agent card publishes to any A2A client the session id, tools [bash], shell: \
+                 SendStreamingMessage, stream/watch, GetTask, ListTasks, CancelTask, \
+                 SubscribeToTask, session/stop, and the agent card publishes to any A2A client the session id, tools [bash], shell: \
                  true, network: true and planes [files] ({})",
                 security_warning_link(W_SEC_032)
             )
@@ -948,7 +959,8 @@ mod tests {
             "{published}"
         );
         assert!(
-            published.contains("can call stream/watch, GetTask, CancelTask, session/stop,"),
+            published
+                .contains("can call stream/watch, GetTask, ListTasks, CancelTask, session/stop,"),
             "{published}"
         );
     }

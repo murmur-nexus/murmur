@@ -956,12 +956,16 @@ token.
 | `SendMessage` | Starting a task with `SendMessage` |
 | `SendStreamingMessage` | Starting or continuing a task with `SendStreamingMessage`; the connection carries [that task's events](streaming-protocol.md#endpoints) while it is open |
 | `stream/watch` | Watching every task on the session |
-| `GetTask` | Reading any task on the session |
-| `CancelTask` | Cancelling any task on the session |
-| `session/stop` | Cancelling every task and reporting the residue |
+| `GetTask` | Reading a task the credential started |
+| `ListTasks` | Listing the tasks the credential started, a page at a time |
+| `CancelTask` | Cancelling a task the credential started |
+| `SubscribeToTask` | Streaming the rest of a live task the credential started |
+| `session/stop` | Cancelling every task on the session and reporting the residue |
 | `resources/files` | The [operator resource plane](resource-plane.md#operator-plane) under `/resources/files` |
 
-A scope names a method, not a task: every authenticated caller shares the session's tasks.
+A scope names a method. A declared credential's token reaches only the tasks a request carrying it
+started; the `operator` token reaches every task. `stream/watch` and `session/stop` reach every task
+whoever holds them — see [Agent Card: Who sees a task](agent-card.md#task-access).
 `GetExtendedAgentCard` takes no scope: every valid token reaches it. What the door answers each
 caller, and the public and extended cards, are in [Agent Card: Security](agent-card.md#security).
 

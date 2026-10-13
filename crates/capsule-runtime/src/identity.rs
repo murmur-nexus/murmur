@@ -7,8 +7,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::a2a::{
     read_send_params, A2aError, A2aTask, CancelOutcome, IncomingMessage, IncomingTask,
-    JsonRpcRequest, JsonRpcResponse, MurmurError, Part, Role, TaskRegistry, TaskState, TaskStatus,
-    DATA_MEDIA_TYPE, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, TEXT_MEDIA_TYPE,
+    JsonRpcRequest, JsonRpcResponse, ListCursor, MurmurError, Part, Role, StateFilter, TaskFilter,
+    TaskRegistry, TaskState, TaskStatus, DATA_MEDIA_TYPE, INTERNAL_ERROR, INVALID_PARAMS,
+    METHOD_NOT_FOUND, TEXT_MEDIA_TYPE,
 };
 use crate::cancel::{Arrival, LiveDelegations, Residue};
 use crate::control_plane::{handle_control_request, is_control_path, ControlPlane, ControlRequest};
@@ -79,19 +80,24 @@ pub(crate) enum DoorMethod {
     SendStreamingMessage,
     StreamWatch,
     GetTask,
+    ListTasks,
     CancelTask,
+    SubscribeToTask,
     SessionStop,
     GetExtendedAgentCard,
 }
 
 impl DoorMethod {
-    /// Every method, in the order the card lists them.
-    pub(crate) const ALL: [DoorMethod; 7] = [
+    /// Every method, in the order the card lists them: A2A v1.0's order, with murmur's own
+    /// methods beside the A2A methods they sit with.
+    pub(crate) const ALL: [DoorMethod; 9] = [
         DoorMethod::SendMessage,
         DoorMethod::SendStreamingMessage,
         DoorMethod::StreamWatch,
         DoorMethod::GetTask,
+        DoorMethod::ListTasks,
         DoorMethod::CancelTask,
+        DoorMethod::SubscribeToTask,
         DoorMethod::SessionStop,
         DoorMethod::GetExtendedAgentCard,
     ];
@@ -104,7 +110,9 @@ impl DoorMethod {
             DoorMethod::SendStreamingMessage => "SendStreamingMessage",
             DoorMethod::StreamWatch => "stream/watch",
             DoorMethod::GetTask => "GetTask",
+            DoorMethod::ListTasks => "ListTasks",
             DoorMethod::CancelTask => "CancelTask",
+            DoorMethod::SubscribeToTask => "SubscribeToTask",
             DoorMethod::SessionStop => "session/stop",
             DoorMethod::GetExtendedAgentCard => "GetExtendedAgentCard",
         }
@@ -125,9 +133,10 @@ impl DoorMethod {
     ///
     /// The only place a request's method is interpreted and the only place
     /// `lifecycle.task_acceptance` gates one: under `TaskAcceptance::None` neither task-starting
-    /// method is served. `GetExtendedAgentCard` is served only by an `authenticated` door, the only
-    /// kind with an extended card. The match is exact — no case folding, no trimming, no other
-    /// spelling — so a name the card lists is the name to send.
+    /// method is served, and neither is `SubscribeToTask`, which streams exactly when
+    /// `SendStreamingMessage` does. `GetExtendedAgentCard` is served only by an `authenticated`
+    /// door, the only kind with an extended card. The match is exact — no case folding, no
+    /// trimming, no other spelling — so a name the card lists is the name to send.
     pub(crate) fn resolve(
         method: &str,
         acceptance: &TaskAcceptance,
@@ -135,14 +144,27 @@ impl DoorMethod {
     ) -> Option<DoorMethod> {
         let resolved = Self::ALL.into_iter().find(|m| m.wire_name() == method)?;
         match (resolved, acceptance) {
-            (DoorMethod::SendMessage | DoorMethod::SendStreamingMessage, TaskAcceptance::None) => {
-                None
-            }
+            (
+                DoorMethod::SendMessage
+                | DoorMethod::SendStreamingMessage
+                | DoorMethod::SubscribeToTask,
+                TaskAcceptance::None,
+            ) => None,
             (DoorMethod::GetExtendedAgentCard, _) if !authenticated => None,
             _ => Some(resolved),
         }
     }
 }
+
+/// The four A2A v1.0 push notification config methods. None is a [`DoorMethod`]: the door answers
+/// each with `PushNotificationNotSupportedError` at the method step, before any scope or params
+/// check, as A2A prescribes for an agent whose card says `capabilities.pushNotifications: false`.
+pub(crate) const PUSH_CONFIG_METHODS: [&str; 4] = [
+    "CreateTaskPushNotificationConfig",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "DeleteTaskPushNotificationConfig",
+];
 
 /// The wire names of every method [`DoorMethod::resolve`] serves under `acceptance` on a door that
 /// is or is not `authenticated`, in `ALL` order.
@@ -195,31 +217,33 @@ pub(crate) struct TransportCapabilities {
 /// Whether a connection made with `method` can receive `frame` from a session on `transport`.
 ///
 /// Each frame's arm states which streaming methods carry it and which transports write it. Only
-/// `SendStreamingMessage`, on a connection that activated the stream extension, and `stream/watch`
-/// write frames; `stream/watch` alone writes the observer's `connection-ack` and `capsule-closed`.
+/// the two task streams, `SendStreamingMessage` and `SubscribeToTask`, on a connection that
+/// activated the stream extension, and `stream/watch` write frames; `stream/watch` alone writes the
+/// observer's `connection-ack` and `capsule-closed`.
 pub(crate) fn writes_frame(
     method: DoorMethod,
     frame: StreamFrame,
     transport: TransportKind,
 ) -> bool {
-    let (on_message_stream, on_stream_watch, transports): (bool, bool, &[TransportKind]) =
-        match frame {
-            StreamFrame::Text
-            | StreamFrame::Thinking
-            | StreamFrame::ToolCallStarted
-            | StreamFrame::ToolCallProgress
-            | StreamFrame::Artifact
-            | StreamFrame::Gap
-            | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
-            StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
-                (false, true, &TransportKind::ALL)
-            }
-        };
+    let (on_task_stream, on_stream_watch, transports): (bool, bool, &[TransportKind]) = match frame
+    {
+        StreamFrame::Text
+        | StreamFrame::Thinking
+        | StreamFrame::ToolCallStarted
+        | StreamFrame::ToolCallProgress
+        | StreamFrame::Artifact
+        | StreamFrame::Gap
+        | StreamFrame::Lagged => (true, true, &TransportKind::ALL),
+        StreamFrame::ConnectionAck | StreamFrame::CapsuleClosed => {
+            (false, true, &TransportKind::ALL)
+        }
+    };
     let carried = match method {
-        DoorMethod::SendStreamingMessage => on_message_stream,
+        DoorMethod::SendStreamingMessage | DoorMethod::SubscribeToTask => on_task_stream,
         DoorMethod::StreamWatch => on_stream_watch,
         DoorMethod::SendMessage
         | DoorMethod::GetTask
+        | DoorMethod::ListTasks
         | DoorMethod::CancelTask
         | DoorMethod::SessionStop
         | DoorMethod::GetExtendedAgentCard => false,
@@ -288,7 +312,7 @@ pub(crate) const CAPSULE_EXTENSION_URI: &str =
 const DOOR_EXTENSION_DESCRIPTION: &str = "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.";
 
 /// What the stream extension says about itself.
-const STREAM_EXTENSION_DESCRIPTION: &str = "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.";
+const STREAM_EXTENSION_DESCRIPTION: &str = "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.";
 
 /// The id of the one skill a door that starts tasks advertises: running a task.
 pub(crate) const TASK_SKILL_ID: &str = "task";
@@ -959,6 +983,8 @@ async fn handle_connection(
         .as_ref()
         .and_then(|grant| grant.formation_caller())
         .map(str::to_string);
+    // Which tasks the caller reaches, by the one rule every task-addressing method reads.
+    let caller = TaskCaller::of(grant.as_ref());
 
     // A capsule that does not consent to peer tasks refuses a peer-origin request here: after the
     // token, so an unauthenticated caller learns nothing the public card does not say, and before
@@ -1061,17 +1087,24 @@ async fn handle_connection(
         // door let in, since the card lists what it serves. A public door has no extended card,
         // and a door that starts no task does not stream, which its card's
         // `capabilities.streaming: false` says: A2A answers asking for either as an unsupported
-        // operation.
+        // operation. The card's `capabilities.pushNotifications: false` says the same of push,
+        // whose four config methods A2A answers `PushNotificationNotSupportedError`.
         let Some(resolved) = DoorMethod::resolve(&req.method, &task_acceptance, gate.is_some())
         else {
-            let response = if req.method == DoorMethod::GetExtendedAgentCard.wire_name() {
+            let streams = [
+                DoorMethod::SendStreamingMessage.wire_name(),
+                DoorMethod::SubscribeToTask.wire_name(),
+            ];
+            let response = if PUSH_CONFIG_METHODS.contains(&req.method.as_str()) {
+                crate::a2a::push_notification_not_supported(req.id)
+            } else if req.method == DoorMethod::GetExtendedAgentCard.wire_name() {
                 JsonRpcResponse::a2a_error(
                     req.id,
                     A2aError::UnsupportedOperation,
                     "this agent serves no extended agent card",
                     &[],
                 )
-            } else if req.method == DoorMethod::SendStreamingMessage.wire_name() {
+            } else if streams.contains(&req.method.as_str()) {
                 JsonRpcResponse::a2a_error(
                     req.id,
                     A2aError::UnsupportedOperation,
@@ -1126,6 +1159,15 @@ async fn handle_connection(
             return;
         }
 
+        // The card's one interface declares no tenant, so a request naming one names something
+        // this agent does not serve. `""` is the proto's unset value.
+        if let Some(response) = tenant_refusal(&req) {
+            let _ = writer_half
+                .write_all(response.into_http_response().as_bytes())
+                .await;
+            return;
+        }
+
         // The streaming methods own the connection; every other method answers one JSON body.
         let response = match resolved {
             DoorMethod::SendStreamingMessage => {
@@ -1139,7 +1181,28 @@ async fn handle_connection(
                         provenance,
                         forget_session,
                         caller_member,
+                        caller,
                     },
+                    StreamRequest {
+                        last_event_id,
+                        activated: crate::a2a::activates_extension(
+                            &a2a_extensions,
+                            STREAM_EXTENSION_URI,
+                        ),
+                    },
+                    sse_tx,
+                    sse_buffer,
+                    closing,
+                )
+                .await;
+                return;
+            }
+            DoorMethod::SubscribeToTask => {
+                handle_task_subscribe(
+                    writer_half,
+                    req,
+                    &task_registry,
+                    &caller,
                     StreamRequest {
                         last_event_id,
                         activated: crate::a2a::activates_extension(
@@ -1182,6 +1245,7 @@ async fn handle_connection(
                 provenance,
                 forget_session,
                 caller_member,
+                caller,
                 detached.as_ref(),
                 &live_delegations,
                 &session_id,
@@ -1250,7 +1314,8 @@ fn framed_bytes(response: &ResourceResponse) -> Vec<u8> {
     bytes
 }
 
-/// What a `SendStreamingMessage` request asked of its stream besides the message.
+/// What a `SendStreamingMessage` or `SubscribeToTask` request asked of its stream besides its
+/// params.
 pub(crate) struct StreamRequest {
     /// The `Last-Event-ID` the client resumes after.
     pub last_event_id: Option<u64>,
@@ -1356,15 +1421,8 @@ fn replay(
 /// with.
 ///
 /// Otherwise the stream opens with the task as the registry held it when the message was taken,
-/// unnumbered; then, for a `Last-Event-ID`, the `gap` when one applies and the buffered events of
-/// this task after the cursor; then its live events. Only this task's events are written, and
-/// murmur frames only to a connection that activated the stream extension. The stream ends after
-/// the task's terminal status, replayed or live, and after a live `TASK_STATE_INPUT_REQUIRED`.
-///
-/// A connection that lagged may have lost the status that ends it, so from then on each heartbeat
-/// reads the task from the registry. Once the task has ended, or waits for input, the connection
-/// writes that status as `GetTask` reports it, after the `response` artifact when the task has
-/// one, both unnumbered, and ends.
+/// unnumbered, and goes on as [`serve_task_stream`] serves it, ending after the task's terminal
+/// status or a live `TASK_STATE_INPUT_REQUIRED`, which the client answers on a new request.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message_stream(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
@@ -1375,14 +1433,14 @@ async fn handle_message_stream(
     request: StreamRequest,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
-    mut closing: watch::Receiver<bool>,
+    closing: watch::Receiver<bool>,
 ) {
     use tokio::io::AsyncWriteExt;
 
     // Subscribe before the message is routed, so no event the task writes once it is enqueued or
     // handed its input is missed. The sender is not kept: the channel closes once the session's
     // own senders are gone.
-    let mut rx = sse_tx.subscribe();
+    let rx = sse_tx.subscribe();
     drop(sse_tx);
 
     let routed = match read_send_params(&req.params) {
@@ -1414,12 +1472,158 @@ async fn handle_message_stream(
     {
         return;
     }
+    serve_task_stream(
+        connection,
+        &opening,
+        request.last_event_id,
+        rx,
+        task_registry,
+        &sse_buffer,
+        closing,
+        true,
+    )
+    .await;
+}
+
+/// `SubscribeToTask`: stream the rest of one task the caller may see and that has not ended.
+///
+/// Every refusal is one JSON-RPC body, written before any SSE head: `-32602` for a missing or
+/// empty `id`, `-32001` for a task the session never held or [`visible_to`] hides from `caller`,
+/// and `-32004` naming the task and its state for a task that has ended.
+///
+/// Otherwise the stream opens with the task exactly as `GetTask` reports it at that moment,
+/// unnumbered, and goes on as [`serve_task_stream`] serves it. It ends only after the task's
+/// terminal status: a subscriber watches a task, and the reply to a task waiting for input
+/// arrives on a request of its own, after which the subscriber sees the task resume.
+#[allow(clippy::too_many_arguments)]
+async fn handle_task_subscribe(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    req: JsonRpcRequest,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    caller: &TaskCaller,
+    request: StreamRequest,
+    sse_tx: SseBroadcast,
+    sse_buffer: Arc<Mutex<SseEventBuffer>>,
+    closing: watch::Receiver<bool>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    // Subscribe before the task is read, so no event emitted after the read is lost. One emitted
+    // between the two is both in the opening task and delivered live, which the stream tolerates.
+    let rx = sse_tx.subscribe();
+    drop(sse_tx);
+
+    let opening = match subscribable_task(&req, task_registry, caller) {
+        Ok(task) => task,
+        Err(response) => {
+            let _ = writer
+                .write_all(response.into_http_response().as_bytes())
+                .await;
+            return;
+        }
+    };
+    let Ok(mut connection) = StreamConnection::open(writer, &req.id, request.activated).await
+    else {
+        return;
+    };
+    if connection
+        .write(None, &task_result(&opening))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    serve_task_stream(
+        connection,
+        &opening,
+        request.last_event_id,
+        rx,
+        task_registry,
+        &sse_buffer,
+        closing,
+        false,
+    )
+    .await;
+}
+
+/// The task a `SubscribeToTask` request names, as `GetTask` reports it, or the error refusing the
+/// request.
+fn subscribable_task(
+    req: &JsonRpcRequest,
+    task_registry: &Mutex<TaskRegistry>,
+    caller: &TaskCaller,
+) -> Result<A2aTask, JsonRpcResponse> {
+    let Some(task_id) = req
+        .params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.is_empty())
+    else {
+        return Err(JsonRpcResponse::err(
+            req.id.clone(),
+            INVALID_PARAMS,
+            "SubscribeToTask requires an id",
+        ));
+    };
+    let reg = task_registry.lock().unwrap();
+    let Some(task) = reg
+        .get_task(task_id)
+        .filter(|_| visible_to(&reg, task_id, caller))
+    else {
+        return Err(task_not_found_response(req.id.clone(), Some(task_id)));
+    };
+    if task.status.state.is_terminal() {
+        let state = task.status.state.wire_name();
+        return Err(JsonRpcResponse::a2a_error(
+            req.id.clone(),
+            A2aError::UnsupportedOperation,
+            &format!("task {task_id} has ended in {state}; there is nothing left to subscribe to"),
+            &[
+                ("taskId", task_id.to_string()),
+                ("state", state.to_string()),
+            ],
+        ));
+    }
+    Ok(task)
+}
+
+/// The part of a task stream after its opening `task`, which both `SendStreamingMessage` and
+/// `SubscribeToTask` write: for a `last_event_id`, the `gap` when one applies and the buffered
+/// events of this task after the cursor, then its live events. Only this task's events are
+/// written, and murmur frames, `gap` and `lagged` only to a connection that activated the stream
+/// extension.
+///
+/// The stream ends after the task's terminal status, replayed or live, when the door closes, or
+/// when the broadcast ends. With `ends_on_input_required` it also ends after a live
+/// `TASK_STATE_INPUT_REQUIRED`; a replayed one never ends it, since the task has left that state by
+/// the time a continuation replays it.
+///
+/// A connection that lagged may have lost the status that ends it, so from then on each heartbeat
+/// reads the task from the registry. Once the task has ended, or waits for input when that ends the
+/// stream, the connection writes that status as `GetTask` reports it, after the `response`
+/// artifact when the task has one, both unnumbered, and ends.
+#[allow(clippy::too_many_arguments)]
+async fn serve_task_stream(
+    mut connection: StreamConnection,
+    opening: &A2aTask,
+    last_event_id: Option<u64>,
+    mut rx: tokio::sync::broadcast::Receiver<Arc<StreamEvent>>,
+    task_registry: &Mutex<TaskRegistry>,
+    sse_buffer: &Mutex<SseEventBuffer>,
+    mut closing: watch::Receiver<bool>,
+    ends_on_input_required: bool,
+) {
     let task = StreamTask::new(&opening.id, &opening.context_id);
     // The state of the last status written for the task, which a carrier repeats.
-    let mut state = opening.status.state;
+    let mut state = opening.status.state.clone();
+    let ends = |end: Option<StreamEnd>| match end {
+        Some(StreamEnd::Terminal) => true,
+        Some(StreamEnd::Interrupted) => ends_on_input_required,
+        None => false,
+    };
 
-    if let Some(last_id) = request.last_event_id {
-        let (gap, events) = replay(&sse_buffer, last_id);
+    if let Some(last_id) = last_event_id {
+        let (gap, events) = replay(sse_buffer, last_id);
         if let (Some(first_available_id), true) = (gap, connection.activated) {
             let frame = MurmurFrame::Gap { first_available_id };
             if connection
@@ -1444,8 +1648,6 @@ async fn handle_message_stream(
             if let Some(written) = &event.state {
                 state = written.clone();
             }
-            // A replayed `input-required` does not end the stream: the task has left that state
-            // by the time a continuation replays it.
             if event.ends == Some(StreamEnd::Terminal) {
                 return;
             }
@@ -1466,7 +1668,9 @@ async fn handle_message_stream(
                 if !lagged {
                     continue;
                 }
-                let Some(results) = lost_stream_end(task_registry, &task) else {
+                let Some(results) =
+                    lost_stream_end(task_registry, &task, ends_on_input_required)
+                else {
                     continue;
                 };
                 for result in results {
@@ -1491,7 +1695,7 @@ async fn handle_message_stream(
                         if let Some(written) = &event.state {
                             state = written.clone();
                         }
-                        if event.ends.is_some() {
+                        if ends(event.ends) {
                             return;
                         }
                     }
@@ -1520,18 +1724,23 @@ async fn handle_message_stream(
 }
 
 /// The events that end `task`'s stream, read from the registry for a connection that may have
-/// lost them, or `None` while the task is neither ended nor waiting for input.
+/// lost them, or `None` while the task has not ended and, unless `ends_on_input_required`, while it
+/// waits for input.
 ///
 /// An ended task's are what [`crate::streaming::emit_task_ending`] writes, read from `GetTask`'s
 /// view once its ending is recorded: a cancel records the state before the task stops, and the
 /// ending after. A task waiting for input is its `input-required` status carrying the prompt.
-fn lost_stream_end(task_registry: &Mutex<TaskRegistry>, task: &StreamTask) -> Option<Vec<String>> {
+fn lost_stream_end(
+    task_registry: &Mutex<TaskRegistry>,
+    task: &StreamTask,
+    ends_on_input_required: bool,
+) -> Option<Vec<String>> {
     let reg = task_registry.lock().unwrap();
     let held = reg.get_task(&task.task_id)?;
     if held.status.state.is_terminal() && reg.has_ending(&task.task_id) {
         return Some(ending_results(&held));
     }
-    if held.status.state != TaskState::InputRequired {
+    if !ends_on_input_required || held.status.state != TaskState::InputRequired {
         return None;
     }
     let prompt = held
@@ -1741,6 +1950,7 @@ fn handle_jsonrpc(
     provenance: TaskProvenance,
     forget_session: bool,
     caller_member: Option<String>,
+    caller: TaskCaller,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
     session_id: &str,
@@ -1757,16 +1967,16 @@ fn handle_jsonrpc(
                 provenance,
                 forget_session,
                 caller_member,
+                caller,
             },
         ),
-        DoorMethod::GetTask => {
-            handle_tasks_get(id, &req.params, task_registry, caller_member.as_deref())
-        }
+        DoorMethod::GetTask => handle_tasks_get(id, &req.params, task_registry, &caller),
+        DoorMethod::ListTasks => handle_tasks_list(id, &req.params, task_registry, &caller),
         DoorMethod::CancelTask => handle_tasks_cancel(
             id,
             &req.params,
             task_registry,
-            caller_member.as_deref(),
+            &caller,
             detached,
             live_delegations,
         ),
@@ -1774,6 +1984,7 @@ fn handle_jsonrpc(
             handle_session_stop(id, task_registry, detached, live_delegations, session_id)
         }
         DoorMethod::SendStreamingMessage
+        | DoorMethod::SubscribeToTask
         | DoorMethod::StreamWatch
         | DoorMethod::GetExtendedAgentCard => {
             unreachable!("handle_connection answers the streaming methods and the extended card")
@@ -1787,8 +1998,43 @@ pub(crate) struct MessageSender {
     pub traceparent: Option<String>,
     pub provenance: TaskProvenance,
     pub forget_session: bool,
-    /// The formation member that sent it, when the door let it in on a formation token.
+    /// The formation member that sent it, when the door let it in on a formation token. Recorded
+    /// on the task it starts for the trace, and decides nothing.
     pub caller_member: Option<String>,
+    /// Which tasks the sender reaches, and so whom a task it starts belongs to.
+    pub caller: TaskCaller,
+}
+
+/// Who is calling, as far as which tasks it reaches: the one rule [`visible_to`] reads for every
+/// method that names or lists a task.
+///
+/// | Caller | Reaches |
+/// |---|---|
+/// | any caller of a public door | every task of the session |
+/// | the operator token | every task of the session |
+/// | a declared credential's token | the tasks a request carrying that credential started |
+/// | a formation token, credential `member:<from>` | the tasks that member started |
+///
+/// The session's own methods, `stream/watch` and `session/stop`, are not task methods: whoever
+/// holds their scope reaches every task through them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskCaller {
+    /// A caller of a public door, or the holder of the operator token.
+    Session,
+    /// The holder of any other token, by the credential it was minted for.
+    Credential(String),
+}
+
+impl TaskCaller {
+    /// The caller a request is, from the grant the door let it in on, or `None` on a public door.
+    pub(crate) fn of(grant: Option<&crate::door_auth::DoorGrant>) -> TaskCaller {
+        match grant {
+            Some(grant) if grant.credential() != murmur_artifact::OPERATOR_CREDENTIAL => {
+                TaskCaller::Credential(grant.credential().to_string())
+            }
+            _ => TaskCaller::Session,
+        }
+    }
 }
 
 /// What [`route_message`] did with a message.
@@ -1811,7 +2057,7 @@ enum MessageRoute {
 /// | The message names | Route |
 /// |---|---|
 /// | no `taskId` | a new task: [`MessageRoute::Rejected`] when the registry cannot accept one, otherwise [`MessageRoute::Started`] |
-/// | a task the registry does not hold, or one `sender` may not see | `-32001` `TaskNotFoundError` |
+/// | a task the registry does not hold, or one [`visible_to`] hides from `sender` | `-32001` `TaskNotFoundError` |
 /// | an ended task | `-32004` `UnsupportedOperationError` naming its state |
 /// | a `submitted` or `working` task | `-32004` naming its state: a task takes a message only while it waits for input |
 /// | an `input-required` task in another `contextId` | `-32602` |
@@ -1828,7 +2074,7 @@ fn route_message(
     sender: MessageSender,
 ) -> MessageRoute {
     let mut reg = task_registry.lock().unwrap();
-    let caller = sender.caller_member.as_deref();
+    let caller = &sender.caller;
     let mut text = message.agent_text();
     if let Some(block) = reg.reference_block(&message.reference_task_ids, |task_id| {
         visible_to(&reg, task_id, caller)
@@ -1931,8 +2177,8 @@ fn start_task(
         return MessageRoute::Rejected(task);
     }
     reg.enqueue(&task_id, &context_id);
-    if let Some(member) = &sender.caller_member {
-        reg.record_submitter(&task_id, member);
+    if let TaskCaller::Credential(credential) = &sender.caller {
+        reg.record_owner(&task_id, credential);
     }
 
     let part_kinds = message.part_kinds();
@@ -1952,8 +2198,7 @@ fn start_task(
     // Capacity was checked under this lock, so the channel has room; a failure is unexpected and
     // takes the task back out of the registry.
     if task_tx.try_send(incoming).is_err() {
-        reg.pending_count -= 1;
-        reg.history.remove(&task_id);
+        reg.withdraw(&task_id);
         return MessageRoute::Refused(JsonRpcResponse::err(
             id.clone(),
             INTERNAL_ERROR,
@@ -1992,10 +2237,30 @@ fn handle_message_send(
     JsonRpcResponse::ok(id, serde_json::json!({ "task": task })).into_http_response()
 }
 
-/// Whether `caller_member` may read or cancel `task_id`: the operator (`None`) reaches every
-/// task, a formation member only the tasks it submitted itself.
-fn visible_to(reg: &TaskRegistry, task_id: &str, caller_member: Option<&str>) -> bool {
-    caller_member.is_none_or(|member| reg.submitter(task_id) == Some(member))
+/// Whether `caller` reaches `task_id`, by the rule [`TaskCaller`] states: a session caller every
+/// task, any other credential only the tasks it started.
+///
+/// Every path that reads, lists, cancels, continues, subscribes to or references a task decides
+/// here, and answers a task it hides exactly as one the session never held.
+fn visible_to(reg: &TaskRegistry, task_id: &str, caller: &TaskCaller) -> bool {
+    match caller {
+        TaskCaller::Session => true,
+        TaskCaller::Credential(credential) => reg.owner(task_id) == Some(credential.as_str()),
+    }
+}
+
+/// The `-32602` answering a request whose `params.tenant` is present and is anything but `""`,
+/// the proto's unset value, or `None`. The door's one interface declares no tenant.
+fn tenant_refusal(req: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    let tenant = req.params.get("tenant").filter(|tenant| *tenant != "")?;
+    Some(JsonRpcResponse::err(
+        req.id.clone(),
+        INVALID_PARAMS,
+        &format!(
+            "Invalid params: tenant {tenant} names a tenant; this agent serves no tenants, so \
+             omit tenant"
+        ),
+    ))
 }
 
 /// The `TaskNotFoundError` answering a request that named `task_id`, or named none.
@@ -2015,16 +2280,13 @@ fn task_not_found_response(id: Value, task_id: Option<&str>) -> JsonRpcResponse 
 /// `GetTask`: one task's state, and how it ended once it has. `params.id` is required, and
 /// `historyLength` is ignored: the door keeps no message history, so a task carries none.
 ///
-/// A formation member — `caller_member`, from the formation token the door let in — reads only
-/// the tasks it submitted itself. Every other id, another member's task or the operator's
-/// included, gets the same [`A2aError::TaskNotFound`] an id this capsule never held gets. A
-/// formation token reaches no `SendStreamingMessage`, so `GetTask` is the only way a member reads
-/// a task.
+/// A task [`visible_to`] hides from `caller` gets the same [`A2aError::TaskNotFound`] an id this
+/// capsule never held gets.
 fn handle_tasks_get(
     id: Value,
     params: &Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
-    caller_member: Option<&str>,
+    caller: &TaskCaller,
 ) -> String {
     let Some(task_id) = params
         .get("id")
@@ -2039,11 +2301,157 @@ fn handle_tasks_get(
     let reg = task_registry.lock().unwrap();
     match reg
         .get_task(&task_id)
-        .filter(|_| visible_to(&reg, &task_id, caller_member))
+        .filter(|_| visible_to(&reg, &task_id, caller))
     {
         Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
         None => task_not_found(id, Some(&task_id)),
     }
+}
+
+/// How many tasks a `ListTasks` page holds when the request names no `pageSize`.
+const DEFAULT_LIST_PAGE_SIZE: u64 = 50;
+
+/// The most tasks a `ListTasks` page holds: a larger `pageSize` is lowered to this, as A2A lets a
+/// server return fewer than asked.
+const MAX_LIST_PAGE_SIZE: u64 = 100;
+
+/// What a `ListTasks` request asks for, as [`read_list_params`] reads it.
+#[derive(Debug, Clone, PartialEq)]
+struct ListRequest {
+    filter: TaskFilter,
+    /// After lowering to [`MAX_LIST_PAGE_SIZE`].
+    page_size: u64,
+    /// The position the page starts after, or `None` for the first page.
+    after: Option<ListCursor>,
+    include_artifacts: bool,
+}
+
+/// The `ListTasksRequest` in `params`, or the error answering request `id`.
+///
+/// Read by hand, in this order, each failure `-32602` naming the parameter but one: `contextId` is
+/// a string, `""` for no filter; `status` is a v1.0 `TaskState` name, `TASK_STATE_UNSPECIFIED` for
+/// no filter; `pageSize` is an integer from 1, [`DEFAULT_LIST_PAGE_SIZE`] when absent; `pageToken`
+/// is `""` or a token this door issued; `statusTimestampAfter` is absent or `null`, and anything
+/// else is `-32004`, since the door records no status timestamps; `includeArtifacts` is a
+/// boolean. `historyLength` and unknown members are ignored.
+fn read_list_params(id: &Value, params: &Value) -> Result<ListRequest, JsonRpcResponse> {
+    let invalid = |message: &str| {
+        Err(JsonRpcResponse::err(
+            id.clone(),
+            INVALID_PARAMS,
+            &format!("Invalid params: {message}"),
+        ))
+    };
+    let context_id = match params.get("contextId") {
+        None => None,
+        Some(Value::String(context_id)) => Some(context_id.clone()).filter(|c| !c.is_empty()),
+        Some(_) => return invalid("contextId must be a string"),
+    };
+    let state = match params.get("status") {
+        None => StateFilter::Any,
+        Some(Value::String(state)) => match StateFilter::from_wire_name(state) {
+            Some(filter) => filter,
+            None => {
+                return invalid(&format!(
+                    "status \"{state}\" is not an A2A v1.0 TaskState name, such as {}",
+                    TaskState::Working.wire_name()
+                ))
+            }
+        },
+        Some(_) => return invalid("status must be an A2A v1.0 TaskState name"),
+    };
+    let page_size = match params.get("pageSize") {
+        None => DEFAULT_LIST_PAGE_SIZE,
+        Some(size) => match size.as_u64().filter(|size| *size >= 1) {
+            Some(size) => size.min(MAX_LIST_PAGE_SIZE),
+            None => {
+                return invalid(&format!(
+                    "pageSize must be an integer of at least 1; a size above \
+                     {MAX_LIST_PAGE_SIZE} is answered with {MAX_LIST_PAGE_SIZE}"
+                ))
+            }
+        },
+    };
+    let after = match params.get("pageToken") {
+        None => None,
+        Some(Value::String(token)) if token.is_empty() => None,
+        Some(Value::String(token)) => match ListCursor::decode(token) {
+            Some(cursor) => Some(cursor),
+            None => return invalid("pageToken is not a nextPageToken this agent issued"),
+        },
+        Some(_) => return invalid("pageToken must be a string"),
+    };
+    if params
+        .get("statusTimestampAfter")
+        .is_some_and(|after| !after.is_null())
+    {
+        return Err(JsonRpcResponse::a2a_error(
+            id.clone(),
+            A2aError::UnsupportedOperation,
+            "statusTimestampAfter is not supported: this agent records no status timestamps",
+            &[("parameter", "statusTimestampAfter".to_string())],
+        ));
+    }
+    let include_artifacts = match params.get("includeArtifacts") {
+        None => false,
+        Some(Value::Bool(include)) => *include,
+        Some(_) => return invalid("includeArtifacts must be a boolean"),
+    };
+    Ok(ListRequest {
+        filter: TaskFilter { context_id, state },
+        page_size,
+        after,
+        include_artifacts,
+    })
+}
+
+/// `ListTasks`: one page of the tasks [`visible_to`] lets `caller` see, newest change first, as a
+/// `ListTasksResponse` whose four members are always present.
+///
+/// Each task is exactly what `GetTask` answers for it, except that `artifacts` is absent unless
+/// `includeArtifacts` is `true`, and then is the task's artifacts or `[]`. `nextPageToken` is `""`
+/// on the last page, `pageSize` is the size used, and `totalSize` counts every visible task that
+/// matches the filters. The filters and visibility apply afresh to every page: a token names a
+/// position, nothing more.
+fn handle_tasks_list(
+    id: Value,
+    params: &Value,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    caller: &TaskCaller,
+) -> String {
+    let request = match read_list_params(&id, params) {
+        Ok(request) => request,
+        Err(response) => return response.into_http_response(),
+    };
+    let page = {
+        let reg = task_registry.lock().unwrap();
+        reg.list_tasks(
+            &request.filter,
+            request.after.as_ref(),
+            usize::try_from(request.page_size).unwrap_or(usize::MAX),
+            |task_id| visible_to(&reg, task_id, caller),
+        )
+    };
+    let tasks: Vec<A2aTask> = page
+        .tasks
+        .into_iter()
+        .map(|mut task| {
+            task.artifacts = request
+                .include_artifacts
+                .then(|| task.artifacts.unwrap_or_default());
+            task
+        })
+        .collect();
+    JsonRpcResponse::ok(
+        id,
+        serde_json::json!({
+            "tasks": tasks,
+            "nextPageToken": page.next.as_ref().map(ListCursor::encode).unwrap_or_default(),
+            "pageSize": request.page_size,
+            "totalSize": page.total,
+        }),
+    )
+    .into_http_response()
 }
 
 /// `CancelTask`: stop one task and report what is still running.
@@ -2057,14 +2465,13 @@ fn handle_tasks_get(
 /// the task and the state it ended in, spelled as `GetTask` spells it. An id this capsule never
 /// held is the same [`A2aError::TaskNotFound`] `GetTask` answers with.
 ///
-/// A formation member — `caller_member` — cancels only the tasks it submitted itself, by the
-/// same [`visible_to`] rule `GetTask` reads by: any other id gets that same `TaskNotFound`, and
-/// nothing is cancelled.
+/// A task [`visible_to`] hides from `caller` gets that same `TaskNotFound`, and nothing is
+/// cancelled.
 fn handle_tasks_cancel(
     id: Value,
     params: &Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
-    caller_member: Option<&str>,
+    caller: &TaskCaller,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
 ) -> String {
@@ -2079,7 +2486,7 @@ fn handle_tasks_cancel(
 
     let (outcome, task) = {
         let mut reg = task_registry.lock().unwrap();
-        if !visible_to(&reg, &task_id, caller_member) {
+        if !visible_to(&reg, &task_id, caller) {
             return task_not_found(id, Some(&task_id));
         }
         let outcome = reg.request_cancel(&task_id);
@@ -2215,12 +2622,17 @@ mod tests {
     #[test]
     fn stream_extension_send_streaming_message_carries_the_first_seven_frames() {
         for transport in TransportKind::ALL {
-            let carried: Vec<&str> = StreamFrame::ALL
-                .into_iter()
-                .filter(|&frame| writes_frame(DoorMethod::SendStreamingMessage, frame, transport))
-                .map(StreamFrame::wire_name)
-                .collect();
-            assert_eq!(carried, ALL_FRAMES[..7], "{transport:?}");
+            for method in [
+                DoorMethod::SendStreamingMessage,
+                DoorMethod::SubscribeToTask,
+            ] {
+                let carried: Vec<&str> = StreamFrame::ALL
+                    .into_iter()
+                    .filter(|&frame| writes_frame(method, frame, transport))
+                    .map(StreamFrame::wire_name)
+                    .collect();
+                assert_eq!(carried, ALL_FRAMES[..7], "{method:?} {transport:?}");
+            }
             let watched: Vec<&str> = StreamFrame::ALL
                 .into_iter()
                 .filter(|&frame| writes_frame(DoorMethod::StreamWatch, frame, transport))
@@ -2242,9 +2654,9 @@ mod tests {
         assert_eq!(
             stream["description"],
             "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on \
-             SendStreamingMessage when the request's A2A-Extensions header names this URI, and \
-             always on stream/watch. Each is carried in a StreamResponse under metadata keyed by \
-             this URI."
+             SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header \
+             names this URI, and always on stream/watch. Each is carried in a StreamResponse under \
+             metadata keyed by this URI."
         );
         assert_eq!(stream["required"], false);
     }
@@ -2411,7 +2823,7 @@ mod tests {
                             "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
                             "required": false,
                             "params": {
-                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
+                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop"],
                                 "peerTasks": false
                             }
                         },
@@ -2429,7 +2841,7 @@ mod tests {
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
                             "required": false,
                             "params": {
                                 "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -2984,13 +3396,13 @@ mod tests {
                             "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
                             "required": false,
                             "params": {
-                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"],
+                                "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop", "GetExtendedAgentCard"],
                                 "peerTasks": false
                             }
                         },
                         {
                             "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+                            "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
                             "required": false,
                             "params": {
                                 "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -3047,10 +3459,10 @@ mod tests {
                     "extendedAgentCard": true,
                     "extensions": [
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1", "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.", "required": false,
-                          "params": { "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"], "peerTasks": false } },
+                          "params": { "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop", "GetExtendedAgentCard"], "peerTasks": false } },
                         { "uri": "https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1", "description": "The session answering this address and what the capsule may do. Served only to authenticated callers once the door authenticates.", "required": false,
                           "params": { "sessionId": "ses_019f01a940ce7761854e768ecbe3d399", "tools": ["bash"], "shell": true, "network": true, "planes": ["files"] } },
-                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.", "required": false,
+                        { "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1", "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.", "required": false,
                           "params": { "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"] } }
                     ]
                 },
@@ -3112,6 +3524,7 @@ mod tests {
             [
                 "stream/watch",
                 "GetTask",
+                "ListTasks",
                 "CancelTask",
                 "session/stop",
                 "GetExtendedAgentCard"
@@ -3245,7 +3658,15 @@ mod tests {
             provenance: TaskProvenance::derive(TaskOrigin::User, None),
             forget_session: false,
             caller_member: caller.map(str::to_string),
+            caller: caller.map_or(TaskCaller::Session, |member| {
+                TaskCaller::Credential(format!("member:{member}"))
+            }),
         }
+    }
+
+    /// The caller holding a token of `credential`.
+    fn credential(credential: &str) -> TaskCaller {
+        TaskCaller::Credential(credential.to_string())
     }
 
     fn response_json(response: &str) -> Value {
@@ -3291,9 +3712,9 @@ mod tests {
         {
             let mut reg = task_registry.lock().unwrap();
             reg.enqueue("tsk_mine", "ctx_mine");
-            reg.record_submitter("tsk_mine", "planner");
+            reg.record_owner("tsk_mine", "member:planner");
             reg.enqueue("tsk_theirs", "ctx_theirs");
-            reg.record_submitter("tsk_theirs", "reviewer");
+            reg.record_owner("tsk_theirs", "member:reviewer");
             reg.enqueue("tsk_operator", "ctx_operator");
         }
         let live = LiveDelegations::new();
@@ -3302,7 +3723,7 @@ mod tests {
                 serde_json::json!(1),
                 &serde_json::json!({"id": task_id}),
                 &task_registry,
-                Some("planner"),
+                &credential("member:planner"),
                 None,
                 &live,
             ))
@@ -3356,7 +3777,7 @@ mod tests {
             serde_json::json!(1),
             &serde_json::json!({"id": "tsk_refused"}),
             &task_registry,
-            None,
+            &TaskCaller::Session,
         );
 
         assert!(
@@ -3393,8 +3814,9 @@ mod tests {
         message
     }
 
-    /// A registry holding `tsk_wait`, which `planner` submitted and which waits for input in
-    /// `ctx_wait`, with `tsk_done` completed and `tsk_queued` submitted, both by the operator. Its queue is full, so it has no room for a new task.
+    /// A registry holding `tsk_wait`, which `planner` started and which waits for input in
+    /// `ctx_wait`, with `tsk_done` completed and `tsk_queued` submitted, both by the operator. Its
+    /// queue is full, so it has no room for a new task.
     fn routing_registry() -> (Arc<Mutex<TaskRegistry>>, oneshot::Receiver<String>) {
         let mut reg = TaskRegistry::new(4, TaskAcceptance::Queue);
         reg.enqueue("tsk_done", "ctx_done");
@@ -3406,7 +3828,7 @@ mod tests {
         reg.finish_task(TaskState::Completed);
         reg.record_ending("tsk_done", "done", Some("four"), false, &[]);
         reg.enqueue("tsk_wait", "ctx_wait");
-        reg.record_submitter("tsk_wait", "planner");
+        reg.record_owner("tsk_wait", "member:planner");
         reg.start_task(
             "tsk_wait".to_string(),
             "ctx_wait".to_string(),
@@ -3655,7 +4077,7 @@ mod tests {
                 serde_json::json!(1),
                 &params,
                 &registry,
-                None,
+                &TaskCaller::Session,
             ));
             assert_eq!(answer["error"]["code"], -32602, "{answer}");
             assert_eq!(answer["error"]["message"], "GetTask requires an id");
@@ -3664,9 +4086,230 @@ mod tests {
             serde_json::json!(1),
             &serde_json::json!({"id": "tsk_done", "historyLength": 3}),
             &registry,
-            None,
+            &TaskCaller::Session,
         ));
         assert_eq!(answer["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+    }
+
+    /// One `ListTasks` answer for `caller`.
+    fn list(registry: &Arc<Mutex<TaskRegistry>>, caller: &TaskCaller, params: Value) -> Value {
+        response_json(&handle_tasks_list(
+            serde_json::json!(1),
+            &params,
+            registry,
+            caller,
+        ))
+    }
+
+    /// Each parameter is read in its documented order, and each refusal names it.
+    #[test]
+    fn list_params_are_refused_by_name() {
+        let (registry, _waiter) = routing_registry();
+        for (params, code, names) in [
+            (serde_json::json!({"contextId": 7}), -32602, "contextId"),
+            (serde_json::json!({"status": "done"}), -32602, "status"),
+            (serde_json::json!({"status": 3}), -32602, "status"),
+            (serde_json::json!({"pageSize": 0}), -32602, "pageSize"),
+            (serde_json::json!({"pageSize": -1}), -32602, "pageSize"),
+            (serde_json::json!({"pageSize": 2.5}), -32602, "pageSize"),
+            (serde_json::json!({"pageSize": "2"}), -32602, "pageSize"),
+            (
+                serde_json::json!({"pageToken": "not-a-token"}),
+                -32602,
+                "pageToken",
+            ),
+            (serde_json::json!({"pageToken": 1}), -32602, "pageToken"),
+            (
+                serde_json::json!({"statusTimestampAfter": "2026-10-01T00:00:00Z"}),
+                -32004,
+                "statusTimestampAfter",
+            ),
+            (
+                serde_json::json!({"includeArtifacts": "yes"}),
+                -32602,
+                "includeArtifacts",
+            ),
+            // The first refused parameter in reading order is the one named.
+            (
+                serde_json::json!({"includeArtifacts": 1, "status": "done"}),
+                -32602,
+                "status",
+            ),
+        ] {
+            let answer = list(&registry, &TaskCaller::Session, params.clone());
+            assert_eq!(answer["error"]["code"], code, "{params}: {answer}");
+            let message = answer["error"]["message"].as_str().unwrap();
+            assert!(message.contains(names), "{params}: {message}");
+        }
+        let unsupported = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"statusTimestampAfter": "2026-10-01T00:00:00Z"}),
+        );
+        assert_eq!(
+            unsupported["error"]["data"][0]["metadata"],
+            serde_json::json!({"parameter": "statusTimestampAfter"})
+        );
+        for accepted in [
+            serde_json::json!({}),
+            serde_json::json!({"contextId": "", "status": "TASK_STATE_UNSPECIFIED",
+                "pageToken": "", "statusTimestampAfter": null, "historyLength": 3,
+                "includeArtifacts": false, "somethingElse": true}),
+        ] {
+            let answer = list(&registry, &TaskCaller::Session, accepted.clone());
+            assert_eq!(answer["result"]["totalSize"], 3, "{accepted}: {answer}");
+            assert_eq!(answer["result"]["pageSize"], 50, "{accepted}: {answer}");
+            assert_eq!(
+                answer["result"]["nextPageToken"], "",
+                "{accepted}: {answer}"
+            );
+        }
+        let lowered = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"pageSize": 500}),
+        );
+        assert_eq!(lowered["result"]["pageSize"], 100, "{lowered}");
+        let nothing = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"status": "TASK_STATE_AUTH_REQUIRED"}),
+        );
+        assert_eq!(
+            nothing["result"],
+            serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 50, "totalSize": 0})
+        );
+    }
+
+    /// A credential lists only the tasks it started; a session caller lists every task. Each
+    /// listed task is `GetTask`'s, with `artifacts` only when asked for.
+    #[test]
+    fn list_tasks_shows_each_caller_what_it_may_see() {
+        let (registry, _waiter) = routing_registry();
+        let ids = |answer: &Value| -> Vec<String> {
+            answer["result"]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let planner = list(
+            &registry,
+            &credential("member:planner"),
+            serde_json::json!({}),
+        );
+        assert_eq!(ids(&planner), ["tsk_wait"]);
+        assert_eq!(planner["result"]["totalSize"], 1);
+        let alice = list(&registry, &credential("alice"), serde_json::json!({}));
+        assert_eq!(
+            alice["result"],
+            serde_json::json!({"tasks": [], "nextPageToken": "", "pageSize": 50, "totalSize": 0})
+        );
+        let session = list(&registry, &TaskCaller::Session, serde_json::json!({}));
+        assert_eq!(ids(&session), ["tsk_queued", "tsk_wait", "tsk_done"]);
+
+        let reg = registry.lock().unwrap();
+        for task in session["result"]["tasks"].as_array().unwrap() {
+            let mut held =
+                serde_json::to_value(reg.get_task(task["id"].as_str().unwrap())).unwrap();
+            held.as_object_mut().unwrap().remove("artifacts");
+            assert_eq!(*task, held);
+        }
+        drop(reg);
+        let with = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"includeArtifacts": true}),
+        );
+        let tasks = with["result"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["artifacts"], serde_json::json!([]), "{with}");
+        assert_eq!(tasks[1]["artifacts"][0]["artifactId"], "prompt", "{with}");
+        assert_eq!(tasks[2]["artifacts"][0]["artifactId"], "response", "{with}");
+
+        let first = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"pageSize": 2}),
+        );
+        assert_eq!(ids(&first), ["tsk_queued", "tsk_wait"]);
+        let token = first["result"]["nextPageToken"].as_str().unwrap();
+        assert!(!token.is_empty());
+        let second = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"pageSize": 2, "pageToken": token}),
+        );
+        assert_eq!(ids(&second), ["tsk_done"]);
+        assert_eq!(second["result"]["nextPageToken"], "");
+        let foreign = list(
+            &registry,
+            &credential("member:planner"),
+            serde_json::json!({"pageSize": 2, "pageToken": token}),
+        );
+        assert_eq!(
+            ids(&foreign),
+            Vec::<String>::new(),
+            "a token is a position only"
+        );
+    }
+
+    /// A tenant other than the proto's unset `""` is refused, and nothing else is.
+    #[test]
+    fn tenant_is_refused_unless_unset() {
+        let req = |params: Value| JsonRpcRequest {
+            id: serde_json::json!(1),
+            method: "GetTask".to_string(),
+            params,
+        };
+        for tenant in [
+            serde_json::json!("acme"),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!({}),
+        ] {
+            let refused = tenant_refusal(&req(serde_json::json!({"tenant": tenant})))
+                .expect("a tenant is refused");
+            let answer = serde_json::to_value(&refused).unwrap();
+            assert_eq!(answer["error"]["code"], -32602, "{answer}");
+            assert_eq!(
+                answer["error"]["message"],
+                format!(
+                    "Invalid params: tenant {tenant} names a tenant; this agent serves no \
+                     tenants, so omit tenant"
+                )
+            );
+        }
+        assert!(tenant_refusal(&req(serde_json::json!({"tenant": ""}))).is_none());
+        assert!(tenant_refusal(&req(serde_json::json!({"id": "tsk_1"}))).is_none());
+    }
+
+    /// The operator is the session; every other token, a formation token's included, is its
+    /// credential.
+    #[test]
+    fn task_caller_of_a_grant_is_the_session_only_for_the_operator() {
+        let auth = crate::door_auth::DoorAuth::mint(&murmur_artifact::NetworkAuthentication {
+            scheme: murmur_artifact::AuthenticationScheme::Bearer,
+            credentials: vec![murmur_artifact::DoorCredential {
+                name: "alice".to_string(),
+                scopes: vec!["ListTasks".to_string()],
+            }],
+        })
+        .unwrap();
+        let grant_of = |name: &str| {
+            let token = &auth.tokens().iter().find(|(n, _)| n == name).unwrap().1;
+            auth.verify(&[&crate::door_auth::bearer_header(token)])
+                .unwrap()
+        };
+        assert_eq!(TaskCaller::of(None), TaskCaller::Session);
+        assert_eq!(
+            TaskCaller::of(Some(&grant_of("operator"))),
+            TaskCaller::Session
+        );
+        assert_eq!(
+            TaskCaller::of(Some(&grant_of("alice"))),
+            credential("alice")
+        );
     }
 
     /// A completion is acknowledged with a message from the agent, in the completion's context.
@@ -3723,7 +4366,13 @@ mod tests {
     fn door_method_acceptance_none_serves_no_task_starting_method() {
         assert_eq!(
             served_methods(&TaskAcceptance::None, false),
-            ["stream/watch", "GetTask", "CancelTask", "session/stop"]
+            [
+                "stream/watch",
+                "GetTask",
+                "ListTasks",
+                "CancelTask",
+                "session/stop"
+            ]
         );
         for acceptance in [TaskAcceptance::Single, TaskAcceptance::Queue] {
             assert_eq!(
@@ -3733,10 +4382,49 @@ mod tests {
                     "SendStreamingMessage",
                     "stream/watch",
                     "GetTask",
+                    "ListTasks",
                     "CancelTask",
+                    "SubscribeToTask",
                     "session/stop"
                 ]
             );
+        }
+    }
+
+    /// `SubscribeToTask` streams exactly when `SendStreamingMessage` does, and `ListTasks` is
+    /// served wherever `GetTask` is.
+    #[test]
+    fn door_method_subscribe_streams_exactly_when_send_streaming_message_does() {
+        for acceptance in &ACCEPTANCES {
+            for authenticated in [false, true] {
+                let resolves = |method: DoorMethod| {
+                    DoorMethod::resolve(method.wire_name(), acceptance, authenticated).is_some()
+                };
+                assert_eq!(
+                    resolves(DoorMethod::SubscribeToTask),
+                    resolves(DoorMethod::SendStreamingMessage),
+                    "{acceptance:?}"
+                );
+                assert_eq!(
+                    resolves(DoorMethod::ListTasks),
+                    resolves(DoorMethod::GetTask),
+                    "{acceptance:?}"
+                );
+            }
+        }
+    }
+
+    /// The push notification config methods are answered, never served: no `DoorMethod` takes
+    /// their names, and the card lists none of them.
+    #[test]
+    fn door_method_push_config_methods_are_not_door_methods() {
+        for name in PUSH_CONFIG_METHODS {
+            for acceptance in &ACCEPTANCES {
+                for authenticated in [false, true] {
+                    assert_eq!(DoorMethod::resolve(name, acceptance, authenticated), None);
+                    assert!(!served_methods(acceptance, authenticated).contains(&name));
+                }
+            }
         }
     }
 
@@ -3762,6 +4450,9 @@ mod tests {
         for acceptance in &ACCEPTANCES {
             for name in [
                 "tasks/list",
+                "tasks/resubscribe",
+                "listTasks",
+                "subscribeToTask",
                 "",
                 "getTask",
                 "GETTASK",
@@ -4801,6 +5492,272 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/content/reference/streaming-protocol.md"
     );
+
+    /// Serves one `SubscribeToTask` for `caller` on a fresh socket, as [`serve_message_stream`]
+    /// serves a `SendStreamingMessage`.
+    async fn serve_subscription(
+        task_id: &str,
+        task_registry: Arc<Mutex<TaskRegistry>>,
+        caller: TaskCaller,
+        sse_tx: &SseBroadcast,
+        sse_buffer: &Arc<Mutex<SseEventBuffer>>,
+        closing: watch::Receiver<bool>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(std::time::Instant, String)>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, lines) = spawn_sse_line_reader(
+            listener.local_addr().unwrap(),
+            std::time::Duration::from_secs(60),
+        );
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let sse = sse_tx.clone();
+        let buffer = Arc::clone(sse_buffer);
+        let req = JsonRpcRequest {
+            id: serde_json::json!("sub-1"),
+            method: "SubscribeToTask".to_string(),
+            params: serde_json::json!({"id": task_id}),
+        };
+        let handler = tokio::spawn(async move {
+            let _read_half = read_half;
+            handle_task_subscribe(
+                write_half,
+                req,
+                &task_registry,
+                &caller,
+                PLAIN,
+                sse,
+                buffer,
+                closing,
+            )
+            .await;
+        });
+        (handler, lines, client)
+    }
+
+    /// A registry holding `tsk_run`, running in `ctx_run`.
+    fn running_task_registry() -> Arc<Mutex<TaskRegistry>> {
+        let mut reg = TaskRegistry::new(4, TaskAcceptance::Queue);
+        reg.enqueue("tsk_run", "ctx_run");
+        reg.start_task(
+            "tsk_run".to_string(),
+            "ctx_run".to_string(),
+            crate::lanes::TaskLane::User,
+        );
+        Arc::new(Mutex::new(reg))
+    }
+
+    /// Every refusal a subscription can meet is one JSON-RPC error, decided before any stream.
+    #[test]
+    fn subscribe_refusals_are_errors_before_any_stream() {
+        let registry = running_task_registry();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.enqueue("tsk_alice", "ctx_a");
+            reg.record_owner("tsk_alice", "alice");
+            reg.enqueue("tsk_done", "ctx_done");
+            reg.request_cancel("tsk_done");
+        }
+        let refusal = |params: Value, caller: &TaskCaller| {
+            let req = JsonRpcRequest {
+                id: serde_json::json!(1),
+                method: "SubscribeToTask".to_string(),
+                params,
+            };
+            let response = subscribable_task(&req, &registry, caller).unwrap_err();
+            serde_json::to_value(&response).unwrap()
+        };
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"id": ""}),
+            serde_json::json!({"id": 7}),
+        ] {
+            let answer = refusal(params, &TaskCaller::Session);
+            assert_eq!(answer["error"]["code"], -32602, "{answer}");
+            assert_eq!(answer["error"]["message"], "SubscribeToTask requires an id");
+        }
+        let never = refusal(
+            serde_json::json!({"id": "tsk_never_held"}),
+            &credential("bob"),
+        );
+        for hidden in ["tsk_run", "tsk_alice"] {
+            let answer = refusal(serde_json::json!({"id": hidden}), &credential("bob"));
+            assert_eq!(answer["error"]["code"], -32001, "{answer}");
+            let mut as_never = never.clone();
+            as_never["error"]["data"][0]["metadata"]["taskId"] = Value::from(hidden);
+            assert_eq!(answer, as_never, "a hidden task reads as one never held");
+        }
+        let ended = refusal(serde_json::json!({"id": "tsk_done"}), &TaskCaller::Session);
+        assert_eq!(ended["error"]["code"], -32004, "{ended}");
+        assert_eq!(
+            ended["error"]["data"][0]["metadata"],
+            serde_json::json!({"taskId": "tsk_done", "state": "TASK_STATE_CANCELED"})
+        );
+        let req = |id: &str| JsonRpcRequest {
+            id: serde_json::json!(1),
+            method: "SubscribeToTask".to_string(),
+            params: serde_json::json!({"id": id}),
+        };
+        assert!(subscribable_task(&req("tsk_alice"), &registry, &credential("alice")).is_ok());
+        assert!(subscribable_task(&req("tsk_run"), &registry, &TaskCaller::Session).is_ok());
+    }
+
+    /// A subscription opens with the task as `GetTask` reports it, and a live `input-required`
+    /// does not end it: only the terminal status does.
+    #[tokio::test]
+    async fn subscribe_writes_through_input_required_to_the_terminal_status() {
+        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(8);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let registry = running_task_registry();
+        let (_closing_tx, closing) = watch::channel(false);
+        let (handler, lines, client) = serve_subscription(
+            "tsk_run",
+            Arc::clone(&registry),
+            TaskCaller::Session,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, Some("TASK_STATE_WORKING")).await;
+        sse_tx
+            .send(stream_event(
+                1,
+                "tsk_run",
+                false,
+                Some(StreamEnd::Interrupted),
+            ))
+            .unwrap();
+        sse_tx
+            .send(stream_event(
+                2,
+                "tsk_other",
+                false,
+                Some(StreamEnd::Terminal),
+            ))
+            .unwrap();
+        sse_tx
+            .send(stream_event(3, "tsk_run", false, Some(StreamEnd::Terminal)))
+            .unwrap();
+        handler.await.unwrap();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let events = events_of(sse_body(&received));
+        assert_eq!(ns(&events), [1, 3], "{received}");
+        assert_eq!(events[0].0, None, "the opening task is unnumbered");
+        let opening = registry.lock().unwrap().get_task("tsk_run").unwrap();
+        assert_eq!(
+            events[0].1,
+            serde_json::json!({"jsonrpc": "2.0", "id": "sub-1",
+                "result": {"task": serde_json::to_value(&opening).unwrap()}})
+        );
+        assert!(events.iter().all(|(_, event)| event["id"] == "sub-1"));
+    }
+
+    /// A subscription that lost its task's ending in a lag writes it from the registry, unnumbered,
+    /// within one heartbeat, and ends.
+    #[tokio::test]
+    async fn subscribe_that_lagged_ends_with_the_terminal_status_from_the_registry() {
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(1);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let registry = running_task_registry();
+        let (_closing_tx, closing) = watch::channel(false);
+        let (handler, lines, client) = serve_subscription(
+            "tsk_run",
+            Arc::clone(&registry),
+            TaskCaller::Session,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, Some("TASK_STATE_WORKING")).await;
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.finish_task(TaskState::Completed);
+            reg.record_ending("tsk_run", "session ended", Some("four"), false, &[]);
+        }
+        let lost_at = std::time::Instant::now();
+        for id in 1..=3 {
+            sse_tx
+                .send(stream_event(id, "tsk_other", false, None))
+                .unwrap();
+        }
+        handler.await.unwrap();
+        assert!(
+            lost_at.elapsed() <= SSE_HEARTBEAT_INTERVAL + std::time::Duration::from_secs(2),
+            "the ending was written within one heartbeat of the loss"
+        );
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+
+        let events = events_of(sse_body(&received));
+        assert_eq!(events.len(), 3, "{received}");
+        assert!(events.iter().all(|(id, _)| id.is_none()), "{received}");
+        let reported = registry.lock().unwrap().get_task("tsk_run").unwrap();
+        assert_eq!(
+            events[1].1["result"]["artifactUpdate"]["artifact"],
+            serde_json::to_value(reported.artifact("response").unwrap()).unwrap()
+        );
+        assert_eq!(
+            events[2].1["result"]["statusUpdate"]["status"],
+            serde_json::to_value(&reported.status).unwrap()
+        );
+    }
+
+    /// A subscription that lagged while its task waits for input stays open: a subscriber watches
+    /// the task, and the reply arrives on a request of its own.
+    #[tokio::test]
+    async fn subscribe_that_lagged_on_an_input_required_task_stays_open() {
+        let (sse_tx, sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(1);
+        drop(sse_rx);
+        let sse_buffer = Arc::new(Mutex::new(SseEventBuffer::new(8)));
+        let registry = running_task_registry();
+        let (_waiter_tx, waiter_rx) = oneshot::channel();
+        registry
+            .lock()
+            .unwrap()
+            .set_input_required("tsk_run", "which branch?".to_string(), _waiter_tx)
+            .unwrap();
+        let (closing_tx, closing) = watch::channel(false);
+        let (handler, lines, client) = serve_subscription(
+            "tsk_run",
+            Arc::clone(&registry),
+            TaskCaller::Session,
+            &sse_tx,
+            &sse_buffer,
+            closing,
+        )
+        .await;
+        let mut received = String::new();
+        collect_sse_lines(&lines, &mut received, Some("TASK_STATE_INPUT_REQUIRED")).await;
+        for id in 1..=3 {
+            sse_tx
+                .send(stream_event(id, "tsk_other", false, None))
+                .unwrap();
+        }
+        tokio::time::sleep(SSE_HEARTBEAT_INTERVAL + std::time::Duration::from_secs(2)).await;
+        assert!(
+            !handler.is_finished(),
+            "a lagged subscription ended on input-required"
+        );
+        closing_tx.send(true).unwrap();
+        handler.await.unwrap();
+        collect_sse_lines(&lines, &mut received, None).await;
+        client.join().unwrap();
+        drop(waiter_rx);
+
+        let events = events_of(sse_body(&received));
+        assert_eq!(events.len(), 1, "only the opening task: {received}");
+        assert!(received.contains(":heartbeat"), "{received}");
+    }
 
     fn protocol_page() -> String {
         std::fs::read_to_string(PROTOCOL_PAGE_PATH)

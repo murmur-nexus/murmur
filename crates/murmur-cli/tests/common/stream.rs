@@ -1,4 +1,5 @@
-//! Reading the A2A v1.0 streams a door writes: `SendStreamingMessage` and `stream/watch`.
+//! Reading the A2A v1.0 streams a door writes: `SendStreamingMessage`, `SubscribeToTask` and
+//! `stream/watch`.
 //!
 //! Every event is an optional `id:` line and one `data:` line holding a JSON-RPC response whose
 //! `result` is an `lf.a2a.v1.StreamResponse`. A murmur frame rides in a `statusUpdate` or a
@@ -214,9 +215,49 @@ pub fn stream_message_with(
     params: Value,
     extra: &[(&str, &str)],
 ) -> (Response, Vec<Event>) {
-    let body =
-        json!({"jsonrpc": "2.0", "id": id, "method": "SendStreamingMessage", "params": params})
-            .to_string();
+    stream_method(addr, token, "SendStreamingMessage", id, params, extra)
+}
+
+/// One `SubscribeToTask` on `task_id` with JSON-RPC id `"sub-1"`, presenting `token` as a bearer
+/// token when given, activating the stream extension when `extensions` is set, and resuming
+/// after `last_event_id` when given. Read to the end of the stream, and checked against A2A v1.0
+/// by the wire recorder. A refusal is answered as JSON, and has no events.
+pub fn subscribe(
+    addr: &str,
+    token: Option<&str>,
+    task_id: &str,
+    extensions: bool,
+    last_event_id: Option<u64>,
+) -> (Response, Vec<Event>) {
+    let cursor = last_event_id.map(|id| id.to_string());
+    let mut extra: Vec<(&str, &str)> = Vec::new();
+    if extensions {
+        extra.push(extensions_header());
+    }
+    if let Some(cursor) = cursor.as_deref() {
+        extra.push(("Last-Event-ID", cursor));
+    }
+    stream_method(
+        addr,
+        token,
+        "SubscribeToTask",
+        json!("sub-1"),
+        json!({"id": task_id}),
+        &extra,
+    )
+}
+
+/// One streaming `method` with request id `id`, `params` and `extra` request headers, read to the
+/// end of the stream.
+pub fn stream_method(
+    addr: &str,
+    token: Option<&str>,
+    method: &str,
+    id: Value,
+    params: Value,
+    extra: &[(&str, &str)],
+) -> (Response, Vec<Event>) {
+    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
     let authorization = token.map(|token| format!("Bearer {token}"));
     let mut headers: Vec<(&str, &str)> = authorization
         .as_deref()

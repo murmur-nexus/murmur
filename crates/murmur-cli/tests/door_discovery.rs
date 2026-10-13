@@ -29,12 +29,14 @@ use serde_json::{json, Value};
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-const ALL_METHODS: [&str; 6] = [
+const ALL_METHODS: [&str; 8] = [
     "SendMessage",
     "SendStreamingMessage",
     "stream/watch",
     "GetTask",
+    "ListTasks",
     "CancelTask",
+    "SubscribeToTask",
     "session/stop",
 ];
 
@@ -419,7 +421,13 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
 
     assert_eq!(
         common::card_door_methods(&card),
-        ["stream/watch", "GetTask", "CancelTask", "session/stop"]
+        [
+            "stream/watch",
+            "GetTask",
+            "ListTasks",
+            "CancelTask",
+            "session/stop"
+        ]
     );
     assert_eq!(
         common::card_stream_frames(&card),

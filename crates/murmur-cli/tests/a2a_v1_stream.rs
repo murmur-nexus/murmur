@@ -747,7 +747,8 @@ fn card_says_what_the_stream_extension_adds() {
     assert_eq!(
         stream["description"],
         "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on \
-         SendStreamingMessage when the request's A2A-Extensions header names this URI, and always \
-         on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI."
+         SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names \
+         this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata \
+         keyed by this URI."
     );
 }

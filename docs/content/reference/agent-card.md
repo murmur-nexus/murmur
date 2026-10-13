@@ -28,7 +28,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
         "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop"],
+          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop"],
           "peerTasks": false
         }
       },
@@ -46,7 +46,7 @@ The card a capsule `my-agent` 0.1.0 serves on port 41873, with `lifecycle.task_a
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
           "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -121,13 +121,13 @@ ProtoJSON shape — see [Tasks and messages](#tasks-and-messages).
 | Key | Type | Value |
 |---|---|---|
 | `capabilities.streaming` | boolean | `true` exactly when the [door extension](#murmur-door-v1) lists `SendStreamingMessage` |
-| `capabilities.pushNotifications` | boolean | `false` |
+| `capabilities.pushNotifications` | boolean | `false` — see [Push notifications](#push-notifications) |
 | `capabilities.extendedAgentCard` | boolean | `false` on a public door, where every caller gets this card. `true` on an [authenticated door](#security) |
 | `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), the [capsule extension](#murmur-capsule-v1), then the [stream extension](#stream-extension). An authenticated door's public card carries the door extension, then the stream extension |
 
 A door that does not serve `SendStreamingMessage` —
 [`lifecycle.task_acceptance: none`](manifest.md#lifecycle-task-acceptance) — reports `false` and
-answers the method `-32004` `UnsupportedOperationError`.
+answers it and `SubscribeToTask` `-32004` `UnsupportedOperationError`.
 
 ## Security { #security }
 
@@ -159,17 +159,40 @@ A scope is a door method's name, or `resources/files` for the
 | `SendStreamingMessage` | `SendStreamingMessage` |
 | `stream/watch` | `stream/watch` |
 | `GetTask` | [`GetTask`](#tasks-get) |
+| `ListTasks` | [`ListTasks`](#list-tasks) |
 | `CancelTask` | `CancelTask` |
+| `SubscribeToTask` | [`SubscribeToTask`](#subscribe-to-task) |
 | `session/stop` | `session/stop` |
 | `resources/files` | The [operator plane](resource-plane.md#operator-plane) |
 
-`GetExtendedAgentCard` needs no scope: every valid token may read the extended card.
+`GetExtendedAgentCard` needs no scope: every valid token may read the extended card. The four push
+config methods need none either: every caller is answered that [push](#push-notifications) is not
+supported.
 
-Every authenticated caller shares the session's one task and context space. A scope limits which
-methods a token reaches, not which tasks: a credential holding `SendStreamingMessage`, `GetTask` or
-`stream/watch` sees every task on the session. The one exception is a
-[formation token](roster.md#formation-token): it reaches [`GetTask`](#tasks-get) and
-`CancelTask` only for the tasks its member submitted, and does not reach `SendStreamingMessage`.
+A scope decides which methods a token reaches. Which tasks those methods reach is decided by the
+credential — see [Who sees a task](#task-access).
+
+### Who sees a task { #task-access }
+
+Every method that names or lists a task reads one rule:
+
+| Caller | Sees |
+|---|---|
+| Any caller of a public door | Every task of the session |
+| The `operator` token | Every task of the session |
+| A declared credential's token | The tasks a request carrying that credential started |
+| A [formation token](roster.md#formation-token), credential `member:<caller>` | The tasks that member started |
+
+The rule governs [`GetTask`](#tasks-get), [`ListTasks`](#list-tasks), `CancelTask`,
+[`SubscribeToTask`](#subscribe-to-task), a message's [`taskId`](#task-id) and its
+[`referenceTaskIds`](#reference-task-ids). A task the caller does not see is answered exactly as an
+id the session never held: [`-32001`](#errors) with `metadata.taskId`, and
+`not a task this capsule holds` in a reference block. A task the runtime starts itself, such as a
+detached command's result, belongs to the session.
+
+`stream/watch` and `session/stop` are the session's own methods. A credential holding either
+reaches every task through it, whatever that credential started: `stream/watch` carries every
+task's events, and `session/stop` cancels every live task.
 
 ### The public card of an authenticated door { #authenticated-public-card }
 
@@ -193,13 +216,13 @@ methods a token reaches, not which tasks: a credential holding `SendStreamingMes
         "description": "Every JSON-RPC method this door answers, including the murmur methods stream/watch and session/stop, which are not A2A methods, and whether it accepts tasks from peer capsules.",
         "required": false,
         "params": {
-          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "CancelTask", "session/stop", "GetExtendedAgentCard"],
+          "methods": ["SendMessage", "SendStreamingMessage", "stream/watch", "GetTask", "ListTasks", "CancelTask", "SubscribeToTask", "session/stop", "GetExtendedAgentCard"],
           "peerTasks": false
         }
       },
       {
         "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
+        "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on stream/watch. Each is carried in a StreamResponse under metadata keyed by this URI.",
         "required": false,
         "params": {
           "frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]
@@ -311,12 +334,15 @@ The door checks, in this order, on every request:
    answers it — see [Completion errors](#murmur-errors).
 10. The method: `-32601` `Method not found` for a method the
     [door extension](#murmur-door-v1) does not list. A public door answers `GetExtendedAgentCard`
-    with `-32004` instead.
+    with `-32004` instead, a door that starts no task answers `SendStreamingMessage` and
+    `SubscribeToTask` with `-32004`, and every door answers the four
+    [push config methods](#push-notifications) with `-32003`.
 11. The scope of the method, on a door declaring `network.authentication`.
 12. On `SendMessage` and `SendStreamingMessage`, an
     [`x-murmur-forget-session: true`](#request-headers) the capsule cannot act on: `-32602`.
 13. `params` that is present and is not an object: `-32602`.
-14. The method itself, whose errors are listed under [Errors](#errors).
+14. A [`tenant`](#tenant) in `params` other than `""`: `-32602`.
+15. The method itself, whose errors are listed under [Errors](#errors).
 
 A refusal at steps 2, 3, 4 and 11 is an HTTP status and a JSON body, never a JSON-RPC envelope:
 
@@ -396,7 +422,7 @@ The standard JSON-RPC errors carry no `data`:
 | `-32700` | `Invalid JSON payload` | A body that is not JSON. `id` is `null` |
 | `-32600` | `Request payload validation error` | A body that is not a [JSON-RPC 2.0 request](#jsonrpc-request) |
 | `-32601` | `Method not found` | A method the door extension does not list |
-| `-32602` | Names the parameter | `params` that is not an object, a message the door cannot [read in full](#message), a message naming a waiting task in another `contextId`, a `GetTask` or `CancelTask` with no `id`, or an `x-murmur-forget-session` the capsule cannot act on |
+| `-32602` | Names the parameter | `params` that is not an object, a [`tenant`](#tenant), a message the door cannot [read in full](#message), a message naming a waiting task in another `contextId`, a `GetTask`, `CancelTask` or `SubscribeToTask` with no `id`, a [`ListTasks` parameter](#list-tasks) it cannot read, or an `x-murmur-forget-session` the capsule cannot act on |
 | `-32603` | Names the failure | A request the door accepted and could not hand to the session |
 
 Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo`:
@@ -410,10 +436,10 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 
 | Code | Error | `reason` | The door answers it | `metadata` |
 |---|---|---|---|---|
-| `-32001` | `TaskNotFoundError` | `TASK_NOT_FOUND` | On `GetTask`, `CancelTask`, and a message whose `taskId` names an id this session never held or a [formation token](roster.md#formation-token) does not reach | `taskId` |
+| `-32001` | `TaskNotFoundError` | `TASK_NOT_FOUND` | On `GetTask`, `CancelTask`, `SubscribeToTask`, naming an id this session never held or a task the caller does not [see](#task-access), and on a message whose `taskId` names one | `taskId` |
 | `-32002` | `TaskNotCancelableError` | `TASK_NOT_CANCELABLE` | On `CancelTask` for a task that had already ended. The task is left unchanged | `taskId`; `state`, the state it ended in, spelled as `GetTask` spells it: `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` or `TASK_STATE_CANCELED` |
-| `-32003` | `PushNotificationNotSupportedError` | `PUSH_NOTIFICATION_NOT_SUPPORTED` | Never | — |
-| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door, with `{}`. On a message whose `taskId` names a task that is not waiting for input — see [Continuing a task](#task-id) | `taskId` and `state`, on a message naming a task |
+| `-32003` | `PushNotificationNotSupportedError` | `PUSH_NOTIFICATION_NOT_SUPPORTED` | On the four push config methods, and on a message asking for push — see [Push notifications](#push-notifications) | `{}` |
+| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door, and on `SendStreamingMessage` and `SubscribeToTask` to a door that starts no task, with `{}`. On a message whose `taskId` names a task that is not waiting for input — see [Continuing a task](#task-id). On `SubscribeToTask` naming a task that has ended. On a `ListTasks` with `statusTimestampAfter` | `taskId` and `state`, on a message or a `SubscribeToTask` naming a task; `parameter`, `statusTimestampAfter`, on `ListTasks` |
 | `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | On a message carrying a `raw` or `url` part — see [Parts](#parts) | `partIndex`, the first file part's 0-based index; `mediaType`, when that part declared one |
 | `-32006` | `InvalidAgentResponseError` | `INVALID_AGENT_RESPONSE` | Never | — |
 | `-32007` | `ExtendedAgentCardNotConfiguredError` | `EXTENDED_AGENT_CARD_NOT_CONFIGURED` | Never | — |
@@ -442,6 +468,41 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 
 A completion's errors, `-31001` and `-31002`, are murmur's own and are listed under
 [Completion errors](#murmur-errors).
+
+### Push notifications { #push-notifications }
+
+The card says `capabilities.pushNotifications: false`. The door answers each request below
+`-32003` `PushNotificationNotSupportedError`, with the message
+`push notifications are not supported by this agent` and `metadata` `{}`:
+
+| Request | Answered |
+|---|---|
+| `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig` | At [step 10](#door-authentication), to every caller the door lets in, before any scope or params check. The door extension does not list them |
+| `SendMessage` or `SendStreamingMessage` whose `configuration.taskPushNotificationConfig` is present and not `null` | Once the message is [read](#message), before any task starts. `SendStreamingMessage` answers it as one JSON body, with no stream |
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "error": {"code": -32003,
+           "message": "push notifications are not supported by this agent",
+           "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                     "reason": "PUSH_NOTIFICATION_NOT_SUPPORTED",
+                     "domain": "a2a-protocol.org",
+                     "metadata": {}}]}}
+```
+
+### Tenants { #tenant }
+
+The card's interface names no `tenant`, and the door serves none. A request to any method the door
+serves, murmur's own included, whose `params.tenant` is present and is anything but `""` is answered
+`-32602` at [step 14](#door-authentication), before anything starts, stops or is cancelled:
+
+```text
+Invalid params: tenant "acme" names a tenant; this agent serves no tenants, so omit tenant
+```
+
+The value is shown as JSON, so `"tenant": 7` reads `tenant 7`. `""`, the unset value, is served as
+if the member were absent. A method the door does not serve is still `-32601`, a push config method
+still `-32003`, and a wrong `A2A-Version` still `-32009`.
 
 ### Tasks and messages { #tasks-and-messages }
 
@@ -490,6 +551,8 @@ The checks run in this order, and the first failure answers:
 4. `text`, `raw`, `url`, `mediaType` and `filename` are strings where present.
 5. `taskId` and `contextId`, then `referenceTaskIds`, as in the table.
 6. The first `raw` or `url` part: [`-32005`](#errors).
+7. A `configuration.taskPushNotificationConfig` that is present and not `null`:
+   [`-32003`](#push-notifications).
 
 Steps 1 to 5 answer `-32602`. Every refusal comes before the door looks up a task or starts one: a
 refused message starts no task, writes no trace record, reaches no model and delivers nothing to a
@@ -540,7 +603,7 @@ Every text part the door writes has `mediaType` `text/plain`, and every data par
 | The message names | Answer |
 |---|---|
 | No task, or `""` | A new task: `TASK_STATE_SUBMITTED`, or `TASK_STATE_REJECTED` when the door has no room or the session is closing |
-| A task this session never held, or one a formation token does not reach | [`-32001`](#errors) |
+| A task this session never held, or one the caller does not [see](#task-access) | [`-32001`](#errors) |
 | A task that has ended | [`-32004`](#errors), naming its state. Send a new message without `taskId`, in the same `contextId`, to start a new task |
 | A `TASK_STATE_SUBMITTED` or `TASK_STATE_WORKING` task | `-32004`, naming its state. A task takes a message only while it waits in `TASK_STATE_INPUT_REQUIRED` |
 | A `TASK_STATE_INPUT_REQUIRED` task, with a `contextId` other than the task's | `-32602` |
@@ -576,7 +639,7 @@ four
 | Live | `- <id>: <state>` |
 | `completed`, with a response | `- <id>: completed`, then the response in a fence labelled `response` |
 | Ended otherwise, with a final status message | `- <id>: <state>: <message>`, the message on one line |
-| Never held, or one a formation token does not reach | `- <id>: not a task this capsule holds` |
+| Never held, or one the sender does not [see](#task-access) | `- <id>: not a task this capsule holds` |
 
 States are [murmur's words](#task-states). A message without `referenceTaskIds` gets no block.
 
@@ -601,8 +664,10 @@ task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door a
 
 `SendMessage` answers as soon as the task is accepted, whatever `configuration.returnImmediately`
 says: A2A v1.0 has a request without it wait for a terminal or interrupted state. Poll
-[`GetTask`](#tasks-get), or read the task's events with `SendStreamingMessage`. The door ignores
-`configuration`, push notification configs and `tenant`.
+[`GetTask`](#tasks-get), or read the task's events with `SendStreamingMessage` or
+[`SubscribeToTask`](#subscribe-to-task). The door ignores `configuration` but for a
+`taskPushNotificationConfig`, which it [refuses](#push-notifications). A `tenant` is
+[refused](#tenant).
 
 A message from the agent — a task's `status.message`, a completion's acknowledgement — has `role`
 `ROLE_AGENT`. A task's `status.message` also carries its `contextId` and `taskId`.
@@ -659,22 +724,25 @@ and `session/stop` are murmur methods, not A2A methods. Methods appear in this o
 | `SendStreamingMessage` | Starts a task and streams its events as `text/event-stream` | `lifecycle.task_acceptance` is `single` or `queue` |
 | `stream/watch` | Streams this session's events as an observer, without starting a task | Always |
 | `GetTask` | Returns the task named by `params.id` | Always |
+| `ListTasks` | Returns one [page](#list-tasks) of the tasks the caller sees | Always |
 | `CancelTask` | Cancels the task named by `params.id`. A task that had already ended is left unchanged and answered [`-32002`](#errors) | Always |
+| `SubscribeToTask` | Streams the rest of the live task named by `params.id` as `text/event-stream` — see [`SubscribeToTask`](#subscribe-to-task) | `lifecycle.task_acceptance` is `single` or `queue` |
 | `session/stop` | Cancels every live task and reports what the session leaves running | Always |
 | `GetExtendedAgentCard` | Returns the [extended card](#extended-card) | The capsule declares [`network.authentication`](manifest.md#field-network-authentication) |
 
 See [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance). Under `none`, `POST /`
-answers `SendMessage` and `SendStreamingMessage` with `-32601`, so neither is listed,
-`capabilities.streaming` is `false` and `skills` is `[]`.
+answers `SendMessage` with `-32601`, and `SendStreamingMessage` and `SubscribeToTask` with `-32004`,
+so none of the three is listed, `capabilities.streaming` is `false` and `skills` is `[]`.
 
 | Door | `params.methods` |
 |---|---|
-| Public | `SendMessage`, `SendStreamingMessage`, `stream/watch`, `GetTask`, `CancelTask`, `session/stop` |
-| Authenticated | The public door's six, then `GetExtendedAgentCard` |
-| Public, `task_acceptance: none` | `stream/watch`, `GetTask`, `CancelTask`, `session/stop` |
-| Authenticated, `task_acceptance: none` | `stream/watch`, `GetTask`, `CancelTask`, `session/stop`, `GetExtendedAgentCard` |
+| Public | `SendMessage`, `SendStreamingMessage`, `stream/watch`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, `session/stop` |
+| Authenticated | The public door's eight, then `GetExtendedAgentCard` |
+| Public, `task_acceptance: none` | `stream/watch`, `GetTask`, `ListTasks`, `CancelTask`, `session/stop` |
+| Authenticated, `task_acceptance: none` | `stream/watch`, `GetTask`, `ListTasks`, `CancelTask`, `session/stop`, `GetExtendedAgentCard` |
 
-The card endpoint itself is not listed.
+The card endpoint itself is not listed, and neither are the four
+[push config methods](#push-notifications), which the door answers but does not serve.
 
 #### Request headers { #request-headers }
 
@@ -764,9 +832,9 @@ naming what the session still runs, one data part per item, when anything is:
                            "mediaType": "application/json"}]}]}
 ```
 
-On a [formation token](roster.md#formation-token), `GetTask` answers only the tasks the calling
-member submitted. Any other id — another member's task, the operator's, or one the session never
-held — is answered `-32001 Task not found`. Every other credential reads every task.
+`GetTask` and `CancelTask` answer only a task the caller [sees](#task-access). Any other id — another
+credential's task, the operator's, or one the session never held — is answered
+`-32001 Task not found`.
 
 A `SendMessage` the door has no room for answers a `TASK_STATE_REJECTED` task whose
 `status.message` says why: `task rejected: capsule is busy`, or
@@ -794,6 +862,83 @@ when neither key is present.
 
 A completed task with `noAnswerBelow` keeps its `response` artifact. A caller that is not a
 formation member can ignore `metadata`: the task reads as an ordinary `failed` or `completed` one.
+
+#### `ListTasks` { #list-tasks }
+
+`ListTasks` answers one page of the tasks the caller [sees](#task-access), the most recently changed
+first. Its `params` are a `ListTasksRequest`, read in this order:
+
+| Param | Accepted | Refused |
+|---|---|---|
+| `contextId` | A string. `""` or absent: every context | Not a string: `-32602` |
+| `status` | A [`TASK_STATE_*`](#task-states) name. `TASK_STATE_UNSPECIFIED` or absent: every state. `TASK_STATE_AUTH_REQUIRED` matches no task | Anything else: `-32602` |
+| `pageSize` | An integer from `1`. Absent: `50`. Above `100`: `100` | Below `1`, or not an integer: `-32602` |
+| `pageToken` | `""` or absent for the first page, or a `nextPageToken` this door answered | Anything else: `-32602` |
+| `statusTimestampAfter` | Absent or `null` | Any other value: `-32004`, `metadata.parameter` `statusTimestampAfter`. The door records no status timestamps |
+| `includeArtifacts` | A boolean. Absent: `false` | Not a boolean: `-32602` |
+| `historyLength` | Any value, ignored: a task carries no `history` | — |
+
+Other members are ignored. The first parameter refused answers, naming it.
+
+The answer is a `ListTasksResponse`, whose four members are always present:
+
+| Member | Value |
+|---|---|
+| `tasks` | The page. Each task is exactly what `GetTask` answers for it, without `artifacts` unless `includeArtifacts` is `true`; then `artifacts` is the task's artifacts, or `[]` |
+| `nextPageToken` | The `pageToken` of the next page. `""` on the last page |
+| `pageSize` | The page size used |
+| `totalSize` | How many tasks the caller sees that match the filters, across every page |
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "result": {"tasks": [{"id": "tsk_…", "contextId": "ctx_…",
+                       "status": {"state": "TASK_STATE_WORKING"}},
+                      {"id": "tsk_…", "contextId": "ctx_…",
+                       "status": {"state": "TASK_STATE_COMPLETED",
+                                  "message": {"messageId": "msg_tsk_…_status", "contextId": "ctx_…",
+                                              "taskId": "tsk_…", "role": "ROLE_AGENT",
+                                              "parts": [{"text": "session ended",
+                                                         "mediaType": "text/plain"}]}}}],
+            "nextPageToken": "MTI6dHNrXzAxYTE…",
+            "pageSize": 2,
+            "totalSize": 5}}
+```
+
+A task moves to the front of the order each time its state changes or its ending is recorded. A
+`nextPageToken` names a position in that order and nothing else: the filters and
+[who sees a task](#task-access) apply afresh to every page, so a token passed to another caller
+shows that caller only its own tasks. A walk returns every matching task once while no matching task
+changes state. A task that changes during a walk moves ahead of the cursor, and a fresh listing
+shows it first.
+
+#### `SubscribeToTask` { #subscribe-to-task }
+
+`SubscribeToTask` streams the rest of one task the caller [sees](#task-access) as
+`text/event-stream`, in the [events](streaming-protocol.md#standard-events)
+`SendStreamingMessage` writes. `params.id` names the task:
+
+| Request | Answer |
+|---|---|
+| No `id`, or `""` | `-32602` `SubscribeToTask requires an id` |
+| A task the session never held, or one the caller does not see | `-32001`, `metadata.taskId` |
+| A task that has ended | `-32004`, `metadata.taskId` and `state` |
+| A door that starts no task | `-32004` |
+| A live task | The stream |
+
+Each refusal is one JSON body; no stream opens. The stream opens with the task as `GetTask` answers
+it at that moment, then carries the task's later events, and ends after its terminal status. It
+stays open through `TASK_STATE_INPUT_REQUIRED`: the reply arrives on a `SendMessage` naming the
+task, and the stream carries the task's resumed `TASK_STATE_WORKING`. `Last-Event-ID` and
+`A2A-Extensions` work as on `SendStreamingMessage` — see
+[Streaming Protocol](streaming-protocol.md#subscribe-to-task).
+
+```bash
+curl -N -X POST http://localhost:41873/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":"sub-1","method":"SubscribeToTask","params":{"id":"tsk_…"}}'
+```
 
 ### Capsule extension { #murmur-capsule-v1 }
 
