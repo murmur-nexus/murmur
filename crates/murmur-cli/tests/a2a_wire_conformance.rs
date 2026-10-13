@@ -18,8 +18,8 @@ use std::{
 use common::{
     a2a_conformance::WirePart,
     door_capsule::{
-        agent_project, driver_home, end_turn, launch_door, message, rpc, stage_door,
-        wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+        agent_project, driver_home, end_turn, launch_door, message, push_config_requests, rpc,
+        stage_door, wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
     },
     wire_recorder::{
         begin_census, exceptions, exceptions_file, observed, parse_exceptions, EXCEPTIONS_PATH,
@@ -94,7 +94,11 @@ fn the_door_fails_exactly_the_listed_exceptions() {
             end_turn(3, "data"),
             end_turn(4, "streamed"),
             end_turn(5, "streamed with the extension"),
-            end_turn(6, "spare"),
+            end_turn(6, "ahead of a subscription"),
+            end_turn(7, "subscribed"),
+            end_turn(8, "ahead of an activated subscription"),
+            end_turn(9, "subscribed with the extension"),
+            end_turn(10, "spare"),
         ],
         Duration::from_millis(400),
     );
@@ -222,6 +226,77 @@ fn the_door_fails_exactly_the_listed_exceptions() {
         );
         assert_eq!(events.iter().any(|event| event.is_frame()), activated);
     }
+
+    // `ListTasks` is measured on two pages.
+    let first = rpc(&addr, token, "ListTasks", json!({"pageSize": 2}));
+    assert_eq!(first.status, 200, "{first:?}");
+    let page_token = first.json()["result"]["nextPageToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("ListTasks answered no page: {first:?}"))
+        .to_string();
+    assert!(!page_token.is_empty(), "{first:?}");
+    let second = rpc(
+        &addr,
+        token,
+        "ListTasks",
+        json!({"pageSize": 2, "pageToken": page_token, "includeArtifacts": true}),
+    );
+    assert_eq!(second.status, 200, "{second:?}");
+    assert!(second.json().get("result").is_some(), "{second:?}");
+
+    // A subscription is measured plain and activated, each on a task queued behind another, so it
+    // is still live when subscribed to.
+    for (index, activated) in [false, true].into_iter().enumerate() {
+        rpc(
+            &addr,
+            token,
+            "SendMessage",
+            message(&format!("m-census-ahead-{index}"), "ahead"),
+        );
+        let subscribed = rpc(
+            &addr,
+            token,
+            "SendMessage",
+            message(&format!("m-census-subscribed-{index}"), "subscribed"),
+        );
+        let subscribed_id = subscribed.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("SendMessage answered no task: {subscribed:?}"))
+            .to_string();
+        let (streamed, events) =
+            common::stream::subscribe(&addr, token, &subscribed_id, activated, None);
+        assert_eq!(streamed.status, 200, "{streamed:?}");
+        assert!(
+            events.len() > 1,
+            "SubscribeToTask wrote no task events: {streamed:?}"
+        );
+        assert_eq!(
+            streamed.header("a2a-extensions"),
+            activated.then_some(common::stream::STREAM_EXTENSION_URI),
+            "{streamed:?}"
+        );
+    }
+
+    // Push is answered, never served: each config method, and a message asking for it.
+    for (method, params) in push_config_requests(&task_id) {
+        let refused = rpc(&addr, token, method, params);
+        assert_eq!(refused.status, 200, "{refused:?}");
+        assert_eq!(refused.json()["error"]["code"], -32003, "{refused:?}");
+    }
+    let mut asking = message("m-census-push", "notify me");
+    asking["configuration"] =
+        json!({"taskPushNotificationConfig": {"url": "https://example.com/hook"}});
+    let pushed = rpc(&addr, token, "SendMessage", asking);
+    assert_eq!(pushed.json()["error"]["code"], -32003, "{pushed:?}");
+
+    // A request naming a tenant is refused.
+    let tenant = rpc(
+        &addr,
+        token,
+        "GetTask",
+        json!({"id": task_id, "tenant": "acme"}),
+    );
+    assert_eq!(tenant.json()["error"]["code"], -32602, "{tenant:?}");
 
     let watched = rpc(&addr, token, "murmur.WatchSession", json!({}));
     assert_eq!(watched.status, 200, "{watched:?}");

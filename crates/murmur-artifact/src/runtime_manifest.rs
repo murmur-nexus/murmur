@@ -704,7 +704,9 @@ pub const DOOR_SCOPES: &[&str] = &[
     "SendStreamingMessage",
     "murmur.WatchSession",
     "GetTask",
+    "ListTasks",
     "CancelTask",
+    "SubscribeToTask",
     "murmur.StopSession",
     "resources/files",
 ];
@@ -13075,6 +13077,36 @@ mod network_authentication_tests {
         assert_eq!(
             auth.credentials[0].scopes,
             ["GetTask", "murmur.WatchSession", "murmur.StopSession"]
+        );
+    }
+
+    /// The two task methods beside `GetTask` are scopes a credential may list, in the method
+    /// table's order.
+    #[test]
+    fn door_scope_list_tasks_and_subscribe_to_task_load_on_a_credential() {
+        let auth = network_authentication_of(
+            "network:\n  authentication:\n    scheme: bearer\n    credentials:\n      \
+             alice:\n        scopes: [SendMessage, ListTasks, SubscribeToTask]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            auth.credentials[0].scopes,
+            ["SendMessage", "ListTasks", "SubscribeToTask"]
+        );
+        assert_eq!(
+            DOOR_SCOPES,
+            [
+                "SendMessage",
+                "SendStreamingMessage",
+                "murmur.WatchSession",
+                "GetTask",
+                "ListTasks",
+                "CancelTask",
+                "SubscribeToTask",
+                "murmur.StopSession",
+                "resources/files",
+            ]
         );
     }
 

@@ -1,6 +1,6 @@
 # Streaming Protocol
 
-The server-sent event streams a capsule serves on its A2A address: the two endpoints, the A2A
+The server-sent event streams a capsule serves on its A2A address: the three endpoints, the A2A
 v1.0 events they write, the murmur frames the stream extension adds, event ids, replay and the
 heartbeat.
 
@@ -11,7 +11,7 @@ under [What `mur watch` implements](#mur-watch).
 
 ## Endpoints { #endpoints }
 
-Both endpoints are JSON-RPC methods sent as `POST /` to the capsule's address, with
+Each endpoint is a JSON-RPC method sent as `POST /` to the capsule's address, with
 `Content-Type: application/json`, `A2A-Version: 1.0` and a non-empty body. A `POST /` without a
 JSON content type or without a body is answered `404 Not Found`. A request without
 [`A2A-Version: 1.0`](agent-card.md#a2a-version) is answered `-32009` as one JSON body, and no
@@ -20,10 +20,13 @@ stream opens.
 | Method | Purpose | Params | Closes when |
 |---|---|---|---|
 | `SendStreamingMessage` | Send a message — a new task, or the reply to a task waiting for input — and stream that task | `params.message`, read as `SendMessage` reads it: see [Agent Card: Messages](agent-card.md#message) | After the task's terminal status, or after a live `TASK_STATE_INPUT_REQUIRED` status of the task. Also when the client disconnects or the capsule exits. Closing the connection does not cancel the task: use `CancelTask` |
+| `SubscribeToTask` | Stream the rest of one live task the caller [sees](agent-card.md#task-access) | `params.id`, the task's id — see [Agent Card: `SubscribeToTask`](agent-card.md#subscribe-to-task) | After the task's terminal status. A `TASK_STATE_INPUT_REQUIRED` status does not close it. Also when the client disconnects or the capsule exits. Closing the connection does not cancel the task |
 | [`murmur.WatchSession`](agent-card.md#watch-session) | Observe every task the capsule runs, without sending anything | `{}` — nothing is read | The capsule's stream ends, or the client disconnects. A task's terminal status does not close it |
 
-On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), both
-methods require `Authorization: Bearer <token>` with a token holding the method's scope. A request
+`SendStreamingMessage` and `SubscribeToTask` are the task streams: each carries one task.
+
+On a capsule declaring [`network.authentication`](manifest.md#field-network-authentication), every
+method requires `Authorization: Bearer <token>` with a token holding the method's scope. A request
 without one is refused with `401` or `403` and a JSON body before the stream opens. See
 [Agent Card: What the door answers](agent-card.md#door-authentication).
 
@@ -37,6 +40,15 @@ curl -N -X POST http://localhost:52222/ \
   -d '{"jsonrpc":"2.0","id":"r1","method":"SendStreamingMessage","params":{"message":{"messageId":"msg-1","role":"ROLE_USER","parts":[{"text":"Summarise README.md"}]}}}'
 ```
 
+Subscribe to a task already running:
+
+```bash
+curl -N -X POST http://localhost:52222/ \
+  -H 'Content-Type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":"sub-1","method":"SubscribeToTask","params":{"id":"tsk_0199c4e2f1b7712a9d3e4f5061728394"}}'
+```
+
 Request a `murmur.WatchSession`:
 
 ```bash
@@ -47,7 +59,7 @@ curl -N -X POST http://localhost:52222/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"murmur.WatchSession","params":{}}'
 ```
 
-Both answer with these response headers, then the event stream. There is no `content-length`: the
+Each answers with these response headers, then the event stream. There is no `content-length`: the
 body ends when the connection closes. The `A2A-Extensions` line names what the answer used, as
 [Activation](#activation) lists. On `murmur.WatchSession` it is always:
 
@@ -73,6 +85,11 @@ as a stream of exactly one unnumbered event: the [`task`](#standard-events) in
 `TASK_STATE_REJECTED`, whose `status.message` is `task rejected: capsule is busy` or
 `task rejected: the session is closing` — the task `SendMessage` answers the same refusal with.
 The stream then ends.
+
+Everything that can refuse a `SubscribeToTask` — no `id`, a task the caller does not see, a task
+that has ended, a door whose `task_acceptance` is `none` — is answered the same way, as one JSON-RPC
+body before any stream opens. The table is under
+[Agent Card: `SubscribeToTask`](agent-card.md#subscribe-to-task).
 
 `murmur.WatchSession` is served whatever `task_acceptance` says.
 
@@ -109,7 +126,7 @@ extension receives only `task`, `statusUpdate` and `artifactUpdate` events of it
 
 | Member | Written | Shape |
 |---|---|---|
-| `task` | First, on every `SendStreamingMessage` stream: the task as [`GetTask`](agent-card.md#tasks-get) would have answered when the message was taken. `TASK_STATE_SUBMITTED` for a new task, `TASK_STATE_WORKING` for one the message continued. Unnumbered | An A2A `Task` |
+| `task` | First, on every task stream, unnumbered. On `SendStreamingMessage`, the task as [`GetTask`](agent-card.md#tasks-get) would have answered when the message was taken: `TASK_STATE_SUBMITTED` for a new task, `TASK_STATE_WORKING` for one the message continued. On `SubscribeToTask`, the task exactly as `GetTask` answers when the stream opens, in any state but a terminal one | An A2A `Task` |
 | `statusUpdate` | Every change of a task's state, and every step the runtime reports while the task works | `taskId`, `contextId`, `status`, and `metadata` on an [annotated](#murmur-stream-v1) event |
 | `artifactUpdate` | Immediately before a `TASK_STATE_COMPLETED` status, when `GetTask` reports a `response` artifact for the task | `taskId`, `contextId`, `artifact` — the `response` artifact exactly as `GetTask` reports it — and `lastChunk: true` |
 | `message` | Only on `murmur.WatchSession`, carrying a [murmur frame](#murmur-stream-v1) that belongs to no task | An A2A `Message` from `ROLE_AGENT` |
@@ -169,6 +186,21 @@ To answer a stream that ended at `TASK_STATE_INPUT_REQUIRED`:
 3. The new stream opens with the task in `TASK_STATE_WORKING` and continues as above.
 
 A `SendMessage` naming the task delivers the same reply without a stream.
+
+### What `SubscribeToTask` writes, in order { #subscribe-to-task }
+
+1. The response headers.
+2. The `task`, unnumbered, as `GetTask` answers it when the stream opens. The connection starts
+   receiving events before the task is read, so no later event is lost; an event written between
+   the two is in the `task` and is also delivered.
+3. When the request carried `Last-Event-ID`: the replay, exactly as on `SendStreamingMessage`.
+4. The task's live events, `lagged` frames when activated, and heartbeats, until the task's
+   terminal status.
+
+The one difference from `SendStreamingMessage` is the end: a `TASK_STATE_INPUT_REQUIRED` status
+does not end a subscription. The reply comes on a `SendMessage` or `SendStreamingMessage` naming the
+task, and the subscription then carries the task's `TASK_STATE_WORKING` status with message
+`resumed`.
 
 ### What `murmur.WatchSession` writes, in order { #watch-order }
 
@@ -235,7 +267,7 @@ carries it too.
 ```json
 {
   "uri": "https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1",
-  "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.",
+  "description": "The murmur frames this capsule writes in addition to the A2A v1.0 events: sent on SendStreamingMessage and SubscribeToTask when the request's A2A-Extensions header names this URI, and always on murmur.WatchSession. Each is carried in a StreamResponse under metadata keyed by this URI.",
   "required": false,
   "params": {"frames": ["text", "thinking", "tool-call-started", "tool-call-progress", "artifact", "gap", "lagged", "connection-ack", "capsule-closed"]}
 }
@@ -245,7 +277,7 @@ carries it too.
 |---|---|---|
 | `params.frames` | array of strings | The frames a connection to this door can receive, in the order of the table below |
 
-| Frame | `SendStreamingMessage`, activated | `murmur.WatchSession` |
+| Frame | A task stream, activated | `murmur.WatchSession` |
 |---|---|---|
 | [`text`](#event-text) | yes | yes |
 | [`thinking`](#event-thinking) | yes | yes |
@@ -263,10 +295,10 @@ Read the list from the capsule's card rather than from this table.
 
 | Request | Connection |
 |---|---|
-| `SendStreamingMessage` whose `A2A-Extensions` headers name the URI | Activated. The response head's `A2A-Extensions` names the URI |
-| `SendStreamingMessage` without it | Plain: the [standard events](#standard-events) of its task and nothing else. The response head does not name the URI |
+| `SendStreamingMessage` or `SubscribeToTask` whose `A2A-Extensions` headers name the URI | Activated. The response head's `A2A-Extensions` names the URI |
+| `SendStreamingMessage` or `SubscribeToTask` without it | Plain: the [standard events](#standard-events) of its task and nothing else. The response head does not name the URI |
 | `murmur.WatchSession` | Always activated, whatever the request says. The response head's `A2A-Extensions` names the door extension's URI, then this one |
-| `SendMessage`, `GetTask`, `CancelTask`, `murmur.StopSession`, `GetExtendedAgentCard` | Never activated. The response head does not name the URI |
+| `SendMessage`, `GetTask`, `ListTasks`, `CancelTask`, `murmur.StopSession`, `GetExtendedAgentCard` | Never activated. The response head does not name the URI |
 
 The door reads every `A2A-Extensions` request line, header name case-insensitive, splits each
 value on `,`, trims each entry and drops empty ones. The connection is activated when one entry
@@ -287,7 +319,7 @@ key naming the frame; the reopen annotation has none, which is how a client tell
 
 | The frame belongs to | Carrier |
 |---|---|
-| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on `SendStreamingMessage`) | A `statusUpdate` of the task repeating its state with no `status.message`. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`. A `gap` repeats the opening `task`'s state; a `lagged` repeats the state of the last `task` or status the connection wrote |
+| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on a task stream) | A `statusUpdate` of the task repeating its state with no `status.message`. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`. A `gap` repeats the opening `task`'s state; a `lagged` repeats the state of the last `task` or status the connection wrote |
 | No task (`connection-ack`, `capsule-closed`, and `gap` and `lagged` on `murmur.WatchSession`) | A `message` from `ROLE_AGENT`, `messageId` `msg_` and a UUIDv7, no `contextId`, and one text part holding the frame's name |
 
 ```json
@@ -516,7 +548,7 @@ successful call whatever its exit status, so `bash` reports `"isError":false` be
 
 Written before a [replay](#replay) when events written after the client's `Last-Event-ID` are no
 longer in the replay buffer, or when that id was never issued by this capsule session. Unnumbered.
-On `SendStreamingMessage` it is written only to an activated connection.
+On a task stream it is written only to an activated connection.
 
 | Key | Type | Notes |
 |---|---|---|
@@ -533,8 +565,8 @@ On `SendStreamingMessage` it is written only to an activated connection.
 
 Written to a connection that fell more than 128 events behind and [lost live events](#lagged),
 before the next event it receives. Unnumbered, and only that connection receives it, once per loss.
-The count is not cumulative: a client that wants a total adds them up. On `SendStreamingMessage`
-it is written only to an activated connection.
+The count is not cumulative: a client that wants a total adds them up. On a task stream it is
+written only to an activated connection.
 
 | Key | Type | Notes |
 |---|---|---|
@@ -591,14 +623,14 @@ events behind loses the oldest of them; an activated connection is written a
 stays open. The capsule also writes the count to its own stderr, as
 `SSE broadcast lagged by <n> events`.
 
-On `SendStreamingMessage`, a lost event may be the status that ends the stream. From the first loss
-on, the connection checks its task's state at each [heartbeat](#heartbeat), and writes what it
-finds, unnumbered, then ends:
+On a task stream, a lost event may be the status that ends the stream. From the first loss on, the
+connection checks its task's state at each [heartbeat](#heartbeat), and writes what it finds,
+unnumbered, then ends:
 
 | The task | Written |
 |---|---|
 | Has ended | Its ending as `GetTask` reports it: the `response` artifact when it has one, then the terminal status |
-| Waits for input | A `TASK_STATE_INPUT_REQUIRED` status carrying the prompt |
+| Waits for input, on `SendStreamingMessage` | A `TASK_STATE_INPUT_REQUIRED` status carrying the prompt. A `SubscribeToTask` connection writes nothing and stays open |
 
 A `murmur.WatchSession` client that needs every event reconnects with the id of the last event it
 received and [replays](#replay) the rest, which recovers them while they are still in the replay
@@ -641,9 +673,9 @@ that tells a client is under [`capsule-closed`](#event-capsule-closed).
 |---|---|
 | Every `statusUpdate` and `artifactUpdate` of a task | yes |
 | Every murmur frame of a task: `text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact` | yes |
-| The opening `task` of a `SendStreamingMessage` stream, and a `TASK_STATE_REJECTED` `task` refused at the door | no |
+| The opening `task` of a task stream, and a `TASK_STATE_REJECTED` `task` refused at the door | no |
 | `gap`, `lagged`, `connection-ack`, `capsule-closed` | no |
-| The ending or `TASK_STATE_INPUT_REQUIRED` status a [lagged](#lagged) `SendStreamingMessage` connection writes in place of a lost one | no |
+| The ending or `TASK_STATE_INPUT_REQUIRED` status a [lagged](#lagged) task stream writes in place of a lost one | no |
 | Heartbeat | no |
 
 A capsule session numbers its events from one sequence:
@@ -653,7 +685,7 @@ A capsule session numbers its events from one sequence:
 | First id | `1` |
 | Next id | Exactly one higher than the previous numbered event's, across every task, every reopened attempt and every event kind, in the order events are written |
 | Uniqueness | Unique within a capsule session. A new session, including one started with `mur run --resume`, starts again at `1` |
-| On one connection | Strictly ascending, never repeated, and not contiguous: a `SendStreamingMessage` connection skips other tasks' ids, and a plain one skips its own task's murmur frames |
+| On one connection | Strictly ascending, never repeated, and not contiguous: a task stream skips other tasks' ids, and a plain one skips its own task's murmur frames |
 
 An event without an id never takes a number, so it leaves no hole in the sequence. A
 [`lagged`](#event-lagged) frame is what reports live events a connection lost.
@@ -669,7 +701,7 @@ The heartbeat and every unnumbered event — the opening `task`, a `TASK_STATE_R
 
 | Endpoint | `Last-Event-ID` sent | `Last-Event-ID` absent | `Last-Event-ID` not a number |
 |---|---|---|---|
-| `SendStreamingMessage` | Replays this task's events after that id, following the opening `task` | No replay | No replay |
+| `SendStreamingMessage`, `SubscribeToTask` | Replays this task's events after that id, following the opening `task` | No replay | No replay |
 | `murmur.WatchSession` | Replays every event after that id, following `connection-ack` | Replays from `0` | Replays from `0` |
 
 The header name is case-insensitive. A replay from id `N`:
@@ -681,19 +713,19 @@ The header name is case-insensitive. A replay from id `N`:
 | The oldest event's id is greater than `N + 1`: events after `N` were evicted | A `gap` naming the oldest id, then every event in the buffer |
 | Otherwise | Every event in the buffer whose id is greater than `N`, in order |
 
-`SendStreamingMessage` writes the replay's events of its own task only, and its `gap` only when
-activated. A replay from `0` of a buffer that has evicted nothing is every event the session has
-written, starting at id `1`. Live events follow the replay on the same connection, starting after
-the highest id the replay held.
+A task stream writes the replay's events of its own task only, and its `gap` only when activated.
+A replay from `0` of a buffer that has evicted nothing is every event the session has written,
+starting at id `1`. Live events follow the replay on the same connection, starting after the
+highest id the replay held.
 
 To reconnect a `murmur.WatchSession`, send the id of the last event received as `Last-Event-ID`. Without
 a `gap`, the replay is exactly the events written after that id. With one, the events between that
 id and `firstAvailableId` are gone, or the id came from an earlier capsule session, whose ids this
 session numbers again from `1`.
 
-A `SendStreamingMessage` connection lost while its task works cannot be reopened: a message naming
-a working task is refused `-32004`. Follow the task on `murmur.WatchSession` from the last id received, or
-poll `GetTask`.
+A `SendStreamingMessage` connection lost while its task works is not reopened by sending the message
+again: a message naming a working task is refused `-32004`. Send a `SubscribeToTask` naming the task,
+with the last id received as `Last-Event-ID`.
 
 ---
 

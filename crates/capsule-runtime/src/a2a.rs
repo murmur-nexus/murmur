@@ -279,8 +279,9 @@ fn error_info(reason: &str, domain: &str, metadata: &[(&str, String)]) -> Value 
 
 /// The A2A errors, A2A v1.0 §5.4, in code order.
 ///
-/// The door answers four of them: [`Self::TaskNotFound`], [`Self::TaskNotCancelable`],
-/// [`Self::UnsupportedOperation`] and [`Self::VersionNotSupported`]. The others are here so a
+/// The door answers six of them: [`Self::TaskNotFound`], [`Self::TaskNotCancelable`],
+/// [`Self::PushNotificationNotSupported`], [`Self::UnsupportedOperation`],
+/// [`Self::ContentTypeNotSupported`] and [`Self::VersionNotSupported`]. The others are here so a
 /// client of a door names any error it is answered with through [`Self::from_code`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum A2aError {
@@ -749,7 +750,6 @@ pub(crate) enum TaskState {
 
 impl TaskState {
     /// Every state, in the proto's order.
-    #[cfg(test)]
     pub(crate) const ALL: [TaskState; 7] = [
         TaskState::Submitted,
         TaskState::Working,
@@ -771,6 +771,14 @@ impl TaskState {
             Self::Rejected => "TASK_STATE_REJECTED",
             Self::Canceled => "TASK_STATE_CANCELED",
         }
+    }
+
+    /// The state whose A2A v1.0 ProtoJSON name is `wire`, or `None` for `TASK_STATE_UNSPECIFIED`,
+    /// `TASK_STATE_AUTH_REQUIRED`, which no task here is ever in, and anything else.
+    pub(crate) fn from_wire_name(wire: &str) -> Option<TaskState> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.wire_name() == wire)
     }
 
     /// The state in murmur's own word, the one a stream frame's `status.state`, the guest's
@@ -858,6 +866,9 @@ pub(crate) enum MessageRefusal {
         kind: &'static str,
         media_type: Option<String>,
     },
+    /// `-32003` `PushNotificationNotSupportedError`: `configuration.taskPushNotificationConfig`
+    /// asks to be notified, and this agent sends no push notifications.
+    PushNotificationNotSupported,
 }
 
 impl MessageRefusal {
@@ -886,8 +897,20 @@ impl MessageRefusal {
                     &metadata,
                 )
             }
+            Self::PushNotificationNotSupported => push_notification_not_supported(id),
         }
     }
+}
+
+/// The `PushNotificationNotSupportedError` answering request `id`: this agent's card says
+/// `capabilities.pushNotifications: false`, so it neither stores a push config nor notifies.
+pub(crate) fn push_notification_not_supported(id: Value) -> JsonRpcResponse {
+    JsonRpcResponse::a2a_error(
+        id,
+        A2aError::PushNotificationNotSupported,
+        "push notifications are not supported by this agent",
+        &[],
+    )
 }
 
 /// The message a `SendMessage` or `SendStreamingMessage` request's `params` carries, or why it is
@@ -900,9 +923,11 @@ impl MessageRefusal {
 /// are strings where present; `referenceTaskIds` is an array of non-empty strings naming at most
 /// [`MAX_REFERENCE_TASK_IDS`] distinct tasks; `metadata[DOOR_EXTENSION_URI]` is an object where
 /// present; its `forgetSession` is a boolean where present; `forgetSession: true` names no
-/// `taskId`. Then the first `raw` or `url` part is [`MessageRefusal::ContentTypeNotSupported`].
-/// Unknown fields are ignored, a `metadata` that is not an object and every other key of it and
-/// of the door extension's object among them.
+/// `taskId`. Then the first `raw` or `url` part is [`MessageRefusal::ContentTypeNotSupported`],
+/// and a `configuration.taskPushNotificationConfig` that is present and not `null` is
+/// [`MessageRefusal::PushNotificationNotSupported`]. The rest of `configuration` and unknown
+/// fields are ignored, a `metadata` that is not an object and every other key of it and of the
+/// door extension's object among them.
 pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, MessageRefusal> {
     let invalid = |message: String| Err(MessageRefusal::InvalidParams(message));
     let Some(message) = params.get("message").and_then(Value::as_object) else {
@@ -1011,6 +1036,13 @@ pub(crate) fn read_send_params(params: &Value) -> Result<IncomingMessage, Messag
             kind: part.content.kind(),
             media_type: part.media_type.clone(),
         });
+    }
+    if params
+        .get("configuration")
+        .and_then(|configuration| configuration.get("taskPushNotificationConfig"))
+        .is_some_and(|config| !config.is_null())
+    {
+        return Err(MessageRefusal::PushNotificationNotSupported);
     }
     Ok(IncomingMessage {
         message_id,
@@ -1197,8 +1229,13 @@ pub(crate) struct TaskRegistry {
     closed: bool,
     /// How each finished task ended, recorded by [`Self::record_ending`].
     endings: HashMap<String, TaskEnding>,
-    /// The formation member that submitted each task the door let in on a formation token.
-    submitters: HashMap<String, String>,
+    /// The door credential that started each task a credential other than the operator's
+    /// started: a declared credential's name, or `member:<from>` for a formation token.
+    owners: HashMap<String, String>,
+    /// The last revision handed out. Every change to a task's state or ending takes the next one.
+    revision: u64,
+    /// Each task's revision as of its last change, which orders `ListTasks`, newest first.
+    revisions: HashMap<String, u64>,
 }
 
 /// The `status.message` of a task refused because the session ended before it started.
@@ -1230,7 +1267,9 @@ impl TaskRegistry {
             resource_generation: Arc::new(AtomicU64::new(0)),
             closed: false,
             endings: HashMap::new(),
-            submitters: HashMap::new(),
+            owners: HashMap::new(),
+            revision: 0,
+            revisions: HashMap::new(),
         }
     }
 
@@ -1268,23 +1307,44 @@ impl TaskRegistry {
 
     pub(crate) fn enqueue(&mut self, task_id: &str, context_id: &str) {
         self.pending_count += 1;
-        self.history.insert(
-            task_id.to_string(),
-            (TaskState::Submitted, context_id.to_string()),
-        );
+        self.record_state(task_id, TaskState::Submitted, context_id.to_string());
     }
 
-    /// Record that the formation member `member` submitted `task_id`. Called under the lock the
-    /// task was enqueued under, so no `GetTask` can see the task without its submitter.
-    pub(crate) fn record_submitter(&mut self, task_id: &str, member: &str) {
-        self.submitters
-            .insert(task_id.to_string(), member.to_string());
+    /// Take back a task [`Self::enqueue`] just enqueued, which the task loop never received:
+    /// its queue slot, its state, its revision and its owner.
+    pub(crate) fn withdraw(&mut self, task_id: &str) {
+        self.pending_count = self.pending_count.saturating_sub(1);
+        self.history.remove(task_id);
+        self.revisions.remove(task_id);
+        self.owners.remove(task_id);
     }
 
-    /// The formation member that submitted `task_id`, or `None` for a task no formation token
-    /// submitted.
-    pub(crate) fn submitter(&self, task_id: &str) -> Option<&str> {
-        self.submitters.get(task_id).map(String::as_str)
+    /// Record `state` for `task_id` in `context_id`, under the next revision. Every write to
+    /// [`Self::history`] goes through here, so no state changes without moving the task to the
+    /// front of `ListTasks`.
+    pub(crate) fn record_state(&mut self, task_id: &str, state: TaskState, context_id: String) {
+        self.history
+            .insert(task_id.to_string(), (state, context_id));
+        self.touch(task_id);
+    }
+
+    /// Stamp `task_id` with the next revision.
+    fn touch(&mut self, task_id: &str) {
+        self.revision += 1;
+        self.revisions.insert(task_id.to_string(), self.revision);
+    }
+
+    /// Record that the door credential `credential` started `task_id`. Called under the lock the
+    /// task was enqueued under, so no `GetTask` can see the task without its owner.
+    pub(crate) fn record_owner(&mut self, task_id: &str, credential: &str) {
+        self.owners
+            .insert(task_id.to_string(), credential.to_string());
+    }
+
+    /// The door credential that started `task_id`, or `None` for a task the operator, a caller of
+    /// a public door or the runtime itself started.
+    pub(crate) fn owner(&self, task_id: &str) -> Option<&str> {
+        self.owners.get(task_id).map(String::as_str)
     }
 
     /// Record how `task_id` ended: its final status's `message`, and its `response` when it
@@ -1309,6 +1369,7 @@ impl TaskRegistry {
                 no_answer_below: no_answer_below.to_vec(),
             },
         );
+        self.touch(task_id);
     }
 
     /// `lane` is the lane the queue selected this task out of, so what the registry reports is
@@ -1316,8 +1377,7 @@ impl TaskRegistry {
     pub(crate) fn start_task(&mut self, task_id: String, context_id: String, lane: TaskLane) {
         debug_assert!(self.pending_count > 0);
         self.pending_count -= 1;
-        self.history
-            .insert(task_id.clone(), (TaskState::Working, context_id.clone()));
+        self.record_state(&task_id, TaskState::Working, context_id.clone());
         self.active_slot = TaskSlotState::Running {
             task_id,
             context_id,
@@ -1359,7 +1419,7 @@ impl TaskRegistry {
             Some((TaskState::Canceled, _)) => TaskState::Canceled,
             _ => final_state,
         };
-        self.history.insert(tid, (final_state.clone(), cid));
+        self.record_state(&tid, final_state.clone(), cid);
         self.active_slot = TaskSlotState::Done;
         Some(final_state)
     }
@@ -1371,8 +1431,7 @@ impl TaskRegistry {
     pub(crate) fn record_input_timeout(&mut self, task_id: &str) {
         self.input_waiters.remove(task_id);
         if let Some((TaskState::InputRequired, ctx)) = self.history.get(task_id).cloned() {
-            self.history
-                .insert(task_id.to_string(), (TaskState::Working, ctx));
+            self.record_state(task_id, TaskState::Working, ctx);
         }
         self.input_timeouts.insert(task_id.to_string());
     }
@@ -1403,8 +1462,7 @@ impl TaskRegistry {
             return Err("task is not in working state");
         }
         if let Some((_, ctx)) = self.history.get(task_id).cloned() {
-            self.history
-                .insert(task_id.to_string(), (TaskState::InputRequired, ctx));
+            self.record_state(task_id, TaskState::InputRequired, ctx);
         }
         self.input_waiters.insert(task_id.to_string(), (prompt, tx));
         Ok(())
@@ -1424,8 +1482,7 @@ impl TaskRegistry {
             return Err("no input waiter found for task");
         };
         if let Some((_, ctx)) = self.history.get(task_id).cloned() {
-            self.history
-                .insert(task_id.to_string(), (TaskState::Working, ctx));
+            self.record_state(task_id, TaskState::Working, ctx);
         }
         // Sending may fail if the receiver was dropped (timeout path), which is fine.
         let _ = tx.send(text);
@@ -1468,8 +1525,7 @@ impl TaskRegistry {
         if matches!(state, TaskState::Submitted) {
             self.pending_count = self.pending_count.saturating_sub(1);
         }
-        self.history
-            .insert(task_id.to_string(), (TaskState::Canceled, context_id));
+        self.record_state(task_id, TaskState::Canceled, context_id);
         self.cancel_watch(task_id).cancel();
         CancelOutcome::Accepted
     }
@@ -1513,8 +1569,7 @@ impl TaskRegistry {
             .collect();
         refused.sort();
         for (task_id, context_id) in &refused {
-            self.history
-                .insert(task_id.clone(), (TaskState::Rejected, context_id.clone()));
+            self.record_state(task_id, TaskState::Rejected, context_id.clone());
             self.cancels.remove(task_id);
         }
         self.pending_count = self.pending_count.saturating_sub(refused.len());
@@ -1622,6 +1677,140 @@ impl TaskRegistry {
             .collect();
         Some(format!("Referenced tasks:\n{}", lines.join("\n")))
     }
+
+    /// One `ListTasks` page: the tasks `visible` lets the caller see that match `filter`, newest
+    /// revision first, the first `page_size` of those strictly after `after`.
+    ///
+    /// Each task is exactly [`Self::get_task`]'s. `next` is the position of the page's last task
+    /// when a matching task lies past it, and `total` counts every visible match, before paging.
+    /// A task whose state changes during a walk takes a newer revision and moves ahead of the
+    /// cursor, so a walk returns every match exactly once only while no match changes.
+    pub(crate) fn list_tasks(
+        &self,
+        filter: &TaskFilter,
+        after: Option<&ListCursor>,
+        page_size: usize,
+        visible: impl Fn(&str) -> bool,
+    ) -> TaskPage {
+        let mut matching: Vec<ListCursor> = self
+            .history
+            .iter()
+            .filter(|(task_id, (state, context_id))| {
+                filter.matches(state, context_id) && visible(task_id)
+            })
+            .map(|(task_id, _)| ListCursor {
+                revision: self.revisions.get(task_id).copied().unwrap_or_default(),
+                task_id: task_id.clone(),
+            })
+            .collect();
+        matching.sort_unstable_by(|a, b| b.cmp(a));
+        let total = matching.len();
+        let rest: Vec<ListCursor> = matching
+            .into_iter()
+            .filter(|position| after.is_none_or(|after| position < after))
+            .collect();
+        let page: Vec<&ListCursor> = rest.iter().take(page_size).collect();
+        let next = (rest.len() > page.len())
+            .then(|| page.last().map(|last| (*last).clone()))
+            .flatten();
+        TaskPage {
+            tasks: page
+                .iter()
+                .filter_map(|position| self.get_task(&position.task_id))
+                .collect(),
+            next,
+            total,
+        }
+    }
+}
+
+/// Which tasks a `ListTasks` call asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TaskFilter {
+    /// Only the tasks in this context, or the tasks of every context when `None`.
+    pub context_id: Option<String>,
+    pub state: StateFilter,
+}
+
+impl TaskFilter {
+    fn matches(&self, state: &TaskState, context_id: &str) -> bool {
+        let in_context = self.context_id.as_deref().is_none_or(|c| c == context_id);
+        let in_state = match &self.state {
+            StateFilter::Any => true,
+            StateFilter::Only(wanted) => wanted == state,
+            StateFilter::Nothing => false,
+        };
+        in_context && in_state
+    }
+}
+
+/// The `status` a `ListTasks` call filters by.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateFilter {
+    /// No `status`, or `TASK_STATE_UNSPECIFIED`.
+    Any,
+    /// Only tasks in this state.
+    Only(TaskState),
+    /// A state no task here is ever in: `TASK_STATE_AUTH_REQUIRED`.
+    Nothing,
+}
+
+impl StateFilter {
+    /// The filter a `status` naming the v1.0 `TaskState` `wire` asks for, or `None` when `wire`
+    /// is not a `TaskState` name.
+    pub(crate) fn from_wire_name(wire: &str) -> Option<StateFilter> {
+        match wire {
+            "TASK_STATE_UNSPECIFIED" => Some(StateFilter::Any),
+            "TASK_STATE_AUTH_REQUIRED" => Some(StateFilter::Nothing),
+            wire => TaskState::from_wire_name(wire).map(StateFilter::Only),
+        }
+    }
+}
+
+/// A place in the `ListTasks` order: a task's revision and its id. Revisions are unique, so the
+/// order is total; the id only makes the position self-describing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ListCursor {
+    pub revision: u64,
+    pub task_id: String,
+}
+
+impl ListCursor {
+    /// The `nextPageToken` naming this position: `<revision>:<task_id>` in unpadded base64url.
+    /// Clients treat it as opaque.
+    pub(crate) fn encode(&self) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{}:{}", self.revision, self.task_id))
+    }
+
+    /// The position a `pageToken` names, or `None` for a string [`Self::encode`] did not produce.
+    pub(crate) fn decode(token: &str) -> Option<ListCursor> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        let (revision, task_id) = text.split_once(':')?;
+        let revision = revision
+            .parse()
+            .ok()
+            .filter(|_| !revision.starts_with('+'))?;
+        (!task_id.is_empty()).then(|| ListCursor {
+            revision,
+            task_id: task_id.to_string(),
+        })
+    }
+}
+
+/// One `ListTasks` page, as [`TaskRegistry::list_tasks`] returns it.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskPage {
+    pub tasks: Vec<A2aTask>,
+    /// Where the next page starts, or `None` on the last page.
+    pub next: Option<ListCursor>,
+    /// How many tasks the caller sees that match the filter.
+    pub total: usize,
 }
 
 // ── Incoming task (HTTP server → main thread) ─────────────────────────────────
@@ -1864,13 +2053,186 @@ mod tests {
     }
 
     #[test]
-    fn a_submitter_is_recorded_per_task() {
+    fn an_owner_is_recorded_per_task() {
         let mut r = make_registry();
         r.enqueue("tsk_a", "ctx_001");
-        r.record_submitter("tsk_a", "lead");
+        r.record_owner("tsk_a", "member:lead");
         r.enqueue("tsk_b", "ctx_001");
-        assert_eq!(r.submitter("tsk_a"), Some("lead"));
-        assert_eq!(r.submitter("tsk_b"), None);
+        assert_eq!(r.owner("tsk_a"), Some("member:lead"));
+        assert_eq!(r.owner("tsk_b"), None);
+        r.withdraw("tsk_a");
+        assert_eq!(r.owner("tsk_a"), None);
+        assert!(r.get_task("tsk_a").is_none());
+        assert_eq!(r.pending_count, 1);
+    }
+
+    /// The ids of a page, in order.
+    fn listed(page: &TaskPage) -> Vec<&str> {
+        page.tasks.iter().map(|task| task.id.as_str()).collect()
+    }
+
+    fn every_task() -> TaskFilter {
+        TaskFilter {
+            context_id: None,
+            state: StateFilter::Any,
+        }
+    }
+
+    /// Every change to a task's state or ending moves it to the front of the listing.
+    #[test]
+    fn list_tasks_orders_by_the_last_change_newest_first() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        for id in ["tsk_a", "tsk_b", "tsk_c"] {
+            r.enqueue(id, "ctx_001");
+        }
+        let all = |r: &TaskRegistry| -> Vec<String> {
+            listed(&r.list_tasks(&every_task(), None, 10, |_| true))
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(all(&r), ["tsk_c", "tsk_b", "tsk_a"]);
+        r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::User);
+        assert_eq!(all(&r), ["tsk_a", "tsk_c", "tsk_b"]);
+        r.request_cancel("tsk_b");
+        assert_eq!(all(&r), ["tsk_b", "tsk_a", "tsk_c"]);
+        let (tx, _rx) = oneshot::channel();
+        r.set_input_required("tsk_a", "which?".to_string(), tx)
+            .unwrap();
+        assert_eq!(all(&r), ["tsk_a", "tsk_b", "tsk_c"]);
+        r.deliver_input("tsk_a", "left".to_string()).unwrap();
+        r.finish_task(TaskState::Completed);
+        r.record_ending("tsk_c", "", None, false, &[]);
+        assert_eq!(all(&r), ["tsk_c", "tsk_a", "tsk_b"]);
+        r.record_ending("tsk_a", "done", Some("four"), false, &[]);
+        assert_eq!(all(&r), ["tsk_a", "tsk_c", "tsk_b"]);
+        r.close_to_new_work();
+        assert_eq!(all(&r), ["tsk_c", "tsk_a", "tsk_b"], "tsk_c was rejected");
+
+        let page = r.list_tasks(&every_task(), None, 10, |_| true);
+        for task in &page.tasks {
+            assert_eq!(
+                serde_json::to_value(task).unwrap(),
+                serde_json::to_value(r.get_task(&task.id).unwrap()).unwrap()
+            );
+        }
+    }
+
+    /// Pages follow one another through the cursor; a task that changes during the walk moves
+    /// ahead of the cursor and is not returned a second time.
+    #[test]
+    fn list_tasks_walks_pages_and_returns_a_task_changed_mid_walk_once() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        for id in ["tsk_1", "tsk_2", "tsk_3", "tsk_4", "tsk_5"] {
+            r.enqueue(id, "ctx_001");
+        }
+        let first = r.list_tasks(&every_task(), None, 2, |_| true);
+        assert_eq!(listed(&first), ["tsk_5", "tsk_4"]);
+        assert_eq!(first.total, 5);
+        let cursor = first.next.clone().expect("more tasks lie past the page");
+        assert_eq!(ListCursor::decode(&cursor.encode()), Some(cursor.clone()));
+
+        r.request_cancel("tsk_4");
+        r.request_cancel("tsk_2");
+        let second = r.list_tasks(&every_task(), Some(&cursor), 2, |_| true);
+        assert_eq!(listed(&second), ["tsk_3", "tsk_1"], "tsk_2 moved ahead");
+        assert_eq!(second.next, None);
+        assert_eq!(second.total, 5);
+        let fresh = r.list_tasks(&every_task(), None, 2, |_| true);
+        assert_eq!(listed(&fresh), ["tsk_2", "tsk_4"]);
+
+        let exact = r.list_tasks(&every_task(), None, 5, |_| true);
+        assert_eq!(exact.tasks.len(), 5);
+        assert_eq!(
+            exact.next, None,
+            "no task lies past a page that ends the list"
+        );
+    }
+
+    /// The filters and the visibility predicate decide the page and the total alike.
+    #[test]
+    fn list_tasks_filters_by_context_state_and_visibility() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_one");
+        r.record_owner("tsk_a", "alice");
+        r.enqueue("tsk_b", "ctx_two");
+        r.record_owner("tsk_b", "alice");
+        r.enqueue("tsk_c", "ctx_one");
+        r.record_owner("tsk_c", "bob");
+        r.request_cancel("tsk_c");
+        let alice = |task_id: &str| r.owner(task_id) == Some("alice");
+        let page = r.list_tasks(&every_task(), None, 10, alice);
+        assert_eq!((listed(&page), page.total), (vec!["tsk_b", "tsk_a"], 2));
+        let in_one = TaskFilter {
+            context_id: Some("ctx_one".to_string()),
+            state: StateFilter::Any,
+        };
+        let page = r.list_tasks(&in_one, None, 10, |_| true);
+        assert_eq!((listed(&page), page.total), (vec!["tsk_c", "tsk_a"], 2));
+        let canceled = TaskFilter {
+            context_id: None,
+            state: StateFilter::Only(TaskState::Canceled),
+        };
+        let page = r.list_tasks(&canceled, None, 10, |_| true);
+        assert_eq!(listed(&page), ["tsk_c"]);
+        let page = r.list_tasks(&canceled, None, 10, alice);
+        assert_eq!((page.tasks.len(), page.total, page.next), (0, 0, None));
+        let nothing = TaskFilter {
+            context_id: None,
+            state: StateFilter::Nothing,
+        };
+        assert_eq!(r.list_tasks(&nothing, None, 10, |_| true).total, 0);
+    }
+
+    #[test]
+    fn list_cursor_reads_only_what_it_wrote() {
+        let cursor = ListCursor {
+            revision: 42,
+            task_id: "tsk_01a1".to_string(),
+        };
+        let token = cursor.encode();
+        assert!(!token.contains('='), "{token}");
+        assert_eq!(ListCursor::decode(&token), Some(cursor));
+        use base64::Engine as _;
+        let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        for garbage in [
+            "not-a-token".to_string(),
+            "".to_string(),
+            "!!".to_string(),
+            encode("42"),
+            encode("42:"),
+            encode("x:tsk_1"),
+            encode("-1:tsk_1"),
+            encode("+1:tsk_1"),
+        ] {
+            assert_eq!(ListCursor::decode(&garbage), None, "{garbage}");
+        }
+    }
+
+    #[test]
+    fn list_state_filter_reads_every_v1_state_name() {
+        for state in TaskState::ALL {
+            assert_eq!(
+                TaskState::from_wire_name(state.wire_name()),
+                Some(state.clone())
+            );
+            assert_eq!(
+                StateFilter::from_wire_name(state.wire_name()),
+                Some(StateFilter::Only(state))
+            );
+        }
+        assert_eq!(
+            StateFilter::from_wire_name("TASK_STATE_UNSPECIFIED"),
+            Some(StateFilter::Any)
+        );
+        assert_eq!(
+            StateFilter::from_wire_name("TASK_STATE_AUTH_REQUIRED"),
+            Some(StateFilter::Nothing)
+        );
+        for other in ["done", "completed", "task_state_completed", ""] {
+            assert_eq!(StateFilter::from_wire_name(other), None, "{other}");
+            assert_eq!(TaskState::from_wire_name(other), None, "{other}");
+        }
     }
 
     #[test]
@@ -2633,6 +2995,42 @@ mod tests {
         assert!(message.contains("names 17 tasks"), "{message}");
     }
 
+    /// A message asking for push notifications is refused, whatever else `configuration` holds;
+    /// a `null` config asks for nothing.
+    #[test]
+    fn read_send_params_refuses_a_push_notification_config() {
+        let message = user(serde_json::json!([{"text": "hi"}]));
+        let asking = serde_json::json!({"message": message,
+            "configuration": {"taskPushNotificationConfig": {"url": "https://example.com/hook"}}});
+        assert_eq!(
+            read_send_params(&asking),
+            Err(MessageRefusal::PushNotificationNotSupported)
+        );
+        let answer = serde_json::to_value(
+            MessageRefusal::PushNotificationNotSupported.into_response(Value::from(1)),
+        )
+        .unwrap();
+        assert_eq!(answer["error"]["code"], -32003);
+        assert_eq!(
+            answer["error"]["message"],
+            "push notifications are not supported by this agent"
+        );
+        assert_eq!(
+            answer["error"]["data"][0],
+            serde_json::json!({"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": "PUSH_NOTIFICATION_NOT_SUPPORTED", "domain": "a2a-protocol.org",
+                "metadata": {}})
+        );
+        for configuration in [
+            serde_json::json!({"taskPushNotificationConfig": null}),
+            serde_json::json!({"acceptedOutputModes": ["text/plain"], "historyLength": 2}),
+            serde_json::json!("ignored"),
+        ] {
+            let params = serde_json::json!({"message": message, "configuration": configuration});
+            assert!(read_send_params(&params).is_ok(), "{params}");
+        }
+    }
+
     /// A message whose `metadata` is `metadata`, naming `task_id` when given.
     fn with_metadata(metadata: Value, task_id: Option<&str>) -> Value {
         let mut message = user(serde_json::json!([{"text": "a"}]));
@@ -2874,7 +3272,7 @@ mod tests {
         r.finish_task(TaskState::Failed);
         r.record_ending("tsk_b", "the driver\nfailed", None, false, &[]);
         r.start_task("tsk_c".to_string(), "ctx_001".to_string(), TaskLane::Bg);
-        r.record_submitter("tsk_e", "reviewer");
+        r.record_owner("tsk_e", "member:reviewer");
         let ids: Vec<String> = ["tsk_a", "tsk_b", "tsk_c", "tsk_d", "tsk_e"]
             .map(str::to_string)
             .to_vec();
@@ -2888,7 +3286,7 @@ mod tests {
              - tsk_d: not a task this capsule holds\n\
              - tsk_e: submitted"
         );
-        let member = |task_id: &str| r.submitter(task_id) == Some("planner");
+        let member = |task_id: &str| r.owner(task_id) == Some("member:planner");
         let block = r.reference_block(&ids[4..], member).unwrap();
         assert_eq!(
             block,

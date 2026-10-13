@@ -24,6 +24,36 @@ pub const AUTHENTICATION_YAML: &str = "network:\n  authentication:\n    scheme: 
      credentials:\n      watcher:\n        scopes: [GetTask, murmur.WatchSession]\n      \
      reader:\n        scopes: [resources/files]\n";
 
+/// `network.authentication` with two credentials, `alice` and `bob`, that may each start, read,
+/// list, cancel and subscribe to tasks, and so reach only the tasks each started.
+pub const CREDENTIALS_YAML: &str = "network:\n  authentication:\n    scheme: bearer\n    \
+     credentials:\n      alice:\n        scopes: [SendMessage, GetTask, ListTasks, CancelTask, \
+     SubscribeToTask]\n      bob:\n        scopes: [SendMessage, GetTask, ListTasks, CancelTask, \
+     SubscribeToTask]\n";
+
+/// The four A2A v1.0 push notification config methods, each with a valid v1.0 request message
+/// naming `task_id`.
+pub fn push_config_requests(task_id: &str) -> [(&'static str, Value); 4] {
+    [
+        (
+            "CreateTaskPushNotificationConfig",
+            json!({"taskId": task_id, "url": "https://example.com/hook"}),
+        ),
+        (
+            "GetTaskPushNotificationConfig",
+            json!({"taskId": task_id, "id": "cfg-1"}),
+        ),
+        (
+            "ListTaskPushNotificationConfigs",
+            json!({"taskId": task_id}),
+        ),
+        (
+            "DeleteTaskPushNotificationConfig",
+            json!({"taskId": task_id, "id": "cfg-1"}),
+        ),
+    ]
+}
+
 /// The `A2A-Version` header every JSON-RPC request to a door carries.
 pub const A2A_VERSION: (&str, &str) = (
     capsule_runtime::A2A_VERSION_HEADER,

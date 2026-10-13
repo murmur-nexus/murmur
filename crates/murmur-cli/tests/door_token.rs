@@ -165,13 +165,15 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
             .to_string();
         wait_completed(&addr, Some(operator), &task_id);
 
-        // A declared credential reads and is refused what its scopes do not grant.
+        // A declared credential is let in on what its scopes grant, reaches only the tasks it
+        // started, and is refused what its scopes do not grant.
         let (ok, watcher, stderr) = token(home.path(), &["--credential", "watcher"]);
         assert!(ok, "{stderr}");
         let watcher = watcher.trim_end();
         assert!(watcher.starts_with("mdt1.") && watcher != operator);
         let got = rpc(&addr, Some(watcher), "GetTask", json!({"id": task_id}));
         assert_eq!(got.status, 200, "{got:?}");
+        assert_eq!(got.json()["error"]["code"], -32001, "{got:?}");
         let refused = rpc(&addr, Some(watcher), "SendMessage", message("m-2", "no"));
         assert_eq!(refused.status, 403, "{refused:?}");
 

@@ -261,7 +261,7 @@ async fn run_task_with_reopens(
     // work reports back.
     let mut continuation: Option<agent::Continuation> = None;
     // The formation member that sent the task, which `end-without-answer` reports to; `None` for
-    // a task no formation token submitted, and on the `task.md` paths. The registry lock is
+    // a task no formation token started, and on the `task.md` paths. The registry lock is
     // released here, before `scope_task` takes the member-calls lock.
     let caller = agent_task_id
         .as_deref()
@@ -270,7 +270,12 @@ async fn run_task_with_reopens(
             let registry = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.submitter(task_id).map(str::to_string)
+            registry
+                .owner(task_id)
+                .and_then(|owner| {
+                    owner.strip_prefix(crate::formation_credentials::FORMATION_CREDENTIAL_PREFIX)
+                })
+                .map(str::to_string)
         });
     // The calls and delegations this task makes are this task's: put it in scope, with the flag
     // that cancels it, until this function returns. Dropping the delegation scope ends any
@@ -766,10 +771,7 @@ async fn end_task(
 fn unregistered_ending(task_id: &str, context_id: &str, ending: &agent::AttemptEnding) -> A2aTask {
     let mut registry = TaskRegistry::new(1, murmur_artifact::TaskAcceptance::Single);
     registry.enqueue(task_id, context_id);
-    registry.history.insert(
-        task_id.to_string(),
-        (ending.state.clone(), context_id.to_string()),
-    );
+    registry.record_state(task_id, ending.state.clone(), context_id.to_string());
     registry.record_ending(
         task_id,
         &ending.message,

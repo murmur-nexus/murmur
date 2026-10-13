@@ -85,10 +85,12 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     {
         return;
     }
-    let server = common::ScriptedServer::start(
+    // Every answer takes a moment, so a task this test cancels or subscribes to is still live.
+    let server = common::ScriptedServer::start_with_delay(
         (1..=8)
             .map(|n| end_turn(n, "done"))
             .collect::<Vec<String>>(),
+        Duration::from_millis(1500),
     );
     let home = driver_home();
     let authority = FormationAuthority::generate(&FormationId::mint()).unwrap();
@@ -130,6 +132,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     // Every other method is the ordinary scope refusal, naming the member credential.
     for (method, path, scope) in [
         ("murmur.StopSession", "/", "murmur.StopSession"),
+        ("murmur.WatchSession", "/", "murmur.WatchSession"),
         ("", "/resources/files/x", "resources/files"),
     ] {
         let refused = if method.is_empty() {
@@ -152,8 +155,8 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
             "{text}"
         );
     }
-    // A stream connection forwards every task's frames on the door, so a formation token is
-    // refused `SendStreamingMessage` before any task starts or any event stream opens.
+    // `SendMessage` and `SubscribeToTask` reach everything `SendStreamingMessage` would, so a
+    // formation token is refused it before any task starts or any event stream opens.
     let streamed = rpc(
         &coder.addr,
         Some(&token),
@@ -268,6 +271,49 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         "{canceled:?}"
     );
 
+    // (f') `ListTasks` lists only the tasks the member started, and `SubscribeToTask` streams one
+    // of them while refusing the operator's as an id the door never held.
+    let listed = rpc(&coder.addr, Some(&token), "ListTasks", json!({}));
+    assert_eq!(listed.status, 200, "{listed:?}");
+    let listed = listed.json()["result"].clone();
+    assert_eq!(listed["totalSize"], 1, "{listed}");
+    assert_eq!(listed["tasks"][0]["id"], task_id.as_str(), "{listed}");
+    let all = rpc(&coder.addr, Some(&coder.operator), "ListTasks", json!({}));
+    assert_eq!(all.json()["result"]["totalSize"], 2, "{all:?}");
+    let hidden = rpc(
+        &coder.addr,
+        Some(&token),
+        "SubscribeToTask",
+        json!({"id": operator_task}),
+    );
+    assert_eq!(hidden.header("content-type"), Some("application/json"));
+    assert_eq!(hidden.json()["error"]["code"], -32001, "{hidden:?}");
+    let watched = rpc(
+        &coder.addr,
+        Some(&token),
+        "SendMessage",
+        message("m-watched", "hi"),
+    );
+    let watched_id = watched.json()["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (subscribed, events) =
+        common::stream::subscribe(&coder.addr, Some(&token), &watched_id, false, None);
+    assert_eq!(subscribed.status, 200, "{subscribed:?}");
+    assert_eq!(events[0].kind(), "task", "{subscribed:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.task_id() == Some(&watched_id)),
+        "{subscribed:?}"
+    );
+    assert_eq!(
+        events.last().unwrap().state(),
+        Some("TASK_STATE_COMPLETED"),
+        "{subscribed:?}"
+    );
+
     // (g) A member that does not consent refuses a peer task on a valid formation token.
     let auditor = door(
         &home,
@@ -291,7 +337,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
     assert_eq!(refused.status, 403, "{refused:?}");
     assert_eq!(refused.json()["error"], "peer_not_accepted");
 
-    // The task the formation token started is recorded as `planner`'s; the operator's is no
+    // The tasks the formation token started are recorded as `planner`'s; the operator's is no
     // member's.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let received = loop {
@@ -299,7 +345,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
             .into_iter()
             .filter(|event| event["event_type"] == "a2a_task_received")
             .collect();
-        if received.len() >= 2 || std::time::Instant::now() >= deadline {
+        if received.len() >= 3 || std::time::Instant::now() >= deadline {
             break received;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -308,7 +354,11 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         .iter()
         .map(|event| event["caller_member"].as_str())
         .collect();
-    assert_eq!(callers, [Some("planner"), None], "{received:?}");
+    assert_eq!(
+        callers,
+        [Some("planner"), None, Some("planner")],
+        "{received:?}"
+    );
     let start = &trace_events(&coder.workdir)[0];
     assert_eq!(start["formation_member"], "coder");
     assert_eq!(start["formation_callees"], json!(["reviewer"]));

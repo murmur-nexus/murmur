@@ -3115,7 +3115,7 @@ address or hostname are off it. A capsule with no `inference:` block serves no d
 warns. `mur run` and `mur doctor` print the same bytes for the same manifest and address.
 
 ```text
-warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call SendMessage, SendStreamingMessage, murmur.WatchSession, GetTask, CancelTask, murmur.StopSession, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
+warning[W-SEC-032]: the door is bound to 0.0.0.0 and network.authentication is not declared — any caller that reaches it can call SendMessage, SendStreamingMessage, murmur.WatchSession, GetTask, ListTasks, CancelTask, SubscribeToTask, murmur.StopSession, and the agent card publishes to any A2A client the session id, tools [bash], shell: true, network: true and planes [files] (https://docs.murmur.nexus/reference/diagnostics/#w-sec-032)
 ```
 
 **Why it matters:** a public door answers every caller that reaches the port. Anyone on the network

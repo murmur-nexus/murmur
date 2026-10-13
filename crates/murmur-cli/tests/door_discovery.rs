@@ -29,12 +29,14 @@ use serde_json::{json, Value};
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-const ALL_METHODS: [&str; 6] = [
+const ALL_METHODS: [&str; 8] = [
     "SendMessage",
     "SendStreamingMessage",
     "murmur.WatchSession",
     "GetTask",
+    "ListTasks",
     "CancelTask",
+    "SubscribeToTask",
     "murmur.StopSession",
 ];
 
@@ -425,6 +427,7 @@ fn a_capsule_that_accepts_no_tasks_lists_neither_task_starting_method() {
         [
             "murmur.WatchSession",
             "GetTask",
+            "ListTasks",
             "CancelTask",
             "murmur.StopSession"
         ]

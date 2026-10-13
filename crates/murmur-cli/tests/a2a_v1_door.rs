@@ -22,7 +22,9 @@ fn served_methods(task_id: &str) -> Vec<(&'static str, Value)> {
         ("SendMessage", message("m-send", "send")),
         ("SendStreamingMessage", message("m-stream", "stream")),
         ("GetTask", json!({"id": task_id})),
+        ("ListTasks", json!({})),
         ("CancelTask", json!({"id": task_id})),
+        ("SubscribeToTask", json!({"id": task_id})),
         ("GetExtendedAgentCard", json!({})),
         ("murmur.WatchSession", json!({})),
         ("murmur.StopSession", json!({})),
@@ -154,11 +156,11 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
     {
         return;
     }
-    // Each served round starts two tasks. Every answer takes a moment, so the task just sent is
+    // Each served round starts three tasks. Every answer takes a moment, so the task just sent is
     // still live when it is cancelled, and short enough that a stream never goes the second quiet
     // `request` reads it until.
     let provider = common::ScriptedServer::start_with_delay(
-        (1..=10).map(|n| end_turn(n, "done")).collect(),
+        (1..=16).map(|n| end_turn(n, "done")).collect(),
         Duration::from_millis(300),
     );
     let door = Door::launch(
@@ -265,15 +267,38 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
             .unwrap()
             .to_string();
         started.push(task_id.clone());
+        // Queued behind the task just sent, so it is still live when it is subscribed to.
+        let queued = versioned(
+            &addr,
+            token,
+            name,
+            &[version],
+            1,
+            "SendMessage",
+            message("m-queued", "queued"),
+        );
+        assert_served("SendMessage", &queued);
+        let queued_id = queued.json()["result"]["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        started.push(queued_id.clone());
         // The task just sent is still live, so its cancel is accepted.
         for method in [
             "GetTask",
+            "ListTasks",
             "CancelTask",
+            "SubscribeToTask",
             "SendStreamingMessage",
             "GetExtendedAgentCard",
             "murmur.WatchSession",
         ] {
-            let (_, params) = served_methods(&task_id)
+            let named = if method == "SubscribeToTask" {
+                &queued_id
+            } else {
+                &task_id
+            };
+            let (_, params) = served_methods(named)
                 .into_iter()
                 .find(|(served, _)| *served == method)
                 .unwrap();
@@ -360,12 +385,14 @@ fn a2a_v1_door_names_are_the_v1_names_alone() {
         "SendStreamingMessage",
         "murmur.WatchSession",
         "GetTask",
+        "ListTasks",
         "CancelTask",
+        "SubscribeToTask",
         "murmur.StopSession",
         "GetExtendedAgentCard",
     ];
     assert_eq!(common::card_door_methods(&authenticated_card), all);
-    assert_eq!(common::card_door_methods(&public_card), all[..6]);
+    assert_eq!(common::card_door_methods(&public_card), all[..8]);
 
     // The spec's own request carries no `params`.
     let body = json!({"jsonrpc": "2.0", "id": "card", "method": "GetExtendedAgentCard"});
@@ -530,7 +557,9 @@ fn murmur_methods_are_listed_served_and_negotiated() {
         "SendStreamingMessage",
         "murmur.WatchSession",
         "GetTask",
+        "ListTasks",
         "CancelTask",
+        "SubscribeToTask",
         "murmur.StopSession",
     ];
     let mut authenticated_methods = public_methods.to_vec();
