@@ -132,16 +132,18 @@ The capsule starts and waits for the first incoming task. You will see no immedi
 
 ## Step 4 — send tasks
 
-The capsule URL is printed to stderr at startup. Note the port — you will use it in every request:
+The capsule URL is printed at startup. Note the port — you will use it in every request:
 
-```text
-MURMUR_CAPSULE_URL: localhost:52322
+```
+mur run
+murmur: url localhost:52222
+session: ses_019ed2af53da75c2aefee84ee10c34af
 ```
 
-Set a shell variable for convenience, replacing `52322` with the port you see:
+Set a shell variable for convenience, replacing `52222` with the port you see:
 
 ```bash
-PORT=52322
+PORT=52222
 ```
 
 Send the first task:
@@ -204,7 +206,7 @@ curl -s -X POST http://localhost:$PORT \
   }'
 ```
 
-Because `queue_depth: 2`, this second task is accepted and queued. A third task sent at the same moment would be answered in `TASK_STATE_REJECTED`.
+Because `queue_depth: 2`, this second task is accepted and queued. Up to two tasks wait while one runs; a message that arrives when two are already waiting is answered with a task in `TASK_STATE_REJECTED`.
 
 When task 2 runs, the agent receives the full history from task 1 — the scores list and the answer about the count — so it can answer the follow-up without the data being repeated. Each completed task also writes a per-task result file alongside the shared `out/result.txt`:
 
@@ -243,7 +245,7 @@ curl -s -X POST http://localhost:$PORT \
 }
 ```
 
-`GetTask` can look up **any task by ID** from the capsule's `TaskRegistry`, including tasks that have already finished — you are not limited to the currently-running task.
+`GetTask` can look up **any task by ID** from the capsule's `TaskRegistry`, including tasks that have already finished, not only the running one.
 
 ---
 

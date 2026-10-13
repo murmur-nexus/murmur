@@ -676,9 +676,9 @@ because of `SIGTERM` or [`mur stop`](cli.md#mur-stop) writes none.
 
 **`member_call_busy`**{ #member-call-busy } — written once per offer of a
 [`call-member`](runtime-provided-tools.md#call-member) call's task that the member's door turned
-away busy: it answered `rejected` with the status message `task rejected: capsule is busy`. The
-first is written as the tool call returns, each later one as the runtime offers the task again —
-see [A busy member](runtime-provided-tools.md#call-member-busy)
+away busy: it answered a task in `TASK_STATE_REJECTED` with the status message
+`task rejected: capsule is busy`. The first is written as the tool call returns, each later one as
+the runtime offers the task again — see [A busy member](runtime-provided-tools.md#call-member-busy)
 
 | Field | Type | Notes |
 |---|---|---|
@@ -729,7 +729,7 @@ delivered to the calling task, or left behind when that task ended
 
 | `status` | Meaning |
 |---|---|
-| `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state |
+| `completed`, `failed`, `canceled`, `rejected` | The member's task ended in that state, which its door reports as `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED` or `TASK_STATE_REJECTED` — see [Task states](agent-card.md#task-states) |
 | `rejected`, with no `member_task_id` | The member never held the task: it stayed busy for the whole [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), or its door refused the task because its session was closing |
 | `failed`, with no `member_task_id` | Every other call that never started: the caller's `capabilities.network.allow` does not reach the member's door, the door's address never arrived, the door answered an error, or it could not be reached |
 | `timed_out` | The member had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs); its task was not cancelled |

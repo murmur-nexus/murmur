@@ -121,7 +121,7 @@ ProtoJSON shape — see [Tasks and messages](#tasks-and-messages).
 | Key | Type | Value |
 |---|---|---|
 | `capabilities.streaming` | boolean | `true` exactly when the [door extension](#murmur-door-v1) lists `SendStreamingMessage` |
-| `capabilities.pushNotifications` | boolean | `false` — see [Push notifications](#push-notifications) |
+| `capabilities.pushNotifications` | boolean | `false` — see [Push notifications](#push-notifications), and [what is not supported](#conformance-not-supported) |
 | `capabilities.extendedAgentCard` | boolean | `false` on a public door, where every caller gets this card. `true` on an [authenticated door](#security) |
 | `capabilities.extensions` | array of objects | The [door extension](#murmur-door-v1), the [capsule extension](#murmur-capsule-v1), then the [stream extension](#stream-extension). An authenticated door's public card carries the door extension, then the stream extension |
 
@@ -132,6 +132,7 @@ answers it and `SubscribeToTask` `-32004` `UnsupportedOperationError`.
 ## Security { #security }
 
 Who may call the door is set by [`network.authentication`](manifest.md#field-network-authentication).
+The security schemes the door does not offer are listed under [A2A v1.0 conformance](#conformance).
 
 | Manifest | Door | `securitySchemes` | `securityRequirements` | Extended card |
 |---|---|---|---|---|
@@ -294,6 +295,77 @@ extended card.
 
 A public door has no extended card. It answers `GetExtendedAgentCard` with
 [`-32004`](#errors) `UnsupportedOperationError`, and its card does not list the method.
+
+## A2A v1.0 conformance { #conformance }
+
+The door conforms to A2A v1.0 as
+[`a2a.proto` at `v1.0.1`](https://github.com/a2aproject/A2A/blob/v1.0.1/specification/a2a.proto)
+defines it. This section lists what it serves, what it answers as not supported, and the
+extensions murmur adds.
+
+### What is served { #conformance-served }
+
+The door has one interface:
+
+| Interface | Value |
+|---|---|
+| Transport | JSON-RPC 2.0 over HTTP: one [`POST /`](#door) per request |
+| Address | The card's `supportedInterfaces[0].url` |
+| `protocolBinding` | `JSONRPC` |
+| `protocolVersion` | `1.0` |
+| Version negotiation | Every JSON-RPC request sends [`A2A-Version: 1.0`](#a2a-version), or is answered `-32009` |
+
+Every method of the proto's `service A2AService`, in its order, then murmur's own:
+
+| Method | Answer | Where documented |
+|---|---|---|
+| `SendMessage` | Served under [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) `single` or `queue`. `-32601` under `none` | [Messages](#message), [Answers](#send-message-response) |
+| `SendStreamingMessage` | Served under `single` or `queue`. `-32004` under `none` | [Streaming Protocol](streaming-protocol.md#stream-order) |
+| `GetTask` | Served under every `task_acceptance` | [`GetTask`](#tasks-get) |
+| `ListTasks` | Served under every `task_acceptance` | [`ListTasks`](#list-tasks) |
+| `CancelTask` | Served under every `task_acceptance`. `-32002` on a task that has ended | [`GetTask`](#tasks-get), [Errors](#errors) |
+| `SubscribeToTask` | Served under `single` or `queue`. `-32004` under `none`, and on a task that has ended | [`SubscribeToTask`](#subscribe-to-task) |
+| `CreateTaskPushNotificationConfig` | `-32003` | [Push notifications](#push-notifications) |
+| `GetTaskPushNotificationConfig` | `-32003` | [Push notifications](#push-notifications) |
+| `ListTaskPushNotificationConfigs` | `-32003` | [Push notifications](#push-notifications) |
+| `GetExtendedAgentCard` | Served on an [authenticated door](#security). `-32004` on a public door | [The extended card](#extended-card) |
+| `DeleteTaskPushNotificationConfig` | `-32003` | [Push notifications](#push-notifications) |
+| `murmur.WatchSession` | Served under every `task_acceptance` | [`murmur.WatchSession`](#watch-session) |
+| `murmur.StopSession` | Served under every `task_acceptance` | [`murmur.StopSession`](#stop-session) |
+
+### What is not supported { #conformance-not-supported }
+
+| Feature | How a request meets it | Why |
+|---|---|---|
+| Push notification configs: the four methods, and `configuration.taskPushNotificationConfig` in a message | [`-32003`](#push-notifications). The card says `capabilities.pushNotifications: false` | A capsule's egress is closed by default, and a webhook to a client's URL would be a new egress path |
+| The gRPC and HTTP+JSON bindings | Not listed in `supportedInterfaces`: the door's one interface is `JSONRPC` | One binding is enough, and JSON-RPC is the one every A2A SDK speaks |
+| The OAuth2, OpenID Connect, API key and mutual TLS security schemes | Not in `securitySchemes`: an authenticated door declares only [`bearer`](#security) | Murmur consumes credentials and never issues them. Door tokens are [minted per launch](#tokens) and presented as bearer tokens |
+| Card signatures | The card carries no `signatures` | Signatures answer whether a provider issued a card, which matters when a card is discovered. A formation launches its own members, so the caller already knows where each card came from |
+| Tenants | A request naming a `tenant` is answered [`-32602`](#tenant). The interface declares no `tenant` | A capsule is one session. A tenant is refused rather than ignored |
+
+Inside the methods it serves, the door refuses these requests:
+
+| Request | Answer |
+|---|---|
+| A message with a `raw` or `url` file part | [`-32005`](#parts) |
+| A `ListTasks` with `statusTimestampAfter` | [`-32004`](#list-tasks) |
+| `SendStreamingMessage` or `SubscribeToTask` to a door that starts no task | [`-32004`](#capabilities) |
+| `SubscribeToTask` naming a task that has ended | [`-32004`](#subscribe-to-task) |
+| A message whose `taskId` names a task that is not in `TASK_STATE_INPUT_REQUIRED` | [`-32004`](#task-id) |
+| `GetExtendedAgentCard` to a public door | [`-32004`](#extended-card) |
+
+`SendMessage` answers as soon as the task is accepted, whatever `configuration.returnImmediately`
+says — see [Answers](#send-message-response).
+
+### Extensions { #conformance-extensions }
+
+Every extension murmur declares has `required: false`, so a client that ignores all three is served.
+
+| URI | Adds | `required` | How a client activates it |
+|---|---|---|---|
+| [`https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1`](#murmur-door-v1) | The `murmur.` methods, the [`forgetSession`](#forget-session) message metadata field, and the `A2A-Extensions` echo of what a request used | `false` | By calling a `murmur.` method, or by setting `forgetSession` under the URI in `message.metadata`. A served answer names the URI in its `A2A-Extensions` header |
+| [`https://docs.murmur.nexus/reference/agent-card/#murmur-capsule-v1`](#murmur-capsule-v1) | Card `params` only: the session id and what the capsule may do | `false` | Nothing to activate. It is on a public door's card, and on an authenticated door's [extended card](#extended-card) |
+| [`https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1`](streaming-protocol.md#murmur-stream-v1) | Murmur's [frames](streaming-protocol.md#murmur-stream-v1) on a stream, in each event's `metadata` under the URI | `false` | By sending `A2A-Extensions: <URI>` on `SendStreamingMessage` or `SubscribeToTask`; the response echoes it — see [Activation](streaming-protocol.md#activation). Always active on `murmur.WatchSession` |
 
 ## The JSON-RPC door { #door }
 
@@ -699,9 +771,8 @@ Installed tools are not skills: a caller cannot invoke a tool directly. They are
 ## Extensions { #extensions }
 
 All three extensions are A2A `AgentExtension` objects with `required: false`: a standard A2A client
-can call the capsule without understanding any of them. No client activates the door or capsule
-extension. The stream extension is activated per request; see
-[Streaming Protocol: Activation](streaming-protocol.md#activation).
+can call the capsule without understanding any of them. How a client uses each is under
+[Extensions](#conformance-extensions).
 
 | Key | Value |
 |---|---|
@@ -1041,7 +1112,7 @@ when neither key is present.
 
 | Key | Type | Present |
 |---|---|---|
-| `noAnswer` | `true` | On a `failed` task the member ended with [`end-without-answer`](runtime-provided-tools.md#end-without-answer). Absent otherwise |
+| `noAnswer` | `true` | On a `TASK_STATE_FAILED` task the member ended with [`end-without-answer`](runtime-provided-tools.md#end-without-answer). Absent otherwise |
 | `noAnswerBelow` | array of `{"member": "<roster name>", "status": "<status>"}` | On a terminal task when a member it called gave it no answer: each such member, then each member those reported below them, each once, at most 8. `status` is a [`member_call`](observability-schemas.md#member-call) status other than `completed`. Absent when empty |
 
 ```json
@@ -1055,7 +1126,8 @@ when neither key is present.
 ```
 
 A completed task with `noAnswerBelow` keeps its `response` artifact. A caller that is not a
-formation member can ignore `metadata`: the task reads as an ordinary `failed` or `completed` one.
+formation member can ignore `metadata`: the task reads as an ordinary `TASK_STATE_FAILED` or
+`TASK_STATE_COMPLETED` one.
 
 #### `ListTasks` { #list-tasks }
 
@@ -1206,8 +1278,8 @@ Find an extension by its `uri` in `capabilities.extensions`, not by its position
 
 ## Migrating from A2A 0.3 { #migrating-a2a-0-3 }
 
-The door speaks A2A v1.0 only. A client written for a door that declared `protocolVersion` `0.3`
-changes these:
+The door speaks A2A v1.0 only — see [A2A v1.0 conformance](#conformance). A client written for a
+door that declared `protocolVersion` `0.3` changes these:
 
 | A2A 0.3 door | A2A v1.0 door |
 |---|---|
@@ -1222,7 +1294,7 @@ changes these:
 | A completion refused with `-32004` | [`-31001` or `-31002`](#murmur-errors). `-32004` is `UnsupportedOperationError` only |
 | Errors without `data` | Every A2A error carries an [`ErrorInfo`](#errors) |
 | Credential scopes `message/send`, `message/stream`, `tasks/get`, `tasks/cancel` | `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`. A manifest listing a 0.3 name is refused — see [`network.authentication.credentials`](manifest.md#field-network-authentication) |
-| Task states `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled` | [`TASK_STATE_*`](#task-states) |
+| Task states `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled` | [`TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`, `TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED`, `TASK_STATE_CANCELED`](#task-states) |
 | `role: "user"`, `role: "agent"` | `ROLE_USER`, `ROLE_AGENT`. A message with `role: "user"` is refused |
 | `message/send` answering a bare task | `SendMessage` answering [`{"task": …}`](#send-message-response) |
 | A reply reaching whichever task waited for input | A reply names its task in [`taskId`](#task-id) |

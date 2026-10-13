@@ -205,8 +205,8 @@ A 200 response confirms the capsule is running:
         "required": false,
         "params": {
           "sessionId": "ses_019f01a940ce7761854e768ecbe3d399",
-          "tools": ["bash"],
-          "shell": true,
+          "tools": [],
+          "shell": false,
           "network": false,
           "planes": []
         }
@@ -266,7 +266,7 @@ curl -s -X POST http://1.2.3.4:9000 \
 
 See [Connect two capsules with A2A messaging](./capsules-a2a-messaging.md) for the full message protocol.
 
-For a capsule to accept incoming tasks it must have `lifecycle.task_acceptance: single` or `queue` in its manifest. Without a lifecycle block the capsule accepts no incoming tasks after its initial run.
+Under the default [`lifecycle`](../reference/manifest.md#lifecycle-task-acceptance), `task_acceptance: single` with `after_task: exit`, the capsule runs one incoming task and then exits. To keep a deployed capsule answering task after task, declare `task_acceptance: queue` with `after_task: sleep`. Under `task_acceptance: none` the door does not serve `SendMessage`.
 
 ---
 

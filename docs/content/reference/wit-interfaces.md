@@ -308,8 +308,9 @@ The contract for running an allowlisted shell binary. The runtime implements it 
 ## `murmur:task/task`
 
 `request-input` pauses the agent loop at a decision boundary and waits for a reply delivered by
-`SendMessage`. From the component's perspective the call is synchronous: pass a prompt string,
-receive the reply string.
+a `SendMessage` naming the task in its [`taskId`](agent-card.md#task-id). While it waits, the door
+reports the task as `TASK_STATE_INPUT_REQUIRED`. From the component's perspective the call is
+synchronous: pass a prompt string, receive the reply string.
 
 Call it when the agent has reached a decision it cannot make on its own — ambiguous
 requirements, or a consequential action that needs approval — and a human or supervisor capsule
@@ -320,7 +321,7 @@ Called anywhere else, it returns an error immediately.
 
 **Timeout:** `lifecycle.input_timeout_secs` in the manifest (see
 [lifecycle.input_timeout_secs](manifest.md#lifecycle-input-timeout-secs)). When it fires,
-the component is aborted and the attempt ends; the task ends `failed` with message
+the component is aborted and the attempt ends; the task ends `TASK_STATE_FAILED` with message
 `input-timeout` unless an `on-task-end` hook reopens it.
 
 ---
@@ -339,8 +340,24 @@ never sees the wire format.
 | Tracing | With OTel configured, the runtime injects a W3C `traceparent` header so the peer's session span nests under the sender's. |
 | Origin | The runtime stamps `x-murmur-task-origin: peer` and the sending task's own `x-murmur-task-trust` on every request, so the receiving capsule inherits the sender's trust class. The `message` record has no field for either, so a capsule cannot set them. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class). |
 | Refusal | A peer that answers with a non-`2xx` status fails the call with `Err("peer at <url> refused the message (<status> <error>): <message>")`, carrying the peer's own `error` code and `message` when its body has them. A peer that does not declare [`exports.peer_tasks.accept: true`](manifest.md#field-exports-peer-tasks) answers `403 peer_not_accepted`. |
-| Result state | `task-result.state` is the state the peer answered the send with, in murmur's word rather than the [`TASK_STATE_*` name](agent-card.md#task-states) on the wire: `submitted`, `working`, `input-required`, `completed`, `failed`, `rejected`, `canceled`, or `auth-required`, which a peer that is not a murmur capsule may answer. Poll the peer's `GetTask` endpoint for the final state. |
+| Result state | `task-result.state` is the state the peer answered the send with, in murmur's word — see the mapping below. Poll the peer's `GetTask` endpoint for the final state. |
 | Answers that fail | A peer answering `TASK_STATE_UNSPECIFIED`, a state that is not an A2A v1.0 task state, or a message rather than a task fails the call with `Err`, naming what the peer sent. |
+
+| `task-result.state` | State on the wire |
+|---|---|
+| `submitted` | `TASK_STATE_SUBMITTED` |
+| `working` | `TASK_STATE_WORKING` |
+| `input-required` | `TASK_STATE_INPUT_REQUIRED` |
+| `completed` | `TASK_STATE_COMPLETED` |
+| `failed` | `TASK_STATE_FAILED` |
+| `rejected` | `TASK_STATE_REJECTED` |
+| `canceled` | `TASK_STATE_CANCELED` |
+| `auth-required` | `TASK_STATE_AUTH_REQUIRED`, which a peer that is not a murmur capsule may answer |
+
+The guest sees murmur's words, not the [`TASK_STATE_*` names](agent-card.md#task-states): the WIT is
+murmur's vocabulary, and the runtime maps each state at the door. `state` is a string that
+components match on, so changing its values would break every built component with no change to
+the WIT version.
 
 ---
 

@@ -189,7 +189,8 @@ error[E-MAN-003]: murmur.yaml: invalid network config for 'network.authenticatio
   hint: write 'murmur.WatchSession' in place of 'stream/watch'
 ```
 
-`agent/getAuthenticatedExtendedCard` has no replacement scope:
+`agent/getAuthenticatedExtendedCard` has no replacement scope, because every valid token may call
+`GetExtendedAgentCard`:
 
 ```text
   hint: remove 'agent/getAuthenticatedExtendedCard': every authenticated caller may call GetExtendedAgentCard, so a credential lists no scope for it
@@ -1973,13 +1974,14 @@ What the turn leaves behind:
 | Surface | What it holds |
 |---|---|
 | `out/result.txt`, and `out/result_<task-id>.txt` under `mode: threaded` | The model's partial text, then a marker naming `inference.max_tokens` and the cap |
-| The terminal A2A `status` event's `response`, and the task output an `on-task-end` hook reads | The same marked text |
+| The task's [`response` artifact](streaming-protocol.md#standard-events) that `GetTask` reports, and the task output an `on-task-end` hook reads | The same marked text |
 | The [conversation record](workdir.md#the-conversation-record)'s assistant message | The model's own bytes, with `"truncated": true` on the message envelope |
 | The trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) event | `"stop_reason": "max_tokens"`, beside a `decision` of `"text"` |
 
-The turn is a result, not a failure: the session ends `ok`, the A2A task reaches `completed`, and
-the runtime attempts no continuation turn. Raising `inference.max_tokens` gives the next run room to
-finish; a task whose answer is genuinely long is better split across turns the agent drives itself.
+The turn is a result, not a failure: the session ends `ok`, the A2A task reaches
+`TASK_STATE_COMPLETED`, and the runtime attempts no continuation turn. Raising
+`inference.max_tokens` gives the next run room to finish; a task whose answer is genuinely long is
+better split across turns the agent drives itself.
 
 ### W-RUN-002 — an untested harness version { #w-run-002 }
 

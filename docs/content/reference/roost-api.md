@@ -465,10 +465,11 @@ failed tool call, and the session continues.
 
 A delegation belongs to the task that made it, on every [`lifecycle`](manifest.md#field-lifecycle).
 Once the model ends its turn, the task waits for every sub-capsule it started and continues in the
-same conversation with each outcome. The task stays `working` while it waits, and its stream says
-so in a non-final `working` frame.
+same conversation with each outcome. The task stays `TASK_STATE_WORKING` while it waits, and its
+stream says so in a [`TASK_STATE_WORKING` status](streaming-protocol.md#working-messages) whose
+message is one of these:
 
-| Frame message | When |
+| Status message | When |
 |---|---|
 | `waiting on delegate-task: M delegation(s) outstanding` | The task starts waiting with a delegation outstanding, and again with the new count each time one ends while another is still outstanding |
 | `continuing with M delegation outcome(s)` | Nothing is outstanding, and the task continues with every outcome |

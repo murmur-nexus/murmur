@@ -6,18 +6,13 @@
 //! serves, so only its JSON-RPC error response is envelope-checked; a non-200 status is not
 //! measured at all.
 //!
-//! A violation whose key is in `tests/fixtures/a2a/wire-exceptions.txt` passes; any other panics
-//! the calling thread. In census mode ([`begin_census`]) nothing panics and every key is kept for
-//! [`observed`], so one test can compare what the door does with the whole list. nextest runs each
-//! test in its own process, so the globals here are per test.
+//! Any violation panics the thread that made the exchange, naming each violation's key, its
+//! errors, the request and what the door answered.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     net::{SocketAddr, TcpStream},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex, MutexGuard, OnceLock,
-    },
+    sync::{Mutex, MutexGuard, OnceLock},
 };
 
 use serde_json::Value;
@@ -26,102 +21,9 @@ use super::a2a_conformance::{
     check_request, check_response, check_stream_event, resolve_method, Violation, WirePart,
 };
 
-/// The exceptions list, relative to the workspace root, as failure messages name it.
-pub const EXCEPTIONS_PATH: &str = "crates/murmur-cli/tests/fixtures/a2a/wire-exceptions.txt";
-
-const EXCEPTIONS_FILE: &str = include_str!("../fixtures/a2a/wire-exceptions.txt");
-
-/// The cards that remove exceptions; every line of the list names one of them.
-pub const PART5_CARDS: [&str; 6] = [
-    "0229ba70", "27678569", "54148d84", "4b46e876", "2eea2c25", "f2ef8db1",
-];
-
 /// The request header that carries the A2A protocol version; without it, v1.0 reads a request as
 /// 0.3.
 pub const VERSION_HEADER: &str = "A2A-Version";
-
-/// One line of the exceptions list: `<method> <part> <subject> <card> <why…>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WireException {
-    pub method: String,
-    pub part: String,
-    pub subject: String,
-    pub card: String,
-    pub why: String,
-}
-
-impl WireException {
-    /// `<method> <part> <subject>`, as [`Violation::key`] spells it.
-    pub fn key(&self) -> String {
-        format!("{} {} {}", self.method, self.part, self.subject)
-    }
-}
-
-/// Every line of `text` that is not blank or a `#` comment, with its 1-based line number: the
-/// line's fields, or why it has fewer than five.
-pub fn parse_exceptions(text: &str) -> Vec<(usize, Result<WireException, String>)> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .map(|(index, line)| {
-            let mut rest = line.trim();
-            let mut fields = Vec::new();
-            for _ in 0..4 {
-                let Some((field, tail)) = rest.split_once(char::is_whitespace) else {
-                    return (index + 1, Err(format!("fewer than five fields: {line:?}")));
-                };
-                fields.push(field.to_string());
-                rest = tail.trim_start();
-            }
-            let line = WireException {
-                method: fields[0].clone(),
-                part: fields[1].clone(),
-                subject: fields[2].clone(),
-                card: fields[3].clone(),
-                why: rest.trim_end().to_string(),
-            };
-            (index + 1, Ok(line))
-        })
-        .collect()
-}
-
-/// The well-formed lines of the checked-in exceptions list.
-pub fn exceptions() -> &'static [WireException] {
-    static EXCEPTIONS: OnceLock<Vec<WireException>> = OnceLock::new();
-    EXCEPTIONS.get_or_init(|| {
-        parse_exceptions(EXCEPTIONS_FILE)
-            .into_iter()
-            .filter_map(|(_, line)| line.ok())
-            .collect()
-    })
-}
-
-/// The checked-in exceptions list, verbatim.
-pub fn exceptions_file() -> &'static str {
-    EXCEPTIONS_FILE
-}
-
-fn listed(key: &str) -> bool {
-    exceptions().iter().any(|line| line.key() == key)
-}
-
-static CENSUS: AtomicBool = AtomicBool::new(false);
-
-/// Switches this process to recording without panicking, so [`observed`] holds every key the
-/// exchanges after it raised.
-pub fn begin_census() {
-    CENSUS.store(true, Ordering::SeqCst);
-}
-
-/// Every key raised in this process so far, each with the first violation that raised it.
-pub fn observed() -> BTreeMap<String, Violation> {
-    lock(observed_map()).clone()
-}
-
-fn observed_map() -> &'static Mutex<BTreeMap<String, Violation>> {
-    static OBSERVED: OnceLock<Mutex<BTreeMap<String, Violation>>> = OnceLock::new();
-    OBSERVED.get_or_init(Default::default)
-}
 
 /// A panic on one test thread must not hide every later exchange from the other threads.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -338,41 +240,20 @@ fn accepted_request(request: &Value, headers: &[(&str, &str)], streamed: bool) -
     violations
 }
 
-/// Keeps each key's first violation, then, outside census mode, panics naming every key not on
-/// the exceptions list.
+/// Panics when `violations` is not empty: the first key leads the message, each later one
+/// follows as `and <key>`, every key with its errors, then the request and `context`.
 fn enforce(violations: Vec<Violation>, request: &Value, context: &str) {
     if violations.is_empty() {
         return;
     }
-    {
-        let mut observed = lock(observed_map());
-        for violation in &violations {
-            observed
-                .entry(violation.key())
-                .or_insert_with(|| violation.clone());
-        }
-    }
-    if CENSUS.load(Ordering::SeqCst) {
-        return;
-    }
-    let unlisted: Vec<&Violation> = violations
-        .iter()
-        .filter(|violation| !listed(&violation.key()))
-        .collect();
-    if unlisted.is_empty() {
-        return;
-    }
     let mut message = String::new();
-    for (index, violation) in unlisted.iter().enumerate() {
+    for (index, violation) in violations.iter().enumerate() {
         let lead = if index == 0 {
             "A2A v1.0 wire check failed: "
         } else {
             "and "
         };
-        message.push_str(&format!(
-            "{lead}{} is not in {EXCEPTIONS_PATH}\n",
-            violation.key()
-        ));
+        message.push_str(&format!("{lead}{}\n", violation.key()));
         for error in &violation.errors {
             message.push_str(&format!("  - {error}\n"));
         }

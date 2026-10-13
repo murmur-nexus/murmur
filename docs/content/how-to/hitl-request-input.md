@@ -108,7 +108,7 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
         call murmur-tool-request-input with a clear, specific question for the operator.
     ```
 
-`network.internal_port` pins the worker capsule to a fixed port on every run. Without it the runtime picks an OS-assigned port at startup, which changes between runs and would invalidate the orchestrator capsule's allow list entry.
+`network.internal_port` pins the capsule to a fixed port on every run. Without it the runtime picks an OS-assigned port at startup, which changes between runs.
 
 `runtime: tool` registers the WASM component with the capsule runtime. The model sees it as a callable tool named `murmur-tool-request-input` with one parameter:
 
@@ -288,7 +288,7 @@ lifecycle:
   input_timeout_secs: 300
 ```
 
-When the deadline passes, the tool call fails and the attempt ends. The task then ends `failed` with message `"input-timeout"`, unless an `on-task-end` hook [reopens it](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). Omit the field to wait indefinitely.
+When the deadline passes, the tool call fails and the attempt ends. The task then ends `TASK_STATE_FAILED` with status message `"input-timeout"`, unless an `on-task-end` hook [reopens it](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). Omit the field to wait indefinitely.
 
 ---
 
