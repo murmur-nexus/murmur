@@ -2360,19 +2360,22 @@ async fn hold_until_settled(
         tokio::time::Instant::now() + HELD_SEND_RECHECK_INTERVAL,
         HELD_SEND_RECHECK_INTERVAL,
     );
-    loop {
+    'held: loop {
         if let Some(task) = settled_task(task_registry, task_id) {
             return task;
         }
-        tokio::select! {
-            biased;
-            received = rx.recv() => match received {
-                Ok(event) if event.task_id != task_id => continue,
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => break,
-            },
-            () = door_closing(&mut closing) => break,
-            _ = recheck.tick() => {}
+        // Another task's event says nothing about this one, so it is skipped without a read.
+        loop {
+            tokio::select! {
+                biased;
+                received = rx.recv() => match received {
+                    Ok(event) if event.task_id != task_id => {}
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue 'held,
+                    Err(RecvError::Closed) => break 'held,
+                },
+                () = door_closing(&mut closing) => break 'held,
+                _ = recheck.tick() => continue 'held,
+            }
         }
     }
     let held = task_registry.lock().unwrap().get_task(task_id);
@@ -6742,8 +6745,8 @@ mod tests {
         assert_eq!(*task, serde_json::to_value(&reported).unwrap());
     }
 
-    /// A held `SendMessage` wakes on its own task's event rather than its next re-check, and
-    /// another task's event wakes nothing it answers.
+    /// A held `SendMessage` wakes on its own task's event rather than its next re-check, and not
+    /// on another task's.
     #[tokio::test(flavor = "multi_thread")]
     async fn held_send_message_answers_on_its_task_s_event() {
         let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
@@ -6792,6 +6795,18 @@ mod tests {
             reg.finish_task(TaskState::Failed);
             reg.record_ending(&task_id, "failed", None, false, &[]);
         }
+        sse_tx
+            .send(stream_event(
+                1,
+                "tsk_other",
+                false,
+                Some(StreamEnd::Terminal),
+            ))
+            .unwrap();
+        assert!(
+            !answered_within(&client, std::time::Duration::from_millis(200)).await,
+            "another task's event answered the held request"
+        );
         let ended_at = std::time::Instant::now();
         sse_tx
             .send(stream_event(1, &task_id, false, Some(StreamEnd::Terminal)))
