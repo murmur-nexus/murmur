@@ -1828,8 +1828,9 @@ A status line is `[<state>]  <message>`; a task's terminal status is `[<state>]`
 completed task's answer follows it, wrapped and indented. `<state>` is murmur's word for the
 [`TASK_STATE_*` name](agent-card.md#task-states) the door writes, so `TASK_STATE_INPUT_REQUIRED`
 prints as `[input-required]`. On a capsule declaring `lifecycle.conversation: threaded`, the
-bracket is `[<context id> / turn <n> / <state>]`, the context id cut to its first 8 characters
-after `ctx_`.
+bracket is `[<context id> / turn <n> / <state>]`. The context id is shortened to `ctx_` and its
+next 8 characters, then `...`; an id without the `ctx_` prefix shows its first 12 characters, then
+`...`.
 
 The bracket after a tool name is the call's outcome, read from the
 [`artifact` frame](streaming-protocol.md#event-artifact):

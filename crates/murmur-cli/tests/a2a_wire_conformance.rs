@@ -618,16 +618,16 @@ fn is_json_rpc_request(text: &str) -> bool {
         .is_ok_and(|value| value.get("jsonrpc").is_some() && value.get("method").is_some())
 }
 
-/// The unit shows a refusal: a JSON-RPC error code `-32xxx`, or an HTTP `401` or `403`.
+/// The unit shows a refusal: a JSON-RPC error code `-32xxx`, or an HTTP `401` or `403`, each as a
+/// word of its own. A bare substring would skip any example whose ids or ports hold `401`.
 fn shows_refusal(unit: &str) -> bool {
-    let bytes = unit.as_bytes();
-    let error_code = unit.match_indices("-32").any(|(at, _)| {
-        let digits = &bytes[at + 3..];
-        digits.len() >= 3
-            && digits[..3].iter().all(u8::is_ascii_digit)
-            && !digits.get(3).is_some_and(u8::is_ascii_digit)
-    });
-    error_code || unit.contains("401") || unit.contains("403")
+    unit.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .any(|word| {
+            let is_error_code = word.strip_prefix("-32").is_some_and(|digits| {
+                digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit())
+            });
+            is_error_code || word == "401" || word == "403"
+        })
 }
 
 #[test]

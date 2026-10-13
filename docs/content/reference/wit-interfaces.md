@@ -355,9 +355,9 @@ never sees the wire format.
 | `auth-required` | `TASK_STATE_AUTH_REQUIRED`, which a peer that is not a murmur capsule may answer |
 
 The guest sees murmur's words, not the [`TASK_STATE_*` names](agent-card.md#task-states): the WIT is
-murmur's vocabulary, and the runtime maps each state at the door. `state` is a string that
-components match on, so changing its values would break every built component with no change to
-the WIT version.
+murmur's vocabulary, and the runtime maps the peer's state when it reads the answer. `state` is a
+string that components match on, so changing its values would break every built component with no
+change to the WIT version.
 
 ---
 
