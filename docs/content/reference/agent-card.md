@@ -348,7 +348,6 @@ Inside the methods it serves, the door refuses these requests:
 | Request | Answer |
 |---|---|
 | A message with a `raw` or `url` file part | [`-32005`](#parts) |
-| A `ListTasks` with `statusTimestampAfter` | [`-32004`](#list-tasks) |
 | `SendStreamingMessage` or `SubscribeToTask` to a door that starts no task | [`-32004`](#capabilities) |
 | `SubscribeToTask` naming a task that has ended | [`-32004`](#subscribe-to-task) |
 | A message whose `taskId` names a task that is not in `TASK_STATE_INPUT_REQUIRED` | [`-32004`](#task-id) |
@@ -512,7 +511,7 @@ Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo
 | `-32001` | `TaskNotFoundError` | `TASK_NOT_FOUND` | On `GetTask`, `CancelTask`, `SubscribeToTask`, naming an id this session never held or a task the caller does not [see](#task-access), and on a message whose `taskId` names one | `taskId` |
 | `-32002` | `TaskNotCancelableError` | `TASK_NOT_CANCELABLE` | On `CancelTask` for a task that had already ended. The task is left unchanged | `taskId`; `state`, the state it ended in, spelled as `GetTask` spells it: `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_REJECTED` or `TASK_STATE_CANCELED` |
 | `-32003` | `PushNotificationNotSupportedError` | `PUSH_NOTIFICATION_NOT_SUPPORTED` | On the four push config methods, and on a message asking for push — see [Push notifications](#push-notifications) | `{}` |
-| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door, and on `SendStreamingMessage` and `SubscribeToTask` to a door that starts no task, with `{}`. On a message whose `taskId` names a task that is not waiting for input — see [Continuing a task](#task-id). On `SubscribeToTask` naming a task that has ended. On a `ListTasks` with `statusTimestampAfter` | `taskId` and `state`, on a message or a `SubscribeToTask` naming a task; `parameter`, `statusTimestampAfter`, on `ListTasks` |
+| `-32004` | `UnsupportedOperationError` | `UNSUPPORTED_OPERATION` | On `GetExtendedAgentCard` to a public door, and on `SendStreamingMessage` and `SubscribeToTask` to a door that starts no task, with `{}`. On a message whose `taskId` names a task that is not waiting for input — see [Continuing a task](#task-id). On `SubscribeToTask` naming a task that has ended | `taskId` and `state`, on a message or a `SubscribeToTask` naming a task |
 | `-32005` | `ContentTypeNotSupportedError` | `CONTENT_TYPE_NOT_SUPPORTED` | On a message carrying a `raw` or `url` part — see [Parts](#parts) | `partIndex`, the first file part's 0-based index; `mediaType`, when that part declared one |
 | `-32006` | `InvalidAgentResponseError` | `INVALID_AGENT_RESPONSE` | Never | — |
 | `-32007` | `ExtendedAgentCardNotConfiguredError` | `EXTENDED_AGENT_CARD_NOT_CONFIGURED` | Never | — |
@@ -597,9 +596,24 @@ names and enum value names. The door reads field names and enum values in that s
 The door never produces `TASK_STATE_AUTH_REQUIRED`: it authenticates a request before any task
 exists, so no task waits for authentication.
 
-Murmur's word is the spelling of every murmur interface: the [stream frames](streaming-protocol.md),
+Murmur's word is the spelling murmur uses off the wire:
 [`murmur:message/send`](wit-interfaces.md#message-send)'s `task-result.state`, `mur` output and the
-trace.
+trace. Every task status on the door and on its [streams](streaming-protocol.md) carries the
+`TASK_STATE_*` name.
+
+#### Status timestamps { #status-timestamp }
+
+Every `status` the door writes carries `timestamp`: when that status was recorded, in RFC 3339 UTC
+with milliseconds and a `Z`, such as `2026-10-13T09:00:00.123Z`.
+
+| Status | `timestamp` |
+|---|---|
+| A task read from the session's task record: [`GetTask`](#tasks-get), [`ListTasks`](#list-tasks), [`CancelTask`](#tasks-get), [`SendMessage`'s answer](#send-message-response), and on a stream the opening `task` and the terminal status | The task's last change: the same change that moves it to the front of `ListTasks` |
+| A refused `TASK_STATE_REJECTED` task the door never took | When the door refused it |
+| A status a [stream](streaming-protocol.md#standard-events) writes as it happens: a `TASK_STATE_WORKING` progress status, a `TASK_STATE_INPUT_REQUIRED` status, a [carrier](streaming-protocol.md#carriers) | When it was written |
+
+A `timestamp` is the exact instant the door compares [`statusTimestampAfter`](#list-tasks) with,
+so a cutoff copied from a task's `status.timestamp` includes that task.
 
 #### Messages { #message }
 
@@ -728,7 +742,8 @@ task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door a
 ```json
 {"jsonrpc": "2.0", "id": 1,
  "result": {"task": {"id": "tsk_…", "contextId": "ctx_…",
-                     "status": {"state": "TASK_STATE_SUBMITTED"}}}}
+                     "status": {"state": "TASK_STATE_SUBMITTED",
+                                "timestamp": "2026-10-13T09:00:00.123Z"}}}}
 ```
 
 ```json
@@ -879,7 +894,7 @@ whatever the request's `A2A-Extensions` says. The first two events of a reconnec
 data: {"jsonrpc":"2.0","id":1,"result":{"message":{"messageId":"msg_01a131fc15437521b334719530864c4f","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"connection-ack"}],"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"connection-ack","role":"observer","conversationMode":"stateless"}}}}}
 
 id: 42
-data: {"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f1b87a01b2c3d4e5f6071829","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"inference turn 2"}]}}}}}
+data: {"jsonrpc":"2.0","id":1,"result":{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f1b87a01b2c3d4e5f6071829","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"inference turn 2"}]},"timestamp":"2026-10-13T09:00:00.123Z"}}}}
 
 ```
 
@@ -977,11 +992,11 @@ curl -s -X POST http://localhost:41873/ \
 ```text
 HTTP/1.1 200 OK
 content-type: application/json
-content-length: 181
+content-length: 220
 connection: close
 A2A-Extensions: https://docs.murmur.nexus/reference/agent-card/#murmur-door-v1
 
-{"jsonrpc":"2.0","id":1,"result":{"task":{"contextId":"ctx_0193f2a1c4d87e01b2c3d4e5f6a7b8c9","id":"tsk_019ed5211c827f63a8fe4be623277c55","status":{"state":"TASK_STATE_SUBMITTED"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"task":{"contextId":"ctx_0193f2a1c4d87e01b2c3d4e5f6a7b8c9","id":"tsk_019ed5211c827f63a8fe4be623277c55","status":{"state":"TASK_STATE_SUBMITTED","timestamp":"2026-10-13T09:00:00.123Z"}}}}
 ```
 
 The door refuses the message with `-32602`, starting no task, in this order. The first three come
@@ -1071,14 +1086,15 @@ is required: a `GetTask` without one, or with `""`, is answered `-32602` `GetTas
  "status": {"state": "TASK_STATE_COMPLETED",
             "message": {"messageId": "msg_tsk_…_status", "contextId": "ctx_…", "taskId": "tsk_…",
                         "role": "ROLE_AGENT",
-                        "parts": [{"text": "session ended", "mediaType": "text/plain"}]}},
+                        "parts": [{"text": "session ended", "mediaType": "text/plain"}]},
+            "timestamp": "2026-10-13T09:00:00.123Z"},
  "artifacts": [{"artifactId": "response", "name": "response",
                 "parts": [{"text": "four", "mediaType": "text/plain"}]}]}
 ```
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
- "status": {"state": "TASK_STATE_INPUT_REQUIRED"},
+ "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": "2026-10-13T09:00:00.123Z"},
  "artifacts": [{"artifactId": "prompt", "name": "prompt",
                 "parts": [{"text": "Which branch?", "mediaType": "text/plain"}]}]}
 ```
@@ -1089,7 +1105,7 @@ is:
 
 ```json
 {"id": "tsk_…", "contextId": "ctx_…",
- "status": {"state": "TASK_STATE_CANCELED"},
+ "status": {"state": "TASK_STATE_CANCELED", "timestamp": "2026-10-13T09:00:00.123Z"},
  "artifacts": [{"artifactId": "residue", "name": "residue",
                 "parts": [{"data": {"kind": "detached_shell", "work_id": "wrk_…",
                                     "binary": "sleep", "command": "sleep 30",
@@ -1120,7 +1136,8 @@ when neither key is present.
  "status": {"state": "TASK_STATE_FAILED",
             "message": {"messageId": "msg_tsk_…_status", "contextId": "ctx_…", "taskId": "tsk_…",
                         "role": "ROLE_AGENT",
-                        "parts": [{"text": "q gave no answer", "mediaType": "text/plain"}]}},
+                        "parts": [{"text": "q gave no answer", "mediaType": "text/plain"}]},
+            "timestamp": "2026-10-13T09:00:00.123Z"},
  "metadata": {"murmur": {"noAnswer": true,
                          "noAnswerBelow": [{"member": "q", "status": "timed_out"}]}}}
 ```
@@ -1140,7 +1157,7 @@ first. Its `params` are a `ListTasksRequest`, read in this order:
 | `status` | A [`TASK_STATE_*`](#task-states) name. `TASK_STATE_UNSPECIFIED` or absent: every state. `TASK_STATE_AUTH_REQUIRED` matches no task | Anything else: `-32602` |
 | `pageSize` | An integer from `1`. Absent: `50`. Above `100`: `100` | Below `1`, or not an integer: `-32602` |
 | `pageToken` | `""` or absent for the first page, or a `nextPageToken` this door answered | Anything else: `-32602` |
-| `statusTimestampAfter` | Absent or `null` | Any other value: `-32004`, `metadata.parameter` `statusTimestampAfter`. The door records no status timestamps |
+| `statusTimestampAfter` | An RFC 3339 timestamp, in any offset: only the tasks whose [`status.timestamp`](#status-timestamp) is at or after it. `null` or absent: every task | Anything else: `-32602` `statusTimestampAfter must be an RFC 3339 timestamp, such as 2026-10-13T09:00:00Z` |
 | `includeArtifacts` | A boolean. Absent: `false` | Not a boolean: `-32602` |
 | `historyLength` | Any value, ignored: a task carries no `history` | — |
 
@@ -1158,13 +1175,15 @@ The answer is a `ListTasksResponse`, whose four members are always present:
 ```json
 {"jsonrpc": "2.0", "id": 1,
  "result": {"tasks": [{"id": "tsk_…", "contextId": "ctx_…",
-                       "status": {"state": "TASK_STATE_WORKING"}},
+                       "status": {"state": "TASK_STATE_WORKING",
+                                  "timestamp": "2026-10-13T09:00:04.512Z"}},
                       {"id": "tsk_…", "contextId": "ctx_…",
                        "status": {"state": "TASK_STATE_COMPLETED",
                                   "message": {"messageId": "msg_tsk_…_status", "contextId": "ctx_…",
                                               "taskId": "tsk_…", "role": "ROLE_AGENT",
                                               "parts": [{"text": "session ended",
-                                                         "mediaType": "text/plain"}]}}}],
+                                                         "mediaType": "text/plain"}]},
+                                  "timestamp": "2026-10-13T09:00:00.123Z"}}],
             "nextPageToken": "MTI6dHNrXzAxYTE…",
             "pageSize": 2,
             "totalSize": 5}}

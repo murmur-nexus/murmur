@@ -382,7 +382,8 @@ pub(crate) fn message_carrier(frame: &MurmurFrame) -> String {
     }))
 }
 
-/// `frame` carried by a `statusUpdate` of `task` repeating `state` with no message.
+/// `frame` carried by a `statusUpdate` of `task` repeating `state` with no message, recorded as
+/// it is written.
 pub(crate) fn status_carrier(task: &StreamTask, state: TaskState, frame: &MurmurFrame) -> String {
     render(StreamResponse::StatusUpdate(StatusUpdate {
         task_id: &task.task_id,
@@ -572,18 +573,19 @@ pub(crate) fn input_required_result(task: &StreamTask, prompt: &str) -> String {
     )
 }
 
-/// A status in `state` whose message, from the agent, is `text`.
+/// A status in `state` whose message, from the agent, is `text`, recorded now.
 fn agent_status(task: &StreamTask, state: TaskState, text: &str) -> TaskStatus {
-    TaskStatus {
+    TaskStatus::at(
         state,
-        message: Some(StatusMessage {
+        Some(StatusMessage {
             message_id: message_id(),
             context_id: task.context_id.clone(),
             task_id: task.task_id.clone(),
             role: Role::Agent,
             parts: vec![Part::text(text)],
         }),
-    }
+        crate::a2a::status_now(),
+    )
 }
 
 /// How `task` ended, exactly as `GetTask` reports it: the `response` artifact, when it has one,
@@ -894,12 +896,15 @@ mod tests {
             },
         ))
         .unwrap();
+        // The carrier is stamped as it is written.
+        let status = &carrier["statusUpdate"]["status"];
+        crate::a2a::assert_bare_status(status, "TASK_STATE_WORKING");
         assert_eq!(
             carrier,
             json!({"statusUpdate": {
                 "taskId": "tsk_1",
                 "contextId": "ctx_1",
-                "status": {"state": "TASK_STATE_WORKING"},
+                "status": {"state": "TASK_STATE_WORKING", "timestamp": status["timestamp"]},
                 "metadata": {STREAM_EXTENSION_URI: {"frame": "text", "text": "Hel", "final": false}},
             }})
         );
@@ -944,6 +949,7 @@ mod tests {
         let events = buffered(buffer_of(&sink));
         let status = &events[0]["statusUpdate"]["status"];
         assert_eq!(status["state"], "TASK_STATE_WORKING");
+        assert_written_now(status);
         let message = &status["message"];
         assert_eq!(message["taskId"], "tsk_1");
         assert_eq!(message["contextId"], "ctx_1");
@@ -1000,14 +1006,18 @@ mod tests {
         assert_eq!(events[0].state, None);
     }
 
+    /// When [`ended`]'s task last changed, as the registry would have stamped it.
+    const ENDED_AT: &str = "2026-10-13T09:00:00.123Z";
+
     fn ended(state: TaskState, response: Option<&str>) -> A2aTask {
         A2aTask {
             id: "tsk_1".into(),
             context_id: "ctx_1".into(),
-            status: TaskStatus {
+            status: TaskStatus::at(
                 state,
-                message: Some(StatusMessage::agent("tsk_1", "ctx_1", "session ended")),
-            },
+                Some(StatusMessage::agent("tsk_1", "ctx_1", "session ended")),
+                ENDED_AT.parse().unwrap(),
+            ),
             artifacts: response.map(|response| {
                 vec![A2aArtifact::named(
                     crate::a2a::RESPONSE_ARTIFACT,
@@ -1051,6 +1061,8 @@ mod tests {
             status["statusUpdate"]["status"],
             serde_json::to_value(&ended(TaskState::Completed, Some("four")).status).unwrap()
         );
+        // The terminal status is the ended task's, its registry timestamp included.
+        assert_eq!(status["statusUpdate"]["status"]["timestamp"], ENDED_AT);
         assert_eq!(events[2].ends, Some(StreamEnd::Terminal));
         assert_eq!(events[2].state, Some(TaskState::Completed));
     }
@@ -1083,6 +1095,16 @@ mod tests {
             status["statusUpdate"]["status"]["message"]["parts"][0]["text"],
             "Which file?"
         );
+        assert_written_now(&status["statusUpdate"]["status"]);
+        let direct: Value =
+            serde_json::from_str(&input_required_result(&task(), "Which file?")).unwrap();
+        assert_written_now(&direct["statusUpdate"]["status"]);
+    }
+
+    /// `status` carries a timestamp in the form a status writes, of an instant no later than now.
+    fn assert_written_now(status: &Value) {
+        let at = crate::a2a::assert_status_timestamp(status);
+        assert!(at <= crate::a2a::status_now(), "{status}");
     }
 
     /// A buffer of `capacity` holding `count` events, ids `1..=count`.

@@ -526,6 +526,16 @@ pub enum RuntimeError {
     )]
     GatewayOnNativeArtifact { name: String },
 
+    /// The launch's `--lifecycle-task-acceptance queue` override turns a manifest that declares
+    /// `lifecycle.queue_depth: 0` under another acceptance into a queue with no room for a waiting
+    /// task. The manifest refuses `queue` at depth 0 at load; this is the one combination load
+    /// cannot see. Refused at staging, before any registry pull or workdir creation.
+    #[error(
+        "the launch sets lifecycle.task_acceptance to queue, and murmur.yaml declares \
+         lifecycle.queue_depth: 0, which leaves the queue no room for a waiting task"
+    )]
+    QueueWithoutRoom,
+
     /// An [`crate::types::ArtifactRequest`]'s gateway carries neither a credential nor the
     /// operator's `keyless: true`. The manifest parser refuses that shape first; staging refuses
     /// it again so no caller can build a gateway that sends keyless by omission.

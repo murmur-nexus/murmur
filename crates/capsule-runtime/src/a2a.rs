@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use murmur_artifact::TaskAcceptance;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -639,16 +640,68 @@ pub(crate) struct TaskStatus {
     /// What the task's final status said, for a terminal task that said something.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<StatusMessage>,
+    /// When this status was recorded, as [`status_timestamp`] writes it. Every status murmur
+    /// writes carries one; a peer's answer may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 impl TaskStatus {
-    /// A status in `state` with no message.
+    /// A status in `state` with no message, recorded now.
     pub(crate) fn of(state: TaskState) -> Self {
+        Self::at(state, None, status_now())
+    }
+
+    /// A status in `state` saying `message`, recorded at `when`.
+    pub(crate) fn at(
+        state: TaskState,
+        message: Option<StatusMessage>,
+        when: DateTime<Utc>,
+    ) -> Self {
         Self {
             state,
-            message: None,
+            message,
+            timestamp: Some(status_timestamp(when)),
         }
     }
+}
+
+/// The current instant, truncated to the millisecond a status timestamp carries, so the string
+/// [`status_timestamp`] writes parses back to exactly the instant stored.
+pub(crate) fn status_now() -> DateTime<Utc> {
+    let now = Utc::now();
+    DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now)
+}
+
+/// The instant of serialized `status`'s `timestamp`, asserting it is one [`status_timestamp`]
+/// could have written: RFC 3339, in UTC with a `Z`, to the millisecond.
+#[cfg(test)]
+pub(crate) fn assert_status_timestamp(status: &Value) -> DateTime<Utc> {
+    let timestamp = status["timestamp"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no timestamp: {status}"));
+    let parsed = DateTime::parse_from_rfc3339(timestamp)
+        .unwrap_or_else(|error| panic!("{timestamp} is not RFC 3339: {error}"))
+        .with_timezone(&Utc);
+    assert_eq!(status_timestamp(parsed), timestamp, "{status}");
+    parsed
+}
+
+/// Asserts `status` is a serialized status in `state` with no message and a `timestamp`
+/// [`status_timestamp`] could have written.
+#[cfg(test)]
+pub(crate) fn assert_bare_status(status: &Value, state: &str) {
+    assert_status_timestamp(status);
+    assert_eq!(
+        *status,
+        serde_json::json!({"state": state, "timestamp": status["timestamp"]})
+    );
+}
+
+/// `at` as a status's `timestamp`: RFC 3339 in UTC with milliseconds and a `Z`, such as
+/// `2026-10-13T09:00:00.123Z`, which is what A2A v1.0's `google.protobuf.Timestamp` takes.
+pub(crate) fn status_timestamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// A task status's message: an A2A message from the agent about one task, with one text part.
@@ -722,9 +775,10 @@ pub(crate) const PROMPT_ARTIFACT: &str = "prompt";
 /// A task's state.
 ///
 /// It has two spellings. On the A2A wire it is the v1.0 ProtoJSON enum name, which serde and
-/// [`Self::wire_name`] give and which is the only spelling it deserializes from. Everywhere murmur
-/// chooses its own words — the guest's `task-result.state`, `mur` output, the stream frames, trace
-/// records and every sentence written for the model — it is [`Self::as_str`].
+/// [`Self::wire_name`] give and which is the only spelling it deserializes from; every stream
+/// event and murmur frame carries that `TASK_STATE_*` name too. Everywhere murmur chooses its own
+/// words — every sentence written for the model, the guest's `task-result.state`, `mur` output
+/// and trace records — it is murmur's word, [`Self::as_str`].
 ///
 /// The door never produces `TASK_STATE_AUTH_REQUIRED`: it authenticates a request before any task
 /// exists, so no task can wait for authentication.
@@ -781,8 +835,10 @@ impl TaskState {
             .find(|state| state.wire_name() == wire)
     }
 
-    /// The state in murmur's own word, the one a stream frame's `status.state`, the guest's
-    /// `task-result.state` and `mur` output carry.
+    /// The state in murmur's own word, the one sentences written for the model carry:
+    /// [`TaskRegistry::reference_block`] and `call-member`'s answers. The guest's
+    /// `task-result.state` and `mur` output reach the same word from a wire name through
+    /// [`murmur_state_name`], and a test holds the two equal.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Submitted => "submitted",
@@ -1137,7 +1193,7 @@ pub(crate) fn user_message(message_id: &str, context_id: Option<&str>, text: &st
 /// a message.
 #[derive(Debug, Clone)]
 pub(crate) enum SendMessageResult {
-    Task(A2aTask),
+    Task(Box<A2aTask>),
     /// The message, as sent. Murmur reads nothing in it.
     Message(Value),
 }
@@ -1148,7 +1204,7 @@ impl SendMessageResult {
     pub(crate) fn from_result(result: &Value) -> Result<SendMessageResult, String> {
         match send_message_member(result)? {
             ("task", task) => serde_json::from_value(task.clone())
-                .map(SendMessageResult::Task)
+                .map(|task| SendMessageResult::Task(Box::new(task)))
                 .map_err(|error| format!("its task is not an A2A task: {error}")),
             (_, message) => Ok(SendMessageResult::Message(message.clone())),
         }
@@ -1236,6 +1292,9 @@ pub(crate) struct TaskRegistry {
     revision: u64,
     /// Each task's revision as of its last change, which orders `ListTasks`, newest first.
     revisions: HashMap<String, u64>,
+    /// The instant of each task's last change, stamped beside its revision: its status's
+    /// `timestamp`, and what `ListTasks`' `statusTimestampAfter` compares against.
+    status_times: HashMap<String, DateTime<Utc>>,
 }
 
 /// The `status.message` of a task refused because the session ended before it started.
@@ -1270,6 +1329,7 @@ impl TaskRegistry {
             owners: HashMap::new(),
             revision: 0,
             revisions: HashMap::new(),
+            status_times: HashMap::new(),
         }
     }
 
@@ -1311,11 +1371,12 @@ impl TaskRegistry {
     }
 
     /// Take back a task [`Self::enqueue`] just enqueued, which the task loop never received:
-    /// its queue slot, its state, its revision and its owner.
+    /// its queue slot, its state, its revision, its status time and its owner.
     pub(crate) fn withdraw(&mut self, task_id: &str) {
         self.pending_count = self.pending_count.saturating_sub(1);
         self.history.remove(task_id);
         self.revisions.remove(task_id);
+        self.status_times.remove(task_id);
         self.owners.remove(task_id);
     }
 
@@ -1328,10 +1389,17 @@ impl TaskRegistry {
         self.touch(task_id);
     }
 
-    /// Stamp `task_id` with the next revision.
+    /// Stamp `task_id` with the next revision and the current instant, together, so its status
+    /// timestamp moves exactly when its place in `ListTasks` does.
     fn touch(&mut self, task_id: &str) {
         self.revision += 1;
         self.revisions.insert(task_id.to_string(), self.revision);
+        self.status_times.insert(task_id.to_string(), status_now());
+    }
+
+    /// The instant of `task_id`'s last change, or `None` for a task this registry does not hold.
+    fn status_time(&self, task_id: &str) -> Option<DateTime<Utc>> {
+        self.status_times.get(task_id).copied()
     }
 
     /// Record that the door credential `credential` started `task_id`. Called under the lock the
@@ -1598,9 +1666,10 @@ impl TaskRegistry {
 
     /// `task_id` as `GetTask` reports it.
     ///
-    /// An `input-required` task carries its prompt as a `prompt` artifact. A terminal task carries
-    /// its final status's message as `status.message`, and a `completed` one its response as a
-    /// `response` artifact, each when it has one.
+    /// Its `status.timestamp` is the instant of the task's last change. An `input-required` task
+    /// carries its prompt as a `prompt` artifact. A terminal task carries its final status's
+    /// message as `status.message`, and a `completed` one its response as a `response` artifact,
+    /// each when it has one.
     pub(crate) fn get_task(&self, task_id: &str) -> Option<A2aTask> {
         self.history.get(task_id).map(|(state, context_id)| {
             let artifact =
@@ -1623,10 +1692,11 @@ impl TaskRegistry {
             A2aTask {
                 id: task_id.to_string(),
                 context_id: context_id.clone(),
-                status: TaskStatus {
-                    state: state.clone(),
+                status: TaskStatus::at(
+                    state.clone(),
                     message,
-                },
+                    self.status_time(task_id).unwrap_or_else(status_now),
+                ),
                 artifacts,
                 metadata: ending.and_then(TaskEnding::metadata),
             }
@@ -1696,7 +1766,7 @@ impl TaskRegistry {
             .history
             .iter()
             .filter(|(task_id, (state, context_id))| {
-                filter.matches(state, context_id) && visible(task_id)
+                filter.matches(state, context_id, self.status_time(task_id)) && visible(task_id)
             })
             .map(|(task_id, _)| ListCursor {
                 revision: self.revisions.get(task_id).copied().unwrap_or_default(),
@@ -1730,17 +1800,23 @@ pub(crate) struct TaskFilter {
     /// Only the tasks in this context, or the tasks of every context when `None`.
     pub context_id: Option<String>,
     pub state: StateFilter,
+    /// Only the tasks whose status time is at or after this instant (`statusTimestampAfter`), or
+    /// every task when `None`.
+    pub status_after: Option<DateTime<Utc>>,
 }
 
 impl TaskFilter {
-    fn matches(&self, state: &TaskState, context_id: &str) -> bool {
+    fn matches(&self, state: &TaskState, context_id: &str, at: Option<DateTime<Utc>>) -> bool {
         let in_context = self.context_id.as_deref().is_none_or(|c| c == context_id);
         let in_state = match &self.state {
             StateFilter::Any => true,
             StateFilter::Only(wanted) => wanted == state,
             StateFilter::Nothing => false,
         };
-        in_context && in_state
+        let in_time = self
+            .status_after
+            .is_none_or(|after| at.is_some_and(|at| at >= after));
+        in_context && in_state && in_time
     }
 }
 
@@ -1937,9 +2013,13 @@ mod tests {
     fn a_working_task_carries_no_artifact_and_no_message() {
         let r = running_registry("tsk_1");
         let task = serde_json::to_value(r.get_task("tsk_1").unwrap()).unwrap();
+        assert_bare_status(&task["status"], "TASK_STATE_WORKING");
         assert_eq!(
             task,
-            serde_json::json!({"id": "tsk_1", "contextId": "ctx_001", "status": {"state": "TASK_STATE_WORKING"}})
+            serde_json::json!({"id": "tsk_1", "contextId": "ctx_001", "status": {
+                "state": "TASK_STATE_WORKING",
+                "timestamp": timestamp_of(&r, "tsk_1"),
+            }})
         );
     }
 
@@ -1965,6 +2045,7 @@ mod tests {
                         "role": "ROLE_AGENT",
                         "parts": [{"text": "done", "mediaType": "text/plain"}],
                     },
+                    "timestamp": status_timestamp(r.status_times["tsk_1"]),
                 },
                 "artifacts": [{
                     "artifactId": "response",
@@ -2075,6 +2156,7 @@ mod tests {
         TaskFilter {
             context_id: None,
             state: StateFilter::Any,
+            status_after: None,
         }
     }
 
@@ -2149,6 +2231,133 @@ mod tests {
         );
     }
 
+    /// The instant a status timestamp names, parsed back.
+    fn instant(timestamp: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn timestamp_of(r: &TaskRegistry, task_id: &str) -> String {
+        r.get_task(task_id).unwrap().status.timestamp.unwrap()
+    }
+
+    /// Long enough that two stamps taken either side of it differ at millisecond precision.
+    fn a_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+
+    /// The status timestamp and the revision are stamped together: each change moves both, and
+    /// nothing else moves either.
+    #[test]
+    fn a_status_timestamp_moves_with_the_revision() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_001");
+        let submitted = timestamp_of(&r, "tsk_a");
+        let submitted_revision = r.revisions["tsk_a"];
+        assert_eq!(r.status_times["tsk_a"], instant(&submitted));
+
+        a_tick();
+        r.record_owner("tsk_a", "alice");
+        assert_eq!(
+            timestamp_of(&r, "tsk_a"),
+            submitted,
+            "an owner is no change"
+        );
+        assert_eq!(r.revisions["tsk_a"], submitted_revision);
+
+        r.start_task("tsk_a".to_string(), "ctx_001".to_string(), TaskLane::User);
+        let working = timestamp_of(&r, "tsk_a");
+        assert!(r.revisions["tsk_a"] > submitted_revision);
+        assert!(
+            instant(&working) > instant(&submitted),
+            "{submitted} → {working}"
+        );
+
+        a_tick();
+        r.finish_task(TaskState::Completed);
+        let completed_revision = r.revisions["tsk_a"];
+        let completed = timestamp_of(&r, "tsk_a");
+        assert!(instant(&completed) > instant(&working));
+
+        a_tick();
+        r.record_ending("tsk_a", "done", Some("four"), false, &[]);
+        assert!(r.revisions["tsk_a"] > completed_revision);
+        assert!(instant(&timestamp_of(&r, "tsk_a")) > instant(&completed));
+    }
+
+    /// GetTask's string is the stored instant exactly, so a cutoff copied from it includes the
+    /// task: the comparison is "at or after".
+    #[test]
+    fn a_status_timestamp_round_trips_and_a_cutoff_equal_to_it_includes_the_task() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_001");
+        let timestamp = timestamp_of(&r, "tsk_a");
+        assert!(timestamp.ends_with('Z'), "{timestamp}");
+        assert_eq!(
+            timestamp.len(),
+            "2026-10-13T09:00:00.123Z".len(),
+            "{timestamp}"
+        );
+        assert_eq!(instant(&timestamp), r.status_times["tsk_a"]);
+        let at = TaskFilter {
+            status_after: Some(instant(&timestamp)),
+            ..every_task()
+        };
+        assert_eq!(listed(&r.list_tasks(&at, None, 10, |_| true)), ["tsk_a"]);
+        let after = TaskFilter {
+            status_after: Some(instant(&timestamp) + chrono::Duration::milliseconds(1)),
+            ..every_task()
+        };
+        assert!(r.list_tasks(&after, None, 10, |_| true).tasks.is_empty());
+    }
+
+    #[test]
+    fn withdraw_drops_the_status_time() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_001");
+        r.withdraw("tsk_a");
+        assert!(!r.status_times.contains_key("tsk_a"));
+        assert!(r.get_task("tsk_a").is_none());
+    }
+
+    /// `status_after` filters before paging, so `total` counts only the tasks it keeps and the
+    /// cursor walks only those; it combines with the other filters.
+    #[test]
+    fn list_tasks_filters_by_status_time_before_paging() {
+        let mut r = TaskRegistry::new(8, TaskAcceptance::Queue);
+        for id in ["tsk_1", "tsk_2", "tsk_3", "tsk_4"] {
+            r.enqueue(id, "ctx_001");
+        }
+        r.request_cancel("tsk_3");
+        let base = instant("2026-10-13T09:00:00Z");
+        for (offset, id) in ["tsk_1", "tsk_2", "tsk_3", "tsk_4"].iter().enumerate() {
+            r.status_times.insert(
+                id.to_string(),
+                base + chrono::Duration::seconds(offset as i64),
+            );
+        }
+        let since = |seconds: i64| TaskFilter {
+            status_after: Some(base + chrono::Duration::seconds(seconds)),
+            ..every_task()
+        };
+        let first = r.list_tasks(&since(1), None, 2, |_| true);
+        assert_eq!(listed(&first), ["tsk_3", "tsk_4"]);
+        assert_eq!(first.total, 3);
+        let second = r.list_tasks(&since(1), first.next.as_ref(), 2, |_| true);
+        assert_eq!(listed(&second), ["tsk_2"]);
+        assert_eq!((second.total, second.next), (3, None));
+
+        let canceled_since = TaskFilter {
+            state: StateFilter::Only(TaskState::Canceled),
+            ..since(1)
+        };
+        let page = r.list_tasks(&canceled_since, None, 10, |_| true);
+        assert_eq!((listed(&page), page.total), (vec!["tsk_3"], 1));
+        assert_eq!(r.list_tasks(&since(4), None, 10, |_| true).total, 0);
+        assert_eq!(r.list_tasks(&every_task(), None, 10, |_| true).total, 4);
+    }
+
     /// The filters and the visibility predicate decide the page and the total alike.
     #[test]
     fn list_tasks_filters_by_context_state_and_visibility() {
@@ -2166,12 +2375,14 @@ mod tests {
         let in_one = TaskFilter {
             context_id: Some("ctx_one".to_string()),
             state: StateFilter::Any,
+            status_after: None,
         };
         let page = r.list_tasks(&in_one, None, 10, |_| true);
         assert_eq!((listed(&page), page.total), (vec!["tsk_c", "tsk_a"], 2));
         let canceled = TaskFilter {
             context_id: None,
             state: StateFilter::Only(TaskState::Canceled),
+            status_after: None,
         };
         let page = r.list_tasks(&canceled, None, 10, |_| true);
         assert_eq!(listed(&page), ["tsk_c"]);
@@ -2180,6 +2391,7 @@ mod tests {
         let nothing = TaskFilter {
             context_id: None,
             state: StateFilter::Nothing,
+            status_after: None,
         };
         assert_eq!(r.list_tasks(&nothing, None, 10, |_| true).total, 0);
     }
@@ -2421,7 +2633,6 @@ mod tests {
         for (mode, depth, expected) in [
             (TaskAcceptance::None, 1, 0),
             (TaskAcceptance::Single, 1, 1),
-            (TaskAcceptance::Queue, 0, 0),
             (TaskAcceptance::Queue, 1, 2),
             (TaskAcceptance::Queue, 3, 4),
         ] {

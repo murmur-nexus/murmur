@@ -180,7 +180,7 @@ Response:
     "task": {
       "id": "tsk_01jw...",
       "contextId": "ctx_01jw...",
-      "status": { "state": "TASK_STATE_SUBMITTED" }
+      "status": { "state": "TASK_STATE_SUBMITTED", "timestamp": "2026-10-13T09:00:00.123Z" }
     }
   }
 }
@@ -210,7 +210,7 @@ While the agent is waiting, the response includes the question it formed:
   "result": {
     "id": "tsk_01jw...",
     "contextId": "ctx_01jw...",
-    "status": { "state": "TASK_STATE_INPUT_REQUIRED" },
+    "status": { "state": "TASK_STATE_INPUT_REQUIRED", "timestamp": "2026-10-13T09:00:02.841Z" },
     "artifacts": [
       {
         "artifactId": "prompt",
@@ -264,7 +264,7 @@ The answer is delivered directly to the suspended tool call. The agent receives 
     "task": {
       "id": "tsk_01jw...",
       "contextId": "ctx_01jw...",
-      "status": { "state": "TASK_STATE_WORKING" }
+      "status": { "state": "TASK_STATE_WORKING", "timestamp": "2026-10-13T09:00:09.307Z" }
     }
   }
 }

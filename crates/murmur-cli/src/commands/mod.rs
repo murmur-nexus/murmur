@@ -41,7 +41,7 @@ use murmur_artifact::{
 
 use crate::error::{
     CliError, E_CAP_018, E_IO_001, E_IO_003, E_MAN_001, E_MAN_002, E_MAN_003, E_RUN_003,
-    GATEWAY_WITHOUT_CREDENTIAL_HINT,
+    GATEWAY_WITHOUT_CREDENTIAL_HINT, QUEUE_WITHOUT_ROOM_HINT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +130,9 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
                 replacement,
             };
             CliError::with_hint(E_MAN_003, error.to_string(), hint)
+        }
+        error @ RuntimeManifestError::QueueWithoutRoom => {
+            CliError::with_hint(E_MAN_003, error.to_string(), QUEUE_WITHOUT_ROOM_HINT)
         }
         RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
             E_MAN_003,

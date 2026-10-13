@@ -323,6 +323,88 @@ fn list_owned_tasks_are_paged_per_credential() {
     }
 }
 
+/// The instant a status timestamp names, which must be RFC 3339 in UTC with a `Z`.
+fn status_instant(timestamp: &Value) -> chrono::DateTime<chrono::Utc> {
+    let text = timestamp
+        .as_str()
+        .unwrap_or_else(|| panic!("no status timestamp: {timestamp}"));
+    assert!(text.ends_with('Z'), "{text}");
+    chrono::DateTime::parse_from_rfc3339(text)
+        .unwrap_or_else(|error| panic!("{text} is not RFC 3339: {error}"))
+        .with_timezone(&chrono::Utc)
+}
+
+/// `statusTimestampAfter` keeps the tasks whose status timestamp is at or after it, alone or with
+/// the other filters, page by page; the cutoff GetTask's own timestamp gives includes that task.
+#[test]
+fn status_timestamp_after_lists_only_tasks_changed_at_or_after_it() {
+    let door = Door::launch(
+        "timestamp-agent",
+        QUEUE_SLEEP_YAML,
+        common::ScriptedServer::start((1..=3).map(|n| end_turn(n, "done")).collect()),
+    );
+    let mut ids = Vec::new();
+    for name in ["a", "b", "c"] {
+        let task_id = door.start(None, message(&format!("m-{name}"), name));
+        door.wait_state(None, &task_id, "TASK_STATE_COMPLETED");
+        ids.push(task_id);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let timestamp_of = |task_id: &str| {
+        let task = door.answer(None, "GetTask", json!({"id": task_id}));
+        task["result"]["status"]["timestamp"].clone()
+    };
+    let [a, b, c] = [&ids[0], &ids[1], &ids[2]].map(|id| timestamp_of(id));
+    let [at_a, at_b, at_c] = [&a, &b, &c].map(status_instant);
+    assert!(at_a <= at_b && at_b <= at_c, "{a} {b} {c}");
+    let list = |params: Value| door.answer(None, "ListTasks", params);
+    let rfc3339 =
+        |at: chrono::DateTime<chrono::Utc>| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let since_b = list(json!({"statusTimestampAfter": b}));
+    assert_eq!(
+        listed_ids(&since_b),
+        [ids[2].clone(), ids[1].clone()],
+        "{since_b}"
+    );
+    assert_eq!(since_b["result"]["totalSize"], 2, "{since_b}");
+
+    let after_c = rfc3339(at_c + chrono::Duration::milliseconds(1));
+    let none = list(json!({"statusTimestampAfter": after_c}));
+    assert_eq!(none["result"]["tasks"], json!([]), "{none}");
+    assert_eq!(none["result"]["totalSize"], 0, "{none}");
+
+    let before_a = rfc3339(at_a - chrono::Duration::seconds(1));
+    let newest_first: Vec<String> = ids.iter().rev().cloned().collect();
+    for cutoff in [json!(before_a), Value::Null] {
+        let all = list(json!({"statusTimestampAfter": cutoff}));
+        assert_eq!(listed_ids(&all), newest_first, "{cutoff}: {all}");
+        assert_eq!(all["result"]["totalSize"], 3, "{all}");
+    }
+
+    let first = list(json!({"statusTimestampAfter": b, "pageSize": 1}));
+    assert_eq!(listed_ids(&first), std::slice::from_ref(&ids[2]), "{first}");
+    assert_eq!(first["result"]["totalSize"], 2, "{first}");
+    let token = first["result"]["nextPageToken"].clone();
+    assert_ne!(token, "", "{first}");
+    let second = list(json!({"statusTimestampAfter": b, "pageSize": 1, "pageToken": token}));
+    assert_eq!(
+        listed_ids(&second),
+        std::slice::from_ref(&ids[1]),
+        "{second}"
+    );
+    assert_eq!(second["result"]["nextPageToken"], "", "{second}");
+
+    let completed = list(json!({"statusTimestampAfter": b, "status": "TASK_STATE_COMPLETED"}));
+    assert_eq!(
+        listed_ids(&completed),
+        [ids[2].clone(), ids[1].clone()],
+        "{completed}"
+    );
+    let working = list(json!({"statusTimestampAfter": b, "status": "TASK_STATE_WORKING"}));
+    assert_eq!(working["result"]["totalSize"], 0, "{working}");
+}
+
 /// `ListTasks` filters by context and state, pages by a size it may lower, and refuses each
 /// parameter it cannot read by name. A public door lists every task to every caller.
 #[test]
@@ -385,8 +467,23 @@ fn list_params_filter_and_refuse_by_name() {
         (json!({"pageSize": 0}), -32602, "pageSize"),
         (json!({"pageToken": "not-a-token"}), -32602, "pageToken"),
         (
-            json!({"statusTimestampAfter": "2026-10-01T00:00:00Z"}),
-            -32004,
+            json!({"statusTimestampAfter": "yesterday"}),
+            -32602,
+            "statusTimestampAfter",
+        ),
+        (
+            json!({"statusTimestampAfter": 42}),
+            -32602,
+            "statusTimestampAfter",
+        ),
+        (
+            json!({"statusTimestampAfter": true}),
+            -32602,
+            "statusTimestampAfter",
+        ),
+        (
+            json!({"statusTimestampAfter": "2026-13-01T00:00:00Z"}),
+            -32602,
             "statusTimestampAfter",
         ),
     ] {
@@ -396,14 +493,17 @@ fn list_params_filter_and_refuse_by_name() {
             error["message"].as_str().unwrap().contains(named),
             "{params}: {error}"
         );
-        if code == -32004 {
-            assert_eq!(error["data"][0]["reason"], "UNSUPPORTED_OPERATION");
+        if named == "statusTimestampAfter" {
             assert_eq!(
-                error["data"][0]["metadata"],
-                json!({"parameter": "statusTimestampAfter"})
+                error["message"],
+                "Invalid params: statusTimestampAfter must be an RFC 3339 timestamp, such as \
+                 2026-10-13T09:00:00Z",
+                "{params}"
             );
         }
     }
+    let no_cutoff = list(json!({"statusTimestampAfter": null}));
+    assert_eq!(no_cutoff["result"]["totalSize"], 4, "{no_cutoff}");
 
     let public = Door::launch(
         "public-listing-agent",

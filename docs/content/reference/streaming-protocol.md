@@ -115,7 +115,7 @@ camelCase.
 
 ```text
 id: 3
-data: {"jsonrpc":"2.0","id":"r1","result":{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f1b87a01b2c3d4e5f6071829","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"inference turn 2"}]}}}}}
+data: {"jsonrpc":"2.0","id":"r1","result":{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f1b87a01b2c3d4e5f6071829","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"inference turn 2"}]},"timestamp":"2026-10-13T09:00:00.123Z"}}}}
 
 ```
 
@@ -134,11 +134,14 @@ extension receives only `task`, `statusUpdate` and `artifactUpdate` events of it
 | `artifactUpdate` | Immediately before a `TASK_STATE_COMPLETED` status, when `GetTask` reports a `response` artifact for the task | `taskId`, `contextId`, `artifact` — the `response` artifact exactly as `GetTask` reports it — and `lastChunk: true` |
 | `message` | Only on `murmur.WatchSession`, carrying a [murmur frame](#murmur-stream-v1) that belongs to no task | An A2A `Message` from `ROLE_AGENT` |
 
-A `status` holds `state` and, when the runtime had something to say, `message`: an A2A `Message`
-from `ROLE_AGENT` naming the task and its context, with one text part. A non-terminal status's
-`messageId` is `msg_` and a UUIDv7, unique within the session. A terminal status is exactly the
-`status` `GetTask` reports for the task afterwards. `TaskStatus.timestamp` and `Task.history` are
-never written.
+A `status` holds `state`, `timestamp` and, when the runtime had something to say, `message`: an
+A2A `Message` from `ROLE_AGENT` naming the task and its context, with one text part. A non-terminal
+status's `messageId` is `msg_` and a UUIDv7, unique within the session. A terminal status is exactly
+the `status` `GetTask` reports for the task afterwards. `Task.history` is never written.
+
+`timestamp` is when the status was recorded: the task's last change for the opening `task` and the
+terminal status, and the moment it was written for every other status. See
+[Agent Card: Status timestamps](agent-card.md#status-timestamp).
 
 | `status.state` | Murmur's word | `status.message` |
 |---|---|---|
@@ -243,7 +246,7 @@ the reopen's ordinal, counted from 1, as `metadata[<URI>].reopen` on that status
 annotation the extension makes on a standard event:
 
 ```json
-{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f2117c0aa1b2c3d4e5f60718","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"reopened by hook review-gate"}]}},"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"reopen":1}}}}
+{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","message":{"messageId":"msg_0199c4e2f2117c0aa1b2c3d4e5f60718","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","role":"ROLE_AGENT","parts":[{"mediaType":"text/plain","text":"reopened by hook review-gate"}]},"timestamp":"2026-10-13T09:00:00.123Z"},"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"reopen":1}}}}
 ```
 
 | What a client sees | Reading |
@@ -322,11 +325,11 @@ key naming the frame; the reopen annotation has none, which is how a client tell
 
 | The frame belongs to | Carrier |
 |---|---|
-| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on a task stream) | A `statusUpdate` of the task repeating its state with no `status.message`. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`. A `gap` repeats the opening `task`'s state; a `lagged` repeats the state of the last `task` or status the connection wrote |
+| A task (`text`, `thinking`, `tool-call-started`, `tool-call-progress`, `artifact`, and `gap` and `lagged` on a task stream) | A `statusUpdate` of the task repeating its state with no `status.message`, its `status.timestamp` the moment the carrier was written. A task's frames are written only while it works, so the state is `TASK_STATE_WORKING`. A `gap` repeats the opening `task`'s state; a `lagged` repeats the state of the last `task` or status the connection wrote |
 | No task (`connection-ack`, `capsule-closed`, and `gap` and `lagged` on `murmur.WatchSession`) | A `message` from `ROLE_AGENT`, `messageId` `msg_` and a UUIDv7, no `contextId`, and one text part holding the frame's name |
 
 ```json
-{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING"},"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"text","text":"README.md describes","final":false}}}}
+{"statusUpdate":{"taskId":"tsk_0199c4e2f1b7712a9d3e4f5061728394","contextId":"ctx_0199c4e2f1b7712a9d3e4f50617283a1","status":{"state":"TASK_STATE_WORKING","timestamp":"2026-10-13T09:00:00.123Z"},"metadata":{"https://docs.murmur.nexus/reference/streaming-protocol/#murmur-stream-v1":{"frame":"text","text":"README.md describes","final":false}}}}
 ```
 
 ```json

@@ -1,5 +1,6 @@
 //! Records every JSON-RPC exchange the common door helpers make and checks it against A2A v1.0
-//! with [`super::a2a_conformance`].
+//! with [`super::a2a_conformance`], and against the one rule murmur adds to the proto's:
+//! [`untimed_statuses`], every task status carries a `timestamp`.
 //!
 //! A request is measured only when the door accepted it: HTTP 200 with a JSON-RPC `result`, or
 //! with an event stream. A refused request is a negative test, not a statement of what the door
@@ -20,6 +21,69 @@ use serde_json::Value;
 use super::a2a_conformance::{
     check_request, check_response, check_stream_event, resolve_method, Violation, WirePart,
 };
+
+/// The subject an [`untimed_statuses`] violation is reported under.
+pub const UNTIMED_STATUS: &str = "murmur.TaskStatus.timestamp";
+
+/// Every task status in `result` that carries no `timestamp`, as one violation of `request`'s
+/// method under `part`, or none.
+///
+/// A task status is any object whose `state` is a string beginning `TASK_STATE_`, at any depth:
+/// a task's `status`, a `statusUpdate`'s, a `ListTasks` page's. The proto leaves
+/// `TaskStatus.timestamp` optional; murmur writes it on every status, so a status without one is
+/// a status some writer forgot to stamp. Each miss is named by its JSON path.
+pub fn untimed_statuses(request: &Value, part: WirePart, result: &Value) -> Vec<Violation> {
+    let mut errors = Vec::new();
+    collect_untimed(result, "result", &mut errors);
+    if errors.is_empty() {
+        return Vec::new();
+    }
+    let wire = request.get("method").and_then(Value::as_str).unwrap_or("-");
+    let method = resolve_method(wire).map_or(wire, |resolved| resolved.name);
+    vec![Violation {
+        method: method.to_string(),
+        part,
+        subject: UNTIMED_STATUS.to_string(),
+        errors,
+    }]
+}
+
+fn collect_untimed(value: &Value, path: &str, errors: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            let is_status = object
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.starts_with("TASK_STATE_"));
+            if is_status && !object.get("timestamp").is_some_and(Value::is_string) {
+                errors.push(format!(
+                    "{path}: a task status without a string `timestamp`"
+                ));
+            }
+            for (key, member) in object {
+                collect_untimed(member, &format!("{path}.{key}"), errors);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_untimed(item, &format!("{path}[{index}]"), errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// [`untimed_statuses`] of one SSE event's `data`, when it is JSON carrying a `result`.
+fn untimed_in_event(request: &Value, data: &str) -> Vec<Violation> {
+    serde_json::from_str::<Value>(data)
+        .ok()
+        .and_then(|event| {
+            event
+                .get("result")
+                .map(|result| untimed_statuses(request, WirePart::Event, result))
+        })
+        .unwrap_or_default()
+}
 
 /// The request header that carries the A2A protocol version; without it, v1.0 reads a request as
 /// 0.3.
@@ -59,6 +123,7 @@ pub fn record_post(
         }
         for data in &events {
             violations.extend(check_stream_event(&request, data));
+            violations.extend(untimed_in_event(&request, data));
         }
         format!("events:\n{}", truncate(&events.join("\n")))
     } else {
@@ -66,8 +131,9 @@ pub fn record_post(
             return;
         };
         violations.extend(check_response(&request, &response));
-        if response.get("result").is_some() {
+        if let Some(result) = response.get("result") {
             violations.extend(accepted_request(&request, request_headers, false));
+            violations.extend(untimed_statuses(&request, WirePart::Result, result));
         }
         format!("response: {}", truncate(&response.to_string()))
     };
@@ -144,7 +210,8 @@ pub fn stream_lines<T>(stream: &TcpStream, lines: &[(T, String)]) {
                 }
                 Phase::Body => {
                     if let Some(data) = watch.parser.line(line) {
-                        let violations = check_stream_event(&watch.request, &data);
+                        let mut violations = check_stream_event(&watch.request, &data);
+                        violations.extend(untimed_in_event(&watch.request, &data));
                         pending.push((
                             violations,
                             watch.request.clone(),

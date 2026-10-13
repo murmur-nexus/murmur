@@ -1796,13 +1796,15 @@ pub fn stage_session(
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
     // sleep` withdraws that bound on purpose. Once withdrawn, the declared lifetime is the only
     // one there is, so it has to be declared and it has to be short.
-    check_persistent_handle_ttl(
-        exports_peer_files.as_ref(),
-        &resolve_lifecycle(
-            request.lifecycle.clone(),
-            request.lifecycle_override.as_ref(),
-        ),
-    )?;
+    let launch_lifecycle = resolve_lifecycle(
+        request.lifecycle.clone(),
+        request.lifecycle_override.as_ref(),
+    );
+    check_persistent_handle_ttl(exports_peer_files.as_ref(), &launch_lifecycle)?;
+    // The manifest refuses `queue` at `queue_depth: 0` at load; an override to `queue` is the one
+    // way such a lifecycle still reaches here, and `launch_session` cannot size its task channel
+    // for it.
+    check_queue_has_room(&launch_lifecycle)?;
     // A second, independent floor question, deliberately asked right here next to the first: not
     // "can this host back what was declared?" but "did the capsule declare enough for what it
     // asks for?". A `staged_runtime` grant needs a composed root to be staged into, and one is
@@ -9941,6 +9943,17 @@ fn check_persistent_handle_ttl(
     }
 }
 
+/// Refuses a launch lifecycle whose queue has no room for a waiting task: `task_acceptance: queue`
+/// at `queue_depth: 0`, which only a `--lifecycle-task-acceptance queue` override over a manifest
+/// declaring `queue_depth: 0` can produce.
+fn check_queue_has_room(lifecycle: &LifecycleConfig) -> Result<(), RuntimeError> {
+    if lifecycle.queue_has_room() {
+        Ok(())
+    } else {
+        Err(RuntimeError::QueueWithoutRoom)
+    }
+}
+
 /// Writes the synthetic tool manifests for the two peer-handoff tools, each only when its own
 /// grant is declared.
 fn write_peer_handoff_tool_manifests(
@@ -12146,6 +12159,48 @@ inference:
             assert!(check_persistent_handle_ttl(None, &lifecycle_with(after_task)).is_ok());
         }
     }
+
+    // ── The queue_depth: 0 refusal at staging ────────────────────────────────
+
+    fn single_at_depth_zero() -> Option<LifecycleConfig> {
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Single,
+            queue_depth: 0,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn queue_depth_zero_under_an_override_to_queue_is_refused_at_staging() {
+        let to_queue = murmur_artifact::LifecycleOverride {
+            task_acceptance: Some(TaskAcceptance::Queue),
+            after_task: None,
+        };
+        let error =
+            check_queue_has_room(&resolve_lifecycle(single_at_depth_zero(), Some(&to_queue)))
+                .expect_err("single/0 overridden to queue must be refused");
+        assert!(matches!(error, RuntimeError::QueueWithoutRoom), "{error:?}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("lifecycle.queue_depth: 0"), "{rendered}");
+        assert!(
+            rendered.contains("lifecycle.task_acceptance to queue"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn queue_depth_zero_without_a_queue_override_passes_staging() {
+        assert!(check_queue_has_room(&resolve_lifecycle(single_at_depth_zero(), None)).is_ok());
+        let to_none = murmur_artifact::LifecycleOverride {
+            task_acceptance: Some(TaskAcceptance::None),
+            after_task: None,
+        };
+        assert!(
+            check_queue_has_room(&resolve_lifecycle(single_at_depth_zero(), Some(&to_none)))
+                .is_ok()
+        );
+    }
+
     use murmur_artifact::{ArtifactMeta, ArtifactRuntime, Registry, ResolvedArtifact, RuntimeType};
     use tempfile::TempDir;
 
@@ -19786,7 +19841,8 @@ inference:
             .unwrap_or_else(|| panic!("no matching frame after {from}: {:#?}", run.frames))
     }
 
-    /// The reopen boundary status, checked for its exact shape, its fresh `messageId` aside.
+    /// The reopen boundary status, checked for its exact shape, its fresh `messageId` and the
+    /// `timestamp` it was written at aside.
     fn assert_boundary_frame(frame: &serde_json::Value, reopen: u32) {
         let mut frame = frame.clone();
         let message_id = frame["status"]["message"]
@@ -19794,6 +19850,15 @@ inference:
             .and_then(|message| message.remove("messageId"));
         assert!(
             message_id.is_some_and(|id| id.as_str().is_some_and(|id| id.starts_with("msg_"))),
+            "{frame}"
+        );
+        let timestamp = frame["status"]
+            .as_object_mut()
+            .and_then(|status| status.remove("timestamp"));
+        assert!(
+            timestamp.is_some_and(|at| at
+                .as_str()
+                .is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok())),
             "{frame}"
         );
         assert_eq!(

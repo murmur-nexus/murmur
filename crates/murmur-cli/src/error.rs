@@ -115,6 +115,12 @@ pub(crate) const GATEWAY_WITHOUT_CREDENTIAL_HINT: &str =
      gateway.keyless: true if this upstream takes no key — the runtime never infers keylessness \
      from the address";
 
+/// The hint on `E-MAN-003` for `lifecycle.queue_depth: 0` under `task_acceptance: queue` in the
+/// manifest itself.
+pub(crate) const QUEUE_WITHOUT_ROOM_HINT: &str =
+    "set lifecycle.queue_depth to 1 or more, or use lifecycle.task_acceptance: single to take one \
+     task at a time";
+
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
 pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or collides in the archive
@@ -725,6 +731,12 @@ impl From<RuntimeError> for CliError {
                 E_RUN_032,
                 error.to_string(),
                 format!("the driver must export {PROCESS_DRIVER_IFACE} and import nothing but WASI"),
+            ),
+            error @ RuntimeError::QueueWithoutRoom => CliError::with_hint(
+                E_MAN_003,
+                error.to_string(),
+                "set lifecycle.queue_depth to 1 or more in murmur.yaml, or launch without \
+                 --lifecycle-task-acceptance queue",
             ),
             error @ RuntimeError::GatewayWithoutCredential { .. } => CliError::with_hint(
                 E_CAP_018,

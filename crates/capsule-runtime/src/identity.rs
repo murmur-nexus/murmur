@@ -2143,14 +2143,15 @@ fn start_task(
             crate::a2a::REJECTED_BUSY_MESSAGE
         };
         let task = A2aTask {
-            status: TaskStatus {
-                state: TaskState::Rejected,
-                message: Some(crate::a2a::StatusMessage::agent(
+            status: TaskStatus::at(
+                TaskState::Rejected,
+                Some(crate::a2a::StatusMessage::agent(
                     &task_id,
                     &context_id,
                     refusal,
                 )),
-            },
+                crate::a2a::status_now(),
+            ),
             id: task_id,
             context_id,
             artifacts: None,
@@ -2188,13 +2189,15 @@ fn start_task(
         ));
     }
 
-    MessageRoute::Started(A2aTask {
+    // Still under the lock it was enqueued under, so this is the `submitted` view, carrying the
+    // registry's timestamp for it.
+    MessageRoute::Started(reg.get_task(&task_id).unwrap_or_else(|| A2aTask {
         id: task_id,
         context_id,
         status: TaskStatus::of(TaskState::Submitted),
         artifacts: None,
         metadata: None,
-    })
+    }))
 }
 
 /// The message a `SendMessage` or `SendStreamingMessage` request's `params` carries, as
@@ -2330,6 +2333,11 @@ const DEFAULT_LIST_PAGE_SIZE: u64 = 50;
 /// server return fewer than asked.
 const MAX_LIST_PAGE_SIZE: u64 = 100;
 
+/// What a `statusTimestampAfter` that is not an RFC 3339 timestamp is answered with, after
+/// `Invalid params: `.
+const STATUS_TIMESTAMP_AFTER_INVALID: &str =
+    "statusTimestampAfter must be an RFC 3339 timestamp, such as 2026-10-13T09:00:00Z";
+
 /// What a `ListTasks` request asks for, as [`read_list_params`] reads it.
 #[derive(Debug, Clone, PartialEq)]
 struct ListRequest {
@@ -2343,12 +2351,12 @@ struct ListRequest {
 
 /// The `ListTasksRequest` in `params`, or the error answering request `id`.
 ///
-/// Read by hand, in this order, each failure `-32602` naming the parameter but one: `contextId` is
-/// a string, `""` for no filter; `status` is a v1.0 `TaskState` name, `TASK_STATE_UNSPECIFIED` for
+/// Read by hand, in this order, each failure `-32602` naming the parameter: `contextId` is a
+/// string, `""` for no filter; `status` is a v1.0 `TaskState` name, `TASK_STATE_UNSPECIFIED` for
 /// no filter; `pageSize` is an integer from 1, [`DEFAULT_LIST_PAGE_SIZE`] when absent; `pageToken`
-/// is `""` or a token this door issued; `statusTimestampAfter` is absent or `null`, and anything
-/// else is `-32004`, since the door records no status timestamps; `includeArtifacts` is a
-/// boolean. `historyLength` and unknown members are ignored.
+/// is `""` or a token this door issued; `statusTimestampAfter` is an RFC 3339 timestamp in any
+/// offset, absent or `null` for no filter; `includeArtifacts` is a boolean. `historyLength` and
+/// unknown members are ignored.
 fn read_list_params(id: &Value, params: &Value) -> Result<ListRequest, JsonRpcResponse> {
     let invalid = |message: &str| {
         Err(JsonRpcResponse::err(
@@ -2396,24 +2404,25 @@ fn read_list_params(id: &Value, params: &Value) -> Result<ListRequest, JsonRpcRe
         },
         Some(_) => return invalid("pageToken must be a string"),
     };
-    if params
-        .get("statusTimestampAfter")
-        .is_some_and(|after| !after.is_null())
-    {
-        return Err(JsonRpcResponse::a2a_error(
-            id.clone(),
-            A2aError::UnsupportedOperation,
-            "statusTimestampAfter is not supported: this agent records no status timestamps",
-            &[("parameter", "statusTimestampAfter".to_string())],
-        ));
-    }
+    let status_after = match params.get("statusTimestampAfter") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(after)) => match chrono::DateTime::parse_from_rfc3339(after) {
+            Ok(after) => Some(after.with_timezone(&chrono::Utc)),
+            Err(_) => return invalid(STATUS_TIMESTAMP_AFTER_INVALID),
+        },
+        Some(_) => return invalid(STATUS_TIMESTAMP_AFTER_INVALID),
+    };
     let include_artifacts = match params.get("includeArtifacts") {
         None => false,
         Some(Value::Bool(include)) => *include,
         Some(_) => return invalid("includeArtifacts must be a boolean"),
     };
     Ok(ListRequest {
-        filter: TaskFilter { context_id, state },
+        filter: TaskFilter {
+            context_id,
+            state,
+            status_after,
+        },
         page_size,
         after,
         include_artifacts,
@@ -4222,6 +4231,39 @@ mod tests {
         ))
     }
 
+    /// `statusTimestampAfter` takes an RFC 3339 timestamp in any offset and keeps the tasks
+    /// changed at or after it; `null` keeps every task.
+    #[test]
+    fn list_status_timestamp_after_keeps_tasks_changed_at_or_after_it() {
+        let (registry, _waiter) = routing_registry();
+        let total = |after: Value| {
+            let answer = list(
+                &registry,
+                &TaskCaller::Session,
+                serde_json::json!({"statusTimestampAfter": after}),
+            );
+            answer["result"]["totalSize"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{after}: {answer}"))
+        };
+        assert_eq!(total(Value::Null), 3);
+        assert_eq!(total(serde_json::json!("2000-01-01T00:00:00Z")), 3);
+        assert_eq!(total(serde_json::json!("2000-01-01T02:00:00+02:00")), 3);
+        assert_eq!(total(serde_json::json!("2999-01-01T00:00:00Z")), 0);
+        let newest = registry.lock().unwrap().get_task("tsk_queued").unwrap();
+        let cutoff = newest.status.timestamp.clone().unwrap();
+        let answer = list(
+            &registry,
+            &TaskCaller::Session,
+            serde_json::json!({"statusTimestampAfter": cutoff}),
+        );
+        let tasks = answer["result"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["id"], "tsk_queued", "{answer}");
+        assert!(tasks
+            .iter()
+            .all(|task| { task["status"]["timestamp"].as_str().unwrap() >= cutoff.as_str() }));
+    }
+
     /// Each parameter is read in its documented order, and each refusal names it.
     #[test]
     fn list_params_are_refused_by_name() {
@@ -4241,8 +4283,23 @@ mod tests {
             ),
             (serde_json::json!({"pageToken": 1}), -32602, "pageToken"),
             (
-                serde_json::json!({"statusTimestampAfter": "2026-10-01T00:00:00Z"}),
-                -32004,
+                serde_json::json!({"statusTimestampAfter": "yesterday"}),
+                -32602,
+                "statusTimestampAfter",
+            ),
+            (
+                serde_json::json!({"statusTimestampAfter": 42}),
+                -32602,
+                "statusTimestampAfter",
+            ),
+            (
+                serde_json::json!({"statusTimestampAfter": true}),
+                -32602,
+                "statusTimestampAfter",
+            ),
+            (
+                serde_json::json!({"statusTimestampAfter": "2026-13-01T00:00:00Z"}),
+                -32602,
                 "statusTimestampAfter",
             ),
             (
@@ -4262,14 +4319,15 @@ mod tests {
             let message = answer["error"]["message"].as_str().unwrap();
             assert!(message.contains(names), "{params}: {message}");
         }
-        let unsupported = list(
+        let not_a_timestamp = list(
             &registry,
             &TaskCaller::Session,
-            serde_json::json!({"statusTimestampAfter": "2026-10-01T00:00:00Z"}),
+            serde_json::json!({"statusTimestampAfter": "yesterday"}),
         );
         assert_eq!(
-            unsupported["error"]["data"][0]["metadata"],
-            serde_json::json!({"parameter": "statusTimestampAfter"})
+            not_a_timestamp["error"]["message"],
+            "Invalid params: statusTimestampAfter must be an RFC 3339 timestamp, such as \
+             2026-10-13T09:00:00Z"
         );
         for accepted in [
             serde_json::json!({}),
@@ -5329,10 +5387,10 @@ mod tests {
             task_id.as_str(),
             "{lagged}"
         );
-        assert_eq!(
-            lagged["result"]["statusUpdate"]["status"],
-            serde_json::json!({"state": "TASK_STATE_SUBMITTED"}),
-            "a carrier repeats the state the connection last wrote"
+        // A carrier repeats the state the connection last wrote.
+        crate::a2a::assert_bare_status(
+            &lagged["result"]["statusUpdate"]["status"],
+            "TASK_STATE_SUBMITTED",
         );
         assert_eq!(
             crate::streaming::frame_of(&lagged["result"]),

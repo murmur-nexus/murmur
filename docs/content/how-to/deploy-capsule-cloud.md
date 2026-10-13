@@ -86,40 +86,36 @@ When a group finishes, the level-2 items collapse — only the checkmarked summa
 Initial state (everything pending):
 
 ```text
-  · ↓ 3 artifacts  2↓  1 cached
+  · ↓ 1 artifact  1 to fetch
       · ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
-      · ↓ murmur-hook-compact@{{ v.murmur_hook_compact }}
-      · ↓ murmur-tool-editor@{{ v.murmur_tool_editor }}
-  · mur vX.Y.Z
+  · ↓ mur vX.Y.Z
   · SSH
   · ↑ mur binary
   · ↑ files
-  · ↑ 3 artifacts
+  · ↑ 1 artifact
       · ↑ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
-      · ↑ murmur-hook-compact@{{ v.murmur_hook_compact }}
-      · ↑ murmur-tool-editor@{{ v.murmur_tool_editor }}
-  · start capsule
+  · ⚙ compile 1 artifact
+  · → start capsule
 ```
 
-During downloads (parallel, bytes / total bar per artifact being fetched):
+During downloads, each artifact being fetched shows a bytes / total bar:
 
 ```text
-  ⠸ ↓ 3 artifacts
-      ✓ ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}  cached
-      ⠸ ↓ murmur-hook-compact@{{ v.murmur_hook_compact }}  2/2 MB  [████████████]
-      ⠸ ↓ murmur-tool-editor@{{ v.murmur_tool_editor }}   7/14 MB [██████░░░░░░]
-  · mur vX.Y.Z
+  ⠸ ↓ 1 artifact
+      ⠸ ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}  1.38 MiB/2.90 MiB  [██████░░░░░░]
+  · ↓ mur vX.Y.Z
   ...
 ```
 
-After each group completes, level-2 items collapse. SSH disappears when the first upload starts:
+After each group completes, level-2 items collapse. SSH disappears once the VM answers, before the first upload. `⚙ compile` counts what the VM's `mur precompile` did with each artifact:
 
 ```text
-  ✓ ↓ 3 artifacts  16 MB  1 cached
+  ✓ ↓ 1 artifact  3 MB
   ✓ ↓ mur vX.Y.Z  cached
   ✓ ↑ mur binary  59 MB
-  ✓ ↑ murmur.yaml · instructions.md
-  ✓ ↑ 3 artifacts  21 MB
+  ✓ ↑ murmur.yaml
+  ✓ ↑ 1 artifact  3 MB
+  ✓ ⚙ compile 1 artifact  1 compiled · 0 stored · 0 not wasm · 0 failed  0.5s
   ✓ → capsule  started · port 9000
 
   ┌──────────────────────────────────────────┐
