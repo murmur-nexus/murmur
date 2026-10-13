@@ -1937,26 +1937,6 @@ fn setup_agent_project_with_lifecycle(endpoint: &str, lifecycle_yaml: &str) -> (
     (home, manifest_path)
 }
 
-/// Every `trace.jsonl` under `root`, at any depth.
-fn traces_under(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.file_name().is_some_and(|name| name == "trace.jsonl") {
-                found.push(path);
-            }
-        }
-    }
-    found
-}
-
 /// A refusal of a queue with no room: `E-MAN-003` naming `lifecycle.queue_depth`, with a hint,
 /// and nothing launched — no panic and no session trace.
 fn assert_refused_before_launch(
@@ -1977,8 +1957,8 @@ fn assert_refused_before_launch(
         "{stderr}"
     );
     for root in [home.path(), manifest_path.parent().unwrap()] {
-        let traces = traces_under(root);
-        assert!(traces.is_empty(), "nothing launched, yet: {traces:?}");
+        let trace = common::find_file(root, "trace.jsonl");
+        assert!(trace.is_none(), "nothing launched, yet: {trace:?}");
     }
     stderr
 }
@@ -2032,7 +2012,7 @@ fn lifecycle_queue_depth_zero_under_an_override_to_queue_is_refused() {
     assert!(server.requests().is_empty(), "no inference was made");
 }
 
-/// `queue_depth` means nothing under `single`, so `0` there launches as it always has.
+/// `queue_depth` means nothing under `single`, so `0` there launches.
 #[test]
 fn lifecycle_queue_depth_zero_under_single_still_runs() {
     let server = end_turn_server("done");

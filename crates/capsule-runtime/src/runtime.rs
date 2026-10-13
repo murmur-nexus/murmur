@@ -12200,6 +12200,7 @@ inference:
                 .is_ok()
         );
     }
+
     use murmur_artifact::{ArtifactMeta, ArtifactRuntime, Registry, ResolvedArtifact, RuntimeType};
     use tempfile::TempDir;
 

@@ -673,23 +673,28 @@ pub(crate) fn status_now() -> DateTime<Utc> {
     DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now)
 }
 
-/// Asserts `status` is a serialized status in `state` with no message and a `timestamp`
-/// [`status_timestamp`] could have written: RFC 3339, in UTC with a `Z`, to the millisecond.
+/// The instant of serialized `status`'s `timestamp`, asserting it is one [`status_timestamp`]
+/// could have written: RFC 3339, in UTC with a `Z`, to the millisecond.
 #[cfg(test)]
-pub(crate) fn assert_bare_status(status: &Value, state: &str) {
+pub(crate) fn assert_status_timestamp(status: &Value) -> DateTime<Utc> {
     let timestamp = status["timestamp"]
         .as_str()
         .unwrap_or_else(|| panic!("no timestamp: {status}"));
     let parsed = DateTime::parse_from_rfc3339(timestamp)
-        .unwrap_or_else(|error| panic!("{timestamp} is not RFC 3339: {error}"));
-    assert_eq!(
-        status_timestamp(parsed.with_timezone(&Utc)),
-        timestamp,
-        "{status}"
-    );
+        .unwrap_or_else(|error| panic!("{timestamp} is not RFC 3339: {error}"))
+        .with_timezone(&Utc);
+    assert_eq!(status_timestamp(parsed), timestamp, "{status}");
+    parsed
+}
+
+/// Asserts `status` is a serialized status in `state` with no message and a `timestamp`
+/// [`status_timestamp`] could have written.
+#[cfg(test)]
+pub(crate) fn assert_bare_status(status: &Value, state: &str) {
+    assert_status_timestamp(status);
     assert_eq!(
         *status,
-        serde_json::json!({"state": state, "timestamp": timestamp})
+        serde_json::json!({"state": state, "timestamp": status["timestamp"]})
     );
 }
 
@@ -831,9 +836,9 @@ impl TaskState {
     }
 
     /// The state in murmur's own word, the one sentences written for the model carry:
-    /// [`TaskRegistry::reference_block`] and `call-member`'s answers. The guest's `task-result.state` and `mur`
-    /// output reach the same word from a wire name through [`murmur_state_name`], and a test holds
-    /// the two equal.
+    /// [`TaskRegistry::reference_block`] and `call-member`'s answers. The guest's
+    /// `task-result.state` and `mur` output reach the same word from a wire name through
+    /// [`murmur_state_name`], and a test holds the two equal.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Submitted => "submitted",
@@ -2254,7 +2259,6 @@ mod tests {
 
         a_tick();
         r.record_owner("tsk_a", "alice");
-        let _ = r.get_task("tsk_a");
         assert_eq!(
             timestamp_of(&r, "tsk_a"),
             submitted,

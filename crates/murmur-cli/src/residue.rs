@@ -102,8 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn a_text_part_prints_no_residue_line() {
+    fn a_part_without_kind_prints_no_residue_line() {
         assert!(residue_lines(&[json!({"text": "nothing is running"})]).is_empty());
+        assert!(residue_lines(&[json!({"work_id": "wrk_1", "command": "sleep 30"})]).is_empty());
     }
 
     /// A detached shell command outlives the cancel and reads `running:`; a delegation is ended

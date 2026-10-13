@@ -139,10 +139,8 @@ A2A `Message` from `ROLE_AGENT` naming the task and its context, with one text p
 status's `messageId` is `msg_` and a UUIDv7, unique within the session. A terminal status is exactly
 the `status` `GetTask` reports for the task afterwards. `Task.history` is never written.
 
-`timestamp` is RFC 3339 UTC with milliseconds and a `Z`. The opening `task` and the terminal status
-are read from the session's task record, so theirs is the task's last change, as `GetTask` reports
-it. Every other status — a `TASK_STATE_WORKING` progress status, a `TASK_STATE_INPUT_REQUIRED`
-status, a [carrier](#carriers) — carries the moment it was written. See
+`timestamp` is when the status was recorded: the task's last change for the opening `task` and the
+terminal status, and the moment it was written for every other status. See
 [Agent Card: Status timestamps](agent-card.md#status-timestamp).
 
 | `status.state` | Murmur's word | `status.message` |

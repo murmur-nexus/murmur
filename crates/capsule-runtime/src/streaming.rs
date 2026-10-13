@@ -1103,14 +1103,8 @@ mod tests {
 
     /// `status` carries a timestamp in the form a status writes, of an instant no later than now.
     fn assert_written_now(status: &Value) {
-        let timestamp = status["timestamp"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no timestamp: {status}"));
-        let at = chrono::DateTime::parse_from_rfc3339(timestamp)
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(crate::a2a::status_timestamp(at), timestamp);
-        assert!(at <= crate::a2a::status_now(), "{timestamp}");
+        let at = crate::a2a::assert_status_timestamp(status);
+        assert!(at <= crate::a2a::status_now(), "{status}");
     }
 
     /// A buffer of `capacity` holding `count` events, ids `1..=count`.

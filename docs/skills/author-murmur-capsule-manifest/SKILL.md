@@ -508,7 +508,7 @@ lifecycle:
 
 Rules:
 
-- `queue_depth` only matters in queue mode;
+- `queue_depth` only matters in queue mode, where it must be `1` or more: `queue_depth: 0` under `task_acceptance: queue` is refused with [`E-MAN-003`](https://docs.murmur.nexus/reference/diagnostics/#e-man-003);
 - a queue capsule holds one running task plus `queue_depth` waiting ones; for a roster member that several members may call, `mur doctor` reports [`W-ROS-001`](https://docs.murmur.nexus/reference/diagnostics/#w-ros-001) with the `queue_depth` that holds every caller;
 - `after_task: sleep` is for a capsule intended to remain available;
 - use `conversation: threaded` only when tasks sharing a context should accumulate conversational history;

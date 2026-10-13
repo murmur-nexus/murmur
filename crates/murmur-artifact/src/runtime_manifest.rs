@@ -5901,7 +5901,7 @@ mod tests {
         );
     }
 
-    /// `queue_depth` means nothing outside `queue`, so `0` there parses as it always has.
+    /// `queue_depth` means nothing outside `queue`, so `0` there parses.
     #[test]
     fn queue_depth_zero_outside_queue_still_parses() {
         for block in [
