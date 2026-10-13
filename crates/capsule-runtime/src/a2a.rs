@@ -728,7 +728,6 @@ pub(crate) enum TaskState {
 
 impl TaskState {
     /// Every state, in the proto's order.
-    #[cfg(test)]
     pub(crate) const ALL: [TaskState; 7] = [
         TaskState::Submitted,
         TaskState::Working,
@@ -755,16 +754,9 @@ impl TaskState {
     /// The state whose A2A v1.0 ProtoJSON name is `wire`, or `None` for `TASK_STATE_UNSPECIFIED`,
     /// `TASK_STATE_AUTH_REQUIRED`, which no task here is ever in, and anything else.
     pub(crate) fn from_wire_name(wire: &str) -> Option<TaskState> {
-        Some(match wire {
-            "TASK_STATE_SUBMITTED" => Self::Submitted,
-            "TASK_STATE_WORKING" => Self::Working,
-            "TASK_STATE_INPUT_REQUIRED" => Self::InputRequired,
-            "TASK_STATE_COMPLETED" => Self::Completed,
-            "TASK_STATE_FAILED" => Self::Failed,
-            "TASK_STATE_REJECTED" => Self::Rejected,
-            "TASK_STATE_CANCELED" => Self::Canceled,
-            _ => return None,
-        })
+        Self::ALL
+            .into_iter()
+            .find(|state| state.wire_name() == wire)
     }
 
     /// The state in murmur's own word, the one a stream frame's `status.state`, the guest's
@@ -2941,7 +2933,6 @@ mod tests {
         assert!(message.contains("names 17 tasks"), "{message}");
     }
 
-    /// A file part is refused only once the message is otherwise well formed, naming the first.
     /// A message asking for push notifications is refused, whatever else `configuration` holds;
     /// a `null` config asks for nothing.
     #[test]
@@ -2978,6 +2969,7 @@ mod tests {
         }
     }
 
+    /// A file part is refused only once the message is otherwise well formed, naming the first.
     #[test]
     fn read_send_params_refuses_the_first_file_part_with_content_type_not_supported() {
         assert_eq!(

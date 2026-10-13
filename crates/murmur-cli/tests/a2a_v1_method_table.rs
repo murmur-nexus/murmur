@@ -19,35 +19,13 @@ use std::{
 };
 
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
-    stage_door_with_tools, Response, AUTHENTICATION_YAML, CREDENTIALS_YAML, DRIVER_NAME,
-    DRIVER_VERSION, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, launch_door, message, push_config_requests, request, rpc,
+    stage_door, stage_door_with_tools, Response, AUTHENTICATION_YAML, CREDENTIALS_YAML,
+    DRIVER_NAME, DRIVER_VERSION, QUEUE_SLEEP_YAML,
 };
 use common::stream::{stream_method, subscribe, Event, STREAM_EXTENSION_URI};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-
-/// The four A2A v1.0 push notification config methods, each with a valid v1.0 request message.
-fn push_methods() -> [(&'static str, Value); 4] {
-    [
-        (
-            "CreateTaskPushNotificationConfig",
-            json!({"taskId": "tsk_x", "url": "https://example.com/hook"}),
-        ),
-        (
-            "GetTaskPushNotificationConfig",
-            json!({"taskId": "tsk_x", "id": "cfg-1"}),
-        ),
-        (
-            "ListTaskPushNotificationConfigs",
-            json!({"taskId": "tsk_x"}),
-        ),
-        (
-            "DeleteTaskPushNotificationConfig",
-            json!({"taskId": "tsk_x", "id": "cfg-1"}),
-        ),
-    ]
-}
 
 /// An in-process door, the tokens it minted and what must outlive it.
 struct Door {
@@ -798,7 +776,7 @@ fn push_config_methods_and_push_requests_are_not_supported() {
         assert_eq!(error["data"][0]["domain"], "a2a-protocol.org", "{context}");
         assert_eq!(error["data"][0]["metadata"], json!({}), "{context}");
     };
-    for (method, params) in push_methods() {
+    for (method, params) in push_config_requests("tsk_x") {
         for (target, who) in [
             (&door, Some("operator")),
             (&door, Some("watcher")),
@@ -848,7 +826,7 @@ fn push_config_methods_and_push_requests_are_not_supported() {
         let card = request(&target.addr, "GET", "/.well-known/agent-card.json", &[], "").json();
         assert_eq!(card["capabilities"]["pushNotifications"], false, "{card}");
         let methods = common::card_door_methods(&card);
-        for (method, _) in push_methods() {
+        for (method, _) in push_config_requests("tsk_x") {
             assert!(!methods.contains(&method), "{methods:?}");
         }
     }
@@ -914,7 +892,7 @@ fn tenant_is_refused_on_every_served_method() {
     let listed = door.answer(operator, "ListTasks", json!({"tenant": ""}));
     assert_eq!(listed["result"]["totalSize"], before, "{listed}");
 
-    let (push, params) = push_methods()[0].clone();
+    let (push, params) = push_config_requests("tsk_x")[0].clone();
     let pushed = door.call(operator, push, with_tenant(params, json!("acme")));
     assert_eq!(error_of(&pushed)["code"], -32003, "{pushed:?}");
     let unserved = door.call(operator, "tasks/list", json!({"tenant": "acme"}));

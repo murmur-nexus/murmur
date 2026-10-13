@@ -708,9 +708,10 @@ The header name is case-insensitive. A replay from id `N`:
 | The oldest event's id is greater than `N + 1`: events after `N` were evicted | A `gap` naming the oldest id, then every event in the buffer |
 | Otherwise | Every event in the buffer whose id is greater than `N`, in order |
 
-A task stream writes the replay's events of its own task only, and its `gap` only when activated. A replay from `0` of a buffer that has evicted nothing is every event the session has
-written, starting at id `1`. Live events follow the replay on the same connection, starting after
-the highest id the replay held.
+A task stream writes the replay's events of its own task only, and its `gap` only when activated.
+A replay from `0` of a buffer that has evicted nothing is every event the session has written,
+starting at id `1`. Live events follow the replay on the same connection, starting after the
+highest id the replay held.
 
 To reconnect a `stream/watch`, send the id of the last event received as `Last-Event-ID`. Without
 a `gap`, the replay is exactly the events written after that id. With one, the events between that

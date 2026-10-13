@@ -18,8 +18,8 @@ use std::{
 use common::{
     a2a_conformance::WirePart,
     door_capsule::{
-        agent_project, driver_home, end_turn, launch_door, message, rpc, stage_door,
-        wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+        agent_project, driver_home, end_turn, launch_door, message, push_config_requests, rpc,
+        stage_door, wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
     },
     wire_recorder::{
         begin_census, exceptions, exceptions_file, observed, parse_exceptions, EXCEPTIONS_PATH,
@@ -278,24 +278,7 @@ fn the_door_fails_exactly_the_listed_exceptions() {
     }
 
     // Push is answered, never served: each config method, and a message asking for it.
-    for (method, params) in [
-        (
-            "CreateTaskPushNotificationConfig",
-            json!({"taskId": task_id, "url": "https://example.com/hook"}),
-        ),
-        (
-            "GetTaskPushNotificationConfig",
-            json!({"taskId": task_id, "id": "cfg-1"}),
-        ),
-        (
-            "ListTaskPushNotificationConfigs",
-            json!({"taskId": task_id}),
-        ),
-        (
-            "DeleteTaskPushNotificationConfig",
-            json!({"taskId": task_id, "id": "cfg-1"}),
-        ),
-    ] {
+    for (method, params) in push_config_requests(&task_id) {
         let refused = rpc(&addr, token, method, params);
         assert_eq!(refused.status, 200, "{refused:?}");
         assert_eq!(refused.json()["error"]["code"], -32003, "{refused:?}");
