@@ -8,8 +8,8 @@ mod common;
 use std::time::Duration;
 
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
-    wait_completed, Response, A2A_VERSION, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, launch_door, message, request, returning_immediately,
+    rpc, stage_door, wait_completed, Response, A2A_VERSION, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use common::{DOOR_EXTENSION_URI, STREAM_EXTENSION_URI};
 use serde_json::{json, Value};
@@ -259,7 +259,7 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
             &[version],
             1,
             "SendMessage",
-            message("m-served", "served"),
+            returning_immediately(message("m-served", "served")),
         );
         assert_served("SendMessage", &sent);
         let task_id = sent.json()["result"]["task"]["id"]
@@ -275,7 +275,7 @@ fn a2a_v1_door_negotiation_serves_1_0_alone_on_every_method() {
             &[version],
             1,
             "SendMessage",
-            message("m-queued", "queued"),
+            returning_immediately(message("m-queued", "queued")),
         );
         assert_served("SendMessage", &queued);
         let queued_id = queued.json()["result"]["task"]["id"]
@@ -449,7 +449,12 @@ fn a2a_v1_door_errors_are_the_a2a_table_with_error_info() {
     let operator = door.token("operator");
     let token = Some(operator.as_str());
 
-    let sent = rpc(&addr, token, "SendMessage", message("m-done", "done"));
+    let sent = rpc(
+        &addr,
+        token,
+        "SendMessage",
+        returning_immediately(message("m-done", "done")),
+    );
     let task_id = sent.json()["result"]["task"]["id"]
         .as_str()
         .unwrap()

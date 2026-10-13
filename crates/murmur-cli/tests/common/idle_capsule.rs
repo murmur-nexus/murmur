@@ -361,6 +361,7 @@ pub fn submit_task(addr: &str, message_id: &str, text: &str) -> String {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": message_id,
                 "role": "ROLE_USER",

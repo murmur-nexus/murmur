@@ -280,13 +280,19 @@ curl -s -X POST http://localhost:$PORT \
         "contextId": "ctx-001",
         "role": "ROLE_USER",
         "parts": [{"text": "Acknowledge message from orchestrator capsule."}]
-      }
+      },
+      "configuration": {"returnImmediately": true}
     }
   }'
 ```
 
 The door speaks A2A v1.0: every JSON-RPC request carries `A2A-Version: 1.0`, and one without it is
 answered with error [`-32009`](../reference/agent-card.md#a2a-version) and starts nothing.
+
+`"returnImmediately": true` has the door answer as soon as it accepts the task, so you can poll it.
+Leave it out and the door holds the request until the task settles, then answers with the task as
+it ended, `response` artifact included — see
+[Agent Card: Answers](../reference/agent-card.md#send-message-response).
 
 Response:
 

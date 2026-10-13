@@ -204,7 +204,10 @@ curl -s -X POST http://localhost:$PORT \
   }'
 ```
 
-See [Connect two capsules with A2A messaging](capsules-a2a-messaging.md) for the full request and response shapes.
+The door answers once the task has finished, with its answer in the `response` artifact; add
+`"configuration": {"returnImmediately": true}` to `params` to be answered as soon as the task is
+accepted. See [Connect two capsules with A2A messaging](capsules-a2a-messaging.md) for the full
+request and response shapes.
 
 Two flags matter when something other than a local script is the caller:
 

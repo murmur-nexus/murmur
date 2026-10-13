@@ -605,6 +605,7 @@ fn send_body(message_id: &str, context: &str, text: &str) -> String {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": message_id,
                 "contextId": context,

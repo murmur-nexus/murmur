@@ -147,6 +147,7 @@ impl Running {
             "id": 1,
             "method": "SendMessage",
             "params": {
+                "configuration": {"returnImmediately": true},
                 "message": {
                     "messageId": message_id,
                     "role": "ROLE_USER",

@@ -2,8 +2,9 @@
 //! authenticated door: `TASK_STATE_*` states, `ROLE_*` roles, a `SendMessageResponse`, artifacts
 //! with an `artifactId`, data parts the agent reads as fenced JSON, file parts refused with
 //! `-32005`, `referenceTaskIds` handed to the agent, and malformed messages refused with
-//! `-32602`. Every exchange goes through the recorded `common::door_capsule` helpers, so each one
-//! is also checked against the A2A v1.0 proto.
+//! `-32602`, and a `SendMessage` held until its task settles unless `returnImmediately` is set.
+//! Every exchange but the one a client abandons goes through the recorded `common::door_capsule`
+//! helpers, so each one is also checked against the A2A v1.0 proto.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -11,15 +12,16 @@ mod common;
 use std::{
     fs,
     io::Write,
+    net::TcpStream,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
 use common::door_capsule::{
-    agent_project, driver_home, end_turn, launch_door, message, rpc, stage_door,
-    stage_door_with_tools, trace_events, wait_completed, wait_for_requests, Response,
-    AUTHENTICATION_YAML, DRIVER_NAME, DRIVER_VERSION, QUEUE_SLEEP_YAML,
+    agent_project, driver_home, end_turn, launch_door, message, returning_immediately, rpc,
+    stage_door, stage_door_with_tools, trace_events, wait_completed, wait_for_requests, MurRun,
+    Response, AUTHENTICATION_YAML, DRIVER_NAME, DRIVER_VERSION, QUEUE_SLEEP_YAML,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -38,9 +40,18 @@ impl Door {
     /// A queue+sleep door named `name` holding at most `queue_depth` queued tasks, against
     /// `provider`.
     fn launch(name: &str, queue_depth: usize, provider: common::ScriptedServer) -> Self {
-        let home = driver_home();
         let lifecycle =
             QUEUE_SLEEP_YAML.replace("queue_depth: 8", &format!("queue_depth: {queue_depth}"));
+        Self::launch_with_lifecycle(name, &lifecycle, provider)
+    }
+
+    /// A door named `name` under the manifest block `lifecycle`, against `provider`.
+    fn launch_with_lifecycle(
+        name: &str,
+        lifecycle: &str,
+        provider: common::ScriptedServer,
+    ) -> Self {
+        let home = driver_home();
         let project = agent_project(
             &provider.endpoint,
             name,
@@ -107,10 +118,14 @@ impl Door {
         response
     }
 
-    /// `SendMessage` with `message`, answered.
+    /// `SendMessage` with `message`, answered at acceptance.
     fn send(&self, message: Value) -> Value {
-        self.rpc("SendMessage", json!({ "message": message }))
-            .json()
+        self.send_params(returning_immediately(json!({ "message": message })))
+    }
+
+    /// `SendMessage` with `params` as given, answered.
+    fn send_params(&self, params: Value) -> Value {
+        self.rpc("SendMessage", params).json()
     }
 
     fn get(&self, task_id: &str) -> Value {
@@ -503,4 +518,291 @@ fn malformed_messages_and_an_unnamed_get_task_are_refused() {
         assert_eq!(answer["error"]["code"], -32602, "{params}: {answer}");
         assert_eq!(answer["error"]["message"], "GetTask requires an id");
     }
+}
+
+// ── When SendMessage answers ──────────────────────────────────────────────────
+
+/// How long the scripted provider takes over each answer in the tests below.
+const PROVIDER_DELAY: Duration = Duration::from_millis(1500);
+
+/// A bare `SendMessage` is held until its task completes and answered with the task exactly as
+/// `GetTask` then reports it, `response` artifact and all; so is one with `returnImmediately:
+/// false` and one with an empty `configuration`.
+#[test]
+fn send_message_waits_for_the_task_to_complete() {
+    let door = Door::launch(
+        "waiting-send-agent",
+        8,
+        common::ScriptedServer::start_with_delay(
+            vec![end_turn(1, "one"), end_turn(2, "two"), end_turn(3, "three")],
+            PROVIDER_DELAY,
+        ),
+    );
+    let bare = |id: &str| json!({ "message": user(id, json!([{"text": "count"}])) });
+    let mut not_immediately = bare("m-wait-false");
+    not_immediately["configuration"] = json!({"returnImmediately": false});
+    let mut empty = bare("m-wait-empty");
+    empty["configuration"] = json!({});
+
+    for (params, answer) in [
+        (bare("m-wait-bare"), "one"),
+        (not_immediately, "two"),
+        (empty, "three"),
+    ] {
+        let sent_at = Instant::now();
+        let sent = door.send_params(params.clone());
+        assert!(
+            sent_at.elapsed() >= PROVIDER_DELAY,
+            "answered before the provider did: {sent}"
+        );
+        let task = &sent["result"]["task"];
+        assert_eq!(
+            task["status"]["state"], "TASK_STATE_COMPLETED",
+            "{params}: {sent}"
+        );
+        assert_eq!(
+            task["artifacts"],
+            json!([{"artifactId": "response", "name": "response",
+                "parts": [{"text": answer, "mediaType": "text/plain"}]}]),
+            "{sent}"
+        );
+        let task_id = task["id"].as_str().unwrap();
+        assert_eq!(
+            *task,
+            door.get(task_id)["result"],
+            "the answer is GetTask's view"
+        );
+    }
+}
+
+/// A bare `SendMessage` whose task pauses for input is answered `TASK_STATE_INPUT_REQUIRED` with
+/// its `prompt` artifact, and the bare reply naming the task is answered with the completed task
+/// and its `response`, with no polling between.
+#[test]
+fn send_message_returns_a_paused_task_and_its_reply_the_completed_one() {
+    let door = Door::launch_with_request_input(common::ScriptedServer::start(vec![
+        ask_for_input(),
+        end_turn(2, "on main"),
+    ]));
+
+    let sent = door.send_params(json!({ "message": user("m-pause", json!([{"text": "start"}])) }));
+    let paused = &sent["result"]["task"];
+    assert_eq!(
+        paused["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+        "{sent}"
+    );
+    assert_eq!(
+        paused["artifacts"],
+        json!([{"artifactId": "prompt", "name": "prompt",
+            "parts": [{"text": r#"{"data":"Which branch?"}"#, "mediaType": "text/plain"}]}]),
+        "{sent}"
+    );
+    let task_id = paused["id"].as_str().unwrap().to_string();
+    assert_eq!(*paused, door.get(&task_id)["result"]);
+
+    let replied = door.send_params(json!({"message": {"messageId": "m-pause-reply",
+        "role": "ROLE_USER", "taskId": task_id, "parts": [{"text": "main"}]}}));
+    let completed = &replied["result"]["task"];
+    assert_eq!(completed["id"], task_id.as_str(), "{replied}");
+    assert_eq!(
+        completed["status"]["state"], "TASK_STATE_COMPLETED",
+        "{replied}"
+    );
+    assert_eq!(
+        completed["artifacts"],
+        json!([{"artifactId": "response", "name": "response",
+            "parts": [{"text": "on main", "mediaType": "text/plain"}]}]),
+        "{replied}"
+    );
+    assert_eq!(*completed, door.get(&task_id)["result"]);
+}
+
+/// `returnImmediately: true` is answered once the task is accepted, before the provider answers,
+/// with no `response` artifact; the task completes later.
+#[test]
+fn return_immediately_answers_at_acceptance() {
+    let delay = Duration::from_secs(5);
+    let door = Door::launch(
+        "immediate-agent",
+        8,
+        common::ScriptedServer::start_with_delay(vec![end_turn(1, "later")], delay),
+    );
+    let sent_at = Instant::now();
+    let sent = door.send(user("m-now", json!([{"text": "go"}])));
+    assert!(
+        sent_at.elapsed() < delay,
+        "answered only once the provider did"
+    );
+    let task = &sent["result"]["task"];
+    let state = task["status"]["state"].as_str().unwrap();
+    assert!(
+        ["TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"].contains(&state),
+        "{sent}"
+    );
+    assert!(task.get("artifacts").is_none(), "{sent}");
+
+    let completed = door.completed(task["id"].as_str().unwrap());
+    assert_eq!(
+        completed["result"]["artifacts"][0]["parts"][0]["text"], "later",
+        "{completed}"
+    );
+}
+
+/// A `returnImmediately` that is present, not `null` and not a boolean is refused `-32602` naming
+/// it, and starts nothing.
+#[test]
+fn return_immediately_must_be_a_boolean() {
+    let door = Door::launch(
+        "flag-agent",
+        8,
+        common::ScriptedServer::start(vec![end_turn(1, "never")]),
+    );
+    for value in [json!("yes"), json!(1), json!({})] {
+        let mut params = json!({ "message": user("m-flag", json!([{"text": "a"}])) });
+        params["configuration"] = json!({ "returnImmediately": value });
+        let answer = door.send_params(params);
+        assert_eq!(answer["error"]["code"], -32602, "{value}: {answer}");
+        assert_eq!(
+            answer["error"]["message"],
+            "Invalid params: configuration.returnImmediately must be a boolean"
+        );
+    }
+    assert!(door.provider.requests().is_empty());
+    assert!(door.trace("task_start").is_empty());
+    let listed = door.rpc("ListTasks", json!({})).json();
+    assert_eq!(listed["result"]["tasks"], json!([]), "{listed}");
+}
+
+/// Under `single`, a bare message to a busy capsule is answered `TASK_STATE_REJECTED` at once,
+/// and a bare message carrying a file part is answered `-32005` at once.
+#[test]
+fn a_rejected_message_answers_at_once() {
+    let delay = Duration::from_secs(10);
+    let door = Door::launch_with_lifecycle(
+        "single-busy-agent",
+        "lifecycle:\n  task_acceptance: single\n  after_task: sleep\n",
+        common::ScriptedServer::start_with_delay(vec![end_turn(1, "done")], delay),
+    );
+    let running = door.send(user("m-running", json!([{"text": "hold"}])));
+    let running_id = running["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    door.wait_state(&running_id, "TASK_STATE_WORKING");
+
+    let sent_at = Instant::now();
+    let busy = door.send_params(json!({ "message": user("m-busy", json!([{"text": "busy"}])) }));
+    assert_eq!(
+        busy["result"]["task"]["status"]["state"], "TASK_STATE_REJECTED",
+        "{busy}"
+    );
+    let file = door.send_params(json!({ "message": user("m-file-now", json!([{"raw": "aGk="}])) }));
+    assert_eq!(file["error"]["code"], -32005, "{file}");
+    assert!(
+        sent_at.elapsed() < delay / 2,
+        "a refusal waited on the running task: {:?}",
+        sent_at.elapsed()
+    );
+    assert_eq!(
+        door.get(&running_id)["result"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+}
+
+/// A client that sends a bare `SendMessage` and leaves stops nothing: the task runs on to
+/// `TASK_STATE_COMPLETED`, `ListTasks` finds it by the `contextId` the client chose, it is never
+/// canceled, and the door goes on serving.
+#[test]
+fn a_client_that_leaves_does_not_stop_the_task() {
+    let door = Door::launch(
+        "abandoned-agent",
+        8,
+        common::ScriptedServer::start_with_delay(
+            vec![end_turn(1, "finished alone"), end_turn(2, "next")],
+            PROVIDER_DELAY,
+        ),
+    );
+    let context_id = "ctx-the-client-left";
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
+        "message": {"messageId": "m-left", "role": "ROLE_USER", "contextId": context_id,
+            "parts": [{"text": "work alone", "mediaType": "text/plain"}]}}})
+    .to_string();
+    {
+        let mut stream = TcpStream::connect(&door.addr).unwrap();
+        write!(
+            stream,
+            "POST / HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nA2A-Version: 1.0\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            door.addr,
+            door.operator,
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        wait_for_requests(&door.provider, 1);
+    }
+
+    let listed = door
+        .rpc("ListTasks", json!({ "contextId": context_id }))
+        .json();
+    let tasks = listed["result"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{listed}");
+    let task_id = tasks[0]["id"].as_str().unwrap().to_string();
+    let completed = door.completed(&task_id);
+    assert_eq!(
+        completed["result"]["artifacts"][0]["parts"][0]["text"], "finished alone",
+        "{completed}"
+    );
+    assert!(
+        door.trace("task_canceled")
+            .iter()
+            .all(|record| record["task_id"] != task_id.as_str()),
+        "the task was canceled"
+    );
+
+    let next = door.send_params(json!({ "message": user("m-next", json!([{"text": "next"}])) }));
+    assert_eq!(
+        next["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{next}"
+    );
+}
+
+/// Under the default lifecycle, `single` and `after_task: exit`, a bare `SendMessage` is answered
+/// with the completed task and its `response` before the capsule exits, and it exits `0`.
+#[test]
+fn a_single_exit_capsule_answers_the_completed_task() {
+    let server = common::ScriptedServer::start_with_delay(
+        vec![end_turn(1, "answered then exited")],
+        PROVIDER_DELAY,
+    );
+    let home = driver_home();
+    let project = agent_project(&server.endpoint, "single-exit-agent", "", "");
+    let mut run = MurRun::start(
+        home.path(),
+        &project.path().join("murmur.yaml"),
+        true,
+        &[],
+        &[],
+    );
+
+    let sent = rpc(&run.url(), None, "SendMessage", message("m-exit", "answer"));
+    assert_eq!(sent.status, 200, "{sent:?}");
+    let task = &sent.json()["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{sent:?}");
+    assert_eq!(
+        task["artifacts"][0],
+        json!({"artifactId": "response", "name": "response",
+            "parts": [{"text": "answered then exited", "mediaType": "text/plain"}]}),
+        "{sent:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = run.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the capsule never exited");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}\n{}", run.stderr());
 }

@@ -17,8 +17,8 @@ use std::{
 
 use common::door_capsule::{
     agent_project, authenticated_capsule_with_a_task_in_flight, driver_home, end_turn,
-    files_containing, message, mur, rpc, wait_completed, MurRun, AUTHENTICATION_YAML,
-    QUEUE_SLEEP_YAML,
+    files_containing, message, mur, returning_immediately, rpc, wait_completed, MurRun,
+    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use serde_json::{json, Value};
 
@@ -157,7 +157,12 @@ fn a_redirected_run_writes_no_token_and_mur_token_reads_each_from_the_record() {
         let operator = operator.trim_end();
 
         // The operator token drives the door.
-        let sent = rpc(&addr, Some(operator), "SendMessage", message("m-1", "hi"));
+        let sent = rpc(
+            &addr,
+            Some(operator),
+            "SendMessage",
+            returning_immediately(message("m-1", "hi")),
+        );
         assert_eq!(sent.status, 200, "{sent:?}");
         let task_id = sent.json()["result"]["task"]["id"]
             .as_str()

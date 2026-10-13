@@ -24,7 +24,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::door_capsule::{message, rpc, DRIVER_NAME, DRIVER_VERSION};
+use common::door_capsule::{message, returning_immediately, rpc, DRIVER_NAME, DRIVER_VERSION};
 use common::formation::{launch_lock, processes_mentioning};
 use common::{
     event_kinds as kinds, never_replying, publish_to_store, read_whole_trace as read_trace, signal,
@@ -323,7 +323,7 @@ impl Parent {
             &self.url(),
             None,
             "SendMessage",
-            message("m-delegate", "delegate"),
+            returning_immediately(message("m-delegate", "delegate")),
         );
         assert_eq!(sent.status, 200, "{sent:?}");
     }

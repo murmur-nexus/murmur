@@ -498,6 +498,7 @@ fn event_origin_task_payload_is_fenced() {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "fence-msg",
                 "role": "ROLE_USER",

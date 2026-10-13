@@ -359,7 +359,8 @@ TASK_ID=$(curl -s -X POST "http://${WORKER_URL}" \
         "contextId": "ctx-001",
         "role": "ROLE_USER",
         "parts": [{"text": "Reply with the single word pong."}]
-      }
+      },
+      "configuration": {"returnImmediately": true}
     }
   }' | jq -r '.result.task.id')
 echo "Task: $TASK_ID"

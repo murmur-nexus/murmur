@@ -165,7 +165,8 @@ curl -s -X POST http://localhost:$PORT \
         "messageId": "msg-001",
         "role": "ROLE_USER",
         "parts": [{"text": "Deploy the latest build. Confirm the target environment before proceeding."}]
-      }
+      },
+      "configuration": {"returnImmediately": true}
     }
   }'
 ```
@@ -187,6 +188,11 @@ Response:
 ```
 
 Save the task `id` at `result.task.id`: you need it to detect the pause and to answer.
+
+`"returnImmediately": true` has the door answer as soon as it accepts the task. Without it the door
+holds the request until the task pauses or ends, and answers with the task as it stands then: here,
+`TASK_STATE_INPUT_REQUIRED` with the agent's question in its `prompt` artifact, which saves the
+polling in step 4. See [Agent Card: Answers](../reference/agent-card.md#send-message-response).
 
 ---
 
@@ -249,7 +255,8 @@ curl -s -X POST http://localhost:$PORT \
         "taskId": "<your_task_id>",
         "role": "ROLE_USER",
         "parts": [{"text": "staging"}]
-      }
+      },
+      "configuration": {"returnImmediately": true}
     }
   }'
 ```

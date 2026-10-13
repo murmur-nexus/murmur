@@ -406,7 +406,7 @@ fn every_kind_of_frame_shares_one_sequence() {
             "taskId": first,
             "role": "ROLE_USER",
             "parts": [{"text": "option A", "mediaType": "text/plain"}]
-        }}),
+        }, "configuration": {"returnImmediately": true}}),
     );
     assert!(
         input["result"]["task"]["id"] == first.as_str(),

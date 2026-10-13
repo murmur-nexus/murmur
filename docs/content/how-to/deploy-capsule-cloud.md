@@ -260,7 +260,11 @@ curl -s -X POST http://1.2.3.4:9000 \
   }'
 ```
 
-See [Connect two capsules with A2A messaging](./capsules-a2a-messaging.md) for the full message protocol.
+The door answers once the task has finished, with the task and its answer in its `response`
+artifact. Add `"configuration": {"returnImmediately": true}` to `params` to be answered as soon as
+the task is accepted instead, then poll `GetTask` — see
+[Agent Card: Answers](../reference/agent-card.md#send-message-response). See
+[Connect two capsules with A2A messaging](./capsules-a2a-messaging.md) for the full message protocol.
 
 Under the default [`lifecycle`](../reference/manifest.md#lifecycle-task-acceptance), `task_acceptance: single` with `after_task: exit`, the capsule runs one incoming task and then exits. To keep a deployed capsule answering task after task, declare `task_acceptance: queue` with `after_task: sleep`. Under `task_acceptance: none` the door does not serve `SendMessage`.
 

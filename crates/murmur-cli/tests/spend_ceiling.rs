@@ -561,7 +561,7 @@ fn send_message(addr: &str, message_id: &str, text: &str) -> Value {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "SendMessage",
-            "params": {"message": {
+            "params": {"configuration": {"returnImmediately": true}, "message": {
                 "messageId": message_id,
                 "role": "ROLE_USER",
                 "parts": [{"text": text, "mediaType": "text/plain"}]

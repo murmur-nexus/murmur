@@ -12,8 +12,9 @@ use std::{
 };
 
 use common::door_capsule::{
-    agent_project, bearer, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
-    trace_events, wait_completed, MurRun, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+    agent_project, bearer, driver_home, end_turn, launch_door, message, request,
+    returning_immediately, rpc, stage_door, trace_events, wait_completed, MurRun,
+    AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
 };
 use serde_json::{json, Value};
 
@@ -206,7 +207,7 @@ fn authenticated_door_gates_every_request_but_the_public_card() {
         &addr,
         Some(&operator),
         "SendMessage",
-        message("m-op", "hello"),
+        returning_immediately(message("m-op", "hello")),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["task"]["id"]
@@ -354,7 +355,12 @@ fn public_door_ignores_authorization_and_has_no_extended_card() {
     assert!(!common::card_door_methods(&card).contains(&"GetExtendedAgentCard"));
 
     for token in [None, Some("garbage")] {
-        let sent = rpc(&addr, token, "SendMessage", message("m-public", "hello"));
+        let sent = rpc(
+            &addr,
+            token,
+            "SendMessage",
+            returning_immediately(message("m-public", "hello")),
+        );
         assert_eq!(sent.status, 200, "{sent:?}");
         let task_id = sent.json()["result"]["task"]["id"]
             .as_str()
@@ -494,7 +500,7 @@ fn tokens_stay_out_of_the_session() {
         &addr,
         Some(&tokens[0]),
         "SendMessage",
-        message("m-env", "read env"),
+        returning_immediately(message("m-env", "read env")),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["task"]["id"]

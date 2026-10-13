@@ -353,9 +353,6 @@ Inside the methods it serves, the door refuses these requests:
 | A message whose `taskId` names a task that is not in `TASK_STATE_INPUT_REQUIRED` | [`-32004`](#task-id) |
 | `GetExtendedAgentCard` to a public door | [`-32004`](#extended-card) |
 
-`SendMessage` answers as soon as the task is accepted, whatever `configuration.returnImmediately`
-says — see [Answers](#send-message-response).
-
 ### Extensions { #conformance-extensions }
 
 Every extension murmur declares has `required: false`, so a client that ignores all three is served.
@@ -494,7 +491,7 @@ The standard JSON-RPC errors carry no `data`:
 | `-32700` | `Invalid JSON payload` | A body that is not JSON. `id` is `null` |
 | `-32600` | `Request payload validation error` | A body that is not a [JSON-RPC 2.0 request](#jsonrpc-request) |
 | `-32601` | `Method not found` | A method the door extension does not list |
-| `-32602` | Names the parameter | `params` that is not an object, a [`tenant`](#tenant), a message the door cannot [read in full](#message), a message naming a waiting task in another `contextId`, a `GetTask`, `CancelTask` or `SubscribeToTask` with no `id`, a [`ListTasks` parameter](#list-tasks) it cannot read, or a [`forgetSession`](#forget-session) that is malformed, names a `taskId`, or reaches a capsule not on `inference.transport: process` |
+| `-32602` | Names the parameter | `params` that is not an object, a [`tenant`](#tenant), a message the door cannot [read in full](#message), a `configuration.returnImmediately` that is not a boolean, a message naming a waiting task in another `contextId`, a `GetTask`, `CancelTask` or `SubscribeToTask` with no `id`, a [`ListTasks` parameter](#list-tasks) it cannot read, or a [`forgetSession`](#forget-session) that is malformed, names a `taskId`, or reaches a capsule not on `inference.transport: process` |
 | `-32603` | Names the failure | A request the door accepted and could not hand to the session |
 
 Every A2A error carries `error.data`, an array holding one `google.rpc.ErrorInfo`:
@@ -640,12 +637,14 @@ The checks run in this order, and the first failure answers:
 5. `taskId` and `contextId`, then `referenceTaskIds`, as in the table.
 6. The door extension's key in `metadata`, then its `forgetSession` — see
    [`forgetSession`](#forget-session).
-7. The first `raw` or `url` part: [`-32005`](#errors).
-8. A `configuration.taskPushNotificationConfig` that is present and not `null`:
+7. A `configuration.returnImmediately` that is present, not `null` and not a boolean — see
+   [Answers](#send-message-response).
+8. The first `raw` or `url` part: [`-32005`](#errors).
+9. A `configuration.taskPushNotificationConfig` that is present and not `null`:
    [`-32003`](#push-notifications).
-9. A `forgetSession: true` to a capsule not on `inference.transport: process`: `-32602`.
+10. A `forgetSession: true` to a capsule not on `inference.transport: process`: `-32602`.
 
-Steps 1 to 6 and 9 answer `-32602`. Every refusal comes before the door looks up a task or starts
+Steps 1 to 7 and 10 answer `-32602`. Every refusal comes before the door looks up a task or starts
 one: a refused message starts no task, writes no trace record, reaches no model and delivers nothing
 to a waiting task. Unknown fields are ignored.
 
@@ -737,7 +736,45 @@ States are [murmur's words](#task-states). A message without `referenceTaskIds` 
 #### Answers { #send-message-response }
 
 `SendMessage` answers a `SendMessageResponse`: `{"task": <Task>}` for a new, rejected or continued
-task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door accepted:
+task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door accepted.
+
+When a task is answered depends on `configuration.returnImmediately`:
+
+| `configuration.returnImmediately` | The door answers |
+|---|---|
+| `false`, `null` or absent, or no `configuration` | Once the task settles, with the task as [`GetTask`](#tasks-get) reports it at that moment |
+| `true` | Once the task is accepted: `TASK_STATE_SUBMITTED` for a new task, `TASK_STATE_WORKING` for a [reply](#task-id) to a waiting task |
+| Anything else | `-32602` `configuration.returnImmediately must be a boolean`. Nothing starts |
+
+A task settles when it ends in `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`
+or `TASK_STATE_REJECTED`, or pauses in `TASK_STATE_INPUT_REQUIRED`. A completed task carries its
+`response` artifact, and a paused one its `prompt` artifact. A reply to the paused task is answered
+the same way.
+
+These are answered at once, whatever `returnImmediately` says:
+
+- every refusal, as a JSON-RPC error;
+- a new task rejected because the door has no room or the session is closing, in
+  `TASK_STATE_REJECTED`;
+- a completion, with its `message`.
+
+A bare `SendMessage` whose task completes:
+
+```json
+{"jsonrpc": "2.0", "id": 1,
+ "result": {"task": {"id": "tsk_…", "contextId": "ctx_…",
+                     "status": {"state": "TASK_STATE_COMPLETED",
+                                "message": {"messageId": "msg_tsk_…_status",
+                                            "contextId": "ctx_…", "taskId": "tsk_…",
+                                            "role": "ROLE_AGENT",
+                                            "parts": [{"text": "session ended",
+                                                       "mediaType": "text/plain"}]},
+                                "timestamp": "2026-10-13T09:00:04.512Z"},
+                     "artifacts": [{"artifactId": "response", "name": "response",
+                                    "parts": [{"text": "four", "mediaType": "text/plain"}]}]}}}
+```
+
+The same message with `"configuration": {"returnImmediately": true}`:
 
 ```json
 {"jsonrpc": "2.0", "id": 1,
@@ -745,6 +782,8 @@ task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door a
                      "status": {"state": "TASK_STATE_SUBMITTED",
                                 "timestamp": "2026-10-13T09:00:00.123Z"}}}}
 ```
+
+A completion:
 
 ```json
 {"jsonrpc": "2.0", "id": 1,
@@ -754,12 +793,23 @@ task, and `{"message": <Message>}` for a [completion](#murmur-errors) the door a
                                    "mediaType": "application/json"}]}}}
 ```
 
-`SendMessage` answers as soon as the task is accepted, whatever `configuration.returnImmediately`
-says: A2A v1.0 has a request without it wait for a terminal or interrupted state. Poll
-[`GetTask`](#tasks-get), or read the task's events with `SendStreamingMessage` or
-[`SubscribeToTask`](#subscribe-to-task). The door ignores `configuration` but for a
-`taskPushNotificationConfig`, which it [refuses](#push-notifications). A `tenant` is
-[refused](#tenant).
+The door sets no deadline on a held request, and writes nothing until it answers. A client whose
+HTTP timeout is shorter than its task sends `returnImmediately: true` and polls `GetTask`, or reads
+the task's events with `SendStreamingMessage` or [`SubscribeToTask`](#subscribe-to-task). A client
+that timed out never learned the task's id: [`ListTasks`](#list-tasks) filtered by the `contextId`
+it put on the message finds the task.
+
+A held request ends one of three ways:
+
+| What happens | The held request |
+|---|---|
+| The task settles | Answered with the task |
+| The door closes: the capsule exits, [`mur stop`](cli.md#mur-stop) runs, or [`murmur.StopSession`](#stop-session) is called | Answered with the task as `GetTask` reports it at that moment, whatever its state. Under `after_task: exit` the task has settled by then |
+| The client disconnects | Nothing changes for the task: it runs on, and `GetTask`, `ListTasks` and `SubscribeToTask` see it. The door finds out the client left only when the answer fails to write. Nothing is cancelled and nothing is logged |
+
+The door reads two members of `configuration`: `returnImmediately`, and
+`taskPushNotificationConfig`, which it [refuses](#push-notifications). Every other member is
+ignored. A `tenant` is [refused](#tenant).
 
 A message from the agent — a task's `status.message`, a completion's acknowledgement — has `role`
 `ROLE_AGENT`. A task's `status.message` also carries its `contextId` and `taskId`.

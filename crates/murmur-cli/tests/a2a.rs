@@ -202,6 +202,7 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "test-msg-1",
                 "role": "ROLE_USER",
@@ -296,6 +297,7 @@ fn a2a_second_message_send_is_rejected() {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "msg-first",
                 "role": "ROLE_USER",
@@ -317,6 +319,7 @@ fn a2a_second_message_send_is_rejected() {
         "id": 2,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "msg-second",
                 "role": "ROLE_USER",
@@ -371,6 +374,7 @@ fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "provenance-msg",
                 "role": "ROLE_USER",
@@ -579,6 +583,7 @@ fn a2a_tasks_get_unknown_method_returns_error() {
         "id": 100,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "unblock",
                 "role": "ROLE_USER",
@@ -663,6 +668,7 @@ fn an_event_origin_task_line_is_labelled_fenced() {
         "id": 1,
         "method": "SendMessage",
         "params": {
+            "configuration": {"returnImmediately": true},
             "message": {
                 "messageId": "fence-event-msg",
                 "role": "ROLE_USER",

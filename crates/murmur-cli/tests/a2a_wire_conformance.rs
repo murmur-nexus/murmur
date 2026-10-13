@@ -19,8 +19,9 @@ use std::{
 use common::{
     a2a_conformance::check_request,
     door_capsule::{
-        agent_project, driver_home, end_turn, launch_door, message, push_config_requests, rpc,
-        stage_door, wait_completed, AUTHENTICATION_YAML, QUEUE_SLEEP_YAML,
+        agent_project, driver_home, end_turn, launch_door, message, push_config_requests,
+        returning_immediately, rpc, stage_door, wait_completed, AUTHENTICATION_YAML,
+        QUEUE_SLEEP_YAML,
     },
     wire_recorder::{record_post, UNTIMED_STATUS, VERSION_HEADER},
 };
@@ -64,6 +65,7 @@ fn every_served_method_conforms() {
     let token = Some(operator.as_str());
     let started = Instant::now();
 
+    // A bare message is held until its task settles, and answered with the completed task.
     let sent = rpc(
         &addr,
         token,
@@ -71,6 +73,11 @@ fn every_served_method_conforms() {
         message("m-census-send", "send"),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
+    assert_eq!(
+        sent.json()["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED",
+        "{sent:?}"
+    );
     let task_id = sent.json()["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("SendMessage answered no task: {sent:?}"))
@@ -92,12 +99,13 @@ fn every_served_method_conforms() {
         "{ended:?}"
     );
 
-    // A task queued behind a running one is live, and its cancel is accepted.
+    // A task queued behind a running one is live, and its cancel is accepted. Both messages are
+    // answered at acceptance.
     let running = rpc(
         &addr,
         token,
         "SendMessage",
-        message("m-census-running", "running"),
+        returning_immediately(message("m-census-running", "running")),
     );
     let running_id = running.json()["result"]["task"]["id"]
         .as_str()
@@ -107,7 +115,7 @@ fn every_served_method_conforms() {
         &addr,
         token,
         "SendMessage",
-        message("m-census-queued", "queued"),
+        returning_immediately(message("m-census-queued", "queued")),
     );
     let queued_id = queued.json()["result"]["task"]["id"]
         .as_str()
@@ -209,13 +217,16 @@ fn every_served_method_conforms() {
             &addr,
             token,
             "SendMessage",
-            message(&format!("m-census-ahead-{index}"), "ahead"),
+            returning_immediately(message(&format!("m-census-ahead-{index}"), "ahead")),
         );
         let subscribed = rpc(
             &addr,
             token,
             "SendMessage",
-            message(&format!("m-census-subscribed-{index}"), "subscribed"),
+            returning_immediately(message(
+                &format!("m-census-subscribed-{index}"),
+                "subscribed",
+            )),
         );
         let subscribed_id = subscribed.json()["result"]["task"]["id"]
             .as_str()

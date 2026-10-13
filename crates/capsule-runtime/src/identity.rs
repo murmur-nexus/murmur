@@ -1128,8 +1128,28 @@ async fn handle_connection(
             return;
         }
 
-        // The streaming methods own the connection; every other method answers one JSON body.
+        // `SendMessage` and the streaming methods own the connection; every other method answers
+        // one JSON body at once.
         let response = match resolved {
+            DoorMethod::SendMessage => {
+                handle_message_send(
+                    writer_half,
+                    req,
+                    &task_registry,
+                    &task_tx,
+                    MessageSender {
+                        traceparent,
+                        provenance,
+                        caller_member,
+                        caller,
+                    },
+                    forgettable_session,
+                    sse_tx,
+                    closing,
+                )
+                .await;
+                return;
+            }
             DoorMethod::SendStreamingMessage => {
                 handle_message_stream(
                     writer_half,
@@ -1200,12 +1220,7 @@ async fn handle_connection(
                 door_method,
                 req,
                 &task_registry,
-                &task_tx,
-                traceparent,
-                provenance,
-                caller_member,
                 caller,
-                forgettable_session,
                 detached.as_ref(),
                 &live_delegations,
                 &session_id,
@@ -1710,12 +1725,11 @@ fn lost_stream_end(
     task: &StreamTask,
     ends_on_input_required: bool,
 ) -> Option<Vec<String>> {
-    let reg = task_registry.lock().unwrap();
-    let held = reg.get_task(&task.task_id)?;
-    if held.status.state.is_terminal() && reg.has_ending(&task.task_id) {
+    let held = settled_task(task_registry, &task.task_id)?;
+    if held.status.state.is_terminal() {
         return Some(ending_results(&held));
     }
-    if !ends_on_input_required || held.status.state != TaskState::InputRequired {
+    if !ends_on_input_required {
         return None;
     }
     let prompt = held
@@ -1923,36 +1937,17 @@ fn completion_received(params: &Value, delegation_id: &str) -> Value {
 }
 
 /// Answers a resolved method that replies with one JSON-RPC body.
-#[allow(clippy::too_many_arguments)]
 fn handle_jsonrpc(
     method: DoorMethod,
     req: JsonRpcRequest,
     task_registry: &Arc<Mutex<TaskRegistry>>,
-    task_tx: &mpsc::Sender<IncomingTask>,
-    traceparent: Option<String>,
-    provenance: TaskProvenance,
-    caller_member: Option<String>,
     caller: TaskCaller,
-    forgettable_session: bool,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
     session_id: &str,
 ) -> String {
     let id = req.id;
     match method {
-        DoorMethod::SendMessage => handle_message_send(
-            id,
-            &req.params,
-            task_registry,
-            task_tx,
-            MessageSender {
-                traceparent,
-                provenance,
-                caller_member,
-                caller,
-            },
-            forgettable_session,
-        ),
         DoorMethod::GetTask => handle_tasks_get(id, &req.params, task_registry, &caller),
         DoorMethod::ListTasks => handle_tasks_list(id, &req.params, task_registry, &caller),
         DoorMethod::CancelTask => handle_tasks_cancel(
@@ -1966,11 +1961,14 @@ fn handle_jsonrpc(
         DoorMethod::StopSession => {
             handle_stop_session(id, task_registry, detached, live_delegations, session_id)
         }
-        DoorMethod::SendStreamingMessage
+        DoorMethod::SendMessage
+        | DoorMethod::SendStreamingMessage
         | DoorMethod::SubscribeToTask
         | DoorMethod::WatchSession
         | DoorMethod::GetExtendedAgentCard => {
-            unreachable!("handle_connection answers the streaming methods and the extended card")
+            unreachable!(
+                "handle_connection answers SendMessage, the streaming methods and the extended card"
+            )
         }
     }
 }
@@ -2225,34 +2223,175 @@ fn read_message(
     Ok(message)
 }
 
-/// `SendMessage`: the message routed as [`route_message`] routes it, answered as a
-/// `SendMessageResponse` holding the task, or as the error refusing it. The answer lists the door
-/// extension in `A2A-Extensions` when the message's metadata used it.
-fn handle_message_send(
+/// How often a held `SendMessage` reads its task from the registry, besides on each of the task's
+/// events. It covers a settling the broadcast did not carry to this request, such as one the
+/// receiver lagged past.
+const HELD_SEND_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What `SendMessage` answers a message with, once it is read and routed.
+enum SendAnswer {
+    /// Written at once: a refusal, a rejected task, or the task as routed when the message asked
+    /// for `configuration.returnImmediately`.
+    Now(String),
+    /// Written once the task settles or the door closes, as [`hold_until_settled`] reads it.
+    Held(Box<HeldMessage>),
+}
+
+/// A `SendMessage` request the door answers once its task settles.
+struct HeldMessage {
+    /// The request's JSON-RPC id.
+    id: Value,
+    /// The task as routed.
+    task: A2aTask,
+    /// The extensions the answer lists in `A2A-Extensions`.
+    extensions: &'static [&'static str],
+}
+
+impl HeldMessage {
+    /// The answer holding `task`, as `GetTask` reports it.
+    fn answer(self, task: &A2aTask) -> String {
+        JsonRpcResponse::ok(self.id, serde_json::json!({ "task": task }))
+            .into_http_response_echoing(self.extensions)
+    }
+}
+
+/// The message in a `SendMessage` request's `params`, read as [`read_message`] reads it and routed
+/// as [`route_message`] routes it.
+///
+/// A refusal and a rejected task are answered at once. So is a started or continued task whose
+/// message set `configuration.returnImmediately`, as the task stood when it was routed. Any other
+/// task is held. The answer lists the door extension in `A2A-Extensions` when the message's
+/// metadata used it.
+fn accept_message_send(
     id: Value,
     params: &Value,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     task_tx: &mpsc::Sender<IncomingTask>,
     sender: MessageSender,
     forgettable_session: bool,
-) -> String {
+) -> SendAnswer {
     let message = match read_message(&id, params, forgettable_session) {
         Ok(message) => message,
-        Err(response) => return response.into_http_response(),
+        Err(response) => return SendAnswer::Now(response.into_http_response()),
     };
-    let extensions: &[&str] = if message.door_extension {
+    let extensions: &'static [&'static str] = if message.door_extension {
         &[DOOR_EXTENSION_URI]
     } else {
         &[]
     };
+    let return_immediately = message.return_immediately;
     let task = match route_message(&id, message, task_registry, task_tx, sender) {
-        MessageRoute::Started(task)
-        | MessageRoute::Continued(task)
-        | MessageRoute::Rejected(task) => task,
-        MessageRoute::Refused(response) => return response.into_http_response(),
+        MessageRoute::Refused(response) => return SendAnswer::Now(response.into_http_response()),
+        MessageRoute::Rejected(task) => task,
+        MessageRoute::Started(task) | MessageRoute::Continued(task) if !return_immediately => {
+            return SendAnswer::Held(Box::new(HeldMessage {
+                id,
+                task,
+                extensions,
+            }))
+        }
+        MessageRoute::Started(task) | MessageRoute::Continued(task) => task,
     };
-    JsonRpcResponse::ok(id, serde_json::json!({ "task": task }))
-        .into_http_response_echoing(extensions)
+    SendAnswer::Now(
+        JsonRpcResponse::ok(id, serde_json::json!({ "task": task }))
+            .into_http_response_echoing(extensions),
+    )
+}
+
+/// `SendMessage`: the message accepted as [`accept_message_send`] accepts it, answered with one
+/// `SendMessageResponse` holding the task, or with the error refusing it.
+///
+/// A held request writes nothing until its task settles, as [`settled_task`] decides, and then
+/// answers the task as `GetTask` reports it. No deadline applies. The connection's read half is
+/// never watched: a client that leaves is found out only when the answer fails to write, which is
+/// ignored, and the task runs on untouched. When the door closes first, the request is answered
+/// with the task as `GetTask` reports it at that moment, whatever its state.
+#[allow(clippy::too_many_arguments)]
+async fn handle_message_send(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    req: JsonRpcRequest,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    task_tx: &mpsc::Sender<IncomingTask>,
+    sender: MessageSender,
+    forgettable_session: bool,
+    sse_tx: SseBroadcast,
+    closing: watch::Receiver<bool>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    // Subscribe before the message is routed, so no event of a task that settles straight after
+    // it is enqueued or handed its input is missed. The sender is not kept: the channel closes
+    // once the session's own senders are gone.
+    let rx = sse_tx.subscribe();
+    drop(sse_tx);
+
+    let response = match accept_message_send(
+        req.id,
+        &req.params,
+        task_registry,
+        task_tx,
+        sender,
+        forgettable_session,
+    ) {
+        SendAnswer::Now(response) => response,
+        SendAnswer::Held(held) => {
+            let task = hold_until_settled(&held.task, rx, task_registry, closing).await;
+            held.answer(&task)
+        }
+    };
+    let _ = writer.write_all(response.as_bytes()).await;
+}
+
+/// Waits for `routed` to settle and returns it as `GetTask` reports it then, or as it stands when
+/// the door closes or the broadcast ends first.
+///
+/// The registry is read once at the start, then on each of the task's events, on a lag, and every
+/// [`HELD_SEND_RECHECK_INTERVAL`]. An event already received wins over the door closing.
+async fn hold_until_settled(
+    routed: &A2aTask,
+    mut rx: tokio::sync::broadcast::Receiver<Arc<StreamEvent>>,
+    task_registry: &Mutex<TaskRegistry>,
+    mut closing: watch::Receiver<bool>,
+) -> A2aTask {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let task_id = routed.id.as_str();
+    let mut recheck = tokio::time::interval_at(
+        tokio::time::Instant::now() + HELD_SEND_RECHECK_INTERVAL,
+        HELD_SEND_RECHECK_INTERVAL,
+    );
+    loop {
+        if let Some(task) = settled_task(task_registry, task_id) {
+            return task;
+        }
+        tokio::select! {
+            biased;
+            received = rx.recv() => match received {
+                Ok(event) if event.task_id != task_id => continue,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+            () = door_closing(&mut closing) => break,
+            _ = recheck.tick() => {}
+        }
+    }
+    let held = task_registry.lock().unwrap().get_task(task_id);
+    held.unwrap_or_else(|| routed.clone())
+}
+
+/// `task_id` as `GetTask` reports it once it has settled, or `None` while it runs.
+///
+/// A task has settled once the registry holds it terminal with its ending recorded, or waiting in
+/// `TASK_STATE_INPUT_REQUIRED`. A terminal state alone is not enough: a cancel records the state
+/// before the task stops and its ending after, and a task's hooks decide before its ending is
+/// recorded.
+fn settled_task(task_registry: &Mutex<TaskRegistry>, task_id: &str) -> Option<A2aTask> {
+    let reg = task_registry.lock().unwrap();
+    let task = reg.get_task(task_id)?;
+    let state = &task.status.state;
+    let settled =
+        (state.is_terminal() && reg.has_ending(task_id)) || *state == TaskState::InputRequired;
+    settled.then_some(task)
 }
 
 /// Whether `caller` reaches `task_id`, by the rule [`TaskCaller`] states: a session caller every
@@ -3672,6 +3811,31 @@ mod tests {
         })
     }
 
+    /// `SendMessage` with `params`, answered at acceptance: the message asks for
+    /// `configuration.returnImmediately`.
+    fn send_now(
+        id: Value,
+        params: &Value,
+        task_registry: &Arc<Mutex<TaskRegistry>>,
+        task_tx: &mpsc::Sender<IncomingTask>,
+        sender: MessageSender,
+        forgettable_session: bool,
+    ) -> String {
+        let mut params = params.clone();
+        params["configuration"] = serde_json::json!({ "returnImmediately": true });
+        match accept_message_send(
+            id,
+            &params,
+            task_registry,
+            task_tx,
+            sender,
+            forgettable_session,
+        ) {
+            SendAnswer::Now(response) => response,
+            SendAnswer::Held(_) => unreachable!("a message returning immediately is never held"),
+        }
+    }
+
     /// The sender of a message the operator sent, carrying no headers.
     fn operator() -> MessageSender {
         member(None)
@@ -3715,7 +3879,7 @@ mod tests {
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
 
-        let raw = handle_message_send(
+        let raw = send_now(
             serde_json::json!(1),
             &forget_params("msg_forget", true),
             &task_registry,
@@ -3741,7 +3905,7 @@ mod tests {
 
         // `false` asks for nothing, so the same capsule serves it and echoes the extension the
         // message used.
-        let raw = handle_message_send(
+        let raw = send_now(
             serde_json::json!(2),
             &forget_params("msg_keep", false),
             &task_registry,
@@ -3770,7 +3934,7 @@ mod tests {
         let task_registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
 
-        let raw = handle_message_send(
+        let raw = send_now(
             serde_json::json!(1),
             &forget_params("msg_forget", true),
             &task_registry,
@@ -3790,7 +3954,7 @@ mod tests {
         );
         assert!(task_rx.try_recv().unwrap().forget_session);
 
-        let raw = handle_message_send(
+        let raw = send_now(
             serde_json::json!(2),
             &message_send_params("msg_plain"),
             &task_registry,
@@ -3810,7 +3974,7 @@ mod tests {
         assert!(task_registry.lock().unwrap().close_to_new_work().is_empty());
         let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
 
-        let response = response_json(&handle_message_send(
+        let response = response_json(&send_now(
             serde_json::json!(1),
             &message_send_params("msg_late"),
             &task_registry,
@@ -3925,7 +4089,7 @@ mod tests {
         caller: Option<&str>,
         message: Value,
     ) -> Value {
-        response_json(&handle_message_send(
+        response_json(&send_now(
             serde_json::json!(1),
             &serde_json::json!({ "message": message }),
             registry,
@@ -6407,5 +6571,242 @@ mod tests {
         assert_eq!(delivered["result"]["message"]["role"], "ROLE_AGENT");
         assert_eq!(live.counts(), (0, 1));
         assert!(task_rx.try_recv().is_err(), "a completion started a task");
+    }
+
+    /// Posts a `SendMessage` with `params` to the door at `addr` from a blocking client, which
+    /// returns the full answer and the instant it finished reading it.
+    fn post_send_message(
+        addr: &str,
+        params: Value,
+    ) -> std::thread::JoinHandle<(std::time::Instant, String)> {
+        use std::io::{Read, Write};
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "SendMessage", "params": params,
+        })
+        .to_string();
+        let addr = addr.to_string();
+        std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .unwrap();
+            write!(
+                stream,
+                "POST / HTTP/1.1\r\nHost: {addr}\r\ncontent-type: application/json\r\n\
+                 A2A-Version: 1.0\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).unwrap();
+            (std::time::Instant::now(), answer)
+        })
+    }
+
+    /// A door over a fresh `queue` registry, holding a bare `SendMessage` whose task it has handed
+    /// to the loop. Returns the registry, the task, the door's shutdown sender, its task channel
+    /// and the client.
+    async fn held_send_message_door() -> (
+        Arc<Mutex<TaskRegistry>>,
+        IncomingTask,
+        oneshot::Sender<()>,
+        mpsc::Receiver<IncomingTask>,
+        std::thread::JoinHandle<(std::time::Instant, String)>,
+    ) {
+        let registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (addr, shutdown, mut task_rx) = serve_test_door_with(
+            TaskAcceptance::Queue,
+            Arc::clone(&registry),
+            Arc::new(LiveDelegations::new()),
+            false,
+        )
+        .await;
+        let client = post_send_message(&addr, message_send_params("msg_held"));
+        let incoming = tokio::time::timeout(std::time::Duration::from_secs(10), task_rx.recv())
+            .await
+            .expect("the task reached the loop")
+            .unwrap();
+        (registry, incoming, shutdown, task_rx, client)
+    }
+
+    /// Whether the client has read an answer within `wait`.
+    async fn answered_within(
+        client: &std::thread::JoinHandle<(std::time::Instant, String)>,
+        wait: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            if client.is_finished() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        client.is_finished()
+    }
+
+    /// A bare `SendMessage` whose task never settles is held, and answered with the task as the
+    /// registry holds it, `TASK_STATE_SUBMITTED`, once the door closes, within the drain grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_send_message_answers_the_registry_s_task_when_the_door_closes() {
+        let (registry, incoming, shutdown, _task_rx, client) = held_send_message_door().await;
+        assert!(
+            !answered_within(&client, std::time::Duration::from_millis(300)).await,
+            "a task that has not settled is not answered"
+        );
+
+        let closed_at = std::time::Instant::now();
+        drop(shutdown);
+        let (answered_at, answer) = client.join().unwrap();
+        assert!(
+            answered_at.duration_since(closed_at) < CONNECTION_DRAIN_GRACE,
+            "answered {:?} after the door closed",
+            answered_at.duration_since(closed_at)
+        );
+        let task = &response_json(&answer)["result"]["task"];
+        assert_eq!(task["status"]["state"], "TASK_STATE_SUBMITTED", "{answer}");
+        let reported = registry
+            .lock()
+            .unwrap()
+            .get_task(&incoming.task_id)
+            .unwrap();
+        assert_eq!(*task, serde_json::to_value(&reported).unwrap());
+    }
+
+    /// A held `SendMessage` is not answered while its task is terminal with no ending recorded,
+    /// and is answered with the task as `GetTask` reports it, `response` artifact and all, once
+    /// the ending is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_send_message_answers_once_the_ending_is_recorded() {
+        let (registry, incoming, _shutdown, _task_rx, client) = held_send_message_door().await;
+        let task_id = incoming.task_id.clone();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.start_task(
+                task_id.clone(),
+                incoming.context_id.clone(),
+                crate::lanes::TaskLane::User,
+            );
+            reg.finish_task(TaskState::Completed);
+        }
+        assert!(
+            !answered_within(&client, HELD_SEND_RECHECK_INTERVAL * 2).await,
+            "a terminal task with no ending is not answered"
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .record_ending(&task_id, "done", Some("four"), false, &[]);
+        let (_, answer) = client.join().unwrap();
+        let task = &response_json(&answer)["result"]["task"];
+        assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{answer}");
+        let reported = registry.lock().unwrap().get_task(&task_id).unwrap();
+        assert!(reported.artifact(crate::a2a::RESPONSE_ARTIFACT).is_some());
+        assert_eq!(*task, serde_json::to_value(&reported).unwrap());
+    }
+
+    /// A held `SendMessage` whose task pauses for input is answered `TASK_STATE_INPUT_REQUIRED`,
+    /// carrying the prompt as a `prompt` artifact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_send_message_answers_a_task_waiting_for_input() {
+        let (registry, incoming, _shutdown, _task_rx, client) = held_send_message_door().await;
+        let (waiter, _input) = oneshot::channel();
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.start_task(
+                incoming.task_id.clone(),
+                incoming.context_id.clone(),
+                crate::lanes::TaskLane::User,
+            );
+            reg.set_input_required(&incoming.task_id, "which branch?".to_string(), waiter)
+                .unwrap();
+        }
+        let (_, answer) = client.join().unwrap();
+        let task = &response_json(&answer)["result"]["task"];
+        assert_eq!(
+            task["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+            "{answer}"
+        );
+        let reported = registry
+            .lock()
+            .unwrap()
+            .get_task(&incoming.task_id)
+            .unwrap();
+        assert_eq!(
+            reported
+                .artifact(crate::a2a::PROMPT_ARTIFACT)
+                .and_then(crate::a2a::A2aArtifact::first_text),
+            Some("which branch?")
+        );
+        assert_eq!(*task, serde_json::to_value(&reported).unwrap());
+    }
+
+    /// A held `SendMessage` wakes on its own task's event rather than its next re-check, and
+    /// another task's event wakes nothing it answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_send_message_answers_on_its_task_s_event() {
+        let (sse_tx, _sse_rx) = tokio::sync::broadcast::channel::<Arc<StreamEvent>>(16);
+        let registry = Arc::new(Mutex::new(TaskRegistry::new(4, TaskAcceptance::Queue)));
+        let (task_tx, mut task_rx) = mpsc::channel::<IncomingTask>(4);
+        let (_closing_tx, closing) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = post_send_message(
+            &listener.local_addr().unwrap().to_string(),
+            message_send_params("msg_held"),
+        );
+        let (sock, _peer) = listener.accept().await.unwrap();
+        let (read_half, write_half) = sock.into_split();
+        let handler = {
+            let (registry, sse) = (Arc::clone(&registry), sse_tx.clone());
+            tokio::spawn(async move {
+                let _read_half = read_half;
+                handle_message_send(
+                    write_half,
+                    JsonRpcRequest {
+                        id: serde_json::json!(7),
+                        method: "SendMessage".to_string(),
+                        params: message_send_params("msg_held"),
+                    },
+                    &registry,
+                    &task_tx,
+                    operator(),
+                    false,
+                    sse,
+                    closing,
+                )
+                .await;
+            })
+        };
+        let incoming = task_rx.recv().await.unwrap();
+        let task_id = incoming.task_id.clone();
+        // Past the check made right after routing, so only an event or a re-check can answer.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        {
+            let mut reg = registry.lock().unwrap();
+            reg.start_task(
+                task_id.clone(),
+                incoming.context_id.clone(),
+                crate::lanes::TaskLane::User,
+            );
+            reg.finish_task(TaskState::Failed);
+            reg.record_ending(&task_id, "failed", None, false, &[]);
+        }
+        let ended_at = std::time::Instant::now();
+        sse_tx
+            .send(stream_event(1, &task_id, false, Some(StreamEnd::Terminal)))
+            .unwrap();
+        handler.await.unwrap();
+        let (answered_at, answer) = client.join().unwrap();
+        assert!(
+            answered_at.duration_since(ended_at) < HELD_SEND_RECHECK_INTERVAL / 2,
+            "answered {:?} after the event",
+            answered_at.duration_since(ended_at)
+        );
+        assert_eq!(
+            response_json(&answer)["result"]["task"]["status"]["state"],
+            "TASK_STATE_FAILED",
+            "{answer}"
+        );
     }
 }

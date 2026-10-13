@@ -14,8 +14,8 @@ use base64::Engine as _;
 use capsule_runtime::mac_token::B64;
 use capsule_runtime::{FormationAuthority, FormationId, FormationMember};
 use common::door_capsule::{
-    agent_project, bearer, driver_home, end_turn, launch_door, message, request, rpc, stage_door,
-    trace_events, Response, QUEUE_SLEEP_YAML,
+    agent_project, bearer, driver_home, end_turn, launch_door, message, request,
+    returning_immediately, rpc, stage_door, trace_events, Response, QUEUE_SLEEP_YAML,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -119,7 +119,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         &coder.addr,
         Some(&token),
         "SendMessage",
-        message("m-a", "hi"),
+        returning_immediately(message("m-a", "hi")),
     );
     assert_eq!(sent.status, 200, "{sent:?}");
     let task_id = sent.json()["result"]["task"]["id"]
@@ -237,7 +237,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         &coder.addr,
         Some(&coder.operator),
         "SendMessage",
-        message("m-op", "hi"),
+        returning_immediately(message("m-op", "hi")),
     );
     assert_eq!(operator.status, 200, "{operator:?}");
 
@@ -292,7 +292,7 @@ fn a_formation_token_reaches_its_audience_and_nothing_else() {
         &coder.addr,
         Some(&token),
         "SendMessage",
-        message("m-watched", "hi"),
+        returning_immediately(message("m-watched", "hi")),
     );
     let watched_id = watched.json()["result"]["task"]["id"]
         .as_str()
@@ -432,7 +432,7 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         &coder.addr,
         Some(&planner),
         "SendMessage",
-        message("m-1", "answer"),
+        returning_immediately(message("m-1", "answer")),
     );
     let completed_id = sent.json()["result"]["task"]["id"]
         .as_str()
@@ -459,7 +459,7 @@ fn a_task_answers_with_its_outcome_to_its_own_caller_only() {
         &coder.addr,
         Some(&planner),
         "SendMessage",
-        message("m-2", "fail"),
+        returning_immediately(message("m-2", "fail")),
     );
     let failed_id = sent.json()["result"]["task"]["id"]
         .as_str()
